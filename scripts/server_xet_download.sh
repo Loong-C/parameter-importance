@@ -14,10 +14,28 @@ expected_sha=${3,,}
 [[ $expected_size =~ ^[0-9]+$ ]] || usage
 [[ $expected_sha =~ ^[0-9a-f]{64}$ ]] || usage
 
+part="${dest}.part"
+meta="${part}.meta"
+lock="${part}.lock"
+mkdir -p -- "$(dirname -- "$dest")"
+command -v flock >/dev/null || { echo "ERROR: flock is required" >&2; exit 2; }
+exec 9>"$lock"
+flock -w 3900 9 || { echo "ERROR: timed out waiting for the object download lock" >&2; exit 8; }
+
+if [[ -f $dest ]]; then
+  final_size=$(stat -c '%s' -- "$dest")
+  [[ $final_size == "$expected_size" ]] || { echo "ERROR: completed object has the wrong size" >&2; exit 4; }
+  final_sha=$(sha256sum -- "$dest" | awk '{print $1}')
+  [[ $final_sha == "$expected_sha" ]] || { echo "ERROR: completed object has the wrong SHA-256" >&2; exit 7; }
+  echo "OK: completed object already exists and is verified"
+  exit 0
+fi
+
 IFS= read -r signed_url
 # Windows PowerShell writes CRLF to a native-process stdin pipe.
 signed_url=${signed_url%$'\r'}
 [[ $signed_url == https://* ]] || { echo "ERROR: stdin did not contain an HTTPS URL" >&2; exit 2; }
+[[ $signed_url != *[$'\n\r"\\']* ]] || { echo "ERROR: URL contains an unsafe curl-config character" >&2; exit 2; }
 
 # Never enable xtrace in this script: signed_url must not enter logs or process arguments.
 host=${signed_url#https://}
@@ -31,19 +49,25 @@ resolve() {
 
 mapfile -t a < <(resolve 223.5.5.5)
 mapfile -t b < <(resolve 119.29.29.29)
-(( ${#a[@]} > 0 && ${#b[@]} > 0 )) || { echo "ERROR: public DNS lookup failed for $host" >&2; exit 3; }
+mapfile -t c < <(resolve 114.114.114.114)
+nonempty=0
+(( ${#a[@]} > 0 )) && (( nonempty += 1 ))
+(( ${#b[@]} > 0 )) && (( nonempty += 1 ))
+(( ${#c[@]} > 0 )) && (( nonempty += 1 ))
+(( nonempty >= 2 )) || { echo "ERROR: fewer than two public DNS resolvers answered for $host" >&2; exit 3; }
 
 ip=''
-for candidate in "${a[@]}"; do
-  for other in "${b[@]}"; do
-    [[ $candidate == "$other" ]] && ip=$candidate && break 2
+for pair in 'a b' 'a c' 'b c'; do
+  read -r left_name right_name <<< "$pair"
+  declare -n left=$left_name right=$right_name
+  for candidate in "${left[@]}"; do
+    for other in "${right[@]}"; do
+      [[ $candidate == "$other" ]] && ip=$candidate && break 3
+    done
   done
 done
-[[ -n $ip ]] || { echo "ERROR: public DNS answers have no common address for $host" >&2; exit 3; }
+[[ -n $ip ]] || { echo "ERROR: no address was corroborated by two public DNS resolvers for $host" >&2; exit 3; }
 
-part="${dest}.part"
-meta="${part}.meta"
-mkdir -p -- "$(dirname -- "$dest")"
 current=0
 [[ -f $part ]] && current=$(stat -c '%s' -- "$part")
 (( current <= expected_size )) || { echo "ERROR: partial file is larger than expected" >&2; exit 4; }
@@ -66,11 +90,13 @@ if (( current < expected_size )); then
   else
     transfer_mode=(--continue-at -)
   fi
-  code=$(curl -q --noproxy '*' --fail --silent --show-error --location \
+  # Read the URL through curl's config stdin so it never appears in curl's argv.
+  code=$(printf 'url = "%s"\n' "$signed_url" | curl -q --config - \
+    --noproxy '*' --fail --silent --show-error --location \
     --connect-timeout 15 --retry 3 --retry-delay 3 \
     --resolve "$host:443:$ip" \
     "${transfer_mode[@]}" \
-    --dump-header "$headers" --output "$part" "$signed_url" \
+    --dump-header "$headers" --output "$part" \
     --write-out '%{http_code}') || rc=$?
   rc=${rc:-0}
   [[ $rc == 0 ]] || { echo "ERROR: transfer failed (curl=$rc); refresh URL and resume" >&2; exit "$rc"; }

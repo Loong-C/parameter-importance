@@ -8,9 +8,9 @@ $log = Join-Path $Root 'linux-runtime-finish.log'
 function Log([string]$Message) { Add-Content -LiteralPath $log -Encoding UTF8 -Value "$(Get-Date -Format o) $Message" }
 
 $wheels = @(Get-ChildItem -File -LiteralPath $wheelhouse -Filter '*.whl' | Sort-Object Name)
-if ($wheels.Count -ne 88) { throw "expected 88 wheels, found $($wheels.Count)" }
+if ($wheels.Count -ne 89) { throw "expected 89 wheels, found $($wheels.Count)" }
 $runtime = @($wheels | Where-Object { $_.Name -match '^(cuda_|nvidia_|triton-)' })
-if ($runtime.Count -ne 18) { throw "expected 18 Linux runtime wheels, found $($runtime.Count)" }
+if ($runtime.Count -ne 19) { throw "expected 19 Linux runtime wheels, found $($runtime.Count)" }
 
 Log "hash all $($wheels.Count) wheels"
 $wheels | ForEach-Object {

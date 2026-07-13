@@ -149,3 +149,77 @@
 - Python venv：新增 CUDA wheel 正在 SCP；传完后自动执行 `--no-index` 安装与 `pip check`。
 - Pile：shard0 后台直下进行中；完成 30,000,000,000-byte 文件及 SHA-256 后将自动继续 1,757,184,042-byte idx。
 - 最终遗留：4 卡 NCCL/BF16、160M forward/backward、单 token verbalizer、Pile idx 覆盖与官方 batch viewer 对比，以及最终 `READY` 标记。
+
+## 后续实施记录（14:30）
+
+### 元数据复核与最终依赖修正
+
+- 直接读取 `torch-2.12.1+cu126` 和 `cuda_toolkit-12.6.3` wheel 的 `METADATA`，逐项核对 Linux marker 与被选择的 extras。
+- 复核发现 `cuda-toolkit[cufile]` 在 Linux 上还要求 `nvidia-cufile-cu12==1.11.1.6`；Windows 主机上的跨平台 pip 解析没有应用这一条 `sys_platform == 'linux'` marker，因此 88 项集合仍少 1 项。
+- 已从 NVIDIA 官方索引下载固定版本 cuFile wheel：
+  - 文件：`nvidia_cufile_cu12-1.11.1.6-py3-none-manylinux2014_x86_64.manylinux_2_17_x86_64.whl`；
+  - 大小：1,142,103 bytes；
+  - SHA-256：`cc23469d1c7e52ce6c1d55253273d32c565dd22068647f3aa59b3c6b005bf159`；
+  - 最终精确锁文件：89 项。
+- 新增 `lab_finish_cufile.ps1` 和 `server_install_cufile.sh`：等待原 18-wheel 大归档传完后，只补传这个单独 wheel，生成覆盖全部 89 个 wheel 的 SHA-256 manifest，再清理重建 venv、离线安装并运行 `pip check`。
+- lab-pc 用户级计划任务 `CjlCuFile` 已启动并处于等待状态，避免与 `CjlLinuxRuntime` 的 2.7 GB SCP 争抢带宽。
+
+### 下载恢复情况
+
+- Pile 第一次签名 URL/SSH stdin 会话在 14:15 左右被连接重置；安全下载器没有混用对象或丢弃 `.part`。
+- `CjlPilePrefix` 已按设计进入第 2 次 URL 刷新并从现有字节续传，最近一次检查 shard0 为 9,466,368,000 bytes。
+- 这次恢复验证了 URL 刷新和断点续传路径确实在真实大文件下载中生效；日志没有记录完整签名 URL。
+
+### 安装后资产复验
+
+- 新增 `verify_asset_manifest.py`，用于对已经复制到最终大盘目录的模型、数据集和源码重新计算大小与 SHA-256，而不是只依赖解包暂存目录中的第一次校验。
+- 服务器复验通过：24 个文件、合计 1,662,669,829 bytes 全部匹配。
+- 复验报告已写入大盘 `manifests/asset-install-verification.json`，状态为 `ok`。
+- 对全部 CUDA/NCCL/Triton wheel 的 `Requires-Dist` 再次逐条审计后，确认 cuFile 是唯一遗漏的强制依赖；其余未下载条目均属于没有选择的 `all`、`build`、`test` 等 extras。
+
+### 当前阶段
+
+- Git 远端和服务器仓库均已快进到 `fd6b69c413da0b3d5607388601489e7748690de3`；该提交含上一阶段详细中文日志。
+- 18-wheel 增量归档正在传输，完成后预期首次安装会因尚未到达的 cuFile 报告缺包；随后 `CjlCuFile` 会自动补齐第 89 个 wheel 并完成最终安装。这是受控的两段式恢复，不需要重新传输 2.7 GB。
+- Pile 与 wheelhouse 仍并行传输；最终离线计算验收尚未开始。
+
+## 后续实施记录（15:17）
+
+### Python 环境与核心离线验收完成
+
+- 18 个 Linux runtime wheel 的 2,705,388,544-byte 增量归档已传完并与基础 70 个 wheel 合并。
+- cuFile 跟进归档为 1,156,096 bytes，补传后服务器最终 wheelhouse 为 89 个文件。
+- 最终 venv 位于大盘 `envs/parameter-importance`；`pip freeze` 包含 `nvidia-cufile-cu12==1.11.1.6`，`pip check` 返回 `No broken requirements found.`。
+- 完全清空代理、设置 Hugging Face/Transformers/Datasets 离线变量后，核心验收全部通过：
+  - PyTorch `2.12.1+cu126`，CUDA `12.6`，cuDNN `91002`；
+  - Transformers `4.57.6`，Datasets `4.8.5`；
+  - 4 卡 NCCL BF16 all-reduce：world size 4，求和结果 10.0；
+  - A100-SXM4-80GB 共 8 张，驱动 `575.57.08`，BF16 支持为真；
+  - Pythia 160M step0 BF16 forward/backward 有限，160M step512 和 14M step0 均能从本地 safetensors 加载；
+  - SST-2 行数为 train 67,349、validation 872、test 1,821；
+  - WikiText-103 raw 行数为 train 1,801,350、validation 3,760、test 4,358；
+  - verbalizer ` negative` 为单 token 4016，` positive` 为单 token 2762。
+- 已生成 `manifests/CORE_READY`、`core-pip-check.txt`、`nccl-smoke.txt`、`offline-smoke.json`、`offline-assets-output.txt` 和 `environment-core.txt`。
+
+### Pile 并发写入故障、数据恢复与下载器加固
+
+1. **故障现象**
+   - 第一次 SSH 控制会话在 14:15 断开后，服务器端旧 curl 成为孤儿并继续写 `.part`；lab-pc 随即刷新 URL，启动了第二个服务器 curl。
+   - 两个 curl 同时写同一 shard0 `.part`，因此并发开始后的文件尾部不能信任。
+2. **保守恢复**
+   - 明确终止了两组只属于 shard0 的 Bash/curl 进程，确认没有残留写入者。
+   - 14:00 的只读检查已确认文件至少显示为 7.8 GiB，早于 14:15 并发开始；选择更保守的十进制 8,000,000,000 bytes 作为安全点。
+   - 将 `.part` 从 10,216,787,968 bytes 截断至 8,000,000,000 bytes；丢弃不可信尾部，不尝试猜测或保留并发写入数据。
+3. **永久修复**
+   - 每个目标对象新增独立 `flock`，确保同一 `.part` 只有一个写入者；新进程会等待旧进程释放锁。
+   - curl 改为经 config stdin 接收 URL；进程 argv 仅显示 `--config -`，不再出现签名 URL。
+   - 公网 DNS 改为查询 `223.5.5.5`、`119.29.29.29`、`114.114.114.114` 三家，只采用至少被其中两家共同返回的 CDN 地址。
+   - lab-pc 的自动刷新上限从 12 次提高到 100 次，保留大小、SHA-256、HTTP 206、Content-Range 和对象元数据检查。
+4. **恢复验证**
+   - 新下载器从 8,000,000,000-byte 安全点恢复，观察到只有 1 个真实 curl；curl argv 不含 URL。
+   - 新下载器恢复后 shard0 已重新增长至 8.12 GB 以上；最终 SHA-256 未通过前不会原子改名。
+
+### 文档与当前遗留
+
+- `Agent/remote_access.md` 已补充单写锁、三家 DNS 任意两家交叉确认、URL 不进入进程参数，以及并发写入后的安全截断恢复规则，并同步到服务器仓库的忽略目录。
+- 当前只剩 Pile shard0、完整 idx、二者固定 SHA-256、前 `512 × 1024` 样本覆盖验证和官方 batch viewer step 0/1/511 对比。

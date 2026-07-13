@@ -29,7 +29,7 @@ foreach ($obj in $objects) {
   & ssh.exe -o BatchMode=yes sophgo13 "mkdir -p '$remote' && test -f '$dest'"
   if ($LASTEXITCODE -eq 0) { Write-Log "already complete: $($obj.Name)"; continue }
 
-  for ($attempt=1; $attempt -le 12; $attempt++) {
+  for ($attempt=1; $attempt -le 100; $attempt++) {
     Write-Log "start/refresh $($obj.Name), attempt $attempt"
     try {
       & $BrokerScript -ResolveUrl "$base/$($obj.Name)" -RemoteDestination $dest `
@@ -40,7 +40,7 @@ foreach ($obj in $objects) {
     }
     & ssh.exe -o BatchMode=yes sophgo13 "test -f '$dest'"
     if ($LASTEXITCODE -eq 0) { Write-Log "complete: $($obj.Name)"; break }
-    if ($attempt -eq 12) { throw "download did not finish after 12 URL refreshes: $($obj.Name)" }
+    if ($attempt -eq 100) { throw "download did not finish after 100 URL refreshes: $($obj.Name)" }
     Start-Sleep -Seconds 5
   }
 }

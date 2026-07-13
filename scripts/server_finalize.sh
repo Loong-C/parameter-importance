@@ -22,6 +22,9 @@ export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 HF_DATASETS_OFFLINE=1
 export NO_PROXY='*' no_proxy='*'
 unset HTTP_PROXY HTTPS_PROXY ALL_PROXY http_proxy https_proxy all_proxy HF_ENDPOINT HF_TOKEN
 
+"$PY" "$REPO/scripts/verify_asset_manifest.py" \
+  --root "$DATA_ROOT" --manifest "$DATA_ROOT/manifests/asset-sha256.tsv" \
+  --output "$DATA_ROOT/manifests/asset-install-verification.json"
 "$PY" "$REPO/scripts/verify_pile_prefix.py" \
   --idx "$IDX" --bin "$BIN" --samples $((512 * 1024)) --tokens-per-sample 2049 \
   --output "$DATA_ROOT/manifests/prefix_coverage.json"

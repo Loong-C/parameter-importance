@@ -9,7 +9,7 @@ $log = Join-Path $Root 'finish.log'
 function Log([string]$Message) { Add-Content -LiteralPath $log -Encoding UTF8 -Value "$(Get-Date -Format o) $Message" }
 
 $wheels = Get-ChildItem -File $wheelhouse
-if ($wheels.Count -ne 88) { throw "expected 88 wheels, found $($wheels.Count)" }
+if ($wheels.Count -ne 89) { throw "expected 89 wheels, found $($wheels.Count)" }
 Log 'hash wheelhouse'
 $wheels | Sort-Object Name | ForEach-Object {
   $h = Get-FileHash -Algorithm SHA256 -LiteralPath $_.FullName
