@@ -11,6 +11,7 @@ mkdir -p "$STAGE" "$DATA_ROOT/manifests" "$DATA_ROOT/envs"
 tar -xf "$ARCHIVE" -C "$STAGE"
 
 while IFS=$'\t' read -r expected size name; do
+  name=${name%$'\r'}
   file="$STAGE/wheelhouse/$name"
   [[ -f $file && $(stat -c '%s' "$file") == "$size" ]] || { echo "ERROR: wheel size mismatch: $name" >&2; exit 3; }
   actual=$(sha256sum "$file" | awk '{print $1}')

@@ -9,6 +9,7 @@ CORE = {
     "torch": "2.12.1+cu126",
     "transformers": "4.57.6",
     "datasets": "4.8.5",
+    "hf-xet": "1.5.1",
 }
 
 
@@ -26,7 +27,10 @@ def main() -> None:
     for name, expected in CORE.items():
         if pins.get(name) != expected:
             raise SystemExit(f"core pin mismatch for {name}: {pins.get(name)!r} != {expected!r}")
-    lines = ["--extra-index-url https://download.pytorch.org/whl/cu126"]
+    lines = [
+        "--extra-index-url https://download.pytorch.org/whl/cu126",
+        "--extra-index-url https://pypi.nvidia.com",
+    ]
     lines.extend(f"{name}=={version}" for name, version in sorted(pins.items()))
     args.output.write_text("\n".join(lines) + "\n", encoding="ascii")
     print(f"wrote {len(pins)} exact pins to {args.output}")

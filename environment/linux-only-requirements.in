@@ -1,0 +1,10 @@
+--extra-index-url https://download.pytorch.org/whl/cu126
+--extra-index-url https://pypi.nvidia.com
+cuda-toolkit[cublas,cudart,cufft,cufile,cupti,curand,cusolver,cusparse,nvjitlink,nvrtc,nvtx]==12.6.3
+cuda-bindings==12.9.7
+nvidia-cudnn-cu12==9.10.2.21
+nvidia-cusparselt-cu12==0.7.1
+nvidia-nccl-cu12==2.29.3
+nvidia-nvshmem-cu12==3.4.5
+triton==3.7.1
+hf-xet==1.5.1

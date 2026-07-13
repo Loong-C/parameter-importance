@@ -111,3 +111,41 @@
 - 等待两个 SCP 归档传输完成，并在服务器校验、解包和离线安装。
 - 等待 Pile shard0 与 idx 下载完成。
 - 资产和 venv 到齐后先做不依赖 Pile 的模型、数据和 NCCL smoke test；Pile 到齐后做最终 idx/batch viewer 验收。
+
+## 后续实施记录（14:01）
+
+### 新完成
+
+- Git 本机主分支的第一批准备脚本、环境声明、计划书和中文工作日志已形成提交 `96ec8bf80a6cf570828f40e2b143bd9def5fc1c5`，已推送至远端；同一提交已同步到服务器仓库。
+- 模型、数据集和源码资产归档已传入并安装到服务器大盘：
+  - 模型目录约 1.3 GiB；
+  - SST-2 目录约 3.2 MiB；
+  - WikiText-103 raw 目录约 301 MiB；
+  - Pythia 固定源码快照解包目录约 73 MiB；
+  - 资产清单位于大盘 `manifests/asset-manifest.json`。
+- 服务器基础 wheelhouse 已有 70 个 wheel、约 989 MiB，且每个文件均已由 SHA-256 manifest 校验。
+- 已补齐并锁定 Linux 专属 CUDA 运行时依赖；最终精确锁文件包含 88 个分发包。
+- lab-pc 的最终 wheelhouse 共 88 个 wheel、3,741,623,140 bytes；其中新增 Linux CUDA/NCCL/Triton wheel 18 个、2,705,361,251 bytes。
+- 已生成只含新增 18 个 wheel 的增量 tar（2,705,388,544 bytes），并注册用户级计划任务 `CjlLinuxRuntime` 后台传入服务器；不重复传输已有 70 个 wheel。
+- Pile shard0 最近一次检查约为 7.8 GiB，服务器直下仍持续增长。
+
+### 新发现与修复
+
+1. **跨平台 pip 解析遗漏 Linux 条件依赖**
+   - 现象：在 Windows 上以 `--platform` 解析出的首版报告没有包含 PyTorch 元数据中受 Linux marker 控制的依赖，服务器 `--no-index` 安装先后报告缺少 `hf-xet`、CUDA Toolkit 组件、cuDNN、NCCL、NVSHMEM 和 Triton。
+   - 处理：直接检查 PyTorch wheel 元数据，并使用 PyPI、PyTorch CUDA 12.6 官方索引和 NVIDIA 官方索引，覆盖 `manylinux_2_28`、`manylinux_2_27`、`manylinux_2_18`、`manylinux_2_17` 与 `manylinux2014` 标签解析下载。
+   - 结果：锁文件从 69 项扩充到 88 项，包含 `hf-xet==1.5.1` 及 18 个 Linux 运行时包；新增增量安装脚本会在服务器重新校验完整 88-wheel manifest 后才创建 venv。
+2. **SHA-256 manifest 的 CRLF 文件名尾部问题**
+   - 现象：lab-pc 生成的 TSV 使用 Windows 行尾，服务器 Bash 首次读取时把 `\r` 保留在 wheel 文件名末尾，造成假性的“文件不存在”。
+   - 处理：服务器安装脚本在每行读取后显式剥离文件名尾部 `\r`。
+   - 结果：70 个基础 wheel 的大小和 SHA-256 均通过验证。
+3. **避免重复传输完整 wheelhouse**
+   - 现象：完整最终 wheelhouse 已达约 3.74 GB，若重新传送会浪费已完成的约 1 GB SCP。
+   - 处理：新增 `lab_finish_linux_runtime.ps1` 与 `server_install_linux_runtime.sh`，只传 18 个新增 wheel，在服务器与原 70 个合并，并用覆盖全部 88 个文件的新 manifest 重新验真。
+
+### 当前阶段与遗留
+
+- 小型模型、SST-2、WikiText 与官方源码：已安装，等待 venv 完成后做完全离线读取与模型计算验收。
+- Python venv：新增 CUDA wheel 正在 SCP；传完后自动执行 `--no-index` 安装与 `pip check`。
+- Pile：shard0 后台直下进行中；完成 30,000,000,000-byte 文件及 SHA-256 后将自动继续 1,757,184,042-byte idx。
+- 最终遗留：4 卡 NCCL/BF16、160M forward/backward、单 token verbalizer、Pile idx 覆盖与官方 batch viewer 对比，以及最终 `READY` 标记。
