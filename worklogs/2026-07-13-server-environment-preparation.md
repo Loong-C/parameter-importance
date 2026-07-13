@@ -327,3 +327,9 @@
 
 - 本机与服务器仓库均已到提交 `0d8801e80c3bac2342b7fa101363bdfad44b0680`，且本机/服务器上一版中文日志及 `Agent/remote_access.md` 的 SHA-256 已核对一致。
 - GitHub HTTPS 读请求可成功，但本轮多次写请求分别遇到 connection reset、empty reply 和 443 connect timeout；远端 `main` 暂停在 `c6b3e5011c6cbf066499e928fd7770274e8cdc41`。最终日志提交会在链路恢复后继续推送，不把这一外部网络波动误记为环境验收失败。
+
+## 最终同步结果（20:26）
+
+- GitHub HTTPS 写通道恢复后，待推提交已成功把远端 `main` 从 `c6b3e5011c6cbf066499e928fd7770274e8cdc41` 推进到包含最终验收记录的 `3b15b7911069a32076a177ac2ef69f25ccd158e9`；此前的多次失败均未造成半提交或远端分叉。
+- 本节所在的最终日志提交继续直接推送 `main`，不创建额外分支或 PR；服务器仓库通过经过 `git bundle verify` 的 bundle 做 `--ff-only` 快进，不使用 `reset --hard`，不接触大盘数据和模型。
+- 收尾验收以本机 HEAD、服务器 HEAD、GitHub `refs/heads/main` 三者完全相同，以及本机/服务器中文日志 SHA-256 完全相同为完成标准；满足后停用每小时 `nlp` 心跳。
