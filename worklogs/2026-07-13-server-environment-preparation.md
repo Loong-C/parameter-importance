@@ -246,3 +246,24 @@
 - 以加固恢复后的约 1.6–1.7 MB/s 持续速度估计，shard0 还需约 3.1–3.4 小时。
 - idx 约 1.76 GB，预计再需约 18–25 分钟；大小/SHA-256、覆盖、batch viewer 与重复核心验收预计 20–40 分钟。
 - 正常情况下最终 `READY` 预计在 19:30–20:15（Asia/Shanghai）之间生成；若 URL/SSH 再次刷新，100 次重试与 supervisor 会自动恢复。
+
+## 后续实施记录（17:43）
+
+### 第二次 SSH 断开与 supervisor 修复
+
+- 原第 12 次控制会话在 17:14 再次发生 SSH connection reset，lab-pc 的 `CjlPilePrefix` 因旧脚本已到刷新上限而转为 `Ready`/退出码 1。
+- 服务器端旧 curl 没有退出，继续持有对象锁并安全下载；shard0 从上一轮 15,394,906,112 bytes 持续增长至 21,392,900,096 bytes，没有出现第二个 curl。
+- `CjlPileSupervisor` 没有及时重启控制任务，原因是它的完成状态 SSH 探测没有显式连接与保活超时，控制链路异常时可能长期卡住。
+- 已给 supervisor 的状态探测和 finalizer 调用增加：
+  - `ConnectTimeout=20`；
+  - `ServerAliveInterval=15`；
+  - `ServerAliveCountMax=2`。
+- 已重新启动采用 100 次刷新上限的 `CjlPilePrefix` 与修复后的 supervisor；两项任务均为 `Running`。
+
+### 单写锁复核
+
+- 进程树显示：
+  - 旧下载器一个父 Bash、一个执行 curl 命令替换的子 Bash，以及一个真实 curl；
+  - 新控制任务一个 Bash 和一个 `flock -w 3900` 进程，仅等待旧下载器释放对象锁。
+- 真实 curl 数始终为 1；新任务尚未进入 curl，不会写 `.part`。
+- 复核时 shard0 已增长至 22,895,489,024 bytes，`READY` 尚未生成，idx 尚未开始。
