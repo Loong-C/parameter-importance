@@ -267,3 +267,24 @@
   - 新控制任务一个 Bash 和一个 `flock -w 3900` 进程，仅等待旧下载器释放对象锁。
 - 真实 curl 数始终为 1；新任务尚未进入 curl，不会写 `.part`。
 - 复核时 shard0 已增长至 22,895,489,024 bytes，`READY` 尚未生成，idx 尚未开始。
+
+## 后续实施记录（19:53）
+
+### shard0 完成与 idx 接续
+
+- shard0 已完成固定的 30,000,000,000 bytes 下载，并通过上游 SHA-256 `1ce355bd2683627d0ff689f8578115cf3df84bd1edf3410e6aca9705d31fc6ea` 后原子改名为 `document-00000-of-00020.bin`；这也从最终结果上验证了从 8,000,000,000-byte 保守安全点恢复的内容完整性。
+- idx 初次接续时，三家公网 DNS 的短时响应没有形成任意两家交集，下载器按安全策略拒绝选用单一来源地址，没有写入错误对象。
+- 后续复测中 `223.5.5.5` 与 `114.114.114.114` 再次返回共同地址；不记录具体 CDN IP。idx 已在第 6 次 URL 刷新中恢复，复核时 `.part` 为 227,364,864 bytes。
+- 服务器复核显示恰有 1 个 idx curl 写进程，且对象锁由 1 个下载器持有；`CjlPilePrefix` 与 `CjlPileSupervisor` 均为 `Running`。
+
+### SSH 状态探针硬超时
+
+- 仅设置 `ConnectTimeout` 与 SSH keepalive 不能限制“连接已建立但远端命令不返回”的总时长；此前 Pile 控制脚本与 supervisor 都可能卡在 `test -f` 状态探针。
+- `lab_prepare_pile_prefix.ps1` 与 `lab_supervise_pile.ps1` 现使用独立 `ssh.exe` 进程执行只读状态探针，并设置 45 秒总等待上限；超时只终止该探针，不终止服务器上持锁的真实下载器。
+- `lab_hf_broker.ps1` 的长时下载 SSH 增加连接和保活参数，但不设置总时长上限，避免正常的大文件传输被误杀。
+- 修复后已实际观察到 DNS 暂无双源交集时，idx 尝试能从第 1 次继续推进到第 6 次，不再永久挂起；整个日志仍未包含签名 URL 或临时 CDN IP。
+
+### 当前阶段
+
+- 最小闭环的 Python 环境、模型、小数据集、源码快照与核心离线验收均已完成；Pile shard0 已完成。
+- 当前只剩 idx 下载及其固定哈希、前缀覆盖、官方 batch viewer 对比和最终重复离线验收；成功后由 supervisor 自动生成 `manifests/READY`。

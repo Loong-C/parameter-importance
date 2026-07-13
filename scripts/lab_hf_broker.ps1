@@ -13,7 +13,7 @@ if ($LASTEXITCODE -ne 0 -or -not $signed.StartsWith('https://')) {
 }
 
 # The signed URL is sent on stdin, never as a remote command argument.
-$signed | ssh.exe -o BatchMode=yes sophgo13 `
+$signed | ssh.exe -o BatchMode=yes -o ConnectTimeout=20 -o ServerAliveInterval=15 -o ServerAliveCountMax=2 sophgo13 `
   bash /home/sophgo13/cjl/parameter-importance/scripts/server_xet_download.sh `
   $RemoteDestination $ExpectedSize $ExpectedSha256.ToLowerInvariant()
 if ($LASTEXITCODE -ne 0) {

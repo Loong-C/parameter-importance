@@ -6,6 +6,31 @@ $ErrorActionPreference = 'Stop'
 $revision = '4647773ea142ab1ff5694602fa104bbf49088408'
 $base = "https://hf-mirror.com/datasets/EleutherAI/pile-deduped-pythia-preshuffled/resolve/$revision"
 $remote = '/home/sophgo13/cjl/storage/parameter-importance/datasets/pile-deduped-pythia-preshuffled'
+$sshOptions = @(
+  '-o', 'BatchMode=yes',
+  '-o', 'ConnectTimeout=20',
+  '-o', 'ServerAliveInterval=15',
+  '-o', 'ServerAliveCountMax=2'
+)
+
+function Test-RemoteState([string]$RemoteCommand, [int]$TimeoutSeconds = 45) {
+  $start = New-Object System.Diagnostics.ProcessStartInfo
+  $start.FileName = 'ssh.exe'
+  $start.Arguments = (($sshOptions + @('sophgo13', "`"$RemoteCommand`"")) -join ' ')
+  $start.UseShellExecute = $false
+  $start.CreateNoWindow = $true
+  $process = New-Object System.Diagnostics.Process
+  $process.StartInfo = $start
+  [void]$process.Start()
+  if (-not $process.WaitForExit($TimeoutSeconds * 1000)) {
+    try { $process.Kill() } catch {}
+    $process.Dispose()
+    return $false
+  }
+  $success = $process.ExitCode -eq 0
+  $process.Dispose()
+  return $success
+}
 
 $objects = @(
   @{
@@ -26,8 +51,10 @@ function Write-Log([string]$Message) {
 
 foreach ($obj in $objects) {
   $dest = "$remote/$($obj.Name)"
-  & ssh.exe -o BatchMode=yes sophgo13 "mkdir -p '$remote' && test -f '$dest'"
-  if ($LASTEXITCODE -eq 0) { Write-Log "already complete: $($obj.Name)"; continue }
+  if (Test-RemoteState "mkdir -p '$remote' && test -f '$dest'") {
+    Write-Log "already complete: $($obj.Name)"
+    continue
+  }
 
   for ($attempt=1; $attempt -le 100; $attempt++) {
     Write-Log "start/refresh $($obj.Name), attempt $attempt"
@@ -38,8 +65,7 @@ foreach ($obj in $objects) {
     } catch {
       Write-Log "segment ended: $($_.Exception.Message)"
     }
-    & ssh.exe -o BatchMode=yes sophgo13 "test -f '$dest'"
-    if ($LASTEXITCODE -eq 0) { Write-Log "complete: $($obj.Name)"; break }
+    if (Test-RemoteState "test -f '$dest'") { Write-Log "complete: $($obj.Name)"; break }
     if ($attempt -eq 100) { throw "download did not finish after 100 URL refreshes: $($obj.Name)" }
     Start-Sleep -Seconds 5
   }
