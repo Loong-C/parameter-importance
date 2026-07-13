@@ -288,3 +288,42 @@
 
 - 最小闭环的 Python 环境、模型、小数据集、源码快照与核心离线验收均已完成；Pile shard0 已完成。
 - 当前只剩 idx 下载及其固定哈希、前缀覆盖、官方 batch viewer 对比和最终重复离线验收；成功后由 supervisor 自动生成 `manifests/READY`。
+
+## 最终验收记录（20:18）
+
+### Pile 最小前缀完整到位
+
+- `document-00000-of-00020.bin`：30,000,000,000 bytes，SHA-256 `1ce355bd2683627d0ff689f8578115cf3df84bd1edf3410e6aca9705d31fc6ea`。
+- `document.idx`：1,757,184,042 bytes，SHA-256 `1d9fdd760295eb2007a4874440b27c559ca722239fa2814aa8a2ee6724b7852f`。
+- 两个对象都在固定大小和固定上游哈希通过后才从 `.part` 原子改名；服务器上已无 Pile 写进程。
+- `prefix_coverage.json` 解析结果：idx version 1、dtype code 8、每 token 2 bytes、146,432,000 个 sequence、1 个 document；最小闭环要求 524,288 个、每个 2,049-token 的样本，最大结束偏移为 2,148,532,224 bytes，小于 30,000,000,000-byte shard0，`covered=true`。
+
+### 官方 batch viewer 对比
+
+- 官方源码固定为 Pythia commit `a19eecb807ec2c79a39ebf18108816e6ffffc1d5`。
+- step 0：形状 `1024 × 2049`，独立 reader 与官方 reader 的 SHA-256 均为 `7b5299e7ed772054885b16d1d61778c5f437a5fb196aeffab5dba4577977c562`。
+- step 1：形状 `1024 × 2049`，两者 SHA-256 均为 `2f08a61f39b39d7fea82babb2908899434648ef0e293ba177f5e8e79a3aa6402`。
+- step 511：形状 `1024 × 2049`，两者 SHA-256 均为 `24718b83391af3c41c5c87802014b436c317f7fedf404d535ef0b5819630ebfb`。
+- 三个目标 step 均为 `equal=true`，`batch-viewer-comparison.json` 总状态为 `ok`。
+
+### 完全离线环境复验
+
+- finalizer 清空全部代理变量、设置 Hugging Face/Transformers/Datasets 离线变量后运行，没有触发网络下载。
+- 安装后资产 manifest 再次通过；24 个模型、数据和源码文件共 1,662,669,829 bytes 与清单一致。
+- `pip check`：`No broken requirements found.`。
+- 4 卡 NCCL/BF16：`NCCL_OK world_size=4 sum=10.0`。
+- `offline-smoke.json`：PyTorch `2.12.1+cu126`、CUDA `12.6`、BF16 支持为真；SST-2 行数 67,349/872/1,821，WikiText-103 raw 行数 1,801,350/3,760/4,358；` negative` 和 ` positive` 均为单 token，ID 分别是 4016 和 2762；总状态为 `ok`。
+- `environment.txt`：Python `3.12.3`、Transformers `4.57.6`、Datasets `4.8.5`、cuDNN `91002`；8 张 `NVIDIA A100-SXM4-80GB`，每张 81,920 MiB，驱动 `575.57.08`。
+
+### READY、竞态保护与阶段结论
+
+- 最终 `manifests/READY` 于 `2026-07-13T12:17:39+00:00`（北京时间 20:17:39）生成；`prefix_coverage.json`、`batch-viewer-comparison.json`、`offline-smoke.json`、`environment.txt` 均已保存在服务器大盘 manifests 目录。
+- idx 完成后，lab→server 的短状态探针仍有一次 45 秒超时，supervisor 因而重复启动了只做“对象已完成”检查的 prefix 任务。随后自动 finalizer 与本机兜底启动恰好重合；服务器 `finalize.lock` 只允许第一实例执行，第二实例以“already running”退出，没有并发验收或报告覆盖。
+- `READY`、全部报告、空闲的验收锁和归零的 finalizer 进程共同确认第一实例正常完成；单行“already running”只是第二实例被正确拒绝，不是验收失败。
+- **环境准备阶段已完成**：后续可以直接在服务器仓库编写代码并开始最小闭环实验，不需要再下载计划范围内的 Python 包、Pythia 160M step0/step512、14M step0、SST-2、WikiText-103、Pythia 源码或 Pile shard0+idx。
+- 尚未纳入本轮范围的资产仍是其余约 570 GB Pile 分片、410M、MNLI 和 RTE；只有实验游标越过已验证前缀或研究范围明确扩展时才需要另行准备。
+
+### Git 同步待收尾
+
+- 本机与服务器仓库均已到提交 `0d8801e80c3bac2342b7fa101363bdfad44b0680`，且本机/服务器上一版中文日志及 `Agent/remote_access.md` 的 SHA-256 已核对一致。
+- GitHub HTTPS 读请求可成功，但本轮多次写请求分别遇到 connection reset、empty reply 和 443 connect timeout；远端 `main` 暂停在 `c6b3e5011c6cbf066499e928fd7770274e8cdc41`。最终日志提交会在链路恢复后继续推送，不把这一外部网络波动误记为环境验收失败。
