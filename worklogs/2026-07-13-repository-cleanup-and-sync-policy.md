@@ -42,5 +42,6 @@
 - 已确认本机物理 `scripts/` 目录不存在，Git 中恰有 22 个待提交删除的原脚本文件，忽略的 `__pycache__` 也已清理。
 - 已扫描计划书、文档、环境声明、新规范和 `worklogs/README.md`，指向 22 个已删除文件名的现行引用为 0；计划书推荐目录树已用 `Agents/` 与 `worklogs/` 替换旧 `scripts/` 项。
 - `git diff --check` 通过；新增规范链接存在；签名参数、令牌参数和私钥头敏感模式扫描通过。
-- 待执行：提交并推送 GitHub `main`，再以验证过的 bundle 对服务器做 `--ff-only` 快进。
-- 待执行：比较本机、GitHub、服务器 HEAD，以及本机/服务器本日志 SHA-256。
+- 清理与规范提交 `60279ea1f32ebc123f2f64f568785c795a1cb4fc` 已推送 GitHub `main`；系统 DNS 路径多次出现 443 connect timeout，最终只在两个公共 DNS 共同返回且 5 秒 TCP 探测可达的地址中选择本次命令级绑定，未修改系统 DNS、`hosts` 或记录具体 IP。
+- 服务器仓库在确认工作树干净后，通过 `git bundle verify` 通过的 bundle 执行 `git merge --ff-only FETCH_HEAD`，快进到同一提交；服务器已确认 `scripts/` 不存在、`Agents/工作日志与多端同步规范.md` 存在，临时 bundle 已按确切路径清理。
+- 被 Git 忽略的 `Agent/remote_access.md` 已单独复制到服务器；本节所在的最终日志提交将再次推送并以相同 bundle 流程快进，随后比较本机、GitHub、服务器 HEAD 及本机/服务器日志 SHA-256。
