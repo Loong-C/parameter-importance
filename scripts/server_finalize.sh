@@ -7,6 +7,9 @@ PY="$DATA_ROOT/envs/parameter-importance/bin/python"
 PILE="$DATA_ROOT/datasets/pile-deduped-pythia-preshuffled"
 BIN="$PILE/document-00000-of-00020.bin"
 IDX="$PILE/document.idx"
+mkdir -p "$DATA_ROOT/manifests"
+exec 8>"$DATA_ROOT/manifests/finalize.lock"
+flock -n 8 || { echo "ERROR: final offline validation is already running" >&2; exit 8; }
 
 [[ -x $PY ]] || { echo "ERROR: venv is not ready" >&2; exit 2; }
 [[ -f $BIN && -f $IDX ]] || { echo "ERROR: Pile prefix is not ready" >&2; exit 2; }
