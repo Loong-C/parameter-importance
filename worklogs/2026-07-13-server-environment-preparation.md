@@ -223,3 +223,26 @@
 
 - `Agent/remote_access.md` 已补充单写锁、三家 DNS 任意两家交叉确认、URL 不进入进程参数，以及并发写入后的安全截断恢复规则，并同步到服务器仓库的忽略目录。
 - 当前只剩 Pile shard0、完整 idx、二者固定 SHA-256、前 `512 × 1024` 样本覆盖验证和官方 batch viewer step 0/1/511 对比。
+
+## 后续实施记录（15:46）
+
+### 无人值守收尾链路
+
+- 新增 lab-pc 用户级计划任务 `CjlPileSupervisor`，最长运行 18 小时：
+  - 每分钟确认 shard0 与 idx 是否最终就位；
+  - 若 `CjlPilePrefix` 意外退出且文件未齐，则安全重启任务；
+  - 服务器对象级 `flock` 继续保证只有一个写入者。
+- supervisor 在 shard0 和 idx 都完成固定大小/SHA-256 校验并原子改名后，会自动调用 `server_finalize.sh`。
+- `server_finalize.sh` 新增单实例验收锁，并会自动完成：安装后资产复验、idx 覆盖、官方 batch viewer step 0/1/511 对比、`pip check`、4 卡 NCCL/BF16、模型和数据集离线验收，以及最终 `manifests/READY`。
+- 当前任务已增加每小时心跳 `NLP环境准备最终验收`：在下载期间检查字节增长与单写状态；`READY` 生成后回到本任务读取报告、追加最终中文日志、提交 Git，并确认本机/服务器/Git 远端三处日志一致后停用自身。
+- 自动 finalizer 与心跳配置时：
+  - shard0 `.part` 为 11,086,516,224 bytes；
+  - idx 尚未开始；
+  - 服务器真实 curl 数为 1；
+  - 服务器与 Git 远端代码提交均为 `3c011b24566dc2ecdda1c92fe3d9266c8738c4ce`。
+
+### 剩余时间估计
+
+- 以加固恢复后的约 1.6–1.7 MB/s 持续速度估计，shard0 还需约 3.1–3.4 小时。
+- idx 约 1.76 GB，预计再需约 18–25 分钟；大小/SHA-256、覆盖、batch viewer 与重复核心验收预计 20–40 分钟。
+- 正常情况下最终 `READY` 预计在 19:30–20:15（Asia/Shanghai）之间生成；若 URL/SSH 再次刷新，100 次重试与 supervisor 会自动恢复。
