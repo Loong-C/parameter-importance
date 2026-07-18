@@ -19,4 +19,4 @@
 
 模型、数据集、wheel、checkpoint 和大型运行产物只在大盘中保存；日志只记录固定 revision、大小、哈希、路径和验证结论，不提交大型二进制文件。
 
-完整的提交、GitHub 推送、sophgo13 Git bundle 快进和三端一致性检查流程见 [`Agents/工作日志与多端同步规范.md`](../Agents/工作日志与多端同步规范.md)。
+完整的本地运维规范位于被 Git 忽略的 `Agent/` 目录：`git.md`、`sync.md` 和 `worklogs.md`。该目录由本机与服务器逐文件同步并核对 SHA-256；GitHub 中的本文件保留不含连接细节的日志基本要求。

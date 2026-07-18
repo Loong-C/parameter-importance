@@ -1,0 +1,74 @@
+# 2026-07-18 回到 main 并重整 Agent 文档
+
+- 任务范围：将本机和 sophgo13 仓库安全切回 `main`；把 `Agent/` 运维说明拆分为五个职责单一的文件；建立新的 Git、同步和日志规则。
+- 当前状态：进行中
+- 工作分支：`main`
+
+## 2026-07-18 10:16 CST — 状态核对与文档重整
+
+### 目标与范围
+
+- 保留已有实验分支和提交，只切换工作分支，不删除实验数据和历史。
+- 根据现有 SSH 配置、lab-pc 隧道脚本和服务器真实目录整理说明。
+- 不修改 SSH 别名、隧道脚本、端口、密钥、服务器数据集或实验结果。
+
+### 实际修改
+
+- 本机和服务器从 `feat/nlp-pythia-stage-ab` 切换到 `main`。
+- 将旧的 `Agent/remote_access.md` 和综合同步说明重整为 `remote_access.md`、`server.md`、`git.md`、`sync.md`、`worklogs.md`。
+- 更新 `worklogs/README.md`，移除对旧综合说明的引用。
+- 用户原有修改：切换前两端工作树均干净，本阶段没有需要合并的未提交用户修改。
+
+### 实验与验证
+
+| 项目 | 命令/配置 | 结果 | 证据路径 |
+|---|---|---|---|
+| 本机分支核对 | `git status --short --branch`、`git rev-parse HEAD` | 已切换 `main`；切换前工作树干净 | 本日志 |
+| lab-pc 连接和隧道入口核对 | `ssh lab-pc`，只读查看桌面 `start.cmd` | lab-pc 可达；确认脚本自动重试且同时维持两条反向转发 | `Agent/remote_access.md` |
+| 服务器连接和分支核对 | `ssh sophgo13-via-lab` | 服务器可达并已切换 `main` | 本日志 |
+| 数据目录核对 | 只读列出 `$DATA_ROOT/datasets` | 确认 Pile、GLUE SST-2、WikiText-103 目录 | `Agent/server.md` |
+
+### 产物与证据
+
+| 路径 | 类型 | 大小 | SHA-256/revision | 验收状态 |
+|---|---|---:|---|---|
+| `Agent/git.md` | 本机/服务器运维文档 | 3294 bytes | `183f4ba702d22a3a97a459d4873aed62377d51b666d2515990a2f408ecd856ca` | 两端一致 |
+| `Agent/remote_access.md` | 本机/服务器运维文档 | 2888 bytes | `795c677e717827492a30342e5b91a4b5959f0df22c72354f14a506ecb023f7a1` | 两端一致 |
+| `Agent/server.md` | 本机/服务器运维文档 | 3099 bytes | `9f2d4370ac64990cd29d33ef13de5c20cca65efb4655e928118ae4f3ca012c68` | 两端一致 |
+| `Agent/sync.md` | 本机/服务器运维文档 | 4559 bytes | `1bf84f8379018b918eb1680c49dacb7d6d75d764c306782f5170212ceb190015` | 两端一致 |
+| `Agent/worklogs.md` | 本机/服务器运维文档 | 3223 bytes | `ca6e9c9f663d55db7dc6a48dd3b61c78903c347a2451eb72ca4dfc68eaa5b43b` | 两端一致 |
+| `worklogs/2026-07-18-reset-main-and-reorganize-agent-docs.md` | 工作日志 | 小型文本 | 随 Git 提交 | 进行中 |
+
+### 问题、原因与风险
+
+- 本机 Git 在沙箱账户下触发仓库所有者保护；所有本机 Git 命令使用单次 `safe.directory` 参数，没有修改用户全局配置。
+- `Agent/` 被 Git 忽略，五个文件必须按 `Agent/sync.md` 通过 SCP 单独同步并逐文件核对哈希。
+- 旧实验分支保留，未合并到 `main`；本任务只改变当前工作分支。
+
+### Git 与多端同步
+
+- 本机分支/HEAD：`main` / `4c91ff6356724d014da9667d2e93d6aac2f23fb8`（提交前）。
+- GitHub `main`：`4c91ff6356724d014da9667d2e93d6aac2f23fb8`（提交前）。
+- 服务器分支/HEAD：`main` / `4c91ff6356724d014da9667d2e93d6aac2f23fb8`（提交前）。
+- `Agent/*.md` 哈希核对：五个文件的文件集合、大小和 SHA-256 已确认一致。
+- 工作树状态和临时 bundle 清理：待完成。
+
+### 下一步
+
+- 检查文档链接、敏感信息和 Git 差异。
+- 同步五个 `Agent/` 文件并核对 SHA-256。
+- 阶段性提交、推送 GitHub，并用 Git bundle 将服务器快进到同一提交。
+
+## 2026-07-18 10:18 CST — Agent 文档同步验收
+
+### 实际完成
+
+- 通过既有 `sophgo13-via-lab` 链路把五个文件逐个复制到服务器仓库的 `Agent/`。
+- 两端 `Agent/` 均只包含规定的五个 Markdown 文件。
+- 本机和服务器逐文件 SHA-256 与上表完全一致。
+- 敏感模式扫描未发现私钥正文、密码/令牌赋值或带 query 的 URL；`git diff --check` 通过。
+
+### 当前状态与下一步
+
+- 文档重整和非 Git 同步阶段已完成。
+- 下一步提交并推送 Git 跟踪的旧规范删除、日志入口更新和本日志，再以 Git bundle 快进服务器。
