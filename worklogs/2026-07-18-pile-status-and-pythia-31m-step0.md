@@ -1,7 +1,7 @@
 # 2026-07-18 Pile 状态与 Pythia-31M step0 资产准备
 
 - 任务范围：确认全量 Pile 下载是否仍在运行；若未运行则恢复；在服务器大盘 `models/` 中准备 Pythia-31M 的初始权重。
-- 当前状态：模型与 Pile 状态验收完成，Git 三端同步待完成
+- 当前状态：完成
 - 工作分支：`main`
 
 ## 2026-07-18 14:06 CST — Pile 状态核对
@@ -47,9 +47,15 @@ Pile 下载监督链仍在运行，但 shard 5 的字节进度暂时受外部 DN
 - lab-pc 临时模型任务最终退出码为 0，日志记录完成时间为 14:37:37 CST；随后精确注销该任务并删除临时 `model-assets/`，工具根目录重新只保留 `pile-full/`。
 - 清理后 `CjlPileFull` 与 `CjlPileFullSupervisor` 仍为 `Running`；Pile 日志持续更新至 14:35 之后，shard 5 `.part` 仍为 `12,518,366,905` bytes。
 - 本次用户对 `docs/` 与 `plan/` 的现有修改按协作规则一并纳入阶段提交，不回滚、不拆分规避。
-- 本机、GitHub 与服务器最终 HEAD、工作树状态和临时传输项清理：待完成。
+- 阶段提交 `a13e2e72ce56b161c9308237297445a52abfde94` 已推送 GitHub，并通过增量 bundle 将服务器 `main` 从 `df46580` 快进到同一提交；服务器和本机临时 bundle 均已精确清理。
+
+## 2026-07-18 14:46 CST — 阶段提交与三端同步
+
+- 按协作规则将用户已有修改一并提交：删除旧 PDF 与旧 U-statistic 报告，新增 `docs/mathematics.md`，更新 `plan/general_plan.md`；未回滚、未避开或拆分用户修改。
+- 暂存差异通过 `git diff --cached --check`；新增文档与工作日志的敏感模式扫描无命中。
+- GitHub `main`、本机 `main` 和服务器 `main` 已在阶段提交 `a13e2e7` 对齐，服务器工作树干净。
+- 本条收尾日志将通过紧随其后的文档提交和相同的 bundle 快进流程同步，不改变服务器模型、Pile 任务或 Agent 运维文档。
 
 ## 尚未解决的问题与下一步
 
-- 提交并推送本日志和用户已有修改，再以增量 bundle 快进服务器。
 - Pile 当前外部 DNS/Xet 阻塞仍未解决；监督器将持续自动重试。
