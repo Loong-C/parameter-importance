@@ -1,0 +1,86 @@
+{
+  "best_validation_reference": {
+    "evaluated_metrics": {
+      "accuracy": 0.7970183486238532,
+      "ece": 0.021528163229613817,
+      "examples": 872.0,
+      "nll": 0.4193590349013652
+    },
+    "importance_path": "/home/sophgo13/cjl/storage/parameter-importance/runs/stage-b-sst2-direct-controlled-seed1234/best-validation/step-000600/importance.safetensors",
+    "importance_sha256": "dbed310a5c4cfafb1ef598b631c3b9f218b8ee7304fd582c09ef52a5808b5550",
+    "model_path": "/home/sophgo13/cjl/storage/parameter-importance/runs/stage-b-sst2-direct-controlled-seed1234/best-validation/step-000600/model.safetensors",
+    "model_sha256": "926d7efb9ee89775d00cd95514ed674ab13a63ecf7c41b8d2336f0137c0ee48a",
+    "selection_metrics": {
+      "accuracy": 0.7970183486238532,
+      "ece": 0.021528163229613817,
+      "examples": 872.0,
+      "nll": 0.4193590349013652,
+      "step": 600
+    },
+    "used_for_pruning": false
+  },
+  "checkpoint_identity": {
+    "config_fingerprint": "8a867bd9ba1b12f3c9bccf26fd6cab5445f4d00220a3bebb1c6b86432120eab6",
+    "experiment_id": "stage-b-sst2-direct-controlled-seed1234",
+    "model_family": "pythia",
+    "model_size": "160m",
+    "route": "direct_supervised",
+    "stage": "B",
+    "world_size": 4
+  },
+  "checkpoint_manifest": {
+    "path": "/home/sophgo13/cjl/storage/parameter-importance/runs/stage-b-sst2-direct-controlled-seed1234/checkpoints/step-003156/manifest.json",
+    "sha256": "6bee820763037dfc3f14be294eac9ff3b1f4e30dfe4d2a388f969c9d3f305bce"
+  },
+  "dataset_manifest": {
+    "path": "/home/sophgo13/cjl/storage/parameter-importance/manifests/asset-manifest.json",
+    "revision": "bcdcba79d07bc864c1c254ccfcedcce55bcc9a8c",
+    "sha256": "e0e5dccda783fd44368e2ab1c86c71c86c31a716ef57a3dc45908208c998f849",
+    "split": "validation"
+  },
+  "device": "cuda",
+  "double_steps": 3156,
+  "eligible": {
+    "definition": "attention projections, MLP weights, and LM head; excludes embeddings, norms, biases",
+    "identity_sha256": "5c62904952f5d660c8af98e2cf740c60361d5b35e903baa1540c4c0066694fe1",
+    "scalar_count": 123568128,
+    "tensor_count": 49
+  },
+  "experiment_id": "stage-b-sst2-direct-pruning-seed1234",
+  "final_checkpoint": "/home/sophgo13/cjl/storage/parameter-importance/runs/stage-b-sst2-direct-controlled-seed1234/checkpoints/step-003156",
+  "final_model": {
+    "path": "/home/sophgo13/cjl/storage/parameter-importance/runs/stage-b-sst2-direct-controlled-seed1234/checkpoints/step-003156/model.safetensors",
+    "sha256": "e7c1e6f11c863f10e10d6553aab4a5a5d4abe2a6e759923ddf0e0c0e04b934ae"
+  },
+  "importance": {
+    "path": "/home/sophgo13/cjl/storage/parameter-importance/runs/stage-b-sst2-direct-controlled-seed1234/checkpoints/step-003156/importance.safetensors",
+    "sha256": "a9bdd6487b4f9a20614ec1e561b1335c083575b82537d111dec36cba14f228f1"
+  },
+  "importance_step": 3156,
+  "model_step": 3156,
+  "provenance_id": "6319b9372640ef20a7f13ef079a7d08a3da4f87669aa8d874643b7e35c072cf6",
+  "pruning_config": {
+    "path": "/home/sophgo13/cjl/parameter-importance/configs/eval/stage_b_sst2_direct_pruning_seed1234.yaml",
+    "sha256": "545ec4c5c592b48295462a76f56652a828e4ae5b87beabd7c2ae82e02c389185"
+  },
+  "source_experiment_id": "stage-b-sst2-direct-controlled-seed1234",
+  "source_run_dir": "/home/sophgo13/cjl/storage/parameter-importance/runs/stage-b-sst2-direct-controlled-seed1234",
+  "tokenizer": {
+    "files": {
+      "special_tokens_map.json": {
+        "sha256": "6f50ab5a5a509a1c309d6171f339b196a900dc9c99ad0408ff23bb615fdae7ad",
+        "size": 99
+      },
+      "tokenizer.json": {
+        "sha256": "c24618a1b3e6a38167beff1c72cffd126c3a66254347304b50547d12c5f25624",
+        "size": 2113710
+      },
+      "tokenizer_config.json": {
+        "sha256": "600feab17b84296ecc5255c745bba867303b5117207ff4420515932b2f8ead80",
+        "size": 396
+      }
+    },
+    "path": "/home/sophgo13/cjl/storage/parameter-importance/models/pythia-160m-deduped-step0"
+  },
+  "torch": "2.12.1+cu126"
+}

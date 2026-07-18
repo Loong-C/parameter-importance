@@ -1,0 +1,10 @@
+{
+  "curves_json_sha256": "a8d2225ebc81262a0e4d1eea77d685c2bd4d62e90d5923be58b645b9afb44255",
+  "experiment_id": "stage-b-sst2-pretrained-pruning-seed1337",
+  "provenance_id": "12c8c8a250fa11403f0d8310dc8383da77dd5dd3dabcadd3d9cb8ef95bf1dbca",
+  "provenance_json_sha256": "496dc952245268a2b8f6a1337fe2226d3660a43a612af28e8e0b3864d309b35a",
+  "rank_json_sha256": "84cfa0153894e40c17e109d655b8f6ed920211bcf0dcce13c84b20804640504b",
+  "record_count": 594,
+  "results_csv_sha256": "71f929c55cec30866bb7b1a8bc999f1344d4bcd6ce2e43319254cc0b1257c017",
+  "results_json_sha256": "250a06bbe0aba09b90a514875c89c93f8a928635b0b6fd0df2df6dc1d4facf9b"
+}

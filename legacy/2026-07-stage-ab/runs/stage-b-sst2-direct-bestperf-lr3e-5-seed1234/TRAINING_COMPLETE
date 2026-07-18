@@ -1,0 +1,12 @@
+{
+  "best_validation_loss": 0.4264441291126636,
+  "best_validation_step": 1700,
+  "experiment_id": "stage-b-sst2-direct-bestperf-lr3e-5-seed1234",
+  "generalization_gaps": {
+    "accuracy_train_minus_validation": 0.09318838431770093,
+    "ece_validation_minus_train": 0.05030066245986149,
+    "nll_validation_minus_train": 0.20592696679881303
+  },
+  "step": 3156,
+  "train_evaluation": "train-evaluation.json"
+}

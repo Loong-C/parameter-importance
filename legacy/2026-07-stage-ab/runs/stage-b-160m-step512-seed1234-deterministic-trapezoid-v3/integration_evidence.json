@@ -1,0 +1,52 @@
+{
+  "gate_passed": true,
+  "gate_rule": "trapezoid",
+  "gates": {
+    "layer_spearman": {
+      "minimum_observed": 0.9666666666666667,
+      "passed": true,
+      "threshold_min": 0.9
+    },
+    "parameter_spearman": {
+      "metric": "spearman_on_nonzero_reference_parameters",
+      "minimum_observed": 0.9832221595923689,
+      "passed": true,
+      "threshold_min": 0.7
+    },
+    "parameter_topk_overlap": {
+      "minimum_observed": 0.9738934240943096,
+      "passed": true,
+      "threshold_min": 0.6
+    }
+  },
+  "integration_contract": "two-node-trapezoid-next-independent-endpoint-v1",
+  "method_change_evidence": {
+    "predecessor_gate_passed": false,
+    "predecessor_gate_rule": "left",
+    "predecessor_gates": {
+      "layer_spearman": {
+        "minimum_observed": 0.5666666666666667,
+        "passed": false,
+        "threshold_min": 0.9
+      },
+      "parameter_spearman": {
+        "metric": "spearman_on_nonzero_reference_parameters",
+        "minimum_observed": 0.710489556047611,
+        "passed": true,
+        "threshold_min": 0.7
+      },
+      "parameter_topk_overlap": {
+        "minimum_observed": 0.8640078136329128,
+        "passed": true,
+        "threshold_min": 0.6
+      }
+    },
+    "root": "/home/sophgo13/cjl/storage/parameter-importance/results/numerical_integration",
+    "summary_path": "/home/sophgo13/cjl/storage/parameter-importance/results/numerical_integration/summary.json",
+    "summary_sha256": "dffafefe81be41249fc7ff2191bbd2d75b497c8b4b8d66f59b1665cb383cbb4e"
+  },
+  "method_variant": "low_frequency_trapezoid_v2",
+  "state_count": 20,
+  "summary_path": "/home/sophgo13/cjl/storage/parameter-importance/results/numerical_integration_trapezoid_v2/summary.json",
+  "summary_sha256": "4b4d8c9b5b4fa0b2041527e9f00852ffdfcac84c547217a154694b7b6ff90d5c"
+}

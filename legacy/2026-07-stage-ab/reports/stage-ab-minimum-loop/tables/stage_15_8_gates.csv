@@ -1,0 +1,8 @@
+gate,criterion,status,evidence
+1,预训练质量门槛通过,passed,public_comparison.json
+2,SST-2 两条路线均高于多数类基线,passed,"route means={'direct': 0.8100152905198778, 'pretrained': 0.8176605504587157}; route minima={'direct': 0.7970183486238532, 'pretrained': 0.8165137614678899}; majority=0.5091743119266054"
+3,高 U-stat positive 参数剪枝损害大于低重要性剪枝,passed,64 curve groups
+4,U-stat 区分度不低于 raw,passed,"absolute gap AUC={'double': 0.07592371610344305, 'magnitude': 0.02878434379623394, 'movement': 0.055857685275733274, 'raw': 0.07168578218950802, 'u_statistic': 0.07258145570523883}"
+5,U-stat 与 double sampling 排序相关和剪枝效果相近或更好,failed,positive pairwise rank rows=18; pruning_similar=False
+6,signed 与 positive-only 至少一套产生稳定功能排序,passed,positive curve-gap score types=['signed']
+7,中断恢复和多 GPU 结果可复现,passed,explicit evidence booleans

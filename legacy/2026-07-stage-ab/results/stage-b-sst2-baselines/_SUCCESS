@@ -1,0 +1,13 @@
+{
+  "baseline_names": [
+    "majority_class",
+    "published_pythia_160m_deduped_step0",
+    "published_pythia_160m_deduped_step512",
+    "uniform_random_expected"
+  ],
+  "experiment_id": "stage-b-sst2-baselines",
+  "provenance_id": "e6b1f60e1b908685e8e01cee96cec30148ffa0b688106357a320639f0401a73a",
+  "provenance_json_sha256": "85de03c0f868a22494a7a3b32d2f230e23bb39c6f8dab83d850375d61d446cd4",
+  "results_json_sha256": "2ffe7ee1f79cb69687f60689298df84344cac20cee09b242751dbc053b84b2c8",
+  "schema_version": "stage-b-sst2-baselines-v1"
+}

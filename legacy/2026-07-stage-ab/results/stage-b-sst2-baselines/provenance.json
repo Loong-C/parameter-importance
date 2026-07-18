@@ -1,0 +1,67 @@
+{
+  "config": {
+    "path": "/home/sophgo13/cjl/parameter-importance/configs/eval/stage_b_sst2_baselines.yaml",
+    "sha256": "2e142be70f8c1e42274d6b7929ea54ebd59eb61fd5b11c96de5a1f41ac833d02"
+  },
+  "dataset": {
+    "asset_manifest": {
+      "path": "/home/sophgo13/cjl/storage/parameter-importance/manifests/asset-manifest.json",
+      "sha256": "e0e5dccda783fd44368e2ab1c86c71c86c31a716ef57a3dc45908208c998f849"
+    },
+    "examples": 872,
+    "filename": "validation-00000-of-00001.parquet",
+    "repository": "nyu-mll/glue",
+    "revision": "bcdcba79d07bc864c1c254ccfcedcce55bcc9a8c",
+    "sha256": "a1371f3b3a7b0bcefa8388799a9359dc3ce76c349cc0079507a7991364fd2a9b",
+    "size": 72819,
+    "split": "validation"
+  },
+  "device": "cuda",
+  "experiment_id": "stage-b-sst2-baselines",
+  "offline": true,
+  "prompt": {
+    "max_length": 128,
+    "negative_token": " A",
+    "positive_token": " B",
+    "template_sha256": "2ac3aeffb962699a45353498547e5a94e9f8095cd9bf8d93dba88d8a7bdfd52e"
+  },
+  "provenance_id": "e6b1f60e1b908685e8e01cee96cec30148ffa0b688106357a320639f0401a73a",
+  "published_identities": {
+    "step0": {
+      "config_sha256": "76eb275107220e450d31258f792a2efcbee109d8b62ae0088260057dec06362f",
+      "config_size": 569,
+      "repository": "EleutherAI/pythia-160m-deduped",
+      "revision": "0450b9dc64e8a49a87c9eec8813d0e6979643420",
+      "weights_sha256": "87c169cd152db340535d6f330af0e2eed7578484ef2d23dd44ca90cbcc215ba7",
+      "weights_size": 649308728
+    },
+    "step512": {
+      "config_sha256": "76eb275107220e450d31258f792a2efcbee109d8b62ae0088260057dec06362f",
+      "config_size": 569,
+      "repository": "EleutherAI/pythia-160m-deduped",
+      "revision": "eaa6383edf563bf355d8b125777f352c2a773bfa",
+      "weights_sha256": "a7793f09ecdd85970740b691a78dc67d2489d8866d8bba6fd95e01e3b69a5999",
+      "weights_size": 649308728
+    }
+  },
+  "tokenizer": {
+    "files": {
+      "special_tokens_map.json": {
+        "sha256": "6f50ab5a5a509a1c309d6171f339b196a900dc9c99ad0408ff23bb615fdae7ad",
+        "size": 99
+      },
+      "tokenizer.json": {
+        "sha256": "c24618a1b3e6a38167beff1c72cffd126c3a66254347304b50547d12c5f25624",
+        "size": 2113710
+      },
+      "tokenizer_config.json": {
+        "sha256": "600feab17b84296ecc5255c745bba867303b5117207ff4420515932b2f8ead80",
+        "size": 396
+      }
+    },
+    "path": "/home/sophgo13/cjl/storage/parameter-importance/models/pythia-160m-deduped-step0",
+    "repository": "EleutherAI/pythia-160m-deduped",
+    "revision": "0450b9dc64e8a49a87c9eec8813d0e6979643420"
+  },
+  "torch": "2.12.1+cu126"
+}

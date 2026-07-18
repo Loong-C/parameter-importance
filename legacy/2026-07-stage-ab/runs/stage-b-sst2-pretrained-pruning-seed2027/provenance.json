@@ -1,0 +1,86 @@
+{
+  "best_validation_reference": {
+    "evaluated_metrics": {
+      "accuracy": 0.8165137614678899,
+      "ece": 0.033477920154865615,
+      "examples": 872.0,
+      "nll": 0.40812242605270593
+    },
+    "importance_path": "/home/sophgo13/cjl/storage/parameter-importance/runs/stage-b-sst2-pretrained-controlled-seed2027/best-validation/step-001200/importance.safetensors",
+    "importance_sha256": "7ed8a642a64fc9cb6d5656650eb70859797188f163165d3dbf42d1a4fe49601c",
+    "model_path": "/home/sophgo13/cjl/storage/parameter-importance/runs/stage-b-sst2-pretrained-controlled-seed2027/best-validation/step-001200/model.safetensors",
+    "model_sha256": "f0c1191d343c12ff842e471b4171c3385a76a26e4a47f2b500e3d19ed2fa8b91",
+    "selection_metrics": {
+      "accuracy": 0.8165137614678899,
+      "ece": 0.033477920154865615,
+      "examples": 872.0,
+      "nll": 0.40812242605270593,
+      "step": 1200
+    },
+    "used_for_pruning": false
+  },
+  "checkpoint_identity": {
+    "config_fingerprint": "9a956ac5334fe7fb6b83486e36154d035bec9b361492a581b01267318e799a9d",
+    "experiment_id": "stage-b-sst2-pretrained-controlled-seed2027",
+    "model_family": "pythia",
+    "model_size": "160m",
+    "route": "pretrained_finetuned",
+    "stage": "B",
+    "world_size": 4
+  },
+  "checkpoint_manifest": {
+    "path": "/home/sophgo13/cjl/storage/parameter-importance/runs/stage-b-sst2-pretrained-controlled-seed2027/checkpoints/step-003156/manifest.json",
+    "sha256": "af367b444b637aa9f26cd863ebe868e03e6af141533b6f36200710506965baa1"
+  },
+  "dataset_manifest": {
+    "path": "/home/sophgo13/cjl/storage/parameter-importance/manifests/asset-manifest.json",
+    "revision": "bcdcba79d07bc864c1c254ccfcedcce55bcc9a8c",
+    "sha256": "e0e5dccda783fd44368e2ab1c86c71c86c31a716ef57a3dc45908208c998f849",
+    "split": "validation"
+  },
+  "device": "cuda",
+  "double_steps": 3156,
+  "eligible": {
+    "definition": "attention projections, MLP weights, and LM head; excludes embeddings, norms, biases",
+    "identity_sha256": "5c62904952f5d660c8af98e2cf740c60361d5b35e903baa1540c4c0066694fe1",
+    "scalar_count": 123568128,
+    "tensor_count": 49
+  },
+  "experiment_id": "stage-b-sst2-pretrained-pruning-seed2027",
+  "final_checkpoint": "/home/sophgo13/cjl/storage/parameter-importance/runs/stage-b-sst2-pretrained-controlled-seed2027/checkpoints/step-003156",
+  "final_model": {
+    "path": "/home/sophgo13/cjl/storage/parameter-importance/runs/stage-b-sst2-pretrained-controlled-seed2027/checkpoints/step-003156/model.safetensors",
+    "sha256": "a17354e3d49a391d99de8a955ff65c78b5ec905e807315f956121332250e4ead"
+  },
+  "importance": {
+    "path": "/home/sophgo13/cjl/storage/parameter-importance/runs/stage-b-sst2-pretrained-controlled-seed2027/checkpoints/step-003156/importance.safetensors",
+    "sha256": "c98c52ea22093c338ceb84fd308486ca2716bc7c45e14dfdd701a133b3b6a827"
+  },
+  "importance_step": 3156,
+  "model_step": 3156,
+  "provenance_id": "4997d17d4da0241d72813bb66b188ee4b7ca1168c0f01381ff2523fa6916479d",
+  "pruning_config": {
+    "path": "/home/sophgo13/cjl/parameter-importance/configs/eval/stage_b_sst2_pretrained_pruning_seed2027.yaml",
+    "sha256": "d840458d346d1d7836ed6c4e3c1c4f4bcd31cf77534356df1af72236a54e2f55"
+  },
+  "source_experiment_id": "stage-b-sst2-pretrained-controlled-seed2027",
+  "source_run_dir": "/home/sophgo13/cjl/storage/parameter-importance/runs/stage-b-sst2-pretrained-controlled-seed2027",
+  "tokenizer": {
+    "files": {
+      "special_tokens_map.json": {
+        "sha256": "6f50ab5a5a509a1c309d6171f339b196a900dc9c99ad0408ff23bb615fdae7ad",
+        "size": 99
+      },
+      "tokenizer.json": {
+        "sha256": "c24618a1b3e6a38167beff1c72cffd126c3a66254347304b50547d12c5f25624",
+        "size": 2113710
+      },
+      "tokenizer_config.json": {
+        "sha256": "600feab17b84296ecc5255c745bba867303b5117207ff4420515932b2f8ead80",
+        "size": 396
+      }
+    },
+    "path": "/home/sophgo13/cjl/storage/parameter-importance/models/pythia-160m-deduped-step0"
+  },
+  "torch": "2.12.1+cu126"
+}

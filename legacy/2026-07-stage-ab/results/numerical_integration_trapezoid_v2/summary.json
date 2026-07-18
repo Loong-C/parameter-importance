@@ -1,0 +1,60 @@
+{
+  "status": "measured",
+  "gate_passed": true,
+  "gate_rule": "trapezoid",
+  "method_variant": "low_frequency_trapezoid_v2",
+  "method_change_evidence_dir": "${DATA_ROOT}/results/numerical_integration",
+  "parameter_scope_supported": true,
+  "state_count": 20,
+  "gates": {
+    "parameter_spearman": {
+      "minimum_observed": 0.9832221595923689,
+      "threshold_min": 0.7,
+      "metric": "spearman_on_nonzero_reference_parameters",
+      "passed": true
+    },
+    "layer_spearman": {
+      "minimum_observed": 0.9666666666666667,
+      "threshold_min": 0.9,
+      "passed": true
+    },
+    "parameter_topk_overlap": {
+      "minimum_observed": 0.9738934240943096,
+      "threshold_min": 0.6,
+      "passed": true
+    }
+  },
+  "interpretation": "parameter_level_local_approximation_supported",
+  "method_change_evidence": {
+    "root": "/home/sophgo13/cjl/storage/parameter-importance/results/numerical_integration",
+    "summary_path": "/home/sophgo13/cjl/storage/parameter-importance/results/numerical_integration/summary.json",
+    "summary_sha256": "dffafefe81be41249fc7ff2191bbd2d75b497c8b4b8d66f59b1665cb383cbb4e",
+    "predecessor_gate_rule": "left",
+    "predecessor_gate_passed": false,
+    "predecessor_gates": {
+      "parameter_spearman": {
+        "minimum_observed": 0.710489556047611,
+        "threshold_min": 0.7,
+        "metric": "spearman_on_nonzero_reference_parameters",
+        "passed": true
+      },
+      "layer_spearman": {
+        "minimum_observed": 0.5666666666666667,
+        "threshold_min": 0.9,
+        "passed": false
+      },
+      "parameter_topk_overlap": {
+        "minimum_observed": 0.8640078136329128,
+        "threshold_min": 0.6,
+        "passed": true
+      }
+    }
+  },
+  "metric_rows": 240,
+  "runtime_rows": 80,
+  "phase_counts": {
+    "early": 6,
+    "late": 7,
+    "middle": 7
+  }
+}

@@ -1,0 +1,34 @@
+{
+  "batch_size": 8,
+  "batches": 8,
+  "context_length": 2048,
+  "dataset_files": [
+    {
+      "name": "validation-00000-of-00001.parquet",
+      "sha256": "204929b7ff9d6184953f867dedb860e40aa69c078fc1e54b3baaa8fb28511c4c",
+      "size": 657209
+    }
+  ],
+  "dataset_root": "/home/sophgo13/cjl/storage/parameter-importance/datasets/wikitext-103-raw-v1",
+  "max_batches": 8,
+  "split": "validation",
+  "tokenizer_files": [
+    {
+      "name": "tokenizer.json",
+      "sha256": "870f4e2baa6b683221fa52004d5d6f40ab8c9d31961617304b78c910c2c3caf2",
+      "size": 2114042
+    },
+    {
+      "name": "tokenizer_config.json",
+      "sha256": "eee017c5bd133137f45907bd0a6e781e2ccd1a533734b7ed2a2f2f4446659809",
+      "size": 4834
+    },
+    {
+      "name": "special_tokens_map.json",
+      "sha256": "10b8c8852c1e1f70b54d9aff61728408c28971c0e97a6c5a7b2debbd1d3e9c0c",
+      "size": 441
+    }
+  ],
+  "tokenizer_root": "/home/sophgo13/cjl/storage/parameter-importance/models/pythia-14m-step0",
+  "tokens_in_stream": 131073
+}

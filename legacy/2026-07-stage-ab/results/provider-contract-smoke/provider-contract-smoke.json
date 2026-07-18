@@ -1,0 +1,111 @@
+{
+  "checkpoint_id": "step-000000",
+  "checks": {
+    "checkpoint_identity": {
+      "passed": true,
+      "wrong_identity_rejected": true
+    },
+    "estimator": {
+      "checkpoint_id": "step-000000",
+      "different_seed_changed": true,
+      "different_seed_l2": 35.469291747019795,
+      "groupings": {
+        "layer": {
+          "group_count": 9,
+          "index_count": 14067712
+        },
+        "module": {
+          "group_count": 9,
+          "index_count": 14067712
+        }
+      },
+      "learning_rate": 0.0006,
+      "microbatch_count": 2,
+      "microbatch_sample_count": 1,
+      "parameter_count": 14067712,
+      "passed": true,
+      "reference_exact_repeat": true,
+      "reference_sample_count": 4,
+      "same_seed_exact_repeat": true
+    },
+    "numerical_path": {
+      "batches_independent": true,
+      "parameter_count": 14067712,
+      "passed": true,
+      "path_metadata": {
+        "clip_factor": 0.12505607513808106,
+        "configured_weight_decay": 0.1,
+        "gradient_norm": 7.9964118003845215,
+        "learning_rate": 0.0006,
+        "path_weight_decay": 0.0,
+        "update_loss": 11.060992240905762,
+        "weight_decay_excluded": true
+      },
+      "phase": "late",
+      "probe_batch_id": "records:514-516",
+      "record_intervals_disjoint": true,
+      "state_id": "step-000000",
+      "update_batch_id": "records:512-514",
+      "update_norm": 1.620410811173106
+    }
+  },
+  "config": {
+    "different_seed": 12341,
+    "formal_stage_a_result": false,
+    "microbatch_count": 2,
+    "output_path": "${DATA_ROOT}/results/provider-contract-smoke/provider-contract-smoke.json",
+    "provider_options": {
+      "batch_size": 2,
+      "bin_path": "${DATA_ROOT}/datasets/pile-deduped-pythia-preshuffled/document-00000-of-00020.bin",
+      "checkpoint_root": "${DATA_ROOT}/runs/stage-a-14m-smoke-seed1234/checkpoints",
+      "checkpoint_steps": [
+        0
+      ],
+      "device": "cuda:0",
+      "expected_source_experiment_id": "stage-a-14m-smoke-seed1234",
+      "idx_path": "${DATA_ROOT}/datasets/pile-deduped-pythia-preshuffled/document.idx",
+      "manifest_path": "${DATA_ROOT}/manifests/prefix_coverage.json",
+      "max_grad_norm": 1.0,
+      "microbatch_size": 1,
+      "model_size": "14m",
+      "path_record_start": 512,
+      "reference_microbatch_size": 2,
+      "reference_seed": 20260714,
+      "reference_start": 0,
+      "reference_stop": 64,
+      "sampling_start": 64,
+      "sampling_stop": 256,
+      "sequence_length": 16,
+      "verify_hashes": true
+    },
+    "reference_sample_count": 4,
+    "required_group_scopes": [
+      "layer",
+      "module"
+    ],
+    "same_seed": 12340,
+    "smoke_only": true
+  },
+  "config_source": {
+    "config_path": "/home/sophgo13/cjl/parameter-importance/configs/method/stage_a_provider_contract_smoke.yaml",
+    "config_sha256": "c98a638e5bef8b51c3c11a385c01a93d30031348f6e6f0967013d8386aef3091"
+  },
+  "formal_stage_a_result": false,
+  "interpretation": "provider_contract_only; reduced budgets are not Stage-A measurements",
+  "provider_provenance": {
+    "checkpoint_ids": [
+      "step-000000"
+    ],
+    "checkpoint_root": "/home/sophgo13/cjl/storage/parameter-importance/runs/stage-a-14m-smoke-seed1234/checkpoints",
+    "dataset_bin": "/home/sophgo13/cjl/storage/parameter-importance/datasets/pile-deduped-pythia-preshuffled/document-00000-of-00020.bin",
+    "dataset_idx": "/home/sophgo13/cjl/storage/parameter-importance/datasets/pile-deduped-pythia-preshuffled/document.idx",
+    "manifest": "/home/sophgo13/cjl/storage/parameter-importance/manifests/prefix_coverage.json",
+    "model_size": "14m",
+    "offline_only": true,
+    "provider": "param_importance_nlp.experiments.pythia_provider.PythiaEstimatorBiasProvider",
+    "sequence_length": 16,
+    "verify_hashes": true
+  },
+  "smoke_only": true,
+  "status": "passed"
+}

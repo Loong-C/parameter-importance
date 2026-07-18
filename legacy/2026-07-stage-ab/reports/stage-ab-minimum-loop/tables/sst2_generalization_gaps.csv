@@ -1,0 +1,7 @@
+route,seed,position,step,status,accuracy_gap_train_minus_validation,nll_gap_validation_minus_train,ece_gap_validation_minus_train,source
+direct,1234,best,600,available,0.08424195219724284,0.12204540890747811,-0.014810095666593082,/home/sophgo13/cjl/storage/parameter-importance/runs/stage-b-sst2-direct-controlled-seed1234/train-evaluation.json
+direct,1337,best,1000,available,0.08879685796605685,0.16308116249139137,-0.01093612786426186,/home/sophgo13/cjl/storage/parameter-importance/runs/stage-b-sst2-direct-controlled-seed1337/train-evaluation.json
+direct,2027,best,1000,available,0.09199616580264292,0.1760733371639895,0.03174290929814658,/home/sophgo13/cjl/storage/parameter-importance/runs/stage-b-sst2-direct-controlled-seed2027/train-evaluation.json
+pretrained,1234,best,1000,available,0.08779854927931885,0.17986501905226432,0.04722691809677619,/home/sophgo13/cjl/storage/parameter-importance/runs/stage-b-sst2-pretrained-controlled-seed1234/train-evaluation.json
+pretrained,1337,best,789,available,0.07377065119238546,0.10771900793810885,-0.007558428863696148,/home/sophgo13/cjl/storage/parameter-importance/runs/stage-b-sst2-pretrained-controlled-seed1337/train-evaluation.json
+pretrained,2027,best,1200,available,0.09943153838808416,0.17933150609791065,-0.012170574361296094,/home/sophgo13/cjl/storage/parameter-importance/runs/stage-b-sst2-pretrained-controlled-seed2027/train-evaluation.json

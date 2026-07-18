@@ -1,0 +1,98 @@
+{
+  "comparisons": [
+    {
+      "left": "u_signed",
+      "pvalue": 0.0,
+      "right": "double",
+      "sample_size": 1000000,
+      "scope": "stratified_scalar_sample_with_replacement",
+      "seed": 1337,
+      "spearman": 0.9647282730162478
+    },
+    {
+      "group_labels": [
+        "embedding-output",
+        "layer-0000",
+        "layer-0001",
+        "layer-0002",
+        "layer-0003",
+        "layer-0004",
+        "layer-0005",
+        "layer-0006",
+        "layer-0007",
+        "layer-0008",
+        "layer-0009",
+        "layer-0010",
+        "layer-0011"
+      ],
+      "groups": 13,
+      "left": "u_signed",
+      "pvalue": 0.0,
+      "right": "double",
+      "scope": "layer_sum",
+      "spearman": 1.0
+    },
+    {
+      "group_labels": [
+        "attention-output",
+        "attention-qkv",
+        "embedding-output",
+        "mlp-input",
+        "mlp-output"
+      ],
+      "groups": 5,
+      "left": "u_signed",
+      "pvalue": 1.4042654220543602e-24,
+      "right": "double",
+      "scope": "module_sum",
+      "spearman": 0.9999999999999999
+    },
+    {
+      "left": "u_positive",
+      "pvalue": 0.0,
+      "right": "double",
+      "sample_size": 1000000,
+      "scope": "stratified_scalar_sample_with_replacement",
+      "seed": 1337,
+      "spearman": 0.9250246633635777
+    },
+    {
+      "group_labels": [
+        "embedding-output",
+        "layer-0000",
+        "layer-0001",
+        "layer-0002",
+        "layer-0003",
+        "layer-0004",
+        "layer-0005",
+        "layer-0006",
+        "layer-0007",
+        "layer-0008",
+        "layer-0009",
+        "layer-0010",
+        "layer-0011"
+      ],
+      "groups": 13,
+      "left": "u_positive",
+      "pvalue": 1.6112145732095236e-09,
+      "right": "double",
+      "scope": "layer_sum",
+      "spearman": 0.9835164835164836
+    },
+    {
+      "group_labels": [
+        "attention-output",
+        "attention-qkv",
+        "embedding-output",
+        "mlp-input",
+        "mlp-output"
+      ],
+      "groups": 5,
+      "left": "u_positive",
+      "pvalue": 0.03738607346849874,
+      "right": "double",
+      "scope": "module_sum",
+      "spearman": 0.8999999999999998
+    }
+  ]
+}

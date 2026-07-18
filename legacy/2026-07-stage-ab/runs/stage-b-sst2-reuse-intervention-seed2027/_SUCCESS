@@ -1,0 +1,9 @@
+{
+  "experiment_id": "stage-b-sst2-reuse-intervention-seed2027",
+  "provenance_id": "2d677a067a1c2d45b34ec6a3a6fc01d3eee44ddac0c2613ef63428e472f08d7d",
+  "provenance_json_sha256": "e36461a48b741230039b740db7f8163f59d08fb9a53521acfc92e4fe53d83e50",
+  "record_count": 60,
+  "results_csv_sha256": "28497ddf07012d04e1a8a47c1b41487c78f87b1b8295b31701e43b08e41d463b",
+  "results_json_sha256": "51bd7f91ae41adfe7b7d696b389d0ffa9a9b4a79705a2afe63e69aa838c6ceff",
+  "seed": 2027
+}

@@ -1,0 +1,3 @@
+route,seed_count,required_minimum,seeds,status
+direct,3,3,1234;1337;2027,passed
+pretrained,3,3,1234;1337;2027,passed

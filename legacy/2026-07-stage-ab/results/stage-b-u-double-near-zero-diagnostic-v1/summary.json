@@ -1,0 +1,55 @@
+{
+  "comparisons": {
+    "original_gate5_semantics": {
+      "all_passed": false,
+      "applicable_rows": 72,
+      "failed_rows": 4,
+      "passed_rows": 68
+    },
+    "positive_vs_double_near_zero": {
+      "all_passed": false,
+      "applicable_rows": 72,
+      "failed_rows": 3,
+      "passed_rows": 69
+    },
+    "signed_symmetric_near_zero": {
+      "all_passed": true,
+      "applicable_rows": 72,
+      "failed_rows": 0,
+      "passed_rows": 72
+    }
+  },
+  "criterion": "u_gap>=0 and u_gap>=0.8*double_gap",
+  "family_discrimination": {
+    "double_near_zero": {
+      "mean_gap": 0.2492821603028719,
+      "nonpositive_gap_rows": 0,
+      "positive_gap_rows": 64,
+      "primary_nonzero_rows": 64
+    },
+    "double_original": {
+      "mean_gap": 0.24924491609401137,
+      "nonpositive_gap_rows": 0,
+      "positive_gap_rows": 64,
+      "primary_nonzero_rows": 64
+    },
+    "u_positive": {
+      "mean_gap": 0.24368974924000658,
+      "nonpositive_gap_rows": 0,
+      "positive_gap_rows": 64,
+      "primary_nonzero_rows": 64
+    },
+    "u_signed": {
+      "mean_gap": 0.24981065876233685,
+      "nonpositive_gap_rows": 0,
+      "positive_gap_rows": 64,
+      "primary_nonzero_rows": 64
+    }
+  },
+  "original_gate5_modified": false,
+  "primary_metrics": [
+    "accuracy",
+    "nll"
+  ],
+  "training_performed": false
+}

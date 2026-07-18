@@ -1,0 +1,20 @@
+{
+  "data_cursor": 524288,
+  "experiment_id": "stage-b-160m-step512-seed1234-deterministic-trapezoid-v3",
+  "final_validation": {
+    "experiment_id": "stage-b-160m-step512-seed1234-deterministic-trapezoid-v3",
+    "loss": 6.048910001429116,
+    "perplexity": 423.6509993002924,
+    "phase": "periodic",
+    "public_checkpoint": false,
+    "step": 512,
+    "tokens": 251904.0
+  },
+  "public_comparison": {
+    "perplexity_ratio": 0.639687711315972,
+    "ratio_gate_passed": true,
+    "validation_improved_from_initial": true
+  },
+  "step": 512,
+  "tokens_seen": 1073741824
+}

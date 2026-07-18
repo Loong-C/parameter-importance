@@ -1,0 +1,36 @@
+{
+  "allocations": [
+    "global",
+    "layer_balanced"
+  ],
+  "dataset_path": "/home/sophgo13/cjl/storage/parameter-importance/datasets/glue-sst2",
+  "device": "cuda",
+  "ece_bins": 10,
+  "experiment_id": "stage-b-sst2-reuse-intervention-seed1337",
+  "finetune_checkpoint_path": "/home/sophgo13/cjl/storage/parameter-importance/runs/stage-b-sst2-pretrained-controlled-seed1337/checkpoints/step-003156",
+  "finetune_experiment_id": "stage-b-sst2-pretrained-controlled-seed1337",
+  "finetune_run_dir": "/home/sophgo13/cjl/storage/parameter-importance/runs/stage-b-sst2-pretrained-controlled-seed1337",
+  "finetune_step": 3156,
+  "glue_revision": "bcdcba79d07bc864c1c254ccfcedcce55bcc9a8c",
+  "manifest_path": "/home/sophgo13/cjl/storage/parameter-importance/manifests/asset-manifest.json",
+  "model_size": "160m",
+  "offline": true,
+  "output_dir": "/home/sophgo13/cjl/storage/parameter-importance/runs/stage-b-sst2-reuse-intervention-seed1337",
+  "pretrain_checkpoint_path": "/home/sophgo13/cjl/storage/parameter-importance/runs/stage-b-160m-step512-seed1234-deterministic-trapezoid-v3/checkpoints/step-000512",
+  "pretrain_experiment_id": "stage-b-160m-step512-seed1234-deterministic-trapezoid-v3",
+  "pretrain_run_dir": "/home/sophgo13/cjl/storage/parameter-importance/runs/stage-b-160m-step512-seed1234-deterministic-trapezoid-v3",
+  "pretrain_step": 512,
+  "ratios": [
+    0.001,
+    0.005,
+    0.01,
+    0.05,
+    0.1,
+    0.2
+  ],
+  "score": "u_positive",
+  "seed": 1337,
+  "stage": "B",
+  "tokenizer_path": "/home/sophgo13/cjl/storage/parameter-importance/models/pythia-160m-deduped-step0",
+  "validation_batch_size": 32
+}

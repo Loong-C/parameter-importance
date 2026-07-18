@@ -1,0 +1,29 @@
+{
+  "command": [
+    "/home/sophgo13/cjl/storage/parameter-importance/envs/parameter-importance/bin/python",
+    "-m",
+    "pytest",
+    "-q",
+    "--ignore=tests/test_pythia_provider_integration.py",
+    "--junitxml=/tmp/stage-a-tests-4pajzqbe/pytest.xml"
+  ],
+  "cuda": "12.6",
+  "elapsed_seconds": 42.52684906299692,
+  "excluded_gate": "tests/test_pythia_provider_integration.py",
+  "generated_utc": "2026-07-17T04:25:03Z",
+  "git_commit": "78329802193d89e121a2e275d8d3ce312bbe1255",
+  "junit_counts": {
+    "errors": 0,
+    "failures": 0,
+    "skipped": 0,
+    "tests": 156
+  },
+  "passed": true,
+  "platform": "Linux-6.8.0-134-generic-x86_64-with-glibc2.39",
+  "python": "3.12.3",
+  "returncode": 0,
+  "schema_version": "stage-a-unit-tests-v1",
+  "stderr_tail": "",
+  "stdout_tail": "........................................................................ [ 46%]\n........................................................................ [ 92%]\n............                                                             [100%]\n156 passed in 40.43s\n",
+  "torch": "2.12.1+cu126"
+}

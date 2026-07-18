@@ -1,0 +1,234 @@
+{
+  "dataset_manifest": {
+    "path": "/home/sophgo13/cjl/storage/parameter-importance/manifests/asset-manifest.json",
+    "revision": "bcdcba79d07bc864c1c254ccfcedcce55bcc9a8c",
+    "sha256": "e0e5dccda783fd44368e2ab1c86c71c86c31a716ef57a3dc45908208c998f849",
+    "split": "validation"
+  },
+  "device": "cuda",
+  "diagnostic_config": {
+    "path": "/home/sophgo13/cjl/parameter-importance/configs/eval/stage_b_u_double_near_zero_diagnostic_v1.yaml",
+    "sha256": "4ce93123fecfd8112a3eed1c0fbcd4fdc6a20b364afbad0f09528a90d685710e"
+  },
+  "diagnostic_definition": {
+    "comparisons": [
+      "original_gate5_semantics",
+      "positive_vs_double_near_zero",
+      "signed_symmetric_near_zero"
+    ],
+    "criterion": "u_gap>=0 and u_gap>=0.8*double_gap",
+    "new_method": "double_near_zero",
+    "new_method_definition": "smallest absolute cumulative signed double scores",
+    "original_gate5_modified": false,
+    "original_pruning_outputs_modified": false,
+    "training_performed": false
+  },
+  "experiment_id": "stage-b-u-double-near-zero-diagnostic-v1",
+  "provenance_id": "fb3e818056fa36e82ec37ddba306e9d924d2676d054e28e37fe444bbe3b35bfa",
+  "sources": [
+    {
+      "best_validation_model": {
+        "path": "/home/sophgo13/cjl/storage/parameter-importance/runs/stage-b-sst2-direct-controlled-seed1234/best-validation/step-000600/model.safetensors",
+        "sha256": "926d7efb9ee89775d00cd95514ed674ab13a63ecf7c41b8d2336f0137c0ee48a",
+        "step": 600
+      },
+      "double_steps": 3156,
+      "final_checkpoint": "/home/sophgo13/cjl/storage/parameter-importance/runs/stage-b-sst2-direct-controlled-seed1234/checkpoints/step-003156",
+      "formal_pruning": {
+        "experiment_id": "stage-b-sst2-direct-pruning-seed1234",
+        "output_dir": "/home/sophgo13/cjl/storage/parameter-importance/runs/stage-b-sst2-direct-pruning-seed1234",
+        "provenance_id": "6319b9372640ef20a7f13ef079a7d08a3da4f87669aa8d874643b7e35c072cf6",
+        "success_sha256": "6d5232ced67b353b1ddfc5ec5e46fcf0d90b616db41b2c3ff0d516b15cb9f5fb",
+        "verified_hashes": {
+          "curves.json": "a72a9a86900134d8f25ee44d0d8e466759b7bba85f3fe4a018acac3bfb25a8f4",
+          "provenance.json": "539b7c3ce25072e5a3f761be8afa5d68a691cb9e7bd804403905a2ac16815519",
+          "results.csv": "3639404a993d5a09bfba9f76253800b3b04e59e5631c02d6919ca1c871afd4b3",
+          "results.json": "3bc39e7b7f23439e3782c7e22d66e61804a5434381af0100078ad1433bd34ec1",
+          "u-vs-double-rank.json": "7384410cd804c2f2d27560e3d1e8a237e67c188bc73b8e021230028311bcf0f5"
+        }
+      },
+      "importance_step": 3156,
+      "model_step": 3156,
+      "pruning_config": {
+        "path": "/home/sophgo13/cjl/parameter-importance/configs/eval/stage_b_sst2_direct_pruning_seed1234.yaml",
+        "sha256": "545ec4c5c592b48295462a76f56652a828e4ae5b87beabd7c2ae82e02c389185"
+      },
+      "route": "direct",
+      "seed": 1234,
+      "source_experiment_id": "stage-b-sst2-direct-controlled-seed1234"
+    },
+    {
+      "best_validation_model": {
+        "path": "/home/sophgo13/cjl/storage/parameter-importance/runs/stage-b-sst2-direct-controlled-seed1337/best-validation/step-001000/model.safetensors",
+        "sha256": "d97f99a9d1a889a0ed409025c9928dc1b1706ffd054b2964e6de7a8952f46547",
+        "step": 1000
+      },
+      "double_steps": 3156,
+      "final_checkpoint": "/home/sophgo13/cjl/storage/parameter-importance/runs/stage-b-sst2-direct-controlled-seed1337/checkpoints/step-003156",
+      "formal_pruning": {
+        "experiment_id": "stage-b-sst2-direct-pruning-seed1337",
+        "output_dir": "/home/sophgo13/cjl/storage/parameter-importance/runs/stage-b-sst2-direct-pruning-seed1337",
+        "provenance_id": "4ede8c9aced68f047ae72736f26b1de2be25cf15d1bc5783a8c2039f1c8cf053",
+        "success_sha256": "c6960bd6d82ad43e107ed9a9aca7a1cfa2fcaa9e76887d2ed31c9e856af86ad9",
+        "verified_hashes": {
+          "curves.json": "c2de74898f08b002c618105e88362247291dc2791d9fc33f771dd214d74a71fc",
+          "provenance.json": "bc5f9d9963b8fa8aa6635d833ed6bbf609645f647ab4cc4541d25f27b603a45c",
+          "results.csv": "570690a127d57f7ab917d5df7e8ad13e39eacfa5e0c4937fd10fe06a5933ff38",
+          "results.json": "987e76142ed4c8dbd5867a21c77fee52fe841692000efe7310c3d22ae4714e72",
+          "u-vs-double-rank.json": "8a25121407cfaad0c873b0e8019e5f25ce7de0283c3945a778fccc76fcb68e0b"
+        }
+      },
+      "importance_step": 3156,
+      "model_step": 3156,
+      "pruning_config": {
+        "path": "/home/sophgo13/cjl/parameter-importance/configs/eval/stage_b_sst2_direct_pruning_seed1337.yaml",
+        "sha256": "1d78145f6a495c4500a65a465649e0a11a17295774bec7b8786228f5c72a2d7a"
+      },
+      "route": "direct",
+      "seed": 1337,
+      "source_experiment_id": "stage-b-sst2-direct-controlled-seed1337"
+    },
+    {
+      "best_validation_model": {
+        "path": "/home/sophgo13/cjl/storage/parameter-importance/runs/stage-b-sst2-direct-controlled-seed2027/best-validation/step-001000/model.safetensors",
+        "sha256": "6110aa2e619dee56c98c006a7a995d1cdb211ed6414c3ea133f2ca151b8d2ae7",
+        "step": 1000
+      },
+      "double_steps": 3156,
+      "final_checkpoint": "/home/sophgo13/cjl/storage/parameter-importance/runs/stage-b-sst2-direct-controlled-seed2027/checkpoints/step-003156",
+      "formal_pruning": {
+        "experiment_id": "stage-b-sst2-direct-pruning-seed2027",
+        "output_dir": "/home/sophgo13/cjl/storage/parameter-importance/runs/stage-b-sst2-direct-pruning-seed2027",
+        "provenance_id": "dd2db752e2706c729d6ef743f30aa89a9fef215164493d1f5844e7fb34ddbfbd",
+        "success_sha256": "bd20f0b115e6745a85f4ea0573b5fad5fc13aa57f262e39ce979622223e7c8af",
+        "verified_hashes": {
+          "curves.json": "7bc79865e7139f51b7a4f9903f526cedb4114c0c6193b26024abe277f1fe7f0a",
+          "provenance.json": "cd2fab086c53476f9e4563ffa24ef64793cbdfb7bb4c4433f67dca0aa255aab3",
+          "results.csv": "8aa466b7c8e09798e1fcd94e39f69a0de47afd315701ac1693fa5506112e5193",
+          "results.json": "8ad6e9dc547f50aa1f486d6b1efcfa4dadb84237b7c67a7b6d19f95dc3788741",
+          "u-vs-double-rank.json": "46b1eede6707025b3ae28593c2a0d051f6f4b1922f8211a588fcd271c8861948"
+        }
+      },
+      "importance_step": 3156,
+      "model_step": 3156,
+      "pruning_config": {
+        "path": "/home/sophgo13/cjl/parameter-importance/configs/eval/stage_b_sst2_direct_pruning_seed2027.yaml",
+        "sha256": "cb3a238ce8c12d7329f5c4326fd3b0995c31cc316ce1b5247c41f5e4937339f1"
+      },
+      "route": "direct",
+      "seed": 2027,
+      "source_experiment_id": "stage-b-sst2-direct-controlled-seed2027"
+    },
+    {
+      "best_validation_model": {
+        "path": "/home/sophgo13/cjl/storage/parameter-importance/runs/stage-b-sst2-pretrained-controlled-seed1234/best-validation/step-001000/model.safetensors",
+        "sha256": "61551236177ba5d2bdecdaa681a9cde7da31c516294992e1e6d25af6e2ec95e4",
+        "step": 1000
+      },
+      "double_steps": 3156,
+      "final_checkpoint": "/home/sophgo13/cjl/storage/parameter-importance/runs/stage-b-sst2-pretrained-controlled-seed1234/checkpoints/step-003156",
+      "formal_pruning": {
+        "experiment_id": "stage-b-sst2-pretrained-pruning-seed1234",
+        "output_dir": "/home/sophgo13/cjl/storage/parameter-importance/runs/stage-b-sst2-pretrained-pruning-seed1234",
+        "provenance_id": "81b191ba45ccfa8f8102e9523fec563f45db035bedfde1c2d8fe30e3652bf474",
+        "success_sha256": "b4ad41d63a9a04c3fb5dedf53c72dfdb44cfd49d2d396eb21e7cbf77ed2b30a8",
+        "verified_hashes": {
+          "curves.json": "7ce1276097a3fdbfd860991b0faaa6e24b75d4a1f4fc4d87bc5984a66d34b8d3",
+          "provenance.json": "48cd8e901cae84763458ad73328d736b15418cf9a33bd8fde6954956e1df861e",
+          "results.csv": "2aff81020fbfef942c5e8a74471140d9505057d92b7c78d1c2a83bce6abe7d9c",
+          "results.json": "d59f25e2d96fb498e6d9f9f5f9bbb5f795cae81740786fcd2cc8b4b018d89898",
+          "u-vs-double-rank.json": "ac2f7d5f8347f88cd05236da97e3cd1a84b6e23ac8be79ecc048f367e0e3828b"
+        }
+      },
+      "importance_step": 3156,
+      "model_step": 3156,
+      "pruning_config": {
+        "path": "/home/sophgo13/cjl/parameter-importance/configs/eval/stage_b_sst2_pretrained_pruning_seed1234.yaml",
+        "sha256": "dc89d2388e524f937af2e28da6b524508d637ebbd161e6482d55daca7c2c03d2"
+      },
+      "route": "pretrained",
+      "seed": 1234,
+      "source_experiment_id": "stage-b-sst2-pretrained-controlled-seed1234"
+    },
+    {
+      "best_validation_model": {
+        "path": "/home/sophgo13/cjl/storage/parameter-importance/runs/stage-b-sst2-pretrained-controlled-seed1337/best-validation/step-000789/model.safetensors",
+        "sha256": "07f63f86a4c4499912b3b419aea5866d9e7082e693931479207786f44fd0a4c9",
+        "step": 789
+      },
+      "double_steps": 3156,
+      "final_checkpoint": "/home/sophgo13/cjl/storage/parameter-importance/runs/stage-b-sst2-pretrained-controlled-seed1337/checkpoints/step-003156",
+      "formal_pruning": {
+        "experiment_id": "stage-b-sst2-pretrained-pruning-seed1337",
+        "output_dir": "/home/sophgo13/cjl/storage/parameter-importance/runs/stage-b-sst2-pretrained-pruning-seed1337",
+        "provenance_id": "12c8c8a250fa11403f0d8310dc8383da77dd5dd3dabcadd3d9cb8ef95bf1dbca",
+        "success_sha256": "47751ddb8885ff4e3c887008dec35f1e2bb6b0ccf1d3c64ff9094dba9ceffe82",
+        "verified_hashes": {
+          "curves.json": "a8d2225ebc81262a0e4d1eea77d685c2bd4d62e90d5923be58b645b9afb44255",
+          "provenance.json": "496dc952245268a2b8f6a1337fe2226d3660a43a612af28e8e0b3864d309b35a",
+          "results.csv": "71f929c55cec30866bb7b1a8bc999f1344d4bcd6ce2e43319254cc0b1257c017",
+          "results.json": "250a06bbe0aba09b90a514875c89c93f8a928635b0b6fd0df2df6dc1d4facf9b",
+          "u-vs-double-rank.json": "84cfa0153894e40c17e109d655b8f6ed920211bcf0dcce13c84b20804640504b"
+        }
+      },
+      "importance_step": 3156,
+      "model_step": 3156,
+      "pruning_config": {
+        "path": "/home/sophgo13/cjl/parameter-importance/configs/eval/stage_b_sst2_pretrained_pruning_seed1337.yaml",
+        "sha256": "e0eecf72a60f3046367bf269964248904d3ea4e94ca3eea7c2508e4386e63773"
+      },
+      "route": "pretrained",
+      "seed": 1337,
+      "source_experiment_id": "stage-b-sst2-pretrained-controlled-seed1337"
+    },
+    {
+      "best_validation_model": {
+        "path": "/home/sophgo13/cjl/storage/parameter-importance/runs/stage-b-sst2-pretrained-controlled-seed2027/best-validation/step-001200/model.safetensors",
+        "sha256": "f0c1191d343c12ff842e471b4171c3385a76a26e4a47f2b500e3d19ed2fa8b91",
+        "step": 1200
+      },
+      "double_steps": 3156,
+      "final_checkpoint": "/home/sophgo13/cjl/storage/parameter-importance/runs/stage-b-sst2-pretrained-controlled-seed2027/checkpoints/step-003156",
+      "formal_pruning": {
+        "experiment_id": "stage-b-sst2-pretrained-pruning-seed2027",
+        "output_dir": "/home/sophgo13/cjl/storage/parameter-importance/runs/stage-b-sst2-pretrained-pruning-seed2027",
+        "provenance_id": "4997d17d4da0241d72813bb66b188ee4b7ca1168c0f01381ff2523fa6916479d",
+        "success_sha256": "dca0c8daee4afeead23290b2e9466f4f33322218a3f6d8dd8bad19f35b5ca88b",
+        "verified_hashes": {
+          "curves.json": "cbe0c94c927c85150abfc81433b52a99e6f378d1f87c0c28dcee1b53e57b6dde",
+          "provenance.json": "d0f785097a20f409504705b2c758865178638867a6d7969f2cf86200f999b19e",
+          "results.csv": "35bf90eae4f2ef4f1643dd706a7a09e6b7dae2e6f35b5134197aa6c323c63f10",
+          "results.json": "9afaf2320b5ac03c66ec637a498a16d5356f2145b39f61f5792290095590c6f0",
+          "u-vs-double-rank.json": "bea1f68295e4ae4101cf0b6c6651b9e53a9bec7229fffa78d48bfbd48bf9ccf0"
+        }
+      },
+      "importance_step": 3156,
+      "model_step": 3156,
+      "pruning_config": {
+        "path": "/home/sophgo13/cjl/parameter-importance/configs/eval/stage_b_sst2_pretrained_pruning_seed2027.yaml",
+        "sha256": "d840458d346d1d7836ed6c4e3c1c4f4bcd31cf77534356df1af72236a54e2f55"
+      },
+      "route": "pretrained",
+      "seed": 2027,
+      "source_experiment_id": "stage-b-sst2-pretrained-controlled-seed2027"
+    }
+  ],
+  "tokenizer": {
+    "files": {
+      "special_tokens_map.json": {
+        "sha256": "6f50ab5a5a509a1c309d6171f339b196a900dc9c99ad0408ff23bb615fdae7ad",
+        "size": 99
+      },
+      "tokenizer.json": {
+        "sha256": "c24618a1b3e6a38167beff1c72cffd126c3a66254347304b50547d12c5f25624",
+        "size": 2113710
+      },
+      "tokenizer_config.json": {
+        "sha256": "600feab17b84296ecc5255c745bba867303b5117207ff4420515932b2f8ead80",
+        "size": 396
+      }
+    },
+    "path": "/home/sophgo13/cjl/storage/parameter-importance/models/pythia-160m-deduped-step0"
+  },
+  "torch": "2.12.1+cu126"
+}

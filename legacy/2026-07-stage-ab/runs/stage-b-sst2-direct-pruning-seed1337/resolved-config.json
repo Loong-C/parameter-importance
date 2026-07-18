@@ -1,0 +1,36 @@
+{
+  "allocations": [
+    "global",
+    "layer_balanced"
+  ],
+  "dataset_path": "/home/sophgo13/cjl/storage/parameter-importance/datasets/glue-sst2",
+  "device": "cuda",
+  "ece_bins": 10,
+  "expected_final_step": 3156,
+  "expected_source_experiment_id": "stage-b-sst2-direct-controlled-seed1337",
+  "experiment_id": "stage-b-sst2-direct-pruning-seed1337",
+  "final_checkpoint_path": "/home/sophgo13/cjl/storage/parameter-importance/runs/stage-b-sst2-direct-controlled-seed1337/checkpoints/step-003156",
+  "glue_revision": "bcdcba79d07bc864c1c254ccfcedcce55bcc9a8c",
+  "manifest_path": "/home/sophgo13/cjl/storage/parameter-importance/manifests/asset-manifest.json",
+  "model_size": "160m",
+  "offline": true,
+  "output_dir": "/home/sophgo13/cjl/storage/parameter-importance/runs/stage-b-sst2-direct-pruning-seed1337",
+  "random_masks": 20,
+  "rank_sample_size": 1000000,
+  "ratios": [
+    0.0,
+    0.001,
+    0.005,
+    0.01,
+    0.02,
+    0.05,
+    0.1,
+    0.2,
+    0.3
+  ],
+  "seed": 1337,
+  "source_run_dir": "/home/sophgo13/cjl/storage/parameter-importance/runs/stage-b-sst2-direct-controlled-seed1337",
+  "stage": "B",
+  "tokenizer_path": "/home/sophgo13/cjl/storage/parameter-importance/models/pythia-160m-deduped-step0",
+  "validation_batch_size": 32
+}

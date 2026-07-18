@@ -1,0 +1,16 @@
+{
+  "aggregate_csv_sha256": "d9dcf94a5a0091387828729d9d0bbd2b4d203d27abf19ef148d5fee66bdc16cf",
+  "experiment_id": "stage-b-u-double-near-zero-diagnostic-v1",
+  "gaps_csv_sha256": "dcfa30250a7ab04135b363e8672a0ab336d7751058a1b9214ee5acd749551e5a",
+  "pairwise_csv_sha256": "e9dc6b6c11594316e20dbcb0af8c377a139c711fd51455cc0040d83f47905a3f",
+  "provenance_id": "fb3e818056fa36e82ec37ddba306e9d924d2676d054e28e37fe444bbe3b35bfa",
+  "provenance_json_sha256": "488634fd744982bfa6ac3f080b318170ee338068905b36771fa530c355ddec4c",
+  "record_count": 108,
+  "report_md_sha256": "4a5e2975dfc66c59ecb68514095c3e3ff2d8f7bf575f2daff5c2843895a40385",
+  "resolved_config_json_sha256": "8725ddc463e94618184baa78f88fb849db911db25881a7e0dc6d6d3696ffcc9b",
+  "results_csv_sha256": "b0e48d1de39d8df48dcdff5a4134cb11a336b9b0b3f4e9136c4a48e8bd6ae3f7",
+  "results_json_sha256": "59f98b7a2ce109ba645ea8954d39dcf81ab5ee5139fb26ec9c4d124ffdf3e952",
+  "runtime_manifest_json_sha256": "e0a7aed42119dea087d96ec0f0b503ab170482b07d5a8c96ac8ef67c7d5b947c",
+  "score_signs_csv_sha256": "77d3c9377352b22c24542808415a00f10b1b1bfe1f3d145a34511371f8b64f29",
+  "summary_json_sha256": "e679e680067bcc6bb6546d42650d2b869f3b597005fcb42b142430903f4fd5d3"
+}

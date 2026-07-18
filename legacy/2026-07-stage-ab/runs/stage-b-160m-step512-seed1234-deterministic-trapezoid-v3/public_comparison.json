@@ -1,0 +1,81 @@
+{
+  "experiment_id": "stage-b-160m-step512-seed1234-deterministic-trapezoid-v3",
+  "initial_validation": {
+    "experiment_id": "stage-b-160m-step512-seed1234-deterministic-trapezoid-v3",
+    "loss": 11.06013780299241,
+    "perplexity": 63585.31350900378,
+    "phase": "initial",
+    "public_checkpoint": false,
+    "step": 0,
+    "tokens": 251904.0
+  },
+  "perplexity_ratio": 0.639687711315972,
+  "public_checkpoint": {
+    "files": [
+      {
+        "name": "config.json",
+        "sha256": "76eb275107220e450d31258f792a2efcbee109d8b62ae0088260057dec06362f",
+        "size": 569
+      },
+      {
+        "name": "model.safetensors",
+        "sha256": "a7793f09ecdd85970740b691a78dc67d2489d8866d8bba6fd95e01e3b69a5999",
+        "size": 649308728
+      }
+    ],
+    "revision": "eaa6383edf563bf355d8b125777f352c2a773bfa",
+    "root": "/home/sophgo13/cjl/storage/parameter-importance/models/pythia-160m-deduped-step512"
+  },
+  "published": {
+    "loss": 6.495685174213192,
+    "perplexity": 662.2778455893006,
+    "tokens": 251904.0
+  },
+  "ratio_gate_passed": true,
+  "ratio_threshold": 1.15,
+  "step": 512,
+  "trained": {
+    "experiment_id": "stage-b-160m-step512-seed1234-deterministic-trapezoid-v3",
+    "loss": 6.048910001429116,
+    "perplexity": 423.6509993002924,
+    "phase": "periodic",
+    "public_checkpoint": false,
+    "step": 512,
+    "tokens": 251904.0
+  },
+  "validation_assets": {
+    "batch_size": 8,
+    "batches": 16,
+    "context_length": 2048,
+    "dataset_files": [
+      {
+        "name": "validation-00000-of-00001.parquet",
+        "sha256": "204929b7ff9d6184953f867dedb860e40aa69c078fc1e54b3baaa8fb28511c4c",
+        "size": 657209
+      }
+    ],
+    "dataset_root": "/home/sophgo13/cjl/storage/parameter-importance/datasets/wikitext-103-raw-v1",
+    "max_batches": 128,
+    "split": "validation",
+    "tokenizer_files": [
+      {
+        "name": "tokenizer.json",
+        "sha256": "c24618a1b3e6a38167beff1c72cffd126c3a66254347304b50547d12c5f25624",
+        "size": 2113710
+      },
+      {
+        "name": "tokenizer_config.json",
+        "sha256": "600feab17b84296ecc5255c745bba867303b5117207ff4420515932b2f8ead80",
+        "size": 396
+      },
+      {
+        "name": "special_tokens_map.json",
+        "sha256": "6f50ab5a5a509a1c309d6171f339b196a900dc9c99ad0408ff23bb615fdae7ad",
+        "size": 99
+      }
+    ],
+    "tokenizer_root": "/home/sophgo13/cjl/storage/parameter-importance/models/pythia-160m-deduped-step0",
+    "tokens_in_stream": 252472
+  },
+  "validation_improved_from_initial": true
+}

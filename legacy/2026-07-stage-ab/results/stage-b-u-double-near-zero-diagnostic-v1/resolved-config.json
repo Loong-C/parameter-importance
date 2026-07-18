@@ -1,0 +1,40 @@
+{
+  "device": "cuda",
+  "ece_bins": 10,
+  "experiment_id": "stage-b-u-double-near-zero-diagnostic-v1",
+  "offline": true,
+  "output_dir": "/home/sophgo13/cjl/storage/parameter-importance/results/stage-b-u-double-near-zero-diagnostic-v1",
+  "sources": [
+    {
+      "pruning_config_path": "/home/sophgo13/cjl/parameter-importance/configs/eval/stage_b_sst2_direct_pruning_seed1234.yaml",
+      "route": "direct",
+      "seed": 1234
+    },
+    {
+      "pruning_config_path": "/home/sophgo13/cjl/parameter-importance/configs/eval/stage_b_sst2_direct_pruning_seed1337.yaml",
+      "route": "direct",
+      "seed": 1337
+    },
+    {
+      "pruning_config_path": "/home/sophgo13/cjl/parameter-importance/configs/eval/stage_b_sst2_direct_pruning_seed2027.yaml",
+      "route": "direct",
+      "seed": 2027
+    },
+    {
+      "pruning_config_path": "/home/sophgo13/cjl/parameter-importance/configs/eval/stage_b_sst2_pretrained_pruning_seed1234.yaml",
+      "route": "pretrained",
+      "seed": 1234
+    },
+    {
+      "pruning_config_path": "/home/sophgo13/cjl/parameter-importance/configs/eval/stage_b_sst2_pretrained_pruning_seed1337.yaml",
+      "route": "pretrained",
+      "seed": 1337
+    },
+    {
+      "pruning_config_path": "/home/sophgo13/cjl/parameter-importance/configs/eval/stage_b_sst2_pretrained_pruning_seed2027.yaml",
+      "route": "pretrained",
+      "seed": 2027
+    }
+  ],
+  "stage": "B"
+}

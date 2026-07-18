@@ -1,0 +1,15 @@
+{
+  "data_cursor": 1024,
+  "experiment_id": "stage-a-14m-smoke-seed1234",
+  "final_validation": {
+    "experiment_id": "stage-a-14m-smoke-seed1234",
+    "loss": 9.570981860160828,
+    "perplexity": 14342.491734201647,
+    "phase": "periodic",
+    "public_checkpoint": false,
+    "step": 32,
+    "tokens": 131072.0
+  },
+  "step": 32,
+  "tokens_seen": 2097152
+}

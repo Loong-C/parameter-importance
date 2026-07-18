@@ -1,0 +1,37 @@
+{
+  "created_at": "2026-07-16T02:40:42.942383+00:00",
+  "git_commit": "5e165d9129f68f544d62035c2540fa86beebcc88",
+  "python": "3.12.3",
+  "platform": "Linux-6.8.0-134-generic-x86_64-with-glibc2.39",
+  "torch": "2.12.1+cu126",
+  "cuda": "12.6",
+  "cudnn": 91002,
+  "nccl": "2.29.3",
+  "gpu_names": [
+    "NVIDIA A100-SXM4-80GB",
+    "NVIDIA A100-SXM4-80GB",
+    "NVIDIA A100-SXM4-80GB",
+    "NVIDIA A100-SXM4-80GB"
+  ],
+  "world_size": 4,
+  "rank": 0,
+  "environment": {
+    "HF_HUB_OFFLINE": "1",
+    "HF_DATASETS_OFFLINE": "1",
+    "TRANSFORMERS_OFFLINE": "1",
+    "TOKENIZERS_PARALLELISM": "false"
+  },
+  "determinism": {
+    "cuda_initialized": true,
+    "algorithms_enabled": true,
+    "warn_only": false,
+    "cublas_workspace_config": ":4096:8",
+    "cudnn_deterministic": true,
+    "cudnn_benchmark": false,
+    "flash_sdp_enabled": false,
+    "memory_efficient_sdp_enabled": false,
+    "math_sdp_enabled": true,
+    "cudnn_sdp_enabled": false,
+    "pythia_attention_implementation": "eager"
+  }
+}

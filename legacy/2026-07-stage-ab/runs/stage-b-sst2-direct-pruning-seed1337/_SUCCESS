@@ -1,0 +1,10 @@
+{
+  "curves_json_sha256": "c2de74898f08b002c618105e88362247291dc2791d9fc33f771dd214d74a71fc",
+  "experiment_id": "stage-b-sst2-direct-pruning-seed1337",
+  "provenance_id": "4ede8c9aced68f047ae72736f26b1de2be25cf15d1bc5783a8c2039f1c8cf053",
+  "provenance_json_sha256": "bc5f9d9963b8fa8aa6635d833ed6bbf609645f647ab4cc4541d25f27b603a45c",
+  "rank_json_sha256": "8a25121407cfaad0c873b0e8019e5f25ce7de0283c3945a778fccc76fcb68e0b",
+  "record_count": 594,
+  "results_csv_sha256": "570690a127d57f7ab917d5df7e8ad13e39eacfa5e0c4937fd10fe06a5933ff38",
+  "results_json_sha256": "987e76142ed4c8dbd5867a21c77fee52fe841692000efe7310c3d22ae4714e72"
+}

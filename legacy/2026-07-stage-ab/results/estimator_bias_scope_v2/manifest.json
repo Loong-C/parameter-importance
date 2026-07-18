@@ -1,0 +1,289 @@
+{
+  "status": "completed",
+  "experiment": "estimator_bias_scope_analysis",
+  "method_variant": "scope_aware_stability_v2",
+  "config": {
+    "source_dir": "${DATA_ROOT}/results/estimator_bias",
+    "output_dir": "${DATA_ROOT}/results/estimator_bias_scope_v2",
+    "source_run_fingerprint": "88a6699bb08b6cfce81cad91dd926168af3bb356e6dda0d8172a443d0bbb69d6",
+    "method_variant": "scope_aware_stability_v2",
+    "required_stability_scopes": [
+      "layer",
+      "module"
+    ]
+  },
+  "analysis_fingerprint": "2052c2157cb43d0c6d34eb34b6b0d0552f8db69a54f4ac58048d6330de935865",
+  "source_run_fingerprint": "88a6699bb08b6cfce81cad91dd926168af3bb356e6dda0d8172a443d0bbb69d6",
+  "source_artifacts": [
+    {
+      "path": "/home/sophgo13/cjl/storage/parameter-importance/results/estimator_bias/manifest.json",
+      "size_bytes": 3318,
+      "sha256": "2c046e3c0ffcf06ce2ed43443e34b1c7f8bc32ec9ec00e41c62245f263793e2b"
+    },
+    {
+      "path": "/home/sophgo13/cjl/storage/parameter-importance/results/estimator_bias/summary.json",
+      "size_bytes": 1356,
+      "sha256": "8d1b55d76d696f4ffd1ae16bd428ff9ee5580d4f7060bd9dc569e0db840c9b9c"
+    },
+    {
+      "path": "/home/sophgo13/cjl/storage/parameter-importance/results/estimator_bias/metrics.csv",
+      "size_bytes": 68381,
+      "sha256": "9322897148badc9972660e6fcde1f77d97d786a9d79797d11f6bc78d5bbc401c"
+    },
+    {
+      "path": "/home/sophgo13/cjl/storage/parameter-importance/results/estimator_bias/runtime.csv",
+      "size_bytes": 1032265,
+      "sha256": "06c7110aa0a5268b2d2bc376c3911b26b4efc02b8409492166601ff93f65778f"
+    },
+    {
+      "path": "/home/sophgo13/cjl/storage/parameter-importance/results/estimator_bias/progress.jsonl",
+      "size_bytes": 10642,
+      "sha256": "36d1b4eef61ad4f43fd437a648fa7cbb852b2ee186ce4c4a5d4c359387800912"
+    }
+  ],
+  "source_units": [
+    {
+      "path": "/home/sophgo13/cjl/storage/parameter-importance/results/estimator_bias/units/checkpoint-0000-m-0008.npz",
+      "size_bytes": 56573542,
+      "sha256": "f3c0ddfa57408822e3af09ff403fe89df6be2e5e84a367ae255329b10d47820d",
+      "checkpoint": "step-000000",
+      "microbatch_count": 8
+    },
+    {
+      "path": "/home/sophgo13/cjl/storage/parameter-importance/results/estimator_bias/units/checkpoint-0000-m-0016.npz",
+      "size_bytes": 56575614,
+      "sha256": "5044b57d7c3c8eef85af33ed64552dbd851afa64fcc5e2f8ec99b7e6e5c67aa8",
+      "checkpoint": "step-000000",
+      "microbatch_count": 16
+    },
+    {
+      "path": "/home/sophgo13/cjl/storage/parameter-importance/results/estimator_bias/units/checkpoint-0000-m-0032.npz",
+      "size_bytes": 56575542,
+      "sha256": "b6f41b235968fcc803180fad0c84a18997b184750652bd4ce1e12435b20d6276",
+      "checkpoint": "step-000000",
+      "microbatch_count": 32
+    },
+    {
+      "path": "/home/sophgo13/cjl/storage/parameter-importance/results/estimator_bias/units/checkpoint-0001-m-0008.npz",
+      "size_bytes": 56575422,
+      "sha256": "a7f86a1b3ab104e8b69c1924a6fef62a64e8ba6574a521e4732bf4ebf7f0f98b",
+      "checkpoint": "step-000001",
+      "microbatch_count": 8
+    },
+    {
+      "path": "/home/sophgo13/cjl/storage/parameter-importance/results/estimator_bias/units/checkpoint-0001-m-0016.npz",
+      "size_bytes": 56576294,
+      "sha256": "ad2621b9e767d16a3566325fa15538bf1a7f1a07971bf88ba51c5913b49c55b9",
+      "checkpoint": "step-000001",
+      "microbatch_count": 16
+    },
+    {
+      "path": "/home/sophgo13/cjl/storage/parameter-importance/results/estimator_bias/units/checkpoint-0001-m-0032.npz",
+      "size_bytes": 56576194,
+      "sha256": "72fae505da12db7f2997a5f2a6fb75f09207eaff4d955d1578d62361285451a9",
+      "checkpoint": "step-000001",
+      "microbatch_count": 32
+    },
+    {
+      "path": "/home/sophgo13/cjl/storage/parameter-importance/results/estimator_bias/units/checkpoint-0002-m-0008.npz",
+      "size_bytes": 56575278,
+      "sha256": "64065beadf4efa574cc6ad49d736bb68d62a8fd01be27bd576673efe8eec795b",
+      "checkpoint": "step-000002",
+      "microbatch_count": 8
+    },
+    {
+      "path": "/home/sophgo13/cjl/storage/parameter-importance/results/estimator_bias/units/checkpoint-0002-m-0016.npz",
+      "size_bytes": 56576462,
+      "sha256": "62c8167f8eb55bf4e3c1ef128b0dc46bb22b32b31fcde49e7cb3fcee7f505852",
+      "checkpoint": "step-000002",
+      "microbatch_count": 16
+    },
+    {
+      "path": "/home/sophgo13/cjl/storage/parameter-importance/results/estimator_bias/units/checkpoint-0002-m-0032.npz",
+      "size_bytes": 56576262,
+      "sha256": "2b98449b37b551944dad76e68450228c6bf7cbb67f4d3b3ff4857618e2dc70b5",
+      "checkpoint": "step-000002",
+      "microbatch_count": 32
+    },
+    {
+      "path": "/home/sophgo13/cjl/storage/parameter-importance/results/estimator_bias/units/checkpoint-0003-m-0008.npz",
+      "size_bytes": 56575462,
+      "sha256": "cd57978da0d3d72fa075d867f7ed43e7b60412f74145ad10b85a49317fb25d7b",
+      "checkpoint": "step-000004",
+      "microbatch_count": 8
+    },
+    {
+      "path": "/home/sophgo13/cjl/storage/parameter-importance/results/estimator_bias/units/checkpoint-0003-m-0016.npz",
+      "size_bytes": 56576478,
+      "sha256": "8abf6fe56f0af29d3aaf8ce4aef4944a8008aaa754bebd9bcfb95dd457407f52",
+      "checkpoint": "step-000004",
+      "microbatch_count": 16
+    },
+    {
+      "path": "/home/sophgo13/cjl/storage/parameter-importance/results/estimator_bias/units/checkpoint-0003-m-0032.npz",
+      "size_bytes": 56576382,
+      "sha256": "b965617bd8beb5c8fc40bd25649fccef69021bc973ea7509cad7e1bc1c6bf85d",
+      "checkpoint": "step-000004",
+      "microbatch_count": 32
+    },
+    {
+      "path": "/home/sophgo13/cjl/storage/parameter-importance/results/estimator_bias/units/checkpoint-0004-m-0008.npz",
+      "size_bytes": 56575298,
+      "sha256": "bb0c7a2dbdbf3b9514b55b43d91071fa7e5d55db087003ae54883f3fc8fc5b4e",
+      "checkpoint": "step-000008",
+      "microbatch_count": 8
+    },
+    {
+      "path": "/home/sophgo13/cjl/storage/parameter-importance/results/estimator_bias/units/checkpoint-0004-m-0016.npz",
+      "size_bytes": 56576498,
+      "sha256": "0b5db61e5d3e8c537f312d77f74f46d8c7ad94358e49c494c8ca20825fdb071f",
+      "checkpoint": "step-000008",
+      "microbatch_count": 16
+    },
+    {
+      "path": "/home/sophgo13/cjl/storage/parameter-importance/results/estimator_bias/units/checkpoint-0004-m-0032.npz",
+      "size_bytes": 56576402,
+      "sha256": "b7473c20f8d910649681b712e6d2a50d0f56175394e50bd2aa4efd6270a2f393",
+      "checkpoint": "step-000008",
+      "microbatch_count": 32
+    },
+    {
+      "path": "/home/sophgo13/cjl/storage/parameter-importance/results/estimator_bias/units/checkpoint-0005-m-0008.npz",
+      "size_bytes": 56575350,
+      "sha256": "401fb31223a0074f2182aa8858d6505a02c093c22e67c8cd239b9c5d0fb37646",
+      "checkpoint": "step-000012",
+      "microbatch_count": 8
+    },
+    {
+      "path": "/home/sophgo13/cjl/storage/parameter-importance/results/estimator_bias/units/checkpoint-0005-m-0016.npz",
+      "size_bytes": 56576346,
+      "sha256": "eb5a51bf1bb944699a607cb1e3e02adcd878e76377554d6a174cce78d9609d5e",
+      "checkpoint": "step-000012",
+      "microbatch_count": 16
+    },
+    {
+      "path": "/home/sophgo13/cjl/storage/parameter-importance/results/estimator_bias/units/checkpoint-0005-m-0032.npz",
+      "size_bytes": 56576502,
+      "sha256": "806a3a30ea264cdf2fe5aeb5e3d4732988a7a4959290e721199dfc4e6027a583",
+      "checkpoint": "step-000012",
+      "microbatch_count": 32
+    },
+    {
+      "path": "/home/sophgo13/cjl/storage/parameter-importance/results/estimator_bias/units/checkpoint-0006-m-0008.npz",
+      "size_bytes": 56575278,
+      "sha256": "7d6db924cfee2b1741abe61ed6693923d64120bc3407b61870a6bad2d83a1b1e",
+      "checkpoint": "step-000016",
+      "microbatch_count": 8
+    },
+    {
+      "path": "/home/sophgo13/cjl/storage/parameter-importance/results/estimator_bias/units/checkpoint-0006-m-0016.npz",
+      "size_bytes": 56576578,
+      "sha256": "bcf91719c1a4c84f5b9bc628beee972353f02a8bf77aec76e10f0aea138e1cd0",
+      "checkpoint": "step-000016",
+      "microbatch_count": 16
+    },
+    {
+      "path": "/home/sophgo13/cjl/storage/parameter-importance/results/estimator_bias/units/checkpoint-0006-m-0032.npz",
+      "size_bytes": 56576414,
+      "sha256": "70d72a77bc76fb789aad9ce93f4bc1b93868d6be2217e03455b75579c09dbf74",
+      "checkpoint": "step-000016",
+      "microbatch_count": 32
+    },
+    {
+      "path": "/home/sophgo13/cjl/storage/parameter-importance/results/estimator_bias/units/checkpoint-0007-m-0008.npz",
+      "size_bytes": 56575342,
+      "sha256": "82ad612eec988dffa3b5723cfcb1909fc87afe022980d4a8f3321c28fce7662a",
+      "checkpoint": "step-000020",
+      "microbatch_count": 8
+    },
+    {
+      "path": "/home/sophgo13/cjl/storage/parameter-importance/results/estimator_bias/units/checkpoint-0007-m-0016.npz",
+      "size_bytes": 56576438,
+      "sha256": "4fa359060a622be2e8b87d20e50f9645fd563d67be063c188a1892fafcfdcde0",
+      "checkpoint": "step-000020",
+      "microbatch_count": 16
+    },
+    {
+      "path": "/home/sophgo13/cjl/storage/parameter-importance/results/estimator_bias/units/checkpoint-0007-m-0032.npz",
+      "size_bytes": 56576574,
+      "sha256": "df4410c3b1261b4f14b9f97dbf1b81b815c74614e30e9ca01750fdcd969a2c08",
+      "checkpoint": "step-000020",
+      "microbatch_count": 32
+    },
+    {
+      "path": "/home/sophgo13/cjl/storage/parameter-importance/results/estimator_bias/units/checkpoint-0008-m-0008.npz",
+      "size_bytes": 56575322,
+      "sha256": "40edc941b20d00e17dca6649e02f4267d3a545bbf66bec34808b3d3bc2265ba3",
+      "checkpoint": "step-000026",
+      "microbatch_count": 8
+    },
+    {
+      "path": "/home/sophgo13/cjl/storage/parameter-importance/results/estimator_bias/units/checkpoint-0008-m-0016.npz",
+      "size_bytes": 56576522,
+      "sha256": "9d53ea471e8c494f72e6cdccbe9eed075f16ff00a514f883a11d715e3be94f35",
+      "checkpoint": "step-000026",
+      "microbatch_count": 16
+    },
+    {
+      "path": "/home/sophgo13/cjl/storage/parameter-importance/results/estimator_bias/units/checkpoint-0008-m-0032.npz",
+      "size_bytes": 56576318,
+      "sha256": "d546ac27fc15a1e99c1a9655b787b8d40e501580956ed6835f66bc8d0d89811b",
+      "checkpoint": "step-000026",
+      "microbatch_count": 32
+    },
+    {
+      "path": "/home/sophgo13/cjl/storage/parameter-importance/results/estimator_bias/units/checkpoint-0009-m-0008.npz",
+      "size_bytes": 56575542,
+      "sha256": "261f4c057d169c5e45db3d8cf33e179ced36a4d66e689b5f0945ac1cddd2a691",
+      "checkpoint": "step-000030",
+      "microbatch_count": 8
+    },
+    {
+      "path": "/home/sophgo13/cjl/storage/parameter-importance/results/estimator_bias/units/checkpoint-0009-m-0016.npz",
+      "size_bytes": 56576570,
+      "sha256": "d895093c5a51f90d807e520f8c84332dd4999ddb7a3b8752575bbd9ece07f0b6",
+      "checkpoint": "step-000030",
+      "microbatch_count": 16
+    },
+    {
+      "path": "/home/sophgo13/cjl/storage/parameter-importance/results/estimator_bias/units/checkpoint-0009-m-0032.npz",
+      "size_bytes": 56576310,
+      "sha256": "2c5e1d8641691730df67681c9a125685c5b381f554f87025253aab2af8381961",
+      "checkpoint": "step-000030",
+      "microbatch_count": 32
+    }
+  ],
+  "provider_provenance": {
+    "provider": "param_importance_nlp.experiments.pythia_provider.PythiaEstimatorBiasProvider",
+    "model_size": "14m",
+    "checkpoint_root": "/home/sophgo13/cjl/storage/parameter-importance/runs/stage-a-14m-smoke-seed1234/checkpoints",
+    "checkpoint_ids": [
+      "step-000000",
+      "step-000001",
+      "step-000002",
+      "step-000004",
+      "step-000008",
+      "step-000012",
+      "step-000016",
+      "step-000020",
+      "step-000026",
+      "step-000030"
+    ],
+    "sequence_length": 128,
+    "dataset_bin": "/home/sophgo13/cjl/storage/parameter-importance/datasets/pile-deduped-pythia-preshuffled/document-00000-of-00020.bin",
+    "dataset_idx": "/home/sophgo13/cjl/storage/parameter-importance/datasets/pile-deduped-pythia-preshuffled/document.idx",
+    "manifest": "/home/sophgo13/cjl/storage/parameter-importance/manifests/prefix_coverage.json",
+    "verify_hashes": true,
+    "offline_only": true
+  },
+  "completed_at_unix": 1784032355.9359355,
+  "artifacts": [
+    "manifest.json",
+    "summary.json",
+    "metrics.csv",
+    "runtime.csv",
+    "stability.csv",
+    "progress.jsonl"
+  ],
+  "result_provenance": "verified persisted U-statistic means from the preserved formal source run; no gradient recomputation and no synthetic fallback"
+}

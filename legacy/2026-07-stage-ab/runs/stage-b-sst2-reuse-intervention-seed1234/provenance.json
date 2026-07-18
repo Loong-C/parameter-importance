@@ -1,0 +1,82 @@
+{
+  "config": {
+    "path": "/home/sophgo13/cjl/parameter-importance/configs/eval/stage_b_sst2_reuse_intervention_seed1234.yaml",
+    "sha256": "fe700b4f530093dd00722fdc9e76bb08deae5d635216d0ad5af5ff9755a9e9a2"
+  },
+  "dataset_manifest": {
+    "path": "/home/sophgo13/cjl/storage/parameter-importance/manifests/asset-manifest.json",
+    "revision": "bcdcba79d07bc864c1c254ccfcedcce55bcc9a8c",
+    "sha256": "e0e5dccda783fd44368e2ab1c86c71c86c31a716ef57a3dc45908208c998f849",
+    "split": "validation"
+  },
+  "device": "cuda",
+  "eligible": {
+    "definition": "same attention, MLP, and LM-head weight set in both checkpoints",
+    "identity_sha256": "5c62904952f5d660c8af98e2cf740c60361d5b35e903baa1540c4c0066694fe1",
+    "scalar_count": 123568128,
+    "tensor_count": 49
+  },
+  "experiment_id": "stage-b-sst2-reuse-intervention-seed1234",
+  "finetune": {
+    "checkpoint": "/home/sophgo13/cjl/storage/parameter-importance/runs/stage-b-sst2-pretrained-controlled-seed1234/checkpoints/step-003156",
+    "experiment_id": "stage-b-sst2-pretrained-controlled-seed1234",
+    "identity": {
+      "config_fingerprint": "2aec111a80866e1862caa67e3721690e23fe05c700216be7bc3c5a193c4e16ff",
+      "experiment_id": "stage-b-sst2-pretrained-controlled-seed1234",
+      "model_family": "pythia",
+      "model_size": "160m",
+      "route": "pretrained_finetuned",
+      "stage": "B",
+      "world_size": 4
+    },
+    "importance_sha256": "6f0d8a687bed210ee68af8c90307a01f4145dcb5611720f0815ab2c84d86465b",
+    "manifest_sha256": "f1e5885ae36a6914b762032f4cb3b099b2a6735c59beb0841337a2b353ea814a",
+    "model_sha256": "d55de16dba5a62961a0ef56f96181d312f041b41e2ef8883ef82d74391d88709",
+    "step": 3156
+  },
+  "finetune_resolved_config": {
+    "path": "/home/sophgo13/cjl/storage/parameter-importance/runs/stage-b-sst2-pretrained-controlled-seed1234/resolved_config.yaml",
+    "sha256": "78cae2a59e9c36a2256c7aca20935eb06172db4b5dd8263028be006b018655d4"
+  },
+  "pretrain": {
+    "checkpoint": "/home/sophgo13/cjl/storage/parameter-importance/runs/stage-b-160m-step512-seed1234-deterministic-trapezoid-v3/checkpoints/step-000512",
+    "experiment_id": "stage-b-160m-step512-seed1234-deterministic-trapezoid-v3",
+    "identity": {
+      "config_fingerprint": "2139a6256823ec5e6d85c986f17c79bdf1e9eedc1eef0739752953d65bf9eea7",
+      "experiment_id": "stage-b-160m-step512-seed1234-deterministic-trapezoid-v3",
+      "model_family": "pythia",
+      "model_size": "160m",
+      "route": "",
+      "stage": "B",
+      "world_size": 4
+    },
+    "importance_sha256": "09f536173f06425ce5caa95edc4f6f7b9b6e3d15512b8fcdcc9a04475ae446cb",
+    "manifest_sha256": "9b17375570beb48729258ed0f11aab927057588ff7a5a91a9fb40d55788c0bf2",
+    "model_sha256": "ff5497794fa56246169a36e33e0df7055612632570dd49f907ddf73f0ea001de",
+    "step": 512
+  },
+  "pretrain_resolved_config": {
+    "path": "/home/sophgo13/cjl/storage/parameter-importance/runs/stage-b-160m-step512-seed1234-deterministic-trapezoid-v3/resolved_config.yaml",
+    "sha256": "47e14cba28b4cf6a7a86714405499717a8eed645d660ee3bd8a18f5bee6cce1b"
+  },
+  "provenance_id": "a65d3536046adfedc65ec805ce944efbf7a25222e8d70b26a101eb94f9543794",
+  "score": "u_positive",
+  "tokenizer": {
+    "files": {
+      "special_tokens_map.json": {
+        "sha256": "6f50ab5a5a509a1c309d6171f339b196a900dc9c99ad0408ff23bb615fdae7ad",
+        "size": 99
+      },
+      "tokenizer.json": {
+        "sha256": "c24618a1b3e6a38167beff1c72cffd126c3a66254347304b50547d12c5f25624",
+        "size": 2113710
+      },
+      "tokenizer_config.json": {
+        "sha256": "600feab17b84296ecc5255c745bba867303b5117207ff4420515932b2f8ead80",
+        "size": 396
+      }
+    },
+    "path": "/home/sophgo13/cjl/storage/parameter-importance/models/pythia-160m-deduped-step0"
+  },
+  "torch": "2.12.1+cu126"
+}

@@ -1,0 +1,31 @@
+{
+  "best_step": 1200,
+  "controlled_run": true,
+  "dataset_scope": {
+    "train": "full",
+    "validation": "full"
+  },
+  "experiment_id": "stage-b-sst2-pretrained-controlled-seed2027",
+  "generalization_gaps": {
+    "accuracy_train_minus_validation": 0.09943153838808416,
+    "ece_validation_minus_train": -0.012170574361296094,
+    "nll_validation_minus_train": 0.17933150609791065
+  },
+  "model_source": "/home/sophgo13/cjl/storage/parameter-importance/runs/stage-b-sst2-pretrained-controlled-seed2027/best-validation/step-001200",
+  "schema_version": "sst2-full-train-evaluation-v1",
+  "selection": "minimum_validation_nll",
+  "splits": {
+    "train": {
+      "accuracy": 0.9159452998559741,
+      "ece": 0.04564849451616171,
+      "examples": 67349.0,
+      "nll": 0.22879091995479528
+    },
+    "validation": {
+      "accuracy": 0.8165137614678899,
+      "ece": 0.033477920154865615,
+      "examples": 872.0,
+      "nll": 0.40812242605270593
+    }
+  }
+}

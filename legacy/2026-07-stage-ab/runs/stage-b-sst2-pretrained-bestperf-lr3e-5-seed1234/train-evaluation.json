@@ -1,0 +1,31 @@
+{
+  "best_step": 800,
+  "controlled_run": false,
+  "dataset_scope": {
+    "train": "full",
+    "validation": "full"
+  },
+  "experiment_id": "stage-b-sst2-pretrained-bestperf-lr3e-5-seed1234",
+  "generalization_gaps": {
+    "accuracy_train_minus_validation": 0.06407228211911631,
+    "ece_validation_minus_train": 0.0019010505025968127,
+    "nll_validation_minus_train": 0.14070960075878663
+  },
+  "model_source": "/home/sophgo13/cjl/storage/parameter-importance/runs/stage-b-sst2-pretrained-bestperf-lr3e-5-seed1234/best-validation/step-000800",
+  "schema_version": "sst2-full-train-evaluation-v1",
+  "selection": "minimum_validation_nll",
+  "splits": {
+    "train": {
+      "accuracy": 0.8874667775319603,
+      "ece": 0.04652763732358656,
+      "examples": 67349.0,
+      "nll": 0.2889369503034211
+    },
+    "validation": {
+      "accuracy": 0.823394495412844,
+      "ece": 0.04842868782618337,
+      "examples": 872.0,
+      "nll": 0.4296465510622077
+    }
+  }
+}

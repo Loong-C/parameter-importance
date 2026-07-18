@@ -1,0 +1,85 @@
+experiment_id: stage-b-sst2-direct-controlled-seed2027
+stage: B
+model:
+  family: pythia
+  size: 160m
+  initialization_path: /home/sophgo13/cjl/storage/parameter-importance/models/pythia-160m-deduped-step0
+  tokenizer_path: /home/sophgo13/cjl/storage/parameter-importance/models/pythia-160m-deduped-step0
+  dtype: bfloat16
+  gradient_checkpointing: false
+data:
+  kind: sst2
+  bin_path: ''
+  idx_path: ''
+  manifest_path: /home/sophgo13/cjl/storage/parameter-importance/manifests/asset-manifest.json
+  dataset_path: /home/sophgo13/cjl/storage/parameter-importance/datasets/glue-sst2
+  split: train
+  sequence_length: 128
+  tokens_per_record: 2049
+  global_sequences_per_step: 64
+  sequences_per_gpu_per_microbatch: 8
+  gradient_accumulation_steps: 2
+  num_workers: 0
+  drop_last: true
+  start_cursor: 0
+optimizer:
+  name: adamw
+  learning_rate: 0.0001
+  betas:
+  - 0.9
+  - 0.95
+  epsilon: 1.0e-08
+  weight_decay: 0.1
+  max_grad_norm: 1.0
+  warmup_ratio: 0.01
+  scheduler: cosine
+importance:
+  enabled: true
+  accumulate_dtype: float32
+  save_signed: true
+  save_positive: true
+  save_negative: true
+  save_raw: true
+  save_actual_update: true
+  clip_adjusted_primary: true
+  require_equal_microbatches: true
+  integration_rule: trapezoid
+  endpoint_batch_policy: next_independent_batch
+  double_sampling_enabled: true
+  double_sampling_start_step: 1
+runtime:
+  seed: 2027
+  total_steps: 3156
+  output_dir: /home/sophgo13/cjl/storage/parameter-importance/runs/stage-b-sst2-direct-controlled-seed2027
+  checkpoint_steps:
+  - 0
+  - 789
+  - 1578
+  - 3156
+  log_every: 10
+  eval_every: 100
+  resume_from: ''
+  deterministic: true
+  allow_tf32: true
+  offline: true
+evaluation:
+  validation_dataset_path: /home/sophgo13/cjl/storage/parameter-importance/datasets/glue-sst2
+  validation_split: validation
+  validation_batch_size: 32
+  max_validation_batches: null
+  public_checkpoint_path: ''
+task:
+  name: sst2
+  prompt_style: letter_verbalizer
+  max_length: 128
+  label_tokens:
+    '0': ' A'
+    '1': ' B'
+  train_batch_size: 64
+  sequences_per_gpu_per_microbatch: 8
+  gradient_accumulation_steps: 2
+  epochs: 3
+  controlled_run: true
+metadata:
+  route: direct_supervised
+  glue_revision: bcdcba79d07bc864c1c254ccfcedcce55bcc9a8c

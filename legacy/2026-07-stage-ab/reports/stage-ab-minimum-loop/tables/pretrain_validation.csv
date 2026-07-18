@@ -1,0 +1,15 @@
+experiment_id,loss,perplexity,phase,public_checkpoint,step,tokens
+stage-b-160m-step512-seed1234-deterministic-trapezoid-v3,11.06013780299241,63585.31350900378,initial,False,0.0,251904.0
+stage-b-160m-step512-seed1234-deterministic-trapezoid-v3,7.944529370563786,2820.104924653122,periodic,False,64.0,251904.0
+stage-b-160m-step512-seed1234-deterministic-trapezoid-v3,7.414198138849522,1659.3780439921823,periodic,False,128.0,251904.0
+stage-b-160m-step512-seed1234-deterministic-trapezoid-v3,7.1094789737608375,1223.5098992294156,periodic,False,192.0,251904.0
+stage-b-160m-step512-seed1234-deterministic-trapezoid-v3,6.779995910520476,880.0651250921352,periodic,False,256.0,251904.0
+stage-b-160m-step512-seed1234-deterministic-trapezoid-v3,6.779995910520476,880.0651250921352,resume_baseline,False,256.0,251904.0
+stage-b-160m-step512-seed1234-deterministic-trapezoid-v3,6.485981158124722,655.8821727655134,periodic,False,320.0,251904.0
+stage-b-160m-step512-seed1234-deterministic-trapezoid-v3,6.485981158124722,655.8821727655134,periodic,False,320.0,251904.0
+stage-b-160m-step512-seed1234-deterministic-trapezoid-v3,6.218391697581222,501.89538300315155,periodic,False,384.0,251904.0
+stage-b-160m-step512-seed1234-deterministic-trapezoid-v3,6.218391697581222,501.89538300315155,periodic,False,384.0,251904.0
+stage-b-160m-step512-seed1234-deterministic-trapezoid-v3,6.077139164374127,435.7807127309724,periodic,False,448.0,251904.0
+stage-b-160m-step512-seed1234-deterministic-trapezoid-v3,6.077139164374127,435.7807127309724,periodic,False,448.0,251904.0
+stage-b-160m-step512-seed1234-deterministic-trapezoid-v3,6.048910001429116,423.6509993002924,periodic,False,512.0,251904.0
+stage-b-160m-step512-seed1234-deterministic-trapezoid-v3,6.495685174213192,662.2778455893006,published_comparison,True,512.0,251904.0

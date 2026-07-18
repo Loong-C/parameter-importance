@@ -1,0 +1,50 @@
+{
+  "status": "measured",
+  "gate_passed": false,
+  "gates": {
+    "group_bias": {
+      "layer": {
+        "u_absolute_bias": 9.822251083385389e-07,
+        "raw_absolute_bias": 4.822093811303845e-05,
+        "ratio": 0.020369265857831893,
+        "threshold_max": 0.95,
+        "passed": true
+      },
+      "module": {
+        "u_absolute_bias": 9.64539433153616e-07,
+        "raw_absolute_bias": 4.822093811303928e-05,
+        "ratio": 0.02000250245842475,
+        "threshold_max": 0.95,
+        "passed": true
+      }
+    },
+    "ranking": {
+      "u_spearman": 0.4973087960780676,
+      "double_spearman": 0.47995714946121826,
+      "tolerance": 0.0,
+      "passed": true
+    },
+    "mse_or_cost": {
+      "u_mse": 7.607005730345576e-18,
+      "double_mse": 8.31401646973368e-18,
+      "mse_ratio": 0.9149615902299564,
+      "formula_cost_ratio": 0.7650615594275342,
+      "passed": true
+    },
+    "m_ge_8_stability": {
+      "minimum_adjacent_spearman": 0.3957230017311087,
+      "threshold_min": 0.9,
+      "passed": false
+    },
+    "numerical_dominance": {
+      "maximum_fraction": 0.012575642704525504,
+      "threshold_max": 0.5,
+      "passed": true
+    }
+  },
+  "interpretation": "stage_a_gate_not_met; inspect metrics.csv and do not expand",
+  "checkpoint_count": 10,
+  "metric_rows": 360,
+  "runtime_rows": 8000,
+  "stability_rows": 20
+}

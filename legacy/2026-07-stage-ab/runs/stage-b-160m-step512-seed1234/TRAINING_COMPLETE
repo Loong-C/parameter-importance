@@ -1,0 +1,20 @@
+{
+  "data_cursor": 524288,
+  "experiment_id": "stage-b-160m-step512-seed1234",
+  "final_validation": {
+    "experiment_id": "stage-b-160m-step512-seed1234",
+    "loss": 6.0412836927708575,
+    "perplexity": 420.432394652142,
+    "phase": "periodic",
+    "public_checkpoint": false,
+    "step": 512,
+    "tokens": 251904.0
+  },
+  "public_comparison": {
+    "perplexity_ratio": 0.6348586629980338,
+    "ratio_gate_passed": true,
+    "validation_improved_from_initial": true
+  },
+  "step": 512,
+  "tokens_seen": 1073741824
+}

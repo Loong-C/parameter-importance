@@ -1,0 +1,12 @@
+{
+  "best_validation_loss": 0.40812242605270593,
+  "best_validation_step": 1200,
+  "experiment_id": "stage-b-sst2-pretrained-controlled-seed2027",
+  "generalization_gaps": {
+    "accuracy_train_minus_validation": 0.09943153838808416,
+    "ece_validation_minus_train": -0.012170574361296094,
+    "nll_validation_minus_train": 0.17933150609791065
+  },
+  "step": 3156,
+  "train_evaluation": "train-evaluation.json"
+}

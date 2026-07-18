@@ -1,0 +1,5 @@
+baseline,kind,checkpoint_step,accuracy,nll,ece,examples
+majority_class,analytical_empirical_prior,,0.5091743119266054,0.6929788351143502,0.0,872
+published_pythia_160m_deduped_step0,published_checkpoint,0,0.481651376146789,0.7181956593049775,0.1111429726683435,872
+published_pythia_160m_deduped_step512,published_checkpoint,512,0.4908256880733945,1.080982594315065,0.3642443128333779,872
+uniform_random_expected,analytical_expected_value,,0.5,0.6931471805599453,0.0,872
