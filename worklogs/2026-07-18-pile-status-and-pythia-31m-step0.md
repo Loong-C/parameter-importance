@@ -59,3 +59,9 @@ Pile 下载监督链仍在运行，但 shard 5 的字节进度暂时受外部 DN
 ## 尚未解决的问题与下一步
 
 - Pile 当前外部 DNS/Xet 阻塞仍未解决；监督器将持续自动重试。
+
+## 2026-07-18 14:51 CST — 最终临时项复核
+
+- 最终 `/tmp` 扫描发现两份 2026-07-16 遗留同步文件：`parameter-importance-93496dc.bundle`（8,486 bytes）与 `parameter-importance-7e3a3d8.bundle`（1,652 bytes）。
+- 两者经 `realpath` 和 `stat` 确认为 `/tmp` 下的普通文件，属主/属组为 `sophgo13:sophgo13`；按旧实验清场范围精确删除并逐一确认路径不再存在。
+- 未清理 reflog、未执行 Git GC、未修改 Git 历史或分支；Git 中的对应提交不受影响。
