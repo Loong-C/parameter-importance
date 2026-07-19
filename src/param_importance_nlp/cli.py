@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 import sys
 
+from .capacity import StorageBudget, check_launch_storage
 from .git_guard import format_findings, scan_repository
 from .storage import REQUIRED_DIRECTORIES, StorageLayout, run_storage_canary
 
@@ -43,6 +44,23 @@ def _storage_check(arguments: argparse.Namespace) -> int:
     return 0 if report["ok"] else 1
 
 
+def _storage_budget_check(arguments: argparse.Namespace) -> int:
+    budget = StorageBudget.from_expected(arguments.name, arguments.expected_new_bytes)
+    report = {
+        "schema_version": "stage0.storage-launch-check.v1",
+        "budget": budget.as_dict(),
+        "measurement": check_launch_storage(
+            data_root=arguments.data_root,
+            root_filesystem=arguments.root_filesystem,
+            budget=budget,
+            root_minimum_free_bytes=arguments.root_minimum_free_bytes,
+        ),
+    }
+    report["ok"] = report["measurement"]["ok"]  # type: ignore[index]
+    print(json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True))
+    return 0 if report["ok"] else 1
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="param-importance-stage0")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -58,6 +76,16 @@ def build_parser() -> argparse.ArgumentParser:
     storage.add_argument("--require-writable", action="store_true")
     storage.add_argument("--canary", action="store_true")
     storage.set_defaults(handler=_storage_check)
+
+    budget = subparsers.add_parser("storage-budget-check")
+    budget.add_argument("--data-root", type=Path, required=True)
+    budget.add_argument("--root-filesystem", type=Path, required=True)
+    budget.add_argument("--name", required=True)
+    budget.add_argument("--expected-new-bytes", type=int, required=True)
+    budget.add_argument(
+        "--root-minimum-free-bytes", type=int, default=10 * 1024 * 1024 * 1024
+    )
+    budget.set_defaults(handler=_storage_budget_check)
     return parser
 
 

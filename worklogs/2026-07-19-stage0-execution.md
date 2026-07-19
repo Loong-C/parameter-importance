@@ -112,3 +112,28 @@
 - G1-B：本地机制和拒绝测试已通过；仍需在服务器同一提交上完成 13 目录 canary、根盘/大盘启动检查后最终判定。
 - G1-D：`PENDING_USER_DECISION`。当前无已授权第二故障域；建议仅对 Stage 0 可再生 smoke 产物接受至 2026-08-18 或 Stage 4 开始前（先发生者）的单盘风险，正式 Stage 4/5 产物不在建议范围。
 - G1 总 gate：尚未通过，因此不开始新资产下载或环境重建。
+
+## 2026-07-19 10:35 CST — G1-B 服务器核验通过
+
+### 实际修改与同步
+
+- 提交 `50282e3d879f09a7ba9fc1dd2541bbe24bda00b2` 已推送到 GitHub `feat/stage0-infrastructure`。
+- 已验证 bundle 后，在服务器从 `main@34966d0` 创建同名分支；服务器 HEAD 与本机/GitHub 一致且工作树干净。
+- 服务器只运行 CPU 测试、Git 守卫、存储/原子 canary 和空间/inode 只读检查；未导入 CUDA、未查询 GPU、未启动训练。
+
+### 实验与验证
+
+| 项目 | 命令/配置 | 结果 | 证据路径 |
+|---|---|---|---|
+| 服务器 CPU 测试 | 现有锁定 venv，三个 Stage 0 测试文件 | 21 passed，退出码 0 | 本轮终端记录 |
+| 服务器 Git 守卫 | 同一提交、完整工作树 | `PASS`，退出码 0 | 本轮终端记录 |
+| 13 目录 canary | `storage-check --require-writable --canary` | 13/13 通过，0 失败，0 残留 | `reports/stage0/g1-storage-canary-20260719.json`；服务器同名报告 |
+| canary 哈希 | 本机下载后与服务器比对 | SHA-256 `76fa7a93...35757fac` 一致 | `reports/stage0/g1-storage-mechanism-20260719.json` |
+| Stage 0 启动空间 | 预计新增 620,000,000,000 B | 需 744,000,000,000 B；大盘可用 3,079,944,097,792 B | 同上 |
+| 根盘/inode 保护 | 根盘 10 GiB 门槛；大盘 inode | 根盘可用 15,176,171,520 B；inode 可用 233,426,897 | 同上 |
+
+### Gate 判定
+
+- G1-B：`PASS`。
+- G1-D：仍为 `PENDING_USER_DECISION`。
+- G1 总 gate：`BLOCKED`；在用户作出明确持久性决定前，不启动 S0.3 环境重建或 S0.4 新资产获取。
