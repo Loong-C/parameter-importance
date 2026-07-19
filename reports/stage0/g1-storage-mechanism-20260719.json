@@ -1,7 +1,8 @@
 {
   "schema_version": "stage0.gate-report.v1",
   "generated_at": "2026-07-19T10:35:00+08:00",
-  "git_commit": "50282e3d879f09a7ba9fc1dd2541bbe24bda00b2",
+  "git_commit": "02f4d4376ecdf624552c70a8f066e8d1957cfa06",
+  "canary_implementation_commit": "50282e3d879f09a7ba9fc1dd2541bbe24bda00b2",
   "gate": "G1-B",
   "status": "PASS",
   "checks": {
@@ -26,10 +27,10 @@
       "status": "PASS",
       "stage0_expected_new_bytes": 620000000000,
       "stage0_required_free_bytes": 744000000000,
-      "data_root_free_bytes": 3079944097792,
+      "data_root_free_bytes": 3079252004864,
       "root_disk_minimum_free_bytes": 10737418240,
-      "root_disk_free_bytes": 15176171520,
-      "data_root_free_inodes": 233426897,
+      "root_disk_free_bytes": 15175081984,
+      "data_root_free_inodes": 233426895,
       "data_root_inode_use_percent": 1,
       "analytical_budget_evidence": "reports/stage0/g1-capacity-budget-20260719.json"
     },
@@ -54,7 +55,7 @@
     "tests": {
       "status": "PASS",
       "local": "22 passed",
-      "server_at_commit": "21 passed",
+      "server_at_commit": "22 passed",
       "server_cpu_only": true
     }
   },
