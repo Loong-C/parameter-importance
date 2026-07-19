@@ -60,6 +60,8 @@
     }
   },
   "active_pile_shard7_touched": false,
-  "g1_d_status": "PENDING_USER_DECISION",
-  "g1_overall_status": "BLOCKED"
+  "g1_d_status": "PASS",
+  "g1_d_satisfaction": "TIME_BOUNDED_RISK_ACCEPTANCE",
+  "g1_d_evidence": "reports/stage0/g1-persistence-decision-20260719.json",
+  "g1_overall_status": "PASS"
 }

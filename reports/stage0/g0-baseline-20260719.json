@@ -39,7 +39,18 @@
     },
     "G0-G": {
       "status": "BLOCKED",
-      "reason": "GPU enumeration and health require administrator action",
+      "reason": "Project scope is reduced to four GPUs, but path B still requires an administrator-enforced PCI/UUID allowlist and excluded-device disposition",
+      "project_scope_decision": {
+        "recorded_at": "2026-07-19T11:35:31+08:00",
+        "requested_gpu_count": 4,
+        "requested_remediation_path": "B",
+        "status": "PROJECT_OWNER_APPROVED_ADMIN_PENDING",
+        "default_exclusions": [
+          "0000:4f:00.0",
+          "0000:50:00.0"
+        ],
+        "interpretation": "The project may proceed on four administrator-approved healthy GPUs; the two unresolved devices remain excluded defects and are not treated as repaired or ignored."
+      },
       "evidence": {
         "driver_version": "575.57.08",
         "pci_gpu_count": 8,
@@ -56,14 +67,15 @@
         "gpu_queries_stopped": true
       },
       "required_resolution": [
-        "Administrator diagnoses the missing 0000:4f:00.0 device",
-        "Administrator disposes of the ECC/Xid/row-remap condition on 0000:50:00.0",
-        "Either 8/8/8 enumeration is restored or an explicit stable allowlist and exclusion decision is issued",
+        "Administrator issues a stable four-GPU PCI/UUID allowlist and enforces it through the authoritative allocation layer",
+        "Administrator records exclusion and disposition for 0000:4f:00.0 and 0000:50:00.0",
+        "NVML and PyTorch enumerate the approved allowlist with identical mappings; unexplained 8/7 remains unacceptable",
         "The selected four-GPU set is rechecked before any CUDA or NCCL test"
       ]
     }
   },
   "system_snapshot": {
+    "hostname": "sophgo13",
     "os": "Ubuntu 24.04.3 LTS",
     "kernel": "6.8.0-134-generic",
     "glibc": "2.39",

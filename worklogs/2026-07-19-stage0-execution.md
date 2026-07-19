@@ -158,3 +158,83 @@
 - 本机与服务器完整 CPU 测试均为 22 passed、退出码 0。
 - 服务器真实 `storage-budget-check` 返回 `ok=true`：大盘可用 3,079,252,004,864 B，要求 744,000,000,000 B；根盘可用 15,175,081,984 B，高于 10 GiB；inode 可用 233,426,895。
 - G1-B 保持 `PASS`；G1-D 仍等待用户明确决定。
+
+## 2026-07-19 10:50 CST — G1-D 获得有期限风险接受
+
+### 用户决定
+
+- 用户明确接受仅 Stage 0 可再生 smoke 产物的单盘丢失风险，有效至 2026-08-18 23:59 CST 或 Stage 4 开始前（先发生者）。
+- 用户明确排除 Stage 4/5 正式产物；该决定不能自动扩展到正式 checkpoint、正式原始结果、人工判定或论文唯一证据。
+- 决定全文、范围、期限和提前失效条件已写入 `docs/stage0/persistence-decision.md` 与机器可读报告。
+
+### Gate 判定
+
+- G1-B：`PASS`。
+- G1-D：`PASS — TIME_BOUNDED_RISK_ACCEPTANCE`。
+- G1：`PASS`。S0.3 环境重建和 S0.4 受控资产工作可以按前置条件开始。
+- Stage 4 开始前必须重新审核并取得覆盖正式产物的备份/风险决定；当前批准届时自动失效。
+
+## 2026-07-19 11:35 CST — GPU 范围收缩为管理员隔离的健康四卡
+
+### 用户决定与准确解释
+
+- 用户确认项目只需要四张 GPU，并选择 G0-G 验收路径 B（稳定隔离/降配）。
+- 项目侧接受把异常设备排除在候选四卡之外，但不把故障记为“已忽略”或“已修复”。
+- 当前至少有两个不同异常对象：`0000:4f:00.0` 在 PCI/驱动层存在但 NVIDIA RM
+  初始化失败；`0000:50:00.0` 有不可纠正 ECC、pending row remap 和 Xid 95。
+- 两设备在管理员逐卡清除前均为默认排除项；不能仅用变化后的数字 GPU index 隐藏
+  8/7 枚举差异。
+
+### Gate 与责任边界
+
+- 项目所有者状态：`APPROVED`；服务器管理员状态：`PENDING`。
+- 管理员仍须给出并强制实施精确四卡 PCI/UUID 白名单、两张异常设备的隔离机制与
+  处置结论、审批期限和失效条件，并确认 NVML/PyTorch 对白名单映射一致。
+- 管理员清场前不再调用 GPU 管理/计算 runtime，不执行 reset、驱动重载、节点重启、
+  ECC 清除、PCI unbind/rebind 或 `sudo` 操作。
+- G0-G 与 G0 继续为 `BLOCKED`；S0.2–S0.5 的纯 CPU 工作可继续，S0.6 GPU、S0.7、
+  GPU 容量实测和正式训练仍禁止。
+
+### 环境重建收口
+
+- S0.3 已实现严格 lock/freeze/wheelhouse 身份模块和非破坏性离线重建入口。
+- 服务器无特权 network namespace 因 `uid_map: Operation not permitted` 不可用；入口
+  明确使用环境白名单、pip hash-checking/`--no-index` 和所有 Python/pip 子进程的
+  `strace` 连接审计，不声称内核级断网。
+- 在 G0-G 阻塞期间，成功的 CPU 重建只能发布
+  `CPU_ONLY_CANDIDATE`（`training_eligible=false`、`g2_status=BLOCKED`），不能更新
+  训练推荐环境或冒充 G2 通过。
+
+## 2026-07-19 16:25 CST — S0.3/S0.4 本地实现收口
+
+### 环境与 lock 加固
+
+- S0.3 重建入口固定读取三份服务器依赖输入，并以机器可读 lock provenance 绑定
+  输入 SHA-256、lock SHA-256、目标平台和核心 runtime 策略；调用者不能替换必需
+  输入，直接依赖缺失或精确 pin 冲突均在创建候选 venv 前失败。
+- wheel 覆盖从名称/版本前缀检查升级为 CPython 3.12、Linux x86-64、manylinux
+  glibc 2.28 兼容标签检查；Windows/macOS、错误架构、错误 ABI 和过新的 manylinux
+  wheel 不再计入覆盖。
+- 核心导入现在逐项核对 Python series、Torch/Transformers/Datasets/Accelerate/
+  TensorBoard、Torch CUDA runtime、cuDNN runtime 与 cuDNN/NCCL 分发包版本。
+  实际 NCCL runtime 仍明确等待 G0-G 后的四卡复验。
+- immutable evidence 和 advisory lock 均拒绝符号链接、非普通文件和多硬链接，避免
+  锁文件截断/污染其他对象。
+
+### 资产合同基础
+
+- S0.4 新增严格资产状态机、角色/证据授权、类型化元数据和固定 revision 校验。
+- READY 解析始终执行完整 SHA-256；READY/INVALID 历史不能在原路径覆盖。
+- manifest 发布要求批准根目录，使用 per-object lock 与 digest CAS，拒绝越界、
+  symlink/junction、并发旧写和无证据状态推进。
+- 这些是 S0.4 的合同与测试基础，不代表服务器实际资产已经全部盘点或 G3 已通过。
+
+### 本地验证
+
+- `pytest -q`：121 passed，1 skipped；唯一 skip 是当前 Windows 无创建目录符号链接
+  权限，对应测试必须在 Linux 服务器补跑。
+- `python -m compileall -q src ops tests`：通过。
+- 8 份 JSON 解析、Draft 2020-12 schema 自检和 `git diff --check`：通过（仅既有
+  Windows checkout 的 LF/CRLF 提示）。
+- 服务器离线重建尚未启动，现有 venv、候选目录和训练任务均未改动；S0.3/G2 仍未
+  因本地测试而标记为通过。

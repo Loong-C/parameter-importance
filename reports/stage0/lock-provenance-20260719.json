@@ -1,0 +1,58 @@
+{
+  "schema_version": "stage0.lock-provenance.v1",
+  "generated_at": "2026-07-19T11:35:31+08:00",
+  "lock_path": "environment/requirements.lock",
+  "lock_sha256": "1bd963c65f75e2077678f289550de8bf6f62ec20bf143f95e8be6350873cf1a5",
+  "distribution_count": 89,
+  "dependency_inputs": {
+    "environment/base-requirements.in": "4aece9997d28dbfe2794bb033ce40b6dd2d3974c7630623a396efe1b7ebde1fc",
+    "environment/linux-only-requirements.in": "f1b8cc1c563503b08dc79d7443da4e9e5411e187ff2362ec923a8abb193cf74a",
+    "environment/requirements.in": "8138d14bd03d07d35a2cb7453cc3f73a82e6d2f3afb1dd3bdea745fb5616ff97"
+  },
+  "target": {
+    "implementation": "CPython",
+    "python": "3.12",
+    "abi": "cp312",
+    "os": "Linux",
+    "architecture": "x86_64",
+    "platform_tags": [
+      "manylinux_2_28_x86_64",
+      "manylinux_2_17_x86_64",
+      "manylinux2014_x86_64"
+    ]
+  },
+  "resolution": {
+    "base_resolver": "pip 25.0.1",
+    "base_resolution_report_sha256": "9464bc33d531b15c58492bd5e8510071ff159bc461b076b4a8b2915005f123e3",
+    "generator": "scripts/lock_from_pip_report.py",
+    "generator_commits": [
+      "96ec8bf80a6cf570828f40e2b143bd9def5fc1c5",
+      "fd6b69c413da0b3d5607388601489e7748690de3"
+    ],
+    "completion_method": "Explicit audit of Linux PyTorch and CUDA wheel metadata added required CUDA, cuDNN, NCCL, NVSHMEM, Triton, hf-xet, and cuFile pins.",
+    "source_indexes": [
+      "PyPI",
+      "PyTorch CUDA 12.6 index",
+      "NVIDIA Python index"
+    ]
+  },
+  "bootstrap_installer": {
+    "server_existing_environment": "pip 24.0",
+    "relationship_to_resolver": "The bootstrap installer is recorded separately and did not re-resolve the application lock."
+  },
+  "runtime_expectations": {
+    "python_implementation": "CPython",
+    "python_series": "3.12",
+    "torch": "2.12.1+cu126",
+    "transformers": "4.57.6",
+    "datasets": "4.8.5",
+    "accelerate": "1.14.0",
+    "tensorboard": "2.21.0",
+    "torch_cuda_runtime": "12.6",
+    "cudnn_distribution": "9.10.2.21",
+    "cudnn_runtime": "9.10.2",
+    "nccl_distribution": "2.29.3",
+    "nccl_runtime_validation": "DEFERRED_UNTIL_G0_G"
+  },
+  "secrets_included": false
+}

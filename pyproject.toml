@@ -33,7 +33,7 @@ where = ["src"]
 
 [tool.pytest.ini_options]
 addopts = "-ra --strict-markers"
-pythonpath = ["src"]
+pythonpath = [".", "src"]
 testpaths = ["tests"]
 markers = [
   "server_cpu: requires the Linux server environment",
