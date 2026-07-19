@@ -268,3 +268,18 @@
   `g2_status=BLOCKED`；没有更新训练环境引用，没有调用 GPU 枚举/计算 runtime。
 - 最终权限核对发现协作 umask 使两份 immutable identity/build 初始模式为 `0664`；
   内容和单链接均正确，但需收紧为 `0644`、目录为 `0755`，并加代码防回归后再封存。
+
+## 2026-07-19 17:02 CST — S0.3 证据封存
+
+- 提交 `5541f660b39d79af135878c22c9efbf70643e49a` 已同步到本机、GitHub 和服务器；
+  用户在知悉内部服务器路径、环境版本和产物哈希后明确批准上传。
+- identity/build 目录已精确收紧为 `0755`，两份不可变文件收紧为 `0644`、link count
+  均为 1；收紧前后内容 SHA-256 不变。
+- 同步后的候选环境在 Linux 上最终全量复验为 123 passed、0 failed；测试专属临时
+  根按已核验绝对路径和所有者精确删除。
+- 服务器原始重建报告、identity、build observation 和 CPU candidate 引用的绝对
+  路径、SHA-256、权限及 gate 判定已封存在
+  `reports/stage0/g2-environment-candidate-20260719.json`。
+- S0.3 的 CPU/离线范围完成；G2 仍正确保持 `BLOCKED`，只因管理员 G0-G 四卡
+  allowlist、逐卡 CUDA 和实际 NCCL runtime 尚未完成。按用户要求，S0.4–S0.12
+  暂停，不继续执行。

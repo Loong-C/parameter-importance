@@ -2,10 +2,11 @@
 
 ## 当前结论
 
-仓库现已具备 S0.3 的本地审计基础：严格 lock/freeze 解析、现场漂移比较、
-wheelhouse TSV 清单核验和稳定 `environment_id`。这不等于 G2 已通过；服务器
-候选环境的离线重建、零外连审计、缺 wheel 负向演练以及硬件恢复后的逐卡 CUDA
-检查仍需独立证据。
+S0.3 的 CPU 与离线范围已经在服务器完成：严格 lock/freeze、wheelhouse TSV、
+稳定 `environment_id`、非破坏性离线重建、零外连审计、缺 wheel 负向演练和新候选
+Linux 全量测试均通过。机器可读摘要见
+`reports/stage0/g2-environment-candidate-20260719.json`。这仍不等于完整 G2 通过；
+管理员路径 B、逐卡 CUDA 健康和实际四卡 NCCL runtime 仍由 G0-G 阻塞。
 
 ## 运行时决策
 
