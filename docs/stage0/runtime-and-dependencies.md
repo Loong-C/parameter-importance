@@ -95,6 +95,10 @@ Torch CUDA runtime、cuDNN runtime 及 cuDNN/NCCL 分发包版本。实际 NCCL 
 `environment-builds/<build_id>.json`。因此同一内容在新的版本化候选路径重建可得到
 同一 `environment_id`，而每次构建仍有独立证据链。
 
+identity/build 不可变文件固定为 `0644`，对应子目录固定为 `0755`；读取已有 identity
+时还会拒绝 symlink、非普通文件、多硬链接以及组/其他可写权限，避免协作 umask 把
+证据悄然降级为可改写对象。
+
 当前 G0-G 仍为 `BLOCKED`，所以 CPU 导入和离线重建即使通过也只原子发布
 `environment-cpu-candidate.json`，其中 `training_eligible=false`、`g2_status=BLOCKED`。
 它不会更新普通训练推荐引用。只有管理员批准稳定四卡 PCI/UUID 白名单，并完成逐卡

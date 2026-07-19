@@ -129,7 +129,7 @@ def ensure_approved_subdirectory(root: Path, parent: Path, name: str) -> Path:
         raise ValueError(f"Unsafe subdirectory name: {name!r}")
     candidate = resolved_parent / name
     try:
-        candidate.mkdir()
+        candidate.mkdir(mode=0o755)
     except FileExistsError:
         pass
     if candidate.is_symlink():
@@ -138,6 +138,10 @@ def ensure_approved_subdirectory(root: Path, parent: Path, name: str) -> Path:
     resolved.relative_to(approved_root)
     if not resolved.is_dir():
         raise NotADirectoryError(resolved)
+    if os.name != "nt" and stat.S_IMODE(resolved.stat().st_mode) & 0o022:
+        raise RuntimeError(
+            f"Immutable manifest subdirectory may not be group/other writable: {resolved}"
+        )
     return resolved
 
 
@@ -613,6 +617,7 @@ def write_immutable(path: Path, payload: bytes) -> None:
         handle.write(payload)
         handle.flush()
         os.fsync(handle.fileno())
+    os.chmod(temporary, 0o644)
     try:
         os.link(temporary, path)
         if os.name != "nt":
@@ -643,6 +648,10 @@ def read_immutable(path: Path) -> bytes:
         if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
             raise RuntimeError(
                 f"Immutable evidence must be a single-link regular file: {path}"
+            )
+        if os.name != "nt" and stat.S_IMODE(metadata.st_mode) & 0o022:
+            raise RuntimeError(
+                f"Immutable evidence may not be group/other writable: {path}"
             )
         get_effective_uid = getattr(os, "geteuid", None)
         if get_effective_uid is not None and metadata.st_uid != get_effective_uid():

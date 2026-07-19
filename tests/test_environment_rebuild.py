@@ -420,6 +420,8 @@ def test_write_immutable_never_overwrites_existing_evidence(tmp_path: Path) -> N
 
     assert target.read_bytes() == b"first\n"
     assert not list(target.parent.glob(f".{target.name}.tmp-*"))
+    if rebuild.os.name != "nt":
+        assert target.stat().st_mode & 0o022 == 0
 
 
 def test_read_immutable_rejects_a_hard_link(tmp_path: Path) -> None:
@@ -429,6 +431,16 @@ def test_read_immutable_rejects_a_hard_link(tmp_path: Path) -> None:
     target.hardlink_to(source)
 
     with pytest.raises(RuntimeError, match="single-link regular file"):
+        read_immutable(target)
+
+
+@pytest.mark.skipif(rebuild.os.name == "nt", reason="POSIX permission semantics")
+def test_read_immutable_rejects_group_writable_evidence(tmp_path: Path) -> None:
+    target = tmp_path / "identity.json"
+    target.write_bytes(b"evidence\n")
+    target.chmod(0o664)
+
+    with pytest.raises(RuntimeError, match="group/other writable"):
         read_immutable(target)
 
 

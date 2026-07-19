@@ -248,3 +248,23 @@
 - 测试专属临时根先核对绝对路径和所有者，再精确递归删除；未接触活动 Pile shard。
 - 重建预检发现 `DATA_ROOT/locks` 不存在，且它不属于 S0.2 批准的 13 个顶层目录。
   因此没有临时创建新根目录；重建锁修正为既有 `operations/` 下的固定文件后再执行。
+
+## 2026-07-19 16:50 CST — CPU-only 环境重建通过
+
+- 服务器在提交 `9335fe6f8f8c090af90628c4dfe9d4760c9219c8` 上完成非破坏性
+  离线重建，报告状态 `PASS`，耗时 228.514 秒。
+- 候选路径为
+  `/home/sophgo13/cjl/storage/parameter-importance/envs/parameter-importance-stage0-1bd963c65f75`，
+  大小 7,135,424,701 B；`environment_id` 为
+  `env-v1-aaf55d32341c60a904b7d80a3c09d69bff7b7ee500e43f42a6432f65438d9d29`。
+- 89 个 wheel、3,742,765,243 B 在安装前后集合、大小、SHA-256、Linux cp312
+  标签和 lock 覆盖全部通过；普通 freeze 与 lock 完全一致，`pip check` 无错误。
+- 缺少 PyYAML 6.0.3 wheel 的负向安装按精确 pin 失败，负向临时树精确清理；11 类
+  受审计子进程外连尝试均为 0。
+- 旧环境前后 `pip freeze --all` SHA-256 均为
+  `f7940de670f5f94eae5038b159dfe80ed647080398bd89c162bdd6514ff933f9`，保持不变。
+- 新候选环境再次运行 Linux 全量纯 CPU 测试：122 passed。
+- G0-G 仍阻塞，因此只发布 `CPU_ONLY_CANDIDATE`，`training_eligible=false`、
+  `g2_status=BLOCKED`；没有更新训练环境引用，没有调用 GPU 枚举/计算 runtime。
+- 最终权限核对发现协作 umask 使两份 immutable identity/build 初始模式为 `0664`；
+  内容和单链接均正确，但需收紧为 `0644`、目录为 `0755`，并加代码防回归后再封存。
