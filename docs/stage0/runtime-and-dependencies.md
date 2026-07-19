@@ -107,7 +107,9 @@ GPU 基线；它还会在不调用 NVML/CUDA runtime 的情况下重新读取
 
 服务器入口为 `ops/stage0/rebuild_environment.py`。它只接受仓库内 lock/GPU 基线、
 大盘内既有 venv/wheelhouse/清单和一个安全的唯一候选名；项目级 advisory lock 串行化
-identity、build observation 和推荐引用发布。负向 venv 使用带 owner marker 的专属
+identity、build observation 和推荐引用发布。锁固定为既有批准目录中的
+`DATA_ROOT/operations/stage0-environment-rebuild.lock`，不会增加布局合同外的根目录。
+负向 venv 使用带 owner marker 的专属
 临时树，先封存精确清理清单，再逐文件 `unlink`、逐目录 `rmdir`，不使用通配清理。
 
 典型 CPU 审计流程为：

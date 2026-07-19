@@ -925,10 +925,10 @@ def main() -> int:
     report_path = report_root / "environment-rebuild.json"
     lock_descriptor: int | None = None
     try:
-        locks_root = resolve_approved_directory(data_root, "locks")
+        operations_root = resolve_approved_directory(data_root, "operations")
         manifests_root = resolve_approved_directory(data_root, "manifests")
         lock_descriptor = acquire_advisory_lock(
-            locks_root / "stage0-environment-rebuild.lock",
+            operations_root / "stage0-environment-rebuild.lock",
             allowed_root=data_root,
         )
         if candidate.exists() or cache.exists() or temporary.exists():

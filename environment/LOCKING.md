@@ -82,6 +82,10 @@ py -3.12 -m venv .venv
 宣称内核级断网。不得原地修改现有 venv，不得使用系统根盘缓存，也不得通过未登记的
 本地缓存或在线索引回退。
 
+全局重建锁使用 S0.2 已批准的
+`DATA_ROOT/operations/stage0-environment-rebuild.lock`；不得为此在 DATA_ROOT 新增
+合同外的顶层 `locks` 目录。
+
 核心导入还必须把 Python implementation/series、Torch/Transformers/Datasets/
 Accelerate/TensorBoard 模块版本、PyTorch CUDA runtime、cuDNN runtime，以及
 cuDNN/NCCL 分发包版本逐项与 lock provenance 比对。G0-G 放行前不调用 NCCL GPU
