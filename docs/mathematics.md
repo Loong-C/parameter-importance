@@ -882,7 +882,7 @@ G_i
 \[
 \mathbb E[\bar G^2]
 =
-\mu^2+rac{\sigma^2}{B},
+\mu^2+\frac{\sigma^2}{B},
 \]
 
 所以

@@ -1,0 +1,43 @@
+[build-system]
+requires = ["setuptools>=77", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "param-importance-nlp"
+version = "0.2.0"
+description = "Reproducible infrastructure for parameter-importance experiments"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+  "numpy==2.5.1",
+  "pyyaml==6.0.3",
+]
+[project.optional-dependencies]
+server = [
+  "accelerate==1.14.0",
+  "datasets==4.8.5",
+  "safetensors==0.8.0",
+  "tensorboard==2.21.0",
+  "torch==2.12.1",
+  "transformers==4.57.6",
+]
+dev = ["pytest==9.1.1"]
+
+[project.scripts]
+param-importance-stage0 = "param_importance_nlp.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+addopts = "-ra --strict-markers"
+pythonpath = ["src"]
+testpaths = ["tests"]
+markers = [
+  "server_cpu: requires the Linux server environment",
+  "gpu: requires one healthy CUDA GPU",
+  "distributed: requires four healthy CUDA GPUs and torchrun",
+  "integration: uses verified server assets",
+]
