@@ -1,0 +1,19 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://parameter-importance.invalid/schemas/shared/quadrature-decision-v1.json",
+  "title": "Stage 3 local quadrature decision",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "decision_id", "status", "default_rule", "fallback_rule", "scope", "formal_eligible", "unresolved_fields", "artifact_hash"],
+  "properties": {
+    "schema_version": {"const": "quadrature-decision-v1"},
+    "decision_id": {"type": "string", "minLength": 1},
+    "status": {"enum": ["FIXTURE_RECOMMENDATION", "BLOCKED"]},
+    "default_rule": {"oneOf": [{"type": "null"}, {"type": "string", "minLength": 1}]},
+    "fallback_rule": {"oneOf": [{"type": "null"}, {"type": "string", "minLength": 1}]},
+    "scope": {"const": "local_fixture"},
+    "formal_eligible": {"const": false},
+    "unresolved_fields": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"type": "string", "minLength": 1}},
+    "artifact_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+  }
+}

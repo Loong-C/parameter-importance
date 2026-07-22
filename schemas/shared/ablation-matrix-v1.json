@@ -1,0 +1,33 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://parameter-importance.invalid/schemas/shared/ablation-matrix-v1.json",
+  "title": "Stage 8 frozen single-factor ablation matrix",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "matrix_id", "baseline_cell_id", "cells", "seed_namespace", "frozen", "matrix_hash"],
+  "properties": {
+    "schema_version": {"const": "ablation-matrix-v1"},
+    "matrix_id": {"type": "string", "minLength": 1},
+    "baseline_cell_id": {"type": "string", "minLength": 1},
+    "cells": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/cell"}},
+    "seed_namespace": {"type": "string", "minLength": 1},
+    "frozen": {"const": true},
+    "matrix_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+  },
+  "$defs": {
+    "cell": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["cell_id", "parent_cell_id", "changed_factor", "changed_path", "config", "config_hash", "seed"],
+      "properties": {
+        "cell_id": {"type": "string", "minLength": 1},
+        "parent_cell_id": {"oneOf": [{"type": "null"}, {"type": "string", "minLength": 1}]},
+        "changed_factor": {"oneOf": [{"type": "null"}, {"type": "string", "minLength": 1}]},
+        "changed_path": {"oneOf": [{"type": "null"}, {"type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1}}]},
+        "config": {"type": "object"},
+        "config_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "seed": {"type": "integer", "minimum": 0}
+      }
+    }
+  }
+}

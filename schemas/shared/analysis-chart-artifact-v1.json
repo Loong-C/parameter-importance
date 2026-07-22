@@ -1,0 +1,35 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://parameter-importance.invalid/schemas/shared/analysis-chart-artifact-v1.json",
+  "title": "Stage 9 chart artifact",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "spec", "renderer_id", "output_format", "render_options", "content_sha256", "artifact_hash"],
+  "properties": {
+    "schema_version": {"const": "analysis-chart-artifact-v1"},
+    "spec": {"$ref": "analysis-chart-spec-v1.json"},
+    "renderer_id": {"type": "string", "minLength": 1},
+    "output_format": {"enum": ["spec", "png"]},
+    "render_options": {"type": "object"},
+    "content_sha256": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/hash"}]},
+    "artifact_hash": {"$ref": "#/$defs/hash"}
+  },
+  "allOf": [
+    {
+      "if": {"properties": {"output_format": {"const": "spec"}}},
+      "then": {
+        "properties": {
+          "renderer_id": {"const": "canonical-spec-only"},
+          "content_sha256": {"type": "null"}
+        }
+      }
+    },
+    {
+      "if": {"properties": {"output_format": {"const": "png"}}},
+      "then": {"properties": {"content_sha256": {"$ref": "#/$defs/hash"}}}
+    }
+  ],
+  "$defs": {
+    "hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+  }
+}

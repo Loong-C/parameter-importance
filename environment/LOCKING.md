@@ -8,6 +8,9 @@
 | `requirements.in` | Linux CPython 3.12 x86-64 | 服务器 Python/CUDA 应用依赖 |
 | `linux-only-requirements.in` | Linux CPython 3.12 x86-64 | CUDA、cuDNN、NCCL、Triton 等服务器专属补充 |
 | `local-dev-requirements.in` | Windows CPython 3.12 | 本机 CPU 小张量测试；不安装 CUDA/NCCL |
+| `windows-cpu-requirements.lock` | Windows CPython 3.12 x86-64 | 本机已验收的完整精确 pin 集合 |
+| `windows-cpu-requirements-hashed.lock` | Windows CPython 3.12 x86-64 | 与验收 wheel SHA-256 一一绑定的离线安装入口 |
+| `windows-cpu-wheel-manifest.tsv` | Windows CPython 3.12 x86-64 | wheel 文件名、字节数与 SHA-256 的权威清单 |
 | `requirements.lock` | Linux CPython 3.12 x86-64 | 服务器离线重建的 89 个精确分发包 pin |
 
 输入声明和锁文件职责不同。修改任一 `.in`、Python minor、目标平台/ABI、
@@ -69,6 +72,16 @@ py -3.12 -m venv .venv
 .venv\Scripts\python.exe -m pip install -r environment\local-dev-requirements.in
 .venv\Scripts\python.exe -m pytest -q
 ```
+
+本轮冻结环境已经把解析后的完整 pin 与 wheel 哈希分别发布到
+`windows-cpu-requirements.lock`、`windows-cpu-requirements-hashed.lock` 和
+`windows-cpu-wheel-manifest.tsv`。后续离线重建应先取得清单中逐字节匹配的 wheelhouse，再执行：
+
+```powershell
+.venv\Scripts\python.exe -m pip install --no-index --find-links <wheelhouse> --require-hashes -r environment\windows-cpu-requirements-hashed.lock
+```
+
+仓库只保存锁和清单，不保存 wheel 本体；不得在缺少 wheelhouse 时退回在线解析。
 
 本机 CPU PyTorch 只用于小型逻辑测试；GPU、NCCL、BF16 和性能测试必须保留
 服务器专属 marker，skip 不得记作 gate 通过。本机不得下载模型或数据资产。

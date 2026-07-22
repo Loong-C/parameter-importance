@@ -1,0 +1,12 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://parameter-importance.invalid/schemas/shared/canonical-artifact-v1.json",
+  "title": "Canonical JSON artifact envelope",
+  "description": "Python loader additionally requires UTF-8 without BOM, duplicate keys or non-finite numbers, sorted compact keys, and one trailing LF.",
+  "type": "object",
+  "required": ["schema_version", "artifact_hash"],
+  "properties": {
+    "schema_version": {"type": "string", "minLength": 1},
+    "artifact_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+  }
+}

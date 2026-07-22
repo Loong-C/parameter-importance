@@ -1,0 +1,35 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://parameter-importance.invalid/schemas/shared/gate-record-v1.json",
+  "title": "Formal gate record",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version", "scope", "gate_id", "stage", "status", "checked_at",
+    "measured", "threshold", "evidence_refs", "reasons", "conditions",
+    "expires_at", "artifact_hash"
+  ],
+  "properties": {
+    "schema_version": {"const": "gate-record-v1"},
+    "scope": {"const": "formal"},
+    "gate_id": {
+      "type": "string",
+      "pattern": "^stage[0-9]\\.G[0-9]+(?:[.-][A-Za-z0-9]+)*$"
+    },
+    "stage": {"type": "integer", "minimum": 0, "maximum": 9},
+    "status": {
+      "enum": ["PASS", "CONDITIONALLY_ACCEPTED", "FAIL", "BLOCKED", "STALE", "NOT_RUN"]
+    },
+    "checked_at": {"type": "string", "format": "date-time"},
+    "measured": {},
+    "threshold": {},
+    "evidence_refs": {
+      "type": "array", "uniqueItems": true,
+      "items": {"type": "string", "minLength": 1, "maxLength": 4096}
+    },
+    "reasons": {"type": "array", "items": {"type": "string", "minLength": 1}},
+    "conditions": {"type": "array", "items": {"type": "string", "minLength": 1}},
+    "expires_at": {"oneOf": [{"type": "null"}, {"type": "string", "format": "date-time"}]},
+    "artifact_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+  }
+}

@@ -22,6 +22,7 @@ envs/
 cache/
 runs/
 results/raw/
+artifacts/
 *.ckpt
 *.part
 *.pt

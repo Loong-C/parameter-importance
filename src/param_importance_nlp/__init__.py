@@ -1,3 +1,3 @@
-"""Parameter-importance experiment infrastructure."""
+"""参数重要性实验的可复现基础设施与本机 CPU 核心实现。"""
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
