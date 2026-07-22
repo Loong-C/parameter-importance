@@ -25,7 +25,8 @@
 1. 为每个端点对分配唯一 `path_state_id`。
 2. 记录来源 run ID、模型资产 ID、训练 seed 和 optimizer step。
 3. 记录更新前 checkpoint 身份。
-4. 记录更新后 checkpoint 身份。
+4. 分别记录 optimizer 更新后 `parameter_post_state` 与 scheduler/scaler/RNG
+   完整提交后的 `attempt_commit_state` 身份；不得共用含混的“更新后”字段。
 5. 记录参数注册表摘要和参数总数。
 6. 记录 optimizer、scheduler、GradScaler、RNG 和数据游标身份。
 7. 记录训练 batch 的不可逆样本/序列标识摘要。
@@ -52,22 +53,26 @@
 12. 对保存内容生成清单和哈希。
 13. 在参数、梯度和所有必填状态落盘并校验前，不发布 pre-state 完成标记。
 
-### 3. 捕获真实更新后状态
+### 3. 分别捕获参数更新后状态与 attempt 提交状态
 
 1. 只执行一次目标 optimizer step。
-2. 在 scheduler 或数据游标进入下一语义步骤前捕获 post-state。
-3. 保存与 pre-state 相同范围的参数和 buffer。
-4. 保存更新后的 optimizer、scheduler 和 GradScaler state。
-5. 保存更新后的 RNG 和数据游标。
+2. optimizer 返回后立即捕获 `parameter_post_state`：保存与 pre-state 相同范围的
+   参数、buffer 和 optimizer state；此时 scheduler/scaler/RNG 尚未声明提交完成。
+3. 按训练合同推进 scheduler、GradScaler、RNG 和数据游标，随后捕获
+   `attempt_commit_state`，并把它与前述 `parameter_post_state` hash 绑定。
+4. 恢复入口只有在 `attempt_commit_state` 权威 commit 存在时才把该 step 视为完整；
+   仅有 `parameter_post_state` 时必须进入 reconciliation，不得自动重复 optimizer step。
+5. 保存两个状态各自的 schema、hash 和事件序号。
 6. 计算逐参数总位移 \(\Delta\Theta_t\)。
-7. 验证 pre-state 加总位移能逐张量重构 post-state。
+7. 验证 pre-state 加总位移能逐张量重构 `parameter_post_state`。
 8. 逐项比较 pre/post buffer，并要求影响 probe 前向的 buffer 完全相同。
 9. 将通过比较的共同 buffer 摘要冻结为唯一 `probe_buffer_snapshot`。
 10. buffer 不一致时拒绝参数路径主合同；只有另行预注册扩展状态路径后才能作为不同研究对象处理。
 11. 检查 frozen 参数是否保持不变。
 12. 检查任何意外新增、丢失或改名的参数。
-13. 对 post-state 和位移清单生成哈希。
-14. 只在 pre/post/位移/共同 buffer 四者全部一致时原子发布端点对。
+13. 对 `parameter_post_state`、`attempt_commit_state` 和位移清单分别生成哈希。
+14. 只在 pre/parameter-post/attempt-commit/位移/共同 buffer 全部一致时，通过
+    “不可变对象 + 独立权威 commit”两阶段协议发布端点对。
 
 ### 4. 处理 full-update 与 data-only 路径
 

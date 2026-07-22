@@ -1,4 +1,4 @@
-"""Stage 2 固定状态估计器的可复现实验编排合同。
+"""Stage 2–3 的可复现实验编排合同。
 
 这里只导出稳定数据类型与纯 CPU 编排；导入本包不会访问服务器、下载模型或
 导入 Hugging Face。需要 Torch 的核心估计器/求积适配器在真正执行时才加载。
@@ -35,6 +35,24 @@ from .stage2 import (
     SufficientStatisticShard,
     build_fixture_estimator_decision,
 )
+from .stage3 import (
+    CorePathIntegrator,
+    EndpointRecord,
+    EndpointState,
+    NodeCacheKey,
+    NodeGradientCache,
+    PathAnalysisRunner,
+    PathEvaluation,
+    PathStateUnit,
+    ProbeSpec,
+    QuadratureDecision,
+    ReadOnlyPathContext,
+    ReferenceConvergenceResult,
+    ReferenceLevel,
+    StateMutationError,
+    assess_reference_convergence,
+    build_fixture_quadrature_decision,
+)
 
 __all__ = [
     "CANDIDATE_BATCH_SIZES",
@@ -42,17 +60,30 @@ __all__ = [
     "COST_SEMANTICS",
     "CandidateEvaluation",
     "CoreEstimatorKernel",
+    "CorePathIntegrator",
     "DeterministicShardReducer",
     "Draw",
+    "EndpointRecord",
+    "EndpointState",
     "EstimatorDecision",
     "FormalDecisionBlocked",
     "MICROBATCH_SELECTION_ORDER",
+    "NodeCacheKey",
+    "NodeGradientCache",
     "PairedEstimatorResult",
     "PairedEstimatorRunner",
+    "PathAnalysisRunner",
+    "PathEvaluation",
+    "PathStateUnit",
     "PilotObservation",
     "PrimaryPairDecision",
+    "ProbeSpec",
+    "QuadratureDecision",
+    "ReadOnlyPathContext",
     "ReducedMoments",
     "ReducedSufficientStatistics",
+    "ReferenceConvergenceResult",
+    "ReferenceLevel",
     "ReferenceResult",
     "ReferenceRunner",
     "RepetitionMapping",
@@ -60,8 +91,11 @@ __all__ = [
     "SamplingPlan",
     "SamplingUniverse",
     "ShardArtifactStore",
+    "StateMutationError",
     "Stage2FixtureStudy",
     "SufficientStatisticShard",
+    "assess_reference_convergence",
     "build_fixture_estimator_decision",
+    "build_fixture_quadrature_decision",
     "select_primary_pair",
 ]
