@@ -1,0 +1,31 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://parameter-importance.invalid/schemas/shared/task-replay-record-v1.json",
+  "title": "Task result deterministic replay comparison",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version", "source_result_ref", "source_result_hash",
+    "replay_result_ref", "replay_result_hash", "task_id", "config_hash",
+    "status_match", "artifact_refs_match", "formal_eligibility_match",
+    "equivalent", "replay_hash"
+  ],
+  "properties": {
+    "schema_version": {"const": "task-replay-record-v1"},
+    "source_result_ref": {"$ref": "#/$defs/logicalRef"},
+    "source_result_hash": {"$ref": "#/$defs/hash"},
+    "replay_result_ref": {"$ref": "#/$defs/logicalRef"},
+    "replay_result_hash": {"$ref": "#/$defs/hash"},
+    "task_id": {"type": "string", "minLength": 1},
+    "config_hash": {"$ref": "#/$defs/hash"},
+    "status_match": {"type": "boolean"},
+    "artifact_refs_match": {"type": "boolean"},
+    "formal_eligibility_match": {"type": "boolean"},
+    "equivalent": {"type": "boolean"},
+    "replay_hash": {"$ref": "#/$defs/hash"}
+  },
+  "$defs": {
+    "hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "logicalRef": {"type": "string", "minLength": 1, "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.(?:/|$))(?!.*\\\\).+$"}
+  }
+}

@@ -567,6 +567,70 @@ class PathAnalysisRunner:
         expected_loss_pre: float | None = None,
         expected_loss_post: float | None = None,
     ) -> PathEvaluation:
+        """执行一个本机 ``PathStateUnit``。
+
+        该兼容入口保留 Stage 3 fixture 的既有合同；实际缓存事务统一委托给
+        :meth:`run_bound`，从而让 formal runner 可以使用已经由 endpoint/probe
+        artifact 冻结的等价身份，而不必伪造一个只允许 ``local_fixture`` 的
+        :class:`PathStateUnit`。
+        """
+
+        return self.run_bound(
+            unit_id=unit.unit_id,
+            precision=unit.precision,
+            parameter_registry_hash=unit.endpoint.parameter_registry_hash,
+            loss_contract_hash=unit.probe.loss_contract_hash,
+            path_spec=path_spec,
+            rule=rule,
+            gradient_callback=gradient_callback,
+            loss_callback=loss_callback,
+            state_controller=state_controller,
+            expected_loss_pre=expected_loss_pre,
+            expected_loss_post=expected_loss_post,
+            scope="local_fixture",
+            formal_eligible=False,
+        )
+
+    def run_bound(
+        self,
+        *,
+        unit_id: str,
+        precision: str,
+        parameter_registry_hash: str,
+        loss_contract_hash: str,
+        path_spec: object,
+        rule: object,
+        gradient_callback: Callable[[float, object], object],
+        loss_callback: Callable[[object], object],
+        state_controller: StateController,
+        expected_loss_pre: float | None = None,
+        expected_loss_post: float | None = None,
+        scope: str = "local_fixture",
+        formal_eligible: bool = False,
+    ) -> PathEvaluation:
+        """按已冻结的路径身份执行同一套缓存与只读状态事务。
+
+        ``unit_id``、精度、registry hash 与 loss hash 必须来自已经验证过的
+        endpoint/probe/path artifact。该入口不会替 formal 运行做资格判断；它只把
+        调用方给出的身份装配成 :class:`NodeCacheKey`。节点梯度先进入本次私有
+        ``pending``，只有求积、端点 loss 校验和状态不变性检查全部成功后，才通过
+        cache 的 ``publish_many`` 一次发布。因此进程内缓存和持久化两阶段缓存共享
+        完全相同的失败边界。
+        """
+
+        if not isinstance(unit_id, str) or not unit_id:
+            raise ValueError("unit_id 不能为空")
+        if precision not in {"float32", "float64"}:
+            raise ValueError("precision 只能是 float32 或 float64")
+        for field_name, digest in (
+            ("parameter_registry_hash", parameter_registry_hash),
+            ("loss_contract_hash", loss_contract_hash),
+        ):
+            _validate_sha256(field_name, digest)
+        if scope not in {"local_fixture", "formal"}:
+            raise ValueError("scope 只能是 local_fixture 或 formal")
+        if formal_eligible and scope != "formal":
+            raise ValueError("只有 formal scope 可以声明 formal_eligible")
         for name, value in (
             ("expected_loss_pre", expected_loss_pre),
             ("expected_loss_post", expected_loss_post),
@@ -582,7 +646,13 @@ class PathAnalysisRunner:
             """先查已发布/本次暂存节点，缺失时才调用真实梯度 provider。"""
 
             nonlocal cache_hits, cache_misses
-            key = self._node_key(unit, alpha)
+            key = NodeCacheKey(
+                path_unit_id=unit_id,
+                alpha=alpha,
+                precision=precision,
+                parameter_registry_hash=parameter_registry_hash,
+                loss_contract_hash=loss_contract_hash,
+            )
             try:
                 cached = self.node_cache.get(key)
             except KeyError:
@@ -618,12 +688,14 @@ class PathAnalysisRunner:
             raise ValueError("核心求积结果的 post probe loss 与冻结端点不一致")
         published = self.node_cache.publish_many(pending)
         return PathEvaluation(
-            unit_id=unit.unit_id,
+            unit_id=unit_id,
             rule_name=rule_name,
             result=result,
             cache_hits=cache_hits,
             cache_misses=cache_misses,
             cache_entries_published=published,
+            scope=scope,
+            formal_eligible=formal_eligible,
         )
 
 

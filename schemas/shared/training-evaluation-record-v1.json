@@ -1,0 +1,36 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://parameter-importance.invalid/schemas/shared/training-evaluation-record-v1.json",
+  "title": "Training evaluation record v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "global_step",
+    "split",
+    "task_name",
+    "metrics",
+    "panel_batch_ids",
+    "panel_sample_ids_hash"
+  ],
+  "properties": {
+    "schema_version": {"const": "training-evaluation-record-v1"},
+    "global_step": {"type": "integer", "minimum": 1},
+    "split": {"type": "string", "minLength": 1},
+    "task_name": {"enum": ["fixture", "pile", "sst2", "mnli", "rte"]},
+    "metrics": {
+      "type": "object",
+      "minProperties": 1,
+      "additionalProperties": {"type": "number"}
+    },
+    "panel_batch_ids": {
+      "type": "array",
+      "minItems": 1,
+      "items": {"type": "string", "minLength": 1}
+    },
+    "panel_sample_ids_hash": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    }
+  }
+}

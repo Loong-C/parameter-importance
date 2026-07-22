@@ -1,0 +1,21 @@
+{
+  "$id": "https://parameter-importance.invalid/schemas/shared/estimator-study-result-v1.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "artifact_hash": {"pattern": "^[0-9a-f]{64}$", "type": "string"},
+    "confirmatory_ref": {"minLength": 1, "type": "string"},
+    "decision_hash": {"pattern": "^[0-9a-f]{64}$", "type": "string"},
+    "decision_ref": {"minLength": 1, "type": "string"},
+    "formal_eligible": {"type": "boolean"},
+    "metadata": {"type": "object"},
+    "pilot_ref": {"minLength": 1, "type": "string"},
+    "reference_ref": {"minLength": 1, "type": "string"},
+    "schema_version": {"const": "estimator-study-result-v1"},
+    "scope": {"enum": ["local_fixture", "formal"]},
+    "study_id": {"minLength": 1, "type": "string"}
+  },
+  "required": ["schema_version", "study_id", "scope", "reference_ref", "pilot_ref", "confirmatory_ref", "decision_ref", "decision_hash", "formal_eligible", "metadata", "artifact_hash"],
+  "title": "Estimator Study Result v1",
+  "type": "object"
+}

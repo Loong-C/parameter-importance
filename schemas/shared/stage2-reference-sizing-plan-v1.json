@@ -1,0 +1,22 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://parameter-importance.invalid/schemas/shared/stage2-reference-sizing-plan-v1.json",
+  "title": "Stage 2 reference sizing ladder",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "reference_id", "candidate_sample_counts", "block_size", "convergence_tolerance", "required_consecutive", "execution_evidence_hash", "artifact_hash"],
+  "properties": {
+    "schema_version": {"const": "stage2-reference-sizing-plan-v1"},
+    "reference_id": {"$ref": "#/$defs/id"},
+    "candidate_sample_counts": {"type": "array", "minItems": 2, "uniqueItems": true, "items": {"type": "integer", "minimum": 1}},
+    "block_size": {"type": "integer", "minimum": 1},
+    "convergence_tolerance": {"type": "number", "exclusiveMinimum": 0},
+    "required_consecutive": {"type": "integer", "minimum": 1},
+    "execution_evidence_hash": {"$ref": "#/$defs/hash"},
+    "artifact_hash": {"$ref": "#/$defs/hash"}
+  },
+  "$defs": {
+    "id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,159}$"},
+    "hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+  }
+}

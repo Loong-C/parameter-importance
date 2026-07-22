@@ -1,0 +1,27 @@
+{
+  "$id": "https://parameter-importance.invalid/schemas/shared/task-run-spec-v1.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "config_hash": {"pattern": "^[0-9a-f]{64}$", "type": "string"},
+    "input_refs": {"items": {"minLength": 1, "type": "string"}, "type": "array", "uniqueItems": true},
+    "output_dir": {"minLength": 1, "type": "string"},
+    "recovery_mode": {"minLength": 1, "type": "string"},
+    "run_intent": {"enum": ["local_fixture", "formal"]},
+    "runner_kind": {"minLength": 1, "type": "string"},
+    "safe_boundary": {"minLength": 1, "type": "string"},
+    "resume_ref": {
+      "oneOf": [
+        {"type": "null"},
+        {"minLength": 1, "type": "string"}
+      ]
+    },
+    "schema_version": {"const": "task-run-spec-v1"},
+    "spec_hash": {"pattern": "^[0-9a-f]{64}$", "type": "string"},
+    "stage": {"maximum": 9, "minimum": 0, "type": "integer"},
+    "task_id": {"pattern": "^stage[0-9]\\.", "type": "string"}
+  },
+  "required": ["schema_version", "task_id", "stage", "runner_kind", "run_intent", "config_hash", "output_dir", "input_refs", "recovery_mode", "safe_boundary", "resume_ref", "spec_hash"],
+  "title": "Task Run Spec v1",
+  "type": "object"
+}

@@ -1,0 +1,19 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://parameter-importance.invalid/schemas/shared/analysis-heatmap-spec-v1.json",
+  "title": "Hash bound complete rectangular heatmap specification",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "table_artifact_hash", "source_content_hash", "heatmap_id", "x_column", "y_column", "value_column", "spec_hash"],
+  "properties": {
+    "schema_version": {"const": "analysis-heatmap-spec-v1"},
+    "table_artifact_hash": {"$ref": "#/$defs/hash"},
+    "source_content_hash": {"$ref": "#/$defs/hash"},
+    "heatmap_id": {"type": "string", "minLength": 1},
+    "x_column": {"type": "string", "minLength": 1},
+    "y_column": {"type": "string", "minLength": 1},
+    "value_column": {"type": "string", "minLength": 1},
+    "spec_hash": {"$ref": "#/$defs/hash"}
+  },
+  "$defs": {"hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"}}
+}

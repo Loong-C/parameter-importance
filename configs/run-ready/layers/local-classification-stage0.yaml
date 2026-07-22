@@ -1,0 +1,13 @@
+# 叠加到 configs/local-fixtures/resolved-config-v1.json。
+# 该层只用于本机 tiny 分类训练，不具有 formal 资格。
+identity:
+  stage: 0
+  task: stage0.06_single_gpu_smoke
+loss:
+  task_type: sequence_classification
+  weighting: sample
+data:
+  statistical_unit: sample
+  weight_unit: sample
+model:
+  architecture: tiny-sequence-classifier

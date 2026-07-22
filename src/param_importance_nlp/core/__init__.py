@@ -6,10 +6,12 @@
 
 from .accumulator import ImportanceAccumulator
 from .baselines import (
+    BaselineProduction,
     cumulative_movement,
     empirical_fisher,
     final_magnitude,
     net_movement,
+    produce_baseline_scores,
     synaptic_intelligence,
 )
 from .errors import CoreContractError, NumericalError, RegistryError, TensorMapError
@@ -97,6 +99,7 @@ from .tensors import TensorMap
 
 __all__ = [
     "CoordinateSelection",
+    "BaselineProduction",
     "ConstantGradientFixture",
     "CoreContractError",
     "EqualSufficientStatistics",
@@ -167,6 +170,7 @@ __all__ = [
     "normalized_linf_error",
     "net_movement",
     "pearson_correlation",
+    "produce_baseline_scores",
     "raw_importance",
     "right_rule",
     "select_pruned_coordinates",

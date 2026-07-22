@@ -1,0 +1,59 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://parameter-importance.invalid/schemas/shared/stage2-reference-sizing-result-v1.json",
+  "title": "Stage 2 recoverable reference sizing result",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "plan_hash", "registry_hash", "provider_state_digest", "processed_sample_count_per_stream", "selected_sample_count_per_stream", "converged", "status", "points", "bias_reference_hash", "cross_reference_hash", "ranking_reference_hash", "resumed_from_block_pairs", "scope", "formal_eligible", "qualification_gate_hash", "weighting_assumptions", "artifact_hash"],
+  "properties": {
+    "schema_version": {"const": "stage2-reference-sizing-result-v1"},
+    "plan_hash": {"$ref": "#/$defs/hash"},
+    "registry_hash": {"$ref": "#/$defs/hash"},
+    "provider_state_digest": {"$ref": "#/$defs/hash"},
+    "processed_sample_count_per_stream": {"type": "integer", "minimum": 1},
+    "selected_sample_count_per_stream": {"oneOf": [{"type": "null"}, {"type": "integer", "minimum": 1}]},
+    "converged": {"type": "boolean"},
+    "status": {"enum": ["FIXTURE_CONVERGED", "FORMAL_CANDIDATE", "REFERENCE_UNRESOLVED"]},
+    "points": {"type": "array", "items": {"$ref": "#/$defs/point"}},
+    "bias_reference_hash": {"$ref": "#/$defs/hash"},
+    "cross_reference_hash": {"$ref": "#/$defs/hash"},
+    "ranking_reference_hash": {"$ref": "#/$defs/hash"},
+    "resumed_from_block_pairs": {"type": "integer", "minimum": 0},
+    "scope": {"enum": ["local_fixture", "formal"]},
+    "formal_eligible": {"const": false},
+    "qualification_gate_hash": {"type": "null"},
+    "weighting_assumptions": {"$ref": "#/$defs/weighting"},
+    "artifact_hash": {"$ref": "#/$defs/hash"}
+  },
+  "$defs": {
+    "hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "weighting": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["statistical_unit", "weight_unit", "sampling_design", "weights_exogenous", "common_mean_assumption"],
+      "properties": {
+        "statistical_unit": {"type": "string", "minLength": 1},
+        "weight_unit": {"type": "string", "minLength": 1},
+        "sampling_design": {"type": "string", "minLength": 1},
+        "weights_exogenous": {"type": "boolean"},
+        "common_mean_assumption": {"type": "boolean"}
+      }
+    },
+    "point": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["sample_count_per_stream", "block_count_total", "bias_reference_hash", "cross_reference_hash", "ranking_reference_hash", "normalized_l1_from_previous", "convergence_streak", "comparison_defined", "comparison_reason"],
+      "properties": {
+        "sample_count_per_stream": {"type": "integer", "minimum": 1},
+        "block_count_total": {"type": "integer", "minimum": 2},
+        "bias_reference_hash": {"$ref": "#/$defs/hash"},
+        "cross_reference_hash": {"$ref": "#/$defs/hash"},
+        "ranking_reference_hash": {"$ref": "#/$defs/hash"},
+        "normalized_l1_from_previous": {"oneOf": [{"type": "null"}, {"type": "number", "minimum": 0}]},
+        "convergence_streak": {"type": "integer", "minimum": 0},
+        "comparison_defined": {"type": "boolean"},
+        "comparison_reason": {"oneOf": [{"type": "null"}, {"enum": ["no_previous_reference", "zero_reference_l1_norm"]}]}
+      }
+    }
+  }
+}

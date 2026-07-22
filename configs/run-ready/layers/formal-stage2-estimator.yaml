@@ -1,0 +1,58 @@
+# Stage 2 正式 fixed-state 估计器研究的科学身份层。
+# revision/hash 占位符必须由已审核资产 manifest 替换；本文件不会触发下载。
+identity:
+  stage: 2
+  task: stage2.04_reference_target
+  route: pretrain
+  run_intent: formal
+  formal_eligible: true
+runtime:
+  environment_id: server-cuda-formal-v1
+  dependency_profile: cuda-formal
+  device: cuda
+  output_root: runs/formal/stage2-reference
+  cache_root: cache/formal/stage2-reference
+  temp_root: runs/formal/stage2-reference/tmp
+  allow_dirty_worktree: false
+model:
+  asset_id: pythia-14m
+  revision: FILL_MODEL_REVISION
+  tokenizer_asset_id: pythia-tokenizer
+  initialization_id: FILL_FIXED_STATE_CHECKPOINT_HASH
+  architecture: pythia-14m
+data:
+  asset_id: pile-pretokenized
+  revision: FILL_DATA_REVISION
+  split: validation
+  sequence_length: 2048
+  sampler: frozen-sampling-universe
+  statistical_unit: sequence
+  weight_unit: effective_token
+  sampling_design: with_replacement_versioned_universe
+  weights_exogenous: true
+  common_mean_assumption: true
+loss:
+  task_type: causal_lm
+  reduction: mean
+  ignore_index: -100
+  weighting: effective_token
+distributed:
+  world_size: 1
+  backend: local
+  device_ids: [0]
+  timeout_seconds: 1800
+precision:
+  compute_dtype: float32
+  gradient_dtype: float32
+  statistic_dtype: float32
+  reference_dtype: float64
+  quadrature_weight_dtype: float64
+  path_accumulation_dtype: float64
+  amp: false
+importance:
+  estimator_name: u
+  estimator_decision_ref: null
+  clip_mode: none
+  accumulate_views: [signed, positive, negative_mass, absolute, raw, data_movement]
+  # Stage 2 负责生成 decision，本开关仍保持 formal fail-closed；当前 task 不读取未来 decision。
+  require_decision_for_formal: true

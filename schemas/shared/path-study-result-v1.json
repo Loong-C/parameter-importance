@@ -1,0 +1,22 @@
+{
+  "$id": "https://parameter-importance.invalid/schemas/shared/path-study-result-v1.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "artifact_hash": {"pattern": "^[0-9a-f]{64}$", "type": "string"},
+    "endpoint_index_ref": {"minLength": 1, "type": "string"},
+    "formal_eligible": {"type": "boolean"},
+    "matrix_ref": {"minLength": 1, "type": "string"},
+    "metadata": {"type": "object"},
+    "probe_panel_ref": {"minLength": 1, "type": "string"},
+    "recommendation_hash": {"pattern": "^[0-9a-f]{64}$", "type": "string"},
+    "recommendation_ref": {"minLength": 1, "type": "string"},
+    "reference_ref": {"minLength": 1, "type": "string"},
+    "schema_version": {"const": "path-study-result-v1"},
+    "scope": {"enum": ["local_fixture", "formal"]},
+    "study_id": {"minLength": 1, "type": "string"}
+  },
+  "required": ["schema_version", "study_id", "scope", "endpoint_index_ref", "probe_panel_ref", "reference_ref", "matrix_ref", "recommendation_ref", "recommendation_hash", "formal_eligible", "metadata", "artifact_hash"],
+  "title": "Path Study Result v1",
+  "type": "object"
+}

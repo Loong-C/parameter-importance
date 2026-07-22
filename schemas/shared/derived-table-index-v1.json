@@ -1,0 +1,29 @@
+{
+  "$id": "https://parameter-importance.invalid/schemas/shared/derived-table-index-v1.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "artifact_hash": {"pattern": "^[0-9a-f]{64}$", "type": "string"},
+    "formal_eligible": {"type": "boolean"},
+    "index_id": {"minLength": 1, "type": "string"},
+    "schema_version": {"const": "derived-table-index-v1"},
+    "scope": {"enum": ["local_fixture", "formal"]},
+    "tables": {
+      "additionalProperties": {
+        "additionalProperties": false,
+        "properties": {
+          "content_hash": {"pattern": "^[0-9a-f]{64}$", "type": "string"},
+          "schema_version": {"minLength": 1, "type": "string"},
+          "source_ref": {"minLength": 1, "type": "string"}
+        },
+        "required": ["source_ref", "content_hash", "schema_version"],
+        "type": "object"
+      },
+      "minProperties": 1,
+      "type": "object"
+    }
+  },
+  "required": ["schema_version", "index_id", "scope", "formal_eligible", "tables", "artifact_hash"],
+  "title": "Derived Table Index v1",
+  "type": "object"
+}

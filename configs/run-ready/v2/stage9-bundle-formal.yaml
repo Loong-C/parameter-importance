@@ -1,0 +1,3 @@
+orchestration:
+  input_result_refs: [FILL_STAGE9_ANALYSIS_REPORT_COMMIT]
+artifacts: {output_dir: runs/formal/stage9/bundle}

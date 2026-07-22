@@ -1,0 +1,25 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://parameter-importance.invalid/schemas/shared/stage3-reference-level-commit-v1.json",
+  "title": "Stage 3 authoritative reference refinement level commit",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "commit_id", "unit_id", "family", "level", "unique_nodes", "rule_hash", "contribution_hash", "object_ref", "object_manifest_hash", "artifact_hash"],
+  "properties": {
+    "schema_version": {"const": "stage3-reference-level-commit-v1"},
+    "commit_id": {"$ref": "#/$defs/hash"},
+    "unit_id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,159}$"},
+    "family": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,159}$"},
+    "level": {"type": "integer", "minimum": 0},
+    "unique_nodes": {"type": "integer", "minimum": 1},
+    "rule_hash": {"$ref": "#/$defs/hash"},
+    "contribution_hash": {"$ref": "#/$defs/hash"},
+    "object_ref": {"$ref": "#/$defs/ref"},
+    "object_manifest_hash": {"$ref": "#/$defs/hash"},
+    "artifact_hash": {"$ref": "#/$defs/hash"}
+  },
+  "$defs": {
+    "hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "ref": {"type": "string", "minLength": 1, "pattern": "^(?!/)(?![A-Za-z]:)(?!.*(?:^|/)\\.\\.(?:/|$))[^\\\\]+$"}
+  }
+}

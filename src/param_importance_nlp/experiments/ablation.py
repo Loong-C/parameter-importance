@@ -47,6 +47,40 @@ def _deep_freeze(value: object) -> object:
     return value
 
 
+def _normalize_base_config_for_matrix(
+    value: Mapping[str, object],
+) -> dict[str, object]:
+    """把矩阵基线规范化为只含可消融字段的配置 payload。
+
+    ``ResolvedConfigV2.to_dict()`` 顶层的 ``config_hash`` 与 ``full_hash`` 是
+    派生身份，不是独立实验因子。如果把完整 wire object 原样放进矩阵，那么修改
+    一个科学叶字段后还必须同时修改两个 hash，既违反单因素约束，也会留下陈旧摘要。
+    因此这里先严格校验完整 wire object，再仅移除这两个可重新计算的派生字段。
+
+    已经去除摘要的 v2 payload 同样会被严格解析一次；普通 v1/领域配置保持原样。
+    导入放在函数内部，避免纯矩阵模块在 import 阶段扩大依赖面。
+    """
+
+    normalized = copy.deepcopy(dict(value))
+    if normalized.get("schema_version") != "resolved-config-v2":
+        return normalized
+    from ..contracts.config_v2 import ResolvedConfigV2
+
+    has_config_hash = "config_hash" in normalized
+    has_full_hash = "full_hash" in normalized
+    if has_config_hash is not has_full_hash:
+        raise ValueError("resolved-config-v2 的两个派生 hash 必须同时存在或同时省略")
+    if has_config_hash:
+        resolved = ResolvedConfigV2.from_mapping(normalized)
+        normalized = resolved.to_dict()
+        normalized.pop("config_hash")
+        normalized.pop("full_hash")
+    else:
+        # 构造器会验证严格字段集和全部跨字段条件；不把未验证的 payload 编入矩阵。
+        ResolvedConfigV2(normalized)  # type: ignore[arg-type]
+    return normalized
+
+
 def _get_path(config: Mapping[str, object], path: tuple[str, ...]) -> object:
     current: object = config
     for component in path:
@@ -250,7 +284,7 @@ class AblationMatrix:
             raise ValueError("factor name 必须唯一")
         if len({factor.config_path for factor in factors}) != len(factors):
             raise ValueError("不同 factor 不能指向同一个 config path")
-        base = copy.deepcopy(dict(base_config))
+        base = _normalize_base_config_for_matrix(base_config)
         for factor in factors:
             actual = _get_path(base, factor.config_path)
             if _canonical_json(actual) != _canonical_json(factor.baseline_value):

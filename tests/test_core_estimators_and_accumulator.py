@@ -278,3 +278,38 @@ def test_accumulator_four_identities_movement_magnitude_and_skip() -> None:
     restored.load_state_dict(accumulator.state_dict())
     torch.testing.assert_close(restored.signed["p"], accumulator.signed["p"])
     torch.testing.assert_close(restored.total_endpoint_movement["p"], accumulator.total_endpoint_movement["p"])
+
+
+def test_accumulator_migrates_03x_v1_state_without_inventing_new_views() -> None:
+    """旧状态可恢复，但不可从 magnitude 猜测参数符号或裁剪/weight-decay 分解。"""
+
+    template = TensorMap({"p": torch.zeros(2, dtype=torch.float64)})
+    source = ImportanceAccumulator(template, accumulation_dtype=torch.float64)
+    source.add_step(
+        TensorMap({"p": torch.tensor([1.0, -2.0], dtype=torch.float64)}),
+        raw=TensorMap({"p": torch.tensor([3.0, 4.0], dtype=torch.float64)}),
+        data_update=TensorMap({"p": torch.tensor([-0.1, 0.2], dtype=torch.float64)}),
+        total_update=TensorMap({"p": torch.tensor([-0.2, 0.1], dtype=torch.float64)}),
+        current_parameters=TensorMap(
+            {"p": torch.tensor([-5.0, 6.0], dtype=torch.float64)}
+        ),
+    )
+    current = source.state_dict()
+    v1_keys = {
+        "accumulation_dtype", "successful_steps", "skipped_steps", "positive",
+        "negative_mass", "raw", "data_movement", "data_displacement",
+        "total_movement", "total_displacement", "magnitude",
+    }
+    legacy = {"version": 1, **{key: current[key] for key in v1_keys}}
+
+    restored = ImportanceAccumulator(template, accumulation_dtype=torch.float64)
+    restored.load_state_dict(legacy)
+
+    torch.testing.assert_close(restored.signed["p"], source.signed["p"])
+    torch.testing.assert_close(restored.raw["p"], source.raw["p"])
+    torch.testing.assert_close(restored.raw_clipped["p"], torch.zeros(2, dtype=torch.float64))
+    torch.testing.assert_close(
+        restored.weight_decay_movement["p"], torch.zeros(2, dtype=torch.float64)
+    )
+    assert restored.state_dict()["version"] == 2
+    assert restored.state_dict()["has_initial_parameters"] is False

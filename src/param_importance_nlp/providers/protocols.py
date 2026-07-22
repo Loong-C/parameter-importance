@@ -153,3 +153,68 @@ class FixedStateGradientProvider(GradientProvider, Protocol):
 
     def assert_unchanged(self, expected_digest: str) -> None:
         """若当前状态与 ``expected_digest`` 不一致则抛出异常。"""
+
+
+@runtime_checkable
+class FrozenSampleResolver(Protocol):
+    """把冻结 sample ID 解析为单个可重放 microbatch。
+
+    resolver 是 Stage 2 draw 与任务数据之间的唯一边界。它必须按
+    sample ID 返回新的、可安全使用的 ``TrainingMicrobatch``，且不得因
+    ``resolve`` 调用推进 cursor、打乱顺序或修改数据状态。返回类型在
+    该协议中保持为 ``object``，是为了避免 ``protocols`` 与训练适配层
+    循环导入；Torch provider 会在运行时严格验证其类型。
+
+    ``loss_unit`` 是 ``LossBatch.statistical_unit`` 的预期值，例如
+    ``target_token`` 或 ``sample``。``statistical_unit`` 则描述一个返回
+    梯度所代表的随机单元，两者不得混为一谈。
+    """
+
+    @property
+    def resolver_id(self) -> str:
+        """返回冻结数据适配器的逻辑身份。"""
+
+    @property
+    def sample_ids(self) -> tuple[Hashable, ...]:
+        """返回可解析的有限 sample universe，顺序属于合同。"""
+
+    @property
+    def loss_unit(self) -> str:
+        """返回 resolver 预期的 ``LossBatch.statistical_unit``。"""
+
+    @property
+    def statistical_unit(self) -> str:
+        """返回 draw group mean gradient 的统计单元名称。"""
+
+    @property
+    def weight_unit(self) -> str:
+        """返回 loss effective count 的权重单位。"""
+
+    @property
+    def sampling_design(self) -> str:
+        """返回不可由 runner 增强的抽样设计声明。"""
+
+    @property
+    def weights_exogenous(self) -> bool:
+        """返回权重外生性的显式声明。"""
+
+    @property
+    def common_mean_assumption(self) -> bool:
+        """返回不同权重单元共享同一目标均值的声明。"""
+
+    def resolve(self, sample_id: Hashable) -> object:
+        """只读解析一个 sample ID；未知 ID 必须失败。"""
+
+    def state_digest(self) -> str:
+        """返回数据、语义和 sample universe 的完整摘要。"""
+
+    def assert_unchanged(self, expected_digest: str) -> None:
+        """若 resolver 不再是该冻结状态则失败。"""
+
+
+__all__ = [
+    "FixedStateGradientProvider",
+    "FrozenSampleResolver",
+    "GradientBatch",
+    "GradientProvider",
+]

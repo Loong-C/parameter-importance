@@ -1,0 +1,26 @@
+{
+  "$id": "https://parameter-importance.invalid/schemas/shared/task-output-artifact-v1.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "artifact_hash": {"pattern": "^[0-9a-f]{64}$", "type": "string"},
+    "artifact_kind": {"pattern": "^[a-z][a-z0-9_]*$", "type": "string"},
+    "config_hash": {"pattern": "^[0-9a-f]{64}$", "type": "string"},
+    "formal_eligible": {"type": "boolean"},
+    "payload": {"$ref": "task-output-payload-v1.json"},
+    "run_intent": {"enum": ["local_fixture", "formal"]},
+    "schema_version": {"const": "task-output-artifact-v1"},
+    "source_refs": {
+      "items": {"minLength": 1, "type": "string"},
+      "type": "array",
+      "uniqueItems": true
+    },
+    "task_id": {"pattern": "^stage[0-9]\\.", "type": "string"}
+  },
+  "required": [
+    "schema_version", "task_id", "artifact_kind", "config_hash", "run_intent",
+    "formal_eligible", "source_refs", "payload", "artifact_hash"
+  ],
+  "title": "Task Output Artifact v1",
+  "type": "object"
+}

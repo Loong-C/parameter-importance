@@ -1,0 +1,73 @@
+# Stage 1 Pythia-14M 单卡训练与在线重要性验证的科学身份层。
+# 本文件只声明离线资产 ID/hash；不会下载模型、数据或 tokenizer。
+identity:
+  stage: 1
+  task: stage1.07_single_gpu_pythia14m
+  route: pretrain
+  run_intent: formal
+  formal_eligible: true
+runtime:
+  environment_id: server-cuda-formal-v1
+  dependency_profile: cuda-formal
+  device: cuda
+  output_root: runs/formal/stage1-pythia14m
+  cache_root: cache/formal/stage1-pythia14m
+  temp_root: runs/formal/stage1-pythia14m/tmp
+  allow_dirty_worktree: false
+model:
+  asset_id: pythia-14m
+  revision: FILL_MODEL_REVISION
+  tokenizer_asset_id: pythia-tokenizer
+  initialization_id: FILL_BASE_INITIALIZATION_HASH
+  architecture: pythia-14m
+data:
+  asset_id: pile-pretokenized
+  revision: FILL_DATA_REVISION
+  split: train
+  sequence_length: 2048
+  sampler: distributed-shuffle
+  statistical_unit: sequence
+  weight_unit: effective_token
+  sampling_design: without_replacement_frozen_epoch
+  weights_exogenous: true
+  common_mean_assumption: true
+loss:
+  task_type: causal_lm
+  reduction: mean
+  ignore_index: -100
+  weighting: effective_token
+batching:
+  global_batch_size: 8
+  per_device_batch_size: 2
+  microbatch_size: 1
+  accumulation_steps: 4
+  no_sync: false
+distributed:
+  world_size: 1
+  backend: local
+  device_ids: [0]
+  timeout_seconds: 1800
+precision:
+  compute_dtype: float32
+  gradient_dtype: float32
+  statistic_dtype: float32
+  reference_dtype: float64
+  quadrature_weight_dtype: float64
+  path_accumulation_dtype: float64
+  amp: false
+optimizer:
+  type: adamw
+  learning_rate: 0.0003
+  momentum: 0.0
+  weight_decay: 0.01
+  fused: false
+  foreach: false
+  parameter_groups: []
+importance:
+  estimator_name: u
+  # Stage 1 早于 Stage 2 decision；配置仍保持 formal fail-closed 默认，但本任务
+  # 的任务目录不声明消费未来 decision，避免形成时间循环依赖。
+  estimator_decision_ref: null
+  clip_mode: global_plugin
+  accumulate_views: [signed, positive, negative_mass, absolute, raw, data_movement]
+  require_decision_for_formal: true

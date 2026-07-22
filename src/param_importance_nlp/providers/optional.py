@@ -41,7 +41,11 @@ class HuggingFaceDependencies:
 
 
 def load_huggingface_dependencies() -> HuggingFaceDependencies:
-    """为未来真实 provider 加载依赖，不调用 ``from_pretrained``。"""
+    """为已实现的严格离线 HF provider 延迟加载依赖。
+
+    本函数只解析模块；模型和数据路径仍由 offline adapter 的 manifest 校验器
+    决定，并强制 ``local_files_only``，这里不会触发下载。
+    """
 
     return HuggingFaceDependencies(
         transformers=require_optional_dependency(

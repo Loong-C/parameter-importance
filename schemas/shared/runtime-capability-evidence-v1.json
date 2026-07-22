@@ -1,0 +1,39 @@
+{
+  "$id": "https://parameter-importance.invalid/schemas/shared/runtime-capability-evidence-v1.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "artifact_hash": {"pattern": "^[0-9a-f]{64}$", "type": "string"},
+    "capability": {"pattern": "^[a-z][a-z0-9_]*$", "type": "string"},
+    "checked_at": {"format": "date-time", "type": "string"},
+    "evidence_refs": {
+      "items": {"$ref": "#/$defs/logicalRef"},
+      "minItems": 1,
+      "type": "array",
+      "uniqueItems": true
+    },
+    "metadata": {"type": "object"},
+    "schema_version": {"const": "runtime-capability-evidence-v1"},
+    "scope": {"const": "formal"},
+    "status": {"enum": ["VERIFIED", "BLOCKED", "STALE"]}
+  },
+  "required": [
+    "schema_version",
+    "scope",
+    "capability",
+    "status",
+    "checked_at",
+    "evidence_refs",
+    "metadata",
+    "artifact_hash"
+  ],
+  "title": "Runtime Capability Evidence v1",
+  "type": "object",
+  "$defs": {
+    "logicalRef": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.(?:/|$))(?!.*\\\\).+$"
+    }
+  }
+}

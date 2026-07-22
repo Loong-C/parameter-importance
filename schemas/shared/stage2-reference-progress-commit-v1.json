@@ -1,0 +1,20 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://parameter-importance.invalid/schemas/shared/stage2-reference-progress-commit-v1.json",
+  "title": "Stage 2 authoritative reference progress commit",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "sequence", "state_digest", "object_ref", "object_manifest_hash", "artifact_hash"],
+  "properties": {
+    "schema_version": {"const": "stage2-reference-progress-commit-v1"},
+    "sequence": {"type": "integer", "minimum": 1},
+    "state_digest": {"$ref": "#/$defs/hash"},
+    "object_ref": {"$ref": "#/$defs/ref"},
+    "object_manifest_hash": {"$ref": "#/$defs/hash"},
+    "artifact_hash": {"$ref": "#/$defs/hash"}
+  },
+  "$defs": {
+    "hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "ref": {"type": "string", "minLength": 1, "pattern": "^(?!/)(?![A-Za-z]:)(?!.*(?:^|/)\\.\\.(?:/|$))[^\\\\]+$"}
+  }
+}

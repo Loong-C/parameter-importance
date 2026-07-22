@@ -1,0 +1,32 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://parameter-importance.invalid/schemas/shared/task-status-snapshot-v1.json",
+  "title": "Hash-bound task result status snapshot",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version", "result_ref", "result_hash", "task_id", "stage",
+    "runner_kind", "run_intent", "config_hash", "recovery_mode", "status",
+    "formal_eligible", "artifact_count", "blocker_codes", "snapshot_hash"
+  ],
+  "properties": {
+    "schema_version": {"const": "task-status-snapshot-v1"},
+    "result_ref": {"$ref": "#/$defs/logicalRef"},
+    "result_hash": {"$ref": "#/$defs/hash"},
+    "task_id": {"type": "string", "minLength": 1},
+    "stage": {"type": "integer", "minimum": 0, "maximum": 9},
+    "runner_kind": {"type": "string", "minLength": 1},
+    "run_intent": {"enum": ["local_fixture", "formal"]},
+    "config_hash": {"$ref": "#/$defs/hash"},
+    "recovery_mode": {"type": "string", "minLength": 1},
+    "status": {"enum": ["PASS", "FAIL", "BLOCKED", "SKIPPED"]},
+    "formal_eligible": {"type": "boolean"},
+    "artifact_count": {"type": "integer", "minimum": 0},
+    "blocker_codes": {"type": "array", "uniqueItems": true, "items": {"type": "string", "minLength": 1}},
+    "snapshot_hash": {"$ref": "#/$defs/hash"}
+  },
+  "$defs": {
+    "hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "logicalRef": {"type": "string", "minLength": 1, "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.(?:/|$))(?!.*\\\\).+$"}
+  }
+}

@@ -1,0 +1,17 @@
+{
+  "$id": "https://parameter-importance.invalid/schemas/shared/training-resource-window-commit-v1.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "artifact_hash": {"pattern": "^[0-9a-f]{64}$", "type": "string"},
+    "commit_hash": {"pattern": "^[0-9a-f]{64}$", "type": "string"},
+    "object_ref": {"minLength": 1, "type": "string"},
+    "repetition": {"minimum": 0, "type": "integer"},
+    "schema_version": {"const": "training-resource-window-commit-v1"}
+  },
+  "required": [
+    "schema_version", "repetition", "artifact_hash", "object_ref", "commit_hash"
+  ],
+  "title": "Training Resource Window Commit v1",
+  "type": "object"
+}

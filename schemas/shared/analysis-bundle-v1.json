@@ -1,0 +1,22 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://parameter-importance.invalid/schemas/shared/analysis-bundle-v1.json",
+  "title": "Stage 9 reproducible analysis bundle",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "bundle_id", "scope", "formal_eligible", "formal_authorization_hash", "tables", "reports", "chart_artifacts", "heatmap_artifacts", "table_artifacts", "artifact_hash"],
+  "properties": {
+    "schema_version": {"const": "analysis-bundle-v1"},
+    "bundle_id": {"type": "string", "minLength": 1},
+    "scope": {"enum": ["local_fixture", "formal"]},
+    "formal_eligible": {"type": "boolean"},
+    "formal_authorization_hash": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/hash"}]},
+    "tables": {"type": "array", "minItems": 1, "items": {"$ref": "bound-frozen-source-table-v1.json"}},
+    "reports": {"type": "array", "items": {"$ref": "analysis-report-v1.json"}},
+    "chart_artifacts": {"type": "array", "items": {"$ref": "analysis-chart-artifact-v1.json"}},
+    "heatmap_artifacts": {"type": "array", "items": {"$ref": "analysis-heatmap-artifact-v1.json"}},
+    "table_artifacts": {"type": "array", "items": {"$ref": "analysis-table-artifact-v1.json"}},
+    "artifact_hash": {"$ref": "#/$defs/hash"}
+  },
+  "$defs": {"hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"}}
+}
