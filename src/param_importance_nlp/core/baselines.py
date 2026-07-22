@@ -122,4 +122,3 @@ def synaptic_intelligence(
     result = numerator.zip_map(denominator, torch.div)
     result.assert_finite()
     return result
-

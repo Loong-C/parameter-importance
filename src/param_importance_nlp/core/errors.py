@@ -21,4 +21,3 @@ class TensorMapError(CoreContractError):
 
 class NumericalError(CoreContractError):
     """计算遇到 NaN/Inf、零分母或不支持的数值边界。"""
-

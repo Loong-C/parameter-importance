@@ -155,4 +155,3 @@ def test_classification_loss_and_weighted_merge() -> None:
         pass
     else:  # pragma: no cover
         raise AssertionError("长度 1 的 causal LM 必须失败")
-
