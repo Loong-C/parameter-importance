@@ -1,0 +1,70 @@
+{
+  "schema_version": "stage0.gpu-maintenance-authorization.v1",
+  "request_id": "g0-g-admin-request-20260719",
+  "recorded_at": "2026-07-19T19:31:45+08:00",
+  "maintenance_window": {
+    "status": "PROJECT_OWNER_CONFIRMED_ACTIVE",
+    "project_owner_statement": "All members were consulted and no member is performing work on the node.",
+    "authorized_actions": [
+      "administrator preflight",
+      "temporary stop and verified restoration of Docker, containerd, LXD allocators, and nvidia-persistenced",
+      "exact PCI driver isolation",
+      "GPU recovery when required by a fail-closed runbook",
+      "post-change NVML and PyTorch verification"
+    ],
+    "password_handling": "The host account owner enters the sudo password directly into the remote TTY; it is not recorded by the project."
+  },
+  "selected_path": "B",
+  "allowed_devices": [
+    {
+      "pci": "0000:9c:00.0",
+      "uuid": "GPU-5c672d04-4f83-3cc0-80d0-0108b1b63267"
+    },
+    {
+      "pci": "0000:9d:00.0",
+      "uuid": "GPU-e78c55cd-db97-b761-f559-dc6eae3be81d"
+    },
+    {
+      "pci": "0000:a0:00.0",
+      "uuid": "GPU-9b2b2a3b-3547-187f-ca29-2c02624e2e4f"
+    },
+    {
+      "pci": "0000:a4:00.0",
+      "uuid": "GPU-5a81500d-5e9c-b0d7-5607-fdfdaab65ff4"
+    }
+  ],
+  "excluded_devices": [
+    {
+      "pci": "0000:4f:00.0",
+      "uuid": "GPU-6ff7389b-eaf8-aefd-b2c6-1611be41fa5d",
+      "disposition": "quarantine: repeated NVIDIA RM initialization failure"
+    },
+    {
+      "pci": "0000:50:00.0",
+      "uuid": "GPU-dc6cfc60-41dd-7bcf-ed09-b7deb5be342c",
+      "disposition": "quarantine: uncorrectable ECC, pending row-remap, and Xid 95"
+    },
+    {
+      "pci": "0000:53:00.0",
+      "uuid": "GPU-180ff767-885a-7dc9-c8a9-921d65a01bbd",
+      "disposition": "healthy spare excluded to enforce the exact four-GPU project scope"
+    },
+    {
+      "pci": "0000:57:00.0",
+      "uuid": "GPU-d0ce0b43-7e46-6bca-b078-5aa7043928d7",
+      "disposition": "healthy spare excluded to enforce the exact four-GPU project scope"
+    }
+  ],
+  "isolation_mechanism": "root-controlled exact PCI unbind from the NVIDIA driver, with excluded device nodes retained as root-only",
+  "rollback_policy": "No automatic rebind of faulting devices. Any rollback requires a new drained maintenance window and exact-identity revalidation.",
+  "invalidation_conditions": [
+    "node reboot",
+    "NVIDIA driver reload",
+    "manual PCI rebind",
+    "kernel change",
+    "hardware or topology change",
+    "PCI or UUID mapping change"
+  ],
+  "secrets_included": false,
+  "internal_server_information_included_with_project_owner_approval": true
+}
