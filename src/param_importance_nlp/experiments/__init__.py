@@ -1,9 +1,21 @@
-"""Stage 2–3 的可复现实验编排合同。
+"""Stage 2–8 的可复现实验编排合同。
 
 这里只导出稳定数据类型与纯 CPU 编排；导入本包不会访问服务器、下载模型或
 导入 Hugging Face。需要 Torch 的核心估计器/求积适配器在真正执行时才加载。
 """
 
+from .ablation import AblationCell, AblationFactor, AblationMatrix
+from .pruning import (
+    IMPORTANCE_METHODS,
+    ImportanceSourceSpec,
+    PruningRunSpec,
+    PruningStudySpec,
+)
+from .routes import (
+    TrainingPhaseSpec,
+    TrainingRouteSpec,
+    validate_comparable_routes,
+)
 from .sampling import (
     CANDIDATE_BATCH_SIZES,
     CANDIDATE_MICROBATCH_COUNTS,
@@ -55,6 +67,9 @@ from .stage3 import (
 )
 
 __all__ = [
+    "AblationCell",
+    "AblationFactor",
+    "AblationMatrix",
     "CANDIDATE_BATCH_SIZES",
     "CANDIDATE_MICROBATCH_COUNTS",
     "COST_SEMANTICS",
@@ -67,6 +82,8 @@ __all__ = [
     "EndpointState",
     "EstimatorDecision",
     "FormalDecisionBlocked",
+    "IMPORTANCE_METHODS",
+    "ImportanceSourceSpec",
     "MICROBATCH_SELECTION_ORDER",
     "NodeCacheKey",
     "NodeGradientCache",
@@ -78,6 +95,8 @@ __all__ = [
     "PilotObservation",
     "PrimaryPairDecision",
     "ProbeSpec",
+    "PruningRunSpec",
+    "PruningStudySpec",
     "QuadratureDecision",
     "ReadOnlyPathContext",
     "ReducedMoments",
@@ -94,8 +113,11 @@ __all__ = [
     "StateMutationError",
     "Stage2FixtureStudy",
     "SufficientStatisticShard",
+    "TrainingPhaseSpec",
+    "TrainingRouteSpec",
     "assess_reference_convergence",
     "build_fixture_estimator_decision",
     "build_fixture_quadrature_decision",
     "select_primary_pair",
+    "validate_comparable_routes",
 ]
