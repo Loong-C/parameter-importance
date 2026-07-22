@@ -1,0 +1,35 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://parameter-importance.invalid/schemas/shared/stage456-derived-artifact-v1.json",
+  "title": "Stage 4--6 derived task payload",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "artifact_role",
+    "source_hashes",
+    "derivation_id",
+    "route_audit",
+    "data",
+    "local_validation_status",
+    "gate_status"
+  ],
+  "properties": {
+    "schema_version": {"const": "stage456-derived-artifact-v1"},
+    "artifact_role": {"type": "string", "pattern": "^[a-z][a-z0-9_]*$"},
+    "source_hashes": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+    },
+    "derivation_id": {"type": "string", "minLength": 1},
+    "route_audit": {"type": ["object", "null"]},
+    "data": {},
+    "local_validation_status": {"enum": ["PASS", "FAIL", "SKIPPED", "NOT_RUN"]},
+    "gate_status": {
+      "type": ["string", "null"],
+      "enum": ["PASS", "CONDITIONALLY_ACCEPTED", "FAIL", "BLOCKED", "STALE", "NOT_RUN", null]
+    }
+  }
+}

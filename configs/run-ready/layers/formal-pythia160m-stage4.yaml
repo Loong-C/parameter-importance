@@ -1,0 +1,85 @@
+# Stage 4 formal 科学配置层。资产 ID/revision 是声明式身份，不是下载地址。
+identity:
+  stage: 4
+  task: stage4.minimal_complete_loop
+  route: pretrain
+  run_intent: formal
+  formal_eligible: true
+runtime:
+  environment_id: server-cuda-formal-v1
+  dependency_profile: cuda-formal
+  device: cuda
+  output_root: runs/formal/stage4-pythia160m
+  cache_root: cache/formal/stage4-pythia160m
+  temp_root: runs/formal/stage4-pythia160m/tmp
+  allow_dirty_worktree: false
+model:
+  asset_id: pythia-160m
+  revision: FILL_MODEL_REVISION
+  tokenizer_asset_id: pythia-tokenizer
+  initialization_id: FILL_BASE_INITIALIZATION_HASH
+  architecture: pythia-160m
+data:
+  asset_id: pile-pretokenized
+  revision: FILL_DATA_REVISION
+  split: train
+  sequence_length: 2048
+  sampler: distributed-shuffle
+  statistical_unit: sequence
+  weight_unit: effective_token
+  sampling_design: without_replacement_frozen_epoch
+  weights_exogenous: true
+  common_mean_assumption: true
+loss:
+  task_type: causal_lm
+  reduction: mean
+  ignore_index: -100
+  weighting: effective_token
+batching:
+  global_batch_size: 64
+  per_device_batch_size: 4
+  microbatch_size: 1
+  accumulation_steps: 4
+  no_sync: true
+distributed:
+  world_size: 4
+  backend: nccl
+  device_ids: [0, 1, 2, 3]
+  timeout_seconds: 1800
+precision:
+  compute_dtype: bfloat16
+  gradient_dtype: float32
+  statistic_dtype: float32
+  reference_dtype: float64
+  quadrature_weight_dtype: float64
+  path_accumulation_dtype: float64
+  amp: true
+optimizer:
+  type: adamw
+  learning_rate: 0.0003
+  momentum: 0.0
+  weight_decay: 0.01
+  fused: false
+  foreach: false
+  parameter_groups: []
+importance:
+  estimator_name: u
+  estimator_decision_ref: decisions/stage2-estimator-decision.json
+  clip_mode: global_plugin
+  accumulate_views: [signed, positive, negative_mass, absolute, raw, data_movement]
+  require_decision_for_formal: true
+path_integration:
+  enabled: true
+  path_name: full_update_linear
+  default_rule: FILL_FROM_STAGE3_RECOMMENDATION
+  fallback_rule: FILL_FROM_STAGE3_RECOMMENDATION
+  # 模板值仅用于通过结构校验；正式提交前必须替换为已审核 Stage 3 recommendation。
+  probe_count: 1
+  node_budget: 2
+  thresholds_ref: decisions/stage3-quadrature-recommendation.json
+pruning:
+  enabled: true
+  strategy: highest
+  scope: global
+  ratios: [0.01, 0.05, 0.1]
+  random_repetitions: 5

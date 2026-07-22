@@ -1,0 +1,68 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://parameter-importance.invalid/schemas/shared/stage456-route-execution-v1.json",
+  "title": "Stage 4--6 route execution payload",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "route_spec",
+    "route_source_hash",
+    "route_execution_hash",
+    "route_result",
+    "checkpoint_lineage",
+    "training_metrics",
+    "evaluation_metrics",
+    "importance_trajectory",
+    "layer_module_summary",
+    "topk_sets",
+    "route_comparison",
+    "pruning_results",
+    "estimator_decision_audit",
+    "quadrature_decision_audit",
+    "event_stream_refs",
+    "distributed_execution",
+    "asset_evidence",
+    "local_validation_status",
+    "gate_status",
+    "artifact_role",
+    "data"
+  ],
+  "properties": {
+    "schema_version": {"const": "stage456-route-execution-v1"},
+    "route_spec": {"type": "object"},
+    "route_source_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "route_execution_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "route_result": {"type": "object"},
+    "checkpoint_lineage": {"type": "array", "items": {"type": "object"}},
+    "training_metrics": {"type": "array", "items": {"type": "object"}},
+    "evaluation_metrics": {"type": "array", "items": {"type": "object"}},
+    "importance_trajectory": {"type": "array", "items": {"type": "object"}},
+    "layer_module_summary": {"type": "array", "items": {"type": "object"}},
+    "topk_sets": {"type": "array", "items": {"type": "object"}},
+    "route_comparison": {"type": "object"},
+    "pruning_results": {"type": "array", "items": {"type": "object"}},
+    "estimator_decision_audit": {"type": "object"},
+    "quadrature_decision_audit": {"type": "object"},
+    "event_stream_refs": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {"type": "string", "pattern": "^(?!/)(?!.*(?:^|/)[.][.](?:/|$)).+$"}
+    },
+    "distributed_execution": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["world_size", "result_rank", "backend"],
+      "properties": {
+        "world_size": {"type": "integer", "minimum": 1},
+        "result_rank": {"type": "integer", "minimum": 0},
+        "backend": {"enum": ["local", "gloo", "nccl"]}
+      }
+    },
+    "asset_evidence": {"type": "object"},
+    "local_validation_status": {"enum": ["PASS", "FAIL", "SKIPPED", "NOT_RUN"]},
+    "gate_status": {"enum": ["PASS", "CONDITIONALLY_ACCEPTED", "FAIL", "BLOCKED", "STALE", "NOT_RUN"]},
+    "artifact_role": {"type": "string", "pattern": "^[a-z][a-z0-9_]*$"},
+    "data": {}
+  }
+}

@@ -1,0 +1,65 @@
+# Stage 3 正式路径积分矩阵的科学身份层。真实阈值、节点预算与规则名称必须来自
+# 已审核 pilot/recommendation；这里的占位值只让声明式配置可被严格解析。
+identity:
+  stage: 3
+  task: stage3.07_formal_experiment_matrix
+  route: path-integration
+  run_intent: formal
+  formal_eligible: true
+runtime:
+  environment_id: server-cuda-formal-v1
+  dependency_profile: cuda-formal
+  device: cuda
+  output_root: runs/formal/stage3-path
+  cache_root: cache/formal/stage3-path
+  temp_root: runs/formal/stage3-path/tmp
+  allow_dirty_worktree: false
+model:
+  asset_id: pythia-14m
+  revision: FILL_MODEL_REVISION
+  tokenizer_asset_id: pythia-tokenizer
+  initialization_id: FILL_ENDPOINT_SOURCE_CHECKPOINT_HASH
+  architecture: pythia-14m
+data:
+  asset_id: pile-pretokenized
+  revision: FILL_DATA_REVISION
+  split: validation
+  sequence_length: 2048
+  sampler: frozen-probe-panel
+  statistical_unit: sequence
+  weight_unit: effective_token
+  sampling_design: disjoint_frozen_probe_panel
+  weights_exogenous: true
+  common_mean_assumption: true
+loss:
+  task_type: causal_lm
+  reduction: mean
+  ignore_index: -100
+  weighting: effective_token
+distributed:
+  world_size: 1
+  backend: local
+  device_ids: [0]
+  timeout_seconds: 1800
+precision:
+  compute_dtype: float32
+  gradient_dtype: float32
+  statistic_dtype: float32
+  reference_dtype: float64
+  quadrature_weight_dtype: float64
+  path_accumulation_dtype: float64
+  amp: false
+importance:
+  estimator_name: u
+  estimator_decision_ref: decisions/stage2-estimator-decision.json
+  clip_mode: none
+  accumulate_views: [signed, positive, negative_mass, absolute, raw, data_movement]
+  require_decision_for_formal: true
+path_integration:
+  enabled: true
+  path_name: full_update_linear
+  default_rule: FILL_FROM_STAGE3_PILOT
+  fallback_rule: FILL_FROM_STAGE3_PILOT
+  probe_count: 1
+  node_budget: 2
+  thresholds_ref: decisions/stage3-threshold-freeze.json

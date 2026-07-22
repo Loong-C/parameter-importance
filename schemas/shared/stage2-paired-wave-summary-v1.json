@@ -1,0 +1,80 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://parameter-importance.invalid/schemas/shared/stage2-paired-wave-summary-v1.json",
+  "title": "Stage 2 recoverable paired wave summary",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "wave_id", "registry_hash", "reference_hash", "expected_unit_ids", "completed_unit_ids", "complete", "status", "method_statistics", "cost_statistics", "scope", "formal_eligible", "qualification_gate_hash", "resumed_unit_count", "weighting_assumptions", "artifact_hash"],
+  "properties": {
+    "schema_version": {"const": "stage2-paired-wave-summary-v1"},
+    "wave_id": {"$ref": "#/$defs/id"},
+    "registry_hash": {"$ref": "#/$defs/hash"},
+    "reference_hash": {"$ref": "#/$defs/hash"},
+    "expected_unit_ids": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"$ref": "#/$defs/id"}},
+    "completed_unit_ids": {"type": "array", "uniqueItems": true, "items": {"$ref": "#/$defs/id"}},
+    "complete": {"type": "boolean"},
+    "status": {"enum": ["INCOMPLETE", "FIXTURE_COMPLETE", "FORMAL_CANDIDATE"]},
+    "method_statistics": {"type": "object", "additionalProperties": {"$ref": "#/$defs/methodStats"}},
+    "cost_statistics": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["scientific_equal_sample_cost", "isolated_estimator_cost", "online_training_incremental_cost"],
+      "properties": {
+        "scientific_equal_sample_cost": {"$ref": "#/$defs/cost"},
+        "isolated_estimator_cost": {"$ref": "#/$defs/cost"},
+        "online_training_incremental_cost": {"$ref": "#/$defs/cost"}
+      }
+    },
+    "scope": {"enum": ["local_fixture", "formal"]},
+    "formal_eligible": {"const": false},
+    "qualification_gate_hash": {"type": "null"},
+    "resumed_unit_count": {"type": "integer", "minimum": 0},
+    "weighting_assumptions": {"$ref": "#/$defs/weighting"},
+    "artifact_hash": {"$ref": "#/$defs/hash"}
+  },
+  "$defs": {
+    "id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,159}$"},
+    "hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "weighting": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["statistical_unit", "weight_unit", "sampling_design", "weights_exogenous", "common_mean_assumption"],
+      "properties": {
+        "statistical_unit": {"type": "string", "minLength": 1},
+        "weight_unit": {"type": "string", "minLength": 1},
+        "sampling_design": {"type": "string", "minLength": 1},
+        "weights_exogenous": {"type": "boolean"},
+        "common_mean_assumption": {"type": "boolean"}
+      }
+    },
+    "methodStats": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["repetitions", "coordinate_count", "bias", "absolute_bias", "variance", "mse", "mae", "negative_fraction", "positive_mass", "negative_mass"],
+      "properties": {
+        "repetitions": {"type": "integer", "minimum": 1},
+        "coordinate_count": {"type": "integer", "minimum": 1},
+        "bias": {"type": "number"},
+        "absolute_bias": {"type": "number", "minimum": 0},
+        "variance": {"type": "number", "minimum": 0},
+        "mse": {"type": "number", "minimum": 0},
+        "mae": {"type": "number", "minimum": 0},
+        "negative_fraction": {"type": "number", "minimum": 0, "maximum": 1},
+        "positive_mass": {"type": "number", "minimum": 0},
+        "negative_mass": {"type": "number", "minimum": 0}
+      }
+    },
+    "cost": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["defined", "gradient_evaluations", "formula_seconds", "wall_seconds", "reason"],
+      "properties": {
+        "defined": {"type": "boolean"},
+        "gradient_evaluations": {"oneOf": [{"type": "null"}, {"type": "integer", "minimum": 0}]},
+        "formula_seconds": {"oneOf": [{"type": "null"}, {"type": "number", "minimum": 0}]},
+        "wall_seconds": {"oneOf": [{"type": "null"}, {"type": "number", "minimum": 0}]},
+        "reason": {"oneOf": [{"type": "null"}, {"type": "string", "minLength": 1}]}
+      }
+    }
+  }
+}

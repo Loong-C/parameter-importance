@@ -15,6 +15,8 @@
 
 ## 第 0 阶段：环境配置与实验基础设施建设
 
+详细实施、核验标准与阶段 gate 见 [`stage0/README.md`](stage0/README.md)。
+
 ### 主要实验内容
 
 完成四张 A100 的服务器环境配置，包括 CUDA、PyTorch、NCCL、Transformers、Datasets、Accelerate 或 DeepSpeed 等基础工具的安装与版本固定。
@@ -47,6 +49,8 @@
 ---
 
 ## 第 1 阶段：参数重要性计算的代码正确性验证
+
+> 详细实施计划见 [`stage1/README.md`](stage1/README.md)，其中包含子任务、前置 Gate、逐步执行单元、产物与核验标准。
 
 ### 主要实验内容
 

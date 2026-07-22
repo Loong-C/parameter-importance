@@ -1,0 +1,39 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://parameter-importance.invalid/schemas/shared/analysis-chart-spec-v1.json",
+  "title": "Stage 9 frozen-source chart specification",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version", "chart_id", "source_name", "source_schema_version", "source_hash",
+    "chart_type", "x_column", "y_columns", "filters", "sort_columns",
+    "sort_descending", "spec_hash"
+  ],
+  "properties": {
+    "schema_version": {"const": "analysis-chart-spec-v1"},
+    "chart_id": {"type": "string", "minLength": 1},
+    "source_name": {"type": "string", "minLength": 1},
+    "source_schema_version": {"type": "string", "minLength": 1},
+    "source_hash": {"$ref": "#/$defs/hash"},
+    "chart_type": {"enum": ["line", "scatter", "bar"]},
+    "x_column": {"type": "string", "minLength": 1},
+    "y_columns": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"type": "string", "minLength": 1}},
+    "filters": {"type": "array", "items": {"$ref": "#/$defs/filter"}},
+    "sort_columns": {"type": "array", "uniqueItems": true, "items": {"type": "string", "minLength": 1}},
+    "sort_descending": {"type": "boolean"},
+    "spec_hash": {"$ref": "#/$defs/hash"}
+  },
+  "$defs": {
+    "hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "filter": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["column", "operator", "value"],
+      "properties": {
+        "column": {"type": "string", "minLength": 1},
+        "operator": {"enum": ["eq", "ne", "lt", "le", "gt", "ge", "in"]},
+        "value": {}
+      }
+    }
+  }
+}

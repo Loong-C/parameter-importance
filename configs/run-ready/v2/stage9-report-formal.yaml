@@ -1,0 +1,5 @@
+orchestration:
+  input_result_refs:
+    - FILL_STAGE9_TABLE_ARTIFACTS_COMMIT
+    - FILL_STAGE9_CHART_ARTIFACTS_COMMIT
+artifacts: {output_dir: runs/formal/stage9/report}

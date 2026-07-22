@@ -1,0 +1,22 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://parameter-importance.invalid/schemas/shared/stage-artifact-rows-v1.json",
+  "title": "Versioned rows extracted from one stage artifact",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "artifact_id", "source_schema_version", "source_artifact_hash", "stage", "adapter_id", "rows", "scope", "formal_eligible", "metadata", "artifact_hash"],
+  "properties": {
+    "schema_version": {"const": "stage-artifact-rows-v1"},
+    "artifact_id": {"type": "string", "minLength": 1},
+    "source_schema_version": {"type": "string", "minLength": 1},
+    "source_artifact_hash": {"$ref": "#/$defs/hash"},
+    "stage": {"type": "integer", "minimum": 0, "maximum": 9},
+    "adapter_id": {"type": "string", "minLength": 1},
+    "rows": {"type": "array", "minItems": 1, "items": {"type": "object", "minProperties": 1}},
+    "scope": {"enum": ["local_fixture", "formal"]},
+    "formal_eligible": {"type": "boolean"},
+    "metadata": {"type": "object"},
+    "artifact_hash": {"$ref": "#/$defs/hash"}
+  },
+  "$defs": {"hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"}}
+}

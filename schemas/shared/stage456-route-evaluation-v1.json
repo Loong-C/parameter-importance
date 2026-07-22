@@ -1,0 +1,55 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://parameter-importance.invalid/schemas/shared/stage456-route-evaluation-v1.json",
+  "title": "Stage 4--6 route checkpoint evaluation v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "route_id",
+    "route_lineage_hash",
+    "phase_id",
+    "phase_type",
+    "task_id",
+    "global_step",
+    "split",
+    "checkpoint_id",
+    "checkpoint_manifest_sha256",
+    "evaluator_id",
+    "metrics",
+    "sample_count",
+    "panel_sample_ids_hash",
+    "evaluation_contract_hash",
+    "record_hash"
+  ],
+  "properties": {
+    "schema_version": {"const": "stage456-route-evaluation-v1"},
+    "route_id": {"type": "string", "minLength": 1},
+    "route_lineage_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "phase_id": {"type": "string", "minLength": 1},
+    "phase_type": {
+      "enum": ["pretrain", "direct_supervised", "finetune"]
+    },
+    "task_id": {"type": ["string", "null"]},
+    "global_step": {"type": "integer", "minimum": 1},
+    "split": {"type": "string", "minLength": 1},
+    "checkpoint_id": {"type": "string", "minLength": 1},
+    "checkpoint_manifest_sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "evaluator_id": {"type": "string", "minLength": 1},
+    "metrics": {
+      "type": "object",
+      "minProperties": 1,
+      "additionalProperties": {"type": "number"}
+    },
+    "sample_count": {"type": "integer", "minimum": 1},
+    "panel_sample_ids_hash": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "evaluation_contract_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "record_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+  }
+}

@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://parameter-importance.invalid/schemas/shared/analysis-table-spec-v1.json",
+  "title": "Deterministic CSV Markdown and LaTeX table specification",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "table_artifact_hash", "columns", "formats", "caption", "spec_hash"],
+  "properties": {
+    "schema_version": {"const": "analysis-table-spec-v1"},
+    "table_artifact_hash": {"$ref": "#/$defs/hash"},
+    "columns": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"type": "string", "minLength": 1}},
+    "formats": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"enum": ["csv", "markdown", "latex"]}},
+    "caption": {"type": "string"},
+    "spec_hash": {"$ref": "#/$defs/hash"}
+  },
+  "$defs": {"hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"}}
+}

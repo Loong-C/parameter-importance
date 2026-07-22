@@ -1,0 +1,30 @@
+{
+  "schema_version": "stage0.persistence-decision.v1",
+  "recorded_at": "2026-07-19T10:50:19+08:00",
+  "gate": "G1-D",
+  "status": "PASS",
+  "satisfaction": "TIME_BOUNDED_RISK_ACCEPTANCE",
+  "approval_source": "user message in the active Codex task",
+  "approved_statement": "我接受仅 Stage 0 可再生 smoke 产物的单盘丢失风险，有效至 2026-08-18 23:59 CST 或 Stage 4 开始前（先发生者）；不包含 Stage 4/5 正式产物。",
+  "scope": [
+    "Stage 0 reproducible smoke checkpoints",
+    "Stage 0 test run events",
+    "Stage 0 reproducible infrastructure diagnostics"
+  ],
+  "excluded": [
+    "Stage 4 formal checkpoints and raw results",
+    "Stage 5 formal checkpoints and raw results",
+    "manual adjudications",
+    "unique paper evidence"
+  ],
+  "expires_at": "2026-08-18T23:59:00+08:00",
+  "early_termination_conditions": [
+    "Stage 4 begins",
+    "storage topology changes",
+    "a disk or filesystem anomaly occurs",
+    "the user withdraws the approval"
+  ],
+  "stage4_requirement": "A newly authorized second failure domain and recovery exercise, or a new explicit decision covering formal artifacts, is required before Stage 4.",
+  "authoritative_large_asset_runtime_copy": "/home/sophgo13/cjl/storage/parameter-importance",
+  "independent_failure_domain_copy_count": 0
+}

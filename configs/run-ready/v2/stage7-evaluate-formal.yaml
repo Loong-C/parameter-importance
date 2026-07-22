@@ -1,0 +1,16 @@
+providers:
+  kind: offline_hf
+  model_manifest_ref: manifests/model/pythia-160m.json
+  model_root_ref: assets/model/pythia-160m
+  data_manifest_ref: manifests/data/pile-pretokenized.json
+  data_root_ref: assets/data/pile-pretokenized
+  tokenizer_manifest_ref: manifests/tokenizer/pythia.json
+  tokenizer_root_ref: assets/tokenizer/pythia
+  task_type: causal_lm
+  task_name: pile
+  num_labels: null
+evaluation: {enabled: true, split: validation, every_steps: 1, batch_size: 4, max_batches: 32, metrics: [loss, perplexity]}
+orchestration:
+  matrix_ref: FILL_STAGE7_PRUNING_MATRIX_COMMIT
+  input_result_refs: [FILL_STAGE4_OR_6_TRAINING_TASK_OUTPUT_COMMIT]
+artifacts: {output_dir: runs/formal/stage7/evaluate}

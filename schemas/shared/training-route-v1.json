@@ -1,0 +1,43 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://parameter-importance.invalid/schemas/shared/training-route-v1.json",
+  "title": "Stage 4-6 training route DAG",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "route_id", "phases", "run_intent", "estimator_decision", "estimator_gate", "metadata", "lineage_hash"],
+  "properties": {
+    "schema_version": {"const": "training-route-v1"},
+    "route_id": {"type": "string", "minLength": 1},
+    "phases": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/phase"}},
+    "run_intent": {"enum": ["local_fixture", "formal"]},
+    "estimator_decision": {"oneOf": [{"type": "null"}, {"$ref": "estimator-decision-v1.json"}]},
+    "estimator_gate": {"oneOf": [{"type": "null"}, {"$ref": "gate-record-v1.json"}]},
+    "metadata": {"type": "object"},
+    "lineage_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+  },
+  "$defs": {
+    "phase": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "phase_id", "phase_type", "base_initialization_id", "model_asset_id",
+        "dataset_asset_id", "output_checkpoint_id", "checkpoint_frequency_steps",
+        "parent_phase_id", "input_checkpoint_id", "task_id", "importance_enabled", "metadata"
+      ],
+      "properties": {
+        "phase_id": {"type": "string", "minLength": 1},
+        "phase_type": {"enum": ["pretrain", "direct_supervised", "finetune"]},
+        "base_initialization_id": {"type": "string", "minLength": 1},
+        "model_asset_id": {"type": "string", "minLength": 1},
+        "dataset_asset_id": {"type": "string", "minLength": 1},
+        "output_checkpoint_id": {"type": "string", "minLength": 1},
+        "checkpoint_frequency_steps": {"type": "integer", "minimum": 1},
+        "parent_phase_id": {"oneOf": [{"type": "null"}, {"type": "string", "minLength": 1}]},
+        "input_checkpoint_id": {"oneOf": [{"type": "null"}, {"type": "string", "minLength": 1}]},
+        "task_id": {"oneOf": [{"type": "null"}, {"type": "string", "minLength": 1}]},
+        "importance_enabled": {"type": "boolean"},
+        "metadata": {"type": "object"}
+      }
+    }
+  }
+}

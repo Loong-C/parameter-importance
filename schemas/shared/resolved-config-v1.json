@@ -1,0 +1,127 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://parameter-importance.invalid/schemas/shared/resolved-config-v1.json",
+  "title": "Stage 0-9 resolved configuration",
+  "description": "Python validation additionally enforces batch arithmetic, path safety, local/formal separation, frozen Stage 2 candidate grids and cross-field rules.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "identity", "runtime", "model", "data", "loss", "batching", "distributed",
+    "precision", "optimizer", "logging", "checkpoint", "importance", "sampling",
+    "path_integration", "pruning", "analysis"
+  ],
+  "properties": {
+    "identity": {"$ref": "#/$defs/identity"},
+    "runtime": {"$ref": "#/$defs/runtime"},
+    "model": {"$ref": "#/$defs/model"},
+    "data": {"$ref": "#/$defs/data"},
+    "loss": {"$ref": "#/$defs/loss"},
+    "batching": {"$ref": "#/$defs/batching"},
+    "distributed": {"$ref": "#/$defs/distributed"},
+    "precision": {"$ref": "#/$defs/precision"},
+    "optimizer": {"$ref": "#/$defs/optimizer"},
+    "logging": {"$ref": "#/$defs/logging"},
+    "checkpoint": {"$ref": "#/$defs/checkpoint"},
+    "importance": {"$ref": "#/$defs/importance"},
+    "sampling": {"$ref": "#/$defs/sampling"},
+    "path_integration": {"$ref": "#/$defs/pathIntegration"},
+    "pruning": {"$ref": "#/$defs/pruning"},
+    "analysis": {"$ref": "#/$defs/analysis"}
+  },
+  "$defs": {
+    "nonEmpty": {"type": "string", "minLength": 1},
+    "optionalRef": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/nonEmpty"}]},
+    "positiveInt": {"type": "integer", "minimum": 1},
+    "nonNegativeInt": {"type": "integer", "minimum": 0},
+    "nonNegativeNumber": {"type": "number", "minimum": 0},
+    "optimizerGroup": {
+      "type": "object", "additionalProperties": false,
+      "required": ["group_id", "parameter_names", "learning_rate", "weight_decay", "momentum"],
+      "properties": {
+        "group_id": {"$ref": "#/$defs/nonEmpty"},
+        "parameter_names": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"$ref": "#/$defs/nonEmpty"}},
+        "learning_rate": {"$ref": "#/$defs/nonNegativeNumber"},
+        "weight_decay": {"$ref": "#/$defs/nonNegativeNumber"},
+        "momentum": {"type": "number", "minimum": 0, "exclusiveMaximum": 1}
+      }
+    },
+    "identity": {
+      "type": "object", "additionalProperties": false,
+      "required": ["schema_version", "stage", "task", "route", "master_seed", "run_intent", "formal_eligible", "parent_experiment_id", "input_run_id", "input_checkpoint_id"],
+      "properties": {
+        "schema_version": {"const": "resolved-config-v1"}, "stage": {"type": "integer", "minimum": 0, "maximum": 9},
+        "task": {"$ref": "#/$defs/nonEmpty"}, "route": {"$ref": "#/$defs/nonEmpty"},
+        "master_seed": {"type": "integer", "minimum": 0, "maximum": 9223372036854775807},
+        "run_intent": {"enum": ["local_fixture", "formal"]}, "formal_eligible": {"type": "boolean"},
+        "parent_experiment_id": {"$ref": "#/$defs/optionalRef"}, "input_run_id": {"$ref": "#/$defs/optionalRef"}, "input_checkpoint_id": {"$ref": "#/$defs/optionalRef"}
+      }
+    },
+    "runtime": {
+      "type": "object", "additionalProperties": false,
+      "required": ["environment_id", "offline", "output_root", "temp_root", "cache_root", "device", "dependency_profile", "allow_dirty_worktree"],
+      "properties": {
+        "environment_id": {"$ref": "#/$defs/nonEmpty"}, "offline": {"type": "boolean"},
+        "output_root": {"$ref": "#/$defs/nonEmpty"}, "temp_root": {"$ref": "#/$defs/nonEmpty"}, "cache_root": {"$ref": "#/$defs/nonEmpty"},
+        "device": {"enum": ["cpu", "cuda"]}, "dependency_profile": {"$ref": "#/$defs/nonEmpty"}, "allow_dirty_worktree": {"type": "boolean"}
+      }
+    },
+    "model": {
+      "type": "object", "additionalProperties": false,
+      "required": ["asset_id", "revision", "tokenizer_asset_id", "initialization_id", "architecture"],
+      "properties": {"asset_id": {"$ref": "#/$defs/nonEmpty"}, "revision": {"$ref": "#/$defs/nonEmpty"}, "tokenizer_asset_id": {"$ref": "#/$defs/optionalRef"}, "initialization_id": {"$ref": "#/$defs/nonEmpty"}, "architecture": {"$ref": "#/$defs/nonEmpty"}}
+    },
+    "data": {
+      "type": "object", "additionalProperties": false,
+      "required": ["asset_id", "revision", "split", "sequence_length", "sampler", "statistical_unit", "weight_unit", "sampling_design", "weights_exogenous", "common_mean_assumption"],
+      "properties": {"asset_id": {"$ref": "#/$defs/nonEmpty"}, "revision": {"$ref": "#/$defs/nonEmpty"}, "split": {"$ref": "#/$defs/nonEmpty"}, "sequence_length": {"$ref": "#/$defs/positiveInt"}, "sampler": {"$ref": "#/$defs/nonEmpty"}, "statistical_unit": {"$ref": "#/$defs/nonEmpty"}, "weight_unit": {"$ref": "#/$defs/nonEmpty"}, "sampling_design": {"$ref": "#/$defs/nonEmpty"}, "weights_exogenous": {"type": "boolean"}, "common_mean_assumption": {"type": "boolean"}}
+    },
+    "loss": {
+      "type": "object", "additionalProperties": false, "required": ["task_type", "reduction", "ignore_index", "weighting"],
+      "properties": {"task_type": {"enum": ["causal_lm", "sequence_classification", "synthetic"]}, "reduction": {"enum": ["mean", "sum"]}, "ignore_index": {"type": "integer"}, "weighting": {"enum": ["sample", "effective_token", "explicit"]}}
+    },
+    "batching": {
+      "type": "object", "additionalProperties": false, "required": ["per_device_batch_size", "global_batch_size", "microbatch_size", "accumulation_steps", "no_sync"],
+      "properties": {"per_device_batch_size": {"$ref": "#/$defs/positiveInt"}, "global_batch_size": {"$ref": "#/$defs/positiveInt"}, "microbatch_size": {"$ref": "#/$defs/positiveInt"}, "accumulation_steps": {"$ref": "#/$defs/positiveInt"}, "no_sync": {"type": "boolean"}}
+    },
+    "distributed": {
+      "type": "object", "additionalProperties": false, "required": ["world_size", "backend", "device_ids", "timeout_seconds"],
+      "properties": {"world_size": {"$ref": "#/$defs/positiveInt"}, "backend": {"enum": ["local", "gloo", "nccl"]}, "device_ids": {"type": "array", "uniqueItems": true, "items": {"type": "integer", "minimum": 0}}, "timeout_seconds": {"$ref": "#/$defs/positiveInt"}}
+    },
+    "precision": {
+      "type": "object", "additionalProperties": false, "required": ["compute_dtype", "gradient_dtype", "statistic_dtype", "reference_dtype", "quadrature_weight_dtype", "path_accumulation_dtype", "amp"],
+      "properties": {"compute_dtype": {"enum": ["float32", "bfloat16", "float16"]}, "gradient_dtype": {"const": "float32"}, "statistic_dtype": {"const": "float32"}, "reference_dtype": {"const": "float64"}, "quadrature_weight_dtype": {"const": "float64"}, "path_accumulation_dtype": {"enum": ["float32", "float64"]}, "amp": {"type": "boolean"}}
+    },
+    "optimizer": {
+      "type": "object", "additionalProperties": false, "required": ["type", "learning_rate", "weight_decay", "momentum", "fused", "foreach", "parameter_groups"],
+      "properties": {"type": {"enum": ["sgd", "momentum", "adamw"]}, "learning_rate": {"$ref": "#/$defs/nonNegativeNumber"}, "weight_decay": {"$ref": "#/$defs/nonNegativeNumber"}, "momentum": {"type": "number", "minimum": 0, "exclusiveMaximum": 1}, "fused": {"const": false}, "foreach": {"const": false}, "parameter_groups": {"type": "array", "items": {"$ref": "#/$defs/optimizerGroup"}}}
+    },
+    "logging": {
+      "type": "object", "additionalProperties": false, "required": ["event_format", "log_every_steps", "tensorboard"],
+      "properties": {"event_format": {"const": "jsonl-v1"}, "log_every_steps": {"$ref": "#/$defs/positiveInt"}, "tensorboard": {"type": "boolean"}}
+    },
+    "checkpoint": {
+      "type": "object", "additionalProperties": false, "required": ["schema_version", "save_every_steps", "max_to_keep", "two_phase_commit"],
+      "properties": {"schema_version": {"const": "checkpoint-bundle-v1"}, "save_every_steps": {"$ref": "#/$defs/positiveInt"}, "max_to_keep": {"$ref": "#/$defs/positiveInt"}, "two_phase_commit": {"const": true}}
+    },
+    "importance": {
+      "type": "object", "additionalProperties": false, "required": ["estimator_decision_ref", "estimator_name", "clip_mode", "accumulate_views", "require_decision_for_formal"],
+      "properties": {"estimator_decision_ref": {"$ref": "#/$defs/optionalRef"}, "estimator_name": {"oneOf": [{"type": "null"}, {"enum": ["raw", "double", "u", "weighted_u"]}]}, "clip_mode": {"enum": ["none", "global_plugin"]}, "accumulate_views": {"type": "array", "minItems": 4, "uniqueItems": true, "items": {"enum": ["signed", "positive", "negative_mass", "absolute", "raw", "data_movement", "net_data_movement", "total_endpoint_movement", "magnitude"]}}, "require_decision_for_formal": {"type": "boolean"}}
+    },
+    "sampling": {
+      "type": "object", "additionalProperties": false, "required": ["universe_version", "candidate_batch_sizes", "candidate_microbatch_counts", "microbatch_preference", "repetition_count", "reference_batch_size"],
+      "properties": {"universe_version": {"$ref": "#/$defs/nonEmpty"}, "candidate_batch_sizes": {"const": [32, 64, 128, 256]}, "candidate_microbatch_counts": {"const": [2, 4, 8, 16, 32]}, "microbatch_preference": {"const": [32, 16, 8, 4]}, "repetition_count": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/positiveInt"}]}, "reference_batch_size": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/positiveInt"}]}}
+    },
+    "pathIntegration": {
+      "type": "object", "additionalProperties": false, "required": ["enabled", "path_name", "default_rule", "fallback_rule", "probe_count", "node_budget", "thresholds_ref"],
+      "properties": {"enabled": {"type": "boolean"}, "path_name": {"$ref": "#/$defs/nonEmpty"}, "default_rule": {"$ref": "#/$defs/optionalRef"}, "fallback_rule": {"$ref": "#/$defs/optionalRef"}, "probe_count": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/positiveInt"}]}, "node_budget": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/positiveInt"}]}, "thresholds_ref": {"$ref": "#/$defs/optionalRef"}}
+    },
+    "pruning": {
+      "type": "object", "additionalProperties": false, "required": ["enabled", "strategy", "scope", "ratios", "random_repetitions"],
+      "properties": {"enabled": {"type": "boolean"}, "strategy": {"enum": ["none", "highest", "lowest", "random"]}, "scope": {"enum": ["global", "layer_balanced"]}, "ratios": {"type": "array", "uniqueItems": true, "items": {"type": "number", "exclusiveMinimum": 0, "maximum": 1}}, "random_repetitions": {"$ref": "#/$defs/nonNegativeInt"}}
+    },
+    "analysis": {
+      "type": "object", "additionalProperties": false, "required": ["schema_version", "top_fractions", "confidence_level", "bootstrap_repetitions", "source_table_hash"],
+      "properties": {"schema_version": {"const": "analysis-v1"}, "top_fractions": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"type": "number", "exclusiveMinimum": 0, "maximum": 1}}, "confidence_level": {"type": "number", "exclusiveMinimum": 0, "exclusiveMaximum": 1}, "bootstrap_repetitions": {"$ref": "#/$defs/nonNegativeInt"}, "source_table_hash": {"oneOf": [{"type": "null"}, {"type": "string", "pattern": "^[0-9a-f]{64}$"}]}}
+    }
+  }
+}

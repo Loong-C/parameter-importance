@@ -1,0 +1,12 @@
+# ResolvedConfigV2 overrides；通过 config-resolve-v2 与 v1 layers 合并。
+training:
+  max_steps: 2
+providers:
+  num_labels: 3
+checkpoint_schedule:
+  segments:
+    - start_step: 0
+      end_step: null
+      every_steps: 1
+artifacts:
+  output_dir: runs/local-stage0-training-smoke

@@ -1,0 +1,30 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://parameter-importance.invalid/schemas/shared/formal-execution-evidence-v1.json",
+  "title": "Stage 2-3 formal execution prerequisite evidence",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "run_intent", "contract_freeze_hash", "asset_manifest_hashes", "prerequisite_gates", "metadata", "artifact_hash"],
+  "properties": {
+    "schema_version": {"const": "formal-execution-evidence-v1"},
+    "run_intent": {"enum": ["local_fixture", "formal"]},
+    "contract_freeze_hash": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/hash"}]},
+    "asset_manifest_hashes": {"type": "array", "uniqueItems": true, "items": {"$ref": "#/$defs/hash"}},
+    "prerequisite_gates": {"type": "array", "items": {"$ref": "gate-record-v1.json"}},
+    "metadata": {"type": "object"},
+    "artifact_hash": {"$ref": "#/$defs/hash"}
+  },
+  "allOf": [
+    {
+      "if": {"properties": {"run_intent": {"const": "formal"}}, "required": ["run_intent"]},
+      "then": {
+        "properties": {
+          "contract_freeze_hash": {"$ref": "#/$defs/hash"},
+          "asset_manifest_hashes": {"minItems": 1},
+          "prerequisite_gates": {"minItems": 1}
+        }
+      }
+    }
+  ],
+  "$defs": {"hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"}}
+}

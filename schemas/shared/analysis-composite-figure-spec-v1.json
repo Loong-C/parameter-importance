@@ -1,0 +1,20 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://parameter-importance.invalid/schemas/shared/analysis-composite-figure-spec-v1.json",
+  "title": "Stage 9 composite heatmap/errorbar/facet specification",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "source_table_hash", "source_content_hash", "producer_source_hash", "value_column", "condition_column", "pair_column", "x_column", "panels"],
+  "properties": {
+    "schema_version": {"const": "analysis-composite-figure-spec-v1"},
+    "source_table_hash": {"$ref": "#/$defs/hash"},
+    "source_content_hash": {"$ref": "#/$defs/hash"},
+    "producer_source_hash": {"$ref": "#/$defs/hash"},
+    "value_column": {"type": "string", "minLength": 1},
+    "condition_column": {"type": "string", "minLength": 1},
+    "pair_column": {"type": "string", "minLength": 1},
+    "x_column": {"type": "string", "minLength": 1},
+    "panels": {"const": ["heatmap", "errorbar", "facet"]}
+  },
+  "$defs": {"hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"}}
+}

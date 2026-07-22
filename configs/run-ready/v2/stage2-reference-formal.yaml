@@ -1,0 +1,26 @@
+providers:
+  kind: offline_hf
+  model_manifest_ref: manifests/model/pythia-14m.json
+  model_root_ref: assets/model/pythia-14m
+  data_manifest_ref: manifests/data/pile-pretokenized.json
+  data_root_ref: assets/data/pile-pretokenized
+  tokenizer_manifest_ref: manifests/tokenizer/pythia.json
+  tokenizer_root_ref: assets/tokenizer/pythia
+  task_type: causal_lm
+  task_name: pile
+  num_labels: null
+launcher:
+  kind: local
+  backend: local
+  world_size: 1
+  init_method: local
+  rendezvous_id: null
+orchestration:
+  input_result_refs:
+    # 必须指向 stage2.03 的全部权威 task-output commit；这里只保留显式占位。
+    - FILL_STAGE2_03_SAMPLING_PLAN_COMMIT
+    - FILL_STAGE2_03_DRAW_MANIFEST_COMMIT
+    - FILL_STAGE2_03_ASSET_RESOLUTION_COMMIT
+    - FILL_STAGE2_03_GATE_RECORD_COMMIT
+artifacts:
+  output_dir: runs/formal/stage2-reference

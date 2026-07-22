@@ -1,0 +1,9 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://parameter-importance.invalid/schemas/stage8/contract-v1.json",
+  "title": "Stage 8 contract freeze",
+  "allOf": [
+    {"$ref": "../shared/contract-freeze-v1.json"},
+    {"type": "object", "required": ["stage", "contract_id"], "properties": {"stage": {"const": 8}, "contract_id": {"pattern": "^stage8\\.contract\\."}}}
+  ]
+}

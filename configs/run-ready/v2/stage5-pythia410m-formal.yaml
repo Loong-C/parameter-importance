@@ -1,0 +1,41 @@
+training:
+  max_steps: 10000
+  validation_every_steps: 500
+  gradient_clip_max_norm: 1.0
+scheduler:
+  kind: cosine
+  warmup_steps: 1000
+  total_steps: 10000
+providers:
+  kind: offline_hf
+  model_manifest_ref: manifests/model/pythia-410m.json
+  model_root_ref: assets/model/pythia-410m
+  data_manifest_ref: manifests/data/pile-pretokenized.json
+  data_root_ref: assets/data/pile-pretokenized
+  tokenizer_manifest_ref: manifests/tokenizer/pythia.json
+  tokenizer_root_ref: assets/tokenizer/pythia
+  task_type: causal_lm
+  task_name: pile
+  num_labels: null
+evaluation:
+  enabled: true
+  split: validation
+  every_steps: 500
+  batch_size: 4
+  max_batches: 64
+  metrics: [loss, perplexity]
+checkpoint_schedule:
+  segments:
+    - {start_step: 0, end_step: 1000, every_steps: 100}
+    - {start_step: 1000, end_step: null, every_steps: 500}
+launcher:
+  kind: torchrun
+  backend: nccl
+  world_size: 4
+  init_method: env
+  rendezvous_id: stage5-pythia410m
+orchestration:
+  route_spec_ref: manifests/routes/stage5-pythia410m.json
+  quadrature_decision_ref: decisions/stage3-quadrature-recommendation.json
+artifacts:
+  output_dir: runs/formal/stage5-pythia410m

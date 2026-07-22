@@ -1,0 +1,9 @@
+# 叠加在 formal-pythia160m-stage4.yaml 之后；cell 训练证据由 manifest 引用。
+identity:
+  stage: 8
+  task: stage8.freeze
+  route: ablation-study
+runtime:
+  output_root: runs/formal/stage8
+  cache_root: cache/formal/stage8
+  temp_root: runs/formal/stage8/tmp

@@ -1,0 +1,19 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://parameter-importance.invalid/schemas/shared/formal-readiness-v1.json",
+  "title": "Formal entry readiness result",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version", "formal_eligible", "reasons", "verified_stages",
+    "verified_gate_ids", "estimator_decision_hash"
+  ],
+  "properties": {
+    "schema_version": {"const": "formal-readiness-v1"},
+    "formal_eligible": {"type": "boolean"},
+    "reasons": {"type": "array", "uniqueItems": true, "items": {"type": "string", "minLength": 1}},
+    "verified_stages": {"type": "array", "uniqueItems": true, "items": {"type": "integer", "minimum": 0, "maximum": 9}},
+    "verified_gate_ids": {"type": "array", "uniqueItems": true, "items": {"type": "string", "pattern": "^stage[0-9]\\.G[0-9]+(?:[.-][A-Za-z0-9]+)*$"}},
+    "estimator_decision_hash": {"oneOf": [{"type": "null"}, {"type": "string", "pattern": "^[0-9a-f]{64}$"}]}
+  }
+}

@@ -1,0 +1,3 @@
+orchestration:
+  input_result_refs: [FILL_STAGE9_STATISTICS_RESULT_COMMIT]
+artifacts: {output_dir: runs/formal/stage9/tables}

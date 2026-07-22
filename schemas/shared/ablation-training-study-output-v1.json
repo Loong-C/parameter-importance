@@ -1,0 +1,22 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://parameter-importance.invalid/schemas/shared/ablation-training-study-output-v1.json",
+  "title": "Stage 8 ablation training study output",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version", "study_result", "evidence_manifest",
+    "evidence_manifest_ref", "artifact_hash"
+  ],
+  "properties": {
+    "schema_version": {"const": "ablation-training-study-output-v1"},
+    "study_result": {"type": "object"},
+    "evidence_manifest": {"type": "object"},
+    "evidence_manifest_ref": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^(?!/)(?![A-Za-z]:)(?!.*(?:^|/)\\.\\.(?:/|$))[^\\\\]+$"
+    },
+    "artifact_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+  }
+}

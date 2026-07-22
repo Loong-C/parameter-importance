@@ -1,0 +1,42 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://parameter-importance.invalid/schemas/shared/sampling-plan-v1.json",
+  "title": "Stage 2 sampling plan",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "universe", "universe_hash", "stream_seeds", "algorithm_version", "plan_hash"],
+  "properties": {
+    "schema_version": {"const": "sampling-plan-v1"},
+    "universe": {"$ref": "#/$defs/universe"},
+    "universe_hash": {"$ref": "#/$defs/hash"},
+    "stream_seeds": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["reference_sizing", "reference_A", "reference_B", "pilot", "confirmatory"],
+      "properties": {
+        "reference_sizing": {"type": "integer"},
+        "reference_A": {"type": "integer"},
+        "reference_B": {"type": "integer"},
+        "pilot": {"type": "integer"},
+        "confirmatory": {"type": "integer"}
+      }
+    },
+    "algorithm_version": {"const": "stage2-draws-python-randrange-v1"},
+    "plan_hash": {"$ref": "#/$defs/hash"}
+  },
+  "$defs": {
+    "hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "universe": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["version", "universe_id", "sampling_design", "sample_ids", "metadata"],
+      "properties": {
+        "version": {"const": "sampling-universe-v1"},
+        "universe_id": {"type": "string", "minLength": 1},
+        "sampling_design": {"const": "uniform_with_replacement"},
+        "sample_ids": {"type": "array", "minItems": 1, "uniqueItems": true},
+        "metadata": {"type": "object"}
+      }
+    }
+  }
+}

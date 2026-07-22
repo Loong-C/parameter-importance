@@ -1,0 +1,46 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://parameter-importance.invalid/schemas/shared/stage3-probe-panel-v1.json",
+  "title": "Stage 3 independent fixed probe panel",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "panel_id", "endpoint_digest", "entries", "minimum_formal_probes", "execution_evidence_hash", "scope", "formal_eligible", "qualification_gate_hash", "artifact_hash"],
+  "properties": {
+    "schema_version": {"const": "stage3-probe-panel-v1"},
+    "panel_id": {"$ref": "#/$defs/id"},
+    "endpoint_digest": {"$ref": "#/$defs/hash"},
+    "entries": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/entry"}},
+    "minimum_formal_probes": {"type": "integer", "minimum": 1},
+    "execution_evidence_hash": {"$ref": "#/$defs/hash"},
+    "scope": {"enum": ["local_fixture", "formal"]},
+    "formal_eligible": {"type": "boolean"},
+    "qualification_gate_hash": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/hash"}]},
+    "artifact_hash": {"$ref": "#/$defs/hash"}
+  },
+  "allOf": [
+    {
+      "if": {"properties": {"formal_eligible": {"const": true}}, "required": ["formal_eligible"]},
+      "then": {"properties": {"scope": {"const": "formal"}, "qualification_gate_hash": {"$ref": "#/$defs/hash"}}},
+      "else": {"properties": {"qualification_gate_hash": {"type": "null"}}}
+    }
+  ],
+  "$defs": {
+    "id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,159}$"},
+    "hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "entry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["role", "probe_id", "sample_ids", "content_hash", "loss_contract_hash", "effective_weight_unit", "metadata", "probe_digest"],
+      "properties": {
+        "role": {"enum": ["pilot", "formal", "replay"]},
+        "probe_id": {"type": "string", "minLength": 1},
+        "sample_ids": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"oneOf": [{"type": "string"}, {"type": "integer"}]}},
+        "content_hash": {"$ref": "#/$defs/hash"},
+        "loss_contract_hash": {"$ref": "#/$defs/hash"},
+        "effective_weight_unit": {"type": "string", "minLength": 1},
+        "metadata": {"type": "object"},
+        "probe_digest": {"$ref": "#/$defs/hash"}
+      }
+    }
+  }
+}
