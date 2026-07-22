@@ -62,6 +62,9 @@
 
 ### 3.5 实现有效 token 加权 U-statistic
 
+0. 冻结并记录 `statistical_unit`、`weight_unit`、`sampling_design`、
+   `weights_exogenous` 与 `common_mean_assumption`；任一统计假设未声明时不得附加
+   无偏性声明。
 1. 对每个 microbatch 读取正的有效 token 数 `b_m`。
 2. 累计 `G1 = sum(b_m * g_m)`。
 3. 累计 `G2 = sum(b_m^2 * g_m^2)`。
@@ -73,6 +76,7 @@
 9. 逐张量乘以实际学习率得到公开 U 字段。
 10. 在所有 `b_m` 相同时与等权公式比较。
 11. 记录每个充分统计量，避免只保存最终分数。
+12. 权重若由同批 loss、gradient 或事后筛选产生，只能输出 plug-in/描述性结果。
 
 ### 3.6 建立公共输入防线
 

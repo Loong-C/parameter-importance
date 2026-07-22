@@ -74,6 +74,10 @@
 9. 验证 raw 未裁剪字段保持不变。
 10. 构造逐 microbatch 先裁剪的负对照，验证它与正确结果产生差异。
 11. 比值仅作诊断图：只纳入 `|U_unclipped| >= 100 * atol * a_q` 的坐标；该阈值和 `a_q` 在运行前写入契约。
+12. 验证同批随机 `clip_factor` 输出字段固定为
+    `local_gradient_space_importance_u_clipped`，并带
+    `unbiasedness_claim=none`、`clip_source=same_batch_global_mean`；不得继承未裁剪
+    `local_gradient_space_importance_u` 的无偏性声明。
 
 ### 3.6 验证 AdamW 解释边界
 

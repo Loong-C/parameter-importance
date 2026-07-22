@@ -66,13 +66,19 @@ Provenance 只按预注册 allowlist 保存；不得 dump 全环境，不复制 
 10. 由 rank 0 验证所有预期 rank 分片齐全，并写入文件清单与 schema/version。
 11. 所有 rank 在有限超时内返回 pre-commit ack；任一缺失或失败都不得进入 commit。
 12. rank 0 在临时目录内写好完成标记并完成结构与哈希自检。
-13. rank 0 通过一次同盘原子目录 rename 提交含完成标记的完整 checkpoint；该 rename 是唯一 commit point。
-14. commit 后把结果广播给所有 rank；若广播失败，已提交 checkpoint 保持有效且不可回滚，同时本次运行记录协调失败供人工处理。
-15. 恢复入口只发现具有完整标记且 manifest 通过的 checkpoint。
-16. 不覆盖已有 checkpoint。
-17. commit 前失败的临时目录保留为诊断或按 manifest 中的精确路径隔离，不伪装成可恢复状态。
-18. barrier、汇报、ack 和广播均有预注册有限超时，rank 死亡不能让其余进程无限等待。
-19. 清理时只处理本次 `<run_id>/<attempt>/<object_id>`，不使用宽泛递归目标。
+13. rank 0 通过同盘原子目录 rename 发布含完成标记的不可变 checkpoint 对象；
+    rename 只表示对象字节已发布，不是可恢复性的 commit point。
+14. rank 0 重新打开并校验已发布对象后，原子发布独立的权威
+    `checkpoint_commit`，绑定对象 manifest hash、父 lineage、generation 与
+    canonical event 指针；该小型 commit 才是唯一恢复发现依据。
+15. commit 后把结果广播给所有 rank；若广播失败，已提交 checkpoint 保持有效且不可回滚，同时本次运行记录协调失败供人工处理。
+16. 恢复入口只发现 commit 指向且完整标记、manifest、文件 hash 均通过的对象；
+    `latest` 与目录时间戳都是可重建派生视图，不具权威性。
+17. 不覆盖已有 checkpoint。
+18. commit 前失败的临时目录或已发布孤儿对象保留为诊断，并由 reconciliation
+    标成 orphan；二者都不伪装成可恢复状态。
+19. barrier、汇报、ack 和广播均有预注册有限超时，rank 死亡不能让其余进程无限等待。
+20. 清理时只处理本次 `<run_id>/<attempt>/<object_id>`，不使用宽泛递归目标。
 
 ### 4.2 实现恢复前校验
 

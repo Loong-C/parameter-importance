@@ -23,11 +23,14 @@
 \[
 \widehat C_{k,t}^{U}
 =
-\eta_t
+\eta_{g(k),t}
 \frac{S_{1,k,t}^2-S_{2,k,t}}{M(M-1)}.
 \]
 
-若启用全局梯度裁剪，在线累计量只额外乘一次全局裁剪因子 \(s_t\)。它估计的是 \(\eta_t s_t\mu_{k,t}^2\)，不是 AdamW 完整实际位移的严格无偏路径积分贡献。
+若启用全局梯度裁剪，在线累计量只额外乘一次由同一 batch 计算的全局裁剪因子
+\(\widehat s_t\)。该字段是对 \(\eta_{g(k),t}s_t\mu_{k,t}^2\) 的 plug-in 在线
+分数：因裁剪因子与 U 核心共享随机性，不继承未裁剪 U 的严格无偏性，也不是
+AdamW 完整实际位移的严格无偏路径积分贡献。
 
 本阶段必须证明：
 
@@ -90,7 +93,7 @@
 | `local_gradient_space_importance_raw_clipped` | 可选的 \(s_t\eta_t\bar g_t^{\odot2}\)，必须与 raw 分字段 | 诊断 |
 | `double_sample_gradient_importance` | 两个独立 batch 提供两个梯度因子的逐元素乘积 | 对照 |
 | `local_gradient_space_importance_u` | 未裁剪的等权或加权 microbatch U-statistic | 核心估计量 |
-| `local_gradient_space_importance_u_clipped` | 只乘一次全局 clip factor 的在线累计量 | 正式在线主指标 |
+| `local_gradient_space_importance_u_clipped` | 只乘一次同批全局 clip factor 的 plug-in 在线累计量，`unbiasedness_claim=none` | 在线诊断/决策消费字段 |
 | `importance_signed` | 单步主指标直接跨步求和 | 必须保存 |
 | `importance_positive` | 单步主指标正部的累计 | 派生量 |
 | `importance_negative_mass` | 单步主指标负部绝对值的累计，始终非负 | 派生量 |
