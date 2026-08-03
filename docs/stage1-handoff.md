@@ -2,7 +2,7 @@
 
 本文件定义 Stage 1 的静态进入边界；正式环境 ID、资产 ID、数值容差、证据路径和最终 G10 状态由 `DATA_ROOT` 下不可变的 `stage0-g10-stage1-handoff-v1` 与 `stage0-g10-readiness-v1` 给出。不得凭本文件中的名称猜测运行身份。
 
-相关依据为 [Stage 0 总计划](../plan/Stage0/README.md)、[S0.11 分层测试与重放](../plan/Stage0/11_test_quality_and_replay.md) 和 [S0.12 最终交付](../plan/Stage0/12_delivery_and_sync.md)。
+相关依据为 [Stage 0 总计划](../plan/stage0/README.md)、[S0.11 分层测试与重放](../plan/stage0/11_test_quality_and_replay.md) 和 [S0.12 最终交付](../plan/stage0/12_delivery_and_sync.md)。
 
 ## 可直接复用
 

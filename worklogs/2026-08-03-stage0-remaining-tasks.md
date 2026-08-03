@@ -294,3 +294,23 @@ G1-D 有效期、中文动态 Worklog、Stage 1 handoff 和不可覆盖的 `READ
 - 下一步：提交 G10 本地实现；取得外发授权后推送、验证 bundle 快进服务器、同步并逐项
   核对 `Agent/` 五文件、清理精确 bundle；在最终同一提交上运行 G3→G10 formal 链并发布
   新 readiness。任何一步不一致都保持“收尾中”，不宣布 Stage 0 完成。
+
+## 2026-08-04 07:28 CST — G10 真实仓库布局复核与 Linux 路径修正
+
+- G10 本地实现已提交为 `021885cbbfd4c30b3ace9a0cfcd5a844496c7444`；提交前完整仓库
+  四分片回归为 `945 passed, 10 skipped, 0 failed`。10 个 skip 仍仅是 Windows symlink、
+  POSIX mode 与本机 Torch Gloo 能力限制，未计作 Linux formal PASS。
+- 在提交后的真实 `_capture_source()` 审计中保留并定位失败：Git 索引记录
+  `plan/stage0/...`，原 G10 关键源引用和三份交付文档却写成 `plan/Stage0/...`；同时仓库
+  根文档的索引名称是 `Readme.md`，G9 replay runbook 使用了 `README.md`。这些引用在
+  Windows 大小写不敏感文件系统上可解析，但在 Linux 服务器会导致关键源探针或链接检查
+  失败，因此不能进入同步/formal 阶段。
+- 已把所有相关引用改为 Git 索引的精确大小写，并增强 G10 链接验证：每个本地 Markdown
+  目标除必须位于仓库且存在外，还必须与 `git ls-files -z` 中的路径逐字匹配。新增真实仓库
+  回归同时校验全部关键源引用和 8 个 Stage 0/Stage 1 交接链接。
+- G10 回归：`9 passed, 0 failed`；G9/G10/task runner/CLI 组合回归：
+  `43 passed, 0 failed`；`python -m compileall -q src ops tests` 与
+  `git diff --check` 均退出 0。修正提交形成后还须直接重跑 `_capture_source()` 与最终仓库
+  inventory，随后按新 HEAD 重新生成增量 bundle。
+- GitHub、服务器和 `Agent/` 外发同步仍等待本任务的明确授权；当前状态继续是“收尾中”，
+  不生成或复用 `READY`。

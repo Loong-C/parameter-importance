@@ -2,7 +2,7 @@
 
 本说明是 S0.11/G9 的可执行交接合同。独立执行者只需要当前 Git 提交、`DATA_ROOT` 中的正式 manifest/index 和本文件；不得依赖聊天记录、未记录的物理 GPU 编号或旧 run 目录。
 
-相关合同见 [Stage 0 总计划](../plan/Stage0/README.md)、[S0.11 计划](../plan/Stage0/11_test_quality_and_replay.md) 与 [项目入口](../README.md)。
+相关合同见 [Stage 0 总计划](../plan/stage0/README.md)、[S0.11 计划](../plan/stage0/11_test_quality_and_replay.md) 与 [项目入口](../Readme.md)。
 
 ## 1. 本机与服务器职责
 

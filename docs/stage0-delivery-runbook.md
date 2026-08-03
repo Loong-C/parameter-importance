@@ -1,6 +1,6 @@
 # Stage 0 最终交付与 G10 运行说明
 
-本说明执行 [S0.12 最终交付计划](../plan/Stage0/12_delivery_and_sync.md)，并把结果交给 [Stage 1 静态交接说明](stage1-handoff.md)。任何一步不满足时保持“收尾中”，不得创建或复用 `READY`。
+本说明执行 [S0.12 最终交付计划](../plan/stage0/12_delivery_and_sync.md)，并把结果交给 [Stage 1 静态交接说明](stage1-handoff.md)。任何一步不满足时保持“收尾中”，不得创建或复用 `READY`。
 
 ## 不可颠倒的顺序
 

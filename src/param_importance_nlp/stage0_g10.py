@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 import json
 from pathlib import Path, PurePosixPath
+import posixpath
 import re
 import subprocess
 from typing import Any, Final, Mapping, Sequence
@@ -75,7 +76,7 @@ _CRITICAL_SOURCE_REFS = (
     "docs/stage1-handoff.md",
     "ops/stage0/collect_g10_sync_observation.py",
     "ops/stage0/formalize_g10.py",
-    "plan/Stage0/12_delivery_and_sync.md",
+    "plan/stage0/12_delivery_and_sync.md",
     "reports/stage0/g1-persistence-decision-20260719.json",
     "schemas/stage0-g10-delivery-manifest-v1.json",
     "schemas/stage0-g10-evidence-v1.json",
@@ -405,6 +406,10 @@ def _category(reference: str) -> str:
 
 
 def _validate_stage_links(repository: Path) -> list[str]:
+    listed = _git(repository, "ls-files", "-z")
+    if listed.returncode != 0:
+        raise Stage0G10Error("G10_REPOSITORY_TRACKED_FILE_LIST_FAILED")
+    tracked = {item for item in listed.stdout.split("\0") if item}
     checked: list[str] = []
     for reference in (
         "docs/stage0-delivery-runbook.md",
@@ -419,6 +424,13 @@ def _validate_stage_links(repository: Path) -> list[str]:
                 continue
             if relative.startswith("/") or "\\" in relative:
                 raise Stage0G10Error(f"G10_REPOSITORY_LINK_INVALID:{reference}:{target}")
+            target_reference = posixpath.normpath(
+                f"{PurePosixPath(reference).parent.as_posix()}/{relative}"
+            )
+            if target_reference not in tracked:
+                raise Stage0G10Error(
+                    f"G10_REPOSITORY_LINK_NOT_TRACKED_EXACT:{reference}:{target}"
+                )
             resolved = (path.parent / relative).resolve()
             try:
                 resolved.relative_to(repository)

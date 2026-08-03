@@ -31,10 +31,12 @@ from param_importance_nlp.stage0_bootstrap import Stage0SourceBinding
 from param_importance_nlp.stage0_g9 import Stage0G9FormalState
 from param_importance_nlp.stage0_g10 import (
     G10SourceBinding,
+    _CRITICAL_SOURCE_REFS,
     _REQUIRED_GATES,
     _asset_inventory,
     _find_gate,
     _repository_inventory,
+    _validate_stage_links,
     build_stage0_g10_config,
     run_formal_g10_task,
     validate_formal_g10_outputs,
@@ -173,6 +175,22 @@ def test_g10_sync_remote_head_parser_is_exact() -> None:
             f"{commit}\trefs/heads/main\n",
             branch="feat/stage0-completion",
         )
+
+
+def test_g10_real_repository_paths_match_git_index_case_exactly() -> None:
+    listed = subprocess.run(
+        [
+            "git", "-c", f"safe.directory={ROOT.as_posix()}", "-C", str(ROOT),
+            "ls-files", "-z",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    tracked = {item for item in listed.stdout.split("\0") if item}
+    assert set(_CRITICAL_SOURCE_REFS) <= tracked
+    checked_links = _validate_stage_links(ROOT)
+    assert len(checked_links) == 8
 
 
 def test_repository_inventory_rejects_runtime_artifacts_and_accepts_clean_fixture(
