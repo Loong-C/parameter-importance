@@ -22,7 +22,7 @@ import os
 from pathlib import Path, PurePosixPath
 import platform
 import sys
-from typing import Iterator, Mapping, Sequence
+from typing import Callable, Iterator, Mapping, Sequence
 
 import torch
 
@@ -73,6 +73,7 @@ from ..runtime.training import (
     TrainingRunResult,
     TrainingRunSpec,
     TrainingState,
+    TrainingStepObserver,
     install_training_rng,
 )
 from ..runtime.training_factory import build_grad_scaler, build_optimizer, build_scheduler
@@ -547,6 +548,24 @@ def _training_resources(
     tokenizer_asset = runtime_assets.resolve(
         str(model_config["tokenizer_asset_id"]), expected_kind="tokenizer"
     )
+    # Reject an out-of-range formal cursor before constructing or moving the
+    # model.  G5 deliberately exercises this startup boundary; a manifest
+    # budget error must not allocate a large model and then fail later.
+    early_global_batch_size = int(batching["global_batch_size"])
+    if data_asset.storage_kind == "pythia_mmap_shards":
+        early_route = formal_pile_route(
+            stage=int(identity["stage"]),
+            evaluation=False,
+            declared_sampling_design=str(data["sampling_design"]),
+            configured_split=str(data["split"]),
+        )
+        runtime_assets.validate_pile_budget(
+            stage=int(identity["stage"]),
+            split=early_route.split,
+            requested_records=max_steps * early_global_batch_size,
+            max_steps=max_steps,
+            global_batch_size=early_global_batch_size,
+        )
     runtime_lineage_sha256 = runtime_assets.runtime_lineage_sha256(
         model_asset, data_asset, tokenizer_asset
     )
@@ -1037,6 +1056,8 @@ class TrainingTaskRunner(TaskRunner):
         reducer: object | None = None,
         resources: _TrainingResources | None = None,
         wrapped_model: TorchModelAdapter | None = None,
+        observers: Sequence[TrainingStepObserver] = (),
+        checkpoint_store_factory: Callable[[Path], CheckpointStore] = CheckpointStore,
     ) -> tuple[
         TrainingRunResult,
         TrainingEngine,
@@ -1088,6 +1109,8 @@ class TrainingTaskRunner(TaskRunner):
                 reducer=reducer,
                 resources=owned_resources,
                 wrapped_model=wrapped_model,
+                observers=observers,
+                checkpoint_store_factory=checkpoint_store_factory,
                 cleanup_handles=cleanup_handles,
             )
         except BaseException as error:
@@ -1124,6 +1147,8 @@ class TrainingTaskRunner(TaskRunner):
         reducer: object | None = None,
         resources: _TrainingResources | None = None,
         wrapped_model: TorchModelAdapter | None = None,
+        observers: Sequence[TrainingStepObserver] = (),
+        checkpoint_store_factory: Callable[[Path], CheckpointStore] = CheckpointStore,
         cleanup_handles: list[object] | None = None,
     ) -> tuple[
         TrainingRunResult,
@@ -1251,7 +1276,9 @@ class TrainingTaskRunner(TaskRunner):
             self.workspace_root, str(artifacts["output_dir"]), field="output_dir"
         )
         checkpoint_root = output_root / "checkpoints" / f"rank-{rank:04d}"
-        checkpoint_store = CheckpointStore(checkpoint_root)
+        checkpoint_store = checkpoint_store_factory(checkpoint_root)
+        if not isinstance(checkpoint_store, CheckpointStore):
+            raise TypeError("TRAINING_CHECKPOINT_STORE_FACTORY_INVALID")
         events_dir = output_root / "events"
         events_dir.mkdir(parents=True, exist_ok=True)
         recovery = request.config.section("recovery")
@@ -1316,7 +1343,12 @@ class TrainingTaskRunner(TaskRunner):
             attempt_id="attempt-0000",
             session_id=f"session-rank-{rank:04d}-{session_index:04d}",
             rank=rank,
+            observers=observers,
         )
+        for observer in observers:
+            bind_engine = getattr(observer, "bind_engine", None)
+            if callable(bind_engine):
+                bind_engine(engine)
         endpoint_plan = _endpoint_capture_plan(
             request, self.workspace_root, spec
         )
@@ -1661,6 +1693,44 @@ class TrainingTaskRunner(TaskRunner):
 
     def run(self, request: TaskExecutionRequest) -> TaskRunResult:
         store = _artifact_store(request, self.workspace_root)
+        if (
+            request.config.run_intent == "formal"
+            and request.task.task_id == "stage0.06_single_gpu_smoke"
+        ):
+            existing_g5 = store.discover_complete(
+                task_id=request.task.task_id,
+                config_hash=request.config.config_hash,
+                artifact_kinds=request.task.artifact_kinds,
+                formal_eligible=True,
+            )
+            if existing_g5 is not None:
+                from ..stage0_g5 import validate_formal_g5_outputs
+
+                gate = validate_formal_g5_outputs(
+                    request,
+                    self.workspace_root,
+                    existing_g5,
+                )
+                return TaskRunResult.passed(
+                    request,
+                    artifact_refs=existing_g5,
+                    checkpoint_ref=existing_g5["checkpoint_commit"],
+                    message="Stage 0 G5 restored from revalidated formal commits",
+                    metadata={
+                        "stage0_g5_specialized": True,
+                        "restored": True,
+                        "gate_id": gate.gate_id,
+                    },
+                )
+            from ..stage0_g5 import run_formal_g5_task
+
+            _, source_refs = _input_evidence(request, self.workspace_root)
+            return run_formal_g5_task(
+                request,
+                self.workspace_root,
+                store,
+                source_refs=source_refs,
+            )
         existing = _completed_result(request, store)
         if existing is not None:
             return existing

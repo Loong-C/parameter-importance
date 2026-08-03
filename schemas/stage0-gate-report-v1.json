@@ -1,0 +1,127 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://parameter-importance.invalid/schemas/stage0-gate-report-v1.json",
+  "title": "Stage 0 formal gate report",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "gate_id",
+    "status",
+    "generated_at",
+    "generator_git_commit",
+    "environment_id",
+    "config_hashes",
+    "input_evidence",
+    "checks",
+    "artifact_hash"
+  ],
+  "properties": {
+    "schema_version": {"const": "stage0-gate-report-v1"},
+    "gate_id": {"type": "string", "pattern": "^stage0\\.G(?:[0-9]|10)(?:-[A-Z0-9]+)?$"},
+    "status": {
+      "enum": ["PASS", "FAIL", "BLOCKED", "CONDITIONALLY_ACCEPTED"]
+    },
+    "generated_at": {"type": "string", "format": "date-time"},
+    "generator_git_commit": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+    "environment_id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$"},
+    "config_hashes": {
+      "type": "object",
+      "propertyNames": {"pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$"},
+      "additionalProperties": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+    },
+    "input_evidence": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/evidence_ref"}
+    },
+    "checks": {
+      "type": "array",
+      "minItems": 1,
+      "items": {"$ref": "#/$defs/check"}
+    },
+    "artifact_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+  },
+  "$defs": {
+    "logical_ref": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.?/)(?!.*\\\\).+$"
+    },
+    "evidence_ref": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["ref", "sha256", "schema_version"],
+      "properties": {
+        "ref": {"$ref": "#/$defs/logical_ref"},
+        "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "schema_version": {"type": "string", "minLength": 1}
+      }
+    },
+    "approval": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "approval_ref",
+        "approval_sha256",
+        "approved_by",
+        "approved_at",
+        "expires_at",
+        "scope"
+      ],
+      "properties": {
+        "approval_ref": {"$ref": "#/$defs/logical_ref"},
+        "approval_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "approved_by": {"type": "string", "minLength": 1},
+        "approved_at": {"type": "string", "format": "date-time"},
+        "expires_at": {"type": "string", "format": "date-time"},
+        "scope": {"type": "string", "minLength": 1}
+      }
+    },
+    "check": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "check_id",
+        "check_class",
+        "status",
+        "summary",
+        "exception_eligible",
+        "measurements",
+        "evidence_refs",
+        "approval"
+      ],
+      "properties": {
+        "check_id": {
+          "type": "string",
+          "pattern": "^stage0\\.[A-Za-z0-9][A-Za-z0-9._-]*$"
+        },
+        "check_class": {
+          "enum": ["correctness", "safety", "operational", "performance", "capacity"]
+        },
+        "status": {"enum": ["PASS", "FAIL", "BLOCKED", "APPROVED_EXCEPTION"]},
+        "summary": {"type": "string", "minLength": 1},
+        "exception_eligible": {"type": "boolean"},
+        "measurements": {"type": "object"},
+        "evidence_refs": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {"$ref": "#/$defs/logical_ref"}
+        },
+        "approval": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/approval"}]}
+      },
+      "allOf": [
+        {
+          "if": {"properties": {"status": {"const": "APPROVED_EXCEPTION"}}},
+          "then": {
+            "properties": {
+              "check_class": {"enum": ["performance", "capacity"]},
+              "exception_eligible": {"const": true},
+              "approval": {"$ref": "#/$defs/approval"}
+            }
+          },
+          "else": {"properties": {"approval": {"type": "null"}}}
+        }
+      ]
+    }
+  }
+}

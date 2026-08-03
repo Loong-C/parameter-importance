@@ -1,0 +1,46 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://parameter-importance.invalid/schemas/stage0-g5-worker-plan-v1.json",
+  "title": "Stage 0 G5 fresh-process worker plan",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version", "run_id", "run_kind", "repeat_index",
+    "generator_git_commit", "config_ref", "config_sha256",
+    "environment_ref", "environment_sha256", "selected_gpu_uuid",
+    "repeat_fixed_batch", "capture_tensor_step", "memory_warmup_steps",
+    "memory_measure_steps", "expected_failure_code", "artifact_hash"
+  ],
+  "properties": {
+    "schema_version": {"const": "stage0-g5-worker-plan-v1"},
+    "run_id": {"type": "string", "minLength": 1},
+    "run_kind": {
+      "enum": [
+        "fp32_determinism", "overfit", "bf16", "memory",
+        "failure_invalid_asset", "failure_out_of_range", "failure_nonfinite",
+        "failure_output_collision", "failure_checkpoint_write"
+      ]
+    },
+    "repeat_index": {"type": "integer", "minimum": 0},
+    "generator_git_commit": {"$ref": "#/$defs/git_commit"},
+    "config_ref": {"$ref": "#/$defs/logical_ref"},
+    "config_sha256": {"$ref": "#/$defs/sha256"},
+    "environment_ref": {"$ref": "#/$defs/logical_ref"},
+    "environment_sha256": {"$ref": "#/$defs/sha256"},
+    "selected_gpu_uuid": {"type": "string", "pattern": "^GPU-.+$"},
+    "repeat_fixed_batch": {"type": "boolean"},
+    "capture_tensor_step": {"type": ["integer", "null"], "minimum": 1},
+    "memory_warmup_steps": {"type": ["integer", "null"], "minimum": 0},
+    "memory_measure_steps": {"type": ["integer", "null"], "minimum": 1},
+    "expected_failure_code": {"type": ["string", "null"], "minLength": 1},
+    "artifact_hash": {"$ref": "#/$defs/sha256"}
+  },
+  "$defs": {
+    "git_commit": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "logical_ref": {
+      "type": "string", "minLength": 1,
+      "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.?(?:/|$))(?!.*\\\\)[^:]+$"
+    }
+  }
+}

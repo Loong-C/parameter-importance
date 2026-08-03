@@ -1,0 +1,105 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://parameter-importance.invalid/schemas/stage0-g3-formalization-index-v1.json",
+  "title": "Stage 0 G3 formalization index",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "generator_git_commit",
+    "checked_at",
+    "bootstrap_index_ref",
+    "bootstrap_index_sha256",
+    "materialization_index_ref",
+    "materialization_index_sha256",
+    "materialization_resolution_artifact_hash",
+    "unlock_environment_ref",
+    "unlock_environment_hash",
+    "config_ref",
+    "config_hash",
+    "task_output_refs",
+    "gate_report_ref",
+    "gate_refs",
+    "capability_refs",
+    "environment_ref",
+    "environment_hash",
+    "next_task_id",
+    "next_input_refs",
+    "artifact_hash"
+  ],
+  "properties": {
+    "schema_version": {"const": "stage0-g3-formalization-index-v1"},
+    "generator_git_commit": {"$ref": "#/$defs/git_commit"},
+    "checked_at": {"type": "string", "format": "date-time"},
+    "bootstrap_index_ref": {"$ref": "#/$defs/logical_ref"},
+    "bootstrap_index_sha256": {"$ref": "#/$defs/sha256"},
+    "materialization_index_ref": {"$ref": "#/$defs/logical_ref"},
+    "materialization_index_sha256": {"$ref": "#/$defs/sha256"},
+    "materialization_resolution_artifact_hash": {"$ref": "#/$defs/sha256"},
+    "unlock_environment_ref": {"$ref": "#/$defs/logical_ref"},
+    "unlock_environment_hash": {"$ref": "#/$defs/sha256"},
+    "config_ref": {"$ref": "#/$defs/logical_ref"},
+    "config_hash": {"$ref": "#/$defs/sha256"},
+    "task_output_refs": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["asset_manifest", "asset_audit", "asset_resolution"],
+      "properties": {
+        "asset_manifest": {"$ref": "#/$defs/logical_ref"},
+        "asset_audit": {"$ref": "#/$defs/logical_ref"},
+        "asset_resolution": {"$ref": "#/$defs/logical_ref"}
+      }
+    },
+    "gate_report_ref": {"$ref": "#/$defs/logical_ref"},
+    "gate_refs": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "stage0.G3-S1",
+        "stage0.G3-S2",
+        "stage0.G3-S4",
+        "stage0.G3-S5",
+        "stage0.G3-S6",
+        "stage0.G3"
+      ],
+      "properties": {
+        "stage0.G3-S1": {"$ref": "#/$defs/logical_ref"},
+        "stage0.G3-S2": {"$ref": "#/$defs/logical_ref"},
+        "stage0.G3-S4": {"$ref": "#/$defs/logical_ref"},
+        "stage0.G3-S5": {"$ref": "#/$defs/logical_ref"},
+        "stage0.G3-S6": {"$ref": "#/$defs/logical_ref"},
+        "stage0.G3": {"$ref": "#/$defs/logical_ref"}
+      }
+    },
+    "capability_refs": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["model_assets", "data_assets", "tokenizer_assets"],
+      "properties": {
+        "model_assets": {"$ref": "#/$defs/logical_ref"},
+        "data_assets": {"$ref": "#/$defs/logical_ref"},
+        "tokenizer_assets": {"$ref": "#/$defs/logical_ref"}
+      }
+    },
+    "environment_ref": {"$ref": "#/$defs/logical_ref"},
+    "environment_hash": {"$ref": "#/$defs/sha256"},
+    "next_task_id": {"const": "stage0.05_config_run_identity_and_seeds"},
+    "next_input_refs": {
+      "type": "array",
+      "minItems": 3,
+      "maxItems": 3,
+      "uniqueItems": true,
+      "items": {"$ref": "#/$defs/logical_ref"}
+    },
+    "artifact_hash": {"$ref": "#/$defs/sha256"}
+  },
+  "$defs": {
+    "git_commit": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "logical_ref": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.?(?:/|$))(?!.*\\\\)[^:]+$"
+    }
+  }
+}

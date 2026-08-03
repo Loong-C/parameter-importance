@@ -507,7 +507,10 @@ class _ProviderContext:
     evidence: FormalExecutionEvidence
     provider_kind: str
     asset_manifest_hashes: tuple[str, ...]
-    asset_provenance: tuple[Mapping[str, JSONValue], ...]
+    # Test/in-memory adapters predate G3 provenance projection.  The formal
+    # provider still supplies the full tuple explicitly; a missing value here
+    # means "no external asset provenance", never an inferred formal claim.
+    asset_provenance: tuple[Mapping[str, JSONValue], ...] = ()
 
     def to_payload(self) -> dict[str, JSONValue]:
         return {

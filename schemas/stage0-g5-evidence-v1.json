@@ -1,0 +1,55 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://parameter-importance.invalid/schemas/stage0-g5-evidence-v1.json",
+  "title": "Stage 0 G5 aggregate evidence",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version", "artifact_role", "status", "checked_at",
+    "generator_git_commit", "environment_hash", "selected_gpu_uuid",
+    "suite_root_ref", "worker_report_refs", "validation_report",
+    "gate_record", "gate_report", "artifact_hash"
+  ],
+  "properties": {
+    "schema_version": {"const": "stage0-g5-evidence-v1"},
+    "artifact_role": {"enum": ["training_smoke_result", "event_stream", "checkpoint_commit"]},
+    "status": {"const": "PASS"},
+    "checked_at": {"type": "string", "format": "date-time"},
+    "generator_git_commit": {"$ref": "#/$defs/git_commit"},
+    "environment_hash": {"$ref": "#/$defs/sha256"},
+    "selected_gpu_uuid": {"type": "string", "pattern": "^GPU-.+$"},
+    "suite_root_ref": {"$ref": "#/$defs/logical_ref"},
+    "worker_report_refs": {
+      "type": "array", "minItems": 14, "maxItems": 14, "uniqueItems": true,
+      "items": {"$ref": "#/$defs/logical_ref"}
+    },
+    "validation_report": {
+      "type": "object", "additionalProperties": false,
+      "required": [
+        "schema_version", "status", "checked_at", "generator_git_commit",
+        "environment_hash", "metrics", "process_audit", "artifact_hash"
+      ],
+      "properties": {
+        "schema_version": {"const": "stage0-g5-validation-report-v1"},
+        "status": {"const": "PASS"},
+        "checked_at": {"type": "string", "format": "date-time"},
+        "generator_git_commit": {"$ref": "#/$defs/git_commit"},
+        "environment_hash": {"$ref": "#/$defs/sha256"},
+        "metrics": {"type": "object"},
+        "process_audit": {"type": "object"},
+        "artifact_hash": {"$ref": "#/$defs/sha256"}
+      }
+    },
+    "gate_record": {"$ref": "shared/gate-record-v1.json"},
+    "gate_report": {"$ref": "stage0-gate-report-v1.json"},
+    "artifact_hash": {"$ref": "#/$defs/sha256"}
+  },
+  "$defs": {
+    "git_commit": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "logical_ref": {
+      "type": "string", "minLength": 1,
+      "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.?(?:/|$))(?!.*\\\\)[^:]+$"
+    }
+  }
+}

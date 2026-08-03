@@ -1,0 +1,71 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://parameter-importance.invalid/schemas/stage0-g4-formalization-index-v1.json",
+  "title": "Stage 0 G4 formalization index",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "generator_git_commit",
+    "checked_at",
+    "g3_index_ref",
+    "g3_index_sha256",
+    "g3_resolution_artifact_hash",
+    "config_ref",
+    "config_hash",
+    "task_output_refs",
+    "gate_ref",
+    "environment_ref",
+    "environment_hash",
+    "next_task_id",
+    "next_input_refs",
+    "artifact_hash"
+  ],
+  "properties": {
+    "schema_version": {"const": "stage0-g4-formalization-index-v1"},
+    "generator_git_commit": {"$ref": "#/$defs/git_commit"},
+    "checked_at": {"type": "string", "format": "date-time"},
+    "g3_index_ref": {"$ref": "#/$defs/logical_ref"},
+    "g3_index_sha256": {"$ref": "#/$defs/sha256"},
+    "g3_resolution_artifact_hash": {"$ref": "#/$defs/sha256"},
+    "config_ref": {"$ref": "#/$defs/logical_ref"},
+    "config_hash": {"$ref": "#/$defs/sha256"},
+    "task_output_refs": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "resolved_config",
+        "run_identity",
+        "seed_plan",
+        "provenance_record"
+      ],
+      "properties": {
+        "resolved_config": {"$ref": "#/$defs/logical_ref"},
+        "run_identity": {"$ref": "#/$defs/logical_ref"},
+        "seed_plan": {"$ref": "#/$defs/logical_ref"},
+        "provenance_record": {"$ref": "#/$defs/logical_ref"}
+      }
+    },
+    "gate_ref": {"$ref": "#/$defs/logical_ref"},
+    "environment_ref": {"$ref": "#/$defs/logical_ref"},
+    "environment_hash": {"$ref": "#/$defs/sha256"},
+    "next_task_id": {"const": "stage0.06_single_gpu_smoke"},
+    "next_input_refs": {
+      "type": "array",
+      "minItems": 4,
+      "maxItems": 4,
+      "uniqueItems": true,
+      "items": {"$ref": "#/$defs/logical_ref"}
+    },
+    "artifact_hash": {"$ref": "#/$defs/sha256"}
+  },
+  "$defs": {
+    "git_commit": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "logical_ref": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.?(?:/|$))(?!.*\\\\)[^:]+$"
+    }
+  }
+}

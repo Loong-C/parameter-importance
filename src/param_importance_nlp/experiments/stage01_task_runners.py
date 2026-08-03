@@ -157,6 +157,7 @@ _FORMAL_EVIDENCE_ONLY_TASKS = frozenset(
 )
 
 _G3_TASK_ID = "stage0.04_assets_and_manifests"
+_G4_TASK_ID = "stage0.05_config_run_identity_and_seeds"
 _G3_REQUIREMENTS_REF = "configs/stage0/g3-asset-requirements-v1.json"
 _G3_LAYOUT_REF = "configs/stage0/g3-asset-layout-v1.json"
 _G3_MANIFEST_SCHEMA_VERSION = "stage0-g3-asset-manifest-index-v1"
@@ -1888,6 +1889,27 @@ class Stage01CompositeTaskRunner(TaskRunner):
                 )
             if (
                 request.config.run_intent == "formal"
+                and request.task.task_id == _G4_TASK_ID
+            ):
+                from ..stage0_g4 import validate_formal_g4_outputs
+
+                gate = validate_formal_g4_outputs(
+                    request,
+                    self.workspace_root,
+                    existing,
+                )
+                return TaskRunResult.passed(
+                    request,
+                    artifact_refs=existing,
+                    message="Stage 0 G4 restored from revalidated formal commits",
+                    metadata={
+                        "stage0_g4_specialized": True,
+                        "restored": True,
+                        "gate_id": gate.gate_id,
+                    },
+                )
+            if (
+                request.config.run_intent == "formal"
                 and request.task.task_id in _FORMAL_EVIDENCE_ONLY_TASKS
             ):
                 for reference in existing.values():
@@ -1927,6 +1949,18 @@ class Stage01CompositeTaskRunner(TaskRunner):
             and request.task.task_id == _G3_TASK_ID
         ):
             return _run_formal_g3_task(
+                request,
+                self.workspace_root,
+                store,
+                source_refs=source_refs,
+            )
+        if (
+            request.config.run_intent == "formal"
+            and request.task.task_id == _G4_TASK_ID
+        ):
+            from ..stage0_g4 import run_formal_g4_task
+
+            return run_formal_g4_task(
                 request,
                 self.workspace_root,
                 store,

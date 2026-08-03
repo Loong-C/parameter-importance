@@ -1,0 +1,63 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://parameter-importance.invalid/schemas/stage0-g4-provenance-evidence-v1.json",
+  "title": "Stage 0 G4 provenance and gate evidence",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "status",
+    "checked_at",
+    "generator_git_commit",
+    "environment_hash",
+    "validation_report",
+    "provenance_record",
+    "gate_record",
+    "gate_report",
+    "artifact_hash"
+  ],
+  "properties": {
+    "schema_version": {"const": "stage0-g4-provenance-evidence-v1"},
+    "status": {"const": "PASS"},
+    "checked_at": {"type": "string", "format": "date-time"},
+    "generator_git_commit": {"$ref": "#/$defs/git_commit"},
+    "environment_hash": {"$ref": "#/$defs/sha256"},
+    "validation_report": {"$ref": "#/$defs/validation_report"},
+    "provenance_record": {"$ref": "shared/provenance-record-v1.json"},
+    "gate_record": {"$ref": "shared/gate-record-v1.json"},
+    "gate_report": {"$ref": "stage0-gate-report-v1.json"},
+    "artifact_hash": {"$ref": "#/$defs/sha256"}
+  },
+  "$defs": {
+    "git_commit": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "validation_report": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "status",
+        "checked_at",
+        "generator_git_commit",
+        "environment_hash",
+        "checks",
+        "observations",
+        "artifact_hash"
+      ],
+      "properties": {
+        "schema_version": {"const": "stage0-g4-validation-report-v1"},
+        "status": {"const": "PASS"},
+        "checked_at": {"type": "string", "format": "date-time"},
+        "generator_git_commit": {"$ref": "#/$defs/git_commit"},
+        "environment_hash": {"$ref": "#/$defs/sha256"},
+        "checks": {
+          "type": "object",
+          "minProperties": 7,
+          "additionalProperties": {"const": true}
+        },
+        "observations": {"type": "object"},
+        "artifact_hash": {"$ref": "#/$defs/sha256"}
+      }
+    }
+  }
+}

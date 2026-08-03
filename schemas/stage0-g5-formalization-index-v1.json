@@ -1,0 +1,49 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://parameter-importance.invalid/schemas/stage0-g5-formalization-index-v1.json",
+  "title": "Stage 0 G5 formalization index",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version", "generator_git_commit", "checked_at", "g4_index_ref",
+    "g4_index_sha256", "g4_gate_artifact_hash", "config_ref", "config_hash",
+    "task_output_refs", "gate_ref", "environment_ref", "environment_hash",
+    "next_task_id", "next_input_refs", "artifact_hash"
+  ],
+  "properties": {
+    "schema_version": {"const": "stage0-g5-formalization-index-v1"},
+    "generator_git_commit": {"$ref": "#/$defs/git_commit"},
+    "checked_at": {"type": "string", "format": "date-time"},
+    "g4_index_ref": {"$ref": "#/$defs/logical_ref"},
+    "g4_index_sha256": {"$ref": "#/$defs/sha256"},
+    "g4_gate_artifact_hash": {"$ref": "#/$defs/sha256"},
+    "config_ref": {"$ref": "#/$defs/logical_ref"},
+    "config_hash": {"$ref": "#/$defs/sha256"},
+    "task_output_refs": {
+      "type": "object", "additionalProperties": false,
+      "required": ["training_smoke_result", "event_stream", "checkpoint_commit"],
+      "properties": {
+        "training_smoke_result": {"$ref": "#/$defs/logical_ref"},
+        "event_stream": {"$ref": "#/$defs/logical_ref"},
+        "checkpoint_commit": {"$ref": "#/$defs/logical_ref"}
+      }
+    },
+    "gate_ref": {"$ref": "#/$defs/logical_ref"},
+    "environment_ref": {"$ref": "#/$defs/logical_ref"},
+    "environment_hash": {"$ref": "#/$defs/sha256"},
+    "next_task_id": {"const": "stage0.07_ddp_and_gradient_semantics"},
+    "next_input_refs": {
+      "type": "array", "minItems": 3, "maxItems": 3, "uniqueItems": true,
+      "items": {"$ref": "#/$defs/logical_ref"}
+    },
+    "artifact_hash": {"$ref": "#/$defs/sha256"}
+  },
+  "$defs": {
+    "git_commit": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "logical_ref": {
+      "type": "string", "minLength": 1,
+      "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.?(?:/|$))(?!.*\\\\)[^:]+$"
+    }
+  }
+}
