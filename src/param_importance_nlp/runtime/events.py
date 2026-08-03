@@ -183,11 +183,15 @@ def _validate_typed_payload(event_type: str, payload: dict[str, Any]) -> None:
         if norm is not None and norm < 0:
             raise ValueError("EVENT_GLOBAL_GRADIENT_NORM_NEGATIVE")
         learning_rates = payload["learning_rates_post_step"]
-        if not isinstance(learning_rates, list) or not learning_rates:
+        if (
+            not isinstance(learning_rates, dict)
+            or not learning_rates
+            or any(not isinstance(key, str) or not key for key in learning_rates)
+        ):
             raise ValueError("EVENT_LEARNING_RATES_INVALID")
         if any(
             (_finite_number(item, field="learning_rates_post_step") or 0.0) < 0
-            for item in learning_rates
+            for item in learning_rates.values()
         ):
             raise ValueError("EVENT_LEARNING_RATE_NEGATIVE")
     elif event_type == EventType.VALIDATION.value:

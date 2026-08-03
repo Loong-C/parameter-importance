@@ -1425,7 +1425,7 @@ def _observability_evidence(request: TaskExecutionRequest, root: Path) -> Mappin
                             "effective_token_count": 1,
                             "mean_loss": 1.0 / (step + 1),
                             "global_gradient_norm": 0.5,
-                            "learning_rates_post_step": [0.1],
+                            "learning_rates_post_step": {"group_0000": 0.1},
                         },
                     ),
                     critical=True,

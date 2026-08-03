@@ -1725,6 +1725,16 @@ class TrainingTaskRunner(TaskRunner):
             from ..stage0_g5 import run_formal_g5_task
 
             _, source_refs = _input_evidence(request, self.workspace_root)
+            if len(source_refs) != 4:
+                raise TaskBlockedError(
+                    TaskBlocker(
+                        BlockerCode.ASSET_UNAVAILABLE,
+                        "offline_training_assets",
+                        "formal G5 缺少完整的 G4 配置、身份、seed 与 provenance 输入",
+                        True,
+                        source_refs,
+                    )
+                )
             return run_formal_g5_task(
                 request,
                 self.workspace_root,

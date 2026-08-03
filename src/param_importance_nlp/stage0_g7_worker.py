@@ -293,7 +293,7 @@ def run_stage0_g7_worker(
                         "effective_token_count": 128,
                         "mean_loss": 1.0 / (step + 1),
                         "learning_rate": 0.001,
-                        "learning_rates_post_step": [0.001],
+                        "learning_rates_post_step": {"group_0000": 0.001},
                         "global_gradient_norm": 0.5,
                     },
                 ),

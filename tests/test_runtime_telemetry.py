@@ -85,7 +85,10 @@ def test_tensorboard_rebuild_uses_global_step_and_stable_nested_tags(
                     "effective_token_count": 32,
                     "mean_loss": 1.25,
                     "global_gradient_norm": 0.5,
-                    "learning_rates_post_step": [0.01, 0.001],
+                    "learning_rates_post_step": {
+                        "group_0000": 0.01,
+                        "group_0001": 0.001,
+                    },
                 },
             )
         )
@@ -93,5 +96,5 @@ def test_tensorboard_rebuild_uses_global_step_and_stable_nested_tags(
     count = rebuild_tensorboard_from_jsonl((event_path,), tmp_path / "tensorboard")
     assert count == len(calls)
     assert ("train/mean_loss", 1.25, 7) in calls
-    assert ("train/learning_rates_post_step/0", 0.01, 7) in calls
-    assert ("train/learning_rates_post_step/1", 0.001, 7) in calls
+    assert ("train/learning_rates_post_step/group_0000", 0.01, 7) in calls
+    assert ("train/learning_rates_post_step/group_0001", 0.001, 7) in calls

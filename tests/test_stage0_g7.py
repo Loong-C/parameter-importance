@@ -39,7 +39,7 @@ def _event(
             "effective_token_count": 16,
             "mean_loss": 1.0,
             "global_gradient_norm": 0.5,
-            "learning_rates_post_step": [0.1],
+            "learning_rates_post_step": {"group_0000": 0.1},
             **payload,
         }
     elif event_type is EventType.SYSTEM:

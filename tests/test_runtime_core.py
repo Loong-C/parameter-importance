@@ -514,7 +514,7 @@ def _event(sequence: int, *, step: int | None = None) -> EventRecord:
             "effective_token_count": 1,
             "mean_loss": 1.0,
             "global_gradient_norm": 0.5,
-            "learning_rates_post_step": [0.1],
+            "learning_rates_post_step": {"group_0000": 0.1},
         },
         event_id=f"event-{sequence}",
         occurred_at="2026-07-22T00:00:00+00:00",
