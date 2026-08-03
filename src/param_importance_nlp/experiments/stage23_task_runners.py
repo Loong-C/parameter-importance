@@ -33,7 +33,6 @@ from time import perf_counter
 import numpy as np
 import torch
 
-from ..assets import AssetManifestError, resolve_ready_asset
 from ..capacity import (
     StorageBudget,
     estimate_experiment_storage,
@@ -78,11 +77,17 @@ from ..core.quadrature import (
 )
 from ..core.registry import ParameterRegistry
 from ..core.tensors import TensorMap
+from ..g3_runtime_assets import (
+    FormalG3RuntimeAssets,
+    G3RuntimeAssetError,
+    formal_pile_route,
+    reject_legacy_provider_paths,
+)
 from ..providers import (
     FixedStateGradientProvider,
     OfflineHuggingFaceModelAdapter,
+    PythiaMMapFrozenSampleResolver,
     PretokenizedGlueDatasetAdapter,
-    PretokenizedPileDatasetAdapter,
     SyntheticGradientProvider,
     TorchFixedStateGradientProvider,
 )
@@ -502,6 +507,7 @@ class _ProviderContext:
     evidence: FormalExecutionEvidence
     provider_kind: str
     asset_manifest_hashes: tuple[str, ...]
+    asset_provenance: tuple[Mapping[str, JSONValue], ...]
 
     def to_payload(self) -> dict[str, JSONValue]:
         return {
@@ -513,6 +519,7 @@ class _ProviderContext:
             "sample_universe_size": len(self.sample_ids),
             "execution_evidence_hash": self.evidence.artifact_hash,
             "asset_manifest_hashes": list(self.asset_manifest_hashes),
+            "asset_provenance": [dict(item) for item in self.asset_provenance],
             "weighting_assumptions": {
                 "statistical_unit": self.provider.statistical_unit,
                 "weight_unit": self.provider.weight_unit,
@@ -564,6 +571,7 @@ def _local_provider(request: TaskExecutionRequest) -> _ProviderContext:
         evidence=evidence,
         provider_kind="synthetic_local_fixture",
         asset_manifest_hashes=(),
+        asset_provenance=(),
     )
 
 
@@ -867,14 +875,6 @@ def _formal_execution_evidence(
     return evidence, reference
 
 
-def _infer_glue_task(asset_id: str) -> str:
-    normalized = asset_id.lower().replace("_", "-")
-    matches = [name for name in ("sst-2", "mnli", "rte") if name in normalized]
-    if len(matches) != 1:
-        raise ValueError("FORMAL_GLUE_TASK_NOT_UNIQUE_IN_DATA_ASSET_ID")
-    return matches[0]
-
-
 def _formal_provider(request: TaskExecutionRequest, root: Path) -> _ProviderContext:
     """验证离线资产并构造真实 Torch fixed-state provider。
 
@@ -894,32 +894,48 @@ def _formal_provider(request: TaskExecutionRequest, root: Path) -> _ProviderCont
             retryable=False,
             evidence_refs=(evidence_ref,),
         )
+    reject_legacy_provider_paths(providers)
 
-    manifest_fields = (
-        ("model_manifest_ref", "model_root_ref"),
-        ("data_manifest_ref", "data_root_ref"),
-        ("tokenizer_manifest_ref", "tokenizer_root_ref"),
-    )
-    resolved_assets: list[object] = []
-    manifest_hashes: list[str] = []
-    manifest_refs: list[str] = []
+    resolution_ref = request.environment.evidence_refs.get("g3_resolution")
     try:
-        for manifest_field, root_field in manifest_fields:
-            manifest_ref = str(providers[manifest_field])
-            root_ref = str(providers[root_field])
-            manifest_path = _workspace_path(root, manifest_ref, field=manifest_field)
-            asset_root = _workspace_path(root, root_ref, field=root_field)
-            manifest_hashes.append(_document_hash(manifest_path))
-            manifest_refs.append(manifest_ref)
-            resolved_assets.append(resolve_ready_asset(manifest_path, asset_root))
-    except (FileNotFoundError, AssetManifestError, ValueError) as error:
+        runtime_assets = FormalG3RuntimeAssets.from_request(request, root)
+        base = request.config.base_config
+        model_config = base.section("model")
+        data = base.section("data")
+        runtime = base.section("runtime")
+        identity = base.section("identity")
+        assert all(
+            isinstance(value, dict)
+            for value in (model_config, data, runtime, identity)
+        )
+        task_type = str(providers["task_type"])
+        expected_data_kind = (
+            "pile" if task_type == "causal_lm" else "glue_derived"
+        )
+        model_asset = runtime_assets.resolve(
+            str(model_config["asset_id"]), expected_kind="model"
+        )
+        data_asset = runtime_assets.resolve(
+            str(data["asset_id"]), expected_kind=expected_data_kind
+        )
+        tokenizer_asset = runtime_assets.resolve(
+            str(model_config["tokenizer_asset_id"]), expected_kind="tokenizer"
+        )
+    except (FileNotFoundError, G3RuntimeAssetError, TypeError, ValueError) as error:
         raise _blocked(
             BlockerCode.ASSET_UNAVAILABLE,
-            "offline_hf_assets",
-            f"offline_hf 资产未就绪或校验失败：{type(error).__name__}: {error}",
-            evidence_refs=tuple(manifest_refs),
+            "qualified_g3_runtime_assets",
+            f"qualified G3 runtime assets unavailable: {type(error).__name__}: {error}",
+            retryable=False,
+            evidence_refs=(resolution_ref,) if isinstance(resolution_ref, str) else (),
         ) from error
 
+    qualified_assets = (model_asset, data_asset, tokenizer_asset)
+    runtime_lineage_sha256 = runtime_assets.runtime_lineage_sha256(
+        *qualified_assets
+    )
+    manifest_hashes = [item.ready_manifest_sha256 for item in qualified_assets]
+    manifest_refs = [item.manifest_ref for item in qualified_assets]
     if not set(manifest_hashes).issubset(evidence.asset_manifest_hashes):
         raise _blocked(
             BlockerCode.ASSET_UNAVAILABLE,
@@ -929,44 +945,79 @@ def _formal_provider(request: TaskExecutionRequest, root: Path) -> _ProviderCont
             evidence_refs=(evidence_ref, *manifest_refs),
         )
 
-    model_asset, data_asset, _tokenizer_asset = resolved_assets
-    base = request.config.base_config
-    data = base.section("data")
-    runtime = base.section("runtime")
-    task_type = str(providers["task_type"])
     try:
         model = OfflineHuggingFaceModelAdapter.from_local_directory(
-            getattr(model_asset, "root"),
+            model_asset.resolved.root,
             task_type=task_type,
             num_labels=providers["num_labels"],  # type: ignore[arg-type]
             torch_dtype=torch.float64,
         )
         model.module.to(torch.device(str(runtime["device"])))
         if task_type == "causal_lm":
-            resolver = PretokenizedPileDatasetAdapter(
-                getattr(data_asset, "root"),
-                dataset_id=str(data["asset_id"]),
-                split=str(data["split"]),
-                microbatch_size=1,
-                microbatches_per_step=1,
+            if data_asset.storage_kind != "pythia_mmap_shards":
+                raise G3RuntimeAssetError(
+                    "G3_RUNTIME_STAGE23_PILE_STORAGE_KIND_INVALID"
+                )
+            stage = int(identity["stage"])
+            route = formal_pile_route(
+                stage=stage,
+                evaluation=False,
+                declared_sampling_design=str(data["sampling_design"]),
+                configured_split=str(data["split"]),
+            )
+            start, stop = runtime_assets.pile_split_interval(data_asset, route.split)
+            runtime_assets.validate_pile_budget(
+                stage=stage,
+                split=route.split,
+                requested_records=stop - start,
+            )
+            resolver = PythiaMMapFrozenSampleResolver(
+                runtime_assets.pythia_dataset(data_asset, split=route.split),
+                asset_id=data_asset.resolved.asset_id,
+                ready_manifest_sha256=data_asset.ready_manifest_sha256,
+                qualification_sha256=data_asset.qualification_artifact_hash,
+                g3_resolution_artifact_hash=(
+                    runtime_assets.resolution_artifact_hash
+                ),
+                g3_source_commit=runtime_assets.source_git_commit,
+                g3_runtime_lineage_sha256=runtime_lineage_sha256,
+                split_start=start,
+                split_stop=stop,
                 sampling_design=str(data["sampling_design"]),
                 weights_exogenous=bool(data["weights_exogenous"]),
                 common_mean_assumption=bool(data["common_mean_assumption"]),
-                allowed_root=getattr(data_asset, "root"),
             )
         elif task_type == "sequence_classification":
-            resolver = PretokenizedGlueDatasetAdapter(
-                getattr(data_asset, "root"),
-                task_name=_infer_glue_task(str(data["asset_id"])),
+            if data_asset.storage_kind != "hf_load_from_disk":
+                raise G3RuntimeAssetError(
+                    "G3_RUNTIME_STAGE23_GLUE_STORAGE_KIND_INVALID"
+                )
+            glue_task = data_asset.require_glue_route(
+                task_name=str(providers["task_name"]),
                 split=str(data["split"]),
-                dataset_id=str(data["asset_id"]),
+            )
+            resolver = PretokenizedGlueDatasetAdapter(
+                data_asset.resolved.root,
+                task_name=glue_task,
+                split=str(data["split"]),
+                dataset_id=data_asset.resolved.asset_id,
                 microbatch_size=1,
                 microbatches_per_step=1,
-                allowed_root=getattr(data_asset, "root"),
+                expected_asset_hash=data_asset.directory_content_sha256,
+                allowed_root=data_asset.resolved.root,
+                g3_resolution_artifact_hash=(
+                    runtime_assets.resolution_artifact_hash
+                ),
+                g3_source_commit=runtime_assets.source_git_commit,
+                g3_runtime_lineage_sha256=runtime_lineage_sha256,
             )
         else:
             raise ValueError("FORMAL_FIXED_STATE_TASK_TYPE_UNSUPPORTED")
-        fixed_id = f"offline-{canonical_json_hash(manifest_hashes)[:24]}"
+        fixed_binding = {
+            "g3_resolution_artifact_hash": runtime_assets.resolution_artifact_hash,
+            "assets": [item.provenance() for item in qualified_assets],
+        }
+        fixed_id = f"offline-{canonical_json_hash(fixed_binding)[:24]}"
         provider = TorchFixedStateGradientProvider(
             model,
             resolver,
@@ -980,7 +1031,13 @@ def _formal_provider(request: TaskExecutionRequest, root: Path) -> _ProviderCont
             str(error),
             evidence_refs=tuple(manifest_refs),
         ) from error
-    except (FileNotFoundError, ValueError, TypeError, RuntimeError) as error:
+    except (
+        FileNotFoundError,
+        G3RuntimeAssetError,
+        ValueError,
+        TypeError,
+        RuntimeError,
+    ) as error:
         raise _blocked(
             BlockerCode.ASSET_UNAVAILABLE,
             "offline_hf_fixed_state_provider",
@@ -994,6 +1051,7 @@ def _formal_provider(request: TaskExecutionRequest, root: Path) -> _ProviderCont
         evidence=evidence,
         provider_kind="offline_hf_torch_fixed_state",
         asset_manifest_hashes=tuple(manifest_hashes),
+        asset_provenance=tuple(item.provenance() for item in qualified_assets),
     )
 
 

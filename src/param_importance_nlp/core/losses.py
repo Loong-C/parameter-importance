@@ -131,6 +131,60 @@ def causal_lm_loss(
     return LossBatch(numerator, effective_count, "target_token")
 
 
+def pre_shifted_causal_lm_loss(
+    logits: torch.Tensor,
+    target_ids: torch.Tensor,
+    attention_mask: torch.Tensor | None = None,
+    *,
+    ignore_index: int = -100,
+) -> LossBatch:
+    """Compute next-token loss when targets are already aligned with logits.
+
+    ``target_ids[:, j]`` is the explicit next-token target predicted by
+    ``logits[:, j, :]``.  Unlike :func:`causal_lm_loss`, this function does
+    not discard the final logit or shift the target tensor a second time.
+    This is the Pythia mmap contract: each 2049-token source record becomes
+    2048 input tokens and 2048 pre-shifted target tokens.
+    """
+
+    if logits.ndim != 3:
+        raise CoreContractError("pre-shifted causal LM logits must be [B, L, V]")
+    if target_ids.ndim != 2 or tuple(target_ids.shape) != tuple(logits.shape[:2]):
+        raise CoreContractError(
+            "pre-shifted target_ids must be [B, L] and match the logits sequence"
+        )
+    if target_ids.dtype not in _INTEGER_DTYPES:
+        raise CoreContractError("pre-shifted target_ids must use an integer dtype")
+    if logits.shape[1] < 1:
+        raise CoreContractError("pre-shifted causal LM sequence length must be positive")
+    if not logits.is_floating_point():
+        raise CoreContractError("pre-shifted causal LM logits must be floating point")
+
+    valid = target_ids.ne(ignore_index)
+    if attention_mask is not None:
+        if attention_mask.ndim != 2 or tuple(attention_mask.shape) != tuple(
+            target_ids.shape
+        ):
+            raise CoreContractError(
+                "pre-shifted attention_mask must have the same shape as target_ids"
+            )
+        _validate_binary_mask(attention_mask, name="pre-shifted attention_mask")
+        valid = valid & attention_mask.to(dtype=torch.bool)
+    effective_count = int(valid.sum().item())
+    if effective_count <= 0:
+        raise CoreContractError("pre-shifted causal LM batch has no target tokens")
+
+    flat_logits = logits.reshape(-1, logits.shape[-1])
+    flat_targets = target_ids.reshape(-1)
+    flat_valid = valid.reshape(-1)
+    numerator = functional.cross_entropy(
+        flat_logits[flat_valid],
+        flat_targets[flat_valid].to(dtype=torch.long),
+        reduction="sum",
+    )
+    return LossBatch(numerator, effective_count, "target_token")
+
+
 def sequence_classification_loss(
     logits: torch.Tensor,
     labels: torch.Tensor,

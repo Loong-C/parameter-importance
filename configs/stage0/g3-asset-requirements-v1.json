@@ -1,6 +1,6 @@
 {
   "schema_version": "stage0-asset-requirements-v1",
-  "artifact_hash": "2c44455bd1914b52338968eba4e9b92370a35523e2f4434c1cbb368a1f5dd648",
+  "artifact_hash": "591ba7f66cfc006845386a59e5661df0609b4613d7f91a527f490c4a11ddaaa9",
   "status": "FROZEN",
   "created_at": "2026-08-03T15:29:40+08:00",
   "generator_git_commit": "1b88e8dd3264d460b0a642caee1e88e2456c247d",
@@ -61,7 +61,17 @@
           "sha256": "5dad0c31b7c19af86f5840674fa4f16a91bdf617245aae17387bdaedd3600319",
           "role": "weights"
         }
-      ]
+      ],
+      "legacy_manifest_diagnostic": {
+        "refs": [
+          "models/pythia-31m-deduped-step0/model-manifest.json",
+          "manifests/pythia-31m-deduped-step0.json"
+        ],
+        "size_bytes": 2189,
+        "sha256": "1f7f812bb522ddb344d5ae10e66b94dc4e11ac9049e7eedbb737350719a24e59",
+        "condition": "utf8_bom_strict_json_rejected",
+        "replacement_manifest_ref": "manifests/model/pythia-31m.json"
+      }
     },
     {
       "name": "pythia-160m-deduped-step0",
@@ -240,6 +250,16 @@
       {"stage": 5, "split": "train", "max_steps": 10000, "global_batch_size": 64, "required_unique_records": 640000, "required_target_tokens": 1310720000},
       {"stage": 5, "split": "validation", "max_steps": null, "global_batch_size": null, "required_unique_records": 256, "required_target_tokens": 524288}
     ],
+    "reference_reader": {
+      "repository": "EleutherAI/pythia",
+      "revision": "a19eecb807ec2c79a39ebf18108816e6ffffc1d5"
+    },
+    "reference_reader_oracle": {
+      "artifact_ref": "manifests/batch-viewer-comparison.json",
+      "artifact_sha256": "94d25dabed134c41a703a792b5bb613c46938d3246b2d2ff8e3904eb9d4da85c",
+      "official_source_ref": "source/pythia-a19eecb807ec2c79a39ebf18108816e6ffffc1d5"
+    },
+    "reference_batch_size": 1024,
     "reference_batch_sha256": {
       "0": "7b5299e7ed772054885b16d1d61778c5f437a5fb196aeffab5dba4577977c562",
       "1": "2f08a61f39b39d7fea82babb2908899434648ef0e293ba177f5e8e79a3aa6402",

@@ -75,6 +75,20 @@ def _offline_provider(root_prefix: str = "assets/local") -> dict[str, object]:
     }
 
 
+def _formal_offline_provider() -> dict[str, object]:
+    provider = _offline_provider()
+    for field in (
+        "model_manifest_ref",
+        "model_root_ref",
+        "data_manifest_ref",
+        "data_root_ref",
+        "tokenizer_manifest_ref",
+        "tokenizer_root_ref",
+    ):
+        provider[field] = None
+    return provider
+
+
 def test_catalog_covers_every_numbered_stage0_to_stage3_plan() -> None:
     expected_plan_refs: set[str] = set()
     for stage in range(4):
@@ -313,7 +327,7 @@ def test_provider_task_name_freezes_pile_and_glue_semantics() -> None:
         )
 
 
-def test_formal_model_execution_requires_explicit_local_hf_manifests_and_roots() -> None:
+def test_formal_model_execution_uses_only_g3_logical_resolution() -> None:
     formal = _formal_mapping()
     formal["runtime"]["device"] = "cuda"  # type: ignore[index]
     with pytest.raises(ConfigContractError, match="offline_hf"):
@@ -323,16 +337,52 @@ def test_formal_model_execution_requires_explicit_local_hf_manifests_and_roots()
             overrides={"training": {"max_steps": 1}},
         )
 
+    logical_provider = _formal_offline_provider()
     config = load_resolved_config_compatible(
         formal,
+        task_id="stage0.06_single_gpu_smoke",
+        overrides={
+            "training": {"max_steps": 1},
+            "providers": logical_provider,
+        },
+    )
+    assert config.section("providers")["kind"] == "offline_hf"  # type: ignore[index]
+    assert config.section("providers")["local_files_only"] is True  # type: ignore[index]
+    assert config.section("providers")["model_manifest_ref"] is None  # type: ignore[index]
+
+    with pytest.raises(ConfigContractError, match="G3 logical resolution"):
+        load_resolved_config_compatible(
+            formal,
+            task_id="stage0.06_single_gpu_smoke",
+            overrides={
+                "training": {"max_steps": 1},
+                "providers": _offline_provider(),
+            },
+        )
+
+
+def test_nonformal_offline_hf_keeps_explicit_legacy_path_contract() -> None:
+    config = load_resolved_config_compatible(
+        _legacy_mapping(),
         task_id="stage0.06_single_gpu_smoke",
         overrides={
             "training": {"max_steps": 1},
             "providers": _offline_provider(),
         },
     )
-    assert config.section("providers")["kind"] == "offline_hf"  # type: ignore[index]
-    assert config.section("providers")["local_files_only"] is True  # type: ignore[index]
+    assert config.section("providers")["model_manifest_ref"] == "manifests/model.json"  # type: ignore[index]
+
+    incomplete = _offline_provider()
+    incomplete["data_root_ref"] = None
+    with pytest.raises(ConfigContractError, match="non-formal offline_hf"):
+        load_resolved_config_compatible(
+            _legacy_mapping(),
+            task_id="stage0.06_single_gpu_smoke",
+            overrides={
+                "training": {"max_steps": 1},
+                "providers": incomplete,
+            },
+        )
 
 
 @pytest.mark.parametrize(
@@ -474,7 +524,7 @@ def test_formal_stage4_training_requires_route_quadrature_assets_evaluation_and_
     formal["batching"]["global_batch_size"] = 8  # type: ignore[index]
     common_overrides = {
         "training": {"max_steps": 2},
-        "providers": _offline_provider(),
+        "providers": _formal_offline_provider(),
         "orchestration": {
             "route_spec_ref": "routes/stage4.json",
             "quadrature_decision_ref": "decisions/quadrature.json",

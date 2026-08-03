@@ -1,0 +1,84 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://parameter-importance.invalid/schemas/stage0-g3-verify-only-report-v1.json",
+  "title": "Stage 0 G3 independent verify-only report",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version", "formal", "status", "checked_at", "actor", "actor_role",
+    "actor_instance_id", "generator_git_commit", "requirements_ref",
+    "requirements_sha256", "layout_ref", "layout_sha256", "acquisition_ref",
+    "acquisition_sha256", "network_attempts", "entry_count", "entries",
+    "artifact_hash"
+  ],
+  "properties": {
+    "schema_version": {"const": "stage0-g3-verify-only-report-v1"},
+    "formal": {"const": true},
+    "status": {"enum": ["PASS", "FAILED"]},
+    "checked_at": {"type": "string", "format": "date-time"},
+    "actor": {"type": "string", "minLength": 1, "maxLength": 256},
+    "actor_role": {"const": "verifier"},
+    "actor_instance_id": {"type": "string", "minLength": 1, "maxLength": 512},
+    "generator_git_commit": {"$ref": "#/$defs/gitDigest"},
+    "requirements_ref": {"$ref": "#/$defs/relativePath"},
+    "requirements_sha256": {"$ref": "#/$defs/sha256"},
+    "layout_ref": {"$ref": "#/$defs/relativePath"},
+    "layout_sha256": {"$ref": "#/$defs/sha256"},
+    "acquisition_ref": {"$ref": "#/$defs/relativePath"},
+    "acquisition_sha256": {"$ref": "#/$defs/sha256"},
+    "network_attempts": {"const": 0},
+    "entry_count": {"const": 13},
+    "entries": {
+      "type": "array",
+      "minItems": 13,
+      "maxItems": 13,
+      "items": {"$ref": "#/$defs/entry"}
+    },
+    "artifact_hash": {"$ref": "#/$defs/sha256"}
+  },
+  "$defs": {
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "gitDigest": {"type": "string", "pattern": "^(?:[0-9a-f]{40}|[0-9a-f]{64})$"},
+    "relativePath": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.(?:/|$))(?!.*[\\\\:?]).+$"
+    },
+    "fileObservation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "path", "expected_size", "expected_sha256", "observed_size",
+        "observed_sha256", "status"
+      ],
+      "properties": {
+        "path": {"$ref": "#/$defs/relativePath"},
+        "expected_size": {"type": "integer", "minimum": 0},
+        "expected_sha256": {"$ref": "#/$defs/sha256"},
+        "observed_size": {"type": ["integer", "null"], "minimum": 0},
+        "observed_sha256": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/sha256"}]},
+        "status": {"enum": ["PASS", "missing", "unsafe", "size_mismatch", "sha256_mismatch"]}
+      }
+    },
+    "entry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "logical_name", "asset_id", "candidate_id", "downloaded_manifest_ref",
+        "downloaded_manifest_sha256", "files", "files_checked", "bytes_checked",
+        "status"
+      ],
+      "properties": {
+        "logical_name": {"type": "string", "minLength": 1, "maxLength": 256},
+        "asset_id": {"$ref": "#/$defs/sha256"},
+        "candidate_id": {"$ref": "#/$defs/sha256"},
+        "downloaded_manifest_ref": {"$ref": "#/$defs/relativePath"},
+        "downloaded_manifest_sha256": {"$ref": "#/$defs/sha256"},
+        "files": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/fileObservation"}},
+        "files_checked": {"type": "integer", "minimum": 0},
+        "bytes_checked": {"type": "integer", "minimum": 0},
+        "status": {"enum": ["PASS", "FAILED"]}
+      }
+    }
+  }
+}

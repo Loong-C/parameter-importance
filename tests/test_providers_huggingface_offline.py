@@ -249,6 +249,45 @@ def test_glue_sst2_split_label_normalization_and_mnli_validation(
         )
 
 
+def test_glue_cursor_resume_rejects_different_full_g3_runtime_lineage(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = _asset_directory(tmp_path)
+    dataset = _FakeDataset(_glue_rows(), fingerprint="sst2-lineage")
+    fake_module = _FakeDatasetsModule({"validation": dataset})
+    monkeypatch.setattr(
+        offline,
+        "require_optional_dependency",
+        lambda name, *, feature: fake_module,
+    )
+    common = {
+        "task_name": "sst2",
+        "split": "validation",
+        "dataset_id": "sst2-qualified",
+        "microbatch_size": 1,
+        "microbatches_per_step": 1,
+        "g3_resolution_artifact_hash": "1" * 64,
+        "g3_source_commit": "a" * 40,
+    }
+    first = offline.PretokenizedGlueDatasetAdapter(
+        root,
+        **common,
+        g3_runtime_lineage_sha256="2" * 64,
+    )
+    second = offline.PretokenizedGlueDatasetAdapter(
+        root,
+        **common,
+        g3_runtime_lineage_sha256="3" * 64,
+    )
+    state = first.cursor(seed=11).state_dict()
+
+    with pytest.raises(
+        ValueError, match="OFFLINE_HF_CURSOR_STATE_IDENTITY_MISMATCH"
+    ):
+        second.cursor(seed=11).load_state_dict(state)
+
+
 def test_remote_or_missing_path_fails_before_optional_dependency(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

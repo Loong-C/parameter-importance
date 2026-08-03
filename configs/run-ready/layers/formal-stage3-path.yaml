@@ -23,7 +23,7 @@ model:
 data:
   asset_id: pile-selected-prefix
   revision: FILL_DATA_REVISION
-  split: validation
+  split: probe
   sequence_length: 2048
   sampler: frozen-probe-panel
   statistical_unit: sequence

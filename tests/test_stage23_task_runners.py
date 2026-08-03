@@ -514,12 +514,12 @@ def test_formal_runner_missing_execution_evidence_is_blocked_before_synthetic_fa
     runtime_section.update({"device": "cuda", "allow_dirty_worktree": False})
     provider = {
         "kind": "offline_hf",
-        "model_manifest_ref": "manifests/model.json",
-        "model_root_ref": "assets/model",
-        "data_manifest_ref": "manifests/data.json",
-        "data_root_ref": "assets/data",
-        "tokenizer_manifest_ref": "manifests/tokenizer.json",
-        "tokenizer_root_ref": "assets/tokenizer",
+        "model_manifest_ref": None,
+        "model_root_ref": None,
+        "data_manifest_ref": None,
+        "data_root_ref": None,
+        "tokenizer_manifest_ref": None,
+        "tokenizer_root_ref": None,
     }
     config = load_resolved_config_compatible(
         value,

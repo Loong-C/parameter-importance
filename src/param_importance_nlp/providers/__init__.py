@@ -52,6 +52,13 @@ from .huggingface_offline import (
     PretokenizedPileDatasetAdapter,
     hash_local_directory,
 )
+from .pythia_mmap import (
+    PythiaMMapBatchCursor,
+    PythiaMMapDatasetAdapter,
+    PythiaMMapFrozenSampleResolver,
+    PythiaMMapProviderError,
+    PythiaSamplingDesign,
+)
 
 __all__ = [
     "BatchCursor",
@@ -74,6 +81,11 @@ __all__ = [
     "PretokenizedJsonlDatasetAdapter",
     "PretokenizedGlueDatasetAdapter",
     "PretokenizedPileDatasetAdapter",
+    "PythiaMMapBatchCursor",
+    "PythiaMMapDatasetAdapter",
+    "PythiaMMapFrozenSampleResolver",
+    "PythiaMMapProviderError",
+    "PythiaSamplingDesign",
     "SyntheticGradientProvider",
     "TaskEvaluator",
     "TinyCausalLM",

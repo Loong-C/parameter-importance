@@ -55,6 +55,37 @@ _MAIN_PILE_INTERVALS: Final = (
     "probe",
     "reserve",
 )
+_EXPECTED_PILE_WORKLOAD_MATRIX: Final = frozenset(
+    {
+        (1, "train"),
+        (1, "validation"),
+        (2, "sampling_universe"),
+        (3, "probe"),
+        (4, "train"),
+        (4, "validation"),
+        (5, "train"),
+        (5, "validation"),
+    }
+)
+_PILE_WORKLOAD_FIELDS: Final = frozenset(
+    {
+        "stage",
+        "split",
+        "max_steps",
+        "global_batch_size",
+        "required_unique_records",
+        "required_target_tokens",
+    }
+)
+_PILE_REFERENCE_ORACLE_REF: Final = "manifests/batch-viewer-comparison.json"
+_PILE_REFERENCE_SOURCE_REF: Final = (
+    "source/pythia-a19eecb807ec2c79a39ebf18108816e6ffffc1d5"
+)
+_LEGACY_31M_MANIFEST_REFS: Final = (
+    "models/pythia-31m-deduped-step0/model-manifest.json",
+    "manifests/pythia-31m-deduped-step0.json",
+)
+_FORMAL_31M_MANIFEST_REF: Final = "manifests/model/pythia-31m.json"
 _EXPECTED_GATE_MATRIX: Final = {
     "stage0.G3-S1": {
         "model_names": ["pythia-14m-step0"],
@@ -208,6 +239,66 @@ def _validate_model(value: Any, *, index: int) -> dict[str, Any]:
         raise AssetRequirementsError(f"models[{index}] context must be 2048")
     if name not in _MODEL_NAMES:
         raise AssetRequirementsError(f"unexpected Stage 0 model: {name}")
+    diagnostic = model.get("legacy_manifest_diagnostic")
+    if name == "pythia-31m-deduped-step0":
+        legacy = _mapping(
+            diagnostic,
+            field=f"models[{index}].legacy_manifest_diagnostic",
+        )
+        required_legacy_fields = {
+            "refs",
+            "size_bytes",
+            "sha256",
+            "condition",
+            "replacement_manifest_ref",
+        }
+        if set(legacy) != required_legacy_fields:
+            raise AssetRequirementsError(
+                f"models[{index}].legacy_manifest_diagnostic fields must be "
+                f"{sorted(required_legacy_fields)}"
+            )
+        refs = _list(
+            legacy["refs"],
+            field=f"models[{index}].legacy_manifest_diagnostic.refs",
+        )
+        if tuple(refs) != _LEGACY_31M_MANIFEST_REFS:
+            raise AssetRequirementsError("31M legacy manifest references drifted")
+        for ref_index, ref in enumerate(refs):
+            validate_asset_path(
+                _text(
+                    ref,
+                    field=(
+                        f"models[{index}].legacy_manifest_diagnostic.refs"
+                        f"[{ref_index}]"
+                    ),
+                )
+            )
+        _integer(
+            legacy["size_bytes"],
+            field=f"models[{index}].legacy_manifest_diagnostic.size_bytes",
+            minimum=1,
+        )
+        _digest(
+            legacy["sha256"],
+            field=f"models[{index}].legacy_manifest_diagnostic.sha256",
+        )
+        if legacy["condition"] != "utf8_bom_strict_json_rejected":
+            raise AssetRequirementsError("31M legacy manifest condition drifted")
+        replacement_ref = validate_asset_path(
+            _text(
+                legacy["replacement_manifest_ref"],
+                field=(
+                    f"models[{index}].legacy_manifest_diagnostic"
+                    ".replacement_manifest_ref"
+                ),
+            )
+        )
+        if replacement_ref != _FORMAL_31M_MANIFEST_REF or replacement_ref in refs:
+            raise AssetRequirementsError("31M replacement manifest reference drifted")
+    elif "legacy_manifest_diagnostic" in model:
+        raise AssetRequirementsError(
+            "legacy manifest diagnostic is only valid for the 31M model"
+        )
     return model
 
 
@@ -350,9 +441,30 @@ def _validate_pile(value: Any) -> None:
     if debug.get("start") != 0 or not 0 < debug.get("stop", 0) <= intervals["train"]["stop"]:
         raise AssetRequirementsError("Pile debug interval must be a train prefix")
 
+    observed_workloads: set[tuple[int, str]] = set()
     for index, raw in enumerate(_list(pile.get("workloads"), field="pile.workloads")):
         workload = _mapping(raw, field=f"pile.workloads[{index}]")
+        if set(workload) != _PILE_WORKLOAD_FIELDS:
+            raise AssetRequirementsError(
+                f"pile.workloads[{index}] fields must be "
+                f"{sorted(_PILE_WORKLOAD_FIELDS)}"
+            )
+        stage = _integer(
+            workload.get("stage"),
+            field=f"pile.workloads[{index}].stage",
+            minimum=1,
+        )
         split = _text(workload.get("split"), field=f"pile.workloads[{index}].split")
+        identity = (stage, split)
+        if identity not in _EXPECTED_PILE_WORKLOAD_MATRIX:
+            raise AssetRequirementsError(
+                f"Pile workload {index} has an unexpected stage/split identity"
+            )
+        if identity in observed_workloads:
+            raise AssetRequirementsError(
+                f"Pile workload {index} duplicates stage/split {identity!r}"
+            )
+        observed_workloads.add(identity)
         records = _integer(
             workload.get("required_unique_records"),
             field=f"pile.workloads[{index}].required_unique_records",
@@ -365,6 +477,10 @@ def _validate_pile(value: Any) -> None:
         steps, batch = workload.get("max_steps"), workload.get("global_batch_size")
         if (steps is None) != (batch is None):
             raise AssetRequirementsError(f"Pile workload {index} step/batch fields mismatch")
+        if (split == "train") != (steps is not None):
+            raise AssetRequirementsError(
+                f"Pile workload {index} train/step policy mismatch"
+            )
         if steps is not None and (
             _integer(steps, field=f"pile.workloads[{index}].max_steps", minimum=1)
             * _integer(
@@ -375,7 +491,60 @@ def _validate_pile(value: Any) -> None:
             != records
         ):
             raise AssetRequirementsError(f"Pile workload {index} record arithmetic mismatch")
+    if observed_workloads != _EXPECTED_PILE_WORKLOAD_MATRIX:
+        raise AssetRequirementsError(
+            "Pile workload stage/split matrix is incomplete or duplicated"
+        )
 
+    reference_reader = _mapping(
+        pile.get("reference_reader"),
+        field="pile.reference_reader",
+    )
+    if reference_reader != {
+        "repository": "EleutherAI/pythia",
+        "revision": "a19eecb807ec2c79a39ebf18108816e6ffffc1d5",
+    }:
+        raise AssetRequirementsError("Pile official reference reader drifted")
+    oracle = _mapping(
+        pile.get("reference_reader_oracle"),
+        field="pile.reference_reader_oracle",
+    )
+    required_oracle_fields = {
+        "artifact_ref",
+        "artifact_sha256",
+        "official_source_ref",
+    }
+    if set(oracle) != required_oracle_fields:
+        raise AssetRequirementsError(
+            "pile.reference_reader_oracle fields must be "
+            f"{sorted(required_oracle_fields)}"
+        )
+    artifact_ref = validate_asset_path(
+        _text(
+            oracle["artifact_ref"],
+            field="pile.reference_reader_oracle.artifact_ref",
+        )
+    )
+    source_ref = validate_asset_path(
+        _text(
+            oracle["official_source_ref"],
+            field="pile.reference_reader_oracle.official_source_ref",
+        )
+    )
+    if artifact_ref != _PILE_REFERENCE_ORACLE_REF:
+        raise AssetRequirementsError("Pile reference-reader oracle ref drifted")
+    if source_ref != _PILE_REFERENCE_SOURCE_REF:
+        raise AssetRequirementsError("Pile official reader source ref drifted")
+    _digest(
+        oracle["artifact_sha256"],
+        field="pile.reference_reader_oracle.artifact_sha256",
+    )
+    if _integer(
+        pile.get("reference_batch_size"),
+        field="pile.reference_batch_size",
+        minimum=1,
+    ) != 1024:
+        raise AssetRequirementsError("Pile reference batch size must be 1024")
     references = _mapping(
         pile.get("reference_batch_sha256"),
         field="pile.reference_batch_sha256",

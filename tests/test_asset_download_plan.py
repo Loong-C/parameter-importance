@@ -102,9 +102,18 @@ def test_download_executor_derives_runtime_urls_only_in_memory(
     (data_root / "models").mkdir(parents=True)
     (data_root / "datasets").mkdir()
     (data_root / "operations").mkdir()
+    (data_root / "tmp").mkdir()
     observed_urls: list[str] = []
 
-    def fake_acquire(spec, runtime_url, target, *, policy):  # type: ignore[no-untyped-def]
+    def fake_acquire(  # type: ignore[no-untyped-def]
+        spec,
+        runtime_url,
+        target,
+        *,
+        policy,
+        data_root: Path,
+    ):
+        del policy
         observed_urls.append(runtime_url)
         assert runtime_url.startswith("https://huggingface.co/")
         assert "?" not in runtime_url

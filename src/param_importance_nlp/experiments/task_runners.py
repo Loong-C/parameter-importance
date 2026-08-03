@@ -26,7 +26,7 @@ from typing import Iterator, Mapping, Sequence
 
 import torch
 
-from ..assets import AssetManifestError, resolve_ready_asset
+from ..assets import AssetManifestError
 from ..atomic import sha256_file
 from ..contracts.jsonio import JSONValue, canonical_json_hash, load_canonical_json
 from ..contracts.seed import SeedPlan
@@ -35,13 +35,19 @@ from ..contracts.task_catalog import DEFAULT_TASK_CATALOG, RunnerKind
 from ..core.estimators import double_sample_importance, equal_u_importance, raw_importance
 from ..core.sufficient_statistics import EqualSufficientStatistics
 from ..core.tensors import TensorMap
+from ..g3_runtime_assets import (
+    FormalG3RuntimeAssets,
+    G3RuntimeAssetError,
+    formal_pile_route,
+    reject_legacy_provider_paths,
+)
 from ..providers import (
     CausalLMEvaluator,
     ClassificationEvaluator,
     HuggingFaceTaskMetricEvaluator,
     OfflineHuggingFaceModelAdapter,
+    PythiaMMapDatasetAdapter,
     PretokenizedGlueDatasetAdapter,
-    PretokenizedPileDatasetAdapter,
     TinyTrainingFixture,
     TorchModelAdapter,
     build_tiny_training_fixture,
@@ -525,31 +531,32 @@ def _training_resources(
             (),
         )
 
-    manifest_fields = (
-        ("model_manifest_ref", "model_root_ref"),
-        ("data_manifest_ref", "data_root_ref"),
-        ("tokenizer_manifest_ref", "tokenizer_root_ref"),
+    if request.config.run_intent != "formal":
+        raise RuntimeError("OFFLINE_HF_PROVIDER_REQUIRES_FORMAL_INTENT")
+    reject_legacy_provider_paths(providers)
+    model_config = request.config.base_config.section("model")
+    assert isinstance(model_config, dict) and isinstance(data, dict)
+    runtime_assets = FormalG3RuntimeAssets.from_request(request, root)
+    expected_data_kind = "pile" if task_name == "pile" else "glue_derived"
+    model_asset = runtime_assets.resolve(
+        str(model_config["asset_id"]), expected_kind="model"
     )
-    resolved_assets = []
-    evidence: list[Mapping[str, JSONValue]] = []
-    for manifest_field, root_field in manifest_fields:
-        manifest_ref = str(providers[manifest_field])
-        root_ref = str(providers[root_field])
-        manifest_path = _resolve_workspace_path(root, manifest_ref, field=manifest_field)
-        asset_root = _resolve_workspace_path(root, root_ref, field=root_field)
-        asset = resolve_ready_asset(manifest_path, asset_root)
-        resolved_assets.append(asset)
-        evidence.append(
-            {
-                "manifest_ref": manifest_ref,
-                "root_ref": root_ref,
-                "asset_id": asset.asset_id,
-                "file_count": len(asset.files),
-            }
-        )
-    model_asset, data_asset, _tokenizer_asset = resolved_assets
+    data_asset = runtime_assets.resolve(
+        str(data["asset_id"]), expected_kind=expected_data_kind
+    )
+    tokenizer_asset = runtime_assets.resolve(
+        str(model_config["tokenizer_asset_id"]), expected_kind="tokenizer"
+    )
+    runtime_lineage_sha256 = runtime_assets.runtime_lineage_sha256(
+        model_asset, data_asset, tokenizer_asset
+    )
+    evidence: list[Mapping[str, JSONValue]] = [
+        model_asset.provenance(),
+        data_asset.provenance(),
+        tokenizer_asset.provenance(),
+    ]
     model = OfflineHuggingFaceModelAdapter.from_local_directory(
-        model_asset.root,
+        model_asset.resolved.root,
         task_type=task_type,
         num_labels=providers["num_labels"],  # type: ignore[arg-type]
     )
@@ -567,41 +574,115 @@ def _training_resources(
         // int(batching["microbatch_size"])
     )
 
-    def build_dataset(*, split: str, microbatch_size: int, micros: int) -> object:
-        if task_name == "pile":
-            return PretokenizedPileDatasetAdapter(
-                data_asset.root,
-                dataset_id=data_asset.asset_id,
-                split=split,
+    stage = int(identity["stage"])
+
+    def build_dataset(
+        *,
+        split: str,
+        microbatch_size: int,
+        micros: int,
+        evaluation_route: bool,
+    ) -> object:
+        if data_asset.storage_kind == "pythia_mmap_shards":
+            if task_type != "causal_lm" or task_name != "pile":
+                raise G3RuntimeAssetError(
+                    "G3_RUNTIME_PYTHIA_MMAP_TASK_DISPATCH_INVALID"
+                )
+            route = formal_pile_route(
+                stage=stage,
+                evaluation=evaluation_route,
+                declared_sampling_design=str(data["sampling_design"]),
+                configured_split=split,
+            )
+            start, stop = runtime_assets.pile_split_interval(data_asset, route.split)
+            return PythiaMMapDatasetAdapter(
+                runtime_assets.pythia_dataset(data_asset, split=route.split),
+                asset_id=data_asset.resolved.asset_id,
+                ready_manifest_sha256=data_asset.ready_manifest_sha256,
+                qualification_sha256=data_asset.qualification_artifact_hash,
+                g3_resolution_artifact_hash=(
+                    runtime_assets.resolution_artifact_hash
+                ),
+                g3_source_commit=runtime_assets.source_git_commit,
+                g3_runtime_lineage_sha256=runtime_lineage_sha256,
+                split_start=start,
+                split_stop=stop,
                 microbatch_size=microbatch_size,
                 microbatches_per_step=micros,
-                sampling_design=str(data["sampling_design"]),
-                weights_exogenous=bool(data["weights_exogenous"]),
-                common_mean_assumption=bool(data["common_mean_assumption"]),
-                allowed_root=data_asset.root,
+                sampling_design=route.sampling_design,
             )
-        return PretokenizedGlueDatasetAdapter(
-            data_asset.root,
+        if data_asset.storage_kind != "hf_load_from_disk":
+            raise G3RuntimeAssetError(
+                f"G3_RUNTIME_STORAGE_KIND_UNSUPPORTED:{data_asset.storage_kind}"
+            )
+        if task_type != "sequence_classification" or task_name == "pile":
+            raise G3RuntimeAssetError("G3_RUNTIME_GLUE_TASK_DISPATCH_INVALID")
+        glue_task = data_asset.require_glue_route(
             task_name=task_name,
             split=split,
-            dataset_id=data_asset.asset_id,
+        )
+        return PretokenizedGlueDatasetAdapter(
+            data_asset.resolved.root,
+            task_name=glue_task,
+            split=split,
+            dataset_id=data_asset.resolved.asset_id,
             microbatch_size=microbatch_size,
             microbatches_per_step=micros,
-            allowed_root=data_asset.root,
+            expected_asset_hash=data_asset.directory_content_sha256,
+            allowed_root=data_asset.resolved.root,
+            g3_resolution_artifact_hash=(
+                runtime_assets.resolution_artifact_hash
+            ),
+            g3_source_commit=runtime_assets.source_git_commit,
+            g3_runtime_lineage_sha256=runtime_lineage_sha256,
         )
 
+    global_batch_size = int(batching["global_batch_size"])
+    if microbatches_per_step * int(batching["microbatch_size"]) * world_size != global_batch_size:
+        raise G3RuntimeAssetError("G3_RUNTIME_GLOBAL_BATCH_ROUTE_MISMATCH")
+    if data_asset.storage_kind == "pythia_mmap_shards":
+        training_route = formal_pile_route(
+            stage=stage,
+            evaluation=False,
+            declared_sampling_design=str(data["sampling_design"]),
+            configured_split=str(data["split"]),
+        )
+        runtime_assets.validate_pile_budget(
+            stage=stage,
+            split=training_route.split,
+            requested_records=max_steps * global_batch_size,
+            max_steps=max_steps,
+            global_batch_size=global_batch_size,
+        )
     dataset = build_dataset(
         split=str(data["split"]),
         microbatch_size=int(batching["microbatch_size"]),
         micros=microbatches_per_step,
+        evaluation_route=False,
     )
     evaluation_dataset = None
     evaluator = None
     if bool(evaluation["enabled"]):
+        if data_asset.storage_kind == "pythia_mmap_shards":
+            evaluation_route = formal_pile_route(
+                stage=stage,
+                evaluation=True,
+                declared_sampling_design=str(data["sampling_design"]),
+                configured_split=str(evaluation["split"]),
+            )
+            runtime_assets.validate_pile_budget(
+                stage=stage,
+                split=evaluation_route.split,
+                requested_records=(
+                    int(evaluation["batch_size"])
+                    * int(evaluation["max_batches"] or 1)
+                ),
+            )
         evaluation_dataset = build_dataset(
             split=str(evaluation["split"]),
             microbatch_size=int(evaluation["batch_size"]),
             micros=1,
+            evaluation_route=True,
         )
         evaluator = HuggingFaceTaskMetricEvaluator(
             task_name, split=str(evaluation["split"])
@@ -612,6 +693,7 @@ def _training_resources(
             "training_split": str(data["split"]),
             "evaluation_split": evaluation["split"],
             "dataset_state_digest": getattr(dataset, "state_digest")(),
+            "storage_kind": data_asset.storage_kind,
         }
     )
     return _TrainingResources(
@@ -963,6 +1045,94 @@ class TrainingTaskRunner(TaskRunner):
         tuple[Mapping[str, JSONValue], ...],
         tuple[Mapping[str, JSONValue], ...],
     ]:
+        owned_resources = resources
+        if owned_resources is None:
+            try:
+                owned_resources = _training_resources(
+                    request,
+                    self.workspace_root,
+                    rank=rank,
+                    world_size=world_size,
+                )
+            except DependencyUnavailable as error:
+                raise TaskBlockedError(
+                    TaskBlocker(
+                        BlockerCode.DEPENDENCY_UNAVAILABLE,
+                        error.dependency,
+                        str(error),
+                        True,
+                    )
+                ) from error
+            except (
+                FileNotFoundError,
+                AssetManifestError,
+                G3RuntimeAssetError,
+            ) as error:
+                raise TaskBlockedError(
+                    TaskBlocker(
+                        BlockerCode.ASSET_UNAVAILABLE,
+                        "offline_training_assets",
+                        "offline training assets unavailable: "
+                        f"{type(error).__name__}: {error}",
+                        True,
+                    )
+                ) from error
+
+        cleanup_handles: list[object] = []
+        primary_error: BaseException | None = None
+        try:
+            return self._run_training_impl(
+                request,
+                rank=rank,
+                world_size=world_size,
+                reducer=reducer,
+                resources=owned_resources,
+                wrapped_model=wrapped_model,
+                cleanup_handles=cleanup_handles,
+            )
+        except BaseException as error:
+            primary_error = error
+            raise
+        finally:
+            cleanup_errors: list[BaseException] = []
+            seen: set[int] = set()
+            candidates = [
+                *reversed(cleanup_handles),
+                owned_resources.evaluation_dataset,
+                owned_resources.dataset,
+            ]
+            for candidate in candidates:
+                if candidate is None or id(candidate) in seen:
+                    continue
+                seen.add(id(candidate))
+                close = getattr(candidate, "close", None)
+                if not callable(close):
+                    continue
+                try:
+                    close()
+                except BaseException as error:
+                    cleanup_errors.append(error)
+            if cleanup_errors and primary_error is None:
+                raise RuntimeError("TRAINING_RESOURCE_CLEANUP_FAILED") from cleanup_errors[0]
+
+    def _run_training_impl(
+        self,
+        request: TaskExecutionRequest,
+        *,
+        rank: int = 0,
+        world_size: int = 1,
+        reducer: object | None = None,
+        resources: _TrainingResources | None = None,
+        wrapped_model: TorchModelAdapter | None = None,
+        cleanup_handles: list[object] | None = None,
+    ) -> tuple[
+        TrainingRunResult,
+        TrainingEngine,
+        Path,
+        tuple[Mapping[str, JSONValue], ...],
+        tuple[Mapping[str, JSONValue], ...],
+        tuple[Mapping[str, JSONValue], ...],
+    ]:
         training = request.config.section("training")
         scheduler_options = request.config.section("scheduler")
         precision = request.config.section("precision_runtime")
@@ -1006,7 +1176,7 @@ class TrainingTaskRunner(TaskRunner):
                         True,
                     )
                 ) from error
-            except (FileNotFoundError, AssetManifestError) as error:
+            except (FileNotFoundError, AssetManifestError, G3RuntimeAssetError) as error:
                 raise TaskBlockedError(
                     TaskBlocker(
                         BlockerCode.ASSET_UNAVAILABLE,
@@ -1130,6 +1300,8 @@ class TrainingTaskRunner(TaskRunner):
             prefetch_factor=data_loader["prefetch_factor"],  # type: ignore[arg-type]
             persistent_workers=bool(data_loader["persistent_workers"]),
         )
+        if cleanup_handles is not None:
+            cleanup_handles.append(training_cursor)
         engine = TrainingEngine(
             spec=spec,
             model=model,
@@ -1374,9 +1546,6 @@ class TrainingTaskRunner(TaskRunner):
         assert result is not None
         if result.status != "COMPLETE":
             raise RuntimeError(f"TRAINING_TASK_NOT_COMPLETE:{result.status}")
-        close_cursor = getattr(training_cursor, "close", None)
-        if callable(close_cursor):
-            close_cursor()
         return (
             result,
             engine,
@@ -1515,7 +1684,7 @@ class TrainingTaskRunner(TaskRunner):
                 evaluations,
                 resource_profiles,
             ) = self._run_training(request)
-        except (AssetManifestError, FileNotFoundError) as error:
+        except (AssetManifestError, FileNotFoundError, G3RuntimeAssetError) as error:
             raise TaskBlockedError(
                 TaskBlocker(
                     BlockerCode.ASSET_UNAVAILABLE,
@@ -1648,7 +1817,7 @@ class DistributedTrainingTaskRunner(TrainingTaskRunner):
                 message="task completed",
                 metadata={"execution_contract": "run-ready-v1"},
             )
-        except (AssetManifestError, FileNotFoundError) as error:
+        except (AssetManifestError, FileNotFoundError, G3RuntimeAssetError) as error:
             raise TaskBlockedError(
                 TaskBlocker(
                     BlockerCode.ASSET_UNAVAILABLE,

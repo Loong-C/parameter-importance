@@ -813,6 +813,8 @@ def _task(
     gates: Sequence[str] = (),
     capabilities: Sequence[str] = (),
     estimator_decision: bool = False,
+    completion_rules: Sequence[str] = (),
+    failure_rules: Sequence[str] = (),
 ) -> TaskDefinition:
     match = _TASK_ID_RE.fullmatch(task_id)
     if match is None:  # pragma: no cover - 常量定义错误会在导入时立即暴露
@@ -849,12 +851,14 @@ def _task(
             "all_required_artifact_commits_published",
             "artifact_hashes_verified",
             "artifact_scope_matches_run_intent",
+            *completion_rules,
         ),
         failure_rules=(
             "unknown_or_missing_config_fails_closed",
             "input_contract_mismatch_fails_closed",
             "artifact_commit_conflict_fails_closed",
             "missing_runtime_prerequisite_returns_blocked",
+            *failure_rules,
         ),
         local_fixture=LocalFixturePolicy(
             supported=True,
@@ -876,7 +880,7 @@ _TASKS_RAW: Final = (
     _task("stage0.01_baseline_and_safety", "基线、安全与硬件现状冻结", "plan/stage0/01_baseline_and_safety.md", RunnerKind.AUDIT, ("baseline_report", "safety_report", "gate_record"), RecoveryMode.RESTART_IDEMPOTENT, SafeBoundary.IMMUTABLE_PUBLISH, capabilities=("git", "server")),
     _task("stage0.02_storage_and_layout", "存储边界、布局与持久性", "plan/stage0/02_storage_and_layout.md", RunnerKind.STORAGE, ("storage_layout_manifest", "storage_validation_report", "persistence_decision"), RecoveryMode.RECONCILE_STATE, SafeBoundary.IMMUTABLE_PUBLISH, gates=("stage0.G0-C",), capabilities=("server",)),
     _task("stage0.03_runtime_and_dependencies", "运行环境与依赖重建", "plan/stage0/03_runtime_and_dependencies.md", RunnerKind.ENVIRONMENT, ("environment_manifest", "dependency_audit", "offline_rebuild_report"), RecoveryMode.RESTART_IDEMPOTENT, SafeBoundary.IMMUTABLE_PUBLISH, gates=("stage0.G0-C", "stage0.G1"), capabilities=("server", "wheelhouse")),
-    _task("stage0.04_assets_and_manifests", "模型、数据与资产 manifest", "plan/stage0/04_assets_and_manifests.md", RunnerKind.ASSET, ("asset_manifest", "asset_audit", "asset_resolution"), RecoveryMode.RESUME_SHARDS, SafeBoundary.SHARD_COMMIT, gates=("stage0.G0-C", "stage0.G1"), capabilities=("server", "model_assets", "data_assets")),
+    _task("stage0.04_assets_and_manifests", "模型、数据与资产 manifest", "plan/stage0/04_assets_and_manifests.md", RunnerKind.ASSET, ("asset_manifest", "asset_audit", "asset_resolution"), RecoveryMode.RESUME_SHARDS, SafeBoundary.SHARD_COMMIT, gates=("stage0.G0-C", "stage0.G1"), capabilities=("server", "model_assets", "data_assets", "tokenizer_assets"), completion_rules=("all_thirteen_assets_exactly_resolved", "all_five_g3_subgates_pass"), failure_rules=("g3_blocked_or_exception_fails_task", "legacy_formal_projection_rejected")),
     _task("stage0.05_config_run_identity_and_seeds", "配置、运行身份、seed 与 provenance", "plan/stage0/05_config_run_identity_and_seeds.md", RunnerKind.CONTRACT, ("resolved_config", "run_identity", "seed_plan", "provenance_record"), RecoveryMode.RESTART_IDEMPOTENT, SafeBoundary.IMMUTABLE_PUBLISH, gates=("stage0.G0-C", "stage0.G1")),
     _task("stage0.06_single_gpu_smoke", "单 GPU 训练 smoke", "plan/stage0/06_single_gpu_smoke.md", RunnerKind.TRAINING, ("training_smoke_result", "event_stream", "checkpoint_commit"), RecoveryMode.RESUME_CHECKPOINT, SafeBoundary.ATTEMPT_COMMIT_STATE, gates=("stage0.G0-G", "stage0.G2", "stage0.G3-S1", "stage0.G4"), capabilities=("server", "cuda", "model_assets", "data_assets")),
     _task("stage0.07_ddp_and_gradient_semantics", "DDP 与全局梯度语义", "plan/stage0/07_ddp_and_gradient_semantics.md", RunnerKind.DISTRIBUTED_TRAINING, ("distributed_validation", "gradient_semantics_report", "communication_report"), RecoveryMode.RESUME_CHECKPOINT, SafeBoundary.ATTEMPT_COMMIT_STATE, gates=("stage0.G0-G", "stage0.G5"), capabilities=("server", "cuda", "nccl")),

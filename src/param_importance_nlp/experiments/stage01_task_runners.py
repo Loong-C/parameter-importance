@@ -14,20 +14,28 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
+import importlib
 import platform
 from pathlib import Path, PurePosixPath
+import re
+import stat
+import subprocess
 import sys
 from types import MappingProxyType
-from typing import Mapping
+from typing import Any, Mapping
 
 import torch
 
+from ..asset_layout import load_stage0_asset_layout
+from ..asset_requirements import load_stage0_asset_requirements
 from ..assets import (
     AssetActorRole,
     AssetState,
     AssetType,
     build_manifest,
+    load_asset_manifest,
     transition_manifest,
+    validate_g3_qualification,
     verify_only,
 )
 from ..atomic import atomic_write_bytes, sha256_file
@@ -83,7 +91,17 @@ from ..runtime.task_runtime import (
     TaskRunner,
 )
 from ..runtime.tensor_bundle import load_tensor_bundle
-from ..storage import REQUIRED_DIRECTORIES, StorageLayout, is_within
+from ..g3_gate import (
+    GATE_IDS as G3_GATE_IDS,
+    evaluate_stage0_g3,
+    validate_stage0_g3_resolution,
+)
+from ..storage import (
+    REQUIRED_DIRECTORIES,
+    StorageLayout,
+    is_within,
+    require_data_root,
+)
 
 
 _HANDLED_BY_KIND: Mapping[RunnerKind, frozenset[str]] = MappingProxyType(
@@ -127,7 +145,6 @@ _FORMAL_EVIDENCE_ONLY_TASKS = frozenset(
         "stage0.01_baseline_and_safety",
         "stage0.02_storage_and_layout",
         "stage0.03_runtime_and_dependencies",
-        "stage0.04_assets_and_manifests",
         "stage0.08_logging_and_tracking",
         "stage0.09_checkpoint_and_resume",
         "stage0.10_capacity_and_operations",
@@ -138,6 +155,749 @@ _FORMAL_EVIDENCE_ONLY_TASKS = frozenset(
         "stage1.11_reporting_and_exit_gate",
     }
 )
+
+_G3_TASK_ID = "stage0.04_assets_and_manifests"
+_G3_REQUIREMENTS_REF = "configs/stage0/g3-asset-requirements-v1.json"
+_G3_LAYOUT_REF = "configs/stage0/g3-asset-layout-v1.json"
+_G3_MANIFEST_SCHEMA_VERSION = "stage0-g3-asset-manifest-index-v1"
+_G3_AUDIT_SCHEMA_VERSION = "stage0-g3-asset-audit-v1"
+_G3_CRITICAL_SOURCE_REFS = (
+    _G3_REQUIREMENTS_REF,
+    _G3_LAYOUT_REF,
+    "configs/stage0/g3-download-plan-v1.json",
+    "ops/stage0/attest_g3_materialization.py",
+    "ops/stage0/materialize_and_publish_g3.py",
+    "ops/stage0/verify_g3_assets.py",
+    "schemas/stage0/asset-layout-v1.json",
+    "schemas/stage0/asset-requirements-v1.json",
+    "schemas/stage0/download-plan-v1.json",
+    "schemas/stage0-asset-manifest-v1.json",
+    "schemas/stage0-g3-acquisition-report-v1.json",
+    "schemas/stage0-g3-verify-only-report-v1.json",
+    "src/param_importance_nlp/asset_acquisition.py",
+    "src/param_importance_nlp/asset_download_plan.py",
+    "src/param_importance_nlp/asset_layout.py",
+    "src/param_importance_nlp/asset_requirements.py",
+    "src/param_importance_nlp/assets.py",
+    "src/param_importance_nlp/atomic.py",
+    "src/param_importance_nlp/contracts/__init__.py",
+    "src/param_importance_nlp/contracts/jsonio.py",
+    "src/param_importance_nlp/data/pythia_mmap.py",
+    "src/param_importance_nlp/experiments/stage01_task_runners.py",
+    "src/param_importance_nlp/g3_asset_publication.py",
+    "src/param_importance_nlp/g3_gate.py",
+    "src/param_importance_nlp/g3_lifecycle_evidence.py",
+    "src/param_importance_nlp/g3_semantic_evidence.py",
+    "src/param_importance_nlp/glue_builder.py",
+    "src/param_importance_nlp/providers/optional.py",
+    "src/param_importance_nlp/runtime/task_artifacts.py",
+)
+_G3_MODULE_ORIGINS = (
+    (
+        "param_importance_nlp.asset_acquisition",
+        "src/param_importance_nlp/asset_acquisition.py",
+    ),
+    (
+        "param_importance_nlp.asset_download_plan",
+        "src/param_importance_nlp/asset_download_plan.py",
+    ),
+    ("param_importance_nlp.asset_layout", "src/param_importance_nlp/asset_layout.py"),
+    (
+        "param_importance_nlp.asset_requirements",
+        "src/param_importance_nlp/asset_requirements.py",
+    ),
+    ("param_importance_nlp.assets", "src/param_importance_nlp/assets.py"),
+    ("param_importance_nlp.atomic", "src/param_importance_nlp/atomic.py"),
+    (
+        "param_importance_nlp.contracts",
+        "src/param_importance_nlp/contracts/__init__.py",
+    ),
+    (
+        "param_importance_nlp.contracts.jsonio",
+        "src/param_importance_nlp/contracts/jsonio.py",
+    ),
+    (
+        "param_importance_nlp.data.pythia_mmap",
+        "src/param_importance_nlp/data/pythia_mmap.py",
+    ),
+    (
+        "param_importance_nlp.g3_asset_publication",
+        "src/param_importance_nlp/g3_asset_publication.py",
+    ),
+    ("param_importance_nlp.g3_gate", "src/param_importance_nlp/g3_gate.py"),
+    (
+        "param_importance_nlp.g3_semantic_evidence",
+        "src/param_importance_nlp/g3_semantic_evidence.py",
+    ),
+    (
+        "param_importance_nlp.g3_lifecycle_evidence",
+        "src/param_importance_nlp/g3_lifecycle_evidence.py",
+    ),
+    (
+        "param_importance_nlp.glue_builder",
+        "src/param_importance_nlp/glue_builder.py",
+    ),
+    (
+        "param_importance_nlp.providers.optional",
+        "src/param_importance_nlp/providers/optional.py",
+    ),
+    (
+        "param_importance_nlp.runtime.task_artifacts",
+        "src/param_importance_nlp/runtime/task_artifacts.py",
+    ),
+)
+_GIT_COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
+_G3_OUTPUT_SCHEMAS: Mapping[str, str] = MappingProxyType(
+    {
+        "asset_manifest": _G3_MANIFEST_SCHEMA_VERSION,
+        "asset_audit": _G3_AUDIT_SCHEMA_VERSION,
+        "asset_resolution": "stage0-g3-resolution-audit-v1",
+    }
+)
+
+
+@dataclass(frozen=True, slots=True)
+class _G3SourceBinding:
+    source_root: Path
+    head_commit: str
+    requirements_path: Path
+    requirements_file_sha256: str
+    layout_path: Path
+    layout_file_sha256: str
+
+    def payload(self, *, producer_git_commit: str) -> dict[str, JSONValue]:
+        return {
+            "producer_git_commit": producer_git_commit,
+            "requirements_ref": _G3_REQUIREMENTS_REF,
+            "requirements_file_sha256": self.requirements_file_sha256,
+            "layout_ref": _G3_LAYOUT_REF,
+            "layout_file_sha256": self.layout_file_sha256,
+            "critical_source_refs": list(_G3_CRITICAL_SOURCE_REFS),
+        }
+
+
+def _assert_g3_module_origins(source_root: Path) -> None:
+    expected_current = source_root.joinpath(
+        *PurePosixPath(
+            "src/param_importance_nlp/experiments/stage01_task_runners.py"
+        ).parts
+    ).resolve(strict=True)
+    if Path(__file__).resolve(strict=True) != expected_current:
+        raise ValueError(
+            "STAGE0_G3_IMPORTED_MODULE_ORIGIN_MISMATCH:stage01_task_runners"
+        )
+    for module_name, reference in _G3_MODULE_ORIGINS:
+        module = importlib.import_module(module_name)
+        raw_origin = getattr(module, "__file__", None)
+        if not isinstance(raw_origin, str) or not raw_origin:
+            raise ValueError(
+                f"STAGE0_G3_IMPORTED_MODULE_ORIGIN_MISSING:{module_name}"
+            )
+        expected = source_root.joinpath(*PurePosixPath(reference).parts).resolve(
+            strict=True
+        )
+        if Path(raw_origin).resolve(strict=True) != expected:
+            raise ValueError(
+                f"STAGE0_G3_IMPORTED_MODULE_ORIGIN_MISMATCH:{module_name}"
+            )
+
+
+def _assert_g3_critical_source_paths(source_root: Path) -> None:
+    for reference in _G3_CRITICAL_SOURCE_REFS:
+        current = source_root
+        for part in PurePosixPath(reference).parts:
+            current = current / part
+            if _is_link_like(current):
+                raise ValueError("STAGE0_G3_CRITICAL_SOURCE_LINK_FORBIDDEN")
+        if not current.is_file():
+            raise ValueError("STAGE0_G3_CRITICAL_SOURCE_INVALID")
+
+
+def _git_constrained_g3_sources() -> _G3SourceBinding:
+    """Capture one clean, tracked current view of every critical G3 source."""
+
+    source_root = Path(__file__).resolve().parents[3]
+    command_prefix = (
+        "git",
+        "-c",
+        f"safe.directory={source_root.as_posix()}",
+        "-C",
+        str(source_root),
+    )
+    try:
+        top_level = subprocess.run(
+            [*command_prefix, "rev-parse", "--show-toplevel"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        if Path(top_level).resolve() != source_root:
+            raise ValueError("STAGE0_G3_SOURCE_GIT_ROOT_MISMATCH")
+        head_commit = subprocess.run(
+            [*command_prefix, "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        if _GIT_COMMIT_RE.fullmatch(head_commit) is None:
+            raise ValueError("STAGE0_G3_SOURCE_HEAD_INVALID")
+        subprocess.run(
+            [
+                *command_prefix,
+                "ls-files",
+                "--error-unmatch",
+                "--",
+                *_G3_CRITICAL_SOURCE_REFS,
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        dirty = subprocess.run(
+            [
+                *command_prefix,
+                "status",
+                "--porcelain=v1",
+                "--untracked-files=all",
+                "--",
+                *_G3_CRITICAL_SOURCE_REFS,
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout
+    except (OSError, subprocess.CalledProcessError) as error:
+        raise ValueError("STAGE0_G3_SOURCE_NOT_GIT_CONSTRAINED") from error
+    if dirty.strip():
+        raise ValueError("STAGE0_G3_CRITICAL_SOURCE_DIRTY")
+
+    _assert_g3_critical_source_paths(source_root)
+    _assert_g3_module_origins(source_root)
+    requirements_path = source_root.joinpath(
+        *PurePosixPath(_G3_REQUIREMENTS_REF).parts
+    )
+    layout_path = source_root.joinpath(*PurePosixPath(_G3_LAYOUT_REF).parts)
+    return _G3SourceBinding(
+        source_root=source_root,
+        head_commit=head_commit,
+        requirements_path=requirements_path,
+        requirements_file_sha256=sha256_file(requirements_path),
+        layout_path=layout_path,
+        layout_file_sha256=sha256_file(layout_path),
+    )
+
+
+def _run_g3_git(
+    source_root: Path,
+    *arguments: str,
+) -> subprocess.CompletedProcess[str]:
+    try:
+        return subprocess.run(
+            [
+                "git",
+                "-c",
+                f"safe.directory={source_root.as_posix()}",
+                "-C",
+                str(source_root),
+                *arguments,
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as error:
+        raise ValueError("STAGE0_G3_SOURCE_NOT_GIT_CONSTRAINED") from error
+
+
+def _assert_g3_producer_commit_compatible(
+    binding: _G3SourceBinding,
+    producer_commit: str,
+) -> None:
+    """Accept later unrelated commits while rejecting any critical-source drift."""
+
+    if _GIT_COMMIT_RE.fullmatch(producer_commit) is None:
+        raise ValueError("STAGE0_G3_ASSET_GENERATOR_COMMIT_INVALID")
+    current_head = _run_g3_git(binding.source_root, "rev-parse", "HEAD")
+    if (
+        current_head.returncode != 0
+        or current_head.stdout.strip() != binding.head_commit
+    ):
+        raise ValueError("STAGE0_G3_SOURCE_BINDING_DRIFTED")
+    verified = _run_g3_git(
+        binding.source_root,
+        "rev-parse",
+        "--verify",
+        f"{producer_commit}^{{commit}}",
+    )
+    if verified.returncode != 0 or verified.stdout.strip() != producer_commit:
+        raise ValueError("STAGE0_G3_ASSET_GENERATOR_COMMIT_UNKNOWN")
+    ancestor = _run_g3_git(
+        binding.source_root,
+        "merge-base",
+        "--is-ancestor",
+        producer_commit,
+        binding.head_commit,
+    )
+    if ancestor.returncode == 1:
+        raise ValueError("STAGE0_G3_ASSET_GENERATOR_COMMIT_NOT_ANCESTOR")
+    if ancestor.returncode != 0:
+        raise ValueError("STAGE0_G3_SOURCE_NOT_GIT_CONSTRAINED")
+
+    for reference in _G3_CRITICAL_SOURCE_REFS:
+        present = _run_g3_git(
+            binding.source_root,
+            "cat-file",
+            "-e",
+            f"{producer_commit}:{reference}",
+        )
+        if present.returncode != 0:
+            raise ValueError(
+                f"STAGE0_G3_ASSET_GENERATOR_SOURCE_REF_ABSENT:{reference}"
+            )
+
+    committed = _run_g3_git(
+        binding.source_root,
+        "diff",
+        "--quiet",
+        f"{producer_commit}..{binding.head_commit}",
+        "--",
+        *_G3_CRITICAL_SOURCE_REFS,
+    )
+    if committed.returncode == 1:
+        raise ValueError("STAGE0_G3_CRITICAL_SOURCE_DRIFT")
+    if committed.returncode != 0:
+        raise ValueError("STAGE0_G3_SOURCE_NOT_GIT_CONSTRAINED")
+
+    # Re-check both views here as well as in ``_git_constrained_g3_sources``.
+    # This keeps the producer-compatibility predicate independently fail-closed
+    # when it is used directly and closes the gap between the earlier capture
+    # and the later producer comparison.
+    for scope in ((), ("--cached",)):
+        dirty = _run_g3_git(
+            binding.source_root,
+            "diff",
+            *scope,
+            "--quiet",
+            "--",
+            *_G3_CRITICAL_SOURCE_REFS,
+        )
+        if dirty.returncode == 1:
+            raise ValueError("STAGE0_G3_CRITICAL_SOURCE_DIRTY")
+        if dirty.returncode != 0:
+            raise ValueError("STAGE0_G3_SOURCE_NOT_GIT_CONSTRAINED")
+
+
+def _formal_g3_roots(workspace_root: Path) -> tuple[_G3SourceBinding, Path]:
+    """Bind formal assets to the explicit DATA_ROOT and sources to Git."""
+
+    workspace = workspace_root.resolve()
+    data_root = require_data_root().resolve()
+    if data_root != workspace:
+        raise ValueError("STAGE0_G3_DATA_ROOT_WORKSPACE_MISMATCH")
+
+    source_root = Path(__file__).resolve().parents[3]
+    if is_within(workspace, source_root) or is_within(source_root, workspace):
+        raise ValueError("STAGE0_G3_WORKSPACE_OVERLAPS_SOURCE_ROOT")
+    return _git_constrained_g3_sources(), data_root
+
+
+def _is_link_like(path: Path) -> bool:
+    if path.is_symlink():
+        return True
+    is_junction = getattr(path, "is_junction", None)
+    if callable(is_junction) and is_junction():
+        return True
+    try:
+        attributes = getattr(path.lstat(), "st_file_attributes", 0)
+    except (FileNotFoundError, OSError):
+        return False
+    return bool(attributes & stat.FILE_ATTRIBUTE_REPARSE_POINT)
+
+
+def _g3_evidence_file(data_root: Path, reference: str) -> Path:
+    logical = _logical(reference, field="g3_evidence_ref")
+    current = data_root
+    for part in logical.parts:
+        current = current / part
+        if current.exists() or _is_link_like(current):
+            if _is_link_like(current):
+                raise ValueError("STAGE0_G3_EVIDENCE_LINK_FORBIDDEN")
+    if not current.is_file():
+        raise FileNotFoundError("STAGE0_G3_EVIDENCE_FILE_MISSING")
+    resolved = current.resolve(strict=True)
+    try:
+        resolved.relative_to(data_root)
+    except ValueError as error:
+        raise ValueError("STAGE0_G3_EVIDENCE_PATH_ESCAPE") from error
+    return resolved
+
+
+@dataclass(frozen=True, slots=True)
+class _G3EvidenceIdentity:
+    checked_at: str
+    producer_git_commit: str
+
+
+def _stable_g3_evidence_identity(
+    binding: _G3SourceBinding,
+    data_root: Path,
+) -> _G3EvidenceIdentity:
+    """Derive the unique timestamp and producer commit admitted by all assets."""
+
+    requirements = load_stage0_asset_requirements(binding.requirements_path)
+    layout = load_stage0_asset_layout(
+        binding.layout_path,
+        requirements=requirements,
+    )
+    checked_at_values: set[str] = set()
+    producer_commits: set[str] = set()
+    for entry in layout["entries"]:
+        manifest = load_asset_manifest(
+            _g3_evidence_file(data_root, entry["manifest_ref"])
+        )
+        raw_qualification = load_canonical_json(
+            _g3_evidence_file(data_root, entry["qualification_ref"])
+        )
+        if not isinstance(raw_qualification, Mapping):
+            raise ValueError("STAGE0_G3_QUALIFICATION_ROOT_INVALID")
+        qualification = dict(raw_qualification)
+        validate_g3_qualification(qualification)
+        manifest_commit = manifest.get("generator_git_commit")
+        qualification_commit = qualification.get("generator_git_commit")
+        if (
+            not isinstance(manifest_commit, str)
+            or _GIT_COMMIT_RE.fullmatch(manifest_commit) is None
+            or qualification_commit != manifest_commit
+        ):
+            raise ValueError("STAGE0_G3_ASSET_GENERATOR_COMMIT_AMBIGUOUS")
+        producer_commits.add(manifest_commit)
+        checked_at = qualification.get("checked_at")
+        if not isinstance(checked_at, str):
+            raise ValueError("STAGE0_G3_QUALIFICATION_CHECKED_AT_INVALID")
+        checked_at_values.add(checked_at)
+    if len(checked_at_values) != 1:
+        raise ValueError("STAGE0_G3_QUALIFICATION_CHECKED_AT_NOT_UNIQUE")
+    if len(producer_commits) != 1:
+        raise ValueError("STAGE0_G3_ASSET_GENERATOR_COMMIT_AMBIGUOUS")
+    return _G3EvidenceIdentity(
+        checked_at=next(iter(checked_at_values)),
+        producer_git_commit=next(iter(producer_commits)),
+    )
+
+
+def _stable_g3_checked_at(
+    binding: _G3SourceBinding,
+    data_root: Path,
+) -> str:
+    """Return the replay-stable qualification timestamp."""
+
+    return _stable_g3_evidence_identity(binding, data_root).checked_at
+
+
+def _evaluate_current_formal_g3(
+    binding: _G3SourceBinding,
+    data_root: Path,
+) -> tuple[dict[str, Any], str]:
+    """Replay qualified resolution and re-check source/asset bindings."""
+
+    evidence_identity = _stable_g3_evidence_identity(binding, data_root)
+    _assert_g3_producer_commit_compatible(
+        binding,
+        evidence_identity.producer_git_commit,
+    )
+    resolution = evaluate_stage0_g3(
+        binding.requirements_path,
+        binding.layout_path,
+        data_root,
+        checked_at=evidence_identity.checked_at,
+    )
+    _require_formal_g3_pass(resolution)
+    if resolution.get("checked_at") != evidence_identity.checked_at:
+        raise ValueError("STAGE0_G3_RESOLUTION_CHECKED_AT_DRIFT")
+    if _stable_g3_evidence_identity(binding, data_root) != evidence_identity:
+        raise ValueError("STAGE0_G3_ASSET_BINDING_DRIFTED")
+    if _git_constrained_g3_sources() != binding:
+        raise ValueError("STAGE0_G3_SOURCE_BINDING_DRIFTED")
+    return resolution, evidence_identity.producer_git_commit
+
+
+def _g3_payload_with_hash(payload: Mapping[str, JSONValue]) -> dict[str, JSONValue]:
+    value = dict(payload)
+    value["artifact_hash"] = canonical_json_hash(value)
+    return value
+
+
+def _is_sha256(value: object) -> bool:
+    return bool(
+        isinstance(value, str)
+        and len(value) == 64
+        and all(character in "0123456789abcdef" for character in value)
+    )
+
+
+def _require_formal_g3_pass(resolution: Mapping[str, object]) -> None:
+    validate_stage0_g3_resolution(resolution)
+    raw_entries = resolution.get("entries")
+    raw_gates = resolution.get("gates")
+    if not isinstance(raw_entries, list) or len(raw_entries) != 13:
+        raise ValueError("STAGE0_G3_RESOLUTION_ENTRY_COUNT_INVALID")
+    if not isinstance(raw_gates, list) or len(raw_gates) != len(G3_GATE_IDS):
+        raise ValueError("STAGE0_G3_RESOLUTION_GATE_COUNT_INVALID")
+    if resolution.get("status") != "PASS" or tuple(
+        gate.get("gate_id") if isinstance(gate, Mapping) else None
+        for gate in raw_gates
+    ) != G3_GATE_IDS:
+        raise ValueError("STAGE0_G3_AGGREGATE_BLOCKED")
+    if any(
+        not isinstance(gate, Mapping) or gate.get("status") != "PASS"
+        for gate in raw_gates
+    ):
+        raise ValueError("STAGE0_G3_SUBGATE_BLOCKED")
+
+    logical_names: set[str] = set()
+    acquisition_bindings: set[tuple[str, str]] = set()
+    for entry in raw_entries:
+        if not isinstance(entry, Mapping) or entry.get("status") != "PASS":
+            raise ValueError("STAGE0_G3_ENTRY_BLOCKED")
+        logical_name = entry.get("logical_name")
+        checks = entry.get("checks")
+        reasons = entry.get("reasons")
+        if (
+            not isinstance(logical_name, str)
+            or logical_name in logical_names
+            or not isinstance(checks, Mapping)
+            or not checks
+            or any(value is not True for value in checks.values())
+            or reasons != []
+        ):
+            raise ValueError("STAGE0_G3_ENTRY_EVIDENCE_INVALID")
+        logical_names.add(logical_name)
+        for field in (
+            "asset_id",
+            "candidate_id",
+            "candidate_sha256",
+            "ready_manifest_sha256",
+            "qualification_artifact_hash",
+            "acquisition_sha256",
+            "verification_sha256",
+            "semantic_evidence_sha256",
+            "semantic_evidence_artifact_hash",
+        ):
+            if not _is_sha256(entry.get(field)):
+                raise ValueError(f"STAGE0_G3_ENTRY_DIGEST_INVALID:{field}")
+        for field in (
+            "manifest_ref",
+            "candidate_ref",
+            "qualification_ref",
+            "acquisition_ref",
+            "verification_ref",
+            "semantic_evidence_ref",
+        ):
+            if not isinstance(entry.get(field), str) or not entry[field]:
+                raise ValueError(f"STAGE0_G3_ENTRY_REF_INVALID:{field}")
+        acquisition_ref = str(entry["acquisition_ref"])
+        acquisition_sha256 = str(entry["acquisition_sha256"])
+        if acquisition_ref != (
+            "manifests/evidence/g3/acquisition/"
+            f"{acquisition_sha256}.json"
+        ):
+            raise ValueError("STAGE0_G3_ENTRY_ACQUISITION_BINDING_INVALID")
+        acquisition_bindings.add((acquisition_ref, acquisition_sha256))
+    if len(acquisition_bindings) != 1:
+        raise ValueError("STAGE0_G3_ACQUISITION_REPORT_NOT_UNIQUE")
+
+
+def _formal_g3_payloads(
+    resolution: Mapping[str, object],
+    *,
+    source_binding: _G3SourceBinding,
+    producer_git_commit: str,
+) -> dict[str, dict[str, JSONValue]]:
+    """Project one validated resolution into three non-overlapping artifacts."""
+
+    _require_formal_g3_pass(resolution)
+    entries = resolution["entries"]
+    gates = resolution["gates"]
+    assert isinstance(entries, list) and isinstance(gates, list)
+
+    manifest_entries: list[JSONValue] = []
+    audit_entries: list[JSONValue] = []
+    for raw_entry in entries:
+        assert isinstance(raw_entry, Mapping)
+        manifest_entries.append(
+            {
+                "logical_name": raw_entry["logical_name"],
+                "kind": raw_entry["kind"],
+                "requirement_name": raw_entry["requirement_name"],
+                "manifest_ref": raw_entry["manifest_ref"],
+                "asset_id": raw_entry["asset_id"],
+                "candidate_id": raw_entry["candidate_id"],
+                "candidate_ref": raw_entry["candidate_ref"],
+                "candidate_sha256": raw_entry["candidate_sha256"],
+                "ready_manifest_sha256": raw_entry["ready_manifest_sha256"],
+            }
+        )
+        audit_entries.append(
+            {
+                "logical_name": raw_entry["logical_name"],
+                "kind": raw_entry["kind"],
+                "status": raw_entry["status"],
+                "checks": raw_entry["checks"],
+                "reasons": raw_entry["reasons"],
+                "qualification_ref": raw_entry["qualification_ref"],
+                "qualification_artifact_hash": raw_entry[
+                    "qualification_artifact_hash"
+                ],
+                "acquisition_ref": raw_entry["acquisition_ref"],
+                "acquisition_sha256": raw_entry["acquisition_sha256"],
+                "verification_ref": raw_entry["verification_ref"],
+                "verification_sha256": raw_entry["verification_sha256"],
+                "semantic_evidence_ref": raw_entry["semantic_evidence_ref"],
+                "semantic_evidence_sha256": raw_entry[
+                    "semantic_evidence_sha256"
+                ],
+                "semantic_evidence_artifact_hash": raw_entry[
+                    "semantic_evidence_artifact_hash"
+                ],
+            }
+        )
+
+    shared: dict[str, JSONValue] = {
+        "status": "PASS",
+        "requirements_ref": resolution["requirements_ref"],
+        "requirements_artifact_hash": resolution["requirements_artifact_hash"],
+        "layout_artifact_hash": resolution["layout_artifact_hash"],
+        "source_binding": source_binding.payload(
+            producer_git_commit=producer_git_commit
+        ),
+    }
+    asset_manifest = _g3_payload_with_hash(
+        {
+            "schema_version": _G3_MANIFEST_SCHEMA_VERSION,
+            **shared,
+            "entry_count": len(manifest_entries),
+            "entries": manifest_entries,
+        }
+    )
+    asset_audit = _g3_payload_with_hash(
+        {
+            "schema_version": _G3_AUDIT_SCHEMA_VERSION,
+            **shared,
+            "entry_count": len(audit_entries),
+            "entries": audit_entries,
+            "gates": gates,
+        }
+    )
+    return {
+        "asset_manifest": asset_manifest,
+        "asset_audit": asset_audit,
+        "asset_resolution": dict(resolution),
+    }
+
+
+def _formal_g3_source_refs(
+    source_binding: _G3SourceBinding,
+    resolution: Mapping[str, object],
+    input_source_refs: tuple[str, ...],
+    *,
+    producer_git_commit: str,
+) -> tuple[str, ...]:
+    """Bind task envelopes to the producer and every replayed evidence object."""
+
+    _require_formal_g3_pass(resolution)
+    _assert_g3_producer_commit_compatible(source_binding, producer_git_commit)
+    refs = list(input_source_refs)
+    expected_git_refs = {
+        f"git-source/{producer_git_commit}/{reference}"
+        for reference in _G3_CRITICAL_SOURCE_REFS
+    }
+    refs.extend(
+        f"git-source/{producer_git_commit}/{reference}"
+        for reference in _G3_CRITICAL_SOURCE_REFS
+    )
+    requirements_ref = resolution.get("requirements_ref")
+    if not isinstance(requirements_ref, str) or not requirements_ref:
+        raise ValueError("STAGE0_G3_REQUIREMENTS_REF_INVALID")
+    refs.append(requirements_ref)
+    entries = resolution.get("entries")
+    if not isinstance(entries, list):
+        raise ValueError("STAGE0_G3_RESOLUTION_ENTRIES_INVALID")
+    for entry in entries:
+        if not isinstance(entry, Mapping):
+            raise ValueError("STAGE0_G3_RESOLUTION_ENTRY_INVALID")
+        for field in (
+            "manifest_ref",
+            "asset_root_ref",
+            "candidate_ref",
+            "qualification_ref",
+            "acquisition_ref",
+            "verification_ref",
+            "semantic_evidence_ref",
+        ):
+            reference = entry.get(field)
+            if not isinstance(reference, str) or not reference:
+                raise ValueError(f"STAGE0_G3_ENTRY_REF_INVALID:{field}")
+            refs.append(reference)
+    gates = resolution.get("gates")
+    if not isinstance(gates, list):
+        raise ValueError("STAGE0_G3_RESOLUTION_GATES_INVALID")
+    for gate in gates:
+        if not isinstance(gate, Mapping):
+            raise ValueError("STAGE0_G3_RESOLUTION_GATE_INVALID")
+        evidence_refs = gate.get("evidence_refs")
+        if not isinstance(evidence_refs, list):
+            raise ValueError("STAGE0_G3_GATE_EVIDENCE_REFS_INVALID")
+        for reference in evidence_refs:
+            if not isinstance(reference, str) or not reference:
+                raise ValueError("STAGE0_G3_GATE_EVIDENCE_REF_INVALID")
+            refs.append(reference)
+    result = tuple(dict.fromkeys(refs))
+    observed_git_refs = {
+        reference for reference in result if reference.startswith("git-source/")
+    }
+    if observed_git_refs != expected_git_refs:
+        raise ValueError("STAGE0_G3_SOURCE_REFS_NOT_EXACT")
+    return result
+
+
+def _restore_formal_g3_outputs(
+    root: Path,
+    references: Mapping[str, str],
+    *,
+    input_source_refs: tuple[str, ...],
+) -> Mapping[str, object]:
+    source_binding, data_root = _formal_g3_roots(root)
+    # A complete old task commit is only a cache candidate.  Re-evaluate all
+    # qualified assets before reading its PASS payload for restoration.
+    resolution, producer_git_commit = _evaluate_current_formal_g3(
+        source_binding,
+        data_root,
+    )
+    expected = _formal_g3_payloads(
+        resolution,
+        source_binding=source_binding,
+        producer_git_commit=producer_git_commit,
+    )
+    expected_sources = _formal_g3_source_refs(
+        source_binding,
+        resolution,
+        input_source_refs,
+        producer_git_commit=producer_git_commit,
+    )
+    loaded = {
+        kind: load_committed_task_artifact(root, references[kind], require_formal=True)
+        for kind in _G3_OUTPUT_SCHEMAS
+    }
+    for kind, expected_schema in _G3_OUTPUT_SCHEMAS.items():
+        if loaded[kind].payload.get("schema_version") != expected_schema:
+            raise ValueError(f"STAGE0_G3_RESTORE_SCHEMA_INVALID:{kind}")
+    for kind in _G3_OUTPUT_SCHEMAS:
+        if loaded[kind].source_refs != expected_sources:
+            raise ValueError(f"STAGE0_G3_RESTORE_SOURCE_REFS_DRIFT:{kind}")
+        if dict(loaded[kind].payload) != expected[kind]:
+            raise ValueError(f"STAGE0_G3_RESTORE_PAYLOAD_DRIFT:{kind}")
+    return resolution
 
 
 def _logical(value: str, *, field: str) -> PurePosixPath:
@@ -348,7 +1108,7 @@ def _formal_guard(request: TaskExecutionRequest, root: Path) -> None:
             else BlockerCode.DEVICE_UNAVAILABLE
             if capability in {"cuda", "nccl"}
             else BlockerCode.ASSET_UNAVAILABLE
-            if capability in {"model_assets", "data_assets"}
+            if capability in {"model_assets", "data_assets", "tokenizer_assets"}
             else BlockerCode.DEPENDENCY_UNAVAILABLE
             if capability == "wheelhouse"
             else BlockerCode.CAPABILITY_UNAVAILABLE
@@ -412,6 +1172,59 @@ def _formal_external_evidence(
             "formal_gate_automatically_passed": False,
         },
         source_refs,
+    )
+
+
+def _run_formal_g3_task(
+    request: TaskExecutionRequest,
+    root: Path,
+    store: TaskArtifactStore,
+    *,
+    source_refs: tuple[str, ...],
+) -> TaskRunResult:
+    try:
+        source_binding, data_root = _formal_g3_roots(root)
+        resolution, producer_git_commit = _evaluate_current_formal_g3(
+            source_binding,
+            data_root,
+        )
+        payloads = _formal_g3_payloads(
+            resolution,
+            source_binding=source_binding,
+            producer_git_commit=producer_git_commit,
+        )
+        bound_source_refs = _formal_g3_source_refs(
+            source_binding,
+            resolution,
+            source_refs,
+            producer_git_commit=producer_git_commit,
+        )
+    except Exception as error:
+        raise RuntimeError(
+            f"STAGE0_G3_FORMAL_EVALUATION_FAILED:{type(error).__name__}"
+        ) from error
+
+    refs: dict[str, str] = {}
+    for artifact_kind in request.task.artifact_kinds:
+        published = store.publish(
+            task_id=request.task.task_id,
+            artifact_kind=artifact_kind,
+            config_hash=request.config.config_hash,
+            run_intent="formal",
+            payload=payloads[artifact_kind],
+            formal_eligible=True,
+            source_refs=bound_source_refs,
+        )
+        refs[artifact_kind] = published.commit_ref
+    return TaskRunResult.passed(
+        request,
+        artifact_refs=refs,
+        message="Stage 0 G3 assets resolved and all five sub-gates passed",
+        metadata={
+            "stage01_specialized": True,
+            "g3_resolution_artifact_hash": resolution["artifact_hash"],
+            "g3_gate_ids": list(G3_GATE_IDS),
+        },
     )
 
 
@@ -1032,6 +1845,13 @@ class Stage01CompositeTaskRunner(TaskRunner):
                 )
             )
         _formal_guard(request, self.workspace_root)
+        if (
+            request.config.run_intent == "formal"
+            and request.task.task_id == _G3_TASK_ID
+        ):
+            # Fail before TaskArtifactStore creates any output directory when
+            # the CLI/runtime accidentally points formal execution at source.
+            _formal_g3_roots(self.workspace_root)
         store = _store(request, self.workspace_root)
         existing = store.discover_complete(
             task_id=request.task.task_id,
@@ -1040,6 +1860,32 @@ class Stage01CompositeTaskRunner(TaskRunner):
             formal_eligible=request.config.run_intent == "formal",
         )
         if existing is not None:
+            if (
+                request.config.run_intent == "formal"
+                and request.task.task_id == _G3_TASK_ID
+            ):
+                _, restore_input_source_refs = _input_evidence(
+                    request,
+                    self.workspace_root,
+                )
+                resolution = _restore_formal_g3_outputs(
+                    self.workspace_root,
+                    existing,
+                    input_source_refs=restore_input_source_refs,
+                )
+                return TaskRunResult.passed(
+                    request,
+                    artifact_refs=existing,
+                    message="Stage 0 G3 assets restored from validated formal commits",
+                    metadata={
+                        "stage01_specialized": True,
+                        "restored": True,
+                        "g3_resolution_artifact_hash": resolution[
+                            "artifact_hash"
+                        ],
+                        "g3_gate_ids": list(G3_GATE_IDS),
+                    },
+                )
             if (
                 request.config.run_intent == "formal"
                 and request.task.task_id in _FORMAL_EVIDENCE_ONLY_TASKS
@@ -1076,6 +1922,16 @@ class Stage01CompositeTaskRunner(TaskRunner):
             )
 
         inputs, source_refs = _input_evidence(request, self.workspace_root)
+        if (
+            request.config.run_intent == "formal"
+            and request.task.task_id == _G3_TASK_ID
+        ):
+            return _run_formal_g3_task(
+                request,
+                self.workspace_root,
+                store,
+                source_refs=source_refs,
+            )
         if (
             request.config.run_intent == "formal"
             and request.task.task_id in _FORMAL_EVIDENCE_ONLY_TASKS

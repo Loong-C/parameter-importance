@@ -78,3 +78,152 @@
 
 - 将服务器保护提交归并到 `feat/stage0-completion`，冲突时保留已审计的本机新版本内容，同时保留服务器提交历史和日志追加。
 - 冻结 S0.4 资产矩阵、序列/目标 token 语义与最大游标预算；先补 manifest、语义审计和 Pile/GLUE 构建合同，再取得/发布正式资产。
+
+## 2026-08-03 16:30 CST — S0.4 G3 冻结合同与安全获取入口
+
+### 目标与范围
+
+- 先冻结 Stage 1/2/4/5/6 实际需要的模型、tokenizer、Pile 游标与 GLUE split，证明本阶段所需 Pile 前缀后再决定下载范围。
+- 建立 G3 manifest、资格准入、DATA_ROOT 逻辑布局和缺失对象获取入口；正式 Gate 必须重放 manifest、qualification、文件哈希和语义合同，不能接受 legacy `READY` 或任意单项 PASS 声明。
+- 下载入口只保存稳定 source ID、固定 revision、大小和 SHA-256；运行时 URL 只在内存构造，不进入 argv、配置、报告或 manifest。
+
+### 冻结决定
+
+- Pile 每个原始 record 为 2049 token；运行输入为 `[0,2048)`，目标为 `[1,2049)`，attention mask 全 1，loss adapter 为 `pre-shifted-next-token-cross-entropy-v1`，禁止模型内部再次位移。
+- 冻结必需游标为 `[0,1048576)`：debug 8192、train 640000、validation 64000、Stage 2 sampling universe 262144、Stage 3 probe 65536、reserve 16896。必需原始 token 为 2,148,532,224，实际目标 token 为 2,147,483,648。
+- `document.idx` 前 1,048,576 项长度均为 2049，指针连续且所需最后字节仍位于完整 shard 0；因此 G3 只选择 `document.idx` 与 shard 0，既不需要也不允许为本阶段恢复整套 Pile 下载。
+- Stage 6 按总计划统一使用 Pythia 410M deduped step0 作为共同 base initialization；sequence-classification head 由运行时固定 seed 初始化，不把 160M 或一个虚构的独立分类模型资产当作输入。
+- GLUE raw 文件路径按各任务 asset root 平铺；上游 `sst2/`、`mnli/`、`rte/` 前缀只属于 source ID，不拼入 DATA_ROOT 下的本地相对路径。
+- Pythia 160M step512 的正式身份统一为 `trained_checkpoint`，并要求绑定同仓库 step0 的 parent asset ID 与 `training_step=512`。
+
+### 已实现合同
+
+- 新增 G3 requirements/layout、13 个 URL-free HTTP object spec 与 13 对象下载计划；固定 410M 的 config/weights/tokenizer 以及 MNLI、RTE 全部 raw parquet。
+- G3 manifest metadata 现在严格表达 model dtype 分布/最大位置、tokenizer 完整 vocab mapping 与 GLUE padding、Pile index/shard/cursor/causal mapping/reference record、GLUE task contract 与 derived lineage。
+- 新增 `downloading → downloaded → verified → ready` 候选链、candidate ID、资格报告及 `resolve_qualified_asset`；G3 READY 不能再由 legacy resolver 使用，也不能绕过 qualification admission。
+- 新增 Pythia mmap reader、pre-shift loss 路线，以及支持 sequential、真正有放回、确定性 DDP 无放回分片和严格恢复身份的 mmap provider adapter。
+- formal 配置中的逻辑资产 ID 已改为 layout 中的精确名称；provider root/manifest refs 使用实际 `models/`、`datasets/`、`manifests/` DATA_ROOT 路径，不引入 `assets/` 别名。
+
+### 验证与当前状态
+
+| 项目 | 结果 |
+|---|---|
+| 原 G3 requirements/layout/schema/spec/asset 定向回归 | `118 passed, 1 skipped`；skip 仅为 Windows symlink 权限 |
+| URL-free 下载计划与配置逻辑名回归 | `17 passed`、`34 passed` |
+| G3 manifest metadata 扩展 | `155 passed, 1 skipped`；兼容回归 `48 passed` |
+| Pythia mmap provider/loss 联合回归 | 新 provider `9 passed`；相关联合回归 `43 passed` |
+
+- S0.4/G3 仍为 `IN_PROGRESS`，尚未声明 PASS。剩余工作是把本轮代码提交并以 bundle 快进服务器，下载缺失 410M/MNLI/RTE，构建三个 GLUE derived 资产，生成 13 份 manifest/qualification/离线语义证据并让 G3-S1/S2/S4/S5/S6 全部通过。
+- 旧 31M 顶层 BOM manifest 保留为问题证据，不原地覆盖；新的 canonical manifest 将发布到 layout 的独立路径。
+
+## 2026-08-03 17:22 CST — G3 真实资产闭环、网络恢复与合同纠偏（进行中）
+
+### 代码、提交与同步
+
+- G3 冻结控制面及安全 HTTP 获取基础提交为 `dda4fe2c3b2feb7b8763a0d54c425f45e56b62d7`；已推送 GitHub，并以已验证增量 bundle 快进服务器，三端该提交一致后精确清理本轮 bundle。
+- 服务器直连公网执行 URL-free 获取入口时，首个 570-byte config 在 6 次有限重试后以 `NETWORK_ERROR` 失败；失败报告为 `$DATA_ROOT/operations/g3-download-dda4fe2.json`，artifact hash `c6dff00550ca9410d0d108a113e6b5c81b763c2157c9e73849a6c3c4d7bd584c`，报告未保存 URL。
+- 新增外部字节 relay 与服务器受锁 receiver：提交 `f75cfc98d8b949c4b08eac1cdd373c10b3e23453`；单行协议修复为 `44a63177b735bd2b5ecd7d84817d2bef2348837c`。两次均已推送并以校验哈希的增量 bundle 快进服务器，随后精确删除本机与 `$DATA_ROOT/tmp` 对应 bundle。
+- receiver 与原 HTTP 获取共用逐对象 advisory lock、`.part`、固定大小/SHA-256 和 no-clobber hard-link 发布；relay 进程只在内存构造 endpoint，不把 URL 放入 argv、报告或资产目录，也不在本机/lab-pc 落盘资产字节。
+
+### 网络路径实测
+
+- 本机到 `lab-pc`、`lab-pc` 到 `sophgo13` 两段既有 SSH alias 均通过；但 lab-pc 访问固定 Hugging Face revision 时，.NET 无代理请求 30 秒超时，`curl --config -` 45 秒超时。因此未修改 DNS/代理/SSH 拓扑，也未把历史可达性冒充当前 PASS。
+- 本机访问同一固定 570-byte config 成功，内存探针得到 HTTP 200、570 bytes 和冻结 SHA-256 `d4c11e84a59c8af4d88446bba53b718f7aef740daa070ded08fd6a9a3aca4fc6`。
+- 端到端 relay 首次把该 config 原子发布到 `$DATA_ROOT/models/pythia-410m-deduped-step0/config.json`；协议修复后重跑返回 `already_ready`，证明只读幂等路径有效。
+- 410M `model.safetensors` 已启动串行可恢复流式传输；2026-08-03 17:16 CST 只读探针为 `339,231,645 / 1,621,370,224` bytes。连接中断后由同一 sender 等待旧 receiver 退出再按新 offset 续传，没有启动第二个写入器。该对象尚未完成时 G3 仍为 `IN_PROGRESS`。
+
+### Pile 合同纠偏
+
+- 复核历史 `batch-viewer-comparison` 后发现三个冻结哈希键 `0/1/511` 表示 batch index，不是 record index。服务器直接读取 shard0 实测：每批为连续 `1024 × 2049 × uint16` 原始字节，三个 SHA-256 与历史值逐项完全一致；单 record 0/1/511 的哈希均不同。
+- `last_required_record_sha256` 独立表示 record `1,048,575` 的 4,098 原始字节；服务器实测仍为 `c70a2422352b10a9027d31ca5a0ed8fe9453218a7a4e1d3e5d675842c7c982c4`。
+- requirements 已显式增加 `reference_batch_size=1024`，并绑定官方 reader `EleutherAI/pythia@a19eecb807ec2c79a39ebf18108816e6ffffc1d5`；语义 probe 按 batch 与最后 record 两条独立路径验证。级联后的 requirements/layout/download-plan artifact hash 分别为 `e1e7edff937cec30771e063d460f75fe68c1a66c8d7b60b055fcc4991663835c`、`22d3dfa67cd19904aa3fb3ce187d65ec473e0e92f2277cef08dd854ddbedec14`、`09768b3aa283b25784220f9ec58d07048654013b4ac4703032a543b8ba574cc9`；13 个 immutable HTTP object spec 未改。
+
+### 本地验证与尚未关闭项
+
+| 项目 | 结果 |
+|---|---|
+| G3 广泛本地回归 | 313 collected；`312 passed, 1 skipped, 0 failed`；唯一 skip 为 Windows 目录 symlink 权限 |
+| relay/acquisition/plan/CLI 定向回归 | `32 passed` |
+| G3 publication/materializer 定向回归 | `12 passed`；另有真实离线模型加载负载检查 |
+| Pile batch 合同、requirements/layout/plan 级联 | `22 passed`，batch-vs-record 专项通过 |
+
+- 静态审查正在补强两条 fail-closed 边界：Gate 必须独立重验 semantic evidence，而不能只信 qualification 中的哈希；GLUE derived lineage 只允许绑定冻结的三个 tokenizer 文件，不能把共享目录中的模型文件或持久 acquisition lock 纳入身份。
+- 在上述修复、全部缺失对象、三个 derived GLUE、13 项 READY/qualification、五个 G3 子 Gate 和三类 formal 报告全部通过前，不声明 S0.4/G3 完成。
+
+## 2026-08-03 18:38 CST — 慢速 SSH 断点续传完成与 G3 二次控制审计（进行中）
+
+### 410M 权重传输结果
+
+- 按用户要求重试既有 `lab-pc → sophgo13` SSH 链路；连接可用但握手和吞吐波动明显，未修改 SSH 配置、DNS、代理或跳板拓扑。
+- 首轮 relay 在 673,520,845 bytes 后退出并遗留一个仍持锁的本轮 receiver。先只读核对 PID、父进程、完整命令和锁，再只终止该精确 receiver；确认进程退出、锁释放且 `.part` 保留后，才从冻结 offset 重启唯一 writer。
+- 重启任务经历三次 `HTTP_TRANSFER_INCOMPLETE` 和一次 SSH banner timeout；每次旧 receiver 退出并释放对象锁后才重连，READY offset 依次为 673,520,845、946,116,123、1,003,467,324、1,486,513,174，没有第二个 writer，也没有把 `.part` 清零。
+- 最终发布 `$DATA_ROOT/models/pythia-410m-deduped-step0/model.safetensors`：1,621,370,224 bytes，SHA-256 `25c40c86d28f75cad7f98fca8a4ed4a75485423f14df85832226b4ded66c097d`；receiver 返回 `COMPLETE status=downloaded`，隐藏 `.part` 消失。
+
+### 二次控制审计与修复状态
+
+- relay/receiver 正在补强不完整 HTTP 响应的 partial-byte 保留、所有 READY/COMPLETE/read/write/wait 的单调总时限、严格终态协议、端到端 requirements/layout/plan/spec/commit/route 绑定、发布前后双哈希以及集中 `.part`/锁目录。当前 410M 使用已提交旧协议完成；剩余对象只在新版整体提交并同步后传输。
+- Gate/publication 已增加 Pile official-reader oracle 与 31M BOM legacy diagnostic 的原始字节、严格字段和来源提交绑定；existing READY 和 qualification-only 恢复都会在当前环境、零外连守卫下重新执行 semantic probe。该线最终定向回归为 `72 passed`。
+- formal G3 runner 已改为从 13 份 qualification 的唯一时间推导稳定 `checked_at`，强制 generator/current HEAD、关键源码 clean/tracked/module-origin、三份正式产物完整来源链，并在旧 PASS 恢复时重新执行 G3、全文件哈希和语义证据；支持第一或第二份产物提交后的幂等续发。定向/邻接回归为 `14 passed`、`53 passed`。
+- 新发现的重大控制面缺口是原 publisher 用同一 actor instance 连续生成 fetcher、verifier、gate 三类状态。修复方案已冻结为三个独立边界：逻辑资产 acquisition attestor、独立 verify-only CLI、gate-only materializer；报告需覆盖 `canonical-plan`、`existing-import`、`derived-build` 三种来源，三角色 instance 两两不同并由不可变 ref/hash 交接。
+- 正式 runtime 正在改为只消费 Stage0.04 committed `asset_resolution`：配置只保留逻辑 asset ID；Pile 使用 manifest 精确 idx/shard 的 mmap reader；Stage 2/3 绑定冻结 sample IDs；Stage 0/1/4/5 强制 split、global-batch 和预算；GLUE derived 继续完全离线 `load_from_disk`。该线尚在实现和独立审计，未形成 PASS。
+
+### 当前判定与下一步
+
+- S0.4/G3 仍为 `IN_PROGRESS`。410M 权重已完成，但 tokenizer 三文件、MNLI 五文件、RTE 三文件仍待新版 relay 顺序补齐。
+- 当前控制面内容哈希已更新为 requirements `591ba7f66cfc006845386a59e5661df0609b4613d7f91a527f490c4a11ddaaa9`、layout `ef347c060af25d7d2e3b1d4c774ff80dbc5ea15e5745749f24b44e0ef8b9ace6`、download-plan `002bef15cede098bb6f75deb2900e456ea3348c1f3ed2512db47729d92b496c2`；这些仍需在实现收敛提交后再次绑定最终 generator Git commit 并级联生成，17:22 节中的旧值仅是当时快照。
+- 下一步依次为：完成三阶段生命周期与 formal runtime 测试；形成干净提交并按 GitHub/验证 bundle 快进服务器；顺序补齐剩余对象；执行 canonical acquisition report、独立 verify-only、gate-only materializer、13 项 READY/qualification、五个 G3 子 Gate和正式 resolution；只有全部通过后才进入 S0.5/G4。
+
+## 2026-08-03 23:18 CST — G3 控制面本地收口与完整定向回归
+
+### 范围与审查
+
+- 按当前续跑要求重新完整阅读 `Agent/` 五份运维文档、`plan/general_plan.md`、
+  `plan/stage0/` 全部 13 份计划和 `worklogs/` 全部现行日志；继续既有
+  `feat/stage0-completion` 工作树，不覆盖或拆散 18:38 CST 之后已经形成的未提交实现。
+- 完成三角色 G3 生命周期、gate-only materializer、正式 runtime resolution、Pile mmap、
+  GLUE derived builder、正式 task runner 与跨 Stage 1–8 配置接线的本地审查和回归。
+- 远端复采后，本机与 `origin/feat/stage0-completion` 仍为 0/0 分叉；本节没有把本机
+  测试冒充服务器资产 Gate，也没有执行新的资产下载或 GPU 运行。
+
+### 本轮修复
+
+- `resolve_source_git_commit` 改用仓库规范允许的一次性 `safe.directory`，使受控沙箱用户
+  可以读取已严格解析的 Git 源身份，且不修改全局 Git 配置。
+- 两份新增 G3 lifecycle schema 补齐项目标准绝对 `$id`；schema 重放入口恢复通过。
+- 测试不再引入锁文件之外、项目明确不依赖的 `jsonschema` 包，改为复用仓库自身的
+  schema 源文档校验并继续由领域 validator 验证实例语义。
+- 将缺失 resolution 的断言更新为实际更早、更精确的 fail-closed 错误
+  `G3_RUNTIME_REF_MISSING_OR_ESCAPE`。
+- 最初把 pytest `--basetemp` 放在源码仓库内，正式 runner 正确拒绝了 workspace/source
+  重叠；改用独立系统临时目录后相应用例全部通过。仓库内由本轮创建的 14 个
+  `.codex-stage0-*` 临时目录已逐个解析并确认位于仓库根下后精确清理。
+
+### 验证
+
+| 检查 | 结果 |
+|---|---|
+| 资产合同、获取、manifest 与 relay | `217 passed, 1 skipped`；skip 仅为 Windows 目录 symlink 权限 |
+| 配置、preflight、provider 与任务 runner 邻接回归 | `90 passed` |
+| 独立 acquisition/verify-only/gate 生命周期 | `16 passed` |
+| G3 发布、崩溃恢复、网络阻断与 provenance 负向路径 | `13 passed` |
+| 五个 G3 子 Gate 汇总与证据重放 | `24 passed` |
+| 正式 runtime resolution | `16 passed, 1 skipped`；skip 仅为 Windows 文件 symlink 权限 |
+| Stage 0.4 正式 runner 与 Git 来源兼容性 | `29 passed` |
+| gate-only materializer CLI | `7 passed` |
+| GLUE builder、Pile mmap reader/provider | `43 passed` |
+| 仓库全部 schema 源文档重放 | `1 passed` |
+| Python 静态编译 | `python -m compileall -q src ops tests`，退出码 0 |
+| Git 大文件/禁止类型守卫 | `git-guard: PASS`；退出码 0 |
+| 空白检查 | `git diff --check`，退出码 0；仅现有 Windows LF/CRLF 提示 |
+
+上述互不重复的定向集合合计 `456 passed, 2 skipped, 0 failed`。两个 skip 都有独立
+Linux/服务器补跑要求，不能计作 G3 formal PASS。
+
+### 当前 Gate 与下一步
+
+- G0–G2 保持既有 `PASS`；S0.4/G3 仍为 `IN_PROGRESS`。
+- 本地控制面已达到可提交、可同步状态，但 requirements/layout/download-plan 的
+  `generator_git_commit` 仍需在本轮实现提交后按生成器提交重新级联冻结。
+- 服务器仍需补齐 410M tokenizer 三文件、MNLI 五文件和 RTE 三文件，随后依次生成
+  acquisition attestation、独立 verify-only 报告、gate-only publication、13 项
+  READY/qualification、G3-S1/S2/S4/S5/S6 与正式 `asset_resolution`；完成前不进入 G4。

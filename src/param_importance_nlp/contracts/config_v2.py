@@ -668,13 +668,23 @@ def _normalize_payload(
         raise ConfigContractError("provider 必须 local_files_only=true 且 trust_remote_code=false")
     if provider_kind == "tiny" and any(reference is not None for reference in provider_refs.values()):
         raise ConfigContractError("tiny provider 不得伪装绑定外部 manifest/root")
-    if provider_kind == "offline_hf" and any(reference is None for reference in provider_refs.values()):
-        raise ConfigContractError("offline_hf provider 必须显式绑定模型、数据和 tokenizer 的 manifest/root")
     formal_model_execution = (
         base_identity["run_intent"] == "formal" and task.runner_kind in _MODEL_EXECUTION_RUNNERS
     )
     if formal_model_execution and provider_kind != "offline_hf":
         raise ConfigContractError("formal 模型执行任务禁止 tiny provider，必须使用本地 offline_hf 资产")
+    if base_identity["run_intent"] == "formal" and provider_kind == "offline_hf":
+        if any(reference is not None for reference in provider_refs.values()):
+            raise ConfigContractError(
+                "formal offline_hf provider 只能使用 G3 logical resolution；"
+                "manifest/root 必须全部为 null"
+            )
+    elif provider_kind == "offline_hf" and any(
+        reference is None for reference in provider_refs.values()
+    ):
+        raise ConfigContractError(
+            "non-formal offline_hf provider 必须显式绑定模型、数据和 tokenizer 的 manifest/root"
+        )
 
     evaluation = _expect_mapping(payload["evaluation"], field="evaluation")
     _expect_fields(evaluation, _EVALUATION_FIELDS, field="evaluation")

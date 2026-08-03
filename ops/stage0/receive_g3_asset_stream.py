@@ -8,8 +8,10 @@ handshake, and delegates all writes to the shared locked acquisition primitive.
 from __future__ import annotations
 
 import argparse
+import math
 from pathlib import Path, PurePosixPath
 import sys
+import time
 from typing import Any
 
 from param_importance_nlp.asset_acquisition import (
@@ -17,10 +19,17 @@ from param_importance_nlp.asset_acquisition import (
     AssetAcquisitionError,
     AssetObjectSpec,
     StreamReceptionPlan,
+    inspect_legacy_acquisition_state,
+    migrate_legacy_acquisition_state,
     receive_streamed_asset,
     resolve_approved_asset_target,
 )
-from param_importance_nlp.asset_download_plan import load_g3_download_plan
+from param_importance_nlp.asset_download_plan import (
+    G3RelayBinding,
+    build_g3_relay_binding,
+    load_g3_download_plan,
+    resolve_source_git_commit,
+)
 from param_importance_nlp.asset_layout import load_stage0_asset_layout
 from param_importance_nlp.asset_requirements import load_stage0_asset_requirements
 from param_importance_nlp.assets import validate_asset_path
@@ -51,6 +60,29 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--layout", type=Path, required=True)
     parser.add_argument("--plan", type=Path, required=True)
     parser.add_argument("--object-id", required=True)
+    parser.add_argument("--revision")
+    parser.add_argument("--expected-size", type=int)
+    parser.add_argument("--expected-sha256")
+    parser.add_argument("--requirements-sha256")
+    parser.add_argument("--layout-sha256")
+    parser.add_argument("--plan-sha256")
+    parser.add_argument("--spec-ref")
+    parser.add_argument("--spec-sha256")
+    parser.add_argument("--asset-root-ref")
+    parser.add_argument("--final-path")
+    parser.add_argument("--generator-git-commit")
+    parser.add_argument("--source-git-commit")
+    parser.add_argument("--route", choices=("lab-direct", "local-via-lab"))
+    parser.add_argument("--overall-timeout-seconds", type=float, default=6 * 60 * 60)
+    parser.add_argument(
+        "--legacy-state-action",
+        choices=("none", "inspect", "migrate"),
+        default="none",
+        help=(
+            "Explicitly inspect or migrate the former asset-adjacent checkpoint; "
+            "normal receive never consumes legacy state."
+        ),
+    )
     return parser
 
 
@@ -74,7 +106,12 @@ def _source_file(source_root: Path, value: str | Path, *, field: str) -> Path:
     return resolved
 
 
-def _asset_root(data_root: Path, reference: str) -> Path:
+def _asset_root(
+    data_root: Path,
+    reference: str,
+    *,
+    create: bool,
+) -> Path:
     relative = PurePosixPath(validate_asset_path(reference))
     target = data_root.joinpath(*relative.parts)
     if not is_within(target, data_root):
@@ -86,7 +123,8 @@ def _asset_root(data_root: Path, reference: str) -> Path:
             raise G3StreamReceiverError("asset root has an unsafe path component")
     if not target.parent.is_dir() or _is_link_like(target.parent):
         raise G3StreamReceiverError("asset root parent is missing or link-like")
-    target.mkdir(mode=0o750, exist_ok=True)
+    if create:
+        target.mkdir(mode=0o750, exist_ok=True)
     if _is_link_like(target) or not target.is_dir():
         raise G3StreamReceiverError("asset root is not a real directory")
     return target
@@ -98,7 +136,13 @@ def _emit(value: dict[str, Any], *, stream: Any) -> None:
     stream.flush()
 
 
-def _resolve_request(arguments: argparse.Namespace) -> tuple[AssetObjectSpec, Path]:
+def _resolve_frozen_object(
+    arguments: argparse.Namespace,
+    *,
+    route: str,
+    create_asset_root: bool = True,
+    deadline: float | None = None,
+) -> tuple[AssetObjectSpec, Path, G3RelayBinding, Path]:
     try:
         source_root = arguments.source_root.resolve(strict=True)
     except OSError as error:
@@ -133,15 +177,146 @@ def _resolve_request(arguments: argparse.Namespace) -> tuple[AssetObjectSpec, Pa
     if spec.source_id != entry["object_id"]:
         raise G3StreamReceiverError("object spec does not match object_id")
     data_root = require_data_root(arguments.data_root)
-    root = _asset_root(data_root, entry["asset_root_ref"])
+    root = _asset_root(
+        data_root,
+        entry["asset_root_ref"],
+        create=create_asset_root,
+    )
     target = resolve_approved_asset_target(root, entry["final_path"])
-    return spec, target
+    try:
+        remaining = (
+            10.0
+            if deadline is None
+            else min(10.0, deadline - time.monotonic())
+        )
+        if remaining <= 0:
+            raise G3StreamReceiverError("receiver deadline expired")
+        source_git_commit = resolve_source_git_commit(
+            source_root,
+            timeout_seconds=remaining,
+        )
+        binding = build_g3_relay_binding(
+            plan=plan,
+            entry=entry,
+            spec=spec,
+            source_git_commit=source_git_commit,
+            route=route,
+        )
+    except ValueError as error:
+        raise G3StreamReceiverError("frozen relay binding is invalid") from error
+    return spec, target, binding, data_root
+
+
+def _requested_binding(arguments: argparse.Namespace) -> G3RelayBinding:
+    fields = {
+        "schema_version": "stage0-g3-relay-binding-v1",
+        "object_id": arguments.object_id,
+        "revision": arguments.revision,
+        "expected_size": arguments.expected_size,
+        "expected_sha256": arguments.expected_sha256,
+        "requirements_sha256": arguments.requirements_sha256,
+        "layout_sha256": arguments.layout_sha256,
+        "plan_sha256": arguments.plan_sha256,
+        "spec_ref": arguments.spec_ref,
+        "spec_sha256": arguments.spec_sha256,
+        "asset_root_ref": arguments.asset_root_ref,
+        "final_path": arguments.final_path,
+        "generator_git_commit": arguments.generator_git_commit,
+        "source_git_commit": arguments.source_git_commit,
+        "route": arguments.route,
+    }
+    try:
+        return G3RelayBinding.from_mapping(fields)
+    except (TypeError, ValueError) as error:
+        raise G3StreamReceiverError("relay request binding is invalid") from error
+
+
+def _resolve_request(
+    arguments: argparse.Namespace,
+    *,
+    deadline: float | None = None,
+) -> tuple[AssetObjectSpec, Path, G3RelayBinding, Path]:
+    requested = _requested_binding(arguments)
+    spec, target, frozen, data_root = _resolve_frozen_object(
+        arguments,
+        route=requested.route,
+        deadline=deadline,
+    )
+    if requested != frozen:
+        raise G3StreamReceiverError("relay request does not match the frozen binding")
+    return spec, target, frozen, data_root
 
 
 def main() -> int:
     arguments = _parser().parse_args()
+    deadline: float | None = None
     try:
-        spec, target = _resolve_request(arguments)
+        if (
+            isinstance(arguments.overall_timeout_seconds, bool)
+            or not math.isfinite(arguments.overall_timeout_seconds)
+            or arguments.overall_timeout_seconds <= 0
+        ):
+            raise G3StreamReceiverError("overall timeout is invalid")
+        deadline = time.monotonic() + arguments.overall_timeout_seconds
+
+        if arguments.legacy_state_action != "none":
+            spec, target, binding, data_root = _resolve_frozen_object(
+                arguments,
+                route=arguments.route or "local-via-lab",
+                create_asset_root=arguments.legacy_state_action == "migrate",
+                deadline=deadline,
+            )
+            if arguments.legacy_state_action == "inspect":
+                result = inspect_legacy_acquisition_state(
+                    spec,
+                    target,
+                    data_root=data_root,
+                ).to_dict()
+                operation = "legacy_state_inspection"
+            else:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise G3StreamReceiverError("receiver deadline expired")
+                result = migrate_legacy_acquisition_state(
+                    spec,
+                    target,
+                    data_root=data_root,
+                    policy=AcquisitionPolicy(
+                        max_attempts=1,
+                        request_timeout_seconds=60.0,
+                        overall_timeout_seconds=remaining,
+                        initial_backoff_seconds=0.0,
+                        max_backoff_seconds=0.0,
+                        lock_timeout_seconds=min(
+                            60.0,
+                            remaining,
+                        ),
+                        lock_poll_interval_seconds=0.1,
+                        chunk_size=4 * 1024 * 1024,
+                    ),
+                ).to_dict()
+                operation = "legacy_state_migration"
+            _emit(
+                {
+                    "schema_version": PROTOCOL_VERSION,
+                    "phase": "COMPLETE",
+                    "operation": operation,
+                    "object_id": arguments.object_id,
+                    "binding": binding.to_dict(),
+                    "result": result,
+                    "runtime_urls_persisted": False,
+                },
+                stream=sys.stdout,
+            )
+            return 0
+
+        spec, target, binding, data_root = _resolve_request(
+            arguments,
+            deadline=deadline,
+        )
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise G3StreamReceiverError("receiver deadline expired")
 
         def ready(plan: StreamReceptionPlan) -> None:
             _emit(
@@ -149,6 +324,7 @@ def main() -> int:
                     "schema_version": PROTOCOL_VERSION,
                     "phase": "READY",
                     "object_id": arguments.object_id,
+                    "binding": binding.to_dict(),
                     "reception": plan.to_dict(),
                     "runtime_urls_persisted": False,
                 },
@@ -163,19 +339,21 @@ def main() -> int:
             policy=AcquisitionPolicy(
                 max_attempts=1,
                 request_timeout_seconds=60.0,
-                overall_timeout_seconds=6 * 60 * 60,
+                overall_timeout_seconds=remaining,
                 initial_backoff_seconds=0.0,
                 max_backoff_seconds=0.0,
                 lock_timeout_seconds=60.0,
                 lock_poll_interval_seconds=0.1,
                 chunk_size=4 * 1024 * 1024,
             ),
+            data_root=data_root,
         )
         _emit(
             {
                 "schema_version": PROTOCOL_VERSION,
                 "phase": "COMPLETE",
                 "object_id": arguments.object_id,
+                "binding": binding.to_dict(),
                 "result": result.to_dict(),
                 "runtime_urls_persisted": False,
             },
@@ -188,22 +366,29 @@ def main() -> int:
                 "schema_version": PROTOCOL_VERSION,
                 "phase": "FAILED",
                 "object_id": arguments.object_id,
-                "failure": error.report.to_dict(),
+                "failure": {
+                    **error.report.to_dict(),
+                    "code": f"ACQUISITION_{error.report.code.value}",
+                },
                 "runtime_urls_persisted": False,
             },
-            stream=sys.stderr,
+            stream=sys.stdout,
         )
         return 2
     except (G3StreamReceiverError, OSError, TypeError, ValueError) as error:
         _emit(
             {
                 "schema_version": PROTOCOL_VERSION,
-                "phase": "REJECTED",
+                "phase": "FAILED",
                 "object_id": arguments.object_id,
-                "error_type": type(error).__name__,
+                "failure": {
+                    "status": "failed",
+                    "code": "REQUEST_REJECTED",
+                    "detail_type": type(error).__name__,
+                },
                 "runtime_urls_persisted": False,
             },
-            stream=sys.stderr,
+            stream=sys.stdout,
         )
         return 2
 

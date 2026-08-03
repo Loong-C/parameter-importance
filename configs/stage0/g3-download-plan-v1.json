@@ -1,12 +1,12 @@
 {
   "schema_version": "stage0-g3-download-plan-v1",
-  "artifact_hash": "24cd08ad7cf64759d81de7ef78d30aafc92c7311f0b62af393f34d327753465d",
+  "artifact_hash": "002bef15cede098bb6f75deb2900e456ea3348c1f3ed2512db47729d92b496c2",
   "created_at": "2026-08-03T16:20:00+08:00",
   "generator_git_commit": "1b88e8dd3264d460b0a642caee1e88e2456c247d",
   "requirements_ref": "configs/stage0/g3-asset-requirements-v1.json",
-  "requirements_sha256": "2c44455bd1914b52338968eba4e9b92370a35523e2f4434c1cbb368a1f5dd648",
+  "requirements_sha256": "591ba7f66cfc006845386a59e5661df0609b4613d7f91a527f490c4a11ddaaa9",
   "layout_ref": "configs/stage0/g3-asset-layout-v1.json",
-  "layout_sha256": "5599c7212c0501b36b100f5c285ca9adebc94f1d001bec4973dbc544522f5eeb",
+  "layout_sha256": "ef347c060af25d7d2e3b1d4c774ff80dbc5ea15e5745749f24b44e0ef8b9ace6",
   "entries": [
     {
       "object_id": "huggingface/EleutherAI/pythia-410m-deduped/config.json",

@@ -1,0 +1,207 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://parameter-importance.invalid/schemas/stage0-g3-acquisition-report-v1.json",
+  "title": "Stage 0 G3 acquisition attestation",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version", "formal", "status", "started_at", "completed_at",
+    "actor", "actor_role", "actor_instance_id", "source_git_commit",
+    "requirements_ref", "requirements_sha256", "layout_ref", "layout_sha256",
+    "download_plan_ref", "download_plan_sha256", "download_report_ref",
+    "download_report_sha256", "runtime_urls_persisted", "entry_count",
+    "entries", "artifact_hash"
+  ],
+  "properties": {
+    "schema_version": {"const": "stage0-g3-acquisition-report-v1"},
+    "formal": {"const": true},
+    "status": {"const": "PASS"},
+    "started_at": {"type": "string", "format": "date-time"},
+    "completed_at": {"type": "string", "format": "date-time"},
+    "actor": {"type": "string", "minLength": 1, "maxLength": 256},
+    "actor_role": {"const": "fetcher"},
+    "actor_instance_id": {"type": "string", "minLength": 1, "maxLength": 512},
+    "source_git_commit": {"$ref": "#/$defs/gitDigest"},
+    "requirements_ref": {"$ref": "#/$defs/relativePath"},
+    "requirements_sha256": {"$ref": "#/$defs/sha256"},
+    "layout_ref": {"$ref": "#/$defs/relativePath"},
+    "layout_sha256": {"$ref": "#/$defs/sha256"},
+    "download_plan_ref": {"$ref": "#/$defs/relativePath"},
+    "download_plan_sha256": {"$ref": "#/$defs/sha256"},
+    "download_report_ref": {"$ref": "#/$defs/relativePath"},
+    "download_report_sha256": {"$ref": "#/$defs/sha256"},
+    "runtime_urls_persisted": {"const": false},
+    "entry_count": {"const": 13},
+    "entries": {
+      "type": "array",
+      "minItems": 13,
+      "maxItems": 13,
+      "items": {"$ref": "#/$defs/entry"}
+    },
+    "artifact_hash": {"$ref": "#/$defs/sha256"}
+  },
+  "$defs": {
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "gitDigest": {"type": "string", "pattern": "^(?:[0-9a-f]{40}|[0-9a-f]{64})$"},
+    "relativePath": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.(?:/|$))(?!.*[\\\\:?]).+$"
+    },
+    "file": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "size_bytes", "sha256"],
+      "properties": {
+        "path": {"$ref": "#/$defs/relativePath"},
+        "size_bytes": {"type": "integer", "minimum": 0},
+        "sha256": {"$ref": "#/$defs/sha256"},
+        "role": {"type": "string", "minLength": 1, "maxLength": 128}
+      }
+    },
+    "tokenizerDescriptor": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "size_bytes", "sha256", "role"],
+      "properties": {
+        "path": {"$ref": "#/$defs/relativePath"},
+        "size_bytes": {"type": "integer", "minimum": 0},
+        "sha256": {"$ref": "#/$defs/sha256"},
+        "role": {"type": "string", "minLength": 1, "maxLength": 128}
+      }
+    },
+    "fileInventoryItem": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "size_bytes"],
+      "properties": {
+        "path": {"$ref": "#/$defs/relativePath"},
+        "size_bytes": {"type": "integer", "minimum": 0}
+      }
+    },
+    "canonicalObject": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "object_id", "spec_ref", "revision", "size_bytes", "sha256",
+        "result_status", "network_accessed"
+      ],
+      "properties": {
+        "object_id": {"type": "string", "minLength": 1, "maxLength": 4096},
+        "spec_ref": {"$ref": "#/$defs/relativePath"},
+        "revision": {"type": "string", "minLength": 1, "maxLength": 4096},
+        "size_bytes": {"type": "integer", "minimum": 0},
+        "sha256": {"$ref": "#/$defs/sha256"},
+        "result_status": {"enum": ["downloaded", "already_ready", "published_by_peer"]},
+        "network_accessed": {"type": "boolean"}
+      }
+    },
+    "canonicalPlanSource": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_version", "object_count", "objects"],
+      "properties": {
+        "schema_version": {"const": "stage0-g3-canonical-plan-source-v1"},
+        "object_count": {"type": "integer", "minimum": 1},
+        "objects": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/canonicalObject"}}
+      }
+    },
+    "existingImportSource": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version", "requirements_ref", "requirements_sha256",
+        "declared_file_count", "declared_bytes"
+      ],
+      "properties": {
+        "schema_version": {"const": "stage0-g3-existing-import-source-v1"},
+        "requirements_ref": {"$ref": "#/$defs/relativePath"},
+        "requirements_sha256": {"$ref": "#/$defs/sha256"},
+        "declared_file_count": {"type": "integer", "minimum": 1},
+        "declared_bytes": {"type": "integer", "minimum": 0}
+      }
+    },
+    "derivedBuildSource": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version", "task", "raw_asset_id", "tokenizer_asset_id",
+        "tokenizer_descriptor_inventory", "tokenizer_descriptor_inventory_hash",
+        "target_ref", "generator_git_commit", "preprocessing_version",
+        "preprocessing_config_hash", "requirement_hash", "derived_splits",
+        "split_counts", "map_fingerprints", "file_inventory", "network_attempts"
+      ],
+      "properties": {
+        "schema_version": {"const": "stage0-g3-derived-build-source-v1"},
+        "task": {"type": "string", "minLength": 1, "maxLength": 256},
+        "raw_asset_id": {"$ref": "#/$defs/sha256"},
+        "tokenizer_asset_id": {"$ref": "#/$defs/sha256"},
+        "tokenizer_descriptor_inventory": {
+          "type": "array", "minItems": 1,
+          "items": {"$ref": "#/$defs/tokenizerDescriptor"}
+        },
+        "tokenizer_descriptor_inventory_hash": {"$ref": "#/$defs/sha256"},
+        "target_ref": {"$ref": "#/$defs/relativePath"},
+        "generator_git_commit": {"$ref": "#/$defs/gitDigest"},
+        "preprocessing_version": {"const": "stage0-glue-preprocessing-v1"},
+        "preprocessing_config_hash": {"$ref": "#/$defs/sha256"},
+        "requirement_hash": {"$ref": "#/$defs/sha256"},
+        "derived_splits": {
+          "type": "array", "minItems": 1, "uniqueItems": true,
+          "items": {"type": "string", "minLength": 1, "maxLength": 128}
+        },
+        "split_counts": {
+          "type": "object", "minProperties": 1,
+          "additionalProperties": {"type": "integer", "minimum": 0}
+        },
+        "map_fingerprints": {
+          "type": "object", "minProperties": 1,
+          "additionalProperties": {"$ref": "#/$defs/sha256"}
+        },
+        "file_inventory": {
+          "type": "array", "minItems": 1,
+          "items": {"$ref": "#/$defs/fileInventoryItem"}
+        },
+        "network_attempts": {"const": 0}
+      }
+    },
+    "entry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "logical_name", "kind", "requirement_name", "asset_root_ref", "mode",
+        "asset_type", "name", "source", "revision", "asset_id", "files",
+        "metadata", "source_evidence"
+      ],
+      "properties": {
+        "logical_name": {"type": "string", "minLength": 1, "maxLength": 256},
+        "kind": {"enum": ["model", "tokenizer", "pile", "glue_raw", "glue_derived"]},
+        "requirement_name": {"type": "string", "minLength": 1, "maxLength": 256},
+        "asset_root_ref": {"$ref": "#/$defs/relativePath"},
+        "mode": {"enum": ["canonical-plan", "existing-import", "derived-build"]},
+        "asset_type": {"enum": ["model", "tokenizer", "dataset", "source"]},
+        "name": {"type": "string", "minLength": 1, "maxLength": 256},
+        "source": {"type": "string", "minLength": 1, "maxLength": 512},
+        "revision": {"type": "string", "minLength": 1, "maxLength": 512},
+        "asset_id": {"$ref": "#/$defs/sha256"},
+        "files": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/file"}},
+        "metadata": {"type": "object"},
+        "source_evidence": {"type": "object"}
+      },
+      "allOf": [
+        {
+          "if": {"properties": {"mode": {"const": "canonical-plan"}}, "required": ["mode"]},
+          "then": {"properties": {"source_evidence": {"$ref": "#/$defs/canonicalPlanSource"}}}
+        },
+        {
+          "if": {"properties": {"mode": {"const": "existing-import"}}, "required": ["mode"]},
+          "then": {"properties": {"source_evidence": {"$ref": "#/$defs/existingImportSource"}}}
+        },
+        {
+          "if": {"properties": {"mode": {"const": "derived-build"}}, "required": ["mode"]},
+          "then": {"properties": {"source_evidence": {"$ref": "#/$defs/derivedBuildSource"}}}
+        }
+      ]
+    }
+  }
+}

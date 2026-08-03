@@ -20,7 +20,12 @@ from typing import Mapping, Protocol, Sequence, runtime_checkable
 import torch
 
 from ..contracts.immutable import freeze_json_mapping, thaw_json_value
-from ..core.losses import LossBatch, causal_lm_loss, sequence_classification_loss
+from ..core.losses import (
+    LossBatch,
+    causal_lm_loss,
+    pre_shifted_causal_lm_loss,
+    sequence_classification_loss,
+)
 from .optional import require_optional_dependency
 
 
@@ -458,26 +463,44 @@ class TorchModelAdapter:
     def task_type(self) -> str:
         return self._task_type
 
+    def _target_field(
+        self, microbatch: TrainingMicrobatch
+    ) -> tuple[str, torch.Tensor]:
+        labels = microbatch.payload.get("labels")
+        target_ids = microbatch.payload.get("target_ids")
+        if labels is not None and target_ids is not None:
+            raise ValueError("TRAINING_BATCH_LABELS_AND_TARGET_IDS_MUTUALLY_EXCLUSIVE")
+        if labels is None and target_ids is None:
+            raise ValueError("TRAINING_BATCH_TARGETS_REQUIRED")
+        if target_ids is not None:
+            if self._task_type != "causal_lm":
+                raise ValueError("TARGET_IDS_REQUIRE_CAUSAL_LM_TASK")
+            return "target_ids", target_ids
+        assert labels is not None
+        return "labels", labels
+
     def logits(self, microbatch: TrainingMicrobatch) -> torch.Tensor:
+        self._target_field(microbatch)
         payload = dict(microbatch.payload)
-        labels = payload.pop("labels", None)
+        payload.pop("labels", None)
+        payload.pop("target_ids", None)
         payload.pop("classification_mask", None)
         outputs = self._module(**payload)
-        if labels is None:
-            raise ValueError("TRAINING_BATCH_LABELS_REQUIRED")
         return _extract_logits(outputs)
 
     def loss(self, microbatch: TrainingMicrobatch) -> LossBatch:
-        labels = microbatch.payload.get("labels")
-        if labels is None:
-            raise ValueError("TRAINING_BATCH_LABELS_REQUIRED")
+        target_name, targets = self._target_field(microbatch)
         logits = self.logits(microbatch)
         if self._task_type == "causal_lm":
+            if target_name == "target_ids":
+                return pre_shifted_causal_lm_loss(
+                    logits, targets, microbatch.payload.get("attention_mask")
+                )
             return causal_lm_loss(
-                logits, labels, microbatch.payload.get("attention_mask")
+                logits, targets, microbatch.payload.get("attention_mask")
             )
         return sequence_classification_loss(
-            logits, labels, microbatch.payload.get("classification_mask")
+            logits, targets, microbatch.payload.get("classification_mask")
         )
 
 

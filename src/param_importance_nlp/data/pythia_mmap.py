@@ -1,0 +1,511 @@
+"""Strict read-only access to Pythia's sharded Megatron mmap dataset.
+
+The index contains byte offsets into one logical byte stream.  The stream may
+be physically split across multiple ``document-*.bin`` files, including in
+the middle of a record.  Callers must supply the ordered shard inventory
+explicitly; this module never scans or globs a dataset directory.
+"""
+
+from __future__ import annotations
+
+from bisect import bisect_right
+from dataclasses import dataclass
+import hashlib
+from pathlib import Path
+import re
+import struct
+from typing import Any, Sequence
+
+import numpy as np
+import torch
+
+
+MMAP_INDEX_MAGIC = b"MMIDIDX\x00\x00"
+MMAP_INDEX_VERSION = 1
+MMAP_INDEX_HEADER_BYTES = 34
+PYTHIA_TOKENS_PER_RECORD = 2049
+
+_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+_SHARD_NAME_RE = re.compile(
+    r"^document-(?P<ordinal>[0-9]{5})-of-(?P<last>[0-9]{5})\.bin$"
+)
+_DTYPE_BY_CODE: dict[int, np.dtype[Any]] = {
+    1: np.dtype(np.uint8),
+    2: np.dtype(np.int8),
+    3: np.dtype(np.int16),
+    4: np.dtype(np.int32),
+    5: np.dtype(np.int64),
+    6: np.dtype(np.float32),
+    7: np.dtype(np.float64),
+    8: np.dtype(np.uint16),
+}
+
+
+class PythiaDataError(ValueError):
+    """Raised when a Pythia index, shard inventory, or record is invalid."""
+
+
+def _require_nonnegative_integer(value: object, *, field: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise PythiaDataError(f"{field} must be a non-negative integer")
+    return value
+
+
+def sha256_file(path: str | Path, *, chunk_size: int = 16 * 1024 * 1024) -> str:
+    """Return the streaming SHA-256 of one regular file."""
+
+    source = Path(path)
+    digest = hashlib.sha256()
+    with source.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(chunk_size), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+@dataclass(frozen=True, slots=True)
+class PythiaShardDescriptor:
+    """Expected immutable identity of one physical Pythia byte-stream shard."""
+
+    ordinal: int
+    path: Path
+    size_bytes: int
+    sha256: str
+
+    def __post_init__(self) -> None:
+        _require_nonnegative_integer(self.ordinal, field="shard ordinal")
+        _require_nonnegative_integer(self.size_bytes, field="shard size_bytes")
+        if self.size_bytes == 0:
+            raise PythiaDataError("shard size_bytes must be positive")
+        if not isinstance(self.sha256, str) or not _SHA256_RE.fullmatch(self.sha256):
+            raise PythiaDataError("shard sha256 must be 64 lowercase hexadecimal characters")
+        try:
+            path = Path(self.path).expanduser()
+        except TypeError as exc:
+            raise PythiaDataError("shard path must be path-like") from exc
+        if path.name.casefold().endswith(".part"):
+            raise PythiaDataError(f"temporary Pile shard is forbidden: {path}")
+        object.__setattr__(self, "path", path)
+
+
+class OrderedShardReader:
+    """Read a verified ordered shard inventory as one continuous byte stream."""
+
+    def __init__(self, shards: Sequence[PythiaShardDescriptor]) -> None:
+        descriptors = tuple(shards)
+        if not descriptors:
+            raise PythiaDataError("at least one Pythia shard descriptor is required")
+        if not all(isinstance(item, PythiaShardDescriptor) for item in descriptors):
+            raise TypeError("shards must contain only PythiaShardDescriptor values")
+
+        ordinals = tuple(item.ordinal for item in descriptors)
+        if len(set(ordinals)) != len(ordinals):
+            raise PythiaDataError("duplicate Pythia shard ordinal")
+        if ordinals != tuple(range(len(descriptors))):
+            raise PythiaDataError(
+                "Pythia shard descriptors must be ordered and contiguous from ordinal zero"
+            )
+
+        resolved_paths = tuple(item.path.resolve() for item in descriptors)
+        if len(set(resolved_paths)) != len(resolved_paths):
+            raise PythiaDataError("duplicate Pythia shard path")
+
+        declared_last: int | None = None
+        starts: list[int] = []
+        ends: list[int] = []
+        cursor = 0
+        for item, resolved in zip(descriptors, resolved_paths, strict=True):
+            match = _SHARD_NAME_RE.fullmatch(item.path.name)
+            if match is None:
+                raise PythiaDataError(f"invalid Pythia shard filename: {item.path.name}")
+            name_ordinal = int(match.group("ordinal"))
+            name_last = int(match.group("last"))
+            if name_ordinal != item.ordinal or item.ordinal > name_last:
+                raise PythiaDataError(
+                    f"Pythia shard filename/ordinal mismatch: {item.path.name}"
+                )
+            if declared_last is None:
+                declared_last = name_last
+            elif name_last != declared_last:
+                raise PythiaDataError("Pythia shard filenames disagree on the final ordinal")
+            if not resolved.is_file():
+                raise FileNotFoundError(f"Pythia shard does not exist: {resolved}")
+            actual_size = resolved.stat().st_size
+            if actual_size != item.size_bytes:
+                raise PythiaDataError(
+                    f"Pythia shard size mismatch for {resolved}: "
+                    f"{actual_size} != {item.size_bytes}"
+                )
+            actual_sha256 = sha256_file(resolved)
+            if actual_sha256 != item.sha256:
+                raise PythiaDataError(
+                    f"Pythia shard SHA-256 mismatch for {resolved}: "
+                    f"{actual_sha256} != {item.sha256}"
+                )
+            starts.append(cursor)
+            cursor += item.size_bytes
+            ends.append(cursor)
+
+        self._shards = descriptors
+        self._paths = resolved_paths
+        self._starts = tuple(starts)
+        self._ends = tuple(ends)
+        self._total_size = cursor
+
+    @property
+    def shards(self) -> tuple[PythiaShardDescriptor, ...]:
+        return self._shards
+
+    @property
+    def total_size(self) -> int:
+        return self._total_size
+
+    def read_exact(self, offset: int, length: int) -> bytes:
+        """Read an exact global byte interval, crossing shard boundaries as needed."""
+
+        offset = _require_nonnegative_integer(offset, field="byte offset")
+        length = _require_nonnegative_integer(length, field="byte length")
+        end = offset + length
+        if end > self.total_size:
+            raise PythiaDataError(
+                f"byte interval [{offset}, {end}) exceeds shard stream size {self.total_size}"
+            )
+        if length == 0:
+            return b""
+
+        shard_index = bisect_right(self._ends, offset)
+        chunks: list[bytes] = []
+        position = offset
+        remaining = length
+        while remaining:
+            if shard_index >= len(self._shards):
+                raise PythiaDataError("Pythia shard stream ended before the requested interval")
+            local_offset = position - self._starts[shard_index]
+            available = self._ends[shard_index] - position
+            count = min(remaining, available)
+            with self._paths[shard_index].open("rb") as handle:
+                handle.seek(local_offset)
+                chunk = handle.read(count)
+            if len(chunk) != count:
+                raise PythiaDataError(
+                    f"short read from Pythia shard {self._paths[shard_index]}: "
+                    f"{len(chunk)} != {count}"
+                )
+            chunks.append(chunk)
+            position += count
+            remaining -= count
+            shard_index += 1
+        return b"".join(chunks)
+
+
+class MMapIndex:
+    """Strict read-only view of a Megatron ``MMIDIDX`` version-1 index."""
+
+    def __init__(
+        self,
+        path: str | Path,
+        *,
+        expected_sha256: str | None = None,
+    ) -> None:
+        self.path = Path(path).expanduser().resolve()
+        if self.path.name.casefold().endswith(".part"):
+            raise PythiaDataError(f"temporary Pythia index is forbidden: {self.path}")
+        if not self.path.is_file():
+            raise FileNotFoundError(f"Pythia index does not exist: {self.path}")
+        if expected_sha256 is not None:
+            if not isinstance(expected_sha256, str) or not _SHA256_RE.fullmatch(
+                expected_sha256
+            ):
+                raise PythiaDataError(
+                    "expected index sha256 must be 64 lowercase hexadecimal characters"
+                )
+            actual_sha256 = sha256_file(self.path)
+            if actual_sha256 != expected_sha256:
+                raise PythiaDataError(
+                    f"Pythia index SHA-256 mismatch: {actual_sha256} != {expected_sha256}"
+                )
+
+        with self.path.open("rb") as handle:
+            header = handle.read(MMAP_INDEX_HEADER_BYTES)
+        if len(header) != MMAP_INDEX_HEADER_BYTES:
+            raise PythiaDataError(f"truncated Pythia index header: {self.path}")
+        if header[:9] != MMAP_INDEX_MAGIC:
+            raise PythiaDataError(f"invalid Pythia index magic: {header[:9]!r}")
+        self.version = struct.unpack_from("<Q", header, 9)[0]
+        if self.version != MMAP_INDEX_VERSION:
+            raise PythiaDataError(f"unsupported Pythia index version: {self.version}")
+        self.dtype_code = header[17]
+        try:
+            self.dtype = _DTYPE_BY_CODE[self.dtype_code]
+        except KeyError as exc:
+            raise PythiaDataError(
+                f"unsupported Pythia index dtype code: {self.dtype_code}"
+            ) from exc
+        self.sequence_count, self.document_count = struct.unpack_from("<QQ", header, 18)
+        if self.sequence_count <= 0:
+            raise PythiaDataError("Pythia index sequence_count must be positive")
+        if self.document_count <= 0:
+            raise PythiaDataError("Pythia index document_count must be positive")
+
+        expected_size = (
+            MMAP_INDEX_HEADER_BYTES
+            + 4 * self.sequence_count
+            + 8 * self.sequence_count
+            + 8 * self.document_count
+        )
+        actual_size = self.path.stat().st_size
+        if actual_size != expected_size:
+            raise PythiaDataError(
+                f"Pythia index size mismatch: {actual_size} != {expected_size}"
+            )
+
+        self._mmap: np.memmap[Any] | None = np.memmap(
+            self.path, mode="r", dtype=np.uint8
+        )
+        sizes_offset = MMAP_INDEX_HEADER_BYTES
+        pointers_offset = sizes_offset + 4 * self.sequence_count
+        documents_offset = pointers_offset + 8 * self.sequence_count
+        self.sizes = np.ndarray(
+            (self.sequence_count,),
+            dtype="<i4",
+            buffer=self._mmap,
+            offset=sizes_offset,
+        )
+        self.pointers = np.ndarray(
+            (self.sequence_count,),
+            dtype="<i8",
+            buffer=self._mmap,
+            offset=pointers_offset,
+        )
+        self.document_index = np.ndarray(
+            (self.document_count,),
+            dtype="<i8",
+            buffer=self._mmap,
+            offset=documents_offset,
+        )
+
+    def close(self) -> None:
+        for name in ("sizes", "pointers", "document_index"):
+            if hasattr(self, name):
+                delattr(self, name)
+        mapping = getattr(self, "_mmap", None)
+        if mapping is not None:
+            mapping._mmap.close()
+            self._mmap = None
+
+    def __enter__(self) -> "MMapIndex":
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        self.close()
+
+
+@dataclass(frozen=True, slots=True)
+class PythiaNextTokenBatch:
+    """A 2049-token record batch mapped to 2048 explicit next-token targets."""
+
+    tokens: torch.Tensor
+    input_ids: torch.Tensor
+    target_ids: torch.Tensor
+    attention_mask: torch.Tensor
+    source_record_start: int
+    source_record_stop: int
+
+    def __post_init__(self) -> None:
+        if self.tokens.ndim != 2 or self.tokens.shape[1] < 2:
+            raise PythiaDataError("Pythia batch tokens must have shape [B, L>=2]")
+        expected = (self.tokens.shape[0], self.tokens.shape[1] - 1)
+        for name, value in (
+            ("input_ids", self.input_ids),
+            ("target_ids", self.target_ids),
+            ("attention_mask", self.attention_mask),
+        ):
+            if tuple(value.shape) != expected:
+                raise PythiaDataError(f"Pythia batch {name} has the wrong shape")
+        if self.source_record_stop - self.source_record_start != self.tokens.shape[0]:
+            raise PythiaDataError("Pythia batch source record interval is inconsistent")
+
+    def payload(self) -> dict[str, torch.Tensor]:
+        """Return the exact payload expected by the pre-shifted training route."""
+
+        return {
+            "input_ids": self.input_ids,
+            "target_ids": self.target_ids,
+            "attention_mask": self.attention_mask,
+        }
+
+
+class PythiaIndexedDataset:
+    """Read a validated record interval through global index byte pointers."""
+
+    _VALIDATION_CHUNK_RECORDS = 1_000_000
+
+    def __init__(
+        self,
+        idx_path: str | Path,
+        shards: Sequence[PythiaShardDescriptor],
+        *,
+        record_start: int = 0,
+        record_stop: int | None = None,
+        tokens_per_record: int = PYTHIA_TOKENS_PER_RECORD,
+        expected_idx_sha256: str | None = None,
+    ) -> None:
+        record_start = _require_nonnegative_integer(record_start, field="record_start")
+        if record_stop is not None:
+            record_stop = _require_nonnegative_integer(record_stop, field="record_stop")
+        tokens_per_record = _require_nonnegative_integer(
+            tokens_per_record, field="tokens_per_record"
+        )
+        if tokens_per_record < 2:
+            raise PythiaDataError("tokens_per_record must be at least two")
+
+        self.index = MMapIndex(idx_path, expected_sha256=expected_idx_sha256)
+        try:
+            self.reader = OrderedShardReader(shards)
+            if self.index.dtype_code != 8 or self.index.dtype != np.dtype(np.uint16):
+                raise PythiaDataError(
+                    "Pythia token records require MMIDIDX dtype code 8 (uint16)"
+                )
+            stop = self.index.sequence_count if record_stop is None else record_stop
+            if record_start >= stop or stop > self.index.sequence_count:
+                raise PythiaDataError(
+                    f"invalid Pythia record interval [{record_start}, {stop}) for "
+                    f"{self.index.sequence_count} indexed records"
+                )
+            self.record_start = record_start
+            self.record_stop = stop
+            self.tokens_per_record = tokens_per_record
+            self._validate_interval()
+        except BaseException:
+            self.index.close()
+            raise
+
+    def _validate_interval(self) -> None:
+        itemsize = self.index.dtype.itemsize
+        previous_end: int | None = None
+        if self.record_start > 0:
+            previous_pointer = int(self.index.pointers[self.record_start - 1])
+            previous_size = int(self.index.sizes[self.record_start - 1])
+            previous_end = previous_pointer + previous_size * itemsize
+
+        for start in range(
+            self.record_start,
+            self.record_stop,
+            self._VALIDATION_CHUNK_RECORDS,
+        ):
+            stop = min(start + self._VALIDATION_CHUNK_RECORDS, self.record_stop)
+            sizes = self.index.sizes[start:stop]
+            pointers = self.index.pointers[start:stop]
+            bad_size = np.flatnonzero(sizes != self.tokens_per_record)
+            if bad_size.size:
+                position = start + int(bad_size[0])
+                raise PythiaDataError(
+                    f"Pythia record {position} has {int(sizes[bad_size[0]])} tokens; "
+                    f"expected {self.tokens_per_record}"
+                )
+            negative = np.flatnonzero(pointers < 0)
+            if negative.size:
+                raise PythiaDataError(
+                    f"Pythia record {start + int(negative[0])} has a negative byte pointer"
+                )
+            misaligned = np.flatnonzero(pointers % itemsize)
+            if misaligned.size:
+                raise PythiaDataError(
+                    f"Pythia record {start + int(misaligned[0])} byte pointer is unaligned"
+                )
+            if previous_end is not None and int(pointers[0]) != previous_end:
+                raise PythiaDataError(
+                    f"Pythia record {start} is not contiguous with its predecessor"
+                )
+            if len(pointers) > 1:
+                expected_next = (
+                    pointers[:-1]
+                    + sizes[:-1].astype(np.int64, copy=False) * itemsize
+                )
+                mismatch = np.flatnonzero(pointers[1:] != expected_next)
+                if mismatch.size:
+                    position = start + int(mismatch[0]) + 1
+                    raise PythiaDataError(
+                        f"Pythia record {position} is not contiguous with its predecessor"
+                    )
+            previous_end = int(pointers[-1]) + int(sizes[-1]) * itemsize
+
+        assert previous_end is not None
+        if self.record_start == 0 and int(self.index.pointers[0]) != 0:
+            raise PythiaDataError("the first Pythia record must start at byte zero")
+        if self.record_stop < self.index.sequence_count:
+            next_pointer = int(self.index.pointers[self.record_stop])
+            if next_pointer != previous_end:
+                raise PythiaDataError(
+                    f"Pythia record {self.record_stop} is not contiguous with its predecessor"
+                )
+        if previous_end > self.reader.total_size:
+            raise PythiaDataError(
+                f"Pythia record interval ends at byte {previous_end}, beyond verified "
+                f"shard coverage {self.reader.total_size}"
+            )
+        self.max_end_offset = previous_end
+
+    def __len__(self) -> int:
+        return self.record_stop - self.record_start
+
+    def _global_index(self, index: int) -> int:
+        if isinstance(index, bool) or not isinstance(index, int):
+            raise TypeError("Pythia record index must be an integer")
+        if index < 0:
+            index += len(self)
+        if index < 0 or index >= len(self):
+            raise IndexError(index)
+        return self.record_start + index
+
+    def raw_record(self, index: int) -> np.ndarray[Any, np.dtype[Any]]:
+        global_index = self._global_index(index)
+        pointer = int(self.index.pointers[global_index])
+        size = int(self.index.sizes[global_index])
+        raw = self.reader.read_exact(pointer, size * self.index.dtype.itemsize)
+        return np.frombuffer(raw, dtype=self.index.dtype, count=size).copy()
+
+    def raw_records(
+        self, start: int, count: int
+    ) -> np.ndarray[Any, np.dtype[Any]]:
+        start = _require_nonnegative_integer(start, field="record batch start")
+        count = _require_nonnegative_integer(count, field="record batch count")
+        if start + count > len(self):
+            raise IndexError(
+                f"record range [{start}, {start + count}) exceeds dataset length {len(self)}"
+            )
+        if count == 0:
+            return np.empty((0, self.tokens_per_record), dtype=self.index.dtype)
+        global_start = self.record_start + start
+        pointer = int(self.index.pointers[global_start])
+        value_count = count * self.tokens_per_record
+        raw = self.reader.read_exact(pointer, value_count * self.index.dtype.itemsize)
+        values = np.frombuffer(raw, dtype=self.index.dtype, count=value_count).copy()
+        return values.reshape(count, self.tokens_per_record)
+
+    def batch(self, start: int, count: int) -> PythiaNextTokenBatch:
+        count = _require_nonnegative_integer(count, field="Pythia batch count")
+        if count == 0:
+            raise PythiaDataError("Pythia batch count must be positive")
+        records = self.raw_records(start, count)
+        tokens = torch.from_numpy(records.astype(np.int64, copy=False))
+        input_ids = tokens[:, :-1]
+        target_ids = tokens[:, 1:]
+        attention_mask = torch.ones_like(input_ids, dtype=torch.int64)
+        source_start = self.record_start + start
+        return PythiaNextTokenBatch(
+            tokens=tokens,
+            input_ids=input_ids,
+            target_ids=target_ids,
+            attention_mask=attention_mask,
+            source_record_start=source_start,
+            source_record_stop=source_start + count,
+        )
+
+    def close(self) -> None:
+        self.index.close()
+
+    def __enter__(self) -> "PythiaIndexedDataset":
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        self.close()

@@ -32,6 +32,7 @@ from param_importance_nlp.runtime import (
     TaskStatusSnapshot,
     load_task_run_result,
 )
+from param_importance_nlp.storage import DATA_ROOT_ENV
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -47,6 +48,31 @@ def _v2_config(tmp_path: Path) -> Path:
         overrides={"artifacts": {"output_dir": "artifacts/cli-test"}},
     )
     target = tmp_path / "config-v2.json"
+    write_canonical_json(target, config.to_dict())
+    return target
+
+
+def _formal_v2_config(tmp_path: Path) -> Path:
+    legacy = load_canonical_json(V1_FIXTURE)
+    assert isinstance(legacy, dict)
+    legacy = copy.deepcopy(legacy)
+    legacy["identity"].update(  # type: ignore[union-attr]
+        {
+            "run_intent": "formal",
+            "formal_eligible": True,
+            "route": "pretrain",
+        }
+    )
+    legacy["runtime"]["allow_dirty_worktree"] = False  # type: ignore[index]
+    legacy["importance"]["estimator_decision_ref"] = (  # type: ignore[index]
+        "decisions/stage2.json"
+    )
+    config = load_resolved_config_compatible(
+        legacy,
+        task_id="stage0.05_config_run_identity_and_seeds",
+        overrides={"artifacts": {"output_dir": "artifacts/cli-formal-test"}},
+    )
+    target = tmp_path / "formal-config-v2.json"
     write_canonical_json(target, config.to_dict())
     return target
 
@@ -157,7 +183,11 @@ def test_nested_task_cli_run_status_replay_and_finalize(
     config_path = _v2_config(tmp_path)
     runtime = TaskRuntime()
     runtime.register(_PassingContractRunner())
-    monkeypatch.setattr(cli_module, "_build_default_task_runtime", lambda: runtime)
+    monkeypatch.setattr(
+        cli_module,
+        "_build_default_task_runtime",
+        lambda workspace_root: runtime,
+    )
 
     assert main(["task", "catalog", "--task-id", "stage0.05_config_run_identity_and_seeds"]) == 0
     catalog_item = json.loads(capsys.readouterr().out)
@@ -275,7 +305,11 @@ def test_task_run_and_resume_have_distinct_explicit_recovery_contracts(
 
     runtime = TaskRuntime()
     runtime.register(_PassingContractRunner())
-    monkeypatch.setattr(cli_module, "_build_default_task_runtime", lambda: runtime)
+    monkeypatch.setattr(
+        cli_module,
+        "_build_default_task_runtime",
+        lambda workspace_root: runtime,
+    )
 
     fresh_path = _v2_config(tmp_path)
     assert main(["task", "resume", "--config", str(fresh_path)]) == 2
@@ -306,7 +340,11 @@ def test_missing_runner_uses_structured_blocked_and_exit_code_three(
     capsys: pytest.CaptureFixture[str],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(cli_module, "_build_default_task_runtime", TaskRuntime)
+    monkeypatch.setattr(
+        cli_module,
+        "_build_default_task_runtime",
+        lambda workspace_root: TaskRuntime(workspace_root=workspace_root),
+    )
     config = _v2_config(tmp_path)
     result = tmp_path / "blocked.json"
     assert main(["task", "run", "--config", str(config), "--result", str(result)]) == 3
@@ -331,6 +369,48 @@ def test_missing_runner_uses_structured_blocked_and_exit_code_three(
     status = json.loads(capsys.readouterr().out)
     assert status["status"] == "BLOCKED"
     assert not finalization.exists()
+
+
+def test_task_cli_workspace_is_bound_to_run_intent(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    local_config = _v2_config(tmp_path)
+    formal_config = _formal_v2_config(tmp_path)
+    local_workspace = tmp_path / "local-workspace"
+    formal_data_root = tmp_path / "formal-data-root"
+    local_workspace.mkdir()
+    formal_data_root.mkdir()
+    captured_roots: list[Path] = []
+
+    def build_runtime(workspace_root: str | Path) -> TaskRuntime:
+        root = Path(workspace_root).resolve()
+        captured_roots.append(root)
+        runtime = TaskRuntime(workspace_root=root)
+        runtime.register(_PassingContractRunner())
+        return runtime
+
+    monkeypatch.setattr(cli_module, "_build_default_task_runtime", build_runtime)
+    monkeypatch.chdir(local_workspace)
+
+    # A local fixture is always scoped to cwd, even when a DATA_ROOT is present.
+    monkeypatch.setenv(DATA_ROOT_ENV, str(formal_data_root))
+    assert main(["task", "preflight", "--config", str(local_config)]) == 0
+    capsys.readouterr()
+    assert captured_roots == [local_workspace.resolve()]
+
+    # Formal execution cannot infer cwd as its evidence workspace.
+    monkeypatch.delenv(DATA_ROOT_ENV)
+    assert main(["task", "preflight", "--config", str(formal_config)]) == 2
+    assert DATA_ROOT_ENV in capsys.readouterr().err
+    assert captured_roots == [local_workspace.resolve()]
+
+    monkeypatch.setenv(DATA_ROOT_ENV, str(formal_data_root))
+    assert main(["task", "preflight", "--config", str(formal_config)]) == 3
+    formal_preflight = json.loads(capsys.readouterr().out)
+    assert formal_preflight["ready"] is False
+    assert captured_roots[-1] == formal_data_root.resolve()
 
 
 def test_artifact_review_approval_never_promotes_fixture(

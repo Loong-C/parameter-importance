@@ -913,7 +913,26 @@ def _load_task_environment(path: Path | None) -> Any:
     return TaskRuntimeEnvironment.from_mapping(_load_mapping(path))
 
 
-def _build_default_task_runtime() -> Any:
+def _task_workspace_root(config: Any) -> Path:
+    """Select the task workspace without inferring a formal DATA_ROOT."""
+
+    run_intent = getattr(config, "run_intent", None)
+    if run_intent == "local_fixture":
+        return Path.cwd().resolve()
+    if run_intent != "formal":
+        raise ValueError("TASK_RUN_INTENT_INVALID")
+
+    from .storage import require_data_root
+
+    root = require_data_root()
+    if not root.is_dir():
+        raise RuntimeError("TASK_FORMAL_DATA_ROOT_MISSING_OR_NOT_DIRECTORY")
+    return root
+
+
+def _build_default_task_runtime(
+    workspace_root: str | Path | None = None,
+) -> Any:
     """延迟接入具体 runner 工厂，核心 CLI 本身不导入训练实现。
 
     ``experiments.task_runners`` 在功能波次尚未落地时可能不存在。只对“模块本身
@@ -923,7 +942,11 @@ def _build_default_task_runtime() -> Any:
 
     from .runtime import TaskRuntime
 
-    workspace_root = Path.cwd().resolve()
+    root = (
+        Path.cwd().resolve()
+        if workspace_root is None
+        else Path(workspace_root).resolve()
+    )
 
     module_name = "param_importance_nlp.experiments.task_runners"
     try:
@@ -931,13 +954,13 @@ def _build_default_task_runtime() -> Any:
     except ModuleNotFoundError as error:
         if error.name != module_name:
             raise
-        return TaskRuntime(workspace_root=workspace_root)
+        return TaskRuntime(workspace_root=root)
     factory = getattr(module, "build_default_task_runtime", None)
     if factory is None:
-        return TaskRuntime(workspace_root=workspace_root)
+        return TaskRuntime(workspace_root=root)
     if not callable(factory):
         raise TypeError("build_default_task_runtime 必须可调用")
-    runtime = factory(workspace_root)
+    runtime = factory(root)
     if not isinstance(runtime, TaskRuntime):
         raise TypeError("build_default_task_runtime 必须返回 TaskRuntime")
     return runtime
@@ -1022,7 +1045,7 @@ def _task_environment_build(arguments: argparse.Namespace) -> int:
 def _task_preflight(arguments: argparse.Namespace) -> int:
     config = _load_v2_config(arguments.config)
     environment = _load_task_environment(arguments.environment)
-    runtime = _build_default_task_runtime()
+    runtime = _build_default_task_runtime(_task_workspace_root(config))
     blockers = runtime.preflight(config, environment=environment)
     execution = config.section("execution")
     report = {
@@ -1057,7 +1080,7 @@ def _execute_task(arguments: argparse.Namespace) -> int:
     if action == "resume" and resume_ref is None:
         raise ValueError("TASK_RESUME_REQUIRES_RECOVERY_RESUME_REF")
     environment = _load_task_environment(arguments.environment)
-    runtime = _build_default_task_runtime()
+    runtime = _build_default_task_runtime(_task_workspace_root(config))
     result = runtime.execute(config, environment=environment)
     _publish_if_requested(arguments.result, result.to_dict())
     _emit(result.to_dict())
@@ -1098,7 +1121,10 @@ def _task_replay(arguments: argparse.Namespace) -> int:
     if source.task_id != config.task_id or source.config_hash != config.config_hash:
         raise ValueError("TASK_REPLAY_CONFIG_IDENTITY_MISMATCH")
     environment = _load_task_environment(arguments.environment)
-    replay = _build_default_task_runtime().execute(config, environment=environment)
+    replay = _build_default_task_runtime(_task_workspace_root(config)).execute(
+        config,
+        environment=environment,
+    )
     publish_canonical_immutable(arguments.result, replay.to_dict())
     record = TaskReplayRecord.compare(
         source,

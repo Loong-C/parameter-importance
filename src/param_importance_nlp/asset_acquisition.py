@@ -10,8 +10,10 @@ import http.client
 import math
 import os
 from pathlib import Path, PurePosixPath
+import queue
 import re
 import stat
+import threading
 import time
 from typing import Any, BinaryIO, Callable, Final, Iterator
 from urllib.error import HTTPError, URLError
@@ -253,6 +255,46 @@ class StreamReceptionPlan:
 
 
 @dataclass(frozen=True, slots=True)
+class LegacyAcquisitionState:
+    """Read-only view of the former asset-adjacent relay checkpoint."""
+
+    source_id: str
+    legacy_part_exists: bool
+    legacy_part_size: int | None
+    legacy_lock_exists: bool
+    legacy_lock_state: str
+    central_part_exists: bool
+    final_state: str
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "schema_version": "stage0-legacy-acquisition-state-v1",
+            "source_id": self.source_id,
+            "legacy_part_exists": self.legacy_part_exists,
+            "legacy_part_size": self.legacy_part_size,
+            "legacy_lock_exists": self.legacy_lock_exists,
+            "legacy_lock_state": self.legacy_lock_state,
+            "central_part_exists": self.central_part_exists,
+            "final_state": self.final_state,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class LegacyMigrationResult:
+    source_id: str
+    status: str
+    migrated_size: int
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "schema_version": "stage0-legacy-acquisition-migration-v1",
+            "source_id": self.source_id,
+            "status": self.status,
+            "migrated_size": self.migrated_size,
+        }
+
+
+@dataclass(frozen=True, slots=True)
 class AcquisitionFailureReport:
     code: AcquisitionFailureCode
     retryable: bool
@@ -314,13 +356,56 @@ class _TransferResult:
     network_accessed: bool
 
 
-def part_path_for(target: str | Path) -> Path:
+def _central_state_path(
+    target: str | Path,
+    *,
+    data_root: str | Path,
+    directory: str,
+    suffix: str,
+) -> Path:
+    root = Path(os.path.abspath(Path(data_root)))
+    destination = Path(os.path.abspath(Path(target)))
+    if not root.is_absolute():  # pragma: no cover - abspath is always absolute
+        raise ValueError("data_root must be absolute")
+    try:
+        relative = destination.relative_to(root)
+    except ValueError as error:
+        raise ValueError("asset target must remain below DATA_ROOT") from error
+    if not relative.parts or relative.parts[0] not in {"models", "datasets"}:
+        raise ValueError("asset target must be below DATA_ROOT/models or datasets")
+    identity = hashlib.sha256(relative.as_posix().encode("utf-8")).hexdigest()
+    return root / directory / f"{identity}{suffix}"
+
+
+def part_path_for(
+    target: str | Path,
+    *,
+    data_root: str | Path | None = None,
+) -> Path:
     destination = Path(target)
+    if data_root is not None:
+        return _central_state_path(
+            destination,
+            data_root=data_root,
+            directory="tmp/g3-acquisition-parts",
+            suffix=".part",
+        )
     return destination.parent / f".{destination.name}.part"
 
 
-def lock_path_for(target: str | Path) -> Path:
+def lock_path_for(
+    target: str | Path,
+    *,
+    data_root: str | Path | None = None,
+) -> Path:
     destination = Path(target)
+    if data_root is not None:
+        return _central_state_path(
+            destination,
+            data_root=data_root,
+            directory="operations/g3-acquisition-locks",
+            suffix=".acquire.lock",
+        )
     return destination.parent / f".{destination.name}.acquire.lock"
 
 
@@ -475,11 +560,12 @@ def _unlock(descriptor: int) -> None:
 def _advisory_object_lock(
     target: Path,
     *,
+    lock_path: Path | None = None,
     timeout_seconds: float,
     overall_deadline: float,
     poll_interval_seconds: float,
 ) -> Iterator[None]:
-    lock_path = lock_path_for(target)
+    lock_path = lock_path or lock_path_for(target)
     if _is_link_like(lock_path):
         raise _AttemptFailure(AcquisitionFailureCode.LOCAL_STATE_INVALID, False)
     flags = os.O_RDWR | os.O_CREAT
@@ -519,6 +605,133 @@ def _advisory_object_lock(
         os.close(descriptor)
 
 
+def _open_existing_lock(path: Path) -> int:
+    if _is_link_like(path):
+        raise _AttemptFailure(AcquisitionFailureCode.LOCAL_STATE_INVALID, False)
+    flags = os.O_RDWR
+    if hasattr(os, "O_BINARY"):
+        flags |= os.O_BINARY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(path, flags)
+    except FileNotFoundError:
+        raise _AttemptFailure(AcquisitionFailureCode.LOCAL_STATE_INVALID, False) from None
+    except OSError as error:
+        raise _AttemptFailure(AcquisitionFailureCode.LOCAL_IO_ERROR, False) from error
+    metadata = os.fstat(descriptor)
+    if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+        os.close(descriptor)
+        raise _AttemptFailure(AcquisitionFailureCode.LOCAL_STATE_INVALID, False)
+    return descriptor
+
+
+@contextmanager
+def _existing_advisory_lock(
+    path: Path,
+    *,
+    timeout_seconds: float,
+    overall_deadline: float,
+    poll_interval_seconds: float,
+) -> Iterator[None]:
+    descriptor = _open_existing_lock(path)
+    locked = False
+    try:
+        lock_deadline = min(overall_deadline, time.monotonic() + timeout_seconds)
+        while not _try_lock(descriptor):
+            remaining = lock_deadline - time.monotonic()
+            if remaining <= 0:
+                raise _AttemptFailure(AcquisitionFailureCode.LOCK_TIMEOUT, True)
+            time.sleep(min(poll_interval_seconds, remaining))
+        locked = True
+        yield
+    finally:
+        if locked:
+            _unlock(descriptor)
+        os.close(descriptor)
+
+
+def _inspect_existing_lock(path: Path) -> str:
+    if not path.exists() and not _is_link_like(path):
+        return "absent"
+    try:
+        descriptor = _open_existing_lock(path)
+    except _AttemptFailure:
+        return "unsafe"
+    locked = False
+    try:
+        locked = _try_lock(descriptor)
+        return "available" if locked else "held"
+    except OSError:
+        return "unsafe"
+    finally:
+        if locked:
+            _unlock(descriptor)
+        os.close(descriptor)
+
+
+def _ensure_real_directory(path: Path, *, parent: Path) -> None:
+    if _is_link_like(parent) or not parent.is_dir():
+        raise _AttemptFailure(AcquisitionFailureCode.LOCAL_STATE_INVALID, False)
+    if path.exists() or _is_link_like(path):
+        if _is_link_like(path) or not path.is_dir():
+            raise _AttemptFailure(AcquisitionFailureCode.LOCAL_STATE_INVALID, False)
+        return
+    try:
+        path.mkdir(mode=0o750)
+    except FileExistsError:
+        pass
+    except OSError as error:
+        raise _AttemptFailure(AcquisitionFailureCode.LOCAL_IO_ERROR, False) from error
+    if _is_link_like(path) or not path.is_dir():
+        raise _AttemptFailure(AcquisitionFailureCode.LOCAL_STATE_INVALID, False)
+
+
+def _prepare_state_paths(
+    target: Path,
+    *,
+    data_root: str | Path | None,
+    allow_legacy_state: bool = False,
+) -> tuple[Path, Path]:
+    if data_root is None:
+        return part_path_for(target), lock_path_for(target)
+    root = Path(os.path.abspath(Path(data_root)))
+    if _is_link_like(root) or not root.is_dir():
+        raise _AttemptFailure(AcquisitionFailureCode.LOCAL_STATE_INVALID, False)
+    temporary_root = root / "tmp"
+    operations_root = root / "operations"
+    for required in (temporary_root, operations_root):
+        if _is_link_like(required) or not required.is_dir():
+            raise _AttemptFailure(
+                AcquisitionFailureCode.LOCAL_STATE_INVALID,
+                False,
+            )
+    part_root = temporary_root / "g3-acquisition-parts"
+    lock_root = operations_root / "g3-acquisition-locks"
+    _ensure_real_directory(part_root, parent=temporary_root)
+    _ensure_real_directory(lock_root, parent=operations_root)
+    if not allow_legacy_state:
+        legacy_part = part_path_for(target)
+        if legacy_part.exists() or _is_link_like(legacy_part):
+            raise _AttemptFailure(
+                AcquisitionFailureCode.LOCAL_STATE_INVALID,
+                False,
+            )
+        legacy_lock = lock_path_for(target)
+        legacy_lock_state = _inspect_existing_lock(legacy_lock)
+        if legacy_lock_state in {"held", "unsafe"}:
+            raise _AttemptFailure(
+                AcquisitionFailureCode.LOCK_TIMEOUT
+                if legacy_lock_state == "held"
+                else AcquisitionFailureCode.LOCAL_STATE_INVALID,
+                legacy_lock_state == "held",
+            )
+    return (
+        part_path_for(target, data_root=root),
+        lock_path_for(target, data_root=root),
+    )
+
+
 @contextmanager
 def _open_part(path: Path) -> Iterator[Any]:
     if _is_link_like(path):
@@ -549,6 +762,44 @@ def _truncate_part(handle: Any) -> None:
     handle.truncate(0)
     handle.flush()
     os.fsync(handle.fileno())
+
+
+def _bounded_call(
+    operation: Callable[[], Any],
+    *,
+    overall_deadline: float,
+    observed_size: int | None,
+) -> Any:
+    """Run a potentially blocking stream/callback operation under one deadline."""
+
+    remaining = overall_deadline - time.monotonic()
+    if remaining <= 0:
+        raise _AttemptFailure(
+            AcquisitionFailureCode.OVERALL_TIMEOUT,
+            True,
+            observed_size=observed_size,
+        )
+    outcome: queue.Queue[tuple[bool, Any]] = queue.Queue(maxsize=1)
+
+    def invoke() -> None:
+        try:
+            outcome.put((True, operation()))
+        except BaseException as error:  # propagated in the caller thread
+            outcome.put((False, error))
+
+    worker = threading.Thread(target=invoke, daemon=True)
+    worker.start()
+    try:
+        succeeded, value = outcome.get(timeout=remaining)
+    except queue.Empty:
+        raise _AttemptFailure(
+            AcquisitionFailureCode.OVERALL_TIMEOUT,
+            True,
+            observed_size=observed_size,
+        ) from None
+    if not succeeded:
+        raise value
+    return value
 
 
 def _validate_runtime_url(runtime_url: str) -> bool:
@@ -655,19 +906,7 @@ def _download_once(
             _truncate_part(part)
             offset = 0
         elif offset == spec.expected_size:
-            part.flush()
-            try:
-                digest = _sha256_file(part_path, chunk_size=policy.chunk_size)
-            except OSError as error:
-                raise _AttemptFailure(
-                    AcquisitionFailureCode.LOCAL_IO_ERROR,
-                    False,
-                    observed_size=offset,
-                ) from error
-            if digest == spec.expected_sha256:
-                return _TransferResult(resumed_from=offset, network_accessed=False)
-            _truncate_part(part)
-            offset = 0
+            return _TransferResult(resumed_from=offset, network_accessed=False)
 
         remaining_time = overall_deadline - time.monotonic()
         if remaining_time <= 0:
@@ -724,7 +963,11 @@ def _download_once(
                         )
                     read_size = min(policy.chunk_size, response_length - received)
                     try:
-                        chunk = response.read(read_size)
+                        chunk = _bounded_call(
+                            lambda: response.read(read_size),
+                            overall_deadline=overall_deadline,
+                            observed_size=offset + received,
+                        )
                     except http.client.IncompleteRead as error:
                         if error.partial:
                             part.write(error.partial)
@@ -737,6 +980,10 @@ def _download_once(
                             observed_size=offset + received,
                             http_status=status,
                         ) from None
+                    except _AttemptFailure:
+                        part.flush()
+                        os.fsync(part.fileno())
+                        raise
                     except (TimeoutError, OSError):
                         part.flush()
                         os.fsync(part.fileno())
@@ -778,22 +1025,6 @@ def _download_once(
                 observed_size=final_size,
                 http_status=status,
             )
-        try:
-            digest = _sha256_file(part_path, chunk_size=policy.chunk_size)
-        except OSError as error:
-            raise _AttemptFailure(
-                AcquisitionFailureCode.LOCAL_IO_ERROR,
-                False,
-                observed_size=final_size,
-            ) from error
-        if digest != spec.expected_sha256:
-            _truncate_part(part)
-            raise _AttemptFailure(
-                AcquisitionFailureCode.HASH_MISMATCH,
-                True,
-                observed_size=final_size,
-                http_status=status,
-            )
         return _TransferResult(resumed_from=offset, network_accessed=True)
 
 
@@ -804,7 +1035,29 @@ def _publish_no_clobber(
     spec: AssetObjectSpec,
     chunk_size: int,
 ) -> AcquisitionStatus:
-    _validate_regular_object(part_path, require_single_link=True)
+    metadata = _validate_regular_object(part_path, require_single_link=True)
+    if metadata.st_size != spec.expected_size:
+        raise _AttemptFailure(
+            AcquisitionFailureCode.SIZE_MISMATCH,
+            True,
+            observed_size=metadata.st_size,
+        )
+    try:
+        candidate_digest = _sha256_file(part_path, chunk_size=chunk_size)
+    except OSError as error:
+        raise _AttemptFailure(
+            AcquisitionFailureCode.LOCAL_IO_ERROR,
+            False,
+            observed_size=metadata.st_size,
+        ) from error
+    if candidate_digest != spec.expected_sha256:
+        with _open_part(part_path) as part:
+            _truncate_part(part)
+        raise _AttemptFailure(
+            AcquisitionFailureCode.HASH_MISMATCH,
+            True,
+            observed_size=metadata.st_size,
+        )
     try:
         os.link(part_path, target, follow_symlinks=False)
     except FileExistsError:
@@ -817,6 +1070,46 @@ def _publish_no_clobber(
         raise _AttemptFailure(AcquisitionFailureCode.TARGET_CONFLICT, False)
     except OSError as error:
         raise _AttemptFailure(AcquisitionFailureCode.LOCAL_IO_ERROR, False) from error
+
+    linked_metadata: os.stat_result | None = None
+    try:
+        linked_metadata = target.stat()
+        if (
+            _is_link_like(target)
+            or not stat.S_ISREG(linked_metadata.st_mode)
+            or linked_metadata.st_size != spec.expected_size
+            or _sha256_file(target, chunk_size=chunk_size) != spec.expected_sha256
+        ):
+            raise _AttemptFailure(
+                AcquisitionFailureCode.HASH_MISMATCH,
+                True,
+                observed_size=linked_metadata.st_size,
+            )
+    except (OSError, _AttemptFailure) as error:
+        try:
+            current = target.stat()
+            if (
+                linked_metadata is not None
+                and current.st_dev == linked_metadata.st_dev
+                and current.st_ino == linked_metadata.st_ino
+            ):
+                target.unlink(missing_ok=True)
+                _fsync_directory(target.parent)
+        except OSError:
+            pass
+        if isinstance(error, _AttemptFailure) and part_path.exists():
+            try:
+                with _open_part(part_path) as part:
+                    _truncate_part(part)
+            except _AttemptFailure:
+                pass
+        if isinstance(error, _AttemptFailure):
+            raise
+        raise _AttemptFailure(
+            AcquisitionFailureCode.LOCAL_IO_ERROR,
+            False,
+            observed_size=spec.expected_size,
+        ) from error
     try:
         part_path.unlink(missing_ok=True)
     finally:
@@ -845,12 +1138,171 @@ def _failure_report(
     )
 
 
+def inspect_legacy_acquisition_state(
+    spec: AssetObjectSpec,
+    target: str | Path,
+    *,
+    data_root: str | Path,
+) -> LegacyAcquisitionState:
+    """Inspect, without migrating or deleting, the pre-central-state checkpoint."""
+
+    destination = Path(target)
+    legacy_part = part_path_for(destination)
+    legacy_lock = lock_path_for(destination)
+    central_part = part_path_for(destination, data_root=data_root)
+    part_exists = legacy_part.exists() or _is_link_like(legacy_part)
+    part_size: int | None = None
+    if part_exists and not _is_link_like(legacy_part):
+        try:
+            metadata = legacy_part.stat()
+            if stat.S_ISREG(metadata.st_mode) and metadata.st_nlink == 1:
+                part_size = metadata.st_size
+        except OSError:
+            part_size = None
+    if not destination.exists() and not _is_link_like(destination):
+        final_state = "absent"
+    else:
+        try:
+            final_state = (
+                "ready"
+                if _verify_final(destination, spec, chunk_size=1024 * 1024)
+                else "absent"
+            )
+        except _AttemptFailure as failure:
+            final_state = (
+                "conflict"
+                if failure.code is AcquisitionFailureCode.TARGET_CONFLICT
+                else "unsafe"
+            )
+    return LegacyAcquisitionState(
+        source_id=spec.source_id,
+        legacy_part_exists=part_exists,
+        legacy_part_size=part_size,
+        legacy_lock_exists=legacy_lock.exists() or _is_link_like(legacy_lock),
+        legacy_lock_state=_inspect_existing_lock(legacy_lock),
+        central_part_exists=central_part.exists() or _is_link_like(central_part),
+        final_state=final_state,
+    )
+
+
+def migrate_legacy_acquisition_state(
+    spec: AssetObjectSpec,
+    target: str | Path,
+    *,
+    data_root: str | Path,
+    policy: AcquisitionPolicy | None = None,
+) -> LegacyMigrationResult:
+    """Explicitly move one quiescent legacy prefix into central DATA_ROOT state.
+
+    The operation is intentionally never called by either acquisition path.  It
+    requires the former lock file to exist and be acquirable, then holds both
+    the legacy and central locks while it verifies that exactly one checkpoint
+    exists.  This prevents an active old relay and a new relay from consuming
+    different resume offsets concurrently.
+    """
+
+    selected_policy = policy or AcquisitionPolicy()
+    destination = Path(target)
+    deadline = time.monotonic() + selected_policy.overall_timeout_seconds
+    legacy_part = part_path_for(destination)
+    legacy_lock = lock_path_for(destination)
+    try:
+        central_part, central_lock = _prepare_state_paths(
+            destination,
+            data_root=data_root,
+            allow_legacy_state=True,
+        )
+        if not legacy_lock.exists() or _is_link_like(legacy_lock):
+            raise _AttemptFailure(AcquisitionFailureCode.LOCAL_STATE_INVALID, False)
+        with _existing_advisory_lock(
+            legacy_lock,
+            timeout_seconds=selected_policy.lock_timeout_seconds,
+            overall_deadline=deadline,
+            poll_interval_seconds=selected_policy.lock_poll_interval_seconds,
+        ):
+            with _advisory_object_lock(
+                destination,
+                lock_path=central_lock,
+                timeout_seconds=selected_policy.lock_timeout_seconds,
+                overall_deadline=deadline,
+                poll_interval_seconds=selected_policy.lock_poll_interval_seconds,
+            ):
+                if _verify_final(
+                    destination,
+                    spec,
+                    chunk_size=selected_policy.chunk_size,
+                ):
+                    return LegacyMigrationResult(
+                        source_id=spec.source_id,
+                        status="final_ready",
+                        migrated_size=0,
+                    )
+                if central_part.exists() or _is_link_like(central_part):
+                    raise _AttemptFailure(
+                        AcquisitionFailureCode.LOCAL_STATE_INVALID,
+                        False,
+                    )
+                metadata = _validate_regular_object(
+                    legacy_part,
+                    require_single_link=True,
+                )
+                if metadata.st_size > spec.expected_size:
+                    raise _AttemptFailure(
+                        AcquisitionFailureCode.SIZE_MISMATCH,
+                        False,
+                        observed_size=metadata.st_size,
+                    )
+                if metadata.st_size == spec.expected_size:
+                    try:
+                        digest = _sha256_file(
+                            legacy_part,
+                            chunk_size=selected_policy.chunk_size,
+                        )
+                    except OSError as error:
+                        raise _AttemptFailure(
+                            AcquisitionFailureCode.LOCAL_IO_ERROR,
+                            False,
+                            observed_size=metadata.st_size,
+                        ) from error
+                    if digest != spec.expected_sha256:
+                        raise _AttemptFailure(
+                            AcquisitionFailureCode.HASH_MISMATCH,
+                            False,
+                            observed_size=metadata.st_size,
+                        )
+                try:
+                    os.replace(legacy_part, central_part)
+                    _fsync_directory(legacy_part.parent)
+                    _fsync_directory(central_part.parent)
+                except OSError as error:
+                    raise _AttemptFailure(
+                        AcquisitionFailureCode.LOCAL_IO_ERROR,
+                        False,
+                        observed_size=metadata.st_size,
+                    ) from error
+                return LegacyMigrationResult(
+                    source_id=spec.source_id,
+                    status="migrated",
+                    migrated_size=metadata.st_size,
+                )
+    except _AttemptFailure as failure:
+        raise AssetAcquisitionError(
+            _failure_report(
+                spec=spec,
+                failure=failure,
+                attempts=0,
+                exhausted=False,
+            )
+        ) from None
+
+
 def acquire_http_asset(
     spec: AssetObjectSpec,
     runtime_url: str,
     target: str | Path,
     *,
     policy: AcquisitionPolicy | None = None,
+    data_root: str | Path | None = None,
 ) -> AcquisitionResult:
     """Acquire one immutable object without ever persisting its runtime URL.
 
@@ -916,10 +1368,24 @@ def acquire_http_asset(
     attempts = 0
     resumed = False
     network_accessed = False
-    part_path = part_path_for(destination)
+    try:
+        part_path, object_lock_path = _prepare_state_paths(
+            destination,
+            data_root=data_root,
+        )
+    except _AttemptFailure as failure:
+        raise AssetAcquisitionError(
+            _failure_report(
+                spec=spec,
+                failure=failure,
+                attempts=0,
+                exhausted=False,
+            )
+        ) from None
     try:
         with _advisory_object_lock(
             destination,
+            lock_path=object_lock_path,
             timeout_seconds=selected_policy.lock_timeout_seconds,
             overall_deadline=overall_deadline,
             poll_interval_seconds=selected_policy.lock_poll_interval_seconds,
@@ -1045,6 +1511,7 @@ def receive_streamed_asset(
     *,
     on_ready: Callable[[StreamReceptionPlan], None] | None = None,
     policy: AcquisitionPolicy | None = None,
+    data_root: str | Path | None = None,
 ) -> AcquisitionResult:
     """Receive one immutable object from a URL-free external byte relay.
 
@@ -1060,7 +1527,20 @@ def receive_streamed_asset(
     selected_policy = policy or AcquisitionPolicy()
     destination = Path(target)
     overall_deadline = time.monotonic() + selected_policy.overall_timeout_seconds
-    part_path = part_path_for(destination)
+    try:
+        part_path, object_lock_path = _prepare_state_paths(
+            destination,
+            data_root=data_root,
+        )
+    except _AttemptFailure as failure:
+        raise AssetAcquisitionError(
+            _failure_report(
+                spec=spec,
+                failure=failure,
+                attempts=0,
+                exhausted=False,
+            )
+        ) from None
     callback = on_ready or (lambda _plan: None)
     attempts = 0
     resumed = False
@@ -1069,6 +1549,7 @@ def receive_streamed_asset(
         destination.parent.mkdir(parents=True, exist_ok=True)
         with _advisory_object_lock(
             destination,
+            lock_path=object_lock_path,
             timeout_seconds=selected_policy.lock_timeout_seconds,
             overall_deadline=overall_deadline,
             poll_interval_seconds=selected_policy.lock_poll_interval_seconds,
@@ -1078,15 +1559,18 @@ def receive_streamed_asset(
                 spec,
                 chunk_size=selected_policy.chunk_size,
             ):
-                callback(
-                    StreamReceptionPlan(
-                        source_id=spec.source_id,
-                        revision=spec.revision,
-                        expected_size=spec.expected_size,
-                        expected_sha256=spec.expected_sha256,
-                        offset=spec.expected_size,
-                        already_ready=True,
-                    )
+                ready_plan = StreamReceptionPlan(
+                    source_id=spec.source_id,
+                    revision=spec.revision,
+                    expected_size=spec.expected_size,
+                    expected_sha256=spec.expected_sha256,
+                    offset=spec.expected_size,
+                    already_ready=True,
+                )
+                _bounded_call(
+                    lambda: callback(ready_plan),
+                    overall_deadline=overall_deadline,
+                    observed_size=spec.expected_size,
                 )
                 return AcquisitionResult(
                     status=AcquisitionStatus.ALREADY_READY,
@@ -1123,15 +1607,18 @@ def receive_streamed_asset(
                         offset = 0
 
                 resumed = 0 < offset < spec.expected_size
-                callback(
-                    StreamReceptionPlan(
-                        source_id=spec.source_id,
-                        revision=spec.revision,
-                        expected_size=spec.expected_size,
-                        expected_sha256=spec.expected_sha256,
-                        offset=offset,
-                        already_ready=False,
-                    )
+                ready_plan = StreamReceptionPlan(
+                    source_id=spec.source_id,
+                    revision=spec.revision,
+                    expected_size=spec.expected_size,
+                    expected_sha256=spec.expected_sha256,
+                    offset=offset,
+                    already_ready=False,
+                )
+                _bounded_call(
+                    lambda: callback(ready_plan),
+                    overall_deadline=overall_deadline,
+                    observed_size=offset,
                 )
 
                 received = 0
@@ -1148,7 +1635,15 @@ def receive_streamed_asset(
                         )
                     read_size = min(selected_policy.chunk_size, remaining - received)
                     try:
-                        chunk = stream.read(read_size)
+                        chunk = _bounded_call(
+                            lambda: stream.read(read_size),
+                            overall_deadline=overall_deadline,
+                            observed_size=offset + received,
+                        )
+                    except _AttemptFailure:
+                        part.flush()
+                        os.fsync(part.fileno())
+                        raise
                     except (OSError, TimeoutError) as error:
                         part.flush()
                         os.fsync(part.fileno())
@@ -1172,7 +1667,13 @@ def receive_streamed_asset(
                             observed_size=offset + received,
                         )
                     try:
-                        written = part.write(chunk)
+                        written = _bounded_call(
+                            lambda: part.write(chunk),
+                            overall_deadline=overall_deadline,
+                            observed_size=offset + received,
+                        )
+                    except _AttemptFailure:
+                        raise
                     except OSError as error:
                         raise _AttemptFailure(
                             AcquisitionFailureCode.LOCAL_IO_ERROR,
@@ -1255,9 +1756,13 @@ __all__ = [
     "AcquisitionStatus",
     "AssetAcquisitionError",
     "AssetObjectSpec",
+    "LegacyAcquisitionState",
+    "LegacyMigrationResult",
     "StreamReceptionPlan",
     "acquire_http_asset",
+    "inspect_legacy_acquisition_state",
     "lock_path_for",
+    "migrate_legacy_acquisition_state",
     "part_path_for",
     "receive_streamed_asset",
     "resolve_approved_asset_target",

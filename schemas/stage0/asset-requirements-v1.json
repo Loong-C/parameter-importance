@@ -156,6 +156,29 @@
           "type": "array",
           "minItems": 2,
           "items": {"$ref": "#/$defs/file"}
+        },
+        "legacy_manifest_diagnostic": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "refs",
+            "size_bytes",
+            "sha256",
+            "condition",
+            "replacement_manifest_ref"
+          ],
+          "properties": {
+            "refs": {
+              "const": [
+                "models/pythia-31m-deduped-step0/model-manifest.json",
+                "manifests/pythia-31m-deduped-step0.json"
+              ]
+            },
+            "size_bytes": {"type": "integer", "minimum": 1},
+            "sha256": {"$ref": "#/$defs/sha256"},
+            "condition": {"const": "utf8_bom_strict_json_rejected"},
+            "replacement_manifest_ref": {"const": "manifests/model/pythia-31m.json"}
+          }
         }
       }
     },
@@ -255,6 +278,9 @@
         "required_target_tokens",
         "cursor_intervals",
         "workloads",
+        "reference_reader",
+        "reference_reader_oracle",
+        "reference_batch_size",
         "reference_batch_sha256",
         "last_required_record_sha256",
         "cross_shard_policy"
@@ -320,6 +346,26 @@
           "minItems": 5,
           "items": {"$ref": "#/$defs/workload"}
         },
+        "reference_reader": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["repository", "revision"],
+          "properties": {
+            "repository": {"const": "EleutherAI/pythia"},
+            "revision": {"const": "a19eecb807ec2c79a39ebf18108816e6ffffc1d5"}
+          }
+        },
+        "reference_reader_oracle": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["artifact_ref", "artifact_sha256", "official_source_ref"],
+          "properties": {
+            "artifact_ref": {"const": "manifests/batch-viewer-comparison.json"},
+            "artifact_sha256": {"$ref": "#/$defs/sha256"},
+            "official_source_ref": {"const": "source/pythia-a19eecb807ec2c79a39ebf18108816e6ffffc1d5"}
+          }
+        },
+        "reference_batch_size": {"const": 1024},
         "reference_batch_sha256": {
           "type": "object",
           "additionalProperties": false,

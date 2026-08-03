@@ -212,7 +212,6 @@ def test_claim_sets_without_committed_evidence_never_unlock_formal(tmp_path: Pat
         "stage0.01_baseline_and_safety",
         "stage0.02_storage_and_layout",
         "stage0.03_runtime_and_dependencies",
-        "stage0.04_assets_and_manifests",
     ),
 )
 def test_external_stage0_formal_tasks_project_committed_evidence_not_local_fixture(
@@ -360,7 +359,7 @@ def test_runtime_capability_artifact_validate_and_default_workspace_binding(
     assert build_default_task_runtime().workspace_root == tmp_path.resolve()
 
 
-def test_offline_training_missing_manifest_is_structured_asset_blocker(
+def test_offline_training_missing_g3_resolution_is_structured_asset_blocker(
     tmp_path: Path,
 ) -> None:
     task_id = "stage0.06_single_gpu_smoke"
@@ -373,12 +372,12 @@ def test_offline_training_missing_manifest_is_structured_asset_blocker(
             "training": {"max_steps": 1, "max_epochs": None},
             "providers": {
                 "kind": "offline_hf",
-                "model_manifest_ref": "missing/model.json",
-                "model_root_ref": "missing/model",
-                "data_manifest_ref": "missing/data.json",
-                "data_root_ref": "missing/data",
-                "tokenizer_manifest_ref": "missing/tokenizer.json",
-                "tokenizer_root_ref": "missing/tokenizer",
+                "model_manifest_ref": None,
+                "model_root_ref": None,
+                "data_manifest_ref": None,
+                "data_root_ref": None,
+                "tokenizer_manifest_ref": None,
+                "tokenizer_root_ref": None,
                 "task_name": "sst2",
                 "num_labels": 2,
             },

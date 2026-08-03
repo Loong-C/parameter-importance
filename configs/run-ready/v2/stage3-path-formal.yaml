@@ -1,11 +1,11 @@
 providers:
   kind: offline_hf
-  model_manifest_ref: manifests/model/pythia-14m.json
-  model_root_ref: models/pythia-14m-step0
-  data_manifest_ref: manifests/data/pile-pretokenized.json
-  data_root_ref: datasets/pile-deduped-pythia-preshuffled
-  tokenizer_manifest_ref: manifests/tokenizer/pythia.json
-  tokenizer_root_ref: models/pythia-410m-deduped-step0
+  model_manifest_ref: null
+  model_root_ref: null
+  data_manifest_ref: null
+  data_root_ref: null
+  tokenizer_manifest_ref: null
+  tokenizer_root_ref: null
   task_type: causal_lm
   task_name: pile
   num_labels: null

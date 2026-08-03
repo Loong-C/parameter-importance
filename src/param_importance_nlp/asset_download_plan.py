@@ -10,10 +10,12 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from copy import deepcopy
+from dataclasses import dataclass
 from datetime import datetime
 import os
 from pathlib import Path, PurePosixPath
 import re
+import subprocess
 from typing import Any, Final
 from urllib.parse import quote
 
@@ -39,8 +41,10 @@ from .storage import is_within, require_data_root
 
 SCHEMA_VERSION: Final = "stage0-g3-download-plan-v1"
 REPORT_SCHEMA_VERSION: Final = "stage0-g3-download-report-v1"
+RELAY_BINDING_SCHEMA_VERSION: Final = "stage0-g3-relay-binding-v1"
 _SHA256: Final = re.compile(r"^[0-9a-f]{64}$")
 _GIT_COMMIT: Final = re.compile(r"^[0-9a-f]{40}$")
+_RELAY_ROUTES: Final = frozenset({"lab-direct", "local-via-lab"})
 _TOP_FIELDS: Final = frozenset(
     {
         "schema_version",
@@ -61,6 +65,107 @@ _ENTRY_FIELDS: Final = frozenset(
 
 class AssetDownloadPlanError(ValueError):
     """Raised when a committed acquisition plan is unsafe or inconsistent."""
+
+
+@dataclass(frozen=True, slots=True)
+class G3RelayBinding:
+    """Exact URL-free control-plane identity carried across every relay hop."""
+
+    object_id: str
+    revision: str
+    expected_size: int
+    expected_sha256: str
+    requirements_sha256: str
+    layout_sha256: str
+    plan_sha256: str
+    spec_ref: str
+    spec_sha256: str
+    asset_root_ref: str
+    final_path: str
+    generator_git_commit: str
+    source_git_commit: str
+    route: str
+
+    def __post_init__(self) -> None:
+        object_id = _text(self.object_id, field="object_id")
+        if (
+            not object_id.startswith("huggingface/")
+            or "://" in object_id
+            or "?" in object_id
+        ):
+            raise AssetDownloadPlanError("relay object_id is not stable")
+        revision = _text(self.revision, field="revision")
+        if _GIT_COMMIT.fullmatch(revision) is None:
+            raise AssetDownloadPlanError("relay revision must be an immutable commit")
+        if (
+            isinstance(self.expected_size, bool)
+            or not isinstance(self.expected_size, int)
+            or self.expected_size < 0
+        ):
+            raise AssetDownloadPlanError("relay expected_size is invalid")
+        _digest(self.expected_sha256, field="expected_sha256")
+        _digest(self.requirements_sha256, field="requirements_sha256")
+        _digest(self.layout_sha256, field="layout_sha256")
+        _digest(self.plan_sha256, field="plan_sha256")
+        _digest(self.spec_sha256, field="spec_sha256")
+        spec_ref = _source_relative_path(self.spec_ref, field="spec_ref")
+        if not spec_ref.startswith("configs/stage0/http-objects/"):
+            raise AssetDownloadPlanError("relay spec_ref is outside the freeze")
+        root_ref = validate_asset_path(self.asset_root_ref)
+        if root_ref.split("/", 1)[0] not in {"models", "datasets"}:
+            raise AssetDownloadPlanError("relay asset_root_ref is invalid")
+        validate_asset_path(self.final_path)
+        for field_name in ("generator_git_commit", "source_git_commit"):
+            field_value = _text(getattr(self, field_name), field=field_name)
+            if _GIT_COMMIT.fullmatch(field_value) is None:
+                raise AssetDownloadPlanError(f"{field_name} must be a Git commit")
+        if self.route not in _RELAY_ROUTES:
+            raise AssetDownloadPlanError("relay route is invalid")
+
+    @classmethod
+    def from_mapping(cls, value: Mapping[str, Any]) -> "G3RelayBinding":
+        binding = _mapping(value, field="relay binding")
+        expected_fields = {
+            "schema_version",
+            "object_id",
+            "revision",
+            "expected_size",
+            "expected_sha256",
+            "requirements_sha256",
+            "layout_sha256",
+            "plan_sha256",
+            "spec_ref",
+            "spec_sha256",
+            "asset_root_ref",
+            "final_path",
+            "generator_git_commit",
+            "source_git_commit",
+            "route",
+        }
+        if set(binding) != expected_fields:
+            raise AssetDownloadPlanError("relay binding fields are not exact")
+        if binding.pop("schema_version") != RELAY_BINDING_SCHEMA_VERSION:
+            raise AssetDownloadPlanError("unsupported relay binding schema_version")
+        return cls(**binding)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "schema_version": RELAY_BINDING_SCHEMA_VERSION,
+            "object_id": self.object_id,
+            "revision": self.revision,
+            "expected_size": self.expected_size,
+            "expected_sha256": self.expected_sha256,
+            "requirements_sha256": self.requirements_sha256,
+            "layout_sha256": self.layout_sha256,
+            "plan_sha256": self.plan_sha256,
+            "spec_ref": self.spec_ref,
+            "spec_sha256": self.spec_sha256,
+            "asset_root_ref": self.asset_root_ref,
+            "final_path": self.final_path,
+            "generator_git_commit": self.generator_git_commit,
+            "source_git_commit": self.source_git_commit,
+            "route": self.route,
+        }
 
 
 def download_plan_artifact_hash(value: Mapping[str, Any]) -> str:
@@ -192,6 +297,81 @@ def load_g3_download_plan(
     return result
 
 
+def resolve_source_git_commit(
+    source_root: str | Path,
+    *,
+    timeout_seconds: float = 10.0,
+) -> str:
+    """Resolve the deployed tracked source identity with a bounded Git call."""
+
+    if (
+        isinstance(timeout_seconds, bool)
+        or not isinstance(timeout_seconds, (int, float))
+        or not 0 < float(timeout_seconds) < float("inf")
+    ):
+        raise AssetDownloadPlanError("Git identity timeout must be positive and finite")
+    root = Path(source_root).resolve(strict=True)
+    try:
+        completed = subprocess.run(
+            [
+                "git",
+                "-c",
+                f"safe.directory={root.as_posix()}",
+                "-C",
+                str(root),
+                "rev-parse",
+                "--verify",
+                "HEAD",
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=float(timeout_seconds),
+        )
+    except (OSError, subprocess.SubprocessError) as error:
+        raise AssetDownloadPlanError("source Git identity is unavailable") from error
+    commit = completed.stdout.strip()
+    if completed.returncode != 0 or _GIT_COMMIT.fullmatch(commit) is None:
+        raise AssetDownloadPlanError("source Git identity is invalid")
+    return commit
+
+
+def build_g3_relay_binding(
+    *,
+    plan: Mapping[str, Any],
+    entry: Mapping[str, Any],
+    spec: AssetObjectSpec,
+    source_git_commit: str,
+    route: str,
+) -> G3RelayBinding:
+    """Build one exact relay request from an already validated frozen plan."""
+
+    validate_g3_download_plan(plan)
+    normalized_entry = _mapping(entry, field="relay plan entry")
+    if set(normalized_entry) != _ENTRY_FIELDS:
+        raise AssetDownloadPlanError("relay plan entry fields are not exact")
+    if normalized_entry not in plan["entries"]:
+        raise AssetDownloadPlanError("relay plan entry is absent from the plan")
+    if spec.source_id != normalized_entry["object_id"]:
+        raise AssetDownloadPlanError("relay object spec does not match the plan")
+    return G3RelayBinding(
+        object_id=spec.source_id,
+        revision=spec.revision,
+        expected_size=spec.expected_size,
+        expected_sha256=spec.expected_sha256,
+        requirements_sha256=plan["requirements_sha256"],
+        layout_sha256=plan["layout_sha256"],
+        plan_sha256=plan["artifact_hash"],
+        spec_ref=normalized_entry["spec_ref"],
+        spec_sha256=canonical_json_hash(spec.to_dict()),
+        asset_root_ref=normalized_entry["asset_root_ref"],
+        final_path=normalized_entry["final_path"],
+        generator_git_commit=plan["generator_git_commit"],
+        source_git_commit=source_git_commit,
+        route=route,
+    )
+
+
 def _huggingface_runtime_url(spec: AssetObjectSpec) -> str:
     prefix = "huggingface/"
     if not spec.source_id.startswith(prefix):
@@ -290,6 +470,7 @@ def execute_g3_download_plan(
                 _huggingface_runtime_url(spec),
                 target,
                 policy=selected_policy,
+                data_root=approved_data_root,
             )
         except AssetAcquisitionError as error:
             failure_payload = {
@@ -334,10 +515,14 @@ def execute_g3_download_plan(
 
 __all__ = [
     "AssetDownloadPlanError",
+    "G3RelayBinding",
+    "RELAY_BINDING_SCHEMA_VERSION",
     "REPORT_SCHEMA_VERSION",
     "SCHEMA_VERSION",
+    "build_g3_relay_binding",
     "download_plan_artifact_hash",
     "execute_g3_download_plan",
     "load_g3_download_plan",
+    "resolve_source_git_commit",
     "validate_g3_download_plan",
 ]

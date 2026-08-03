@@ -38,6 +38,7 @@ from .training import (
 
 
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
+_GIT_COMMIT = re.compile(r"^[0-9a-f]{40}$")
 _GLUE_LABEL_COUNTS = {"sst2": 2, "mnli": 3, "rte": 2}
 _GLUE_SPLITS = {
     "sst2": frozenset({"train", "validation"}),
@@ -395,6 +396,9 @@ class _PretokenizedHFDatasetAdapter:
         microbatches_per_step: int,
         expected_asset_hash: str | None,
         allowed_root: str | Path | None,
+        g3_resolution_artifact_hash: str | None,
+        g3_source_commit: str | None,
+        g3_runtime_lineage_sha256: str | None,
         sampling_design: str,
         weights_exogenous: bool,
         common_mean_assumption: bool,
@@ -412,6 +416,34 @@ class _PretokenizedHFDatasetAdapter:
             raise ValueError("OFFLINE_DATASET_BATCH_SIZE_INVALID")
         if type(weights_exogenous) is not bool or type(common_mean_assumption) is not bool:
             raise TypeError("OFFLINE_DATASET_WEIGHT_ASSUMPTION_NOT_BOOLEAN")
+        lineage_values = (
+            g3_resolution_artifact_hash,
+            g3_source_commit,
+            g3_runtime_lineage_sha256,
+        )
+        if any(value is not None for value in lineage_values) and any(
+            value is None for value in lineage_values
+        ):
+            raise ValueError("OFFLINE_DATASET_G3_LINEAGE_INCOMPLETE")
+        if g3_resolution_artifact_hash is not None:
+            normalized_resolution = _validate_hash(
+                g3_resolution_artifact_hash,
+                field_name="g3_resolution_artifact_hash",
+            )
+            if (
+                not isinstance(g3_source_commit, str)
+                or _GIT_COMMIT.fullmatch(g3_source_commit) is None
+            ):
+                raise ValueError("OFFLINE_DATASET_G3_SOURCE_COMMIT_INVALID")
+            normalized_source_commit = g3_source_commit
+            normalized_runtime_lineage = _validate_hash(
+                g3_runtime_lineage_sha256,
+                field_name="g3_runtime_lineage_sha256",
+            )
+        else:
+            normalized_resolution = None
+            normalized_source_commit = None
+            normalized_runtime_lineage = None
         task = _normalize_task_name(task_name)
         root = _resolve_local_directory(path, allowed_root=allowed_root)
         before_stat = _directory_stat_manifest(root)
@@ -449,6 +481,9 @@ class _PretokenizedHFDatasetAdapter:
         self._weights_exogenous = weights_exogenous
         self._common_mean_assumption = common_mean_assumption
         self._asset_hash = asset_hash
+        self._g3_resolution_artifact_hash = normalized_resolution
+        self._g3_source_commit = normalized_source_commit
+        self._g3_runtime_lineage_sha256 = normalized_runtime_lineage
         self._asset_stat = before_stat
         self._row_count = row_count
         self._columns = columns
@@ -593,6 +628,11 @@ class _PretokenizedHFDatasetAdapter:
             tuple(self._sample_ids[index] for index in indices),
             {
                 "asset_hash": self.asset_hash,
+                "g3_resolution_artifact_hash": (
+                    self.g3_resolution_artifact_hash
+                ),
+                "g3_source_commit": self.g3_source_commit,
+                "g3_runtime_lineage_sha256": self.g3_runtime_lineage_sha256,
                 "dataset_id": self.dataset_id,
                 "dataset_split": self.split,
                 "task_name": self.task_name,
@@ -619,6 +659,18 @@ class _PretokenizedHFDatasetAdapter:
     @property
     def asset_hash(self) -> str:
         return self._asset_hash
+
+    @property
+    def g3_resolution_artifact_hash(self) -> str | None:
+        return self._g3_resolution_artifact_hash
+
+    @property
+    def g3_source_commit(self) -> str | None:
+        return self._g3_source_commit
+
+    @property
+    def g3_runtime_lineage_sha256(self) -> str | None:
+        return self._g3_runtime_lineage_sha256
 
     @property
     def row_count(self) -> int:
@@ -690,6 +742,9 @@ class _PretokenizedHFDatasetAdapter:
             "task_name": self.task_name,
             "split": self.split,
             "asset_hash": self.asset_hash,
+            "g3_resolution_artifact_hash": self.g3_resolution_artifact_hash,
+            "g3_source_commit": self.g3_source_commit,
+            "g3_runtime_lineage_sha256": self.g3_runtime_lineage_sha256,
             "dataset_fingerprint": self._fingerprint,
             "columns": list(self._columns),
             "row_count": self.row_count,
@@ -742,6 +797,9 @@ class PretokenizedPileDatasetAdapter(_PretokenizedHFDatasetAdapter):
         common_mean_assumption: bool,
         expected_asset_hash: str | None = None,
         allowed_root: str | Path | None = None,
+        g3_resolution_artifact_hash: str | None = None,
+        g3_source_commit: str | None = None,
+        g3_runtime_lineage_sha256: str | None = None,
     ) -> None:
         super().__init__(
             path,
@@ -752,6 +810,9 @@ class PretokenizedPileDatasetAdapter(_PretokenizedHFDatasetAdapter):
             microbatches_per_step=microbatches_per_step,
             expected_asset_hash=expected_asset_hash,
             allowed_root=allowed_root,
+            g3_resolution_artifact_hash=g3_resolution_artifact_hash,
+            g3_source_commit=g3_source_commit,
+            g3_runtime_lineage_sha256=g3_runtime_lineage_sha256,
             sampling_design=sampling_design,
             weights_exogenous=weights_exogenous,
             common_mean_assumption=common_mean_assumption,
@@ -773,6 +834,9 @@ class PretokenizedGlueDatasetAdapter(_PretokenizedHFDatasetAdapter):
         sampling_design: str = "uniform_with_replacement_over_frozen_glue_rows",
         expected_asset_hash: str | None = None,
         allowed_root: str | Path | None = None,
+        g3_resolution_artifact_hash: str | None = None,
+        g3_source_commit: str | None = None,
+        g3_runtime_lineage_sha256: str | None = None,
     ) -> None:
         normalized = _normalize_task_name(task_name)
         if normalized not in _GLUE_LABEL_COUNTS:
@@ -786,6 +850,9 @@ class PretokenizedGlueDatasetAdapter(_PretokenizedHFDatasetAdapter):
             microbatches_per_step=microbatches_per_step,
             expected_asset_hash=expected_asset_hash,
             allowed_root=allowed_root,
+            g3_resolution_artifact_hash=g3_resolution_artifact_hash,
+            g3_source_commit=g3_source_commit,
+            g3_runtime_lineage_sha256=g3_runtime_lineage_sha256,
             sampling_design=sampling_design,
             # GLUE 每个已标注 example 的 effective count 恒为 1。
             weights_exogenous=True,

@@ -25,6 +25,9 @@ from param_importance_nlp.asset_acquisition import (
     AssetObjectSpec,
     StreamReceptionPlan,
     acquire_http_asset,
+    inspect_legacy_acquisition_state,
+    lock_path_for,
+    migrate_legacy_acquisition_state,
     part_path_for,
     receive_streamed_asset,
 )
@@ -61,6 +64,13 @@ def _policy(
         lock_poll_interval_seconds=0.005,
         chunk_size=64,
     )
+
+
+def _data_root(tmp_path: Path) -> Path:
+    root = tmp_path / "data-root"
+    for name in ("models", "datasets", "tmp", "operations"):
+        (root / name).mkdir(parents=True, exist_ok=True)
+    return root
 
 
 def test_stream_receiver_publishes_exact_object_with_url_free_handshake(
@@ -483,3 +493,184 @@ def test_spec_rejects_runtime_urls_and_generic_revisions() -> None:
         AssetObjectSpec("public-source", "latest", 1, digest)
     with pytest.raises(ValueError, match="max_attempts"):
         AcquisitionPolicy(max_attempts=0)
+
+
+def test_data_root_state_uses_central_tmp_and_operations_paths(
+    tmp_path: Path,
+) -> None:
+    payload = bytes(range(64)) * 4
+    data_root = _data_root(tmp_path)
+    target = data_root / "models" / "fixture" / "model.bin"
+    target.parent.mkdir()
+    prefix = payload[:91]
+
+    with pytest.raises(AssetAcquisitionError) as caught:
+        receive_streamed_asset(
+            _spec(payload),
+            target,
+            BytesIO(prefix),
+            policy=_policy(),
+            data_root=data_root,
+        )
+    assert caught.value.report.code is AcquisitionFailureCode.TRANSFER_INCOMPLETE
+    central_part = part_path_for(target, data_root=data_root)
+    central_lock = lock_path_for(target, data_root=data_root)
+    assert central_part.read_bytes() == prefix
+    assert central_part.is_relative_to(data_root / "tmp")
+    assert central_lock.is_relative_to(data_root / "operations")
+    assert central_lock.exists()
+    assert not part_path_for(target).exists()
+    assert not lock_path_for(target).exists()
+
+    result = receive_streamed_asset(
+        _spec(payload),
+        target,
+        BytesIO(payload[len(prefix) :]),
+        policy=_policy(),
+        data_root=data_root,
+    )
+    assert result.resumed is True
+    assert target.read_bytes() == payload
+    assert not central_part.exists()
+
+
+def test_central_state_refuses_an_unmigrated_legacy_checkpoint(
+    tmp_path: Path,
+) -> None:
+    payload = b"explicit migration required"
+    data_root = _data_root(tmp_path)
+    target = data_root / "models" / "fixture" / "asset.bin"
+    target.parent.mkdir()
+    part_path_for(target).write_bytes(payload[:7])
+    lock_path_for(target).write_bytes(b"\0")
+
+    state = inspect_legacy_acquisition_state(
+        _spec(payload),
+        target,
+        data_root=data_root,
+    )
+    assert state.legacy_lock_state == "available"
+    assert state.legacy_part_size == 7
+    with pytest.raises(AssetAcquisitionError) as caught:
+        receive_streamed_asset(
+            _spec(payload),
+            target,
+            BytesIO(payload),
+            policy=_policy(),
+            data_root=data_root,
+        )
+    assert caught.value.report.code is AcquisitionFailureCode.LOCAL_STATE_INVALID
+    assert part_path_for(target).read_bytes() == payload[:7]
+    assert not part_path_for(target, data_root=data_root).exists()
+
+
+def test_explicit_legacy_migration_holds_one_resume_checkpoint(
+    tmp_path: Path,
+) -> None:
+    payload = b"migrate once, then resume centrally"
+    data_root = _data_root(tmp_path)
+    target = data_root / "models" / "fixture" / "asset.bin"
+    target.parent.mkdir()
+    prefix = payload[:13]
+    part_path_for(target).write_bytes(prefix)
+    lock_path_for(target).write_bytes(b"\0")
+
+    migrated = migrate_legacy_acquisition_state(
+        _spec(payload),
+        target,
+        data_root=data_root,
+        policy=_policy(),
+    )
+    assert migrated.status == "migrated"
+    assert migrated.migrated_size == len(prefix)
+    assert not part_path_for(target).exists()
+    assert part_path_for(target, data_root=data_root).read_bytes() == prefix
+    assert lock_path_for(target).exists()  # historical lock is never deleted implicitly
+
+    result = receive_streamed_asset(
+        _spec(payload),
+        target,
+        BytesIO(payload[len(prefix) :]),
+        policy=_policy(),
+        data_root=data_root,
+    )
+    assert result.resumed is True
+    assert target.read_bytes() == payload
+
+
+def test_legacy_migration_rejects_two_checkpoint_files(tmp_path: Path) -> None:
+    payload = b"only one resume state may exist"
+    data_root = _data_root(tmp_path)
+    target = data_root / "models" / "fixture" / "asset.bin"
+    target.parent.mkdir()
+    part_path_for(target).write_bytes(payload[:3])
+    lock_path_for(target).write_bytes(b"\0")
+    central_part = part_path_for(target, data_root=data_root)
+    central_part.parent.mkdir()
+    central_part.write_bytes(payload[:5])
+
+    with pytest.raises(AssetAcquisitionError) as caught:
+        migrate_legacy_acquisition_state(
+            _spec(payload),
+            target,
+            data_root=data_root,
+            policy=_policy(),
+        )
+    assert caught.value.report.code is AcquisitionFailureCode.LOCAL_STATE_INVALID
+    assert part_path_for(target).read_bytes() == payload[:3]
+    assert central_part.read_bytes() == payload[:5]
+
+
+def test_stream_read_is_bounded_by_the_overall_deadline(tmp_path: Path) -> None:
+    payload = b"deadline"
+    target = tmp_path / "asset.bin"
+
+    class BlockingStream:
+        def read(self, _size: int) -> bytes:
+            time.sleep(0.3)
+            return payload
+
+    started = time.monotonic()
+    with pytest.raises(AssetAcquisitionError) as caught:
+        receive_streamed_asset(
+            _spec(payload),
+            target,
+            BlockingStream(),  # type: ignore[arg-type]
+            policy=_policy(overall_timeout=0.03),
+        )
+    assert caught.value.report.code is AcquisitionFailureCode.OVERALL_TIMEOUT
+    assert time.monotonic() - started < 0.2
+
+
+def test_post_link_verification_closes_candidate_publish_toctou(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = b"verified candidate"
+    rival = b"mutated candidate!"
+    assert len(payload) == len(rival)
+    target = tmp_path / "toctou.bin"
+    state = _HTTPState(payload)
+    real_link = acquisition.os.link
+
+    def mutate_then_link(
+        source: str | bytes | Path,
+        destination: str | bytes | Path,
+        *,
+        follow_symlinks: bool = True,
+    ) -> None:
+        Path(source).write_bytes(rival)
+        real_link(source, destination, follow_symlinks=follow_symlinks)
+
+    monkeypatch.setattr(acquisition.os, "link", mutate_then_link)
+    with _serve(state) as runtime_url:
+        with pytest.raises(AssetAcquisitionError) as caught:
+            acquire_http_asset(
+                _spec(payload),
+                runtime_url,
+                target,
+                policy=_policy(max_attempts=1),
+            )
+    assert caught.value.report.code is AcquisitionFailureCode.HASH_MISMATCH
+    assert not target.exists()
+    assert part_path_for(target).read_bytes() == b""

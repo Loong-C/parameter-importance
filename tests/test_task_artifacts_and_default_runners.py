@@ -15,6 +15,7 @@ from param_importance_nlp.contracts import (
 from param_importance_nlp.contracts.config_v2 import ResolvedConfigV2
 from param_importance_nlp.contracts.task_catalog import RunnerKind
 from param_importance_nlp.experiments import build_default_task_runtime
+from param_importance_nlp.experiments import task_runners as task_runners_module
 from param_importance_nlp.runtime import (
     CheckpointStore,
     TaskArtifactStore,
@@ -40,6 +41,83 @@ def _base_config(*, stage: int, task_id: str) -> ResolvedConfig:
 def test_default_runtime_registers_every_runner_kind(tmp_path) -> None:
     runtime = build_default_task_runtime(tmp_path)
     assert set(runtime.registered_kinds) == set(RunnerKind)
+
+
+class _CloseRecorder:
+    def __init__(
+        self,
+        name: str,
+        events: list[str],
+        *,
+        fail: bool = False,
+    ) -> None:
+        self.name = name
+        self.events = events
+        self.fail = fail
+
+    def close(self) -> None:
+        self.events.append(self.name)
+        if self.fail:
+            raise RuntimeError(f"close failed:{self.name}")
+
+
+def _cleanup_test_resources(events: list[str], *, fail_dataset: bool = False):
+    return task_runners_module._TrainingResources(
+        model=object(),  # type: ignore[arg-type]
+        dataset=_CloseRecorder("dataset", events, fail=fail_dataset),
+        evaluation_dataset=_CloseRecorder("evaluation_dataset", events),
+        evaluator=None,
+        task_name="cleanup-fixture",
+        asset_evidence=(),
+    )
+
+
+def test_training_runner_closes_cursor_then_datasets_on_success(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+    resources = _cleanup_test_resources(events)
+    sentinel = ("completed",)
+
+    def _successful_impl(self, request, **kwargs):
+        kwargs["cleanup_handles"].append(_CloseRecorder("cursor", events))
+        return sentinel
+
+    monkeypatch.setattr(
+        task_runners_module.TrainingTaskRunner,
+        "_run_training_impl",
+        _successful_impl,
+    )
+    runner = task_runners_module.TrainingTaskRunner(tmp_path)
+
+    assert runner._run_training(object(), resources=resources) == sentinel  # type: ignore[arg-type,comparison-overlap]
+    assert events == ["cursor", "evaluation_dataset", "dataset"]
+
+
+def test_training_runner_cleanup_does_not_mask_primary_error(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+    resources = _cleanup_test_resources(events, fail_dataset=True)
+
+    def _failing_impl(self, request, **kwargs):
+        kwargs["cleanup_handles"].append(
+            _CloseRecorder("cursor", events, fail=True)
+        )
+        raise ValueError("primary training failure")
+
+    monkeypatch.setattr(
+        task_runners_module.TrainingTaskRunner,
+        "_run_training_impl",
+        _failing_impl,
+    )
+    runner = task_runners_module.TrainingTaskRunner(tmp_path)
+
+    with pytest.raises(ValueError, match="primary training failure"):
+        runner._run_training(object(), resources=resources)  # type: ignore[arg-type]
+    assert events == ["cursor", "evaluation_dataset", "dataset"]
 
 
 def test_training_task_is_idempotent_and_publishes_safe_state(tmp_path) -> None:

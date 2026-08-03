@@ -35,7 +35,6 @@ from typing import Mapping, Sequence
 
 import torch
 
-from ..assets import resolve_ready_asset
 from ..contracts.jsonio import (
     JSONValue,
     canonical_json_hash,
@@ -46,12 +45,19 @@ from ..contracts.status import GateRecord, GateStatus
 from ..contracts.task_catalog import RunnerKind
 from ..core.pruning import PruningContext, PruningPlan, select_pruned_coordinates
 from ..core.tensors import TensorMap
+from ..g3_runtime_assets import (
+    FormalG3RuntimeAssets,
+    G3RuntimeAssetError,
+    formal_pile_route,
+    reject_legacy_provider_paths,
+)
+from ..providers.huggingface_offline import PretokenizedGlueDatasetAdapter
+from ..providers.pythia_mmap import PythiaMMapDatasetAdapter
 from ..providers.tiny import TinyTrainingFixture, build_tiny_training_fixture
 from ..providers.training import (
     CausalLMEvaluator,
     ClassificationEvaluator,
     OfflineHuggingFaceModelAdapter,
-    PretokenizedJsonlDatasetAdapter,
     TorchModelAdapter,
     TrainingMicrobatch,
     configure_batch_cursor,
@@ -951,6 +957,7 @@ class _RoutePhaseBuilder:
         self.evaluation_steps: dict[str, tuple[int, ...]] = {}
         self._sinks: list[JsonlEventSink] = []
         self._cursors: list[object] = []
+        self._g3_runtime_assets: FormalG3RuntimeAssets | None = None
 
     def close(self) -> None:
         for sink in self._sinks:
@@ -974,19 +981,22 @@ class _RoutePhaseBuilder:
             )
         return {**base, **dict(raw)}
 
-    @staticmethod
-    def _select_dataset_file(asset: object, split: str) -> Path:
-        matches = [
-            item.path
-            for item in tuple(getattr(asset, "files"))
-            if item.path.suffix.casefold() in {".jsonl", ".json"}
-            and (item.role == split or split.casefold() in item.relative_path.casefold())
-        ]
-        if len(matches) != 1:
-            raise ValueError(
-                f"STAGE456_DATASET_SPLIT_FILE_NOT_UNIQUE:{split}:count={len(matches)}"
+    def _formal_g3_assets(self) -> FormalG3RuntimeAssets:
+        if self._g3_runtime_assets is not None:
+            return self._g3_runtime_assets
+        resolution_ref = self.request.environment.evidence_refs.get("g3_resolution")
+        try:
+            self._g3_runtime_assets = FormalG3RuntimeAssets.from_request(
+                self.request, self.workspace_root
             )
-        return matches[0]
+        except G3RuntimeAssetError as error:
+            raise _blocked_missing(
+                BlockerCode.ASSET_UNAVAILABLE,
+                "qualified_g3_runtime_assets",
+                f"qualified G3 runtime assets unavailable: {error}",
+                evidence_refs=(resolution_ref,) if isinstance(resolution_ref, str) else (),
+            ) from error
+        return self._g3_runtime_assets
 
     def resources(
         self,
@@ -1054,62 +1064,145 @@ class _RoutePhaseBuilder:
 
         if providers["kind"] != "offline_hf":
             raise ValueError("STAGE456_PROVIDER_KIND_UNSUPPORTED")
-        pairs = (
-            ("model_manifest_ref", "model_root_ref"),
-            ("data_manifest_ref", "data_root_ref"),
-            ("tokenizer_manifest_ref", "tokenizer_root_ref"),
+        if self.request.config.run_intent != "formal":
+            raise ValueError("STAGE456_OFFLINE_HF_REQUIRES_FORMAL_INTENT")
+        reject_legacy_provider_paths(providers)
+        runtime_assets = self._formal_g3_assets()
+        model_config = self.request.config.base_config.section("model")
+        stage = int(identity["stage"])
+        assert isinstance(model_config, dict)
+        expected_data_kind = (
+            "pile" if options.task_type == "causal_lm" else "glue_derived"
         )
-        assets = []
-        evidence: list[Mapping[str, JSONValue]] = []
-        for manifest_field, root_field in pairs:
-            manifest_ref = providers[manifest_field]
-            root_ref = providers[root_field]
-            if manifest_ref is None or root_ref is None:
-                raise _blocked_missing(
-                    BlockerCode.ASSET_UNAVAILABLE,
-                    manifest_field,
-                    f"formal phase 缺少 {manifest_field}/{root_field}",
-                )
-            try:
-                asset = resolve_ready_asset(
-                    _resolve(self.workspace_root, manifest_ref, field_name=manifest_field),
-                    _resolve(self.workspace_root, root_ref, field_name=root_field),
-                )
-            except FileNotFoundError as error:
-                raise _blocked_missing(
-                    BlockerCode.ASSET_UNAVAILABLE,
-                    manifest_field,
-                    str(error),
-                    evidence_refs=(str(manifest_ref),),
-                ) from error
-            assets.append(asset)
-            evidence.append(
-                {
-                    "manifest_ref": str(manifest_ref),
-                    "asset_id": asset.asset_id,
-                    "file_count": len(asset.files),
-                }
+        try:
+            model_asset = runtime_assets.resolve(
+                phase.model_asset_id, expected_kind="model"
             )
-        model_asset, data_asset, _tokenizer_asset = assets
-        if model_asset.asset_id != phase.model_asset_id:
-            raise ValueError("STAGE456_ROUTE_MODEL_ASSET_ID_MISMATCH")
-        if data_asset.asset_id != phase.dataset_asset_id:
-            raise ValueError("STAGE456_ROUTE_DATASET_ASSET_ID_MISMATCH")
+            data_asset = runtime_assets.resolve(
+                phase.dataset_asset_id, expected_kind=expected_data_kind
+            )
+            tokenizer_asset = runtime_assets.resolve(
+                str(model_config["tokenizer_asset_id"]), expected_kind="tokenizer"
+            )
+        except G3RuntimeAssetError as error:
+            raise _blocked_missing(
+                BlockerCode.ASSET_UNAVAILABLE,
+                "qualified_g3_phase_assets",
+                f"route phase asset resolution failed: {error}",
+                evidence_refs=(runtime_assets.resolution_ref,),
+            ) from error
+        runtime_lineage_sha256 = runtime_assets.runtime_lineage_sha256(
+            model_asset, data_asset, tokenizer_asset
+        )
+        evidence: list[Mapping[str, JSONValue]] = [
+            model_asset.provenance(),
+            data_asset.provenance(),
+            tokenizer_asset.provenance(),
+        ]
         with torch.random.fork_rng(devices=[]):
             torch.manual_seed(master_seed)
             model = OfflineHuggingFaceModelAdapter.from_local_directory(
-                model_asset.root,
+                model_asset.resolved.root,
                 task_type=options.task_type,
                 num_labels=options.num_labels,
             )
         split = options.evaluation_split if evaluation else options.training_split
-        source = self._select_dataset_file(data_asset, split)
-        dataset = PretokenizedJsonlDatasetAdapter(
-            source,
-            dataset_id=data_asset.asset_id,
-            microbatch_size=microbatch_size,
-            microbatches_per_step=micros_per_step,
-            tensor_fields=("input_ids", "attention_mask", "labels"),
+        evaluation_config = self.request.config.section("evaluation")
+        assert isinstance(evaluation_config, dict)
+        dataset_microbatch_size = (
+            int(evaluation_config["batch_size"])
+            if evaluation
+            else microbatch_size
+        )
+        dataset_micros = 1 if evaluation else micros_per_step
+        if data_asset.storage_kind == "pythia_mmap_shards":
+            if options.task_type != "causal_lm":
+                raise ValueError("STAGE456_PYTHIA_MMAP_TASK_TYPE_MISMATCH")
+            route = formal_pile_route(
+                stage=stage,
+                evaluation=evaluation,
+                declared_sampling_design=str(data["sampling_design"]),
+                configured_split=split,
+            )
+            start, stop = runtime_assets.pile_split_interval(data_asset, route.split)
+            if evaluation:
+                requested_records = dataset_microbatch_size * int(
+                    evaluation_config["max_batches"] or 1
+                )
+                runtime_assets.validate_pile_budget(
+                    stage=stage,
+                    split=route.split,
+                    requested_records=requested_records,
+                )
+            else:
+                global_batch_size = int(batching["global_batch_size"])
+                if (
+                    microbatch_size * micros_per_step * self.world_size
+                    != global_batch_size
+                ):
+                    raise G3RuntimeAssetError(
+                        "G3_RUNTIME_GLOBAL_BATCH_ROUTE_MISMATCH"
+                    )
+                runtime_assets.validate_pile_budget(
+                    stage=stage,
+                    split=route.split,
+                    requested_records=options.max_steps * global_batch_size,
+                    max_steps=options.max_steps,
+                    global_batch_size=global_batch_size,
+                )
+            dataset = PythiaMMapDatasetAdapter(
+                runtime_assets.pythia_dataset(data_asset, split=route.split),
+                asset_id=data_asset.resolved.asset_id,
+                ready_manifest_sha256=data_asset.ready_manifest_sha256,
+                qualification_sha256=data_asset.qualification_artifact_hash,
+                g3_resolution_artifact_hash=(
+                    runtime_assets.resolution_artifact_hash
+                ),
+                g3_source_commit=runtime_assets.source_git_commit,
+                g3_runtime_lineage_sha256=runtime_lineage_sha256,
+                split_start=start,
+                split_stop=stop,
+                microbatch_size=dataset_microbatch_size,
+                microbatches_per_step=dataset_micros,
+                sampling_design=route.sampling_design,
+            )
+            self._cursors.append(dataset)
+        elif data_asset.storage_kind == "hf_load_from_disk":
+            if options.task_type != "sequence_classification":
+                raise ValueError("STAGE456_GLUE_TASK_TYPE_MISMATCH")
+            glue_task = data_asset.require_glue_route(
+                task_name=str(providers["task_name"]),
+                split=split,
+            )
+            dataset = PretokenizedGlueDatasetAdapter(
+                data_asset.resolved.root,
+                task_name=glue_task,
+                split=split,
+                dataset_id=data_asset.resolved.asset_id,
+                microbatch_size=dataset_microbatch_size,
+                microbatches_per_step=dataset_micros,
+                expected_asset_hash=data_asset.directory_content_sha256,
+                allowed_root=data_asset.resolved.root,
+                g3_resolution_artifact_hash=(
+                    runtime_assets.resolution_artifact_hash
+                ),
+                g3_source_commit=runtime_assets.source_git_commit,
+                g3_runtime_lineage_sha256=runtime_lineage_sha256,
+            )
+        else:
+            raise G3RuntimeAssetError(
+                f"G3_RUNTIME_STORAGE_KIND_UNSUPPORTED:{data_asset.storage_kind}"
+            )
+        evidence.append(
+            {
+                "schema_version": "stage456-qualified-provider-route-v1",
+                "stage": stage,
+                "phase_id": phase.phase_id,
+                "evaluation": evaluation,
+                "split": split,
+                "storage_kind": data_asset.storage_kind,
+                "dataset_state_digest": dataset.state_digest(),
+            }
         )
         return _PhaseResources(model, dataset, options, tuple(evidence))
 

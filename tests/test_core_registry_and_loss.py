@@ -12,6 +12,7 @@ from param_importance_nlp.core import (
     causal_lm_loss,
     sequence_classification_loss,
 )
+from param_importance_nlp.core.losses import pre_shifted_causal_lm_loss
 
 
 class _AliasedModel(torch.nn.Module):
@@ -134,6 +135,35 @@ def test_causal_lm_loss_shift_mask_and_gradient() -> None:
     batch.mean_loss.backward()
     assert logits.grad is not None
     assert torch.count_nonzero(logits.grad[:, 2:]) == 0
+
+
+def test_pre_shifted_causal_lm_loss_uses_every_aligned_target() -> None:
+    logits = torch.tensor(
+        [
+            [
+                [4.0, 0.0, 0.0],
+                [0.0, 4.0, 0.0],
+                [0.0, 0.0, 4.0],
+                [4.0, 0.0, 0.0],
+            ]
+        ],
+        requires_grad=True,
+    )
+    target_ids = torch.tensor([[0, 1, 2, 1]])
+    attention_mask = torch.tensor([[1, 1, 1, 0]])
+    batch = pre_shifted_causal_lm_loss(logits, target_ids, attention_mask)
+    expected = functional.cross_entropy(
+        logits[:, :3].reshape(-1, 3),
+        target_ids[:, :3].reshape(-1),
+        reduction="sum",
+    )
+    assert batch.effective_count == 3
+    assert batch.statistical_unit == "target_token"
+    torch.testing.assert_close(batch.loss_numerator, expected)
+    batch.mean_loss.backward()
+    assert logits.grad is not None
+    assert torch.count_nonzero(logits.grad[:, :3]) > 0
+    assert torch.count_nonzero(logits.grad[:, 3:]) == 0
 
 
 def test_classification_loss_and_weighted_merge() -> None:
