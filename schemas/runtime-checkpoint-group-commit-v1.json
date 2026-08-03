@@ -1,0 +1,87 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "runtime-checkpoint-group-commit-v1.json",
+  "title": "Runtime Checkpoint Group Commit v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "checkpoint_id", "generation", "run_id", "world_size", "parent_checkpoint_id", "last_completed_step", "next_step", "rank_checkpoints", "shared_state_sha256", "metadata", "commit_sha256"],
+  "properties": {
+    "schema_version": {"const": "runtime.checkpoint-group-commit.v1"},
+    "checkpoint_id": {"$ref": "#/$defs/id"},
+    "generation": {"type": "integer", "minimum": 0},
+    "run_id": {"type": "string", "minLength": 1},
+    "world_size": {"type": "integer", "minimum": 1},
+    "parent_checkpoint_id": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/id"}]},
+    "last_completed_step": {"type": "integer", "minimum": 0},
+    "next_step": {"type": "integer", "minimum": 1},
+    "rank_checkpoints": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/rank"}},
+    "shared_state_sha256": {
+      "type": "object", "additionalProperties": false,
+      "required": ["model_sha256", "optimizer_sha256", "scheduler_sha256", "scaler_sha256", "importance_sha256"],
+      "properties": {
+        "model_sha256": {"$ref": "#/$defs/hash"},
+        "optimizer_sha256": {"$ref": "#/$defs/hash"},
+        "scheduler_sha256": {"$ref": "#/$defs/hash"},
+        "scaler_sha256": {"$ref": "#/$defs/hash"},
+        "importance_sha256": {"$ref": "#/$defs/hash"}
+      }
+    },
+    "metadata": {"$ref": "#/$defs/metadata"},
+    "commit_sha256": {"$ref": "#/$defs/hash"}
+  },
+  "$defs": {
+    "hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"},
+    "logicalRef": {"type": "string", "minLength": 1, "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.(?:/|$))(?!.*\\\\).+$"},
+    "eventPointer": {
+      "type": "object", "additionalProperties": false,
+      "required": ["event_ref", "event_sha256", "checkpoint_event_sequence"],
+      "properties": {
+        "event_ref": {"$ref": "#/$defs/logicalRef"},
+        "event_sha256": {"$ref": "#/$defs/hash"},
+        "checkpoint_event_sequence": {"type": "integer", "minimum": 0}
+      }
+    },
+    "rank": {
+      "type": "object", "additionalProperties": false,
+      "required": ["rank", "checkpoint_store_ref", "checkpoint_id", "commit_ref", "commit_sha256", "bundle_manifest_sha256", "full_state_sha256", "model_sha256", "optimizer_sha256", "scheduler_sha256", "scaler_sha256", "importance_sha256", "rng_sha256", "cursor_sha256", "event_pointer"],
+      "properties": {
+        "rank": {"type": "integer", "minimum": 0},
+        "checkpoint_store_ref": {"$ref": "#/$defs/logicalRef"},
+        "checkpoint_id": {"$ref": "#/$defs/id"},
+        "commit_ref": {"$ref": "#/$defs/logicalRef"},
+        "commit_sha256": {"$ref": "#/$defs/hash"},
+        "bundle_manifest_sha256": {"$ref": "#/$defs/hash"},
+        "full_state_sha256": {"$ref": "#/$defs/hash"},
+        "model_sha256": {"$ref": "#/$defs/hash"},
+        "optimizer_sha256": {"$ref": "#/$defs/hash"},
+        "scheduler_sha256": {"$ref": "#/$defs/hash"},
+        "scaler_sha256": {"$ref": "#/$defs/hash"},
+        "importance_sha256": {"$ref": "#/$defs/hash"},
+        "rng_sha256": {"$ref": "#/$defs/hash"},
+        "cursor_sha256": {"$ref": "#/$defs/hash"},
+        "event_pointer": {"$ref": "#/$defs/eventPointer"}
+      }
+    },
+    "metadata": {
+      "type": "object", "additionalProperties": false,
+      "required": ["config_hash", "environment_hash", "model_manifest_id", "data_manifest_id", "sampler_seed", "epoch", "committed_global_batch", "next_global_batch", "prefetch_policy", "snapshot_type", "state_extension_schema", "save_wall_seconds", "checkpoint_bytes", "peak_memory_bytes"],
+      "properties": {
+        "config_hash": {"$ref": "#/$defs/hash"},
+        "environment_hash": {"$ref": "#/$defs/hash"},
+        "model_manifest_id": {"type": "string", "minLength": 1},
+        "data_manifest_id": {"type": "string", "minLength": 1},
+        "sampler_seed": {"type": "integer", "minimum": 0},
+        "epoch": {"type": "integer", "minimum": 0},
+        "committed_global_batch": {"type": "integer", "minimum": 0},
+        "next_global_batch": {"type": "integer", "minimum": 0},
+        "prefetch_policy": {"type": "string", "minLength": 1},
+        "snapshot_type": {"const": "optimizer_step_checkpoint"},
+        "state_extension_schema": {"type": "string", "minLength": 1},
+        "save_wall_seconds": {"type": "number", "minimum": 0},
+        "checkpoint_bytes": {"type": "integer", "minimum": 0},
+        "peak_memory_bytes": {"type": "integer", "minimum": 0}
+      }
+    }
+  }
+}

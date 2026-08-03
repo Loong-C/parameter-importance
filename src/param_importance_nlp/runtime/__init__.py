@@ -2,10 +2,16 @@
 
 from .checkpoint import (
     CheckpointCommit,
+    CheckpointPurgeApplication,
     CheckpointRetentionApplication,
     CheckpointRetentionPolicy,
     CheckpointRetentionSelection,
     CheckpointStore,
+)
+from .checkpoint_group import (
+    CheckpointGroupCommit,
+    CheckpointGroupStore,
+    checkpoint_state_sha256,
 )
 from .events import (
     EventRecord,
@@ -86,11 +92,15 @@ from .training_factory import build_grad_scaler, build_optimizer, build_schedule
 
 __all__ = [
     "CheckpointCommit",
+    "CheckpointPurgeApplication",
     "AttemptCommitEvent",
     "CheckpointRetentionApplication",
     "CheckpointRetentionPolicy",
     "CheckpointRetentionSelection",
     "CheckpointStore",
+    "CheckpointGroupCommit",
+    "CheckpointGroupStore",
+    "checkpoint_state_sha256",
     "BlockerCode",
     "DistributedLaunchSpec",
     "AttemptDisposition",

@@ -1,0 +1,35 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "stage0-g7-recovery-evidence-v1.json",
+  "title": "Stage 0 G7 Recovery Evidence v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "artifact_role", "status", "checked_at", "generator_git_commit", "environment_hash", "gate_id", "logging_component_refs", "suite_root_ref", "suite_environment_ref", "config_refs", "worker_report_refs", "boundary_refs", "launch_transcript_refs", "cpu_reference_ref", "fault_report_ref", "retention_report_ref", "validation_report", "gate_record", "gate_report", "artifact_hash"],
+  "properties": {
+    "schema_version": {"const": "stage0-g7-recovery-evidence-v1"},
+    "artifact_role": {"enum": ["checkpoint_commit", "resume_equivalence_report", "retention_report"]},
+    "status": {"const": "PASS"},
+    "checked_at": {"type": "string", "format": "date-time"},
+    "generator_git_commit": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+    "environment_hash": {"$ref": "#/$defs/hash"},
+    "gate_id": {"const": "stage0.G7"},
+    "logging_component_refs": {"type": "array", "minItems": 3, "maxItems": 3, "uniqueItems": true, "items": {"$ref": "#/$defs/ref"}},
+    "suite_root_ref": {"$ref": "#/$defs/ref"},
+    "suite_environment_ref": {"$ref": "#/$defs/ref"},
+    "config_refs": {"type": "array", "minItems": 2, "maxItems": 2, "uniqueItems": true, "items": {"$ref": "#/$defs/ref"}},
+    "worker_report_refs": {"type": "array", "minItems": 4, "maxItems": 4, "uniqueItems": true, "items": {"$ref": "#/$defs/ref"}},
+    "boundary_refs": {"type": "array", "minItems": 2, "maxItems": 2, "uniqueItems": true, "items": {"$ref": "#/$defs/ref"}},
+    "launch_transcript_refs": {"type": "array", "minItems": 6, "maxItems": 6, "uniqueItems": true, "items": {"$ref": "#/$defs/ref"}},
+    "cpu_reference_ref": {"$ref": "#/$defs/ref"},
+    "fault_report_ref": {"$ref": "#/$defs/ref"},
+    "retention_report_ref": {"$ref": "#/$defs/ref"},
+    "validation_report": {"type": "object"},
+    "gate_record": {"type": "object"},
+    "gate_report": {"type": "object"},
+    "artifact_hash": {"$ref": "#/$defs/hash"}
+  },
+  "$defs": {
+    "hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "ref": {"type": "string", "minLength": 1, "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.(?:/|$))(?!.*\\\\).+$"}
+  }
+}

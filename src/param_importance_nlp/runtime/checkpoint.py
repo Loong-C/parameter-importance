@@ -10,6 +10,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+import shutil
 from types import MappingProxyType
 from typing import Any, Mapping
 
@@ -192,6 +193,27 @@ class CheckpointRetentionApplication:
             raise ValueError("CHECKPOINT_RETENTION_PATH_COUNT_MISMATCH")
 
 
+@dataclass(frozen=True, slots=True)
+class CheckpointPurgeApplication:
+    """Result of an exact-ID physical purge authorized by a durable intent."""
+
+    checkpoint_id: str
+    purge_intent_path: str
+    purge_record_path: str
+    released_bytes: int
+    objects_deleted: int = 1
+    schema_version: str = "runtime.checkpoint-purge-application.v1"
+
+    def __post_init__(self) -> None:
+        if self.schema_version != "runtime.checkpoint-purge-application.v1":
+            raise ValueError("CHECKPOINT_PURGE_APPLICATION_SCHEMA_MISMATCH")
+        CheckpointStore._validate_id(self.checkpoint_id)
+        if self.objects_deleted != 1 or self.released_bytes <= 0:
+            raise ValueError("CHECKPOINT_PURGE_APPLICATION_COUNTS_INVALID")
+        if not self.purge_intent_path or not self.purge_record_path:
+            raise ValueError("CHECKPOINT_PURGE_APPLICATION_PATH_MISSING")
+
+
 class CheckpointStore:
     """只发现已提交 checkpoint 的本地文件存储。"""
 
@@ -200,7 +222,15 @@ class CheckpointStore:
         self.objects = self.root / "objects"
         self.commits = self.root / "commits"
         self.tombstones = self.root / "tombstones"
-        for path in (self.objects, self.commits, self.tombstones):
+        self.purge_intents = self.root / "purge-intents"
+        self.purges = self.root / "purges"
+        for path in (
+            self.objects,
+            self.commits,
+            self.tombstones,
+            self.purge_intents,
+            self.purges,
+        ):
             path.mkdir(parents=True, exist_ok=True)
 
     @staticmethod
@@ -400,6 +430,118 @@ class CheckpointStore:
     def _is_tombstoned(self, checkpoint_id: str) -> bool:
         return self._read_tombstone(checkpoint_id) is not None
 
+    def _read_purge_intent(
+        self,
+        checkpoint_id: str,
+        *,
+        commit_value: dict[str, Any] | None = None,
+        tombstone_value: dict[str, Any] | None = None,
+    ) -> dict[str, Any] | None:
+        path = self.purge_intents / f"{checkpoint_id}.json"
+        if not path.exists():
+            return None
+        value = load_canonical_json(path)
+        if not isinstance(value, dict):
+            raise ValueError("CHECKPOINT_PURGE_INTENT_ROOT_NOT_OBJECT")
+        expected = {
+            "schema_version",
+            "checkpoint_id",
+            "commit_sha256",
+            "tombstone_sha256",
+            "bundle_manifest_sha256",
+            "object_relative_path",
+            "authorized_release_bytes",
+            "reason",
+            "authorized_at",
+            "intent_hash",
+        }
+        if set(value) != expected or value.get("schema_version") != (
+            "runtime.checkpoint-purge-intent.v1"
+        ):
+            raise ValueError("CHECKPOINT_PURGE_INTENT_FIELDS_OR_VERSION_INVALID")
+        declared = value.pop("intent_hash")
+        if declared != stable_json_hash(value):
+            raise ValueError("CHECKPOINT_PURGE_INTENT_HASH_MISMATCH")
+        value["intent_hash"] = declared
+        if value.get("checkpoint_id") != checkpoint_id:
+            raise ValueError("CHECKPOINT_PURGE_INTENT_ID_MISMATCH")
+        commit = (
+            commit_value
+            if commit_value is not None
+            else self._read_commit(checkpoint_id)
+        )
+        tombstone = (
+            tombstone_value
+            if tombstone_value is not None
+            else self._read_tombstone(checkpoint_id, commit_value=commit)
+        )
+        if tombstone is None:
+            raise ValueError("CHECKPOINT_PURGE_INTENT_WITHOUT_TOMBSTONE")
+        if (
+            value.get("commit_sha256") != stable_json_hash(commit)
+            or value.get("tombstone_sha256") != stable_json_hash(tombstone)
+            or value.get("bundle_manifest_sha256")
+            != commit["bundle_manifest_sha256"]
+            or value.get("object_relative_path")
+            != commit["object_relative_path"]
+        ):
+            raise ValueError("CHECKPOINT_PURGE_INTENT_IDENTITY_MISMATCH")
+        released = value.get("authorized_release_bytes")
+        if isinstance(released, bool) or not isinstance(released, int) or released <= 0:
+            raise ValueError("CHECKPOINT_PURGE_INTENT_RELEASE_BYTES_INVALID")
+        if not isinstance(value.get("reason"), str) or not value["reason"].strip():
+            raise ValueError("CHECKPOINT_PURGE_INTENT_REASON_INVALID")
+        if not isinstance(value.get("authorized_at"), str) or not value["authorized_at"]:
+            raise ValueError("CHECKPOINT_PURGE_INTENT_TIMESTAMP_INVALID")
+        return value
+
+    def _read_purge_record(
+        self,
+        checkpoint_id: str,
+        *,
+        intent_value: dict[str, Any] | None = None,
+    ) -> dict[str, Any] | None:
+        path = self.purges / f"{checkpoint_id}.json"
+        if not path.exists():
+            return None
+        value = load_canonical_json(path)
+        if not isinstance(value, dict):
+            raise ValueError("CHECKPOINT_PURGE_RECORD_ROOT_NOT_OBJECT")
+        expected = {
+            "schema_version",
+            "checkpoint_id",
+            "purge_intent_hash",
+            "released_bytes",
+            "objects_deleted",
+            "completed_at",
+            "record_hash",
+        }
+        if set(value) != expected or value.get("schema_version") != (
+            "runtime.checkpoint-purge-record.v1"
+        ):
+            raise ValueError("CHECKPOINT_PURGE_RECORD_FIELDS_OR_VERSION_INVALID")
+        declared = value.pop("record_hash")
+        if declared != stable_json_hash(value):
+            raise ValueError("CHECKPOINT_PURGE_RECORD_HASH_MISMATCH")
+        value["record_hash"] = declared
+        intent = (
+            intent_value
+            if intent_value is not None
+            else self._read_purge_intent(checkpoint_id)
+        )
+        if intent is None:
+            raise ValueError("CHECKPOINT_PURGE_RECORD_WITHOUT_INTENT")
+        if (
+            value.get("checkpoint_id") != checkpoint_id
+            or value.get("purge_intent_hash") != intent["intent_hash"]
+            or value.get("released_bytes") != intent["authorized_release_bytes"]
+            or value.get("objects_deleted") != 1
+            or not isinstance(value.get("completed_at"), str)
+            or not value["completed_at"]
+        ):
+            raise ValueError("CHECKPOINT_PURGE_RECORD_IDENTITY_INVALID")
+        return value
+
     def _load_verified_lineage(
         self,
         checkpoint_id: str,
@@ -470,14 +612,33 @@ class CheckpointStore:
                 and tombstone is not None
             ):
                 raise ValueError(f"CHECKPOINT_TOMBSTONED:{current_id}")
-
-            state, bundle = load_tensor_bundle(
-                self.root / value["object_relative_path"]
+            purge_intent = self._read_purge_intent(
+                current_id,
+                commit_value=value,
+                tombstone_value=tombstone,
             )
-            if bundle.manifest_sha256 != value["bundle_manifest_sha256"]:
-                raise ValueError(
-                    f"CHECKPOINT_BUNDLE_HASH_MISMATCH:{current_id}"
+            purge_record = (
+                None
+                if purge_intent is None
+                else self._read_purge_record(
+                    current_id,
+                    intent_value=purge_intent,
                 )
+            )
+            object_path = self.root / value["object_relative_path"]
+            state: Any = None
+            if object_path.exists():
+                if purge_record is not None:
+                    raise ValueError(
+                        f"CHECKPOINT_PURGE_RECORDED_BUT_OBJECT_PRESENT:{current_id}"
+                    )
+                state, bundle = load_tensor_bundle(object_path)
+                if bundle.manifest_sha256 != value["bundle_manifest_sha256"]:
+                    raise ValueError(
+                        f"CHECKPOINT_BUNDLE_HASH_MISMATCH:{current_id}"
+                    )
+            elif tombstone is None or purge_intent is None:
+                raise ValueError(f"CHECKPOINT_OBJECT_MISSING:{current_id}")
             if current_id == target_id:
                 target_state = state
                 target_value = value
@@ -663,6 +824,123 @@ class CheckpointStore:
             },
         )
         return target
+
+    def purge_tombstoned_object(
+        self,
+        checkpoint_id: str,
+        *,
+        reason: str,
+        protected_checkpoint_ids: tuple[str, ...] = (),
+    ) -> CheckpointPurgeApplication:
+        """Physically remove one tombstoned object after durable authorization.
+
+        The purge intent is published before deletion and binds the commit,
+        tombstone, bundle manifest, exact object path, and byte count.  A crash
+        after intent publication is therefore recoverable: reconciliation may
+        accept the missing bytes only as a tombstoned ancestor, never as an
+        active recovery target, and a retry deterministically finishes the
+        completion record.
+        """
+
+        self._validate_id(checkpoint_id)
+        if not isinstance(reason, str) or not reason.strip():
+            raise ValueError("CHECKPOINT_PURGE_REASON_REQUIRED")
+        protected = tuple(protected_checkpoint_ids)
+        if len(protected) != len(set(protected)):
+            raise ValueError("CHECKPOINT_PURGE_PROTECTED_IDS_DUPLICATE")
+        for item in protected:
+            self._validate_id(item)
+        if checkpoint_id in protected:
+            raise ValueError(f"CHECKPOINT_PURGE_TARGET_PROTECTED:{checkpoint_id}")
+        commit = self._read_commit(checkpoint_id)
+        tombstone = self._read_tombstone(
+            checkpoint_id,
+            commit_value=commit,
+        )
+        if tombstone is None:
+            raise ValueError(f"CHECKPOINT_PURGE_TARGET_NOT_TOMBSTONED:{checkpoint_id}")
+        object_path = self.root / commit["object_relative_path"]
+        if object_path.parent.resolve() != self.objects.resolve() or (
+            object_path.name != checkpoint_id
+        ):
+            raise ValueError("CHECKPOINT_PURGE_OBJECT_PATH_INVALID")
+        intent_path = self.purge_intents / f"{checkpoint_id}.json"
+        intent = self._read_purge_intent(
+            checkpoint_id,
+            commit_value=commit,
+            tombstone_value=tombstone,
+        )
+        if intent is None:
+            # Validate every byte immediately before authorizing its removal.
+            _, bundle = load_tensor_bundle(object_path)
+            if bundle.manifest_sha256 != commit["bundle_manifest_sha256"]:
+                raise ValueError("CHECKPOINT_PURGE_BUNDLE_HASH_MISMATCH")
+            released_bytes = sum(
+                path.stat().st_size
+                for path in object_path.rglob("*")
+                if path.is_file()
+            )
+            if released_bytes <= 0:
+                raise ValueError("CHECKPOINT_PURGE_OBJECT_EMPTY")
+            intent = {
+                "schema_version": "runtime.checkpoint-purge-intent.v1",
+                "checkpoint_id": checkpoint_id,
+                "commit_sha256": stable_json_hash(commit),
+                "tombstone_sha256": stable_json_hash(tombstone),
+                "bundle_manifest_sha256": commit["bundle_manifest_sha256"],
+                "object_relative_path": commit["object_relative_path"],
+                "authorized_release_bytes": released_bytes,
+                "reason": reason.strip(),
+                "authorized_at": _now(),
+            }
+            intent["intent_hash"] = stable_json_hash(intent)
+            atomic_write_json(intent_path, intent)
+            intent = self._read_purge_intent(
+                checkpoint_id,
+                commit_value=commit,
+                tombstone_value=tombstone,
+            )
+            if intent is None:  # pragma: no cover - atomic publication invariant
+                raise RuntimeError("CHECKPOINT_PURGE_INTENT_NOT_PUBLISHED")
+        if object_path.exists():
+            # Re-validate on retries before touching a partially completed
+            # operation.  A partial directory is a hard failure, not something
+            # this method guesses how to clean.
+            _, bundle = load_tensor_bundle(object_path)
+            if bundle.manifest_sha256 != intent["bundle_manifest_sha256"]:
+                raise ValueError("CHECKPOINT_PURGE_RETRY_BUNDLE_HASH_MISMATCH")
+            shutil.rmtree(object_path)
+        if object_path.exists():  # pragma: no cover - shutil failure raises first
+            raise RuntimeError("CHECKPOINT_PURGE_OBJECT_STILL_PRESENT")
+        record_path = self.purges / f"{checkpoint_id}.json"
+        record = self._read_purge_record(
+            checkpoint_id,
+            intent_value=intent,
+        )
+        if record is None:
+            record = {
+                "schema_version": "runtime.checkpoint-purge-record.v1",
+                "checkpoint_id": checkpoint_id,
+                "purge_intent_hash": intent["intent_hash"],
+                "released_bytes": intent["authorized_release_bytes"],
+                "objects_deleted": 1,
+                "completed_at": _now(),
+            }
+            record["record_hash"] = stable_json_hash(record)
+            atomic_write_json(record_path, record)
+            record = self._read_purge_record(
+                checkpoint_id,
+                intent_value=intent,
+            )
+            if record is None:  # pragma: no cover
+                raise RuntimeError("CHECKPOINT_PURGE_RECORD_NOT_PUBLISHED")
+        self.reconcile()
+        return CheckpointPurgeApplication(
+            checkpoint_id=checkpoint_id,
+            purge_intent_path=intent_path.relative_to(self.root).as_posix(),
+            purge_record_path=record_path.relative_to(self.root).as_posix(),
+            released_bytes=int(intent["authorized_release_bytes"]),
+        )
 
     def select_retention(
         self,

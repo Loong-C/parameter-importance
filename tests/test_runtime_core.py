@@ -432,6 +432,59 @@ def test_checkpoint_retention_rejects_stale_selection_and_can_keep_lineage(
         )
 
 
+def test_checkpoint_exact_id_purge_releases_bytes_and_preserves_active_lineage(
+    tmp_path: Path,
+) -> None:
+    store = CheckpointStore(tmp_path / "purge")
+    store.publish("step-0", {"x": torch.tensor([0])}, generation=0, metadata={})
+    store.publish(
+        "step-1",
+        {"x": torch.tensor([1])},
+        generation=1,
+        metadata={},
+        parent_checkpoint_id="step-0",
+    )
+    selection = store.select_retention(CheckpointRetentionPolicy(keep_latest=1))
+    store.apply_retention(selection, reason="purge fixture")
+
+    with pytest.raises(ValueError, match="CHECKPOINT_PURGE_TARGET_PROTECTED"):
+        store.purge_tombstoned_object(
+            "step-0",
+            reason="must reject protected target",
+            protected_checkpoint_ids=("step-0", "step-1"),
+        )
+
+    purged = store.purge_tombstoned_object(
+        "step-0",
+        reason="exact-ID purge fixture",
+        protected_checkpoint_ids=selection.keep_checkpoint_ids,
+    )
+    assert purged.objects_deleted == 1
+    assert purged.released_bytes > 0
+    assert not (store.objects / "step-0").exists()
+    assert (store.root / purged.purge_intent_path).is_file()
+    assert (store.root / purged.purge_record_path).is_file()
+    state, commit = store.load("step-1")
+    assert commit.checkpoint_id == "step-1"
+    assert torch.equal(state["x"], torch.tensor([1]))
+    assert store.reconcile() == {
+        "schema_version": "runtime.checkpoint-reconcile.v1",
+        "valid": ["step-1"],
+        "invalid": [],
+        "tombstoned": ["step-0"],
+        "orphan_objects": [],
+    }
+    with pytest.raises(ValueError, match="CHECKPOINT_TOMBSTONED"):
+        store.load("step-0")
+
+    replayed = store.purge_tombstoned_object(
+        "step-0",
+        reason="idempotent replay",
+        protected_checkpoint_ids=selection.keep_checkpoint_ids,
+    )
+    assert replayed == purged
+
+
 def test_cpu_training_checkpoint_resume_matches_uninterrupted(tmp_path: Path) -> None:
     """固定 CPU 输入上，checkpoint 边界不能改变 Momentum SGD 的最终状态。"""
 

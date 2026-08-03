@@ -1,0 +1,29 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "runtime-checkpoint-purge-record-v1.json",
+  "title": "Runtime Checkpoint Purge Record v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "checkpoint_id",
+    "purge_intent_hash",
+    "released_bytes",
+    "objects_deleted",
+    "completed_at",
+    "record_hash"
+  ],
+  "properties": {
+    "schema_version": {"const": "runtime.checkpoint-purge-record.v1"},
+    "checkpoint_id": {"$ref": "#/$defs/id"},
+    "purge_intent_hash": {"$ref": "#/$defs/hash"},
+    "released_bytes": {"type": "integer", "minimum": 1},
+    "objects_deleted": {"const": 1},
+    "completed_at": {"type": "string", "format": "date-time"},
+    "record_hash": {"$ref": "#/$defs/hash"}
+  },
+  "$defs": {
+    "hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"}
+  }
+}

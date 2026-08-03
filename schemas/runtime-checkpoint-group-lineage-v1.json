@@ -1,0 +1,28 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "runtime-checkpoint-group-lineage-v1.json",
+  "title": "Runtime Checkpoint Group Lineage v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "commits", "event_ref", "event_sha256", "artifact_hash"],
+  "properties": {
+    "schema_version": {"const": "runtime.checkpoint-group-lineage.v1"},
+    "commits": {
+      "type": "array",
+      "items": {
+        "type": "object", "additionalProperties": false,
+        "required": ["checkpoint_id", "generation", "parent_checkpoint_id", "commit_sha256"],
+        "properties": {
+          "checkpoint_id": {"type": "string", "minLength": 1},
+          "generation": {"type": "integer", "minimum": 0},
+          "parent_checkpoint_id": {"oneOf": [{"type": "null"}, {"type": "string", "minLength": 1}]},
+          "commit_sha256": {"$ref": "#/$defs/hash"}
+        }
+      }
+    },
+    "event_ref": {"type": "string", "minLength": 1},
+    "event_sha256": {"$ref": "#/$defs/hash"},
+    "artifact_hash": {"$ref": "#/$defs/hash"}
+  },
+  "$defs": {"hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"}}
+}

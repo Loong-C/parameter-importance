@@ -1,0 +1,38 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "runtime-checkpoint-purge-intent-v1.json",
+  "title": "Runtime Checkpoint Purge Intent v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "checkpoint_id",
+    "commit_sha256",
+    "tombstone_sha256",
+    "bundle_manifest_sha256",
+    "object_relative_path",
+    "authorized_release_bytes",
+    "reason",
+    "authorized_at",
+    "intent_hash"
+  ],
+  "properties": {
+    "schema_version": {"const": "runtime.checkpoint-purge-intent.v1"},
+    "checkpoint_id": {"$ref": "#/$defs/id"},
+    "commit_sha256": {"$ref": "#/$defs/hash"},
+    "tombstone_sha256": {"$ref": "#/$defs/hash"},
+    "bundle_manifest_sha256": {"$ref": "#/$defs/hash"},
+    "object_relative_path": {
+      "type": "string",
+      "pattern": "^objects/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+    },
+    "authorized_release_bytes": {"type": "integer", "minimum": 1},
+    "reason": {"type": "string", "minLength": 1},
+    "authorized_at": {"type": "string", "format": "date-time"},
+    "intent_hash": {"$ref": "#/$defs/hash"}
+  },
+  "$defs": {
+    "hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"}
+  }
+}
