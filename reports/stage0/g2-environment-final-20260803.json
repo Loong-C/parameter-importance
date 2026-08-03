@@ -1,0 +1,73 @@
+{
+  "schema_version": "stage0.environment-gate-summary.v1",
+  "generated_at": "2026-08-03T13:34:36+08:00",
+  "subtask": "S0.3",
+  "subtask_status": "COMPLETE",
+  "gate": {
+    "id": "G2",
+    "status": "PASS",
+    "training_eligible": true,
+    "published_classification": "TRAINING_ELIGIBLE",
+    "reason": "The previously accepted offline rebuild is now bound to a current-boot exact-four-GPU G0-G PASS, per-GPU CUDA tensor validation, and a four-rank NCCL communication smoke."
+  },
+  "candidate": {
+    "path": "/home/sophgo13/cjl/storage/parameter-importance/envs/parameter-importance-stage0-1bd963c65f75",
+    "environment_id": "env-v1-aaf55d32341c60a904b7d80a3c09d69bff7b7ee500e43f42a6432f65438d9d29",
+    "build_id": "env-build-v1-c023ca43cccc9a80634b9dd1c770cb7a62e10206fd96e6b3ea524b409ee601d4",
+    "python": "3.12.3",
+    "torch": "2.12.1+cu126",
+    "torch_cuda_runtime": "12.6",
+    "cudnn_runtime": "9.10.2",
+    "nccl_distribution": "2.29.3",
+    "nccl_runtime": "2.29.3"
+  },
+  "offline_rebuild_reference": {
+    "summary": "reports/stage0/g2-environment-candidate-20260719.json",
+    "status": "PASS",
+    "locked_distribution_count": 89,
+    "wheel_count": 89,
+    "freeze_matches_lock": true,
+    "pip_check": "PASS",
+    "external_network_attempts": 0,
+    "negative_missing_wheel_test": "PASS"
+  },
+  "gpu_gate_reference": {
+    "summary": "reports/stage0/g0-g-gpu-final-20260803.json",
+    "status": "PASS",
+    "allowed_gpu_count": 4,
+    "excluded_gpu_count": 4
+  },
+  "promotion": {
+    "source_commit": "c2b19f34389c210125cfb1407cdb9c8a539ff800",
+    "qualification_id": "gpuq-v1-bf47422fb498ccbe300742a2e22d819214e0de6939dd4fc85574683584fdd10b",
+    "qualification_manifest": "/home/sophgo13/cjl/storage/parameter-importance/manifests/environment-gpu-qualifications/gpuq-v1-bf47422fb498ccbe300742a2e22d819214e0de6939dd4fc85574683584fdd10b.json",
+    "qualification_sha256": "29d34128fc489a56d768dc247822530c673350562a87f1792f5d108e1113333c",
+    "qualification_mode_owner_links": "0644 sophgo13:sophgo13 1",
+    "recommendation": "/home/sophgo13/cjl/storage/parameter-importance/manifests/environment-recommended.json",
+    "recommendation_sha256": "a794615600cae0aef913df577118fc8fca26ef980ae73fb5271dc739ce96dd31",
+    "recommendation_mode_owner_links": "0644 sophgo13:sophgo13 1",
+    "published_at": "2026-08-03T05:32:41.888920+00:00",
+    "gpu_evidence_observed_at": "2026-08-03T05:11:56+00:00"
+  },
+  "superseded_qualification": {
+    "qualification_id": "gpuq-v1-68870f48fadeda2f8abe59ef7f6a1a7712cb8db88cc69b417080491ecd6e8f93",
+    "sha256": "cf081ea9db1afcab50ac7224936a9c4d7c14dadf880b7bb580c2178c54ff3251",
+    "reason": "Retained as immutable history; its generated_at field used the evidence time rather than the publication time. It is not referenced by environment-recommended.json."
+  },
+  "scope": {
+    "s0_3_complete": true,
+    "s0_4_through_s0_12_paused_by_project_owner": true,
+    "g6_distributed_semantics_claimed": false,
+    "formal_training_started": false,
+    "stage4_or_stage5_formal_artifacts_created": false
+  },
+  "persistence_decision": {
+    "status": "VALID_ON_2026-08-03",
+    "scope": "Stage 0 reproducible smoke artifacts only",
+    "expires_at": "2026-08-18T23:59:00+08:00",
+    "earlier_termination": "Stage 4 begins",
+    "stage4_or_stage5_formal_artifacts_excluded": true
+  },
+  "secrets_included": false,
+  "internal_server_paths_included_with_user_approval": true
+}

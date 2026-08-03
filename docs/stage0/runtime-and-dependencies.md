@@ -2,11 +2,13 @@
 
 ## 当前结论
 
-S0.3 的 CPU 与离线范围已经在服务器完成：严格 lock/freeze、wheelhouse TSV、
-稳定 `environment_id`、非破坏性离线重建、零外连审计、缺 wheel 负向演练和新候选
-Linux 全量测试均通过。机器可读摘要见
-`reports/stage0/g2-environment-candidate-20260719.json`。这仍不等于完整 G2 通过；
-管理员路径 B、逐卡 CUDA 健康和实际四卡 NCCL runtime 仍由 G0-G 阻塞。
+S0.3 已于 2026-08-03 完成并形成 `G2=PASS`。此前的严格 lock/freeze、wheelhouse
+TSV、稳定 `environment_id`、非破坏性离线重建、零外连审计、缺 wheel 负向演练和
+Linux 全量测试继续由
+`reports/stage0/g2-environment-candidate-20260719.json` 证明；本轮又完成管理员路径 B、
+逐白名单 GPU CUDA 张量检查和实际四卡 NCCL runtime 通信 smoke，并原子发布
+`TRAINING_ELIGIBLE` 推荐环境。最终机器可读摘要见
+`reports/stage0/g2-environment-final-20260803.json`。
 
 ## 运行时决策
 
@@ -61,8 +63,8 @@ lock provenance 完全一致；调用者不能用 `--dependency-input` 替换必
 bootstrap `pip`。
 
 核心导入输出不只留档，还逐项与 lock provenance 比对 Python series、核心模块、
-Torch CUDA runtime、cuDNN runtime 及 cuDNN/NCCL 分发包版本。实际 NCCL runtime
-保持空值并显式等待 G0-G 后的四卡通信复验。
+Torch CUDA runtime、cuDNN runtime 及 cuDNN/NCCL 分发包版本。2026-08-03 的资格
+清单已实测 PyTorch 2.12.1+cu126、CUDA runtime 12.6、cuDNN 9.10.2 和 NCCL 2.29.3。
 
 ## 版本字段边界
 
@@ -100,10 +102,14 @@ identity/build 不可变文件固定为 `0644`，对应子目录固定为 `0755`
 时还会拒绝 symlink、非普通文件、多硬链接以及组/其他可写权限，避免协作 umask 把
 证据悄然降级为可改写对象。
 
-当前 G0-G 仍为 `BLOCKED`，所以 CPU 导入和离线重建即使通过也只原子发布
-`environment-cpu-candidate.json`，其中 `training_eligible=false`、`g2_status=BLOCKED`。
-它不会更新普通训练推荐引用。只有管理员批准稳定四卡 PCI/UUID 白名单，并完成逐卡
-CUDA 健康复验与实际 NCCL runtime 采集后，才能形成完整 G2。
+历史 CPU/离线重建先发布 `environment-cpu-candidate.json`，其中
+`training_eligible=false`、`g2_status=BLOCKED`，该历史引用保留不覆盖。G0-G 路径 B、
+逐卡 CUDA 和四卡 NCCL 通信 smoke 通过后，
+`ops/stage0/promote_environment_after_gpu_gate.py` 对 root 管理员证据、smoke 哈希、
+当前启动、服务、驱动、精确 UUID、ECC、row-remap、内核日志和候选环境再次进行
+fail-closed 核验，再发布不可变 GPU qualification 和原子
+`environment-recommended.json`。当前推荐引用为 `training_eligible=true`、
+`g2_status=PASS`。这只完成 G2 环境边界，不冒充 S0.7 的 G6 分布式数值语义 gate。
 
 重建入口只接受 24 小时内、schema/G0-C/总状态自洽且 hostname 匹配当前服务器的
 GPU 基线；它还会在不调用 NVML/CUDA runtime 的情况下重新读取

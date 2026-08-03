@@ -1,5 +1,15 @@
 # Stage 0 GPU 管理员诊断与修复说明
 
+## 2026-08-03 实施结果
+
+管理员路径 B 已完成并通过：系统通过持久化 `NVreg_ExcludedGpus` 精确排除四个 UUID，
+NVML 与 PyTorch 只枚举批准的四张 A100；两张故障卡继续隔离，另外两张健康卡作为
+项目范围外备用卡隔离。重启后管理员 finalizer、证据校验、逐卡 CUDA 张量和四 rank
+NCCL 通信 smoke 均为 `PASS`，服务已恢复；无 NVSwitch PCI 绑定，因此 Fabric Manager
+按“不适用”保持 masked。最终状态见
+`reports/stage0/g0-g-gpu-final-20260803.json`。本文后续的“阻塞/待管理员处理”描述保留为
+2026-07-19 的历史处置依据，不代表当前 gate 状态。
+
 ## 项目范围决定（2026-07-19）
 
 项目所有者已确认正式计算只需要四张 A100，并选择下述路径 B。项目侧同意排除故障

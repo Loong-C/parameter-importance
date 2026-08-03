@@ -1,0 +1,115 @@
+{
+  "schema_version": "stage0.g0-g-gpu-final.v1",
+  "generated_at": "2026-08-03T13:34:36+08:00",
+  "host": "sophgo13",
+  "gate": {
+    "id": "G0-G",
+    "status": "PASS",
+    "accepted_path": "B_PERSISTENT_EXACT_FOUR_UUID_EXCLUSION",
+    "boot_id": "04326255-b422-4f1e-8dc6-9c3cc8f0a5b9",
+    "kernel": "6.8.0-136-generic",
+    "driver_version": "575.57.08"
+  },
+  "allowed_gpus": [
+    {
+      "pci_bdf": "0000:9c:00.0",
+      "uuid": "GPU-5c672d04-4f83-3cc0-80d0-0108b1b63267"
+    },
+    {
+      "pci_bdf": "0000:9d:00.0",
+      "uuid": "GPU-e78c55cd-db97-b761-f559-dc6eae3be81d"
+    },
+    {
+      "pci_bdf": "0000:a0:00.0",
+      "uuid": "GPU-9b2b2a3b-3547-187f-ca29-2c02624e2e4f"
+    },
+    {
+      "pci_bdf": "0000:a4:00.0",
+      "uuid": "GPU-5a81500d-5e9c-b0d7-5607-fdfdaab65ff4"
+    }
+  ],
+  "excluded_gpus": [
+    {
+      "pci_bdf": "0000:4f:00.0",
+      "uuid": "GPU-6ff7389b-eaf8-aefd-b2c6-1611be41fa5d",
+      "disposition": "faulting device remains persistently excluded"
+    },
+    {
+      "pci_bdf": "0000:50:00.0",
+      "uuid": "GPU-dc6cfc60-41dd-7bcf-ed09-b7deb5be342c",
+      "disposition": "ECC/Xid/row-remap affected device remains persistently excluded"
+    },
+    {
+      "pci_bdf": "0000:53:00.0",
+      "uuid": "GPU-180ff767-885a-7dc9-c8a9-921d65a01bbd",
+      "disposition": "healthy spare excluded to enforce the exact-four project scope"
+    },
+    {
+      "pci_bdf": "0000:57:00.0",
+      "uuid": "GPU-d0ce0b43-7e46-6bca-b078-5aa7043928d7",
+      "disposition": "healthy spare excluded to enforce the exact-four project scope"
+    }
+  ],
+  "persistent_configuration": {
+    "path": "/etc/modprobe.d/parameter-importance-stage0-gpu-exclusion.conf",
+    "module_parameter": "NVreg_ExcludedGpus",
+    "present_in_initramfs": true,
+    "proc_parameter_matches_exact_excluded_uuid_order": true
+  },
+  "administrator_finalizer": {
+    "status": "PASS",
+    "run_id": "20260803T050131Z",
+    "path": "/var/lib/parameter-importance/stage0/g0-g-uuid-exclusion/service-finalize/finalize-20260803T050131Z.8nhBSwZk",
+    "success_sha256": "769bd6879abb356a318a4e7f402488ad14fbb3335e5181bb6a7f40f6a25091ef",
+    "checksums_sha256": "7a273929287ff13c00a405e718300b8f1195e69ad9be7ed05d90179cac3d9e46",
+    "response_sha256": "32ed5e7125917b85ddb2cc31dbe92a30f473d5255275ba7ca1b9d4d16d46851f",
+    "all_listed_checksums_verified": true,
+    "retry_baseline_restored": true
+  },
+  "services": {
+    "nvidia_persistenced": "active/enabled",
+    "containerd": "active/enabled",
+    "docker_service": "active/enabled",
+    "docker_socket": "active/enabled",
+    "snap_lxd_entry_units": "restored",
+    "fabric_manager": "NOT_APPLICABLE_MASKED",
+    "fabric_manager_reason": "No PCI function is bound to the nvidia-nvswitch driver; the topology is PCIe and Fabric Manager reports no applicable fabric."
+  },
+  "health": {
+    "nvml_device_count": 4,
+    "pytorch_device_count": 4,
+    "volatile_uncorrectable_ecc_each": 0,
+    "aggregate_uncorrectable_ecc_each": 0,
+    "row_remap_pending_each": "No",
+    "row_remap_failure_each": "No",
+    "compute_clients_after_validation": 0,
+    "current_boot_critical_gpu_or_pci_events": 0
+  },
+  "cuda_nccl_smoke": {
+    "status": "PASS",
+    "run_id": "20260803T051156Z",
+    "path": "/home/sophgo13/cjl/storage/parameter-importance/operations/stage0/g0-g-uuid-exclusion/cuda-nccl-smoke-20260803T051156Z",
+    "success_sha256": "9b52e4a482b9696938c3ee2dbfcb0b1bb4848865f486852ba6a22e2a4c89d774",
+    "checksums_sha256": "e1a59d088d939a4a2674131ee07404d3b9ce6407f2ef005b2096c0fbd3f64324",
+    "per_gpu_tensor_sha256": "a0b4d6fba7baa8885088cfe0c1547bf55ac3709229a472d6e73851d885188882",
+    "nccl_allreduce_sha256": "95906092806fb07fea0071ce3910cebbd080507e9fc14b4d0a7d09e45dbe75a2",
+    "torch": "2.12.1+cu126",
+    "cuda_runtime": "12.6",
+    "cudnn_runtime": "9.10.2",
+    "nccl_runtime": "2.29.3",
+    "world_size": 4,
+    "allreduce_message_elements": 1048576,
+    "allreduce_collectives": 3,
+    "allreduce_expected_sum": 10.0,
+    "scope_note": "This is a hardware/environment communication smoke, not the S0.7 G6 distributed-semantics or performance gate."
+  },
+  "scope": {
+    "faulting_devices_repaired": false,
+    "faulting_devices_admitted": false,
+    "project_operates_only_on_allowed_four": true,
+    "stage4_or_stage5_formal_artifacts_in_scope": false,
+    "s0_4_through_s0_12_executed": false
+  },
+  "secrets_included": false,
+  "internal_server_information_included_with_project_owner_approval": true
+}
