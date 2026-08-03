@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "runtime-checkpoint-purge-record-v1.json",
+  "$id": "https://parameter-importance.invalid/schemas/runtime-checkpoint-purge-record-v1.json",
   "title": "Runtime Checkpoint Purge Record v1",
   "type": "object",
   "additionalProperties": false,

@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "stage0-g7-recovery-evidence-v1.json",
+  "$id": "https://parameter-importance.invalid/schemas/stage0-g7-recovery-evidence-v1.json",
   "title": "Stage 0 G7 Recovery Evidence v1",
   "type": "object",
   "additionalProperties": false,

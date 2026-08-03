@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "runtime-checkpoint-group-lineage-v1.json",
+  "$id": "https://parameter-importance.invalid/schemas/runtime-checkpoint-group-lineage-v1.json",
   "title": "Runtime Checkpoint Group Lineage v1",
   "type": "object",
   "additionalProperties": false,
