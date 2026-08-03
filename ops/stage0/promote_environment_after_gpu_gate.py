@@ -603,9 +603,10 @@ def main(argv: list[str] | None = None) -> int:
             "source_commit": arguments.source_commit,
         }
         qualification_id = "gpuq-v1-" + sha256_bytes(stable_json_bytes(qualification_identity))
-        generated_at = datetime.strptime(
+        evidence_observed_at = datetime.strptime(
             str(smoke["run_id"]), "%Y%m%dT%H%M%SZ"
         ).replace(tzinfo=timezone.utc).isoformat()
+        generated_at = datetime.now(timezone.utc).isoformat()
         qualification = {
             "schema_version": "stage0.environment-gpu-qualification.v1",
             "qualification_id": qualification_id,
@@ -614,6 +615,7 @@ def main(argv: list[str] | None = None) -> int:
             "environment_id": candidate["reference"]["environment_id"],
             "build_id": candidate["reference"]["build_id"],
             "generated_at": generated_at,
+            "evidence_observed_at": evidence_observed_at,
             "source_commit": arguments.source_commit,
             "candidate_reference": {
                 "path": candidate["reference_path"],
@@ -636,8 +638,39 @@ def main(argv: list[str] | None = None) -> int:
         qualification_path = qualification_root / f"{qualification_id}.json"
         qualification_bytes = stable_json_bytes(qualification)
         if qualification_path.exists():
-            if qualification_path.read_bytes() != qualification_bytes:
+            existing_qualification = load_json(qualification_path)
+            stable_existing = {
+                "schema_version": existing_qualification.get("schema_version"),
+                "qualification_id": existing_qualification.get("qualification_id"),
+                "status": existing_qualification.get("status"),
+                "environment_id": existing_qualification.get("environment_id"),
+                "build_id": existing_qualification.get("build_id"),
+                "source_commit": existing_qualification.get("source_commit"),
+                "evidence_observed_at": existing_qualification.get("evidence_observed_at"),
+                "administrator_success_sha256": existing_qualification.get(
+                    "administrator_evidence", {}
+                ).get("success_sha256"),
+                "smoke_success_sha256": existing_qualification.get(
+                    "cuda_nccl_smoke_evidence", {}
+                ).get("success_sha256"),
+            }
+            stable_expected = {
+                "schema_version": qualification["schema_version"],
+                "qualification_id": qualification_id,
+                "status": "PASS",
+                "environment_id": qualification["environment_id"],
+                "build_id": qualification["build_id"],
+                "source_commit": arguments.source_commit,
+                "evidence_observed_at": evidence_observed_at,
+                "administrator_success_sha256": admin["success_sha256"],
+                "smoke_success_sha256": smoke["success_sha256"],
+            }
+            if stable_existing != stable_expected:
                 raise PromotionError("existing GPU qualification conflicts with this identity")
+            generated_at = str(existing_qualification.get("generated_at", ""))
+            if not generated_at:
+                raise PromotionError("existing GPU qualification lacks a publication time")
+            qualification_bytes = qualification_path.read_bytes()
         else:
             write_immutable(qualification_path, qualification_bytes)
         recommendation = {
