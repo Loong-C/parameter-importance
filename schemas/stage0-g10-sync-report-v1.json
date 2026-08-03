@@ -1,0 +1,20 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://parameter-importance.invalid/schemas/stage0-g10-sync-report-v1.json",
+  "title": "Stage 0 G10 synchronization report v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "status", "generated_at", "generator_git_commit", "branch", "sync_observation_ref", "sync_observation_sha256", "sync_observation_artifact_hash", "local_head", "github_head", "server_head", "local_worktree_clean", "server_worktree_clean", "fast_forward_only", "force_push_used", "agent_sync", "bundle_cleanup", "artifact_hash"],
+  "properties": {
+    "schema_version": {"const": "stage0-g10-sync-report-v1"}, "status": {"const": "PASS"},
+    "generated_at": {"type": "string", "format": "date-time"}, "generator_git_commit": {"$ref": "#/$defs/commit"}, "branch": {"type": "string", "minLength": 1},
+    "sync_observation_ref": {"$ref": "#/$defs/ref"}, "sync_observation_sha256": {"$ref": "#/$defs/hash"}, "sync_observation_artifact_hash": {"$ref": "#/$defs/hash"},
+    "local_head": {"$ref": "#/$defs/commit"}, "github_head": {"$ref": "#/$defs/commit"}, "server_head": {"$ref": "#/$defs/commit"},
+    "local_worktree_clean": {"const": true}, "server_worktree_clean": {"const": true}, "fast_forward_only": {"const": true}, "force_push_used": {"const": false},
+    "agent_sync": {"type": "object"}, "bundle_cleanup": {"type": "object"}, "artifact_hash": {"$ref": "#/$defs/hash"}
+  },
+  "$defs": {
+    "hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"}, "commit": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+    "ref": {"type": "string", "minLength": 1, "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.(?:/|$))(?!.*\\\\).+$"}
+  }
+}

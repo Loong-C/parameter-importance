@@ -145,7 +145,6 @@ _FORMAL_EVIDENCE_ONLY_TASKS = frozenset(
         "stage0.01_baseline_and_safety",
         "stage0.02_storage_and_layout",
         "stage0.03_runtime_and_dependencies",
-        "stage0.12_delivery_and_sync",
         "stage1.09_precision_clipping_and_optimizer_boundaries",
         "stage1.10_checkpoint_resume_and_artifacts",
         "stage1.11_reporting_and_exit_gate",
@@ -1999,6 +1998,27 @@ class Stage01CompositeTaskRunner(TaskRunner):
                 )
             if (
                 request.config.run_intent == "formal"
+                and request.task.task_id == "stage0.12_delivery_and_sync"
+            ):
+                from ..stage0_g10 import validate_formal_g10_outputs
+
+                gate = validate_formal_g10_outputs(
+                    request,
+                    self.workspace_root,
+                    existing,
+                )
+                return TaskRunResult.passed(
+                    request,
+                    artifact_refs=existing,
+                    message="Stage 0 S0.12 restored from revalidated formal commits",
+                    metadata={
+                        "stage0_g10_specialized": True,
+                        "restored": True,
+                        "gate_id": gate.gate_id,
+                    },
+                )
+            if (
+                request.config.run_intent == "formal"
                 and request.task.task_id in _FORMAL_EVIDENCE_ONLY_TASKS
             ):
                 for reference in existing.values():
@@ -2098,6 +2118,18 @@ class Stage01CompositeTaskRunner(TaskRunner):
             from ..stage0_g9 import run_formal_g9_task
 
             return run_formal_g9_task(
+                request,
+                self.workspace_root,
+                store,
+                source_refs=source_refs,
+            )
+        if (
+            request.config.run_intent == "formal"
+            and request.task.task_id == "stage0.12_delivery_and_sync"
+        ):
+            from ..stage0_g10 import run_formal_g10_task
+
+            return run_formal_g10_task(
                 request,
                 self.workspace_root,
                 store,

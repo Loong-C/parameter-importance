@@ -1,0 +1,14 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://parameter-importance.invalid/schemas/stage0-g10-worklog-v1.json",
+  "title": "Stage 0 final Chinese worklog projection v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "language", "timezone", "generated_at", "git_branch", "git_commit", "status", "entries", "final_evidence", "secrets_included", "temporary_download_urls_included", "artifact_hash"],
+  "properties": {
+    "schema_version": {"const": "stage0-g10-worklog-v1"}, "language": {"const": "zh-CN"}, "timezone": {"const": "Asia/Shanghai"},
+    "generated_at": {"type": "string", "format": "date-time"}, "git_branch": {"type": "string", "minLength": 1}, "git_commit": {"type": "string", "pattern": "^[0-9a-f]{40}$"}, "status": {"const": "PASS"},
+    "entries": {"type": "array", "minItems": 7, "maxItems": 7, "items": {"type": "object", "additionalProperties": false, "required": ["phase", "objective", "actual_changes", "validation", "exit_status", "evidence_refs", "risk"], "properties": {"phase": {"type": "string"}, "objective": {"type": "string"}, "actual_changes": {"type": "string"}, "validation": {"type": "object"}, "exit_status": {"const": "PASS"}, "evidence_refs": {"type": "array", "minItems": 1, "items": {"type": "string"}}, "risk": {"type": "string"}}}},
+    "final_evidence": {"type": "object"}, "secrets_included": {"const": false}, "temporary_download_urls_included": {"const": false}, "artifact_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+  }
+}

@@ -1,0 +1,23 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://parameter-importance.invalid/schemas/stage0-g10-stage1-handoff-v1.json",
+  "title": "Stage 0 to Stage 1 handoff v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "status", "generated_at", "generator_git_commit", "environment_id", "configuration_refs", "reusable_assets", "deterministic_fixture", "verified_training_semantics", "entry_requirements", "non_blocking_risks", "prohibited_inferences", "artifact_hash"],
+  "properties": {
+    "schema_version": {"const": "stage0-g10-stage1-handoff-v1"},
+    "status": {"const": "READY_FOR_STAGE1_ENTRY"},
+    "generated_at": {"type": "string", "format": "date-time"},
+    "generator_git_commit": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+    "environment_id": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "configuration_refs": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"type": "string", "minLength": 1}},
+    "reusable_assets": {"type": "array", "minItems": 13, "items": {"type": "object"}},
+    "deterministic_fixture": {"type": "object"},
+    "verified_training_semantics": {"type": "array", "minItems": 7, "uniqueItems": true, "items": {"type": "string", "minLength": 1}},
+    "entry_requirements": {"type": "object", "required": ["required_gate", "required_status", "allowed_model_scope", "importance_correctness_must_be_proven_in_stage1"]},
+    "non_blocking_risks": {"type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1}},
+    "prohibited_inferences": {"type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1}},
+    "artifact_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+  }
+}

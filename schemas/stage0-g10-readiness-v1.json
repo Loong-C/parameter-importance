@@ -1,0 +1,28 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://parameter-importance.invalid/schemas/stage0-g10-readiness-v1.json",
+  "title": "Stage 0 immutable readiness marker v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "status", "stage", "published_at", "generator_git_commit", "git_branch", "environment_hash", "config_hash", "all_hard_gates_pass", "approved_exceptions", "gate_records", "persistence_status", "delivery_manifest_ref", "sync_report_ref", "worklog_ref", "stage1_handoff_ref", "gate_report_ref", "evidence", "artifact_hash"],
+  "properties": {
+    "schema_version": {"const": "stage0-g10-readiness-v1"},
+    "status": {"const": "READY"},
+    "stage": {"const": 0},
+    "published_at": {"type": "string", "format": "date-time"},
+    "generator_git_commit": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+    "git_branch": {"type": "string", "minLength": 1},
+    "environment_hash": {"$ref": "#/$defs/hash"}, "config_hash": {"$ref": "#/$defs/hash"},
+    "all_hard_gates_pass": {"const": true},
+    "approved_exceptions": {"const": []},
+    "gate_records": {"type": "object", "minProperties": 21},
+    "persistence_status": {"type": "object"},
+    "delivery_manifest_ref": {"$ref": "#/$defs/ref"}, "sync_report_ref": {"$ref": "#/$defs/ref"}, "worklog_ref": {"$ref": "#/$defs/ref"}, "stage1_handoff_ref": {"$ref": "#/$defs/ref"}, "gate_report_ref": {"$ref": "#/$defs/ref"},
+    "evidence": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"type": "object", "additionalProperties": false, "required": ["ref", "sha256"], "properties": {"ref": {"$ref": "#/$defs/ref"}, "sha256": {"$ref": "#/$defs/hash"}}}},
+    "artifact_hash": {"$ref": "#/$defs/hash"}
+  },
+  "$defs": {
+    "hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "ref": {"type": "string", "minLength": 1, "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.(?:/|$))(?!.*\\\\).+$"}
+  }
+}

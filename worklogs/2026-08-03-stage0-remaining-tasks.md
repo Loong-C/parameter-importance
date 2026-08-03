@@ -241,3 +241,56 @@ Linux/服务器补跑要求，不能计作 G3 formal PASS。
 - requirements/layout/download-plan、13 个 HTTP object spec 与 relay 联合回归：
   `49 passed, 0 failed`。同时更新一条旧测试，使其断言 formal provider 不再嵌入物理
   manifest/root 路径；实际资产只允许由提交的 G3 resolution 解析。
+
+## 2026-08-03 23:59 CST — G3–G9 收口补记与 G10 本地实现
+
+本节按不可变 Git 提交和测试输出补记 23:21 之后的工作，不重写前述失败、进行中状态或
+历史证据。当前分支为 `feat/stage0-completion`；服务器 formal Gate 尚须在最终同一提交上
+重跑，因此本节只把已完成的本地实现与仍未完成的外部步骤分开记录。
+
+### 实际修改与阶段提交
+
+| 范围 | 提交 | 实际成果 |
+|---|---|---|
+| G3 控制冻结 | `83e3492b70f8dc428e9cc1f6001b82e8f8279934` | 冻结 requirements/layout/download-plan 与资产控制引用 |
+| G3–G5 | `7bb9403b5de4d7137ef149839ab88d98608cee98` | 正式资产、provenance、单卡训练 Gate 与 handoff |
+| G6 | `114de62a34a2f305293d03d8aa8591c3d171037f` | 四卡 NCCL、全局 loss 归约、累积、`no_sync` 与故障合同 |
+| G7 logging | `828a82d2c205853ea9d1e4ad84b6836d0843192e` | canonical JSONL、lineage、TensorBoard 派生视图和开销证据 |
+| G7 recovery | `d8f52ead4d265f65e88b107f0d64d681e6203686` | 单卡/四卡 fresh-process checkpoint 恢复、保留与故障拒绝 |
+| 预检/Schema 修复 | `5103ba4033b3ff516e911c899d26fabc73172a46`、`8da72929c5ea74fcff56ec58c299af9cb00f55ab` | 保留 formal fail-closed 语义并统一 schema identity |
+| G8 | `1ddc5ee869f93e5aa2859f8ab53528b2fdeebd65` | 14M/160M/410M 容量 envelope、36-launch 计划、租约、预检与故障处置 |
+| G9 | `33924a43d48d41d0b9ea59ce005da66eb872811a` | 六层硬测试矩阵、确定性 fixture、离线 socket 审计、独立单卡/四卡/恢复重放与运行说明 |
+
+S0.12/G10 的本地实现新增三端只读观察、逐文件 Git 交付清单、13 项服务器资产
+existence/size 复核、全部 G0–G9 committed GateRecord 重放、Agent 五文件哈希、bundle 清理、
+G1-D 有效期、中文动态 Worklog、Stage 1 handoff 和不可覆盖的 `READY`。该实现尚未形成
+提交；只有提交、推送、服务器快进并在同一 HEAD 上完成 formal G3–G10 后才可发布 READY。
+
+### 本地验证与退出状态
+
+| 检查 | 结果 |
+|---|---|
+| G9/G7/task runner/CLI 定向回归 | `47 passed, 0 failed` |
+| 完整仓库测试（86 个测试文件，源码树外四分片） | `937 passed, 10 skipped, 0 failed` |
+| Windows skip 审查 | 目录/file symlink 权限、POSIX mode、Windows Torch Gloo 能力；均未计作 formal PASS，Linux G9 只允许版本化矩阵声明的 Windows-junction 不适用项 |
+| G10 合成三端观察、资产 manifest、配置、schema 与 runner 回归 | `41 passed, 0 failed` |
+| Python 静态编译 | `python -m compileall -q src ops tests`，退出码 0 |
+| 空白检查 | `git diff --check`，退出码 0；只有现有 Windows LF/CRLF 提示 |
+
+完整回归首次把 `--basetemp` 放入仓库时，G3 路径守卫按设计以
+`STAGE0_G3_WORKSPACE_OVERLAPS_SOURCE_ROOT` 拒绝；改到 Codex 可写但位于源码树之外的专用
+目录后全部通过。该失败没有被删除或改写为产品缺陷。
+
+### 当前同步与风险
+
+- 本机 HEAD 为 `33924a43d48d41d0b9ea59ce005da66eb872811a`；本日志与 G10 实现尚未提交。
+- `origin/feat/stage0-completion` 和服务器最后已知 HEAD 仍为
+  `44a63177b735bd2b5ecd7d84817d2bef2348837c`。当前不满足三端一致，G10 不能通过。
+- GitHub push 与 Git bundle/源码/非敏感验证产物传输需要用户对本任务明确授权；在得到
+  授权前不重试外发，也不把本地提交冒充服务器 formal 证据。
+- G1-D 仍是单盘、可再生 Stage 0 smoke 产物的限时风险接受，不是备份；有效至
+  `2026-08-18T23:59:00+08:00` 或更早终止条件发生时。Stage 4 前仍须第二故障域与恢复演练
+  或新的明确风险决定。
+- 下一步：提交 G10 本地实现；取得外发授权后推送、验证 bundle 快进服务器、同步并逐项
+  核对 `Agent/` 五文件、清理精确 bundle；在最终同一提交上运行 G3→G10 formal 链并发布
+  新 readiness。任何一步不一致都保持“收尾中”，不宣布 Stage 0 完成。

@@ -1,0 +1,32 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://parameter-importance.invalid/schemas/stage0-g10-delivery-manifest-v1.json",
+  "title": "Stage 0 G10 final delivery manifest v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "status", "generated_at", "generator_git_commit", "git_branch", "repository_inventory", "server_asset_inventory", "server_evidence_inventory", "gate_records", "gate_evidence_refs", "persistence_status", "sync_observation_ref", "stage1_handoff_ref", "readiness_ref", "large_runtime_artifacts_in_git", "authoritative_runtime_copy_described_as_backup", "artifact_hash"],
+  "properties": {
+    "schema_version": {"const": "stage0-g10-delivery-manifest-v1"},
+    "status": {"const": "PASS"},
+    "generated_at": {"type": "string", "format": "date-time"},
+    "generator_git_commit": {"$ref": "#/$defs/commit"},
+    "git_branch": {"type": "string", "minLength": 1},
+    "repository_inventory": {"type": "object", "required": ["status", "tracked_file_count", "rows"]},
+    "server_asset_inventory": {"type": "object", "required": ["status", "asset_count", "rows"]},
+    "server_evidence_inventory": {"type": "object", "required": ["status", "evidence_count", "rows"]},
+    "gate_records": {"type": "object", "minProperties": 20},
+    "gate_evidence_refs": {"type": "object", "minProperties": 20, "additionalProperties": {"$ref": "#/$defs/ref"}},
+    "persistence_status": {"type": "object", "required": ["status", "satisfaction", "expires_at", "independent_failure_domain_copy_count", "authoritative_runtime_copy_is_backup"]},
+    "sync_observation_ref": {"$ref": "#/$defs/ref"},
+    "stage1_handoff_ref": {"$ref": "#/$defs/ref"},
+    "readiness_ref": {"$ref": "#/$defs/ref"},
+    "large_runtime_artifacts_in_git": {"const": false},
+    "authoritative_runtime_copy_described_as_backup": {"const": false},
+    "artifact_hash": {"$ref": "#/$defs/hash"}
+  },
+  "$defs": {
+    "hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "commit": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+    "ref": {"type": "string", "minLength": 1, "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.(?:/|$))(?!.*\\\\).+$"}
+  }
+}

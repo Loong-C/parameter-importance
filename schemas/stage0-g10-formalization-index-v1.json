@@ -1,0 +1,27 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://parameter-importance.invalid/schemas/stage0-g10-formalization-index-v1.json",
+  "title": "Stage 0 G10 formalization index v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "generator_git_commit", "checked_at", "g9_index_ref", "g9_index_sha256", "g9_gate_artifact_hash", "sync_observation_ref", "sync_observation_sha256", "config_ref", "config_hash", "input_environment_hash", "task_output_refs", "gate_ref", "gate_artifact_hash", "readiness_ref", "readiness_sha256", "readiness_artifact_hash", "environment_ref", "environment_hash", "next_task_id", "next_input_refs", "artifact_hash"],
+  "properties": {
+    "schema_version": {"const": "stage0-g10-formalization-index-v1"},
+    "generator_git_commit": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+    "checked_at": {"type": "string", "format": "date-time"},
+    "g9_index_ref": {"$ref": "#/$defs/ref"}, "g9_index_sha256": {"$ref": "#/$defs/hash"}, "g9_gate_artifact_hash": {"$ref": "#/$defs/hash"},
+    "sync_observation_ref": {"$ref": "#/$defs/ref"}, "sync_observation_sha256": {"$ref": "#/$defs/hash"},
+    "config_ref": {"$ref": "#/$defs/ref"}, "config_hash": {"$ref": "#/$defs/hash"}, "input_environment_hash": {"$ref": "#/$defs/hash"},
+    "task_output_refs": {"type": "object", "required": ["delivery_manifest", "worklog", "sync_report"], "additionalProperties": {"$ref": "#/$defs/ref"}},
+    "gate_ref": {"$ref": "#/$defs/ref"}, "gate_artifact_hash": {"$ref": "#/$defs/hash"},
+    "readiness_ref": {"$ref": "#/$defs/ref"}, "readiness_sha256": {"$ref": "#/$defs/hash"}, "readiness_artifact_hash": {"$ref": "#/$defs/hash"},
+    "environment_ref": {"$ref": "#/$defs/ref"}, "environment_hash": {"$ref": "#/$defs/hash"},
+    "next_task_id": {"const": "stage1.01_entry_and_contract"},
+    "next_input_refs": {"type": "array", "minItems": 3, "maxItems": 3, "uniqueItems": true, "items": {"$ref": "#/$defs/ref"}},
+    "artifact_hash": {"$ref": "#/$defs/hash"}
+  },
+  "$defs": {
+    "hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "ref": {"type": "string", "minLength": 1, "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.(?:/|$))(?!.*\\\\).+$"}
+  }
+}

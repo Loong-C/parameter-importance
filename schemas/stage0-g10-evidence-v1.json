@@ -1,0 +1,19 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://parameter-importance.invalid/schemas/stage0-g10-evidence-v1.json",
+  "title": "Stage 0 G10 committed task evidence v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "artifact_role", "task_id", "config_hash", "environment_hash", "canonical_evidence_hash", "canonical_evidence", "role_summary"],
+  "properties": {
+    "schema_version": {"const": "stage0-g10-evidence-v1"},
+    "artifact_role": {"enum": ["delivery_manifest", "worklog", "sync_report"]},
+    "task_id": {"const": "stage0.12_delivery_and_sync"},
+    "config_hash": {"$ref": "#/$defs/hash"},
+    "environment_hash": {"$ref": "#/$defs/hash"},
+    "canonical_evidence_hash": {"$ref": "#/$defs/hash"},
+    "canonical_evidence": {"type": "object"},
+    "role_summary": {"type": "object"}
+  },
+  "$defs": {"hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"}}
+}
