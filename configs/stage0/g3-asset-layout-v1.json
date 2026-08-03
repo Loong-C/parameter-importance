@@ -1,10 +1,10 @@
 {
   "schema_version": "stage0-g3-asset-layout-v1",
-  "artifact_hash": "ef347c060af25d7d2e3b1d4c774ff80dbc5ea15e5745749f24b44e0ef8b9ace6",
+  "artifact_hash": "56b0dc1da9b2fa5e605afb4fd82da0a57eaa27f3cc05e5ec54803df60cab7203",
   "created_at": "2026-08-03T15:29:40+08:00",
-  "generator_git_commit": "1b88e8dd3264d460b0a642caee1e88e2456c247d",
+  "generator_git_commit": "69dbe38c1c2ead921366f665794e77a579b2f8ff",
   "requirements_ref": "configs/stage0/g3-asset-requirements-v1.json",
-  "requirements_sha256": "591ba7f66cfc006845386a59e5661df0609b4613d7f91a527f490c4a11ddaaa9",
+  "requirements_sha256": "3d8183c4c8a9152d3f44ca900509c2b401ba298c5af8b727f1eee0dcb61bc433",
   "workspace_semantics": "paths_are_posix_relative_to_DATA_ROOT",
   "entries": [
     {

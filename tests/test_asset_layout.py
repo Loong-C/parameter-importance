@@ -80,13 +80,9 @@ def test_layout_loader_rejects_bom(tmp_path: Path) -> None:
         load_stage0_asset_layout(target)
 
 
-def test_formal_provider_paths_are_exact_pairs_from_the_data_root_layout() -> None:
+def test_formal_provider_configs_do_not_embed_physical_asset_paths() -> None:
     layout, requirements = _values()
     validate_stage0_asset_layout(layout, requirements=requirements)
-    allowed = {
-        (entry["manifest_ref"], entry["asset_root_ref"])
-        for entry in layout["entries"]  # type: ignore[union-attr]
-    }
     paths = sorted((ROOT / "configs/run-ready/v2").glob("*-formal.yaml"))
     provider_configs = 0
     for path in paths:
@@ -96,10 +92,6 @@ def test_formal_provider_paths_are_exact_pairs_from_the_data_root_layout() -> No
             continue
         provider_configs += 1
         for prefix in ("model", "data", "tokenizer"):
-            pair = (
-                providers[f"{prefix}_manifest_ref"],
-                providers[f"{prefix}_root_ref"],
-            )
-            assert pair in allowed, f"unfrozen {prefix} path pair in {path.name}: {pair}"
-            assert not pair[1].startswith("assets/")
+            assert providers[f"{prefix}_manifest_ref"] is None, path.name
+            assert providers[f"{prefix}_root_ref"] is None, path.name
     assert provider_configs >= 11

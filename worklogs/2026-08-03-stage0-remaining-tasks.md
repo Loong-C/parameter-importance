@@ -227,3 +227,17 @@ Linux/服务器补跑要求，不能计作 G3 formal PASS。
 - 服务器仍需补齐 410M tokenizer 三文件、MNLI 五文件和 RTE 三文件，随后依次生成
   acquisition attestation、独立 verify-only 报告、gate-only publication、13 项
   READY/qualification、G3-S1/S2/S4/S5/S6 与正式 `asset_resolution`；完成前不进入 G4。
+
+## 2026-08-03 23:21 CST — G3 控制文件绑定实现提交
+
+- G3 控制面实现提交：`69dbe38c1c2ead921366f665794e77a579b2f8ff`。
+- requirements、layout、download plan 的 `generator_git_commit` 统一绑定该实现提交，并按
+  requirements → layout → plan 的依赖顺序重新计算全部 artifact hash：
+  - requirements：`3d8183c4c8a9152d3f44ca900509c2b401ba298c5af8b727f1eee0dcb61bc433`；
+  - layout：`56b0dc1da9b2fa5e605afb4fd82da0a57eaa27f3cc05e5ec54803df60cab7203`；
+  - download plan：`33fbd373875b3fde10074742aa04accd612109e70380989b007b6e9d00e190a8`。
+- 三份文件已由严格 loader 联合重放，交叉引用、13 对象集合和生成提交均通过；下一步完成
+  定向回归后形成独立冻结提交并同步服务器。
+- requirements/layout/download-plan、13 个 HTTP object spec 与 relay 联合回归：
+  `49 passed, 0 failed`。同时更新一条旧测试，使其断言 formal provider 不再嵌入物理
+  manifest/root 路径；实际资产只允许由提交的 G3 resolution 解析。

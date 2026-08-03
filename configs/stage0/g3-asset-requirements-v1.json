@@ -1,9 +1,9 @@
 {
   "schema_version": "stage0-asset-requirements-v1",
-  "artifact_hash": "591ba7f66cfc006845386a59e5661df0609b4613d7f91a527f490c4a11ddaaa9",
+  "artifact_hash": "3d8183c4c8a9152d3f44ca900509c2b401ba298c5af8b727f1eee0dcb61bc433",
   "status": "FROZEN",
   "created_at": "2026-08-03T15:29:40+08:00",
-  "generator_git_commit": "1b88e8dd3264d460b0a642caee1e88e2456c247d",
+  "generator_git_commit": "69dbe38c1c2ead921366f665794e77a579b2f8ff",
   "source_plan_refs": [
     "plan/general_plan.md",
     "plan/stage0/04_assets_and_manifests.md"
