@@ -26,6 +26,16 @@ from .distributed_training import DistributedLaunchSpec, TorchDDPTrainingExecuto
 from .gradients import GradientAttempt, GradientPhase
 from .lineage import AttemptDisposition, AttemptLineageRecord, LineageStore
 from .optimizer import OptimizerBridge, StepOutcome, compute_global_clip_factor
+from .operations import (
+    FailureClass,
+    GpuLeaseIdentity,
+    LaunchClaimRegistry,
+    ProjectGpuLease,
+    classify_stale_heartbeat,
+    evaluate_launch_preflight,
+    exercise_canary_writer,
+    failure_response,
+)
 from .process_state import ProcessSnapshot, ProcessStateStore
 from .reducers import (
     LocalReducer,
@@ -111,12 +121,14 @@ __all__ = [
     "GradientAttempt",
     "GradientReadyEvent",
     "GradientPhase",
+    "GpuLeaseIdentity",
     "ImportanceSnapshot",
     "ImportanceTrajectory",
     "ImportanceTrajectoryPoint",
     "JsonlEventSink",
     "LocalReducer",
     "LineageStore",
+    "LaunchClaimRegistry",
     "LoadedTaskArtifact",
     "OptimizerBridge",
     "OnlineImportanceTracker",
@@ -124,11 +136,13 @@ __all__ = [
     "SkippedAttemptEvent",
     "ProcessSnapshot",
     "ProcessStateStore",
+    "ProjectGpuLease",
     "PublishedTaskArtifact",
     "Reducer",
     "ReducerCapabilities",
     "ResourceProfile",
     "ResourceSampler",
+    "FailureClass",
     "RunStatus",
     "RunStatusStore",
     "SessionStatus",
@@ -172,6 +186,10 @@ __all__ = [
     "build_optimizer",
     "build_scheduler",
     "compute_global_clip_factor",
+    "classify_stale_heartbeat",
+    "evaluate_launch_preflight",
+    "exercise_canary_writer",
+    "failure_response",
     "load_tensor_bundle",
     "load_committed_task_artifact",
     "load_task_run_result",

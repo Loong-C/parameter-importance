@@ -10,9 +10,14 @@ from param_importance_nlp.cache import (
     validate_runtime_cache_environment,
 )
 from param_importance_nlp.capacity import (
+    CAPACITY_PROTOCOL_VERSION,
     GIB,
+    ParameterTensorShape,
     StorageBudget,
+    build_compute_communication_envelope,
+    build_parameter_state_envelope,
     check_launch_storage,
+    estimate_fixed_model_budget,
     estimate_checkpoint_bytes,
     estimate_experiment_storage,
 )
@@ -117,3 +122,89 @@ def test_capacity_estimates_scale_with_models_and_repeats() -> None:
         logs_and_reports_per_run=GIB,
     )
     assert repeated == one * 6
+
+
+def test_exact_shape_capacity_envelope_covers_all_required_lifecycles() -> None:
+    tensors = (
+        ParameterTensorShape("embedding.weight", (11, 7), "float32"),
+        ParameterTensorShape("block.weight", (7, 7), "float32"),
+        ParameterTensorShape("buffer", (7,), "float32", requires_grad=False),
+    )
+    envelope = build_parameter_state_envelope(
+        model_id="tiny-exact-shapes",
+        tensors=tensors,
+        config_hash="a" * 64,
+        model_manifest_id="manifest-a",
+        checkpoint_every_steps=25,
+    )
+    assert CAPACITY_PROTOCOL_VERSION == "stage0.capacity-measurement.v1"
+    assert envelope["trainable_parameter_count"] == 126
+    assert envelope["trainable_tensor_count"] == 2
+    assert envelope["mathematics_implemented"] is False
+    rows = {item["buffer_id"]: item for item in envelope["buffers"]}
+    assert {
+        "raw_accumulator",
+        "signed_accumulator",
+        "positive_accumulator",
+        "negative_accumulator",
+        "u_first_moment",
+        "u_second_moment",
+        "path_integral_accumulator",
+        "distributed_reduction_scratch",
+        "checkpoint_serialization_scratch",
+    } <= set(rows)
+    assert rows["raw_accumulator"]["bytes"] == 126 * 4
+    assert rows["distributed_reduction_scratch"]["simultaneously_resident"] is False
+    assert envelope["peak_parameter_state_gpu_bytes"] > envelope["resident_gpu_bytes"]
+
+
+def test_work_envelope_and_fixed_model_budgets_bind_each_model_separately() -> None:
+    first = (ParameterTensorShape("weight", (5, 7), "float32"),)
+    second = (ParameterTensorShape("weight", (9, 11), "float32"),)
+    first_budget = estimate_fixed_model_budget(
+        model_id="model-a",
+        tensors=first,
+        hidden_size=7,
+        layers=2,
+        sequence_length=8,
+        microbatch_size=1,
+        compute_dtype="bfloat16",
+        retained_checkpoints=2,
+        checkpoint_every_steps=25,
+        seed_count=1,
+        parallel_runs=1,
+        logs_and_reports_per_run=1024,
+    )
+    second_budget = estimate_fixed_model_budget(
+        model_id="model-b",
+        tensors=second,
+        hidden_size=11,
+        layers=3,
+        sequence_length=8,
+        microbatch_size=1,
+        compute_dtype="bfloat16",
+        retained_checkpoints=2,
+        checkpoint_every_steps=100,
+        seed_count=1,
+        parallel_runs=1,
+        logs_and_reports_per_run=1024,
+    )
+    assert first_budget["tensor_shape_hash"] != second_budget["tensor_shape_hash"]
+    assert first_budget["derived_from_other_model_scale"] is False
+    assert second_budget["parameter_count"] == 99
+    work = build_compute_communication_envelope(
+        model_id="model-b",
+        parameter_count=99,
+        world_size=4,
+        microbatches_per_optimizer_step=16,
+        checkpoint_every_steps=100,
+        collective_chunk_bytes=128,
+        compute_dtype="bfloat16",
+        sequence_length=2048,
+        microbatch_size=4,
+    )
+    assert work["per_optimizer_step"]["forward_calls"] == 16
+    assert work["checkpoint_boundary"]["collective_count"] == 4
+    assert work["compute_dtype"] == "bfloat16"
+    assert work["per_optimizer_step"]["distributed_gradient_sync"]["logical_collective_count"] == 1
+    assert work["mathematics_implemented"] is False

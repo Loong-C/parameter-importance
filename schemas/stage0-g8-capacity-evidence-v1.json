@@ -1,0 +1,38 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://parameter-importance.invalid/schemas/stage0-g8-capacity-evidence-v1.json",
+  "title": "Stage 0 G8 Capacity and Operations Evidence v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "artifact_role", "status", "checked_at", "generator_git_commit", "environment_hash", "gate_ids", "suite_root_ref", "budget_report_ref", "config_refs", "parameter_envelope_refs", "work_envelope_refs", "preflight_ref", "worker_plan_refs", "worker_report_refs", "launch_transcript_refs", "measurement_summary_ref", "fault_report_ref", "postflight_ref", "lease_history_ref", "gate_records", "gate_reports", "artifact_hash"],
+  "properties": {
+    "schema_version": {"const": "stage0-g8-capacity-evidence-v1"},
+    "artifact_role": {"enum": ["capacity_envelope", "operations_preflight", "fault_report"]},
+    "status": {"const": "PASS"},
+    "checked_at": {"type": "string", "format": "date-time"},
+    "generator_git_commit": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+    "environment_hash": {"$ref": "#/$defs/hash"},
+    "gate_ids": {"const": ["stage0.G8-C", "stage0.G8-S4", "stage0.G8-S5", "stage0.G8"]},
+    "suite_root_ref": {"$ref": "#/$defs/ref"},
+    "budget_report_ref": {"$ref": "#/$defs/ref"},
+    "config_refs": {"$ref": "#/$defs/refMap"},
+    "parameter_envelope_refs": {"$ref": "#/$defs/refMap"},
+    "work_envelope_refs": {"$ref": "#/$defs/refMap"},
+    "preflight_ref": {"$ref": "#/$defs/ref"},
+    "worker_plan_refs": {"type": "array", "minItems": 36, "maxItems": 36, "uniqueItems": true, "items": {"$ref": "#/$defs/ref"}},
+    "worker_report_refs": {"type": "array", "minItems": 36, "maxItems": 36, "uniqueItems": true, "items": {"$ref": "#/$defs/ref"}},
+    "launch_transcript_refs": {"type": "array", "minItems": 36, "maxItems": 36, "uniqueItems": true, "items": {"$ref": "#/$defs/ref"}},
+    "measurement_summary_ref": {"$ref": "#/$defs/ref"},
+    "fault_report_ref": {"$ref": "#/$defs/ref"},
+    "postflight_ref": {"$ref": "#/$defs/ref"},
+    "lease_history_ref": {"$ref": "#/$defs/ref"},
+    "gate_records": {"type": "object", "minProperties": 4, "maxProperties": 4, "additionalProperties": {"type": "object"}},
+    "gate_reports": {"type": "object", "minProperties": 4, "maxProperties": 4, "additionalProperties": {"type": "object"}},
+    "artifact_hash": {"$ref": "#/$defs/hash"}
+  },
+  "$defs": {
+    "hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "ref": {"type": "string", "minLength": 1, "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.(?:/|$))(?!.*\\\\).+$"},
+    "refMap": {"type": "object", "minProperties": 7, "maxProperties": 7, "additionalProperties": {"$ref": "#/$defs/ref"}}
+  }
+}

@@ -1,0 +1,30 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://parameter-importance.invalid/schemas/stage0-g8-parameter-envelope-v1.json",
+  "title": "Stage 0 G8 Exact Parameter State Capacity Envelope v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "model_id", "model_manifest_id", "config_hash", "tensor_shapes", "tensor_shape_hash", "trainable_tensor_count", "trainable_parameter_count", "source_dtype_counts", "buffers", "resident_gpu_bytes", "transient_gpu_bytes_max", "peak_parameter_state_gpu_bytes", "transient_cpu_bytes_max", "checkpoint_parameter_state_bytes", "checkpoint_every_steps", "mathematics_implemented", "scope", "artifact_hash"],
+  "properties": {
+    "schema_version": {"const": "stage0.parameter-state-capacity-envelope.v1"},
+    "model_id": {"type": "string", "minLength": 1},
+    "model_manifest_id": {"type": "string", "minLength": 1},
+    "config_hash": {"$ref": "#/$defs/hash"},
+    "tensor_shapes": {"type": "array", "minItems": 1, "items": {"type": "object", "additionalProperties": false, "required": ["name", "shape", "dtype", "requires_grad", "element_count", "storage_bytes"], "properties": {"name": {"type": "string", "minLength": 1}, "shape": {"type": "array", "minItems": 1, "items": {"type": "integer", "minimum": 1}}, "dtype": {"type": "string", "minLength": 1}, "requires_grad": {"type": "boolean"}, "element_count": {"type": "integer", "minimum": 1}, "storage_bytes": {"type": "integer", "minimum": 1}}}},
+    "tensor_shape_hash": {"$ref": "#/$defs/hash"},
+    "trainable_tensor_count": {"type": "integer", "minimum": 1},
+    "trainable_parameter_count": {"type": "integer", "minimum": 1},
+    "source_dtype_counts": {"type": "object", "minProperties": 1, "additionalProperties": {"type": "integer", "minimum": 1}},
+    "buffers": {"type": "array", "minItems": 13, "maxItems": 13, "items": {"type": "object"}},
+    "resident_gpu_bytes": {"type": "integer", "minimum": 1},
+    "transient_gpu_bytes_max": {"type": "integer", "minimum": 1},
+    "peak_parameter_state_gpu_bytes": {"type": "integer", "minimum": 1},
+    "transient_cpu_bytes_max": {"type": "integer", "minimum": 1},
+    "checkpoint_parameter_state_bytes": {"type": "integer", "minimum": 1},
+    "checkpoint_every_steps": {"type": "integer", "minimum": 1},
+    "mathematics_implemented": {"const": false},
+    "scope": {"const": "shape_dtype_lifecycle_capacity_only"},
+    "artifact_hash": {"$ref": "#/$defs/hash"}
+  },
+  "$defs": {"hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"}}
+}

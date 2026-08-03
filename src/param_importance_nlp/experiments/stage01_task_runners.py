@@ -145,7 +145,6 @@ _FORMAL_EVIDENCE_ONLY_TASKS = frozenset(
         "stage0.01_baseline_and_safety",
         "stage0.02_storage_and_layout",
         "stage0.03_runtime_and_dependencies",
-        "stage0.10_capacity_and_operations",
         "stage0.11_test_quality_and_replay",
         "stage0.12_delivery_and_sync",
         "stage1.09_precision_clipping_and_optimizer_boundaries",
@@ -1946,6 +1945,27 @@ class Stage01CompositeTaskRunner(TaskRunner):
                     self.workspace_root,
                     existing,
                 )
+            if (
+                request.config.run_intent == "formal"
+                and request.task.task_id == "stage0.10_capacity_and_operations"
+            ):
+                from ..stage0_g8 import validate_formal_g8_outputs
+
+                gate = validate_formal_g8_outputs(
+                    request,
+                    self.workspace_root,
+                    existing,
+                )
+                return TaskRunResult.passed(
+                    request,
+                    artifact_refs=existing,
+                    message="Stage 0 S0.10 restored from revalidated formal commits",
+                    metadata={
+                        "stage0_g8_specialized": True,
+                        "restored": True,
+                        "gate_id": gate.gate_id,
+                    },
+                )
                 return TaskRunResult.passed(
                     request,
                     artifact_refs=existing,
@@ -2034,6 +2054,18 @@ class Stage01CompositeTaskRunner(TaskRunner):
             from ..stage0_g7_recovery import run_formal_g7_recovery_task
 
             return run_formal_g7_recovery_task(
+                request,
+                self.workspace_root,
+                store,
+                source_refs=source_refs,
+            )
+        if (
+            request.config.run_intent == "formal"
+            and request.task.task_id == "stage0.10_capacity_and_operations"
+        ):
+            from ..stage0_g8 import run_formal_g8_task
+
+            return run_formal_g8_task(
                 request,
                 self.workspace_root,
                 store,

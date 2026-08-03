@@ -454,6 +454,7 @@ def _training_resources(
     *,
     rank: int,
     world_size: int,
+    data_route_stage: int | None = None,
 ) -> _TrainingResources:
     providers = request.config.section("providers")
     training = request.config.section("training")
@@ -466,6 +467,9 @@ def _training_resources(
         and isinstance(training, dict)
         and isinstance(evaluation, dict)
     )
+    stage = int(identity["stage"]) if data_route_stage is None else data_route_stage
+    if isinstance(stage, bool) or not isinstance(stage, int) or not 0 <= stage <= 9:
+        raise ValueError("TRAINING_DATA_ROUTE_STAGE_INVALID")
     max_steps = training["max_steps"]
     if not isinstance(max_steps, int):
         raise TaskBlockedError(
@@ -554,13 +558,13 @@ def _training_resources(
     early_global_batch_size = int(batching["global_batch_size"])
     if data_asset.storage_kind == "pythia_mmap_shards":
         early_route = formal_pile_route(
-            stage=int(identity["stage"]),
+            stage=stage,
             evaluation=False,
             declared_sampling_design=str(data["sampling_design"]),
             configured_split=str(data["split"]),
         )
         runtime_assets.validate_pile_budget(
-            stage=int(identity["stage"]),
+            stage=stage,
             split=early_route.split,
             requested_records=max_steps * early_global_batch_size,
             max_steps=max_steps,
@@ -592,8 +596,6 @@ def _training_resources(
         int(batching["per_device_batch_size"])
         // int(batching["microbatch_size"])
     )
-
-    stage = int(identity["stage"])
 
     def build_dataset(
         *,

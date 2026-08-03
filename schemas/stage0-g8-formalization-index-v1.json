@@ -1,0 +1,30 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://parameter-importance.invalid/schemas/stage0-g8-formalization-index-v1.json",
+  "title": "Stage 0 G8 Formalization Index v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "generator_git_commit", "checked_at", "g7_recovery_index_ref", "g7_recovery_index_sha256", "g7_gate_artifact_hash", "config_ref", "config_hash", "task_output_refs", "gate_ref", "gate_artifact_hash", "environment_ref", "environment_hash", "next_task_id", "next_input_refs", "artifact_hash"],
+  "properties": {
+    "schema_version": {"const": "stage0-g8-formalization-index-v1"},
+    "generator_git_commit": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+    "checked_at": {"type": "string", "format": "date-time"},
+    "g7_recovery_index_ref": {"$ref": "#/$defs/ref"},
+    "g7_recovery_index_sha256": {"$ref": "#/$defs/hash"},
+    "g7_gate_artifact_hash": {"$ref": "#/$defs/hash"},
+    "config_ref": {"$ref": "#/$defs/ref"},
+    "config_hash": {"$ref": "#/$defs/hash"},
+    "task_output_refs": {"type": "object", "additionalProperties": false, "required": ["capacity_envelope", "operations_preflight", "fault_report"], "properties": {"capacity_envelope": {"$ref": "#/$defs/ref"}, "operations_preflight": {"$ref": "#/$defs/ref"}, "fault_report": {"$ref": "#/$defs/ref"}}},
+    "gate_ref": {"$ref": "#/$defs/ref"},
+    "gate_artifact_hash": {"$ref": "#/$defs/hash"},
+    "environment_ref": {"$ref": "#/$defs/ref"},
+    "environment_hash": {"$ref": "#/$defs/hash"},
+    "next_task_id": {"const": "stage0.11_test_quality_and_replay"},
+    "next_input_refs": {"type": "array", "minItems": 3, "maxItems": 3, "uniqueItems": true, "items": {"$ref": "#/$defs/ref"}},
+    "artifact_hash": {"$ref": "#/$defs/hash"}
+  },
+  "$defs": {
+    "hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "ref": {"type": "string", "minLength": 1, "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.(?:/|$))(?!.*\\\\).+$"}
+  }
+}

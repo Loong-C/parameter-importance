@@ -1,0 +1,23 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://parameter-importance.invalid/schemas/stage0-g8-work-envelope-v1.json",
+  "title": "Stage 0 G8 Compute Communication Work Envelope v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "model_id", "world_size", "candidate_stage", "compute_dtype", "sequence_length", "microbatch_size", "per_optimizer_step", "checkpoint_boundary", "mathematics_implemented", "scope", "artifact_hash"],
+  "properties": {
+    "schema_version": {"const": "stage0.compute-communication-work-envelope.v1"},
+    "model_id": {"type": "string", "minLength": 1},
+    "world_size": {"enum": [1, 4]},
+    "candidate_stage": {"enum": [0, 4, 5]},
+    "compute_dtype": {"enum": ["float32", "bfloat16"]},
+    "sequence_length": {"type": "integer", "minimum": 1},
+    "microbatch_size": {"type": "integer", "minimum": 1},
+    "per_optimizer_step": {"type": "object", "additionalProperties": false, "required": ["forward_calls", "backward_calls", "gradient_evaluations", "activation_recomputations", "synthetic_full_parameter_updates", "cpu_aggregation_bytes", "serialization_bytes", "distributed_gradient_sync"], "properties": {"forward_calls": {"type": "integer", "minimum": 1}, "backward_calls": {"type": "integer", "minimum": 1}, "gradient_evaluations": {"type": "integer", "minimum": 1}, "activation_recomputations": {"type": "integer", "minimum": 0}, "synthetic_full_parameter_updates": {"const": 7}, "cpu_aggregation_bytes": {"type": "integer", "minimum": 0}, "serialization_bytes": {"type": "integer", "minimum": 0}, "distributed_gradient_sync": {"type": "object"}}},
+    "checkpoint_boundary": {"type": "object", "additionalProperties": false, "required": ["cadence_steps", "collective_type", "collective_count", "collective_payload_bytes", "collective_chunk_bytes", "cpu_aggregation", "serialization_scope"], "properties": {"cadence_steps": {"type": "integer", "minimum": 1}, "collective_type": {"const": "all_reduce_sum"}, "collective_count": {"type": "integer", "minimum": 0}, "collective_payload_bytes": {"type": "integer", "minimum": 1}, "collective_chunk_bytes": {"type": "integer", "minimum": 1}, "cpu_aggregation": {"const": "per_rank_no_rank0_gather"}, "serialization_scope": {"type": "string", "minLength": 1}}},
+    "mathematics_implemented": {"const": false},
+    "scope": {"const": "synthetic_compute_communication_upper_bound"},
+    "artifact_hash": {"$ref": "#/$defs/hash"}
+  },
+  "$defs": {"hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"}}
+}
