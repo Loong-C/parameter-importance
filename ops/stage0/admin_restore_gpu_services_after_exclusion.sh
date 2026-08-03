@@ -68,8 +68,8 @@ if (( $# != 0 )); then
   printf 'ERROR: this finalizer accepts no arguments.\n' >&2
   exit 4
 fi
-for required in flock fuser lspci nvidia-smi runuser timeout journalctl \
-  docker ctr lxc /usr/bin/python3; do
+for required in awk chmod chown find flock fuser lspci nvidia-smi runuser \
+  sed stat systemctl timeout journalctl docker ctr lxc /usr/bin/python3; do
   command -v "${required}" >/dev/null 2>&1 || {
     printf 'ERROR: required command is unavailable: %s\n' "${required}" >&2
     exit 5
@@ -111,6 +111,7 @@ SAFE_HOLD_VERIFIED=0
 FAILED_LINE=""
 FAILED_COMMAND=""
 FABRIC_OUTCOME="NOT_ATTEMPTED"
+RETRY_BASELINE_RESTORED=0
 GPU_NODES=()
 
 record_error() {
@@ -176,6 +177,7 @@ publish_failure() {
     printf 'failed_line=%s\n' "${FAILED_LINE}"
     printf 'failed_command=%s\n' "${FAILED_COMMAND}"
     printf 'fabric_manager=%s\n' "${FABRIC_OUTCOME}"
+    printf 'retry_baseline_restored=%s\n' "${RETRY_BASELINE_RESTORED}"
     printf 'safe_hold_verified=%s\n' "${SAFE_HOLD_VERIFIED}"
   } > "${tmp}"
   chmod 0444 "${tmp}"
@@ -357,7 +359,18 @@ validate_pytorch() {
     "${CANDIDATE_PYTHON}" -I - > "${RUN_DIR}/pytorch-${prefix}.json" <<'PY'
 import json
 import os
+import re
 import torch
+
+def canonical_uuid(value):
+    if isinstance(value, bytes):
+        value = value.decode("ascii")
+    value = str(value or "")
+    if value.startswith("GPU-"):
+        value = value[4:]
+    if not re.fullmatch(r"[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}", value):
+        raise SystemExit(f"invalid PyTorch GPU UUID: {value!r}")
+    return "GPU-" + value.lower()
 
 expected = os.environ["EXPECTED_UUIDS"].split(",")
 if torch.cuda.device_count() != 4:
@@ -365,10 +378,8 @@ if torch.cuda.device_count() != 4:
 rows = []
 for index in range(4):
     p = torch.cuda.get_device_properties(index)
-    uuid = getattr(p, "uuid", "")
-    if isinstance(uuid, bytes):
-        uuid = uuid.decode("ascii")
-    rows.append({"index": index, "uuid": str(uuid), "name": p.name, "memory": p.total_memory})
+    uuid = canonical_uuid(getattr(p, "uuid", ""))
+    rows.append({"index": index, "uuid": uuid, "name": p.name, "memory": p.total_memory})
 if [x["uuid"] for x in rows] != expected:
     raise SystemExit(f"PyTorch UUID mismatch: {rows!r}")
 print(json.dumps({"device_count": 4, "devices": rows}, indent=2))
@@ -432,6 +443,111 @@ run_exact_four_gate() {
   validate_gpu_clients "${prefix}" "${allow_fabric}"
 }
 
+restore_driver_node_contract() {
+  local node metadata rdev minor_value capability_file capability_minor
+  local capability_mode_decimal expected_capability_mode match_count
+  local -a numeric_nodes=() world_nodes=() capability_nodes=()
+  shopt -s nullglob
+  numeric_nodes=(/dev/nvidia[0-9]*)
+  capability_nodes=(/dev/nvidia-caps/*)
+  shopt -u nullglob
+  (( ${#numeric_nodes[@]} == 4 )) || {
+    printf 'ERROR: retry baseline expected four numeric NVIDIA nodes, got %s.\n' "${#numeric_nodes[@]}" >&2
+    return 1
+  }
+  world_nodes=(
+    "${numeric_nodes[@]}" /dev/nvidiactl /dev/nvidia-uvm /dev/nvidia-uvm-tools
+    /dev/nvidia-modeset
+  )
+  if [[ -e /dev/nvidia-nvswitchctl || -L /dev/nvidia-nvswitchctl ]]; then
+    world_nodes+=(/dev/nvidia-nvswitchctl)
+  fi
+  for node in "${world_nodes[@]}"; do
+    [[ -c ${node} ]] || {
+      printf 'ERROR: retry baseline NVIDIA node is missing or invalid: %s.\n' "${node}" >&2
+      return 1
+    }
+    chown root:root -- "${node}"
+    chmod 0666 -- "${node}"
+    metadata="$(stat -c '%u:%g:%a' -- "${node}")"
+    [[ ${metadata} == 0:0:666 ]] || {
+      printf 'ERROR: failed to restore NVIDIA node metadata: %s=%s.\n' "${node}" "${metadata}" >&2
+      return 1
+    }
+  done
+  for node in "${capability_nodes[@]}"; do
+    [[ -c ${node} ]] || {
+      printf 'ERROR: retry baseline capability node is invalid: %s.\n' "${node}" >&2
+      return 1
+    }
+    rdev="$(stat -c '%T' -- "${node}")"
+    minor_value=$((16#${rdev}))
+    match_count=0
+    expected_capability_mode=""
+    while IFS= read -r capability_file; do
+      capability_minor="$(sed -n 's/^DeviceFileMinor:[[:space:]]*//p' "${capability_file}")"
+      capability_mode_decimal="$(sed -n 's/^DeviceFileMode:[[:space:]]*//p' "${capability_file}")"
+      if [[ ${capability_minor} == "${minor_value}" ]]; then
+        [[ ${capability_mode_decimal} =~ ^[0-9]+$ ]] || {
+          printf 'ERROR: invalid capability mode declaration: %s=%s.\n' \
+            "${capability_file}" "${capability_mode_decimal}" >&2
+          return 1
+        }
+        printf -v expected_capability_mode '%o' "${capability_mode_decimal}"
+        ((match_count += 1))
+      fi
+    done < <(find /proc/driver/nvidia/capabilities -type f -print 2>/dev/null)
+    (( match_count == 1 )) || {
+      printf 'ERROR: capability minor %s has %s driver declarations.\n' "${minor_value}" "${match_count}" >&2
+      return 1
+    }
+    chown root:root -- "${node}"
+    chmod "${expected_capability_mode}" -- "${node}"
+    metadata="$(stat -c '%u:%g:%a' -- "${node}")"
+    [[ ${metadata} == "0:0:${expected_capability_mode}" ]] || {
+      printf 'ERROR: failed to restore capability metadata: %s=%s.\n' "${node}" "${metadata}" >&2
+      return 1
+    }
+  done
+}
+
+prepare_retry_baseline_if_needed() {
+  local node mode
+  if systemctl is-active --quiet nvidia-persistenced.service; then
+    return 0
+  fi
+  shopt -s nullglob
+  GPU_NODES=(
+    /dev/nvidia[0-9]* /dev/nvidiactl /dev/nvidia-uvm /dev/nvidia-uvm-tools
+    /dev/nvidia-modeset /dev/nvidia-caps/*
+  )
+  shopt -u nullglob
+  if [[ -e /dev/nvidia-nvswitchctl || -L /dev/nvidia-nvswitchctl ]]; then
+    GPU_NODES+=(/dev/nvidia-nvswitchctl)
+  fi
+  (( ${#GPU_NODES[@]} > 0 )) || {
+    printf 'ERROR: no NVIDIA nodes exist for retry-baseline recovery.\n' >&2
+    return 1
+  }
+  for node in "${GPU_NODES[@]}"; do
+    mode="$(stat -c '%a:%u:%g' -- "${node}" 2>/dev/null || true)"
+    [[ ${mode} == 600:0:0 ]] || {
+      printf 'ERROR: persistenced is inactive outside a recognized safe hold: %s=%s.\n' "${node}" "${mode}" >&2
+      return 1
+    }
+  done
+  validate_gpu_clients "retry-safe-hold" 0
+  MUTATION_STARTED=1
+  restore_driver_node_contract
+  systemctl start nvidia-persistenced.service
+  systemctl is-active --quiet nvidia-persistenced.service || {
+    printf 'ERROR: nvidia-persistenced did not start during retry-baseline recovery.\n' >&2
+    return 1
+  }
+  RETRY_BASELINE_RESTORED=1
+  printf 'Retry baseline restored from a verified safe hold.\n'
+}
+
 printf 'Stage 0 UUID-exclusion service finalizer: %s\n' "$(date --iso-8601=seconds)"
 printf 'Run directory: %s\n' "${RUN_DIR}"
 
@@ -464,6 +580,7 @@ for unit in "${SNAP_LXD_STATIC_SERVICES[@]}"; do
     exit 20
   fi
 done
+prepare_retry_baseline_if_needed
 systemctl is-active --quiet nvidia-persistenced.service || {
   printf 'ERROR: nvidia-persistenced is not active.\n' >&2
   exit 21
@@ -484,26 +601,40 @@ run_exact_four_gate "pre-restore" 0
 PRECONDITIONS_VERIFIED=1
 MUTATION_STARTED=1
 
-# Fabric Manager was enabled+failed before this maintenance.  Try once while
-# all workload allocators are still masked.  A clean failure is preserved as a
-# documented degraded state; it must not perturb the exact-four GPU contract.
-systemctl unmask "${FABRIC_UNIT}"
-systemctl enable "${FABRIC_UNIT}"
-set +e
-timeout 60 systemctl start "${FABRIC_UNIT}"
-fabric_rc=$?
-set -e
-if [[ ${fabric_rc} -eq 0 ]] && systemctl is-active --quiet "${FABRIC_UNIT}"; then
-  FABRIC_OUTCOME="ACTIVE"
-  allow_fabric=1
-else
-  systemctl status "${FABRIC_UNIT}" --no-pager -l > "${RUN_DIR}/fabric-manager-failure.txt" 2>&1 || true
-  journalctl -u "${FABRIC_UNIT}" -b --no-pager > "${RUN_DIR}/fabric-manager-journal.txt" 2>&1 || true
+# Fabric Manager is applicable only when the nvidia-nvswitch driver has an
+# actual bound PCI function.  A control node alone is insufficient: the driver
+# may create it even when Fabric Manager reports NV_WARN_NOTHING_TO_DO.
+shopt -s nullglob
+NVSWITCH_PCI_DEVICES=(/sys/bus/pci/drivers/nvidia-nvswitch/????:??:??.?)
+shopt -u nullglob
+if (( ${#NVSWITCH_PCI_DEVICES[@]} == 0 )); then
   systemctl stop "${FABRIC_UNIT}" >/dev/null 2>&1 || true
   systemctl mask "${FABRIC_UNIT}"
+  systemctl reset-failed "${FABRIC_UNIT}" >/dev/null 2>&1 || true
   assert_masked_inactive "${FABRIC_UNIT}"
-  FABRIC_OUTCOME="DEGRADED_MASKED"
+  FABRIC_OUTCOME="NOT_APPLICABLE_MASKED"
   allow_fabric=0
+  printf 'Fabric Manager is not applicable: no bound NVSwitch PCI function.\n'
+else
+  systemctl unmask "${FABRIC_UNIT}"
+  systemctl enable "${FABRIC_UNIT}"
+  set +e
+  timeout 60 systemctl start "${FABRIC_UNIT}"
+  fabric_rc=$?
+  set -e
+  if [[ ${fabric_rc} -eq 0 ]] && systemctl is-active --quiet "${FABRIC_UNIT}"; then
+    FABRIC_OUTCOME="ACTIVE"
+    allow_fabric=1
+  else
+    systemctl status "${FABRIC_UNIT}" --no-pager -l > "${RUN_DIR}/fabric-manager-failure.txt" 2>&1 || true
+    journalctl -u "${FABRIC_UNIT}" -b --no-pager > "${RUN_DIR}/fabric-manager-journal.txt" 2>&1 || true
+    systemctl stop "${FABRIC_UNIT}" >/dev/null 2>&1 || true
+    systemctl mask "${FABRIC_UNIT}"
+    systemctl reset-failed "${FABRIC_UNIT}" >/dev/null 2>&1 || true
+    assert_masked_inactive "${FABRIC_UNIT}"
+    FABRIC_OUTCOME="DEGRADED_MASKED"
+    allow_fabric=0
+  fi
 fi
 sleep 3
 run_exact_four_gate "post-fabric-manager" "${allow_fabric}"
@@ -545,6 +676,8 @@ done
 for unit in "${MASKED_ALLOCATOR_UNITS[@]}"; do
   systemctl unmask "${unit}"
   systemctl enable "${unit}"
+done
+for unit in "${MASKED_ALLOCATOR_UNITS[@]}"; do
   timeout 60 systemctl start "${unit}"
   systemctl is-active --quiet "${unit}" || {
     printf 'ERROR: restored unit is not active: %s\n' "${unit}" >&2
@@ -618,7 +751,7 @@ from datetime import datetime, timezone
 
 payload = {
     "schema_version": "stage0.gpu-uuid-exclusion-service-finalize.v1",
-    "status": "PASS" if sys.argv[4] == "ACTIVE" else "PASS_WITH_FABRIC_MANAGER_DEGRADED",
+    "status": "PASS" if sys.argv[4] in {"ACTIVE", "NOT_APPLICABLE_MASKED"} else "PASS_WITH_FABRIC_MANAGER_DEGRADED",
     "run_id": sys.argv[2],
     "boot_id": sys.argv[3],
     "generated_at": datetime.now(timezone.utc).isoformat(),
@@ -649,6 +782,7 @@ success_tmp="$(mktemp -p "${RUN_DIR}" .success.XXXXXXXX)"
   printf 'run_id=%s\n' "${RUN_ID}"
   printf 'boot_id=%s\n' "${BOOT_ID}"
   printf 'fabric_manager=%s\n' "${FABRIC_OUTCOME}"
+  printf 'retry_baseline_restored=%s\n' "${RETRY_BASELINE_RESTORED}"
   printf 'evidence=%s\n' "${RUN_DIR}"
 } > "${success_tmp}"
 chmod 0444 "${success_tmp}"

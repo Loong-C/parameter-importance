@@ -122,7 +122,7 @@ run_bounded() {
   run_bounded_for "${COMMAND_TIMEOUT_SECONDS}" "$@"
 }
 
-for required in awk basename grep hostname id journalctl nvidia-smi pgrep readlink runuser sed stat systemctl timeout uname /usr/bin/python3; do
+for required in awk basename find grep hostname id journalctl nvidia-smi pgrep readlink runuser sed stat systemctl timeout uname /usr/bin/python3; do
   command -v "${required}" >/dev/null 2>&1 || fail "required command unavailable: ${required}"
 done
 [[ -x ${PROJECT_PYTHON} ]] || fail "project Python is unavailable: ${PROJECT_PYTHON}"
@@ -211,14 +211,23 @@ pass "four_allowed_bdfs_bound_with_exact_uuid_and_model"
 
 verify_device_nodes() {
   local node basename_value minor_value metadata rdev major_hex minor_hex
-  local -a numeric_nodes=() nodes=()
+  local capability_file capability_minor capability_mode_decimal
+  local expected_capability_mode match_count
+  local -a numeric_nodes=() world_nodes=() capability_nodes=() nvswitch_devices=()
   shopt -s nullglob
   numeric_nodes=(/dev/nvidia[0-9]*)
-  nodes=(
+  capability_nodes=(/dev/nvidia-caps/*)
+  nvswitch_devices=(/sys/bus/pci/drivers/nvidia-nvswitch/????:??:??.?)
+  world_nodes=(
     "${numeric_nodes[@]}" /dev/nvidiactl /dev/nvidia-uvm /dev/nvidia-uvm-tools
-    /dev/nvidia-modeset /dev/nvidia-nvswitchctl /dev/nvidia-caps/*
+    /dev/nvidia-modeset
   )
   shopt -u nullglob
+  if (( ${#nvswitch_devices[@]} > 0 )); then
+    world_nodes+=(/dev/nvidia-nvswitchctl)
+  elif [[ -e /dev/nvidia-nvswitchctl || -L /dev/nvidia-nvswitchctl ]]; then
+    world_nodes+=(/dev/nvidia-nvswitchctl)
+  fi
   (( ${#numeric_nodes[@]} == 4 )) || fail "expected 4 numeric NVIDIA nodes, observed ${#numeric_nodes[@]}"
   [[ -c /dev/nvidiactl ]] || fail "required shared node is missing: /dev/nvidiactl"
   for node in "${numeric_nodes[@]}"; do
@@ -234,16 +243,38 @@ verify_device_nodes() {
   for minor_value in "${!EXPECTED_NUMERIC_NODE[@]}"; do
     [[ -c /dev/nvidia${minor_value} ]] || fail "missing numeric node for allowed minor ${minor_value}"
   done
-  for node in "${nodes[@]}"; do
+  for node in "${world_nodes[@]}"; do
     [[ -c ${node} ]] || fail "NVIDIA path is not a character device: ${node}"
     metadata="$(stat -c '%u:%g:%a' -- "${node}")"
     [[ ${metadata} == 0:0:666 ]] || fail "unsafe/unrestored node metadata: ${node}=${metadata}, expected 0:0:666"
+  done
+  for node in "${capability_nodes[@]}"; do
+    [[ -c ${node} ]] || fail "NVIDIA capability path is not a character device: ${node}"
+    rdev="$(stat -c '%T' -- "${node}")"
+    minor_value=$((16#${rdev}))
+    match_count=0
+    expected_capability_mode=""
+    while IFS= read -r capability_file; do
+      capability_minor="$(sed -n 's/^DeviceFileMinor:[[:space:]]*//p' "${capability_file}")"
+      capability_mode_decimal="$(sed -n 's/^DeviceFileMode:[[:space:]]*//p' "${capability_file}")"
+      if [[ ${capability_minor} == "${minor_value}" ]]; then
+        [[ ${capability_mode_decimal} =~ ^[0-9]+$ ]] \
+          || fail "invalid driver-declared capability mode: ${capability_file}=${capability_mode_decimal}"
+        printf -v expected_capability_mode '%o' "${capability_mode_decimal}"
+        ((match_count += 1))
+      fi
+    done < <(find /proc/driver/nvidia/capabilities -type f -print 2>/dev/null)
+    (( match_count == 1 )) \
+      || fail "capability node minor does not map to exactly one driver declaration: ${node} minor=${minor_value} matches=${match_count}"
+    metadata="$(stat -c '%u:%g:%a' -- "${node}")"
+    [[ ${metadata} == "0:0:${expected_capability_mode}" ]] \
+      || fail "capability node metadata mismatch: ${node}=${metadata}, expected 0:0:${expected_capability_mode}"
   done
 }
 
 begin_check device_nodes_initial
 verify_device_nodes
-pass "numeric_nodes_exactly_map_allowed_minors_and_all_nodes_are_root_root_0666"
+pass "numeric_nodes_exactly_map_allowed_minors;world_nodes_0666;capability_nodes_match_driver_modes;nvswitch_node_matches_bound_hardware"
 
 verify_service_barrier() {
   local unit active enabled load_state
@@ -381,19 +412,28 @@ begin_check pytorch_enumeration
 EXPECTED_ALLOWED_ORDER="$(IFS=,; printf '%s' "${ALLOWED_UUIDS[*]}")"
 run_bounded_for "${PYTORCH_TIMEOUT_SECONDS}" "project PyTorch enumeration" "${USER_ENV_PREFIX[@]}" EXPECTED_UUIDS="${EXPECTED_ALLOWED_ORDER}" \
   CUDA_DEVICE_ORDER=PCI_BUS_ID "${PROJECT_PYTHON}" -I -c '
-import json, os
+import json, os, re
 if "CUDA_VISIBLE_DEVICES" in os.environ:
     raise SystemExit("CUDA_VISIBLE_DEVICES must be absent")
 import torch
+
+def canonical_uuid(value):
+    if isinstance(value, bytes):
+        value = value.decode("ascii")
+    value = str(value or "")
+    if value.startswith("GPU-"):
+        value = value[4:]
+    if not re.fullmatch(r"[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}", value):
+        raise SystemExit(f"invalid PyTorch GPU UUID: {value!r}")
+    return "GPU-" + value.lower()
+
 expected = os.environ["EXPECTED_UUIDS"].split(",")
 if torch.cuda.device_count() != 4:
     raise SystemExit(f"PyTorch expected 4 devices, observed {torch.cuda.device_count()}")
 observed = []
 for index in range(4):
     value = getattr(torch.cuda.get_device_properties(index), "uuid", None)
-    if isinstance(value, bytes):
-        value = value.decode("ascii")
-    observed.append(str(value or ""))
+    observed.append(canonical_uuid(value))
 if observed != expected:
     raise SystemExit(f"PyTorch UUID order mismatch: {observed!r}")
 print(json.dumps({"device_count": 4, "uuids": observed}, separators=(",", ":")))
@@ -408,7 +448,7 @@ verify_service_barrier
 pass "no_compute_contexts;device_permissions_and_service_barrier_unchanged"
 
 begin_check current_boot_kernel_log
-run_bounded "current-boot kernel journal" /usr/bin/journalctl -k -b "${BOOT_ID}" --no-pager --quiet -o short-monotonic
+run_bounded "current-boot kernel journal" /usr/bin/journalctl -k -b 0 --no-pager --quiet -o short-monotonic
 KERNEL_LOG="${BOUNDED_OUTPUT}"
 [[ -n ${KERNEL_LOG//[[:space:]]/} && ${KERNEL_LOG} == *"Linux version"* ]] || fail "current-boot kernel journal is empty, incomplete, or unreadable"
 ALLOWED_BDF_RE='0000:(9c|9d|a0|a4):00(\.0)?'

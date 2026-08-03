@@ -672,7 +672,18 @@ validate_pytorch_enumeration() {
     "${CANDIDATE_PYTHON}" -I - > "${output_path}" <<'PY'
 import json
 import os
+import re
 import torch
+
+def canonical_uuid(value):
+    if isinstance(value, bytes):
+        value = value.decode("ascii")
+    value = str(value or "")
+    if value.startswith("GPU-"):
+        value = value[4:]
+    if not re.fullmatch(r"[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}", value):
+        raise SystemExit(f"invalid PyTorch GPU UUID: {value!r}")
+    return "GPU-" + value.lower()
 
 allowed = os.environ["EXPECTED_UUIDS"].split(",")
 count = torch.cuda.device_count()
@@ -683,9 +694,7 @@ observed = []
 for index in range(count):
     properties = torch.cuda.get_device_properties(index)
     raw_uuid = getattr(properties, "uuid", None)
-    if isinstance(raw_uuid, bytes):
-        raw_uuid = raw_uuid.decode("ascii")
-    uuid = str(raw_uuid or "")
+    uuid = canonical_uuid(raw_uuid)
     observed.append(uuid)
     devices.append(
         {
