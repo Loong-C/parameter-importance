@@ -132,6 +132,21 @@ class Stage0G5FormalizationResult:
 
 
 @dataclass(frozen=True, slots=True)
+class Stage0G5FormalState:
+    """Revalidated G5 handoff consumed by the four-GPU G6 suite."""
+
+    environment: TaskRuntimeEnvironment
+    task_output_refs: Mapping[str, str]
+    config: ResolvedConfigV2
+    config_ref: str
+    environment_ref: str
+    index_ref: str
+    index_sha256: str
+    gate_artifact_hash: str
+    g4_index_ref: str
+
+
+@dataclass(frozen=True, slots=True)
 class _ChildSpec:
     run_kind: str
     repeat_index: int
@@ -1319,13 +1334,123 @@ def execute_stage0_g5(
     )
 
 
+def load_stage0_g5_formal_state(
+    *,
+    data_root: str | Path,
+    index_ref: str,
+    expected_git_commit: str,
+) -> Stage0G5FormalState:
+    """Load G5 only after replaying G4, every worker report, and the gate."""
+
+    root = Path(data_root).resolve(strict=True)
+    index_path = _logical_path(root, index_ref, field="index_ref")
+    raw = _mapping(load_canonical_json(index_path), field="g5_index")
+    expected = {
+        "schema_version",
+        "generator_git_commit",
+        "checked_at",
+        "g4_index_ref",
+        "g4_index_sha256",
+        "g4_gate_artifact_hash",
+        "config_ref",
+        "config_hash",
+        "task_output_refs",
+        "gate_ref",
+        "environment_ref",
+        "environment_hash",
+        "next_task_id",
+        "next_input_refs",
+        "artifact_hash",
+    }
+    if set(raw) != expected or raw.get("schema_version") != (
+        "stage0-g5-formalization-index-v1"
+    ):
+        raise Stage0G5Error("G5_STATE_INDEX_FIELDS_OR_VERSION_INVALID")
+    declared = raw.pop("artifact_hash")
+    if declared != canonical_json_hash(raw):
+        raise Stage0G5Error("G5_STATE_INDEX_HASH_MISMATCH")
+    raw["artifact_hash"] = declared
+    if raw.get("generator_git_commit") != expected_git_commit:
+        raise Stage0G5Error("G5_STATE_GENERATOR_COMMIT_MISMATCH")
+
+    g4_state = load_stage0_g4_formal_state(
+        data_root=root,
+        index_ref=str(raw["g4_index_ref"]),
+        expected_git_commit=expected_git_commit,
+    )
+    if (
+        raw.get("g4_index_sha256") != g4_state.index_sha256
+        or raw.get("g4_gate_artifact_hash") != g4_state.gate_artifact_hash
+    ):
+        raise Stage0G5Error("G5_STATE_G4_BINDING_MISMATCH")
+    config_path = _logical_path(root, raw["config_ref"], field="config_ref")
+    config = ResolvedConfigV2.from_mapping(
+        _mapping(load_canonical_json(config_path), field="config")
+    )
+    if config.task_id != TASK_ID or config.config_hash != raw.get("config_hash"):
+        raise Stage0G5Error("G5_STATE_CONFIG_MISMATCH")
+    outputs = _mapping(raw["task_output_refs"], field="task_output_refs")
+    if set(outputs) != _OUTPUT_KINDS or any(
+        not isinstance(value, str) for value in outputs.values()
+    ):
+        raise Stage0G5Error("G5_STATE_OUTPUT_SET_INVALID")
+    ordered_outputs = {
+        key: str(outputs[key])
+        for key in ("training_smoke_result", "event_stream", "checkpoint_commit")
+    }
+    request = TaskExecutionRequest(
+        config=config,
+        task=config.task_definition,
+        environment=g4_state.environment,
+    )
+    gate = validate_formal_g5_outputs(request, root, ordered_outputs)
+    if raw.get("gate_ref") != outputs["training_smoke_result"]:
+        raise Stage0G5Error("G5_STATE_GATE_REF_MISMATCH")
+
+    environment_path = _logical_path(
+        root, raw["environment_ref"], field="environment_ref"
+    )
+    environment = TaskRuntimeEnvironment.from_mapping(
+        _mapping(load_canonical_json(environment_path), field="environment")
+    )
+    next_inputs = raw.get("next_input_refs")
+    if (
+        environment.environment_hash != raw.get("environment_hash")
+        or gate.gate_id not in environment.passed_gate_ids
+        or environment.evidence_refs.get("gate_stage0_g5") != raw.get("gate_ref")
+        or raw.get("next_task_id") != "stage0.07_ddp_and_gradient_semantics"
+        or not isinstance(next_inputs, list)
+        or set(next_inputs) != set(outputs.values())
+    ):
+        raise Stage0G5Error("G5_STATE_ENVIRONMENT_OR_HANDOFF_MISMATCH")
+    loaded_gate = load_committed_task_artifact(
+        root, str(raw["gate_ref"]), require_formal=True
+    )
+    gate_hash = loaded_gate.payload.get("artifact_hash")
+    if not isinstance(gate_hash, str) or _SHA256_RE.fullmatch(gate_hash) is None:
+        raise Stage0G5Error("G5_STATE_GATE_ARTIFACT_HASH_INVALID")
+    return Stage0G5FormalState(
+        environment=environment,
+        task_output_refs=ordered_outputs,
+        config=config,
+        config_ref=str(raw["config_ref"]),
+        environment_ref=str(raw["environment_ref"]),
+        index_ref=index_ref,
+        index_sha256=sha256_file(index_path),
+        gate_artifact_hash=gate_hash,
+        g4_index_ref=str(raw["g4_index_ref"]),
+    )
+
+
 __all__ = [
     "G5SourceBinding",
     "Stage0G5Error",
+    "Stage0G5FormalState",
     "Stage0G5FormalizationResult",
     "TASK_ID",
     "build_stage0_g5_config",
     "execute_stage0_g5",
+    "load_stage0_g5_formal_state",
     "run_formal_g5_task",
     "validate_formal_g5_outputs",
     "validate_g5_report_set",

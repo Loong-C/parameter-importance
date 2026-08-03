@@ -1790,6 +1790,44 @@ class DistributedTrainingTaskRunner(TrainingTaskRunner):
     runner_kind: RunnerKind = RunnerKind.DISTRIBUTED_TRAINING
 
     def run(self, request: TaskExecutionRequest) -> TaskRunResult:
+        store = _artifact_store(request, self.workspace_root)
+        if (
+            request.config.run_intent == "formal"
+            and request.task.task_id == "stage0.07_ddp_and_gradient_semantics"
+        ):
+            existing_g6 = store.discover_complete(
+                task_id=request.task.task_id,
+                config_hash=request.config.config_hash,
+                artifact_kinds=request.task.artifact_kinds,
+                formal_eligible=True,
+            )
+            if existing_g6 is not None:
+                from ..stage0_g6 import validate_formal_g6_outputs
+
+                gate = validate_formal_g6_outputs(
+                    request,
+                    self.workspace_root,
+                    existing_g6,
+                )
+                return TaskRunResult.passed(
+                    request,
+                    artifact_refs=existing_g6,
+                    message="Stage 0 G6 restored from revalidated formal commits",
+                    metadata={
+                        "stage0_g6_specialized": True,
+                        "restored": True,
+                        "gate_id": gate.gate_id,
+                    },
+                )
+            from ..stage0_g6 import run_formal_g6_task
+
+            _, source_refs = _input_evidence(request, self.workspace_root)
+            return run_formal_g6_task(
+                request,
+                self.workspace_root,
+                store,
+                source_refs=source_refs,
+            )
         launcher = request.config.section("launcher")
         assert isinstance(launcher, dict)
         world_size = int(launcher["world_size"])
@@ -1805,7 +1843,6 @@ class DistributedTrainingTaskRunner(TrainingTaskRunner):
             executor.close()
             raise ValueError("DISTRIBUTED_LAUNCHER_WORLD_SIZE_MISMATCH")
         rank = executor.spec.rank
-        store = _artifact_store(request, self.workspace_root)
         try:
             if rank == 0:
                 existing = _completed_result(request, store)

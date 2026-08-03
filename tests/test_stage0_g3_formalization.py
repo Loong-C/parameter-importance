@@ -22,9 +22,13 @@ from param_importance_nlp.g3_gate import GATE_IDS, g3_resolution_artifact_hash
 from param_importance_nlp.runtime import (
     TaskExecutionRequest,
     TaskRunResult,
+    TaskRuntimeEnvironment,
     load_committed_task_artifact,
 )
-from param_importance_nlp.experiments.task_runners import TrainingTaskRunner
+from param_importance_nlp.experiments.task_runners import (
+    DistributedTrainingTaskRunner,
+    TrainingTaskRunner,
+)
 from param_importance_nlp.stage0_bootstrap import (
     Stage0RuntimeSnapshot,
     Stage0SourceBinding,
@@ -33,6 +37,7 @@ from param_importance_nlp.stage0_bootstrap import (
 from param_importance_nlp import stage0_g3_formalization as formalization
 from param_importance_nlp import stage0_g4
 from param_importance_nlp import stage0_g5
+from param_importance_nlp import stage0_g6
 from param_importance_nlp.stage0_g3_formalization import (
     Stage0G3FormalizationError,
     formalize_stage0_g3,
@@ -494,3 +499,61 @@ def test_g4_formal_runner_publishes_real_contracts_and_pass_gate(
     direct = TrainingTaskRunner(tmp_path).run(request)
     assert direct.status.value == "PASS"
     assert dispatched == [tuple(first.task_output_refs.values())]
+
+    g5_environment = TaskRuntimeEnvironment(
+        capabilities=state.environment.capabilities,
+        frozen_contract_stages=state.environment.frozen_contract_stages,
+        passed_gate_ids=state.environment.passed_gate_ids | frozenset({"stage0.G5"}),
+        estimator_decision_ref=state.environment.estimator_decision_ref,
+        evidence_refs={
+            **state.environment.evidence_refs,
+            "gate_stage0_g5": first.task_output_refs["provenance_record"],
+        },
+    )
+    g5_state = stage0_g5.Stage0G5FormalState(
+        environment=g5_environment,
+        task_output_refs=first.task_output_refs,
+        config=g5_config,
+        config_ref="fixture/g5-config.json",
+        environment_ref="fixture/g5-environment.json",
+        index_ref="fixture/g5-index.json",
+        index_sha256="b" * 64,
+        gate_artifact_hash="c" * 64,
+        g4_index_ref=first.index_ref,
+    )
+    g6_config = stage0_g6.build_stage0_g6_config(
+        binding=_binding(),
+        data_root=tmp_path,
+        state=g5_state,
+    )
+    assert g6_config.task_id == "stage0.07_ddp_and_gradient_semantics"
+    assert g6_config.section("launcher")["world_size"] == 4
+    assert g6_config.section("launcher")["backend"] == "nccl"
+    assert g6_config.base_config.section("batching") == {
+        "global_batch_size": 8,
+        "per_device_batch_size": 1,
+        "microbatch_size": 1,
+        "accumulation_steps": 2,
+        "no_sync": True,
+    }
+    g6_dispatched: list[tuple[str, ...]] = []
+
+    def fake_g6(request, root, store, *, source_refs):
+        del root, store
+        g6_dispatched.append(tuple(source_refs))
+        return TaskRunResult.passed(
+            request,
+            artifact_refs={
+                kind: f"fake/{kind}.json" for kind in request.task.artifact_kinds
+            },
+        )
+
+    monkeypatch.setattr(stage0_g6, "run_formal_g6_task", fake_g6)
+    g6_request = TaskExecutionRequest(
+        config=g6_config,
+        task=g6_config.task_definition,
+        environment=g5_environment,
+    )
+    distributed = DistributedTrainingTaskRunner(tmp_path).run(g6_request)
+    assert distributed.status.value == "PASS"
+    assert g6_dispatched == [tuple(first.task_output_refs.values())]

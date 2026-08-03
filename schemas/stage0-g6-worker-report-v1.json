@@ -1,0 +1,53 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://parameter-importance.invalid/schemas/stage0-g6-worker-report-v1.json",
+  "title": "Stage 0 G6 torchrun worker report",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version", "run_id", "run_kind", "repeat_index", "status",
+    "started_at", "completed_at", "generator_git_commit", "plan_ref",
+    "plan_sha256", "config_ref", "config_sha256", "config_hash",
+    "environment_ref", "environment_sha256", "environment_hash",
+    "selected_gpu_uuids", "backend", "world_size", "rank_records",
+    "metrics", "artifact_hash"
+  ],
+  "properties": {
+    "schema_version": {"const": "stage0-g6-worker-report-v1"},
+    "run_id": {"type": "string", "minLength": 1},
+    "run_kind": {"enum": ["collective", "semantic", "recovery"]},
+    "repeat_index": {"type": "integer", "minimum": 0},
+    "status": {"const": "PASS"},
+    "started_at": {"type": "string", "format": "date-time"},
+    "completed_at": {"type": "string", "format": "date-time"},
+    "generator_git_commit": {"$ref": "#/$defs/git_commit"},
+    "plan_ref": {"$ref": "#/$defs/logical_ref"},
+    "plan_sha256": {"$ref": "#/$defs/sha256"},
+    "config_ref": {"$ref": "#/$defs/logical_ref"},
+    "config_sha256": {"$ref": "#/$defs/sha256"},
+    "config_hash": {"$ref": "#/$defs/sha256"},
+    "environment_ref": {"$ref": "#/$defs/logical_ref"},
+    "environment_sha256": {"$ref": "#/$defs/sha256"},
+    "environment_hash": {"$ref": "#/$defs/sha256"},
+    "selected_gpu_uuids": {
+      "type": "array", "minItems": 4, "maxItems": 4, "uniqueItems": true,
+      "items": {"type": "string", "pattern": "^GPU-.+$"}
+    },
+    "backend": {"const": "nccl"},
+    "world_size": {"const": 4},
+    "rank_records": {
+      "type": "array", "minItems": 4, "maxItems": 4,
+      "items": {"type": "object"}
+    },
+    "metrics": {"type": "object"},
+    "artifact_hash": {"$ref": "#/$defs/sha256"}
+  },
+  "$defs": {
+    "git_commit": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "logical_ref": {
+      "type": "string", "minLength": 1,
+      "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.?(?:/|$))(?!.*\\\\)[^:]+$"
+    }
+  }
+}

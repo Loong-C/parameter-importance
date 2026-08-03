@@ -1,0 +1,55 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://parameter-importance.invalid/schemas/stage0-g6-worker-plan-v1.json",
+  "title": "Stage 0 G6 torchrun worker plan",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version", "run_id", "run_kind", "repeat_index",
+    "generator_git_commit", "config_ref", "config_sha256", "config_hash",
+    "environment_ref", "environment_sha256", "environment_hash",
+    "selected_gpu_uuids", "report_ref", "timeout_seconds",
+    "collective_protocol", "artifact_hash"
+  ],
+  "properties": {
+    "schema_version": {"const": "stage0-g6-worker-plan-v1"},
+    "run_id": {"type": "string", "minLength": 1},
+    "run_kind": {"enum": ["collective", "semantic", "recovery", "failure_rank"]},
+    "repeat_index": {"type": "integer", "minimum": 0},
+    "generator_git_commit": {"$ref": "#/$defs/git_commit"},
+    "config_ref": {"$ref": "#/$defs/logical_ref"},
+    "config_sha256": {"$ref": "#/$defs/sha256"},
+    "config_hash": {"$ref": "#/$defs/sha256"},
+    "environment_ref": {"$ref": "#/$defs/logical_ref"},
+    "environment_sha256": {"$ref": "#/$defs/sha256"},
+    "environment_hash": {"$ref": "#/$defs/sha256"},
+    "selected_gpu_uuids": {
+      "type": "array", "minItems": 4, "maxItems": 4, "uniqueItems": true,
+      "items": {"type": "string", "pattern": "^GPU-.+$"}
+    },
+    "report_ref": {"$ref": "#/$defs/logical_ref"},
+    "timeout_seconds": {"type": "integer", "minimum": 1, "maximum": 3600},
+    "collective_protocol": {
+      "type": "object", "additionalProperties": false,
+      "required": ["protocol_version", "warmup_iterations", "measured_iterations", "tensor_elements"],
+      "properties": {
+        "protocol_version": {"const": "stage0-unified-measurement-v1"},
+        "warmup_iterations": {"const": 20},
+        "measured_iterations": {"const": 50},
+        "tensor_elements": {
+          "type": "array", "minItems": 3, "uniqueItems": true,
+          "items": {"type": "integer", "minimum": 1}
+        }
+      }
+    },
+    "artifact_hash": {"$ref": "#/$defs/sha256"}
+  },
+  "$defs": {
+    "git_commit": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "logical_ref": {
+      "type": "string", "minLength": 1,
+      "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.?(?:/|$))(?!.*\\\\)[^:]+$"
+    }
+  }
+}
