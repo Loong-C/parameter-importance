@@ -163,6 +163,18 @@ def normalize_uuid(value: Any) -> str:
     return "GPU-" + text.lower()
 
 
+def parse_excluded_uuid_parameter(value: str) -> list[str]:
+    text = value.strip()
+    if len(text) >= 2 and text[0] == text[-1] == '"':
+        text = text[1:-1]
+    elif '"' in text:
+        raise PromotionError("malformed quoted NVIDIA excluded-UUID parameter")
+    values = [normalize_uuid(item.strip()) for item in text.split(",") if item.strip()]
+    if not values:
+        raise PromotionError("NVIDIA excluded-UUID parameter is empty")
+    return values
+
+
 def validate_admin_evidence(root: Path, boot_id: str) -> dict[str, Any]:
     required = {
         "administrator-response-final.json",
@@ -345,7 +357,7 @@ def validate_live_host(python: Path, boot_id: str, data_root: Path) -> dict[str,
         raise PromotionError(f"promotion may run only on {EXPECTED_HOST}")
     params = Path("/proc/driver/nvidia/params").read_text(encoding="utf-8")
     match = re.search(r"^ExcludedGpus:\s*(.*)$", params, flags=re.MULTILINE)
-    if not match or match.group(1).split(",") != EXPECTED_EXCLUDED_UUIDS:
+    if not match or parse_excluded_uuid_parameter(match.group(1)) != EXPECTED_EXCLUDED_UUIDS:
         raise PromotionError("live NVIDIA excluded-UUID contract mismatch")
     nvml_command = [
         "nvidia-smi",

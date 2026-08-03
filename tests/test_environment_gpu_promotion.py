@@ -10,6 +10,7 @@ from ops.stage0.promote_environment_after_gpu_gate import (
     PromotionError,
     normalize_uuid,
     parse_marker,
+    parse_excluded_uuid_parameter,
     verify_sha256sums,
 )
 
@@ -25,6 +26,22 @@ def test_normalize_uuid_accepts_pytorch_and_nvml_forms() -> None:
 def test_normalize_uuid_rejects_malformed_values(value: str) -> None:
     with pytest.raises(PromotionError, match="invalid GPU UUID"):
         normalize_uuid(value)
+
+
+def test_parse_excluded_uuid_parameter_accepts_driver_quoted_form() -> None:
+    value = (
+        ' "GPU-5c672d04-4f83-3cc0-80d0-0108b1b63267,'
+        'GPU-e78c55cd-db97-b761-f559-dc6eae3be81d"'
+    )
+    assert parse_excluded_uuid_parameter(value) == [
+        "GPU-5c672d04-4f83-3cc0-80d0-0108b1b63267",
+        "GPU-e78c55cd-db97-b761-f559-dc6eae3be81d",
+    ]
+
+
+def test_parse_excluded_uuid_parameter_rejects_unbalanced_quotes() -> None:
+    with pytest.raises(PromotionError, match="malformed quoted"):
+        parse_excluded_uuid_parameter('"GPU-5c672d04-4f83-3cc0-80d0-0108b1b63267')
 
 
 def test_parse_marker_rejects_duplicate_keys(tmp_path: Path) -> None:
