@@ -145,7 +145,6 @@ _FORMAL_EVIDENCE_ONLY_TASKS = frozenset(
         "stage0.01_baseline_and_safety",
         "stage0.02_storage_and_layout",
         "stage0.03_runtime_and_dependencies",
-        "stage0.11_test_quality_and_replay",
         "stage0.12_delivery_and_sync",
         "stage1.09_precision_clipping_and_optimizer_boundaries",
         "stage1.10_checkpoint_resume_and_artifacts",
@@ -1945,6 +1944,17 @@ class Stage01CompositeTaskRunner(TaskRunner):
                     self.workspace_root,
                     existing,
                 )
+                return TaskRunResult.passed(
+                    request,
+                    artifact_refs=existing,
+                    checkpoint_ref=existing["checkpoint_commit"],
+                    message="Stage 0 S0.9 restored from revalidated formal commits",
+                    metadata={
+                        "stage0_g7_recovery_specialized": True,
+                        "restored": True,
+                        "gate_id": gate.gate_id,
+                    },
+                )
             if (
                 request.config.run_intent == "formal"
                 and request.task.task_id == "stage0.10_capacity_and_operations"
@@ -1966,13 +1976,23 @@ class Stage01CompositeTaskRunner(TaskRunner):
                         "gate_id": gate.gate_id,
                     },
                 )
+            if (
+                request.config.run_intent == "formal"
+                and request.task.task_id == "stage0.11_test_quality_and_replay"
+            ):
+                from ..stage0_g9 import validate_formal_g9_outputs
+
+                gate = validate_formal_g9_outputs(
+                    request,
+                    self.workspace_root,
+                    existing,
+                )
                 return TaskRunResult.passed(
                     request,
                     artifact_refs=existing,
-                    checkpoint_ref=existing["checkpoint_commit"],
-                    message="Stage 0 S0.9 restored from revalidated formal commits",
+                    message="Stage 0 S0.11 restored from revalidated formal commits",
                     metadata={
-                        "stage0_g7_recovery_specialized": True,
+                        "stage0_g9_specialized": True,
                         "restored": True,
                         "gate_id": gate.gate_id,
                     },
@@ -2066,6 +2086,18 @@ class Stage01CompositeTaskRunner(TaskRunner):
             from ..stage0_g8 import run_formal_g8_task
 
             return run_formal_g8_task(
+                request,
+                self.workspace_root,
+                store,
+                source_refs=source_refs,
+            )
+        if (
+            request.config.run_intent == "formal"
+            and request.task.task_id == "stage0.11_test_quality_and_replay"
+        ):
+            from ..stage0_g9 import run_formal_g9_task
+
+            return run_formal_g9_task(
                 request,
                 self.workspace_root,
                 store,

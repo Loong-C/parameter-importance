@@ -1,0 +1,21 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://parameter-importance.invalid/schemas/stage0-deterministic-training-fixture-v1.json",
+  "title": "Stage 0 Deterministic Training Fixture v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "fixture_id", "generator_version", "generator_source_ref", "change_reason", "mathematical_semantics", "model", "inputs", "expected", "tolerances", "artifact_hash"],
+  "properties": {
+    "schema_version": {"const": "stage0-deterministic-training-fixture-v1"},
+    "fixture_id": {"const": "stage0-tiny-token-lm-v1"},
+    "generator_version": {"const": "tiny-token-lm-generator-v1"},
+    "generator_source_ref": {"const": "src/param_importance_nlp/deterministic_fixture.py"},
+    "change_reason": {"type": "string", "minLength": 1},
+    "mathematical_semantics": {"type": "object", "required": ["task", "loss", "ignore_index", "importance_mathematics_implemented"]},
+    "model": {"type": "object", "required": ["seed", "vocab_size", "hidden_size", "dtype", "initial_state_sha256"]},
+    "inputs": {"type": "object", "required": ["sample_ids", "token_ids", "labels"]},
+    "expected": {"type": "object", "required": ["effective_count", "loss_numerator", "mean_loss", "gradient_state_sha256", "gradient_summaries"]},
+    "tolerances": {"type": "object", "required": ["absolute", "relative"]},
+    "artifact_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+  }
+}

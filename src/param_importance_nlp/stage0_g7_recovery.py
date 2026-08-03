@@ -1245,7 +1245,14 @@ def _run_suite(
     source: G7RecoverySourceBinding,
     selected: Sequence[str],
     suite_ref: str,
+    *,
+    run_id_prefix: str = "g7",
 ) -> dict[str, Any]:
+    if not run_id_prefix or any(
+        character not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_"
+        for character in run_id_prefix
+    ):
+        raise Stage0G7RecoveryError("G7_RECOVERY_RUN_ID_PREFIX_INVALID")
     environment_ref = f"{suite_ref}/environment.json"
     ddp_config_ref = f"{suite_ref}/configs/ddp.json"
     single_config_ref = f"{suite_ref}/configs/single.json"
@@ -1276,8 +1283,8 @@ def _run_suite(
     boundaries: dict[int, dict[str, Any]] = {}
     for world_size, scope in ((1, "single"), (4, "ddp")):
         config, config_ref, config_sha = configs[world_size]
-        baseline_run = f"g7-{scope}-baseline"
-        recovery_run = f"g7-{scope}-recovery"
+        baseline_run = f"{run_id_prefix}-{scope}-baseline"
+        recovery_run = f"{run_id_prefix}-{scope}-recovery"
         baseline_root = f"{suite_ref}/{scope}/baseline"
         recovery_root = f"{suite_ref}/{scope}/recovery"
         phases = (

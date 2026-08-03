@@ -56,4 +56,6 @@ markers = [
   "distributed: requires four healthy CUDA GPUs and torchrun",
   "distributed_cpu: requires the local Torch Gloo backend",
   "integration: uses verified server assets",
+  "fault: exercises a controlled fail-closed path",
+  "replay: rebuilds an immutable workflow from an empty output root",
 ]

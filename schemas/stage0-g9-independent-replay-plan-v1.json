@@ -1,0 +1,36 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://parameter-importance.invalid/schemas/stage0-g9-independent-replay-plan-v1.json",
+  "title": "Stage 0 G9 Independent Replay Plan v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "replay_id", "run_id_prefix", "generator_git_commit", "g7_config_ref", "g7_config_sha256", "g7_config_hash", "g7_environment_ref", "g7_environment_sha256", "g7_environment_hash", "test_matrix_ref", "test_matrix_sha256", "test_matrix_hash", "fixture_ref", "fixture_sha256", "fixture_hash", "suite_root_ref", "report_ref", "selected_gpu_uuids", "pytest_timeout_seconds", "replay_timeout_seconds", "artifact_hash"],
+  "properties": {
+    "schema_version": {"const": "stage0-g9-independent-replay-plan-v1"},
+    "replay_id": {"type": "string", "pattern": "^stage0-g9-"},
+    "run_id_prefix": {"type": "string", "pattern": "^g9-[A-Za-z0-9_-]+$"},
+    "generator_git_commit": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+    "g7_config_ref": {"$ref": "#/$defs/ref"},
+    "g7_config_sha256": {"$ref": "#/$defs/hash"},
+    "g7_config_hash": {"$ref": "#/$defs/hash"},
+    "g7_environment_ref": {"$ref": "#/$defs/ref"},
+    "g7_environment_sha256": {"$ref": "#/$defs/hash"},
+    "g7_environment_hash": {"$ref": "#/$defs/hash"},
+    "test_matrix_ref": {"$ref": "#/$defs/ref"},
+    "test_matrix_sha256": {"$ref": "#/$defs/hash"},
+    "test_matrix_hash": {"$ref": "#/$defs/hash"},
+    "fixture_ref": {"$ref": "#/$defs/ref"},
+    "fixture_sha256": {"$ref": "#/$defs/hash"},
+    "fixture_hash": {"$ref": "#/$defs/hash"},
+    "suite_root_ref": {"$ref": "#/$defs/ref"},
+    "report_ref": {"$ref": "#/$defs/ref"},
+    "selected_gpu_uuids": {"type": "array", "minItems": 4, "maxItems": 4, "uniqueItems": true, "items": {"type": "string", "pattern": "^GPU-"}},
+    "pytest_timeout_seconds": {"type": "integer", "minimum": 60},
+    "replay_timeout_seconds": {"type": "integer", "minimum": 60},
+    "artifact_hash": {"$ref": "#/$defs/hash"}
+  },
+  "$defs": {
+    "hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "ref": {"type": "string", "minLength": 1, "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.(?:/|$))(?!.*\\\\).+$"}
+  }
+}

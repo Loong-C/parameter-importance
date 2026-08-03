@@ -1,0 +1,37 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://parameter-importance.invalid/schemas/stage0-g9-independent-replay-report-v1.json",
+  "title": "Stage 0 G9 Independent Replay Report v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "status", "replay_id", "generator_git_commit", "plan_ref", "plan_sha256", "started_from_empty_output_root", "completed_at", "g7_config_hash", "g7_environment_hash", "test_matrix_hash", "fixture_hash", "fixture_validation", "pytest_report", "layer_results", "network_audit", "recovery_pair_metrics", "cpu_reference", "fault_summary", "retention_summary", "run_lineage", "evidence_refs", "artifact_hash"],
+  "properties": {
+    "schema_version": {"const": "stage0-g9-independent-replay-report-v1"},
+    "status": {"const": "PASS"},
+    "replay_id": {"type": "string", "pattern": "^stage0-g9-"},
+    "generator_git_commit": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+    "plan_ref": {"$ref": "#/$defs/ref"},
+    "plan_sha256": {"$ref": "#/$defs/hash"},
+    "started_from_empty_output_root": {"const": true},
+    "completed_at": {"type": "string", "format": "date-time"},
+    "g7_config_hash": {"$ref": "#/$defs/hash"},
+    "g7_environment_hash": {"$ref": "#/$defs/hash"},
+    "test_matrix_hash": {"$ref": "#/$defs/hash"},
+    "fixture_hash": {"$ref": "#/$defs/hash"},
+    "fixture_validation": {"type": "object"},
+    "pytest_report": {"type": "object"},
+    "layer_results": {"type": "array", "minItems": 6, "maxItems": 6, "items": {"type": "object"}},
+    "network_audit": {"type": "object"},
+    "recovery_pair_metrics": {"type": "object"},
+    "cpu_reference": {"type": "object"},
+    "fault_summary": {"type": "object"},
+    "retention_summary": {"type": "object"},
+    "run_lineage": {"type": "array", "minItems": 4, "maxItems": 4, "items": {"type": "object"}},
+    "evidence_refs": {"type": "object"},
+    "artifact_hash": {"$ref": "#/$defs/hash"}
+  },
+  "$defs": {
+    "hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "ref": {"type": "string", "minLength": 1, "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.(?:/|$))(?!.*\\\\).+$"}
+  }
+}
