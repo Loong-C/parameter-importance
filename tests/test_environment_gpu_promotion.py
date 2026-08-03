@@ -44,6 +44,16 @@ def test_verify_sha256sums_checks_required_regular_files(tmp_path: Path) -> None
     assert verify_sha256sums(tmp_path, {"report.json"}) == {"report.json": digest}
 
 
+def test_verify_sha256sums_normalizes_standard_dot_slash_prefix(tmp_path: Path) -> None:
+    payload = b"evidence\n"
+    (tmp_path / "report.json").write_bytes(payload)
+    digest = hashlib.sha256(payload).hexdigest()
+    (tmp_path / "SHA256SUMS").write_text(
+        f"{digest}  ./report.json\n", encoding="utf-8"
+    )
+    assert verify_sha256sums(tmp_path, {"report.json"}) == {"report.json": digest}
+
+
 def test_verify_sha256sums_rejects_traversal(tmp_path: Path) -> None:
     digest = "0" * 64
     (tmp_path / "SHA256SUMS").write_text(

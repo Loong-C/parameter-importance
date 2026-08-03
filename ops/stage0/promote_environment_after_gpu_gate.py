@@ -133,7 +133,13 @@ def verify_sha256sums(root: Path, required: set[str]) -> dict[str, str]:
             raise PromotionError(f"invalid checksum line in {manifest}: {line!r}")
         expected, name = match.groups()
         candidate = Path(name)
-        if candidate.is_absolute() or len(candidate.parts) != 1 or name in records:
+        normalized_name = candidate.name
+        if (
+            candidate.is_absolute()
+            or len(candidate.parts) != 1
+            or name not in {normalized_name, f"./{normalized_name}"}
+            or normalized_name in records
+        ):
             raise PromotionError(f"unsafe or duplicate checksum target: {name!r}")
         target = root / name
         if target.is_symlink() or not target.is_file():
@@ -141,7 +147,7 @@ def verify_sha256sums(root: Path, required: set[str]) -> dict[str, str]:
         actual = sha256_file(target)
         if actual != expected:
             raise PromotionError(f"checksum mismatch: {target}: {actual} != {expected}")
-        records[name] = actual
+        records[normalized_name] = actual
     missing = required - set(records)
     if missing:
         raise PromotionError(f"checksum manifest is missing required files: {sorted(missing)}")
