@@ -93,7 +93,8 @@ def _asset_root(data_root: Path, reference: str) -> Path:
 
 
 def _emit(value: dict[str, Any], *, stream: Any) -> None:
-    stream.write(canonical_json_bytes(value).decode("utf-8") + "\n")
+    payload = canonical_json_bytes(value).decode("utf-8")
+    stream.write(payload if payload.endswith("\n") else payload + "\n")
     stream.flush()
 
 

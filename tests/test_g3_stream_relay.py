@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from io import StringIO
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -47,6 +48,13 @@ def test_receiver_resolves_only_the_frozen_object_target(tmp_path: Path) -> None
     assert spec.expected_size == 570
     assert target == data_root / "models/pythia-410m-deduped-step0/config.json"
     assert target.parent.is_dir()
+
+
+def test_receiver_protocol_emitter_writes_exactly_one_json_line() -> None:
+    output = StringIO()
+    receiver._emit({"phase": "READY"}, stream=output)
+    assert output.getvalue().count("\n") == 1
+    assert output.getvalue().splitlines() == ['{"phase":"READY"}']
 
 
 def test_dispatcher_sends_script_over_stdin_and_keeps_urls_out_of_argv(
