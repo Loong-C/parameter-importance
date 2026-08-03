@@ -145,7 +145,6 @@ _FORMAL_EVIDENCE_ONLY_TASKS = frozenset(
         "stage0.01_baseline_and_safety",
         "stage0.02_storage_and_layout",
         "stage0.03_runtime_and_dependencies",
-        "stage0.08_logging_and_tracking",
         "stage0.09_checkpoint_and_resume",
         "stage0.10_capacity_and_operations",
         "stage0.11_test_quality_and_replay",
@@ -1419,7 +1418,15 @@ def _observability_evidence(request: TaskExecutionRequest, root: Path) -> Mappin
                         sequence=sequence,
                         event_id=f"stage0-event-{sequence:04d}",
                         occurred_at=f"2026-01-01T00:00:0{sequence}+00:00",
-                        payload={"global_step": step, "finite": True},
+                        payload={
+                            "global_step": step,
+                            "microstep_count": 1,
+                            "sample_count": 1,
+                            "effective_token_count": 1,
+                            "mean_loss": 1.0 / (step + 1),
+                            "global_gradient_norm": 0.5,
+                            "learning_rates_post_step": [0.1],
+                        },
                     ),
                     critical=True,
                 )
@@ -1910,6 +1917,27 @@ class Stage01CompositeTaskRunner(TaskRunner):
                 )
             if (
                 request.config.run_intent == "formal"
+                and request.task.task_id == "stage0.08_logging_and_tracking"
+            ):
+                from ..stage0_g7 import validate_formal_g7_outputs
+
+                gate = validate_formal_g7_outputs(
+                    request,
+                    self.workspace_root,
+                    existing,
+                )
+                return TaskRunResult.passed(
+                    request,
+                    artifact_refs=existing,
+                    message="Stage 0 S0.8 restored from revalidated formal commits",
+                    metadata={
+                        "stage0_g7_logging_specialized": True,
+                        "restored": True,
+                        "component_gate_id": gate.gate_id,
+                    },
+                )
+            if (
+                request.config.run_intent == "formal"
                 and request.task.task_id in _FORMAL_EVIDENCE_ONLY_TASKS
             ):
                 for reference in existing.values():
@@ -1961,6 +1989,18 @@ class Stage01CompositeTaskRunner(TaskRunner):
             from ..stage0_g4 import run_formal_g4_task
 
             return run_formal_g4_task(
+                request,
+                self.workspace_root,
+                store,
+                source_refs=source_refs,
+            )
+        if (
+            request.config.run_intent == "formal"
+            and request.task.task_id == "stage0.08_logging_and_tracking"
+        ):
+            from ..stage0_g7 import run_formal_g7_task
+
+            return run_formal_g7_task(
                 request,
                 self.workspace_root,
                 store,

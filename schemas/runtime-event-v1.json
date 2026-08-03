@@ -1,0 +1,164 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://parameter-importance.invalid/schemas/runtime-event-v1.json",
+  "title": "Typed runtime event",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version", "event_id", "experiment_id", "run_id", "attempt_id",
+    "session_id", "rank", "event_type", "sequence", "occurred_at", "payload"
+  ],
+  "properties": {
+    "schema_version": {"const": "runtime.event.v1"},
+    "event_id": {"type": "string", "minLength": 1},
+    "experiment_id": {"type": "string", "minLength": 1},
+    "run_id": {"type": "string", "minLength": 1},
+    "attempt_id": {"type": "string", "minLength": 1},
+    "session_id": {"type": "string", "minLength": 1},
+    "rank": {"type": "integer", "minimum": 0},
+    "event_type": {
+      "enum": ["run_lifecycle", "optimizer_step", "validation", "checkpoint", "system", "warning", "error"]
+    },
+    "sequence": {"type": "integer", "minimum": 0},
+    "occurred_at": {"type": "string", "format": "date-time"},
+    "payload": {"type": "object"}
+  },
+  "allOf": [
+    {
+      "if": {"properties": {"event_type": {"const": "run_lifecycle"}}},
+      "then": {"properties": {"payload": {"$ref": "#/$defs/runLifecyclePayload"}}}
+    },
+    {
+      "if": {"properties": {"event_type": {"const": "optimizer_step"}}},
+      "then": {"properties": {"payload": {"$ref": "#/$defs/optimizerStepPayload"}}}
+    },
+    {
+      "if": {"properties": {"event_type": {"const": "validation"}}},
+      "then": {"properties": {"payload": {"$ref": "#/$defs/validationPayload"}}}
+    },
+    {
+      "if": {"properties": {"event_type": {"const": "checkpoint"}}},
+      "then": {"properties": {"payload": {"$ref": "#/$defs/checkpointPayload"}}}
+    },
+    {
+      "if": {"properties": {"event_type": {"const": "system"}}},
+      "then": {"properties": {"payload": {"$ref": "#/$defs/systemPayload"}}}
+    },
+    {
+      "if": {"properties": {"event_type": {"const": "warning"}}},
+      "then": {"properties": {"payload": {"$ref": "#/$defs/warningPayload"}}}
+    },
+    {
+      "if": {"properties": {"event_type": {"const": "error"}}},
+      "then": {"properties": {"payload": {"$ref": "#/$defs/errorPayload"}}}
+    }
+  ],
+  "$defs": {
+    "nonNegativeInteger": {"type": "integer", "minimum": 0},
+    "nonNegativeNumber": {"type": "number", "minimum": 0},
+    "nullableNumber": {"type": ["number", "null"]},
+    "runLifecyclePayload": {
+      "type": "object", "additionalProperties": false, "required": ["status"],
+      "properties": {
+        "status": {"type": "string", "minLength": 1},
+        "reason": {"type": "string"},
+        "checkpoint_ref": {"type": ["string", "null"]},
+        "recoverable": {"type": "boolean"}
+      }
+    },
+    "optimizerStepPayload": {
+      "type": "object", "additionalProperties": false,
+      "required": [
+        "global_step", "microstep_count", "sample_count", "effective_token_count",
+        "mean_loss", "global_gradient_norm", "learning_rates_post_step"
+      ],
+      "properties": {
+        "global_step": {"$ref": "#/$defs/nonNegativeInteger"},
+        "attempt_index": {"$ref": "#/$defs/nonNegativeInteger"},
+        "status": {"type": "string"},
+        "batch_ids": {"type": "array", "items": {"type": "string"}},
+        "mean_loss": {"$ref": "#/$defs/nullableNumber"},
+        "effective_count": {"$ref": "#/$defs/nonNegativeInteger"},
+        "global_gradient_norm": {"anyOf": [{"$ref": "#/$defs/nonNegativeNumber"}, {"type": "null"}]},
+        "clip_factor": {"$ref": "#/$defs/nullableNumber"},
+        "estimator_name": {"type": ["string", "null"]},
+        "parameter_post_state_hash": {"type": ["string", "null"]},
+        "attempt_commit_state_hash": {"type": ["string", "null"]},
+        "skip_reason": {"type": ["string", "null"]},
+        "microstep_count": {"type": "integer", "minimum": 1},
+        "sample_count": {"type": "integer", "minimum": 1},
+        "effective_token_count": {"$ref": "#/$defs/nonNegativeInteger"},
+        "learning_rates_post_step": {
+          "type": "array", "minItems": 1,
+          "items": {"$ref": "#/$defs/nonNegativeNumber"}
+        },
+        "learning_rate": {"$ref": "#/$defs/nonNegativeNumber"}
+      }
+    },
+    "validationPayload": {
+      "type": "object", "additionalProperties": false,
+      "required": ["global_step", "split", "metrics"],
+      "properties": {
+        "global_step": {"$ref": "#/$defs/nonNegativeInteger"},
+        "split": {"type": "string", "minLength": 1},
+        "metrics": {"type": "object"},
+        "sample_count": {"$ref": "#/$defs/nonNegativeInteger"},
+        "effective_token_count": {"$ref": "#/$defs/nonNegativeInteger"}
+      }
+    },
+    "checkpointPayload": {
+      "type": "object", "additionalProperties": false,
+      "required": ["checkpoint_id", "global_step", "checkpoint_ref", "status", "manifest_sha256"],
+      "properties": {
+        "checkpoint_id": {"type": "string", "minLength": 1},
+        "global_step": {"$ref": "#/$defs/nonNegativeInteger"},
+        "checkpoint_ref": {"type": "string", "minLength": 1},
+        "status": {"type": "string", "minLength": 1},
+        "manifest_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "parent_checkpoint_id": {"type": ["string", "null"]}
+      }
+    },
+    "systemPayload": {
+      "type": "object", "additionalProperties": false,
+      "required": [
+        "gpu_memory_bytes", "gpu_utilization_percent", "cpu_memory_bytes",
+        "disk_free_bytes", "throughput_units_per_second"
+      ],
+      "properties": {
+        "global_step": {"$ref": "#/$defs/nonNegativeInteger"},
+        "gpu_memory_bytes": {"$ref": "#/$defs/nonNegativeNumber"},
+        "gpu_utilization_percent": {"$ref": "#/$defs/nonNegativeNumber"},
+        "cpu_memory_bytes": {"$ref": "#/$defs/nonNegativeNumber"},
+        "disk_free_bytes": {"$ref": "#/$defs/nonNegativeNumber"},
+        "throughput_units_per_second": {"$ref": "#/$defs/nonNegativeNumber"},
+        "gpu_uuid": {"type": ["string", "null"]}
+      }
+    },
+    "warningPayload": {
+      "type": "object", "additionalProperties": false,
+      "required": ["warning_code", "message"],
+      "properties": {
+        "warning_code": {"type": "string", "minLength": 1},
+        "message": {"type": "string", "minLength": 1},
+        "global_step": {"$ref": "#/$defs/nonNegativeInteger"},
+        "affected_ranks": {"type": "array", "items": {"$ref": "#/$defs/nonNegativeInteger"}}
+      }
+    },
+    "errorPayload": {
+      "type": "object", "additionalProperties": false,
+      "required": ["exception_class", "last_valid_step", "affected_ranks", "recoverable"],
+      "properties": {
+        "exception_class": {"type": "string", "minLength": 1},
+        "last_valid_step": {"$ref": "#/$defs/nonNegativeInteger"},
+        "affected_ranks": {
+          "type": "array", "minItems": 1,
+          "items": {"$ref": "#/$defs/nonNegativeInteger"}
+        },
+        "recoverable": {"type": "boolean"},
+        "message": {"type": "string"},
+        "traceback_ref": {"type": ["string", "null"]},
+        "error_code": {"type": "string"}
+      }
+    }
+  }
+}

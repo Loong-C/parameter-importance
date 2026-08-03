@@ -20,6 +20,7 @@ from param_importance_nlp.contracts import (
 from param_importance_nlp.experiments import stage01_task_runners as stage01
 from param_importance_nlp.g3_gate import GATE_IDS, g3_resolution_artifact_hash
 from param_importance_nlp.runtime import (
+    TaskArtifactStore,
     TaskExecutionRequest,
     TaskRunResult,
     TaskRuntimeEnvironment,
@@ -38,6 +39,7 @@ from param_importance_nlp import stage0_g3_formalization as formalization
 from param_importance_nlp import stage0_g4
 from param_importance_nlp import stage0_g5
 from param_importance_nlp import stage0_g6
+from param_importance_nlp import stage0_g7
 from param_importance_nlp.stage0_g3_formalization import (
     Stage0G3FormalizationError,
     formalize_stage0_g3,
@@ -557,3 +559,209 @@ def test_g4_formal_runner_publishes_real_contracts_and_pass_gate(
     distributed = DistributedTrainingTaskRunner(tmp_path).run(g6_request)
     assert distributed.status.value == "PASS"
     assert g6_dispatched == [tuple(first.task_output_refs.values())]
+
+    g6_environment = TaskRuntimeEnvironment(
+        capabilities=g5_environment.capabilities,
+        frozen_contract_stages=g5_environment.frozen_contract_stages,
+        passed_gate_ids=g5_environment.passed_gate_ids | frozenset({"stage0.G6"}),
+        estimator_decision_ref=g5_environment.estimator_decision_ref,
+        evidence_refs={
+            **g5_environment.evidence_refs,
+            "gate_stage0_g6": first.task_output_refs["provenance_record"],
+        },
+    )
+    g4_refs = list(first.task_output_refs.values())
+    g6_outputs = {
+        "distributed_validation": g4_refs[0],
+        "gradient_semantics_report": g4_refs[1],
+        "communication_report": g4_refs[2],
+    }
+    g6_state = stage0_g6.Stage0G6FormalState(
+        environment=g6_environment,
+        task_output_refs=g6_outputs,
+        config=g6_config,
+        config_ref="fixture/g6-config.json",
+        environment_ref="fixture/g6-environment.json",
+        index_ref="fixture/g6-index.json",
+        index_sha256="d" * 64,
+        gate_artifact_hash="e" * 64,
+        g5_index_ref="fixture/g5-index.json",
+    )
+    g7_config = stage0_g7.build_stage0_g7_config(
+        binding=_binding(),
+        data_root=tmp_path,
+        state=g6_state,
+    )
+    assert g7_config.task_id == "stage0.08_logging_and_tracking"
+    assert g7_config.section("launcher") == {
+        "kind": "local",
+        "backend": "local",
+        "world_size": 1,
+        "init_method": "local",
+        "init_ref": None,
+        "rendezvous_id": None,
+        "max_restarts": 0,
+    }
+    assert g7_config.base_config.section("logging") == {
+        "event_format": "jsonl-v1",
+        "tensorboard": True,
+        "log_every_steps": 1,
+    }
+    g7_dispatched: list[tuple[str, ...]] = []
+    real_run_g7 = stage0_g7.run_formal_g7_task
+
+    def fake_g7(request, root, store, *, source_refs):
+        del root, store
+        g7_dispatched.append(tuple(source_refs))
+        return TaskRunResult.passed(
+            request,
+            artifact_refs={
+                kind: f"fake/{kind}.json" for kind in request.task.artifact_kinds
+            },
+        )
+
+    monkeypatch.setattr(stage0_g7, "run_formal_g7_task", fake_g7)
+    monkeypatch.setattr(stage01, "_formal_guard", lambda request, root: None)
+    monkeypatch.setattr(
+        stage01,
+        "_input_evidence",
+        lambda request, root: ([], tuple(g6_outputs.values())),
+    )
+    g7_request = TaskExecutionRequest(
+        config=g7_config,
+        task=g7_config.task_definition,
+        environment=g6_environment,
+    )
+    observability = stage01.Stage01CompositeTaskRunner(
+        g7_request.task.runner_kind, tmp_path
+    ).run(g7_request)
+    assert observability.status.value == "PASS"
+    assert g7_dispatched == [tuple(g6_outputs.values())]
+
+    report_refs: list[str] = []
+    reports: list[dict[str, object]] = []
+    for repeat, (minimal_rate, formal_rate) in enumerate(
+        zip((100.0, 101.0, 99.0), (95.0, 94.0, 96.0), strict=True)
+    ):
+        for mode, rate in (("minimal", minimal_rate), ("formal", formal_rate)):
+            ref = f"fixture/g7/reports/{mode}-{repeat}.json"
+            report = {
+                "repeat_index": repeat,
+                "mode": mode,
+                "completed_at": f"2026-08-03T04:00:0{repeat}Z",
+                "workload_checksum": 10.0 + repeat,
+                "steps_per_second": rate,
+                "event_append_p95_seconds": 0.001,
+                "critical_flush_max_seconds": 0.002,
+                "derived_tracking_seconds": 0.003 if mode == "formal" else 0.0,
+                "step_median_seconds": 1.0 / rate,
+                "step_p95_seconds": 1.2 / rate,
+            }
+            write_canonical_json(tmp_path / ref, report)
+            report_refs.append(ref)
+            reports.append(report)
+    functional = stage0_g7._with_hash(
+        {
+            "schema_version": "stage0-g7-functional-report-v1",
+            "concurrent_writer_rejected": True,
+            "non_json_payload_rejected": True,
+            "volume_guard_rejected": True,
+            "tensorboard_failure_warned": True,
+            "tensorboard_failure_truth_unchanged": True,
+            "raw_streams_unchanged": True,
+            "terminal_transition_rejected": True,
+            "sensitive_pattern_rejections": 4,
+            "truth_write_failure_run_status": "FAILED_FINAL",
+            "canonical_optimizer_steps": [0, 1, 2, 3],
+            "canonical_typed_event_count": 9,
+            "canonical_tensorboard_scalars": 12,
+            "shared_metric_writer_rank": 0,
+            "rank_event_refs": [f"rank/{rank}/events.jsonl" for rank in range(4)],
+            "rank_console_refs": [f"rank/{rank}/console.log" for rank in range(4)],
+            "canonical_lineage": {
+                "segments": [
+                    {"disposition": "CANONICAL"},
+                    {"disposition": "CANONICAL"},
+                ],
+                "superseded_tails": [{"disposition": "SUPERSEDED"}],
+            },
+            "run_status": {"run_status": "SUCCESS"},
+            "transition_matrix": {
+                "run": {
+                    name: []
+                    for name in (
+                        "CREATED",
+                        "RUNNING",
+                        "RESUMABLE",
+                        "SUCCESS",
+                        "FAILED_FINAL",
+                        "ABORTED_FINAL",
+                    )
+                },
+                "attempt": {
+                    name: []
+                    for name in (
+                        "STARTING",
+                        "RUNNING",
+                        "SUCCEEDED",
+                        "FAILED",
+                        "ABORTED",
+                        "STALE",
+                    )
+                },
+                "session": {
+                    name: []
+                    for name in (
+                        "STARTING",
+                        "RUNNING",
+                        "SUCCEEDED",
+                        "FAILED",
+                        "ABORTED",
+                        "STALE",
+                    )
+                },
+            },
+            "evidence_refs": [],
+        }
+    )
+    functional_ref = "fixture/g7/functional.json"
+    write_canonical_json(tmp_path / functional_ref, functional)
+    runtime_ref = "fixture/g7/runtime-evidence.json"
+    write_canonical_json(tmp_path / runtime_ref, {"status": "PASS"})
+    by_ref = dict(zip(report_refs, reports, strict=True))
+
+    monkeypatch.setattr(
+        stage0_g7,
+        "_capture_source",
+        lambda: stage0_g7.G7SourceBinding(ROOT, HEAD, "feat/stage0-completion"),
+    )
+    monkeypatch.setattr(
+        stage0_g7,
+        "_run_suite",
+        lambda request, root, source, suite_ref: (
+            report_refs,
+            reports,
+            functional_ref,
+            functional,
+            (runtime_ref,),
+        ),
+    )
+    monkeypatch.setattr(
+        stage0_g7,
+        "_validate_worker_report",
+        lambda root, reference, source, request: by_ref[reference],
+    )
+    artifact_store = TaskArtifactStore(
+        tmp_path, str(g7_config.section("artifacts")["output_dir"])
+    )
+    published = real_run_g7(
+        g7_request,
+        tmp_path,
+        artifact_store,
+        source_refs=tuple(g6_outputs.values()),
+    )
+    assert published.status.value == "PASS"
+    gate = stage0_g7.validate_formal_g7_outputs(
+        g7_request, tmp_path, published.artifact_refs
+    )
+    assert gate.gate_id == "stage0.G7-LOGGING"

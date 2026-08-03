@@ -1,0 +1,75 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://parameter-importance.invalid/schemas/runtime-run-status-v1.json",
+  "title": "Atomic run and session status",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "run_id", "run_status", "attempts", "sessions", "heartbeat", "history", "artifact_hash"],
+  "properties": {
+    "schema_version": {"const": "runtime.run-status.v1"},
+    "run_id": {"type": "string", "minLength": 1},
+    "run_status": {"enum": ["CREATED", "RUNNING", "RESUMABLE", "SUCCESS", "FAILED_FINAL", "ABORTED_FINAL"]},
+    "attempts": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object", "additionalProperties": false,
+        "required": ["status", "created_at", "updated_at"],
+        "properties": {
+          "status": {"$ref": "#/$defs/executionStatus"},
+          "created_at": {"type": "string", "format": "date-time"},
+          "updated_at": {"type": "string", "format": "date-time"}
+        }
+      }
+    },
+    "sessions": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object", "additionalProperties": false,
+        "required": ["attempt_id", "status", "created_at", "updated_at"],
+        "properties": {
+          "attempt_id": {"type": "string", "minLength": 1},
+          "status": {"$ref": "#/$defs/executionStatus"},
+          "created_at": {"type": "string", "format": "date-time"},
+          "updated_at": {"type": "string", "format": "date-time"}
+        }
+      }
+    },
+    "heartbeat": {
+      "oneOf": [
+        {"type": "null"},
+        {
+          "type": "object", "additionalProperties": false,
+          "required": ["session_id", "last_step", "observed_at"],
+          "properties": {
+            "session_id": {"type": "string", "minLength": 1},
+            "last_step": {"type": "integer", "minimum": 0},
+            "observed_at": {"type": "string", "format": "date-time"}
+          }
+        }
+      ]
+    },
+    "history": {
+      "type": "array", "minItems": 1,
+      "items": {
+        "type": "object", "additionalProperties": false,
+        "required": ["entity", "entity_id", "from", "to", "at", "actor", "reason", "checkpoint_ref"],
+        "properties": {
+          "entity": {"enum": ["run", "attempt", "session"]},
+          "entity_id": {"type": "string", "minLength": 1},
+          "from": {"type": ["string", "null"]},
+          "to": {"type": "string", "minLength": 1},
+          "at": {"type": "string", "format": "date-time"},
+          "actor": {"type": "string", "minLength": 1},
+          "reason": {"type": "string", "minLength": 1},
+          "checkpoint_ref": {"type": ["string", "null"]}
+        }
+      }
+    },
+    "artifact_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+  },
+  "$defs": {
+    "executionStatus": {
+      "enum": ["STARTING", "RUNNING", "SUCCEEDED", "FAILED", "ABORTED", "STALE"]
+    }
+  }
+}

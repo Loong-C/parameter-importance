@@ -507,7 +507,15 @@ def _event(sequence: int, *, step: int | None = None) -> EventRecord:
         rank=0,
         event_type=EventType.OPTIMIZER_STEP,
         sequence=sequence,
-        payload={"global_step": sequence if step is None else step},
+        payload={
+            "global_step": sequence if step is None else step,
+            "microstep_count": 1,
+            "sample_count": 1,
+            "effective_token_count": 1,
+            "mean_loss": 1.0,
+            "global_gradient_norm": 0.5,
+            "learning_rates_post_step": [0.1],
+        },
         event_id=f"event-{sequence}",
         occurred_at="2026-07-22T00:00:00+00:00",
     )

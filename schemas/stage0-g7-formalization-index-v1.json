@@ -1,0 +1,38 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://parameter-importance.invalid/schemas/stage0-g7-formalization-index-v1.json",
+  "title": "Stage 0 S0.8 formalization handoff",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version", "generator_git_commit", "checked_at", "g6_index_ref",
+    "g6_index_sha256", "g6_gate_artifact_hash", "config_ref", "config_hash",
+    "task_output_refs", "component_gate_ref", "environment_ref", "environment_hash",
+    "next_task_id", "next_input_refs", "artifact_hash"
+  ],
+  "properties": {
+    "schema_version": {"const": "stage0-g7-formalization-index-v1"},
+    "generator_git_commit": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+    "checked_at": {"type": "string", "format": "date-time"},
+    "g6_index_ref": {"type": "string", "minLength": 1},
+    "g6_index_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "g6_gate_artifact_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "config_ref": {"type": "string", "minLength": 1},
+    "config_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "task_output_refs": {
+      "type": "object", "additionalProperties": false,
+      "required": ["event_stream", "lineage_manifest", "logging_overhead_report"],
+      "properties": {
+        "event_stream": {"type": "string", "minLength": 1},
+        "lineage_manifest": {"type": "string", "minLength": 1},
+        "logging_overhead_report": {"type": "string", "minLength": 1}
+      }
+    },
+    "component_gate_ref": {"type": "string", "minLength": 1},
+    "environment_ref": {"type": "string", "minLength": 1},
+    "environment_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "next_task_id": {"const": "stage0.09_checkpoint_and_resume"},
+    "next_input_refs": {"type": "array", "minItems": 3, "maxItems": 3, "uniqueItems": true},
+    "artifact_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+  }
+}

@@ -1,0 +1,31 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://parameter-importance.invalid/schemas/stage0-g7-evidence-v1.json",
+  "title": "Stage 0 S0.8 observability evidence",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version", "artifact_role", "status", "checked_at",
+    "generator_git_commit", "environment_hash", "component_gate_id",
+    "full_g7_status", "suite_root_ref", "worker_report_refs",
+    "functional_report_ref", "validation_report", "gate_record", "gate_report",
+    "artifact_hash"
+  ],
+  "properties": {
+    "schema_version": {"const": "stage0-g7-evidence-v1"},
+    "artifact_role": {"enum": ["event_stream", "lineage_manifest", "logging_overhead_report"]},
+    "status": {"const": "PASS"},
+    "checked_at": {"type": "string", "format": "date-time"},
+    "generator_git_commit": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+    "environment_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "component_gate_id": {"const": "stage0.G7-LOGGING"},
+    "full_g7_status": {"const": "PENDING_S0.9"},
+    "suite_root_ref": {"type": "string", "minLength": 1},
+    "worker_report_refs": {"type": "array", "minItems": 6, "maxItems": 6, "uniqueItems": true},
+    "functional_report_ref": {"type": "string", "minLength": 1},
+    "validation_report": {"type": "object"},
+    "gate_record": {"$ref": "shared/gate-record-v1.json"},
+    "gate_report": {"$ref": "stage0-gate-report-v1.json"},
+    "artifact_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+  }
+}

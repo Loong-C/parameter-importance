@@ -1,0 +1,38 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://parameter-importance.invalid/schemas/stage0-g7-worker-plan-v1.json",
+  "title": "Stage 0 S0.8 paired overhead worker plan",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version", "run_id", "mode", "repeat_index", "generator_git_commit",
+    "config_ref", "config_sha256", "config_hash", "environment_ref",
+    "environment_sha256", "environment_hash", "output_root_ref", "report_ref",
+    "warmup_steps", "measured_steps", "matrix_size", "seed", "artifact_hash"
+  ],
+  "properties": {
+    "schema_version": {"const": "stage0-g7-worker-plan-v1"},
+    "run_id": {"type": "string", "minLength": 1},
+    "mode": {"enum": ["minimal", "formal"]},
+    "repeat_index": {"type": "integer", "minimum": 0, "maximum": 2},
+    "generator_git_commit": {"$ref": "#/$defs/git_commit"},
+    "config_ref": {"$ref": "#/$defs/logical_ref"},
+    "config_sha256": {"$ref": "#/$defs/sha256"},
+    "config_hash": {"$ref": "#/$defs/sha256"},
+    "environment_ref": {"$ref": "#/$defs/logical_ref"},
+    "environment_sha256": {"$ref": "#/$defs/sha256"},
+    "environment_hash": {"$ref": "#/$defs/sha256"},
+    "output_root_ref": {"$ref": "#/$defs/logical_ref"},
+    "report_ref": {"$ref": "#/$defs/logical_ref"},
+    "warmup_steps": {"const": 10},
+    "measured_steps": {"const": 30},
+    "matrix_size": {"type": "integer", "minimum": 256, "maximum": 4096},
+    "seed": {"type": "integer", "minimum": 0},
+    "artifact_hash": {"$ref": "#/$defs/sha256"}
+  },
+  "$defs": {
+    "git_commit": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "logical_ref": {"type": "string", "minLength": 1, "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.?(?:/|$))(?!.*\\\\)[^:]+$"}
+  }
+}

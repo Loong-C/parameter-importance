@@ -312,6 +312,26 @@ def rebuild_tensorboard_from_jsonl(
         # 用户显式请求重建时发生。
         from torch.utils.tensorboard import SummaryWriter as writer_class  # type: ignore[assignment]
 
+    def scalar_items(value: object, prefix: str = "") -> Iterable[tuple[str, float]]:
+        if isinstance(value, bool):
+            return
+        if isinstance(value, (int, float)):
+            numeric = float(value)
+            if not (-float("inf") < numeric < float("inf")):
+                raise ValueError("TENSORBOARD_REBUILD_NONFINITE_SCALAR")
+            yield prefix, numeric
+            return
+        if isinstance(value, Mapping) and len(value) <= 64:
+            for key, item in sorted(value.items()):
+                if isinstance(key, str):
+                    child = key if not prefix else f"{prefix}/{key}"
+                    yield from scalar_items(item, child)
+            return
+        if isinstance(value, (list, tuple)) and len(value) <= 16:
+            for index, item in enumerate(value):
+                child = str(index) if not prefix else f"{prefix}/{index}"
+                yield from scalar_items(item, child)
+
     count = 0
     writer = writer_class(log_dir=str(Path(output_dir)))
     try:
@@ -337,13 +357,23 @@ def rebuild_tensorboard_from_jsonl(
                         or not isinstance(event_type, str)
                     ):
                         raise ValueError("TENSORBOARD_REBUILD_EVENT_FIELDS_INVALID")
-                    for key, value in sorted(payload.items()):
-                        if isinstance(value, bool) or not isinstance(value, (int, float)):
-                            continue
-                        numeric = float(value)
-                        if not (-float("inf") < numeric < float("inf")):
-                            raise ValueError("TENSORBOARD_REBUILD_NONFINITE_SCALAR")
-                        writer.add_scalar(f"{event_type}/{key}", numeric, sequence)
+                    step = (
+                        payload.get("global_step")
+                        if isinstance(payload.get("global_step"), int)
+                        and not isinstance(payload.get("global_step"), bool)
+                        else sequence
+                    )
+                    namespace = {
+                        "optimizer_step": "train",
+                        "validation": "validation",
+                        "system": "system",
+                        "checkpoint": "checkpoint",
+                        "warning": "warning",
+                        "error": "error",
+                        "run_lifecycle": "run",
+                    }.get(event_type, event_type)
+                    for key, numeric in scalar_items(payload):
+                        writer.add_scalar(f"{namespace}/{key}", numeric, int(step))
                         count += 1
     finally:
         writer.close()

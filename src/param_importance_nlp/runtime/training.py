@@ -1270,7 +1270,7 @@ class TrainingEngine:
             )
             self._importance_points.append(point)
         try:
-            self.checkpoint_store.publish(
+            commit = self.checkpoint_store.publish(
                 checkpoint_id,
                 self._checkpoint_state(),
                 generation=self.state.global_step,
@@ -1295,7 +1295,14 @@ class TrainingEngine:
                     rank=self.rank,
                     event_type=EventType.CHECKPOINT,
                     sequence=sequence,
-                    payload={"checkpoint_id": checkpoint_id},
+                    payload={
+                        "checkpoint_id": checkpoint_id,
+                        "global_step": self.state.global_step,
+                        "checkpoint_ref": f"commits/{checkpoint_id}.json",
+                        "status": "COMMITTED",
+                        "manifest_sha256": commit.manifest_sha256,
+                        "parent_checkpoint_id": commit.parent_checkpoint_id,
+                    },
                     event_id=(
                         _sha256(
                             f"{self.spec.spec_hash}:{self.rank}:{sequence}:checkpoint".encode(
@@ -1601,7 +1608,18 @@ class TrainingEngine:
             ):
                 self.save_checkpoint()
             if self.state.attempt_index % self.spec.log_every_steps == 0:
-                self._emit(EventType.OPTIMIZER_STEP, record.to_dict())
+                event_payload = record.to_dict()
+                event_payload.update(
+                    {
+                        "microstep_count": len(record.batch_ids),
+                        "sample_count": sum(
+                            len(batch.sample_ids) for batch in microbatches
+                        ),
+                        "effective_token_count": record.effective_count,
+                        "learning_rates_post_step": self._learning_rates(),
+                    }
+                )
+                self._emit(EventType.OPTIMIZER_STEP, event_payload)
         if self.state.global_step == self.spec.max_steps:
             status = "COMPLETE"
         elif self.state.global_step == target_step and until_step is not None:

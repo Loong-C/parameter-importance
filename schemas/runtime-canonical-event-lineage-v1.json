@@ -1,0 +1,24 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://parameter-importance.invalid/schemas/runtime-canonical-event-lineage-v1.json",
+  "title": "Canonical event lineage across sessions",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version", "run_id", "parent_checkpoint_ref", "segments",
+    "superseded_tails", "canonical_event_ref", "canonical_event_sha256",
+    "canonical_event_count", "optimizer_steps", "artifact_hash"
+  ],
+  "properties": {
+    "schema_version": {"const": "runtime.canonical-event-lineage.v1"},
+    "run_id": {"type": "string", "minLength": 1},
+    "parent_checkpoint_ref": {"type": ["string", "null"]},
+    "segments": {"type": "array", "minItems": 1, "items": {"type": "object"}},
+    "superseded_tails": {"type": "array", "items": {"type": "object"}},
+    "canonical_event_ref": {"type": "string", "minLength": 1},
+    "canonical_event_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "canonical_event_count": {"type": "integer", "minimum": 1},
+    "optimizer_steps": {"type": "array", "items": {"type": "integer", "minimum": 0}},
+    "artifact_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+  }
+}

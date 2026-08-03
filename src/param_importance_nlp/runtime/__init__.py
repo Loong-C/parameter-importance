@@ -15,6 +15,7 @@ from .events import (
     canonical_optimizer_steps,
     read_event_stream,
 )
+from .event_lineage import build_canonical_event_lineage
 from .distributed_training import DistributedLaunchSpec, TorchDDPTrainingExecutor
 from .gradients import GradientAttempt, GradientPhase
 from .lineage import AttemptDisposition, AttemptLineageRecord, LineageStore
@@ -26,6 +27,7 @@ from .reducers import (
     ReducerCapabilities,
     TorchDistributedReducer,
 )
+from .run_status import RunStatus, RunStatusStore, SessionStatus
 from .tensor_bundle import TensorBundle, load_tensor_bundle, publish_tensor_bundle
 from .telemetry import ResourceProfile, ResourceSampler, rebuild_tensorboard_from_jsonl
 from .transactions import StepPhase, StepTransaction
@@ -117,6 +119,9 @@ __all__ = [
     "ReducerCapabilities",
     "ResourceProfile",
     "ResourceSampler",
+    "RunStatus",
+    "RunStatusStore",
+    "SessionStatus",
     "StepOutcome",
     "StepPhase",
     "StepTransaction",
@@ -152,6 +157,7 @@ __all__ = [
     "TrainingStepObserver",
     "install_training_rng",
     "canonical_optimizer_steps",
+    "build_canonical_event_lineage",
     "build_grad_scaler",
     "build_optimizer",
     "build_scheduler",
