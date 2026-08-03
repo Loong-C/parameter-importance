@@ -185,4 +185,3 @@ def test_g5_aggregate_rejects_missing_failure_path(tmp_path: Path) -> None:
     reports.pop()
     with pytest.raises(Stage0G5Error, match="G5_REPORT_SET_CARDINALITY_INVALID"):
         validate_g5_report_set(tmp_path, reports)
-

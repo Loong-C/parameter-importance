@@ -312,5 +312,13 @@ G1-D 有效期、中文动态 Worklog、Stage 1 handoff 和不可覆盖的 `READ
   `43 passed, 0 failed`；`python -m compileall -q src ops tests` 与
   `git diff --check` 均退出 0。修正提交形成后还须直接重跑 `_capture_source()` 与最终仓库
   inventory，随后按新 HEAD 重新生成增量 bundle。
+- Linux 路径修正已提交为 `6d58b016ea38ed6da8bb02df4bb83405a34e7804`。提交后真实
+  `_capture_source()` 已通过；随后 inventory 对远端基线 `44a6317..HEAD` 的范围检查继续
+  保留并发现 3 个已提交的 G5 EOF 多余空行：`ops/stage0/formalize_g5.py`、
+  `ops/stage0/run_g5_worker.py`、`tests/test_stage0_g5.py`。这说明只对未提交工作树运行
+  `git diff --check` 不能证明整个交付范围干净。
+- 已精确移除上述 3 个 EOF 空行；G5+G10 回归为 `12 passed, 0 failed`，相关 Python
+  静态编译与当前工作树 `git diff --check` 均退出 0。形成新提交后必须再次用
+  `44a6317..HEAD` 重跑范围检查和完整 inventory；未通过前仍不生成 bundle 或 READY。
 - GitHub、服务器和 `Agent/` 外发同步仍等待本任务的明确授权；当前状态继续是“收尾中”，
   不生成或复用 `READY`。
