@@ -13,7 +13,7 @@ from pathlib import Path, PurePosixPath
 import re
 import stat
 import time
-from typing import Any, Final, Iterator
+from typing import Any, BinaryIO, Callable, Final, Iterator
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
 from urllib.request import Request, urlopen
@@ -226,6 +226,29 @@ class AcquisitionResult:
             "attempts": self.attempts,
             "resumed": self.resumed,
             "network_accessed": self.network_accessed,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class StreamReceptionPlan:
+    """Receiver-side handshake for an externally relayed immutable object."""
+
+    source_id: str
+    revision: str
+    expected_size: int
+    expected_sha256: str
+    offset: int
+    already_ready: bool
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "schema_version": "stage0-asset-stream-reception-plan-v1",
+            "source_id": self.source_id,
+            "revision": self.revision,
+            "expected_size": self.expected_size,
+            "expected_sha256": self.expected_sha256,
+            "offset": self.offset,
+            "already_ready": self.already_ready,
         }
 
 
@@ -1015,6 +1038,215 @@ def acquire_http_asset(
         ) from None
 
 
+def receive_streamed_asset(
+    spec: AssetObjectSpec,
+    target: str | Path,
+    stream: BinaryIO,
+    *,
+    on_ready: Callable[[StreamReceptionPlan], None] | None = None,
+    policy: AcquisitionPolicy | None = None,
+) -> AcquisitionResult:
+    """Receive one immutable object from a URL-free external byte relay.
+
+    The receiver shares the same per-target advisory lock, ``.part`` path,
+    complete SHA-256 verification, and no-clobber publication primitive as the
+    direct HTTP acquisition path.  ``on_ready`` runs while the object lock is
+    held and communicates the exact resume offset to the relay before any
+    bytes are read.  A short stream preserves the verified prefix for a later
+    retry; a full object with the wrong digest is truncated so it cannot be
+    mistaken for a resumable prefix.
+    """
+
+    selected_policy = policy or AcquisitionPolicy()
+    destination = Path(target)
+    overall_deadline = time.monotonic() + selected_policy.overall_timeout_seconds
+    part_path = part_path_for(destination)
+    callback = on_ready or (lambda _plan: None)
+    attempts = 0
+    resumed = False
+    network_accessed = False
+    try:
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        with _advisory_object_lock(
+            destination,
+            timeout_seconds=selected_policy.lock_timeout_seconds,
+            overall_deadline=overall_deadline,
+            poll_interval_seconds=selected_policy.lock_poll_interval_seconds,
+        ):
+            if _verify_final(
+                destination,
+                spec,
+                chunk_size=selected_policy.chunk_size,
+            ):
+                callback(
+                    StreamReceptionPlan(
+                        source_id=spec.source_id,
+                        revision=spec.revision,
+                        expected_size=spec.expected_size,
+                        expected_sha256=spec.expected_sha256,
+                        offset=spec.expected_size,
+                        already_ready=True,
+                    )
+                )
+                return AcquisitionResult(
+                    status=AcquisitionStatus.ALREADY_READY,
+                    source_id=spec.source_id,
+                    revision=spec.revision,
+                    size_bytes=spec.expected_size,
+                    sha256=spec.expected_sha256,
+                    attempts=0,
+                    resumed=False,
+                    network_accessed=False,
+                )
+
+            attempts = 1
+            with _open_part(part_path) as part:
+                part.seek(0, os.SEEK_END)
+                offset = part.tell()
+                if offset > spec.expected_size:
+                    _truncate_part(part)
+                    offset = 0
+                elif offset == spec.expected_size:
+                    try:
+                        digest = _sha256_file(
+                            part_path,
+                            chunk_size=selected_policy.chunk_size,
+                        )
+                    except OSError as error:
+                        raise _AttemptFailure(
+                            AcquisitionFailureCode.LOCAL_IO_ERROR,
+                            False,
+                            observed_size=offset,
+                        ) from error
+                    if digest != spec.expected_sha256:
+                        _truncate_part(part)
+                        offset = 0
+
+                resumed = 0 < offset < spec.expected_size
+                callback(
+                    StreamReceptionPlan(
+                        source_id=spec.source_id,
+                        revision=spec.revision,
+                        expected_size=spec.expected_size,
+                        expected_sha256=spec.expected_sha256,
+                        offset=offset,
+                        already_ready=False,
+                    )
+                )
+
+                received = 0
+                remaining = spec.expected_size - offset
+                part.seek(offset)
+                while received < remaining:
+                    if time.monotonic() >= overall_deadline:
+                        part.flush()
+                        os.fsync(part.fileno())
+                        raise _AttemptFailure(
+                            AcquisitionFailureCode.OVERALL_TIMEOUT,
+                            True,
+                            observed_size=offset + received,
+                        )
+                    read_size = min(selected_policy.chunk_size, remaining - received)
+                    try:
+                        chunk = stream.read(read_size)
+                    except (OSError, TimeoutError) as error:
+                        part.flush()
+                        os.fsync(part.fileno())
+                        raise _AttemptFailure(
+                            AcquisitionFailureCode.NETWORK_ERROR,
+                            True,
+                            observed_size=offset + received,
+                        ) from error
+                    if not chunk:
+                        part.flush()
+                        os.fsync(part.fileno())
+                        raise _AttemptFailure(
+                            AcquisitionFailureCode.TRANSFER_INCOMPLETE,
+                            True,
+                            observed_size=offset + received,
+                        )
+                    if not isinstance(chunk, (bytes, bytearray, memoryview)):
+                        raise _AttemptFailure(
+                            AcquisitionFailureCode.LOCAL_STATE_INVALID,
+                            False,
+                            observed_size=offset + received,
+                        )
+                    try:
+                        written = part.write(chunk)
+                    except OSError as error:
+                        raise _AttemptFailure(
+                            AcquisitionFailureCode.LOCAL_IO_ERROR,
+                            False,
+                            observed_size=offset + received,
+                        ) from error
+                    if written != len(chunk):
+                        raise _AttemptFailure(
+                            AcquisitionFailureCode.LOCAL_IO_ERROR,
+                            False,
+                            observed_size=offset + received,
+                        )
+                    received += written
+                    network_accessed = True
+                part.flush()
+                os.fsync(part.fileno())
+                try:
+                    digest = _sha256_file(
+                        part_path,
+                        chunk_size=selected_policy.chunk_size,
+                    )
+                except OSError as error:
+                    raise _AttemptFailure(
+                        AcquisitionFailureCode.LOCAL_IO_ERROR,
+                        False,
+                        observed_size=spec.expected_size,
+                    ) from error
+                if digest != spec.expected_sha256:
+                    _truncate_part(part)
+                    raise _AttemptFailure(
+                        AcquisitionFailureCode.HASH_MISMATCH,
+                        True,
+                        observed_size=spec.expected_size,
+                    )
+
+            status = _publish_no_clobber(
+                part_path=part_path,
+                target=destination,
+                spec=spec,
+                chunk_size=selected_policy.chunk_size,
+            )
+            return AcquisitionResult(
+                status=status,
+                source_id=spec.source_id,
+                revision=spec.revision,
+                size_bytes=spec.expected_size,
+                sha256=spec.expected_sha256,
+                attempts=attempts,
+                resumed=resumed,
+                network_accessed=network_accessed,
+            )
+    except AssetAcquisitionError:
+        raise
+    except _AttemptFailure as failure:
+        raise AssetAcquisitionError(
+            _failure_report(
+                spec=spec,
+                failure=failure,
+                attempts=attempts,
+                exhausted=False,
+            )
+        ) from None
+    except OSError:
+        failure = _AttemptFailure(AcquisitionFailureCode.LOCAL_IO_ERROR, False)
+        raise AssetAcquisitionError(
+            _failure_report(
+                spec=spec,
+                failure=failure,
+                attempts=attempts,
+                exhausted=False,
+            )
+        ) from None
+
+
 __all__ = [
     "AcquisitionFailureCode",
     "AcquisitionFailureReport",
@@ -1023,8 +1255,10 @@ __all__ = [
     "AcquisitionStatus",
     "AssetAcquisitionError",
     "AssetObjectSpec",
+    "StreamReceptionPlan",
     "acquire_http_asset",
     "lock_path_for",
     "part_path_for",
+    "receive_streamed_asset",
     "resolve_approved_asset_target",
 ]

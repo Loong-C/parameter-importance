@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 import errno
 import hashlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from io import BytesIO
 import json
 from pathlib import Path
 import socket
@@ -22,8 +23,10 @@ from param_importance_nlp.asset_acquisition import (
     AcquisitionStatus,
     AssetAcquisitionError,
     AssetObjectSpec,
+    StreamReceptionPlan,
     acquire_http_asset,
     part_path_for,
+    receive_streamed_asset,
 )
 
 
@@ -58,6 +61,110 @@ def _policy(
         lock_poll_interval_seconds=0.005,
         chunk_size=64,
     )
+
+
+def test_stream_receiver_publishes_exact_object_with_url_free_handshake(
+    tmp_path: Path,
+) -> None:
+    payload = b"relayed-stage0-object"
+    target = tmp_path / "asset.bin"
+    plans: list[StreamReceptionPlan] = []
+
+    result = receive_streamed_asset(
+        _spec(payload),
+        target,
+        BytesIO(payload),
+        on_ready=plans.append,
+        policy=_policy(),
+    )
+
+    assert result.status is AcquisitionStatus.DOWNLOADED
+    assert result.network_accessed is True
+    assert result.resumed is False
+    assert target.read_bytes() == payload
+    assert not part_path_for(target).exists()
+    assert [plan.offset for plan in plans] == [0]
+    assert plans[0].already_ready is False
+    assert "url" not in json.dumps(plans[0].to_dict()).lower()
+
+
+def test_stream_receiver_preserves_prefix_and_resumes_under_same_lock(
+    tmp_path: Path,
+) -> None:
+    payload = bytes(range(128)) * 4
+    target = tmp_path / "asset.bin"
+    first_plans: list[StreamReceptionPlan] = []
+    prefix = payload[:137]
+
+    with pytest.raises(AssetAcquisitionError) as caught:
+        receive_streamed_asset(
+            _spec(payload),
+            target,
+            BytesIO(prefix),
+            on_ready=first_plans.append,
+            policy=_policy(),
+        )
+    assert caught.value.report.code is AcquisitionFailureCode.TRANSFER_INCOMPLETE
+    assert part_path_for(target).read_bytes() == prefix
+    assert [plan.offset for plan in first_plans] == [0]
+
+    resumed_plans: list[StreamReceptionPlan] = []
+    result = receive_streamed_asset(
+        _spec(payload),
+        target,
+        BytesIO(payload[len(prefix) :]),
+        on_ready=resumed_plans.append,
+        policy=_policy(),
+    )
+    assert result.status is AcquisitionStatus.DOWNLOADED
+    assert result.resumed is True
+    assert target.read_bytes() == payload
+    assert [plan.offset for plan in resumed_plans] == [len(prefix)]
+
+
+def test_stream_receiver_truncates_full_object_with_wrong_hash(
+    tmp_path: Path,
+) -> None:
+    payload = b"correct-object"
+    target = tmp_path / "asset.bin"
+    wrong = b"x" * len(payload)
+
+    with pytest.raises(AssetAcquisitionError) as caught:
+        receive_streamed_asset(
+            _spec(payload),
+            target,
+            BytesIO(wrong),
+            policy=_policy(),
+        )
+    assert caught.value.report.code is AcquisitionFailureCode.HASH_MISMATCH
+    assert part_path_for(target).read_bytes() == b""
+    assert not target.exists()
+
+
+def test_stream_receiver_existing_final_is_read_only_and_skips_input(
+    tmp_path: Path,
+) -> None:
+    payload = b"already-published"
+    target = tmp_path / "asset.bin"
+    target.write_bytes(payload)
+    plans: list[StreamReceptionPlan] = []
+
+    class _ForbiddenStream:
+        def read(self, _size: int) -> bytes:
+            raise AssertionError("existing final object must not consume relay input")
+
+    result = receive_streamed_asset(
+        _spec(payload),
+        target,
+        _ForbiddenStream(),  # type: ignore[arg-type]
+        on_ready=plans.append,
+        policy=_policy(),
+    )
+    assert result.status is AcquisitionStatus.ALREADY_READY
+    assert result.attempts == 0
+    assert result.network_accessed is False
+    assert plans[0].already_ready is True
+    assert plans[0].offset == len(payload)
 
 
 @dataclass
