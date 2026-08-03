@@ -15,13 +15,13 @@ runtime:
   temp_root: runs/formal/stage1-pythia14m/tmp
   allow_dirty_worktree: false
 model:
-  asset_id: pythia-14m
+  asset_id: pythia-14m-step0
   revision: FILL_MODEL_REVISION
   tokenizer_asset_id: pythia-tokenizer
   initialization_id: FILL_BASE_INITIALIZATION_HASH
   architecture: pythia-14m
 data:
-  asset_id: pile-pretokenized
+  asset_id: pile-selected-prefix
   revision: FILL_DATA_REVISION
   split: train
   sequence_length: 2048

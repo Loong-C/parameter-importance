@@ -3,7 +3,9 @@ from __future__ import annotations
 import argparse
 import importlib
 import json
+import os
 from pathlib import Path
+import re
 import sys
 from typing import Any, Mapping
 
@@ -1199,6 +1201,231 @@ def _asset_verify(arguments: argparse.Namespace) -> int:
     return 0
 
 
+_ASSET_FETCH_FAILURE_MESSAGES: Mapping[str, str] = {
+    "RUNTIME_URL_ARGV_FORBIDDEN": (
+        "runtime URL values are forbidden in argv; use a named environment "
+        "variable or stdin"
+    ),
+    "OUTPUT_EXISTS": "the requested output path already exists",
+    "OUTPUT_CONFLICT": "the canonical output could not be published without clobbering",
+    "SPEC_INVALID": "the fixed asset object specification is invalid",
+    "TARGET_PATH_INVALID": "the approved asset root or relative final path is invalid",
+    "POLICY_INVALID": "the acquisition policy is outside the supported bounds",
+    "RUNTIME_URL_SOURCE_INVALID": "the selected runtime URL source is invalid or unavailable",
+    "INTERNAL_ERROR": "the asset acquisition command failed safely",
+}
+_ASSET_FETCH_ENV_NAME_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,127}$")
+_ASSET_FETCH_MAX_URL_CHARS = 8192
+_ASSET_FETCH_FORBIDDEN_URL_OPTIONS = frozenset(
+    {
+        "--url",
+        "--runtime-url",
+        "--endpoint-url",
+        "--download-url",
+    }
+)
+
+
+def _asset_fetch_cli_failure(code: str) -> dict[str, object]:
+    return {
+        "schema_version": "stage0-asset-fetch-http-failure-v1",
+        "status": "failed",
+        "code": code,
+        "message": _ASSET_FETCH_FAILURE_MESSAGES[code],
+    }
+
+
+def _asset_fetch_output_is_occupied(path: Path) -> bool:
+    return (
+        path.exists()
+        or path.is_symlink()
+        or bool(getattr(path, "is_junction", lambda: False)())
+    )
+
+
+def _asset_fetch_finish(
+    arguments: argparse.Namespace,
+    value: Mapping[str, object],
+    *,
+    exit_code: int,
+) -> int:
+    if arguments.output is not None:
+        from .runtime import publish_canonical_immutable
+
+        try:
+            publish_canonical_immutable(arguments.output, value)
+        except (ValueError, TypeError, KeyError, OSError, RuntimeError):
+            _emit(_asset_fetch_cli_failure("OUTPUT_CONFLICT"))
+            return 2
+    _emit(value)
+    return exit_code
+
+
+def _asset_fetch_policy(arguments: argparse.Namespace) -> object:
+    from .asset_acquisition import AcquisitionPolicy
+
+    values = {
+        "max_attempts": arguments.max_attempts,
+        "request_timeout_seconds": arguments.request_timeout_seconds,
+        "overall_timeout_seconds": arguments.overall_timeout_seconds,
+        "initial_backoff_seconds": arguments.initial_backoff_seconds,
+        "max_backoff_seconds": arguments.max_backoff_seconds,
+        "lock_timeout_seconds": arguments.lock_timeout_seconds,
+        "lock_poll_interval_seconds": arguments.lock_poll_interval_seconds,
+        "chunk_size": arguments.chunk_size,
+    }
+    if not 1 <= values["max_attempts"] <= 16:
+        raise ValueError("max_attempts is outside CLI bounds")
+    if not 0 < values["request_timeout_seconds"] <= 300:
+        raise ValueError("request_timeout_seconds is outside CLI bounds")
+    if not 0 < values["overall_timeout_seconds"] <= 3600:
+        raise ValueError("overall_timeout_seconds is outside CLI bounds")
+    if not 0 <= values["initial_backoff_seconds"] <= 60:
+        raise ValueError("initial_backoff_seconds is outside CLI bounds")
+    if not 0 <= values["max_backoff_seconds"] <= 60:
+        raise ValueError("max_backoff_seconds is outside CLI bounds")
+    if not 0 < values["lock_timeout_seconds"] <= 300:
+        raise ValueError("lock_timeout_seconds is outside CLI bounds")
+    if not 0 < values["lock_poll_interval_seconds"] <= 5:
+        raise ValueError("lock_poll_interval_seconds is outside CLI bounds")
+    if not 1 <= values["chunk_size"] <= 16 * 1024 * 1024:
+        raise ValueError("chunk_size is outside CLI bounds")
+    return AcquisitionPolicy(**values)
+
+
+def _asset_fetch_runtime_url(
+    arguments: argparse.Namespace,
+) -> tuple[str | None, str | None]:
+    if arguments.url_env is not None:
+        if not _ASSET_FETCH_ENV_NAME_PATTERN.fullmatch(arguments.url_env):
+            return None, "RUNTIME_URL_SOURCE_INVALID"
+        value = os.environ.get(arguments.url_env)
+        if value is None:
+            return None, "RUNTIME_URL_SOURCE_INVALID"
+    else:
+        try:
+            value = sys.stdin.read(_ASSET_FETCH_MAX_URL_CHARS + 3)
+        except (OSError, UnicodeError):
+            return None, "RUNTIME_URL_SOURCE_INVALID"
+        if value.endswith("\r\n"):
+            value = value[:-2]
+        elif value.endswith("\n"):
+            value = value[:-1]
+
+    if (
+        not value
+        or len(value) > _ASSET_FETCH_MAX_URL_CHARS
+        or value != value.strip()
+        or any(character in value for character in ("\x00", "\r", "\n"))
+    ):
+        return None, "RUNTIME_URL_SOURCE_INVALID"
+    return value, None
+
+
+def _asset_fetch_http(arguments: argparse.Namespace) -> int:
+    from .asset_acquisition import (
+        AssetAcquisitionError,
+        AssetObjectSpec,
+        acquire_http_asset,
+        resolve_approved_asset_target,
+    )
+
+    try:
+        if arguments.output is not None and _asset_fetch_output_is_occupied(
+            arguments.output
+        ):
+            _emit(_asset_fetch_cli_failure("OUTPUT_EXISTS"))
+            return 2
+    except OSError:
+        _emit(_asset_fetch_cli_failure("OUTPUT_CONFLICT"))
+        return 2
+
+    if arguments.spec.suffix.casefold() != ".json":
+        return _asset_fetch_finish(
+            arguments,
+            _asset_fetch_cli_failure("SPEC_INVALID"),
+            exit_code=2,
+        )
+    try:
+        spec = AssetObjectSpec.from_mapping(_load_mapping(arguments.spec))
+    except (ValueError, TypeError, KeyError, OSError):
+        return _asset_fetch_finish(
+            arguments,
+            _asset_fetch_cli_failure("SPEC_INVALID"),
+            exit_code=2,
+        )
+
+    try:
+        target = resolve_approved_asset_target(
+            arguments.asset_root,
+            arguments.final_path,
+        )
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target = resolve_approved_asset_target(
+            arguments.asset_root,
+            arguments.final_path,
+        )
+    except (ValueError, TypeError, OSError):
+        return _asset_fetch_finish(
+            arguments,
+            _asset_fetch_cli_failure("TARGET_PATH_INVALID"),
+            exit_code=2,
+        )
+
+    try:
+        policy = _asset_fetch_policy(arguments)
+    except (ValueError, TypeError, OverflowError):
+        return _asset_fetch_finish(
+            arguments,
+            _asset_fetch_cli_failure("POLICY_INVALID"),
+            exit_code=2,
+        )
+
+    runtime_url, input_error = _asset_fetch_runtime_url(arguments)
+    if input_error is not None or runtime_url is None:
+        return _asset_fetch_finish(
+            arguments,
+            _asset_fetch_cli_failure("RUNTIME_URL_SOURCE_INVALID"),
+            exit_code=2,
+        )
+
+    try:
+        result = acquire_http_asset(
+            spec,
+            runtime_url,
+            target,
+            policy=policy,
+        )
+    except AssetAcquisitionError as error:
+        return _asset_fetch_finish(
+            arguments,
+            error.report.to_dict(),
+            exit_code=3,
+        )
+    except (ValueError, TypeError, KeyError, OSError, RuntimeError):
+        return _asset_fetch_finish(
+            arguments,
+            _asset_fetch_cli_failure("INTERNAL_ERROR"),
+            exit_code=3,
+        )
+    return _asset_fetch_finish(arguments, result.to_dict(), exit_code=0)
+
+
+def _asset_fetch_argv_contains_runtime_url(argv: list[str]) -> bool:
+    if len(argv) < 2 or argv[0:2] != ["asset", "fetch-http"]:
+        return False
+    for argument in argv[2:]:
+        option = argument.split("=", 1)[0].casefold()
+        if option in _ASSET_FETCH_FORBIDDEN_URL_OPTIONS:
+            return True
+        lowered = argument.casefold()
+        if "://" in argument or "?" in argument or lowered.startswith(
+            ("http:", "https:")
+        ):
+            return True
+    return False
+
+
 def _artifact_review_identity(
     path: Path,
     *,
@@ -1940,9 +2167,51 @@ def build_parser(*, prog: str | None = None) -> argparse.ArgumentParser:
     task_tensorboard.set_defaults(handler=_task_tensorboard_rebuild)
 
     asset_group = subparsers.add_parser(
-        "asset", help="仅本地资产登记与完整性验证（绝不下载）"
+        "asset", help="资产 HTTP 获取、本地登记与完整性验证"
     )
     asset_commands = asset_group.add_subparsers(dest="asset_command", required=True)
+    asset_fetch_http = asset_commands.add_parser(
+        "fetch-http",
+        help="从环境变量或 stdin 提供的运行时 URL 获取固定身份资产",
+    )
+    asset_fetch_http.add_argument("--spec", type=Path, required=True)
+    asset_fetch_http.add_argument("--asset-root", type=Path, required=True)
+    asset_fetch_http.add_argument("--final-path", required=True)
+    asset_fetch_url_source = asset_fetch_http.add_mutually_exclusive_group(
+        required=True
+    )
+    asset_fetch_url_source.add_argument(
+        "--url-env",
+        help="只传环境变量名；运行时 URL 值不得进入 argv",
+    )
+    asset_fetch_url_source.add_argument(
+        "--url-stdin",
+        action="store_true",
+        help="从 stdin 读取一行运行时 URL",
+    )
+    asset_fetch_http.add_argument("--output", type=Path)
+    asset_fetch_http.add_argument("--max-attempts", type=int, default=4)
+    asset_fetch_http.add_argument(
+        "--request-timeout-seconds", type=float, default=30.0
+    )
+    asset_fetch_http.add_argument(
+        "--overall-timeout-seconds", type=float, default=600.0
+    )
+    asset_fetch_http.add_argument(
+        "--initial-backoff-seconds", type=float, default=0.5
+    )
+    asset_fetch_http.add_argument(
+        "--max-backoff-seconds", type=float, default=8.0
+    )
+    asset_fetch_http.add_argument(
+        "--lock-timeout-seconds", type=float, default=30.0
+    )
+    asset_fetch_http.add_argument(
+        "--lock-poll-interval-seconds", type=float, default=0.05
+    )
+    asset_fetch_http.add_argument("--chunk-size", type=int, default=1024 * 1024)
+    asset_fetch_http.set_defaults(handler=_asset_fetch_http)
+
     asset_acquire = asset_commands.add_parser(
         "acquire", help="把已有本地文件登记为 downloaded candidate"
     )
@@ -2114,7 +2383,11 @@ def build_parser(*, prog: str | None = None) -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
-    arguments = build_parser(prog=Path(sys.argv[0]).stem).parse_args(argv)
+    selected_argv = list(sys.argv[1:] if argv is None else argv)
+    if _asset_fetch_argv_contains_runtime_url(selected_argv):
+        _emit(_asset_fetch_cli_failure("RUNTIME_URL_ARGV_FORBIDDEN"))
+        return 2
+    arguments = build_parser(prog=Path(sys.argv[0]).stem).parse_args(selected_argv)
     try:
         return int(arguments.handler(arguments))
     except (ValueError, TypeError, KeyError, OSError, RuntimeError) as exc:

@@ -1,0 +1,371 @@
+{
+  "schema_version": "stage0-asset-requirements-v1",
+  "artifact_hash": "2c44455bd1914b52338968eba4e9b92370a35523e2f4434c1cbb368a1f5dd648",
+  "status": "FROZEN",
+  "created_at": "2026-08-03T15:29:40+08:00",
+  "generator_git_commit": "1b88e8dd3264d460b0a642caee1e88e2456c247d",
+  "source_plan_refs": [
+    "plan/general_plan.md",
+    "plan/stage0/04_assets_and_manifests.md"
+  ],
+  "models": [
+    {
+      "name": "pythia-14m-step0",
+      "gate_ids": ["stage0.G3-S1"],
+      "repository": "EleutherAI/pythia-14m",
+      "revision": "56079904bb80b7f36d3b794089f146e7a4d6efae",
+      "checkpoint": "step0",
+      "initialization_kind": "base_initialization",
+      "architecture": "GPTNeoXForCausalLM",
+      "parameter_count": 14067712,
+      "tensor_count": 76,
+      "dtype_counts": {"F16": 14067712},
+      "max_position_embeddings": 2048,
+      "files": [
+        {
+          "path": "config.json",
+          "size_bytes": 698,
+          "sha256": "f97f966a66c444890ed461fff2a51eefb15d74303df05b948124719f199b0b17",
+          "role": "config"
+        },
+        {
+          "path": "model.safetensors",
+          "size_bytes": 28143920,
+          "sha256": "495e509ae82ddbe9cf39558a13b10973822c7bcedd0c6fd7d3225620b9e2edb5",
+          "role": "weights"
+        }
+      ]
+    },
+    {
+      "name": "pythia-31m-deduped-step0",
+      "gate_ids": ["stage0.G3-S2"],
+      "repository": "EleutherAI/pythia-31m-deduped",
+      "revision": "73628c85dd9d12d43c07be77ebcf10cef5fd9660",
+      "checkpoint": "step0",
+      "initialization_kind": "base_initialization",
+      "architecture": "GPTNeoXForCausalLM",
+      "parameter_count": 30494720,
+      "tensor_count": 76,
+      "dtype_counts": {"F32": 30494720},
+      "max_position_embeddings": 2048,
+      "files": [
+        {
+          "path": "config.json",
+          "size_bytes": 596,
+          "sha256": "3a6bc92e94cd3dca46e2a3eef81a8ebb17185ffb4d5ad16bb01fd67021ccd5b6",
+          "role": "config"
+        },
+        {
+          "path": "model.safetensors",
+          "size_bytes": 121987544,
+          "sha256": "5dad0c31b7c19af86f5840674fa4f16a91bdf617245aae17387bdaedd3600319",
+          "role": "weights"
+        }
+      ]
+    },
+    {
+      "name": "pythia-160m-deduped-step0",
+      "gate_ids": ["stage0.G3-S4"],
+      "repository": "EleutherAI/pythia-160m-deduped",
+      "revision": "0450b9dc64e8a49a87c9eec8813d0e6979643420",
+      "checkpoint": "step0",
+      "initialization_kind": "base_initialization",
+      "architecture": "GPTNeoXForCausalLM",
+      "parameter_count": 162322944,
+      "tensor_count": 148,
+      "dtype_counts": {"F32": 162322944},
+      "max_position_embeddings": 2048,
+      "files": [
+        {
+          "path": "config.json",
+          "size_bytes": 569,
+          "sha256": "76eb275107220e450d31258f792a2efcbee109d8b62ae0088260057dec06362f",
+          "role": "config"
+        },
+        {
+          "path": "model.safetensors",
+          "size_bytes": 649308728,
+          "sha256": "87c169cd152db340535d6f330af0e2eed7578484ef2d23dd44ca90cbcc215ba7",
+          "role": "weights"
+        }
+      ]
+    },
+    {
+      "name": "pythia-160m-deduped-step512",
+      "gate_ids": ["stage0.G3-S4"],
+      "repository": "EleutherAI/pythia-160m-deduped",
+      "revision": "eaa6383edf563bf355d8b125777f352c2a773bfa",
+      "checkpoint": "step512",
+      "initialization_kind": "trained_checkpoint",
+      "architecture": "GPTNeoXForCausalLM",
+      "parameter_count": 162322944,
+      "tensor_count": 148,
+      "dtype_counts": {"F32": 162322944},
+      "max_position_embeddings": 2048,
+      "files": [
+        {
+          "path": "config.json",
+          "size_bytes": 569,
+          "sha256": "76eb275107220e450d31258f792a2efcbee109d8b62ae0088260057dec06362f",
+          "role": "config"
+        },
+        {
+          "path": "model.safetensors",
+          "size_bytes": 649308728,
+          "sha256": "a7793f09ecdd85970740b691a78dc67d2489d8866d8bba6fd95e01e3b69a5999",
+          "role": "weights"
+        }
+      ]
+    },
+    {
+      "name": "pythia-410m-deduped-step0",
+      "gate_ids": ["stage0.G3-S5", "stage0.G3-S6"],
+      "repository": "EleutherAI/pythia-410m-deduped",
+      "revision": "e361f9afd54b3e7856879eead5326d36ff6f32d7",
+      "checkpoint": "step0",
+      "initialization_kind": "base_initialization",
+      "architecture": "GPTNeoXForCausalLM",
+      "parameter_count": 405334016,
+      "tensor_count": 292,
+      "dtype_counts": {"F32": 405334016},
+      "max_position_embeddings": 2048,
+      "files": [
+        {
+          "path": "config.json",
+          "size_bytes": 570,
+          "sha256": "d4c11e84a59c8af4d88446bba53b718f7aef740daa070ded08fd6a9a3aca4fc6",
+          "role": "config"
+        },
+        {
+          "path": "model.safetensors",
+          "size_bytes": 1621370224,
+          "sha256": "25c40c86d28f75cad7f98fca8a4ed4a75485423f14df85832226b4ded66c097d",
+          "role": "weights"
+        }
+      ]
+    }
+  ],
+  "tokenizer": {
+    "name": "pythia-tokenizer",
+    "repository": "EleutherAI/pythia-410m-deduped",
+    "revision": "e361f9afd54b3e7856879eead5326d36ff6f32d7",
+    "tokenizer_class": "GPTNeoXTokenizerFast",
+    "vocab_size": 50254,
+    "token_count_with_added_tokens": 50277,
+    "vocab_mapping_sha256": "728db3c8825c64b8de98049c042221ba64b16a89348ada66f8d63c3d12dea84f",
+    "special_token_ids": {"bos": 0, "eos": 0, "unk": 0},
+    "glue_padding_token": {
+      "token": "<|padding|>",
+      "token_id": 1,
+      "policy": "explicit_existing_added_token"
+    },
+    "files": [
+      {
+        "path": "special_tokens_map.json",
+        "size_bytes": 99,
+        "sha256": "6f50ab5a5a509a1c309d6171f339b196a900dc9c99ad0408ff23bb615fdae7ad",
+        "role": "special_tokens"
+      },
+      {
+        "path": "tokenizer.json",
+        "size_bytes": 2113710,
+        "sha256": "c24618a1b3e6a38167beff1c72cffd126c3a66254347304b50547d12c5f25624",
+        "role": "tokenizer_model"
+      },
+      {
+        "path": "tokenizer_config.json",
+        "size_bytes": 396,
+        "sha256": "70e38394e494931c6f773ba41e19460dd4436526b852207367f04341b4066d3f",
+        "role": "tokenizer_config"
+      }
+    ]
+  },
+  "pile": {
+    "repository": "EleutherAI/pile-deduped-pythia-preshuffled",
+    "revision": "4647773ea142ab1ff5694602fa104bbf49088408",
+    "index": {
+      "path": "document.idx",
+      "size_bytes": 1757184042,
+      "sha256": "1d9fdd760295eb2007a4874440b27c559ca722239fa2814aa8a2ee6724b7852f",
+      "role": "index"
+    },
+    "selected_shards": [
+      {
+        "path": "document-00000-of-00020.bin",
+        "size_bytes": 30000000000,
+        "sha256": "1ce355bd2683627d0ff689f8578115cf3df84bd1edf3410e6aca9705d31fc6ea",
+        "role": "token_shard",
+        "ordinal": 0,
+        "byte_start": 0,
+        "byte_stop": 30000000000
+      }
+    ],
+    "index_contract": {
+      "magic_hex": "4d4d49444944580000",
+      "version": 1,
+      "dtype_code": 8,
+      "dtype_bytes": 2,
+      "sequence_count": 146432000,
+      "document_count": 1
+    },
+    "causal_lm_contract": {
+      "labels_alignment": "pre_shifted_next_token",
+      "source_tokens_per_record": 2049,
+      "input_sequence_length": 2048,
+      "target_sequence_length": 2048,
+      "input_slice": [0, 2048],
+      "target_slice": [1, 2049],
+      "attention_mask_policy": "all_one_for_fixed_full_record",
+      "effective_target_tokens_per_record": 2048,
+      "loss_adapter_id": "pre-shifted-next-token-cross-entropy-v1"
+    },
+    "required_cursor_stop": 1048576,
+    "required_raw_tokens": 2148532224,
+    "required_target_tokens": 2147483648,
+    "cursor_intervals": [
+      {"name": "debug", "start": 0, "stop": 8192, "purpose": "G3-S1/G5 fixed smoke subset"},
+      {"name": "train", "start": 0, "stop": 640000, "purpose": "Stage 1, 4 and 5 training cursor range"},
+      {"name": "validation", "start": 640000, "stop": 704000, "purpose": "shared frozen validation pool"},
+      {"name": "sampling_universe", "start": 704000, "stop": 966144, "purpose": "Stage 2 with-replacement universe"},
+      {"name": "probe", "start": 966144, "stop": 1031680, "purpose": "Stage 3 disjoint probe panel"},
+      {"name": "reserve", "start": 1031680, "stop": 1048576, "purpose": "frozen non-consumed safety margin"}
+    ],
+    "workloads": [
+      {"stage": 1, "split": "train", "max_steps": 100, "global_batch_size": 8, "required_unique_records": 800, "required_target_tokens": 1638400},
+      {"stage": 1, "split": "validation", "max_steps": null, "global_batch_size": null, "required_unique_records": 32, "required_target_tokens": 65536},
+      {"stage": 2, "split": "sampling_universe", "max_steps": null, "global_batch_size": null, "required_unique_records": 262144, "required_target_tokens": 536870912},
+      {"stage": 3, "split": "probe", "max_steps": null, "global_batch_size": null, "required_unique_records": 65536, "required_target_tokens": 134217728},
+      {"stage": 4, "split": "train", "max_steps": 1000, "global_batch_size": 64, "required_unique_records": 64000, "required_target_tokens": 131072000},
+      {"stage": 4, "split": "validation", "max_steps": null, "global_batch_size": null, "required_unique_records": 128, "required_target_tokens": 262144},
+      {"stage": 5, "split": "train", "max_steps": 10000, "global_batch_size": 64, "required_unique_records": 640000, "required_target_tokens": 1310720000},
+      {"stage": 5, "split": "validation", "max_steps": null, "global_batch_size": null, "required_unique_records": 256, "required_target_tokens": 524288}
+    ],
+    "reference_batch_sha256": {
+      "0": "7b5299e7ed772054885b16d1d61778c5f437a5fb196aeffab5dba4577977c562",
+      "1": "2f08a61f39b39d7fea82babb2908899434648ef0e293ba177f5e8e79a3aa6402",
+      "511": "24718b83391af3c41c5c87802014b436c317f7fedf404d535ef0b5819630ebfb"
+    },
+    "last_required_record_sha256": "c70a2422352b10a9027d31ca5a0ed8fe9453218a7a4e1d3e5d675842c7c982c4",
+    "cross_shard_policy": "explicit_ordered_global_byte_stream_selected_prefix_must_be_fully_covered"
+  },
+  "glue": [
+    {
+      "task": "sst2",
+      "repository": "nyu-mll/glue",
+      "revision": "bcdcba79d07bc864c1c254ccfcedcce55bcc9a8c",
+      "raw_files": [
+        {"path": "train-00000-of-00001.parquet", "size_bytes": 3110468, "sha256": "66a253e67968acfabcbe49dbe9da964b42ac1c851c40ab760e8c8942efdb3229", "role": "train"},
+        {"path": "validation-00000-of-00001.parquet", "size_bytes": 72819, "sha256": "a1371f3b3a7b0bcefa8388799a9359dc3ce76c349cc0079507a7991364fd2a9b", "role": "validation"},
+        {"path": "test-00000-of-00001.parquet", "size_bytes": 147793, "sha256": "e9d23cf0067211d2baf018328b507f5153fb6704d75117295a8bda47c7adccb1", "role": "test"}
+      ],
+      "split_counts": {"train": 67349, "validation": 872, "test": 1821},
+      "text_fields": ["sentence"],
+      "label_mapping": {"negative": 0, "positive": 1},
+      "unlabeled_test_policy": "retain_in_raw_exclude_from_derived_training_and_evaluation",
+      "preprocessing": {
+        "tokenizer_name": "pythia-tokenizer",
+        "max_length": 512,
+        "truncation": true,
+        "padding": "max_length",
+        "pad_token": "<|padding|>",
+        "derived_splits": ["train", "validation"]
+      }
+    },
+    {
+      "task": "mnli",
+      "repository": "nyu-mll/glue",
+      "revision": "bcdcba79d07bc864c1c254ccfcedcce55bcc9a8c",
+      "raw_files": [
+        {"path": "train-00000-of-00001.parquet", "size_bytes": 52224361, "sha256": "49a4a5508b89b8fed2c6e81d2c47d00f4759050a7048c6cc5d95d31122ced3c1", "role": "train"},
+        {"path": "validation_matched-00000-of-00001.parquet", "size_bytes": 1214936, "sha256": "7f918c09d9c35446b8e8f06a5672f8ab704e2897fecbf52e2e154141f3d7c421", "role": "validation_matched"},
+        {"path": "validation_mismatched-00000-of-00001.parquet", "size_bytes": 1251152, "sha256": "04aba92823a954be36fe1b69b61eed334c9eb1009daba0dd79f69d77b87c535c", "role": "validation_mismatched"},
+        {"path": "test_matched-00000-of-00001.parquet", "size_bytes": 1220119, "sha256": "a330c4f2aeb0bc92f1b4b133fbbaf51bf9c7d0f5cac3d06f49ef63af47dbb822", "role": "test_matched"},
+        {"path": "test_mismatched-00000-of-00001.parquet", "size_bytes": 1257857, "sha256": "e5078398d5c83d183578b1bdafe94e4491ed28ad1cf8d98ee8846afcec651f16", "role": "test_mismatched"}
+      ],
+      "split_counts": {
+        "train": 392702,
+        "validation_matched": 9815,
+        "validation_mismatched": 9832,
+        "test_matched": 9796,
+        "test_mismatched": 9847
+      },
+      "text_fields": ["premise", "hypothesis"],
+      "label_mapping": {"entailment": 0, "neutral": 1, "contradiction": 2},
+      "unlabeled_test_policy": "retain_in_raw_exclude_from_derived_training_and_evaluation",
+      "preprocessing": {
+        "tokenizer_name": "pythia-tokenizer",
+        "max_length": 512,
+        "truncation": true,
+        "padding": "max_length",
+        "pad_token": "<|padding|>",
+        "derived_splits": ["train", "validation_matched", "validation_mismatched"]
+      }
+    },
+    {
+      "task": "rte",
+      "repository": "nyu-mll/glue",
+      "revision": "bcdcba79d07bc864c1c254ccfcedcce55bcc9a8c",
+      "raw_files": [
+        {"path": "train-00000-of-00001.parquet", "size_bytes": 583976, "sha256": "a6252ab17015d718f6de1effe0980f7b158df63e3d16207cd8bd396b608e5147", "role": "train"},
+        {"path": "validation-00000-of-00001.parquet", "size_bytes": 69020, "sha256": "fb2aa2e04f551133ba663617a15ae133dc22b0f6a969bc0629b5ea6003ee9cf8", "role": "validation"},
+        {"path": "test-00000-of-00001.parquet", "size_bytes": 621413, "sha256": "3f44aadbfb8bbb7a64ba0674bd26ff77b66e88fdf7a6d64255a5ba6ae9057383", "role": "test"}
+      ],
+      "split_counts": {"train": 2490, "validation": 277, "test": 3000},
+      "text_fields": ["sentence1", "sentence2"],
+      "label_mapping": {"entailment": 0, "not_entailment": 1},
+      "unlabeled_test_policy": "retain_in_raw_exclude_from_derived_training_and_evaluation",
+      "preprocessing": {
+        "tokenizer_name": "pythia-tokenizer",
+        "max_length": 512,
+        "truncation": true,
+        "padding": "max_length",
+        "pad_token": "<|padding|>",
+        "derived_splits": ["train", "validation"]
+      }
+    }
+  ],
+  "gate_matrix": {
+    "stage0.G3-S1": {
+      "model_names": ["pythia-14m-step0"],
+      "require_tokenizer": true,
+      "pile_intervals": ["debug"],
+      "glue_tasks": [],
+      "require_glue_derived": false
+    },
+    "stage0.G3-S2": {
+      "model_names": ["pythia-31m-deduped-step0"],
+      "require_tokenizer": true,
+      "pile_intervals": ["sampling_universe"],
+      "glue_tasks": [],
+      "require_glue_derived": false
+    },
+    "stage0.G3-S4": {
+      "model_names": ["pythia-160m-deduped-step0", "pythia-160m-deduped-step512"],
+      "require_tokenizer": true,
+      "pile_intervals": ["train", "validation"],
+      "glue_tasks": ["sst2"],
+      "require_glue_derived": true
+    },
+    "stage0.G3-S5": {
+      "model_names": ["pythia-410m-deduped-step0"],
+      "require_tokenizer": true,
+      "pile_intervals": ["train", "validation"],
+      "glue_tasks": [],
+      "require_glue_derived": false
+    },
+    "stage0.G3-S6": {
+      "model_names": ["pythia-410m-deduped-step0"],
+      "require_tokenizer": true,
+      "pile_intervals": [],
+      "glue_tasks": ["sst2", "mnli", "rte"],
+      "require_glue_derived": true
+    }
+  },
+  "stage6_route": {
+    "architecture": "pythia-410m-sequence-classification",
+    "base_model_name": "pythia-410m-deduped-step0",
+    "direct_supervision_input": "base_initialization",
+    "pretrained_finetune_input": "stage5_checkpoint_with_same_base_initialization",
+    "classifier_head_initialization": "deterministic_seeded_runtime_head"
+  }
+}

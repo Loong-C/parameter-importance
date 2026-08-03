@@ -1,0 +1,128 @@
+{
+  "schema_version": "stage0-g3-asset-layout-v1",
+  "artifact_hash": "5599c7212c0501b36b100f5c285ca9adebc94f1d001bec4973dbc544522f5eeb",
+  "created_at": "2026-08-03T15:29:40+08:00",
+  "generator_git_commit": "1b88e8dd3264d460b0a642caee1e88e2456c247d",
+  "requirements_ref": "configs/stage0/g3-asset-requirements-v1.json",
+  "requirements_sha256": "2c44455bd1914b52338968eba4e9b92370a35523e2f4434c1cbb368a1f5dd648",
+  "workspace_semantics": "paths_are_posix_relative_to_DATA_ROOT",
+  "entries": [
+    {
+      "logical_name": "pythia-14m-step0",
+      "kind": "model",
+      "requirement_name": "pythia-14m-step0",
+      "manifest_ref": "manifests/model/pythia-14m.json",
+      "asset_root_ref": "models/pythia-14m-step0",
+      "qualification_ref": "manifests/qualifications/pythia-14m-step0.json",
+      "gate_ids": ["stage0.G3-S1"]
+    },
+    {
+      "logical_name": "pythia-31m-deduped-step0",
+      "kind": "model",
+      "requirement_name": "pythia-31m-deduped-step0",
+      "manifest_ref": "manifests/model/pythia-31m.json",
+      "asset_root_ref": "models/pythia-31m-deduped-step0",
+      "qualification_ref": "manifests/qualifications/pythia-31m-deduped-step0.json",
+      "gate_ids": ["stage0.G3-S2"]
+    },
+    {
+      "logical_name": "pythia-160m-deduped-step0",
+      "kind": "model",
+      "requirement_name": "pythia-160m-deduped-step0",
+      "manifest_ref": "manifests/model/pythia-160m.json",
+      "asset_root_ref": "models/pythia-160m-deduped-step0",
+      "qualification_ref": "manifests/qualifications/pythia-160m-deduped-step0.json",
+      "gate_ids": ["stage0.G3-S4"]
+    },
+    {
+      "logical_name": "pythia-160m-deduped-step512",
+      "kind": "model",
+      "requirement_name": "pythia-160m-deduped-step512",
+      "manifest_ref": "manifests/model/pythia-160m-step512.json",
+      "asset_root_ref": "models/pythia-160m-deduped-step512",
+      "qualification_ref": "manifests/qualifications/pythia-160m-deduped-step512.json",
+      "gate_ids": ["stage0.G3-S4"]
+    },
+    {
+      "logical_name": "pythia-410m-deduped-step0",
+      "kind": "model",
+      "requirement_name": "pythia-410m-deduped-step0",
+      "manifest_ref": "manifests/model/pythia-410m.json",
+      "asset_root_ref": "models/pythia-410m-deduped-step0",
+      "qualification_ref": "manifests/qualifications/pythia-410m-deduped-step0.json",
+      "gate_ids": ["stage0.G3-S5", "stage0.G3-S6"]
+    },
+    {
+      "logical_name": "pythia-tokenizer",
+      "kind": "tokenizer",
+      "requirement_name": "pythia-tokenizer",
+      "manifest_ref": "manifests/tokenizer/pythia.json",
+      "asset_root_ref": "models/pythia-410m-deduped-step0",
+      "qualification_ref": "manifests/qualifications/pythia-tokenizer.json",
+      "gate_ids": ["stage0.G3-S1", "stage0.G3-S2", "stage0.G3-S4", "stage0.G3-S5", "stage0.G3-S6"]
+    },
+    {
+      "logical_name": "pile-selected-prefix",
+      "kind": "pile",
+      "requirement_name": "pile",
+      "manifest_ref": "manifests/data/pile-pretokenized.json",
+      "asset_root_ref": "datasets/pile-deduped-pythia-preshuffled",
+      "qualification_ref": "manifests/qualifications/pile-selected-prefix.json",
+      "gate_ids": ["stage0.G3-S1", "stage0.G3-S2", "stage0.G3-S4", "stage0.G3-S5"]
+    },
+    {
+      "logical_name": "glue-sst2-raw",
+      "kind": "glue_raw",
+      "requirement_name": "sst2",
+      "manifest_ref": "manifests/data/glue-sst2-raw.json",
+      "asset_root_ref": "datasets/glue-sst2",
+      "qualification_ref": "manifests/qualifications/glue-sst2-raw.json",
+      "gate_ids": ["stage0.G3-S4", "stage0.G3-S6"]
+    },
+    {
+      "logical_name": "glue-sst2-pretokenized",
+      "kind": "glue_derived",
+      "requirement_name": "sst2",
+      "manifest_ref": "manifests/data/glue-sst2-pretokenized.json",
+      "asset_root_ref": "datasets/glue-sst2-pretokenized",
+      "qualification_ref": "manifests/qualifications/glue-sst2-pretokenized.json",
+      "gate_ids": ["stage0.G3-S4", "stage0.G3-S6"]
+    },
+    {
+      "logical_name": "glue-mnli-raw",
+      "kind": "glue_raw",
+      "requirement_name": "mnli",
+      "manifest_ref": "manifests/data/glue-mnli-raw.json",
+      "asset_root_ref": "datasets/glue-mnli",
+      "qualification_ref": "manifests/qualifications/glue-mnli-raw.json",
+      "gate_ids": ["stage0.G3-S6"]
+    },
+    {
+      "logical_name": "glue-mnli-pretokenized",
+      "kind": "glue_derived",
+      "requirement_name": "mnli",
+      "manifest_ref": "manifests/data/glue-mnli-pretokenized.json",
+      "asset_root_ref": "datasets/glue-mnli-pretokenized",
+      "qualification_ref": "manifests/qualifications/glue-mnli-pretokenized.json",
+      "gate_ids": ["stage0.G3-S6"]
+    },
+    {
+      "logical_name": "glue-rte-raw",
+      "kind": "glue_raw",
+      "requirement_name": "rte",
+      "manifest_ref": "manifests/data/glue-rte-raw.json",
+      "asset_root_ref": "datasets/glue-rte",
+      "qualification_ref": "manifests/qualifications/glue-rte-raw.json",
+      "gate_ids": ["stage0.G3-S6"]
+    },
+    {
+      "logical_name": "glue-rte-pretokenized",
+      "kind": "glue_derived",
+      "requirement_name": "rte",
+      "manifest_ref": "manifests/data/glue-rte-pretokenized.json",
+      "asset_root_ref": "datasets/glue-rte-pretokenized",
+      "qualification_ref": "manifests/qualifications/glue-rte-pretokenized.json",
+      "gate_ids": ["stage0.G3-S6"]
+    }
+  ]
+}

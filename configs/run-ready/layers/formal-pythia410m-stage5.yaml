@@ -7,7 +7,7 @@ runtime:
   cache_root: cache/formal/stage5-pythia410m
   temp_root: runs/formal/stage5-pythia410m/tmp
 model:
-  asset_id: pythia-410m
+  asset_id: pythia-410m-deduped-step0
   revision: FILL_MODEL_REVISION
   initialization_id: FILL_BASE_INITIALIZATION_HASH
   architecture: pythia-410m

@@ -8,11 +8,11 @@ runtime:
   cache_root: cache/formal/stage6-glue
   temp_root: runs/formal/stage6-glue/tmp
 model:
-  asset_id: pythia-160m-sequence-classification
+  asset_id: pythia-410m-deduped-step0
   revision: FILL_MODEL_REVISION
   tokenizer_asset_id: pythia-tokenizer
   initialization_id: FILL_SHARED_BASE_INITIALIZATION_HASH
-  architecture: pythia-160m-sequence-classification
+  architecture: pythia-410m-sequence-classification
 data:
   asset_id: glue-pretokenized
   revision: FILL_DATA_REVISION

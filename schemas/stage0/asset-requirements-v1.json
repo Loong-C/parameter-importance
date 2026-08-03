@@ -1,0 +1,436 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://parameter-importance.invalid/schemas/stage0/asset-requirements-v1.json",
+  "title": "Stage 0 G3 asset and data-budget freeze",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "artifact_hash",
+    "status",
+    "created_at",
+    "generator_git_commit",
+    "source_plan_refs",
+    "models",
+    "tokenizer",
+    "pile",
+    "glue",
+    "gate_matrix",
+    "stage6_route"
+  ],
+  "properties": {
+    "schema_version": {"const": "stage0-asset-requirements-v1"},
+    "artifact_hash": {"$ref": "#/$defs/sha256"},
+    "status": {"const": "FROZEN"},
+    "created_at": {"type": "string", "format": "date-time"},
+    "generator_git_commit": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+    "source_plan_refs": {
+      "type": "array",
+      "minItems": 2,
+      "uniqueItems": true,
+      "items": {"$ref": "#/$defs/relativePath"}
+    },
+    "models": {
+      "type": "array",
+      "minItems": 5,
+      "items": {"$ref": "#/$defs/model"}
+    },
+    "tokenizer": {"$ref": "#/$defs/tokenizer"},
+    "pile": {"$ref": "#/$defs/pile"},
+    "glue": {
+      "type": "array",
+      "minItems": 3,
+      "maxItems": 3,
+      "items": {"$ref": "#/$defs/glueTask"}
+    },
+    "gate_matrix": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["stage0.G3-S1", "stage0.G3-S2", "stage0.G3-S4", "stage0.G3-S5", "stage0.G3-S6"],
+      "properties": {
+        "stage0.G3-S1": {"$ref": "#/$defs/gateRequirement"},
+        "stage0.G3-S2": {"$ref": "#/$defs/gateRequirement"},
+        "stage0.G3-S4": {"$ref": "#/$defs/gateRequirement"},
+        "stage0.G3-S5": {"$ref": "#/$defs/gateRequirement"},
+        "stage0.G3-S6": {"$ref": "#/$defs/gateRequirement"}
+      }
+    },
+    "stage6_route": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "architecture",
+        "base_model_name",
+        "direct_supervision_input",
+        "pretrained_finetune_input",
+        "classifier_head_initialization"
+      ],
+      "properties": {
+        "architecture": {"const": "pythia-410m-sequence-classification"},
+        "base_model_name": {"const": "pythia-410m-deduped-step0"},
+        "direct_supervision_input": {"const": "base_initialization"},
+        "pretrained_finetune_input": {"const": "stage5_checkpoint_with_same_base_initialization"},
+        "classifier_head_initialization": {"const": "deterministic_seeded_runtime_head"}
+      }
+    }
+  },
+  "$defs": {
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "relativePath": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.(?:/|$))(?!.*\\\\).+$"
+    },
+    "file": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "size_bytes", "sha256", "role"],
+      "properties": {
+        "path": {"$ref": "#/$defs/relativePath"},
+        "size_bytes": {"type": "integer", "minimum": 0},
+        "sha256": {"$ref": "#/$defs/sha256"},
+        "role": {"type": "string", "minLength": 1}
+      }
+    },
+    "shard": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "path",
+        "size_bytes",
+        "sha256",
+        "role",
+        "ordinal",
+        "byte_start",
+        "byte_stop"
+      ],
+      "properties": {
+        "path": {"$ref": "#/$defs/relativePath"},
+        "size_bytes": {"type": "integer", "minimum": 1},
+        "sha256": {"$ref": "#/$defs/sha256"},
+        "role": {"const": "token_shard"},
+        "ordinal": {"type": "integer", "minimum": 0},
+        "byte_start": {"type": "integer", "minimum": 0},
+        "byte_stop": {"type": "integer", "minimum": 1}
+      }
+    },
+    "model": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "gate_ids",
+        "repository",
+        "revision",
+        "checkpoint",
+        "initialization_kind",
+        "architecture",
+        "parameter_count",
+        "tensor_count",
+        "dtype_counts",
+        "max_position_embeddings",
+        "files"
+      ],
+      "properties": {
+        "name": {"type": "string", "minLength": 1},
+        "gate_ids": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {"enum": ["stage0.G3-S1", "stage0.G3-S2", "stage0.G3-S4", "stage0.G3-S5", "stage0.G3-S6"]}
+        },
+        "repository": {"type": "string", "pattern": "^EleutherAI/pythia-"},
+        "revision": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+        "checkpoint": {"type": "string", "pattern": "^step[0-9]+$"},
+        "initialization_kind": {"enum": ["base_initialization", "trained_checkpoint"]},
+        "architecture": {"const": "GPTNeoXForCausalLM"},
+        "parameter_count": {"type": "integer", "minimum": 1},
+        "tensor_count": {"type": "integer", "minimum": 1},
+        "dtype_counts": {
+          "type": "object",
+          "minProperties": 1,
+          "additionalProperties": {"type": "integer", "minimum": 1}
+        },
+        "max_position_embeddings": {"const": 2048},
+        "files": {
+          "type": "array",
+          "minItems": 2,
+          "items": {"$ref": "#/$defs/file"}
+        }
+      }
+    },
+    "tokenizer": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "repository",
+        "revision",
+        "tokenizer_class",
+        "vocab_size",
+        "token_count_with_added_tokens",
+        "vocab_mapping_sha256",
+        "special_token_ids",
+        "glue_padding_token",
+        "files"
+      ],
+      "properties": {
+        "name": {"const": "pythia-tokenizer"},
+        "repository": {"const": "EleutherAI/pythia-410m-deduped"},
+        "revision": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+        "tokenizer_class": {"const": "GPTNeoXTokenizerFast"},
+        "vocab_size": {"const": 50254},
+        "token_count_with_added_tokens": {"const": 50277},
+        "vocab_mapping_sha256": {"$ref": "#/$defs/sha256"},
+        "special_token_ids": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["bos", "eos", "unk"],
+          "properties": {
+            "bos": {"const": 0},
+            "eos": {"const": 0},
+            "unk": {"const": 0}
+          }
+        },
+        "glue_padding_token": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["token", "token_id", "policy"],
+          "properties": {
+            "token": {"const": "<|padding|>"},
+            "token_id": {"const": 1},
+            "policy": {"const": "explicit_existing_added_token"}
+          }
+        },
+        "files": {
+          "type": "array",
+          "minItems": 3,
+          "items": {"$ref": "#/$defs/file"}
+        }
+      }
+    },
+    "interval": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "start", "stop", "purpose"],
+      "properties": {
+        "name": {"type": "string", "minLength": 1},
+        "start": {"type": "integer", "minimum": 0},
+        "stop": {"type": "integer", "minimum": 1},
+        "purpose": {"type": "string", "minLength": 1}
+      }
+    },
+    "workload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "stage",
+        "split",
+        "max_steps",
+        "global_batch_size",
+        "required_unique_records",
+        "required_target_tokens"
+      ],
+      "properties": {
+        "stage": {"type": "integer", "minimum": 1, "maximum": 5},
+        "split": {"type": "string", "minLength": 1},
+        "max_steps": {"type": ["integer", "null"], "minimum": 1},
+        "global_batch_size": {"type": ["integer", "null"], "minimum": 1},
+        "required_unique_records": {"type": "integer", "minimum": 1},
+        "required_target_tokens": {"type": "integer", "minimum": 1}
+      }
+    },
+    "pile": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "repository",
+        "revision",
+        "index",
+        "selected_shards",
+        "index_contract",
+        "causal_lm_contract",
+        "required_cursor_stop",
+        "required_raw_tokens",
+        "required_target_tokens",
+        "cursor_intervals",
+        "workloads",
+        "reference_batch_sha256",
+        "last_required_record_sha256",
+        "cross_shard_policy"
+      ],
+      "properties": {
+        "repository": {"const": "EleutherAI/pile-deduped-pythia-preshuffled"},
+        "revision": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+        "index": {"$ref": "#/$defs/file"},
+        "selected_shards": {
+          "type": "array",
+          "minItems": 1,
+          "items": {"$ref": "#/$defs/shard"}
+        },
+        "index_contract": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["magic_hex", "version", "dtype_code", "dtype_bytes", "sequence_count", "document_count"],
+          "properties": {
+            "magic_hex": {"const": "4d4d49444944580000"},
+            "version": {"const": 1},
+            "dtype_code": {"const": 8},
+            "dtype_bytes": {"const": 2},
+            "sequence_count": {"const": 146432000},
+            "document_count": {"const": 1}
+          }
+        },
+        "causal_lm_contract": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "labels_alignment",
+            "source_tokens_per_record",
+            "input_sequence_length",
+            "target_sequence_length",
+            "input_slice",
+            "target_slice",
+            "attention_mask_policy",
+            "effective_target_tokens_per_record",
+            "loss_adapter_id"
+          ],
+          "properties": {
+            "labels_alignment": {"const": "pre_shifted_next_token"},
+            "source_tokens_per_record": {"const": 2049},
+            "input_sequence_length": {"const": 2048},
+            "target_sequence_length": {"const": 2048},
+            "input_slice": {"const": [0, 2048]},
+            "target_slice": {"const": [1, 2049]},
+            "attention_mask_policy": {"const": "all_one_for_fixed_full_record"},
+            "effective_target_tokens_per_record": {"const": 2048},
+            "loss_adapter_id": {"const": "pre-shifted-next-token-cross-entropy-v1"}
+          }
+        },
+        "required_cursor_stop": {"const": 1048576},
+        "required_raw_tokens": {"const": 2148532224},
+        "required_target_tokens": {"const": 2147483648},
+        "cursor_intervals": {
+          "type": "array",
+          "minItems": 6,
+          "items": {"$ref": "#/$defs/interval"}
+        },
+        "workloads": {
+          "type": "array",
+          "minItems": 5,
+          "items": {"$ref": "#/$defs/workload"}
+        },
+        "reference_batch_sha256": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["0", "1", "511"],
+          "properties": {
+            "0": {"$ref": "#/$defs/sha256"},
+            "1": {"$ref": "#/$defs/sha256"},
+            "511": {"$ref": "#/$defs/sha256"}
+          }
+        },
+        "last_required_record_sha256": {"$ref": "#/$defs/sha256"},
+        "cross_shard_policy": {"const": "explicit_ordered_global_byte_stream_selected_prefix_must_be_fully_covered"}
+      }
+    },
+    "gateRequirement": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "model_names",
+        "require_tokenizer",
+        "pile_intervals",
+        "glue_tasks",
+        "require_glue_derived"
+      ],
+      "properties": {
+        "model_names": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {"type": "string", "minLength": 1}
+        },
+        "require_tokenizer": {"const": true},
+        "pile_intervals": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {"enum": ["debug", "train", "validation", "sampling_universe", "probe", "reserve"]}
+        },
+        "glue_tasks": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {"enum": ["sst2", "mnli", "rte"]}
+        },
+        "require_glue_derived": {"type": "boolean"}
+      }
+    },
+    "glueTask": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "task",
+        "repository",
+        "revision",
+        "raw_files",
+        "split_counts",
+        "text_fields",
+        "label_mapping",
+        "unlabeled_test_policy",
+        "preprocessing"
+      ],
+      "properties": {
+        "task": {"enum": ["sst2", "mnli", "rte"]},
+        "repository": {"const": "nyu-mll/glue"},
+        "revision": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+        "raw_files": {
+          "type": "array",
+          "minItems": 3,
+          "items": {"$ref": "#/$defs/file"}
+        },
+        "split_counts": {
+          "type": "object",
+          "minProperties": 3,
+          "additionalProperties": {"type": "integer", "minimum": 1}
+        },
+        "text_fields": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 2,
+          "items": {"type": "string", "minLength": 1}
+        },
+        "label_mapping": {
+          "type": "object",
+          "minProperties": 2,
+          "additionalProperties": {"type": "integer", "minimum": 0}
+        },
+        "unlabeled_test_policy": {"const": "retain_in_raw_exclude_from_derived_training_and_evaluation"},
+        "preprocessing": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "tokenizer_name",
+            "max_length",
+            "truncation",
+            "padding",
+            "pad_token",
+            "derived_splits"
+          ],
+          "properties": {
+            "tokenizer_name": {"const": "pythia-tokenizer"},
+            "max_length": {"const": 512},
+            "truncation": {"const": true},
+            "padding": {"const": "max_length"},
+            "pad_token": {"const": "<|padding|>"},
+            "derived_splits": {
+              "type": "array",
+              "minItems": 2,
+              "uniqueItems": true,
+              "items": {"type": "string", "minLength": 1}
+            }
+          }
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,70 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://parameter-importance.invalid/schemas/stage0/asset-layout-v1.json",
+  "title": "Stage 0 G3 DATA_ROOT-relative asset layout",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "artifact_hash",
+    "created_at",
+    "generator_git_commit",
+    "requirements_ref",
+    "requirements_sha256",
+    "workspace_semantics",
+    "entries"
+  ],
+  "properties": {
+    "schema_version": {"const": "stage0-g3-asset-layout-v1"},
+    "artifact_hash": {"$ref": "#/$defs/sha256"},
+    "created_at": {"type": "string", "format": "date-time"},
+    "generator_git_commit": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+    "requirements_ref": {"$ref": "#/$defs/relativePath"},
+    "requirements_sha256": {"$ref": "#/$defs/sha256"},
+    "workspace_semantics": {"const": "paths_are_posix_relative_to_DATA_ROOT"},
+    "entries": {
+      "type": "array",
+      "minItems": 13,
+      "maxItems": 13,
+      "items": {"$ref": "#/$defs/entry"}
+    }
+  },
+  "$defs": {
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "relativePath": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.(?:/|$))(?!.*\\\\).+$"
+    },
+    "gateId": {
+      "enum": ["stage0.G3-S1", "stage0.G3-S2", "stage0.G3-S4", "stage0.G3-S5", "stage0.G3-S6"]
+    },
+    "entry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "logical_name",
+        "kind",
+        "requirement_name",
+        "manifest_ref",
+        "asset_root_ref",
+        "qualification_ref",
+        "gate_ids"
+      ],
+      "properties": {
+        "logical_name": {"type": "string", "minLength": 1},
+        "kind": {"enum": ["model", "tokenizer", "pile", "glue_raw", "glue_derived"]},
+        "requirement_name": {"type": "string", "minLength": 1},
+        "manifest_ref": {"$ref": "#/$defs/relativePath"},
+        "asset_root_ref": {"$ref": "#/$defs/relativePath"},
+        "qualification_ref": {"$ref": "#/$defs/relativePath"},
+        "gate_ids": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {"$ref": "#/$defs/gateId"}
+        }
+      }
+    }
+  }
+}

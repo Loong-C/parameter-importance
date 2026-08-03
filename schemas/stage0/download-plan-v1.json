@@ -1,0 +1,67 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://parameter-importance.invalid/schemas/stage0/download-plan-v1.json",
+  "title": "Stage 0 G3 URL-free download plan",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "artifact_hash",
+    "created_at",
+    "generator_git_commit",
+    "requirements_ref",
+    "requirements_sha256",
+    "layout_ref",
+    "layout_sha256",
+    "entries"
+  ],
+  "properties": {
+    "schema_version": {"const": "stage0-g3-download-plan-v1"},
+    "artifact_hash": {"$ref": "#/$defs/sha256"},
+    "created_at": {"type": "string", "format": "date-time"},
+    "generator_git_commit": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+    "requirements_ref": {"$ref": "#/$defs/sourceRelativePath"},
+    "requirements_sha256": {"$ref": "#/$defs/sha256"},
+    "layout_ref": {"$ref": "#/$defs/sourceRelativePath"},
+    "layout_sha256": {"$ref": "#/$defs/sha256"},
+    "entries": {
+      "type": "array",
+      "minItems": 13,
+      "maxItems": 13,
+      "items": {"$ref": "#/$defs/entry"}
+    }
+  },
+  "$defs": {
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "sourceRelativePath": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.(?:/|$))(?!.*\\\\).+$"
+    },
+    "assetRelativePath": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.(?:/|$))(?!.*\\\\)(?!.*(?:^|/)(?:[^/]*[._-])?(?:part|partial|lock|tmp|temp)(?:[._-][^/]*)?(?:/|$)).+$"
+    },
+    "entry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["object_id", "spec_ref", "asset_root_ref", "final_path"],
+      "properties": {
+        "object_id": {
+          "type": "string",
+          "pattern": "^huggingface/[^/?]+/[^/?]+/[^?]+$"
+        },
+        "spec_ref": {
+          "type": "string",
+          "pattern": "^configs/stage0/http-objects/[a-z0-9-]+\\.json$"
+        },
+        "asset_root_ref": {
+          "type": "string",
+          "pattern": "^(?:models|datasets)/[^/]+$"
+        },
+        "final_path": {"$ref": "#/$defs/assetRelativePath"}
+      }
+    }
+  }
+}
