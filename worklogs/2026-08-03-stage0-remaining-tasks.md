@@ -415,3 +415,28 @@ G1-D 有效期、中文动态 Worklog、Stage 1 handoff 和不可覆盖的 `READ
 - 下一步先把本次纠错形成新提交并三端快进，再用该不可变 HEAD 重跑 99 字节真实冒烟和剩余
   10 个冻结对象。G3 非 GPU 资产闭环可以继续；bootstrap 与后续 CUDA/NCCL Gate 必须等待
   GPU 3 经新的管理员维护授权恢复并重新通过四卡只读资格检查，当前仍不发布 READY。
+
+## 2026-08-04 12:42 CST — 99 字节实测通过与 dataset repository 类型纠错
+
+- 原生管道纠错已提交为 `f6f64f1d4426aa1db5033b627f5c9a1d6a3ce932`，非强推到 GitHub
+  并通过 4,052 字节增量 bundle 快进服务器；bundle 的 SHA-256 为
+  `135c46017b40018a42609778efe1c4cb0727422767d7ac743e269f449411282c`，服务器端再次执行
+  `git bundle verify` 后才 `--ff-only` 合并。本机和服务器临时 bundle 随后均按精确路径删除，
+  三端 HEAD 一致且 tracked 工作树干净。
+- 在该不可变提交上的 99 字节 `special_tokens_map.json` 真实 `lab-pipe` 冒烟通过：镜像 emitter
+  精确输出 99 字节，dispatcher 返回 `status=PASS objects=1`，服务器 receiver 以冻结大小和
+  SHA-256 原子发布。这证明逐 token 远端命令和无长度镜像响应两项修复均通过真实两段 SSH 路径。
+- 随后的完整 13 项遍历只读跳过已经就绪的 config、weights 和 99 字节对象，并成功发布
+  `tokenizer.json`（2,113,710 字节）与 `tokenizer_config.json`（396 字节）；到首个 MNLI train
+  对象时，lab emitter 在发送字节前以 `HTTP_STATUS_404` 失败关闭，dispatcher 总体退出 1。
+- 404 根因是 URL 派生把所有稳定 `huggingface/owner/repo/path` ID 都解释为 model repository；
+  GLUE 实际位于 Hugging Face dataset repository，必须经过 `/datasets/owner/repo/...` namespace。
+  冻结 object spec 不含单独类型字段，但同一 download plan 与 relay binding 已把目标绑定为
+  `models/...` 或 `datasets/...`，且该字段受 plan hash、binding transcript 和服务器重放保护。
+- 已统一修正直接 acquisition 和 lab relay：repository 类型只从冻结 `asset_root_ref` 首段派生，
+  `models/` 不加 namespace，`datasets/` 加 `/datasets/`，其他根拒绝；没有修改 13 项 object ID、
+  revision、大小、SHA-256 或控制文件 artifact hash，也没有把 runtime URL 写入 argv/报告。
+  新增 model/dataset URL 派生、非法根和完整计划观察断言后，relay、下载计划与原子 acquisition
+  组合回归为 `54 passed, 0 failed`，相关 `py_compile` 和 `git diff --check` 均退出 0。
+- 下一步把 repository 类型纠错形成新提交并三端快进，再从 MNLI train 重跑；已发布 tokenizer
+  将按同一服务器 SHA-256 只读识别为 ready。G3 完整离线重放前仍不声明资产 Gate 通过。

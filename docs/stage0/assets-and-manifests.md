@@ -173,6 +173,7 @@ weights = asset.path_for("model.safetensors")
 当服务器不能直接取得冻结对象时，使用 `ops/stage0/dispatch_g3_relay_via_lab.py` 经文档规定的 SSH alias 中继。dispatcher 只接受 download plan 中的对象 ID、命名 endpoint profile 和命名 lab-pc Python profile；不得把 URL、签名参数或任意远程命令作为参数写入日志或证据。
 
 - `--endpoint-profile official` 是默认源；已核验镜像路径时可显式选择 `--endpoint-profile hf-mirror`。两者都在 lab-pc 进程内根据同一固定 revision 和对象 ID 派生 URL。
+- Hugging Face 的 model/dataset repository namespace 不从文件扩展名猜测：它只由同一哈希绑定 download-plan entry 的 `asset_root_ref` 首段派生；`models/` 对应模型仓库，`datasets/` 对应 dataset 仓库的 `/datasets/` namespace，其他根失败关闭。
 - `--lab-python-profile path` 使用远端 `PATH`；受控 lab-pc 的用户级 Python 3.12 使用 `--lab-python-profile cjl-python312`。profile 是版本化枚举，不接受任意解释器命令。
 - 若 Windows `ssh.exe` 在 Python 双向 stdin/stdout 管道下不能转发 `READY`，使用 `--relay-process lab-pipe`。dispatcher 先以独立 `plan-only` 会话在对象锁内取得精确 resume offset，再用本机 `cmd.exe` 原生字节管道连接 lab emitter 与服务器 receiver；receiver 同时要求锁内 offset 未漂移，竞争或状态变化会失败关闭。
 - relay 不在本机或 lab-pc 落盘对象字节；服务器 receiver 在对象专用锁内复用 `.part`，并在固定字节数和 SHA-256 全部通过后 no-clobber 发布最终文件。

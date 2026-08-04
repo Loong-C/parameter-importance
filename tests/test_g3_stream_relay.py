@@ -171,11 +171,13 @@ def test_relay_endpoint_profile_is_named_and_runtime_only() -> None:
     official = relay._runtime_url(
         _FIRST_OBJECT,
         "a" * 40,
+        asset_root_ref="models/pythia-410m-deduped-step0",
         endpoint_profile="official",
     )
     mirror = relay._runtime_url(
         _FIRST_OBJECT,
         "a" * 40,
+        asset_root_ref="models/pythia-410m-deduped-step0",
         endpoint_profile="hf-mirror",
     )
     assert official.startswith("https://huggingface.co/")
@@ -184,7 +186,33 @@ def test_relay_endpoint_profile_is_named_and_runtime_only() -> None:
         "https://hf-mirror.com"
     )
     with pytest.raises(relay.RelayError, match="ENDPOINT_PROFILE_INVALID"):
-        relay._runtime_url(_FIRST_OBJECT, "a" * 40, endpoint_profile="invalid")
+        relay._runtime_url(
+            _FIRST_OBJECT,
+            "a" * 40,
+            asset_root_ref="models/pythia-410m-deduped-step0",
+            endpoint_profile="invalid",
+        )
+
+
+def test_relay_runtime_url_uses_the_frozen_asset_root_repository_type() -> None:
+    dataset_object = (
+        "huggingface/nyu-mll/glue/mnli/train-00000-of-00001.parquet"
+    )
+    dataset_url = relay._runtime_url(
+        dataset_object,
+        "a" * 40,
+        asset_root_ref="datasets/glue-mnli",
+        endpoint_profile="hf-mirror",
+    )
+    assert dataset_url.startswith("https://hf-mirror.com/datasets/nyu-mll/glue/")
+    assert "/resolve/" in dataset_url
+    with pytest.raises(relay.RelayError, match="ASSET_ROOT_REF_INVALID"):
+        relay._runtime_url(
+            dataset_object,
+            "a" * 40,
+            asset_root_ref="cache/glue-mnli",
+            endpoint_profile="hf-mirror",
+        )
 
 
 class _ResponseMetadata:

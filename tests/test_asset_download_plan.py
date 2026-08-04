@@ -140,6 +140,12 @@ def test_download_executor_derives_runtime_urls_only_in_memory(
     )
     assert len(observed_urls) == 13
     assert len(set(observed_urls)) == 13
+    assert observed_urls[0].startswith(
+        "https://huggingface.co/EleutherAI/pythia-410m-deduped/"
+    )
+    assert observed_urls[5].startswith(
+        "https://huggingface.co/datasets/nyu-mll/glue/"
+    )
     assert report["status"] == "PASS"
     assert report["artifact_hash"] == download_plan_module.canonical_json_hash(
         {key: value for key, value in report.items() if key != "artifact_hash"}

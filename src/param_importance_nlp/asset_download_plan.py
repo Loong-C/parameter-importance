@@ -372,17 +372,28 @@ def build_g3_relay_binding(
     )
 
 
-def _huggingface_runtime_url(spec: AssetObjectSpec) -> str:
+def _huggingface_runtime_url(
+    spec: AssetObjectSpec,
+    *,
+    asset_root_ref: str,
+) -> str:
     prefix = "huggingface/"
     if not spec.source_id.startswith(prefix):
         raise AssetDownloadPlanError("only frozen Hugging Face source IDs are supported")
     parts = spec.source_id[len(prefix) :].split("/")
     if len(parts) < 3 or any(not part for part in parts):
         raise AssetDownloadPlanError("Hugging Face source ID must include owner/repo/path")
+    root_kind = validate_asset_path(asset_root_ref).split("/", 1)[0]
+    if root_kind == "models":
+        repository_namespace = ""
+    elif root_kind == "datasets":
+        repository_namespace = "datasets/"
+    else:
+        raise AssetDownloadPlanError("asset root does not identify a repository type")
     owner, repository, *object_parts = parts
     encoded_path = "/".join(quote(part, safe="") for part in object_parts)
     return (
-        f"https://huggingface.co/{quote(owner, safe='')}/"
+        f"https://huggingface.co/{repository_namespace}{quote(owner, safe='')}/"
         f"{quote(repository, safe='')}/resolve/{quote(spec.revision, safe='')}/"
         f"{encoded_path}"
     )
@@ -467,7 +478,10 @@ def execute_g3_download_plan(
         try:
             outcome = acquire_http_asset(
                 spec,
-                _huggingface_runtime_url(spec),
+                _huggingface_runtime_url(
+                    spec,
+                    asset_root_ref=entry["asset_root_ref"],
+                ),
                 target,
                 policy=selected_policy,
                 data_root=approved_data_root,

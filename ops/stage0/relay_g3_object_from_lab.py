@@ -179,6 +179,8 @@ def _validate(arguments: argparse.Namespace) -> None:
             or any(part in {"", ".", ".."} for part in value.split("/"))
         ):
             raise RelayError("BINDING_INVALID")
+    if arguments.asset_root_ref.split("/", 1)[0] not in {"models", "datasets"}:
+        raise RelayError("BINDING_INVALID")
     route = getattr(arguments, "route", "")
     expected_alias = {
         "lab-direct": SERVER_ALIAS,
@@ -223,16 +225,24 @@ def _runtime_url(
     object_id: str,
     revision: str,
     *,
+    asset_root_ref: str,
     endpoint_profile: str = "official",
 ) -> str:
     try:
         origin = _ENDPOINT_ORIGINS[endpoint_profile]
     except KeyError as error:
         raise RelayError("ENDPOINT_PROFILE_INVALID") from error
+    root_kind = asset_root_ref.split("/", 1)[0]
+    if root_kind == "models":
+        repository_namespace = ""
+    elif root_kind == "datasets":
+        repository_namespace = "datasets/"
+    else:
+        raise RelayError("ASSET_ROOT_REF_INVALID")
     owner, repository, *path_parts = object_id[len("huggingface/") :].split("/")
     encoded_path = "/".join(quote(part, safe="") for part in path_parts)
     return (
-        f"{origin}/{quote(owner, safe='')}/"
+        f"{origin}/{repository_namespace}{quote(owner, safe='')}/"
         f"{quote(repository, safe='')}/resolve/{quote(revision, safe='')}/"
         f"{encoded_path}"
     )
@@ -661,6 +671,7 @@ def _open_http_response(
         _runtime_url(
             arguments.object_id,
             arguments.revision,
+            asset_root_ref=arguments.asset_root_ref,
             endpoint_profile=getattr(
                 arguments,
                 "endpoint_profile",
