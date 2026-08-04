@@ -176,6 +176,7 @@ weights = asset.path_for("model.safetensors")
 - Hugging Face 的 model/dataset repository namespace 不从文件扩展名猜测：它只由同一哈希绑定 download-plan entry 的 `asset_root_ref` 首段派生；`models/` 对应模型仓库，`datasets/` 对应 dataset 仓库的 `/datasets/` namespace，其他根失败关闭。
 - `--lab-python-profile path` 使用远端 `PATH`；受控 lab-pc 的用户级 Python 3.12 使用 `--lab-python-profile cjl-python312`。profile 是版本化枚举，不接受任意解释器命令。
 - 若 Windows `ssh.exe` 在 Python 双向 stdin/stdout 管道下不能转发 `READY`，使用 `--relay-process lab-pipe`。dispatcher 先以独立 `plan-only` 会话在对象锁内取得精确 resume offset，再用本机 `cmd.exe` 原生字节管道连接 lab emitter 与服务器 receiver；receiver 同时要求锁内 offset 未漂移，竞争或状态变化会失败关闭。
+- `lab-pipe` 每项默认最多执行 6 个有界 session；连接或 transcript 未完整收口时，每次都重新运行锁内 plan、记录不含 URL 的 offset 后再续传。`--lab-pipe-max-attempts` 只能设置正整数，所有 session 共用同一个整体 monotonic deadline。
 - relay 不在本机或 lab-pc 落盘对象字节；服务器 receiver 在对象专用锁内复用 `.part`，并在固定字节数和 SHA-256 全部通过后 no-clobber 发布最终文件。
 - 每次中继后仍须运行离线 acquisition、独立 verification 和 READY materialization；中继成功本身不是 G3 Gate PASS。
 

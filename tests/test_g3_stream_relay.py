@@ -435,7 +435,7 @@ def test_lab_pipe_plan_and_completion_transcripts_are_exact() -> None:
     ) == result
 
 
-def test_dispatcher_runs_plan_then_native_pipe_for_lab_pipe(
+def test_dispatcher_replans_after_a_native_pipe_transport_failure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("COMSPEC", r"C:\Windows\System32\cmd.exe")
@@ -448,6 +448,7 @@ def test_dispatcher_runs_plan_then_native_pipe_for_lab_pipe(
     arguments.relay_process = "lab-pipe"
     arguments.endpoint_profile = "hf-mirror"
     arguments.lab_python_profile = "cjl-python312"
+    arguments.lab_pipe_max_attempts = 2
     _, _, items = dispatcher._load_specs(arguments)
     binding = items[0][1]
     reception = {
@@ -496,23 +497,52 @@ def test_dispatcher_runs_plan_then_native_pipe_for_lab_pipe(
     ).encode()
     calls: list[list[str]] = []
 
+    pipe_attempts = 0
+
     def fake_run(command: list[str], **kwargs: Any) -> Any:
+        nonlocal pipe_attempts
         assert kwargs["check"] is False
         assert kwargs["stdout"] is dispatcher.subprocess.PIPE
         assert kwargs["stderr"] is None
         assert kwargs["timeout"] > 0
         calls.append(command)
-        payload = plan_payload if "--plan-only" in command[-1] else pipe_payload
-        return SimpleNamespace(returncode=0, stdout=payload)
+        if "--plan-only" in command[-1]:
+            return SimpleNamespace(returncode=0, stdout=plan_payload)
+        pipe_attempts += 1
+        if pipe_attempts == 1:
+            return SimpleNamespace(returncode=1, stdout=b"")
+        return SimpleNamespace(returncode=0, stdout=pipe_payload)
 
     monkeypatch.setattr(dispatcher.subprocess, "run", fake_run)
     results = dispatcher.dispatch(arguments)
 
-    assert len(calls) == 2
+    assert len(calls) == 4
     assert calls[0][0] == "ssh" and "-n" in calls[0]
     assert Path(calls[1][0]).name.casefold() == "cmd.exe"
+    assert calls[2][0] == "ssh" and "-n" in calls[2]
+    assert Path(calls[3][0]).name.casefold() == "cmd.exe"
     assert results[0]["result_status"] == "downloaded"
     assert results[0]["relay_process"] == "lab-pipe"
+
+
+@pytest.mark.parametrize("invalid_attempts", [0, -1, True, 1.5])
+def test_dispatcher_rejects_an_invalid_lab_pipe_attempt_budget(
+    monkeypatch: pytest.MonkeyPatch,
+    invalid_attempts: Any,
+) -> None:
+    monkeypatch.setattr(
+        dispatcher,
+        "resolve_source_git_commit",
+        lambda _root, **_kwargs: "a" * 40,
+    )
+    arguments = _dispatch_args(_FIRST_OBJECT)
+    arguments.relay_process = "lab-pipe"
+    arguments.lab_pipe_max_attempts = invalid_attempts
+    with pytest.raises(
+        dispatcher.G3RelayDispatchError,
+        match="lab_pipe_max_attempts is invalid",
+    ):
+        dispatcher.dispatch(arguments)
 
 
 def test_emit_mode_is_single_attempt_and_lab_direct_only() -> None:

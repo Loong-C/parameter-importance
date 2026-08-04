@@ -88,6 +88,15 @@ def _parser() -> argparse.ArgumentParser:
             "user Python is selected without accepting an arbitrary command."
         ),
     )
+    parser.add_argument(
+        "--lab-pipe-max-attempts",
+        type=int,
+        default=6,
+        help=(
+            "Bounded native-pipe sessions per object. Every retry reacquires "
+            "the locked server offset before resuming."
+        ),
+    )
     return parser
 
 
@@ -635,6 +644,96 @@ def _parse_pipe_result(
     return _validate_acquisition_result(complete.get("result"), binding=binding)
 
 
+def _dispatch_lab_pipe(
+    relay_path: Path,
+    binding: G3RelayBinding,
+    *,
+    deadline: float,
+    endpoint_profile: str,
+    lab_python_profile: str,
+    max_attempts: int,
+) -> tuple[dict[str, Any], int]:
+    for attempt in range(1, max_attempts + 1):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise G3RelayDispatchError("relay dispatch deadline expired")
+        try:
+            plan = subprocess.run(
+                _plan_command(
+                    binding,
+                    overall_timeout_seconds=remaining,
+                ),
+                check=False,
+                stdout=subprocess.PIPE,
+                stderr=None,
+                timeout=remaining,
+            )
+            reception = _parse_plan_result(
+                plan.stdout,
+                binding=binding,
+                returncode=plan.returncode,
+            )
+            print(
+                f"object_id={binding.object_id} phase=PLAN "
+                f"attempt={attempt}/{max_attempts} "
+                f"offset={reception['offset']} "
+                f"already_ready={str(reception['already_ready']).lower()}",
+                file=sys.stderr,
+                flush=True,
+            )
+            if reception["already_ready"]:
+                return (
+                    {
+                        "schema_version": "stage0-asset-acquisition-result-v1",
+                        "status": "already_ready",
+                        "source_id": binding.object_id,
+                        "revision": binding.revision,
+                        "size_bytes": binding.expected_size,
+                        "sha256": binding.expected_sha256,
+                        "attempts": 0,
+                        "resumed": False,
+                        "network_accessed": False,
+                    },
+                    0,
+                )
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise G3RelayDispatchError("relay dispatch deadline expired")
+            completed = subprocess.run(
+                _pipe_command(
+                    relay_path,
+                    binding,
+                    offset=int(reception["offset"]),
+                    overall_timeout_seconds=remaining,
+                    endpoint_profile=endpoint_profile,
+                    lab_python_profile=lab_python_profile,
+                ),
+                check=False,
+                stdout=subprocess.PIPE,
+                stderr=None,
+                timeout=remaining,
+            )
+            return (
+                _parse_pipe_result(
+                    completed.stdout,
+                    binding=binding,
+                    returncode=completed.returncode,
+                    expected_offset=int(reception["offset"]),
+                ),
+                completed.returncode,
+            )
+        except G3RelayDispatchError:
+            if attempt >= max_attempts:
+                raise
+            print(
+                f"object_id={binding.object_id} phase=RETRY "
+                f"completed_attempt={attempt}/{max_attempts}",
+                file=sys.stderr,
+                flush=True,
+            )
+    raise G3RelayDispatchError("lab-pipe attempt budget exhausted")
+
+
 def dispatch(arguments: argparse.Namespace) -> list[dict[str, Any]]:
     overall_timeout_seconds = getattr(
         arguments,
@@ -665,6 +764,13 @@ def dispatch(arguments: argparse.Namespace) -> list[dict[str, Any]]:
     lab_python_profile = getattr(arguments, "lab_python_profile", "path")
     if lab_python_profile not in _LAB_PYTHON_PROFILES:
         raise G3RelayDispatchError("lab_python_profile is invalid")
+    lab_pipe_max_attempts = getattr(arguments, "lab_pipe_max_attempts", 6)
+    if (
+        isinstance(lab_pipe_max_attempts, bool)
+        or not isinstance(lab_pipe_max_attempts, int)
+        or lab_pipe_max_attempts < 1
+    ):
+        raise G3RelayDispatchError("lab_pipe_max_attempts is invalid")
     results: list[dict[str, Any]] = []
     for index, (spec, binding) in enumerate(specs, start=1):
         remaining = deadline - time.monotonic()
@@ -701,58 +807,14 @@ def dispatch(arguments: argparse.Namespace) -> list[dict[str, Any]]:
                 )
                 completed_returncode = completed.returncode
             elif relay_process == "lab-pipe":
-                plan = subprocess.run(
-                    _plan_command(
-                        binding,
-                        overall_timeout_seconds=remaining,
-                    ),
-                    check=False,
-                    stdout=subprocess.PIPE,
-                    stderr=None,
-                    timeout=remaining,
+                protocol_result, completed_returncode = _dispatch_lab_pipe(
+                    relay_path,
+                    binding,
+                    deadline=deadline,
+                    endpoint_profile=endpoint_profile,
+                    lab_python_profile=lab_python_profile,
+                    max_attempts=lab_pipe_max_attempts,
                 )
-                reception = _parse_plan_result(
-                    plan.stdout,
-                    binding=binding,
-                    returncode=plan.returncode,
-                )
-                if reception["already_ready"]:
-                    protocol_result = {
-                        "schema_version": "stage0-asset-acquisition-result-v1",
-                        "status": "already_ready",
-                        "source_id": binding.object_id,
-                        "revision": binding.revision,
-                        "size_bytes": binding.expected_size,
-                        "sha256": binding.expected_sha256,
-                        "attempts": 0,
-                        "resumed": False,
-                        "network_accessed": False,
-                    }
-                else:
-                    remaining = deadline - time.monotonic()
-                    if remaining <= 0:
-                        raise G3RelayDispatchError("relay dispatch deadline expired")
-                    completed = subprocess.run(
-                        _pipe_command(
-                            relay_path,
-                            binding,
-                            offset=int(reception["offset"]),
-                            overall_timeout_seconds=remaining,
-                            endpoint_profile=endpoint_profile,
-                            lab_python_profile=lab_python_profile,
-                        ),
-                        check=False,
-                        stdout=subprocess.PIPE,
-                        stderr=None,
-                        timeout=remaining,
-                    )
-                    protocol_result = _parse_pipe_result(
-                        completed.stdout,
-                        binding=binding,
-                        returncode=completed.returncode,
-                        expected_offset=int(reception["offset"]),
-                    )
-                    completed_returncode = completed.returncode
             else:
                 completed = subprocess.run(
                     _local_command(

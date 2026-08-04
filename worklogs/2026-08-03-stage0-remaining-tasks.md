@@ -440,3 +440,22 @@ G1-D 有效期、中文动态 Worklog、Stage 1 handoff 和不可覆盖的 `READ
   组合回归为 `54 passed, 0 failed`，相关 `py_compile` 和 `git diff --check` 均退出 0。
 - 下一步把 repository 类型纠错形成新提交并三端快进，再从 MNLI train 重跑；已发布 tokenizer
   将按同一服务器 SHA-256 只读识别为 ready。G3 完整离线重放前仍不声明资产 Gate 通过。
+
+## 2026-08-04 13:03 CST — dataset 续传实测与 dispatcher 有界重试
+
+- repository namespace 修复已提交为 `a30f3df721856eaf8df6eb92f124cbb28a383762`，非强推到
+  GitHub 并以 5,732 字节增量 bundle 快进服务器；bundle SHA-256 为
+  `626092c40e837b9f4d711094f5bfde4657ee76f2dc5f86c6d64925cc00127570`，服务器端
+  `git bundle verify` 与 `--ff-only` 均通过后，两端临时文件已精确删除。
+- 在 `a30f3df` 上只选择 download plan 中 8 个 `datasets/` 对象重跑，首个 MNLI train 已越过
+  先前的即时 404，但约 654.5 秒后两段 SSH 报 `Connection reset`，dispatcher 按设计退出 1，
+  没有把未完成 transcript 计作成功。随后独立 `plan-only` 只读查询也因 SSH transcript 不完整
+  失败，未臆测或记录一个未经服务器确认的 offset。
+- 服务器 receiver 本来已能保留固定身份 `.part`，但旧 `lab-pipe` dispatcher 每项只执行一个
+  native-pipe session；外层命令失败后需要人工重启，未把已有断点能力纳入同一个整体 deadline。
+  已新增每对象默认 6 次的有界 session：每次失败后都重新运行锁内 plan，输出 URL-free 的
+  attempt/offset/already-ready 诊断，再从服务器确认的 offset 构造新管道；所有 session 共用原有
+  monotonic 总 deadline，emitter 每个 session 仍严格单尝试，receiver 的 offset 竞争检查不变。
+- 新增首次 pipe transcript 失败、第二次重新 plan 后成功的编排回归，并拒绝 0、负数、布尔值和
+  非整数 attempt budget；文档新增 `--lab-pipe-max-attempts` 合同。代码形成不可变提交并三端同步
+  前不用于资产发布；同步后才继续 MNLI/RTE 断点续传。
