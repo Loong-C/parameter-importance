@@ -21,7 +21,7 @@
       "residual_canary_files": 0,
       "evidence": "reports/stage0/g1-storage-canary-20260804.json",
       "sha256": "ee24d9865a899068327f7ebdd6b763fa04ae87589cca0b77d3578acdfc0da11a",
-      "server_authoritative_path": "/home/sophgo13/cjl/storage/parameter-importance/tmp/stage0-canary-20260804.json"
+      "server_authoritative_path": "/home/sophgo13/cjl/storage/parameter-importance/reports/stage0/g1-storage-canary-20260804.json"
     },
     "launch_capacity": {
       "status": "PASS",
