@@ -88,7 +88,7 @@ def _json_safe(value: object) -> JSONValue:
         return [_json_safe(item) for item in value]
     if isinstance(value, list):
         return [_json_safe(item) for item in value]
-    if isinstance(value, dict):
+    if isinstance(value, Mapping):
         return {str(key): _json_safe(item) for key, item in value.items()}
     return value  # type: ignore[return-value]
 

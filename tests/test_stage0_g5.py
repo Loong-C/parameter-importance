@@ -8,6 +8,7 @@ import pytest
 import torch
 
 from param_importance_nlp.experiments.task_runners import _decision_hash
+from param_importance_nlp.stage0_g5_worker import _json_safe
 from param_importance_nlp.runtime import publish_tensor_bundle
 from param_importance_nlp.stage0_g5 import Stage0G5Error, validate_g5_report_set
 
@@ -168,6 +169,19 @@ def test_g5_decision_hash_uses_formal_eligibility(tmp_path: Path) -> None:
     config = SimpleNamespace(run_intent="formal")
     request = SimpleNamespace(task=task, config=config)
     assert _decision_hash(request, tmp_path) == (None, None)
+
+
+def test_g5_json_safe_handles_frozen_mapping(tmp_path: Path) -> None:
+    from param_importance_nlp.contracts.immutable import freeze_json_mapping
+    from param_importance_nlp.contracts.jsonio import ensure_json_object
+
+    frozen = freeze_json_mapping(
+        {"split": [0, 8192], "nested": {"x": (1, 2)}},
+        field="t",
+    )
+    safe = _json_safe(frozen)
+    assert safe == {"split": [0, 8192], "nested": {"x": [1, 2]}}
+    ensure_json_object(safe, field="t")
 
 
 def test_g5_aggregate_rejects_tensor_drift_and_memory_growth(tmp_path: Path) -> None:
