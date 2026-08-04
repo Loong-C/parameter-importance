@@ -31,10 +31,6 @@ from typing import Any
 
 os.environ.setdefault("CUDA_DEVICE_ORDER", "PCI_BUS_ID")
 
-import torch
-import torch.distributed as dist
-import torch.multiprocessing as mp
-
 
 EXPECTED_HOST = "sophgo13"
 EXPECTED_BDFS = [
@@ -375,8 +371,6 @@ def main(argv: list[str] | None = None) -> int:
         raise SmokeError(f"output directory already exists: {output_root}")
     output_root.mkdir(parents=True, exist_ok=False)
 
-    _validate_expected_runtime()
-
     assert_no_compute_apps("before the smoke")
     nvml_before = nvml_csv()
     validate_nvml_rows(nvml_before, "nvml-before")
@@ -388,6 +382,19 @@ def main(argv: list[str] | None = None) -> int:
     (output_root / "nvml-before.csv").write_text(nvml_before, encoding="utf-8")
     (output_root / "row-remapper-before.txt").write_text(row_before, encoding="utf-8")
     (output_root / "compute-apps-before.csv").write_text("", encoding="utf-8")
+
+    # Importing a CUDA-enabled torch can create a tiny driver context on this
+    # host.  The before-snapshot therefore must be captured by the same process
+    # before any torch import, so the evidence reflects the idle baseline.
+    import torch  # noqa: E402
+    import torch.distributed as dist  # noqa: E402
+    import torch.multiprocessing as mp  # noqa: E402
+
+    globals()["torch"] = torch
+    globals()["dist"] = dist
+    globals()["mp"] = mp
+
+    _validate_expected_runtime()
 
     per_gpu = per_gpu_smoke()
     nccl = nccl_smoke()
