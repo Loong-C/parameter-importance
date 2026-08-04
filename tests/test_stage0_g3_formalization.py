@@ -75,7 +75,7 @@ def _snapshot(tmp_path: Path) -> Stage0RuntimeSnapshot:
     return Stage0RuntimeSnapshot(
         checked_at=CHECKED_AT,
         hostname="sophgo13",
-        boot_id="04326255-b422-4f1e-8dc6-9c3cc8f0a5b9",
+        boot_id="1dc04123-4945-4d8b-abcb-27fb84725526",
         kernel="6.8.0-136-generic",
         data_root=tmp_path.as_posix(),
         python_prefix=(

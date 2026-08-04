@@ -49,10 +49,10 @@ _EXPECTED_REPOSITORY = Path("/home/sophgo13/cjl/parameter-importance")
 _EXPECTED_DATA_ROOT = Path("/home/sophgo13/cjl/storage/parameter-importance")
 _SOURCE_REPORT_REFS = (
     "reports/stage0/g0-baseline-20260719.json",
-    "reports/stage0/g0-g-gpu-final-20260803.json",
-    "reports/stage0/g1-storage-mechanism-20260719.json",
+    "reports/stage0/g0-g-gpu-final-20260804.json",
+    "reports/stage0/g1-storage-mechanism-20260804.json",
     "reports/stage0/g1-persistence-decision-20260719.json",
-    "reports/stage0/g2-environment-final-20260803.json",
+    "reports/stage0/g2-environment-final-20260804.json",
 )
 _BOOTSTRAP_TASK_IDS = (
     "stage0.01_baseline_and_safety",
@@ -250,7 +250,7 @@ def inspect_stage0_runtime(
         raise Stage0BootstrapError("STAGE0_BOOTSTRAP_BOOT_ID_UNAVAILABLE")
     boot_id = boot_path.read_text(encoding="utf-8").strip()
 
-    g2 = _load_report(binding.repository, "reports/stage0/g2-environment-final-20260803.json")
+    g2 = _load_report(binding.repository, "reports/stage0/g2-environment-final-20260804.json")
     candidate = _mapping(g2.get("candidate"), field="g2.candidate")
     expected_prefix = Path(_string(candidate.get("path"), field="g2.candidate.path")).resolve()
     prefix = Path(sys.prefix).resolve()
@@ -269,7 +269,7 @@ def inspect_stage0_runtime(
     )
     wheelhouse_verified = wheelhouse_verified and pip_check.returncode == 0
 
-    g0g = _load_report(binding.repository, "reports/stage0/g0-g-gpu-final-20260803.json")
+    g0g = _load_report(binding.repository, "reports/stage0/g0-g-gpu-final-20260804.json")
     allowed = _sequence(g0g.get("allowed_gpus"), field="g0g.allowed_gpus")
     expected_uuids = tuple(
         _string(_mapping(item, field="g0g.allowed_gpu").get("uuid"), field="g0g.uuid")
