@@ -483,6 +483,11 @@ def test_g4_formal_runner_publishes_real_contracts_and_pass_gate(
     assert g5_config.run_intent == "formal"
     assert g5_config.section("providers")["kind"] == "offline_hf"
     assert g5_config.base_config.section("distributed")["device_ids"] == [0]
+    assert g5_config.base_config.section("data")["split"] == "debug"
+    assert (
+        g5_config.base_config.section("data")["sampling_design"]
+        == "without_replacement_frozen_epoch"
+    )
     assert tuple(g5_config.section("orchestration")["input_result_refs"]) == tuple(
         first.task_output_refs.values()
     )

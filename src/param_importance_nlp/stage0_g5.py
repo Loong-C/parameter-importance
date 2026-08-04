@@ -318,9 +318,9 @@ def build_stage0_g5_config(
             "model": model,
             "data": {
                 **data,
-                "split": "train",
-                "sampler": "with_replacement",
-                "sampling_design": "iid_with_replacement",
+                "split": "debug",
+                "sampler": "without_replacement",
+                "sampling_design": "without_replacement_frozen_epoch",
             },
             "loss": {
                 "task_type": "causal_lm",
