@@ -81,6 +81,18 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
+def _json_safe(value: object) -> JSONValue:
+    """Convert frozen tuple metadata back into JSON-safe containers."""
+
+    if isinstance(value, tuple):
+        return [_json_safe(item) for item in value]
+    if isinstance(value, list):
+        return [_json_safe(item) for item in value]
+    if isinstance(value, dict):
+        return {str(key): _json_safe(item) for key, item in value.items()}
+    return value  # type: ignore[return-value]
+
+
 def _mapping(value: object, *, field: str) -> dict[str, Any]:
     if not isinstance(value, Mapping) or any(not isinstance(key, str) for key in value):
         raise Stage0G5WorkerError(f"G5_WORKER_OBJECT_INVALID:{field}")
@@ -565,7 +577,7 @@ def _first_real_batch(
                 ),
                 "min_token_id": int(input_ids.min().item()) if isinstance(input_ids, torch.Tensor) else None,
                 "max_token_id": int(input_ids.max().item()) if isinstance(input_ids, torch.Tensor) else None,
-                "metadata": dict(item.metadata),
+                "metadata": _json_safe(item.metadata),
                 "valid": bool(valid),
             }
         )
