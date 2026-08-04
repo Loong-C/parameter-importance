@@ -187,6 +187,68 @@ def test_relay_endpoint_profile_is_named_and_runtime_only() -> None:
         relay._runtime_url(_FIRST_OBJECT, "a" * 40, endpoint_profile="invalid")
 
 
+class _ResponseMetadata:
+    def __init__(
+        self,
+        *,
+        status: int,
+        content_length: str | None = None,
+        content_range: str | None = None,
+    ) -> None:
+        self.status = status
+        self.headers: dict[str, str] = {}
+        if content_length is not None:
+            self.headers["Content-Length"] = content_length
+        if content_range is not None:
+            self.headers["Content-Range"] = content_range
+
+    def getcode(self) -> int:
+        return self.status
+
+
+def test_only_mirror_profile_may_stream_without_content_length() -> None:
+    response = _ResponseMetadata(status=200)
+    with pytest.raises(relay.RelayError, match="HTTP_CONTENT_LENGTH_INVALID"):
+        relay._validate_response(response, offset=0, expected_size=99)
+    assert (
+        relay._validate_response(
+            response,
+            offset=0,
+            expected_size=99,
+            allow_missing_content_length=True,
+        )
+        == 99
+    )
+
+
+def test_missing_content_length_resume_still_requires_exact_range() -> None:
+    response = _ResponseMetadata(
+        status=206,
+        content_range="bytes 40-98/99",
+    )
+    assert (
+        relay._validate_response(
+            response,
+            offset=40,
+            expected_size=99,
+            allow_missing_content_length=True,
+        )
+        == 59
+    )
+    for invalid in (
+        _ResponseMetadata(status=200, content_range="bytes 40-98/99"),
+        _ResponseMetadata(status=206),
+        _ResponseMetadata(status=206, content_range="bytes 41-98/99"),
+    ):
+        with pytest.raises(relay.RelayError, match="HTTP_RANGE_SEMANTICS_INVALID"):
+            relay._validate_response(
+                invalid,
+                offset=40,
+                expected_size=99,
+                allow_missing_content_length=True,
+            )
+
+
 def test_dispatcher_passes_only_the_named_mirror_profile_in_argv() -> None:
     arguments = _dispatch_args(_FIRST_OBJECT)
     arguments.relay_process = "lab"
@@ -263,6 +325,8 @@ def test_lab_pipe_command_is_url_free_and_uses_only_native_ssh_pipe(
     assert "--relay-mode emit" in pipeline
     assert "--emit-offset 0" in pipeline
     assert "--expected-offset 0" in pipeline
+    assert f"{dispatcher.SERVER_ALIAS} env PYTHONPATH=" in pipeline
+    assert f'{dispatcher.SERVER_ALIAS} "env PYTHONPATH=' not in pipeline
     assert "://" not in pipeline and "?" not in pipeline
 
     complete_part_command = dispatcher._pipe_command(

@@ -322,13 +322,13 @@ def _ssh_options(*, no_stdin: bool = False) -> list[str]:
     return options
 
 
-def _receiver_remote_command(
+def _receiver_remote_arguments(
     binding: G3RelayBinding,
     *,
     overall_timeout_seconds: float,
     plan_only: bool = False,
     expected_offset: int | None = None,
-) -> str:
+) -> list[str]:
     command = [
         "env",
         f"PYTHONPATH={_SERVER_REPO}/src:{_SERVER_REPO}",
@@ -354,7 +354,24 @@ def _receiver_remote_command(
         command.append("--plan-only")
     if expected_offset is not None:
         command.extend(("--expected-offset", str(expected_offset)))
-    return shlex.join(command)
+    return command
+
+
+def _receiver_remote_command(
+    binding: G3RelayBinding,
+    *,
+    overall_timeout_seconds: float,
+    plan_only: bool = False,
+    expected_offset: int | None = None,
+) -> str:
+    return shlex.join(
+        _receiver_remote_arguments(
+            binding,
+            overall_timeout_seconds=overall_timeout_seconds,
+            plan_only=plan_only,
+            expected_offset=expected_offset,
+        )
+    )
 
 
 def _plan_command(
@@ -421,7 +438,7 @@ def _pipe_command(
     right = [
         *_ssh_options(),
         SERVER_ALIAS,
-        _receiver_remote_command(
+        *_receiver_remote_arguments(
             binding,
             overall_timeout_seconds=overall_timeout_seconds,
             expected_offset=offset,

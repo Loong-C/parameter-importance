@@ -436,14 +436,23 @@ def _validated_offset(
     return offset, already_ready
 
 
-def _validate_response(response: Any, *, offset: int, expected_size: int) -> int:
+def _validate_response(
+    response: Any,
+    *,
+    offset: int,
+    expected_size: int,
+    allow_missing_content_length: bool = False,
+) -> int:
     status = int(getattr(response, "status", response.getcode()))
     raw_length = response.headers.get("Content-Length")
-    try:
-        content_length = int(raw_length)
-    except (TypeError, ValueError) as error:
-        raise RelayError("HTTP_CONTENT_LENGTH_INVALID") from error
     remaining = expected_size - offset
+    if raw_length is None and allow_missing_content_length:
+        content_length = remaining
+    else:
+        try:
+            content_length = int(raw_length)
+        except (TypeError, ValueError) as error:
+            raise RelayError("HTTP_CONTENT_LENGTH_INVALID") from error
     if content_length != remaining:
         raise RelayError("HTTP_CONTENT_LENGTH_INVALID")
     if offset == 0:
@@ -682,6 +691,9 @@ def _emit_once(arguments: argparse.Namespace, *, deadline: float) -> None:
             response,
             offset=offset,
             expected_size=arguments.expected_size,
+            allow_missing_content_length=(
+                getattr(arguments, "endpoint_profile", "official") == "hf-mirror"
+            ),
         )
         _stream_response(
             response,
@@ -734,6 +746,10 @@ def _relay_once(
                     response,
                     offset=offset,
                     expected_size=arguments.expected_size,
+                    allow_missing_content_length=(
+                        getattr(arguments, "endpoint_profile", "official")
+                        == "hf-mirror"
+                    ),
                 )
                 _stream_response(
                     response,

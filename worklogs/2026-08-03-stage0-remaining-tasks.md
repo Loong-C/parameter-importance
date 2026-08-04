@@ -384,3 +384,34 @@ G1-D 有效期、中文动态 Worklog、Stage 1 handoff 和不可覆盖的 `READ
   的 48 项组合和 207 项资产状态机测试均已完整退出 0；最终 Linux formal 链仍须重放 G3。
 - 上述新实现形成下一提交后，`88254d2` 的 bootstrap 将成为旧提交证据；须再次三端快进并
   从新 HEAD 重跑 bootstrap 与 G3–G10，当前不发布 READY。
+
+## 2026-08-04 12:25 CST — 原生管道实测纠错与当前 GPU 硬件阻断
+
+- `lab-pipe` 实现已提交为 `b2903883d31a2222ea259778fcb327298d3f8042`；本机、GitHub、
+  服务器均以非强推/`--ff-only` 快进到该提交，增量 bundle 经两端 SHA-256 和 `git bundle
+  verify` 校验后已按精确路径清理。提交后 inventory 为 900 个 tracked 文件、40,776,641
+  字节、21 个关键源和 8 个交付链接；禁止类型、超限文件、疑似秘密与范围空白检查均无命中，
+  `Agent/` 五文件集合和 SHA-256 继续三端一致。
+- 在 `b290388` 上用 G2 冻结环境重跑 bootstrap 时，CUDA 预检不再满足旧报告中的四卡事实：
+  `nvidia-smi -L` 仍列出四张白名单 A100，但物理 GPU 3（PCI `a4:00.0`）温度和 ECC 变为
+  `Unknown Error`/`N/A`，CUDA 进程只能看到 3 张卡并对 `cuda:3` 返回
+  `invalid device ordinal`。当前 boot ID 仍为 `04326255-b422-4f1e-8dc6-9c3cc8f0a5b9`；内核
+  记录同一 GPU 的 Xid 120（GSP task exception）、119（GSP RPC timeout）和 154，恢复动作
+  已变为 `GPU Reset Required`。因此本次 bootstrap 失败关闭且没有发布 `b290388` 证据；
+  `f9a0c43`/`88254d2` 的旧提交 bootstrap 也不得复用。
+- 2026-07-19 的 GPU 恢复/重启报告只覆盖当时维护窗口，不能自动延伸至本次新故障；用户当前
+  授权覆盖 GitHub 和项目服务器文件传输，不覆盖系统 GPU reset 或 reboot。项目代码按计划
+  也不得执行这两项管理员动作，因此本轮只做了只读诊断，没有复位 GPU、解绑驱动或重启服务器。
+- `b290388` 的首个真实 99 字节 `lab-pipe` 冒烟在发送资产字节前失败关闭并保留失败输出：
+  右侧 `cmd.exe` 管道把整条远端 receiver 命令引用成一个可执行文件名；同时镜像最终响应采用
+  无 `Content-Length` 的流式传输，旧校验返回 `HTTP_CONTENT_LENGTH_INVALID`。最终资产未发布，
+  没有把不完整内容视为 G3 输入。
+- 已把右侧 SSH 命令改为逐 token 传递 `env`、冻结 Python 和 receiver 参数，避免整串命令被
+  Windows 引用；HTTP 纠错只允许命名 `hf-mirror` profile 缺少 `Content-Length`。官方 endpoint
+  继续强制长度头；镜像仍强制 200/206 状态、断点续传时的精确 `Content-Range`、固定预期字节数、
+  多余字节拒绝，并由服务器最终重算冻结 SHA-256 后 no-clobber 发布。新增无长度首传/续传、
+  错误 Range 和远端命令分词回归；中继单文件为 `29 passed`，与 receiver 原子发布、断点续传和
+  下载计划的组合回归为 `53 passed, 0 failed`，相关 `py_compile` 与 `git diff --check` 均退出 0。
+- 下一步先把本次纠错形成新提交并三端快进，再用该不可变 HEAD 重跑 99 字节真实冒烟和剩余
+  10 个冻结对象。G3 非 GPU 资产闭环可以继续；bootstrap 与后续 CUDA/NCCL Gate 必须等待
+  GPU 3 经新的管理员维护授权恢复并重新通过四卡只读资格检查，当前仍不发布 READY。
