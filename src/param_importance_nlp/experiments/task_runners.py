@@ -1243,7 +1243,7 @@ class TrainingTaskRunner(TaskRunner):
             run_intent=request.config.run_intent,
             max_steps=max_steps,
             max_attempts=max_steps + int(execution["max_attempts"]) - 1,
-            importance_enabled=True,
+            importance_enabled=request.task.stage > 0,
             estimator_name=str(base_importance["estimator_name"]),
             accumulation_dtype=str(base.section("precision")["statistic_dtype"]),
             max_grad_norm=training["gradient_clip_max_norm"],  # type: ignore[arg-type]
