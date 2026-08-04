@@ -1,0 +1,143 @@
+{
+  "schema_version": "stage0.g0-baseline-redo.v1",
+  "generated_at": "2026-08-04T14:03:45+08:00",
+  "task": "S0.1 re-validation",
+  "scope": "重新采集本机/GitHub/服务器三端仓库基线、Agent 文档哈希、系统/存储/GPU 健康状态，形成 G0-C 与 G0-G 判定",
+  "local": {
+    "branch": "redo/from-run-ready",
+    "head": "8f1bc5b6bdaa1f7c875c246ee59e6acc7e37c763",
+    "head_time": "2026-08-04T13:21:55+08:00",
+    "subject": "fix(stage0): release stalled G3 stream locks",
+    "worktree": "clean",
+    "remote_url": "https://github.com/Loong-C/parameter-importance.git",
+    "pushed_to_github": false
+  },
+  "github": {
+    "main": "34966d0819a5229569169bfe436afe9058c0ed24",
+    "feat/stage0-completion": "8f1bc5b6bdaa1f7c875c246ee59e6acc7e37c763",
+    "feat/local-contracts-core-stage0-9": "11a3f9072b01ab122d3bd3dc947f637dcfe8d755",
+    "feat/stage0-infrastructure": "1ab0de198513c4fcf791e26d44d1608d627da847",
+    "redo/from-run-ready": "absent"
+  },
+  "server": {
+    "branch": "feat/stage0-completion",
+    "head": "1746903c46dd90142644e6c3f2d529000b9c6131",
+    "worktree": "clean",
+    "behind_github_by": 1,
+    "os": "Ubuntu 24.04.3 LTS",
+    "kernel": "6.8.0-136-generic",
+    "cpu_count": 128,
+    "memory_total_gib": 1007,
+    "storage": {
+      "device": "/dev/nvme0n1",
+      "filesystem": "ext4",
+      "size": "3.5T",
+      "used": "537G",
+      "avail": "2.8T",
+      "used_percent": 17
+    },
+    "data_root_owner_mode": "sophgo13:sophgo13 0750",
+    "inode": {
+      "total": 234422272,
+      "used": 1040753,
+      "avail": 233381519,
+      "used_percent": 1
+    }
+  },
+  "agent_hashes": {
+    "git.md": "183f4ba702d22a3a97a459d4873aed62377d51b666d2515990a2f408ecd856ca",
+    "remote_access.md": "795c677e717827492a30342e5b91a4b5959f0df22c72354f14a506ecb023f7a1",
+    "server.md": "9f2d4370ac64990cd29d33ef13de5c20cca65efb4655e928118ae4f3ca012c68",
+    "sync.md": "1bf84f8379018b918eb1680c49dacb7d6d75d764c306782f5170212ceb190015",
+    "worklogs.md": "4a61b34b02a7070b5d3321b349d13016548615a0f3ce069901d18049072a10da",
+    "local_server_match": true
+  },
+  "gpu": {
+    "collected_at": "2026-08-04T14:00+08:00",
+    "nvidia_smi_device_count": 4,
+    "allowed_four_visible": true,
+    "gpus": [
+      {
+        "index": 0,
+        "pci_bdf": "0000:9C:00.0",
+        "uuid": "GPU-5c672d04-4f83-3cc0-80d0-0108b1b63267",
+        "name": "NVIDIA A100-SXM4-80GB",
+        "memory_total_mib": 81920,
+        "memory_used_mib": 0,
+        "volatile_uncorrectable_ecc": 0,
+        "aggregate_uncorrectable_ecc": 0
+      },
+      {
+        "index": 1,
+        "pci_bdf": "0000:9D:00.0",
+        "uuid": "GPU-e78c55cd-db97-b761-f559-dc6eae3be81d",
+        "name": "NVIDIA A100-SXM4-80GB",
+        "memory_total_mib": 81920,
+        "memory_used_mib": 0,
+        "volatile_uncorrectable_ecc": 0,
+        "aggregate_uncorrectable_ecc": 0
+      },
+      {
+        "index": 2,
+        "pci_bdf": "0000:A0:00.0",
+        "uuid": "GPU-9b2b2a3b-3547-187f-ca29-2c02624e2e4f",
+        "name": "NVIDIA A100-SXM4-80GB",
+        "memory_total_mib": 81920,
+        "memory_used_mib": 0,
+        "volatile_uncorrectable_ecc": 0,
+        "aggregate_uncorrectable_ecc": 0
+      },
+      {
+        "index": 3,
+        "pci_bdf": "0000:A4:00.0",
+        "uuid": "GPU-5a81500d-5e9c-b0d7-5607-fdfdaab65ff4",
+        "name": "NVIDIA A100-SXM4-80GB",
+        "memory_total_mib": 81920,
+        "memory_used_mib": 0,
+        "volatile_uncorrectable_ecc": "N/A",
+        "aggregate_uncorrectable_ecc": "N/A"
+      }
+    ],
+    "compute_apps": [
+      {
+        "pid": "N/A",
+        "gpu_uuid": "GPU-5a81500d-5e9c-b0d7-5607-fdfdaab65ff4"
+      }
+    ],
+    "known_kernel_events_20260804": [
+      "Xid 120 GSP task exception",
+      "Xid 119 GSP RPC timeout",
+      "Xid 154 GPU Reset Required"
+    ],
+    "status": "DEGRADED"
+  },
+  "gates": {
+    "G0-C": {
+      "status": "PASS",
+      "notes": [
+        "既有 SSH 别名非交互可达，身份与目录符合 Agent/remote_access.md",
+        "本机/GitHub/服务器提交关系已重新采集并记录",
+        "Agent/*.md 本机与服务器 5/5 SHA-256 一致",
+        "本机工作树干净，无未记录的用户修改",
+        "当前分支 redo/from-run-ready 未推送 GitHub，已记录为待用户决策项"
+      ]
+    },
+    "G0-G": {
+      "status": "BLOCKED",
+      "notes": [
+        "白名单 GPU 3（0000:A4:00.0）ECC 字段返回 N/A",
+        "该 GPU 存在 PID 不可见的 compute app 记录",
+        "2026-08-04 内核记录 Xid 120/119/154，恢复动作 GPU Reset Required",
+        "等待管理员维护授权恢复该卡后重新执行四卡资格与 CUDA/NCCL smoke"
+      ]
+    },
+    "G0": {
+      "status": "BLOCKED",
+      "notes": [
+        "G0-C 通过但 G0-G 阻塞，G0 总 gate 未通过",
+        "可继续不占用 GPU 的 S0.2 本地/服务器核验准备"
+      ]
+    }
+  },
+  "secrets_included": false
+}
