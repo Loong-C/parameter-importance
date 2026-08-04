@@ -459,3 +459,23 @@ G1-D 有效期、中文动态 Worklog、Stage 1 handoff 和不可覆盖的 `READ
 - 新增首次 pipe transcript 失败、第二次重新 plan 后成功的编排回归，并拒绝 0、负数、布尔值和
   非整数 attempt budget；文档新增 `--lab-pipe-max-attempts` 合同。代码形成不可变提交并三端同步
   前不用于资产发布；同步后才继续 MNLI/RTE 断点续传。
+
+## 2026-08-04 13:21 CST — 断链 receiver 孤儿锁定位、精确终止与不活动时限
+
+- 有界重试提交为 `1746903c46dd90142644e6c3f2d529000b9c6131`，已非强推到 GitHub 并以
+  3,716 字节增量 bundle 快进服务器；bundle SHA-256 为
+  `b8a124cc7602231dc464ebe292bd61fde5d1d8c0c26a41b0768be1f0c44df071`，服务器验证和
+  `--ff-only` 通过后两端临时 bundle 已精确删除。
+- 在该提交上重跑 8 项 dataset 时，MNLI train 的 6 次预算全部在 plan transcript 完成前失败；
+  每次约 80 秒，与对象锁等待 60 秒高度一致。只读进程核对发现 PID `69037` 是本任务在
+  `a30f3df` 启动、已运行约 30 分钟的同一 MNLI receiver，父进程为断链 `sshd@notty`，stdin
+  指向旧 pipe，FD 3/4 精确持有该对象中央 lock 与 `.part`；本机对应 dispatcher 早已退出。
+- 在确认 PID、父进程、完整对象 ID、revision、大小、SHA-256、source commit、FD 和无本地 writer
+  后，只对 PID `69037` 发送 `SIGTERM`。终止后 `/proc/69037` 消失，对象锁可非阻塞取得；中央
+  `.part` 保留为单链接普通文件，大小 `4,194,304` 字节。没有删除断点、最终目标或其他进程。
+- 根因是 `receive_streamed_asset()` 对 stdin 阻塞读取只使用 acquisition 总 deadline；网络断开后
+  旧 sshd 未关闭远端 pipe，receiver 因而可持锁等待近 4 小时，使 dispatcher 的重新 plan 无法
+  取得锁。现把每次 stream read deadline 设为整体 deadline 与已有
+  `request_timeout_seconds` 的较早者；不活动超时会先 fsync `.part`、退出并释放锁，随后外层有界
+  session 重新 plan/续传。新增“整体 deadline 尚远但单次读取不活动”回归，并保留原整体 deadline
+  测试；形成提交并三端同步前不继续资产写入。

@@ -1635,9 +1635,14 @@ def receive_streamed_asset(
                         )
                     read_size = min(selected_policy.chunk_size, remaining - received)
                     try:
+                        read_deadline = min(
+                            overall_deadline,
+                            time.monotonic()
+                            + selected_policy.request_timeout_seconds,
+                        )
                         chunk = _bounded_call(
                             lambda: stream.read(read_size),
-                            overall_deadline=overall_deadline,
+                            overall_deadline=read_deadline,
                             observed_size=offset + received,
                         )
                     except _AttemptFailure:

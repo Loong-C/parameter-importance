@@ -51,12 +51,13 @@ def _policy(
     max_attempts: int = 3,
     lock_timeout: float = 1.0,
     overall_timeout: float = 3.0,
+    request_timeout: float = 1.0,
     initial_backoff: float = 0.0,
     max_backoff: float = 0.0,
 ) -> AcquisitionPolicy:
     return AcquisitionPolicy(
         max_attempts=max_attempts,
-        request_timeout_seconds=1.0,
+        request_timeout_seconds=request_timeout,
         overall_timeout_seconds=overall_timeout,
         initial_backoff_seconds=initial_backoff,
         max_backoff_seconds=max_backoff,
@@ -640,6 +641,30 @@ def test_stream_read_is_bounded_by_the_overall_deadline(tmp_path: Path) -> None:
         )
     assert caught.value.report.code is AcquisitionFailureCode.OVERALL_TIMEOUT
     assert time.monotonic() - started < 0.2
+
+
+def test_stream_read_inactivity_releases_before_the_overall_deadline(
+    tmp_path: Path,
+) -> None:
+    payload = b"inactivity"
+    target = tmp_path / "asset.bin"
+
+    class BlockingStream:
+        def read(self, _size: int) -> bytes:
+            time.sleep(0.3)
+            return payload
+
+    started = time.monotonic()
+    with pytest.raises(AssetAcquisitionError) as caught:
+        receive_streamed_asset(
+            _spec(payload),
+            target,
+            BlockingStream(),  # type: ignore[arg-type]
+            policy=_policy(overall_timeout=3.0, request_timeout=0.03),
+        )
+    assert caught.value.report.code is AcquisitionFailureCode.OVERALL_TIMEOUT
+    assert time.monotonic() - started < 0.2
+    assert part_path_for(target).is_file()
 
 
 def test_post_link_verification_closes_candidate_publish_toctou(
