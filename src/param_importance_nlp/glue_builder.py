@@ -753,6 +753,7 @@ def _validate_dataset_split(
     expected_rows: int,
     expected_fingerprint: str,
     label_count: int,
+    check_loaded_fingerprint: bool = True,
 ) -> None:
     observed_columns = _dataset_columns(dataset)
     if len(observed_columns) != len(OUTPUT_COLUMNS) or set(observed_columns) != set(
@@ -761,7 +762,10 @@ def _validate_dataset_split(
         raise _BuildFailure("DATASET_OUTPUT_COLUMNS_INVALID", split)
     if _dataset_length(dataset) != expected_rows:
         raise _BuildFailure("DATASET_ROW_COUNT_MISMATCH", split)
-    if str(getattr(dataset, "_fingerprint", "")) != expected_fingerprint:
+    if (
+        check_loaded_fingerprint
+        and str(getattr(dataset, "_fingerprint", "")) != expected_fingerprint
+    ):
         raise _BuildFailure("DATASET_FINGERPRINT_MISMATCH", split)
     observed_rows = 0
     for batch in _iter_dataset_batches(dataset):
@@ -1040,6 +1044,9 @@ def _validate_saved_dataset(
         raise _BuildFailure("DATASET_SPLITS_MISMATCH", str(root))
     label_count = len(requirement["label_mapping"])
     for split in expected_splits:
+        persisted = _persisted_dataset_fingerprint(root, split)
+        if persisted != fingerprints[split]:
+            raise _BuildFailure("DATASET_FINGERPRINT_MISMATCH", split)
         try:
             dataset = loaded[split]
         except (KeyError, TypeError) as error:
@@ -1050,9 +1057,23 @@ def _validate_saved_dataset(
             expected_rows=requirement["split_counts"][split],
             expected_fingerprint=fingerprints[split],
             label_count=label_count,
+            check_loaded_fingerprint=False,
         )
     if _stat_snapshot(root) != before:
         raise _BuildFailure("DATASET_VALIDATION_MUTATED_TARGET", str(root))
+
+
+def _persisted_dataset_fingerprint(root: Path, split: str) -> str:
+    state = root / split / "state.json"
+    _regular_file(state, code="GLUE_STATE_MISSING_OR_INVALID")
+    decoded = ensure_json_object(
+        loads_strict_json(state.read_bytes()),
+        field="dataset state",
+    )
+    fingerprint = decoded.get("_fingerprint")
+    if not isinstance(fingerprint, str) or not fingerprint:
+        raise _BuildFailure("GLUE_STATE_FINGERPRINT_INVALID", split)
+    return fingerprint
 
 
 def _fsync_directory(path: Path) -> None:

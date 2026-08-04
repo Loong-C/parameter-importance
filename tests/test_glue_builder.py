@@ -113,7 +113,7 @@ class _FakeDatasetDict(dict[str, _FakeDataset]):
                 encoding="utf-8",
             )
             (split_root / "state.json").write_text(
-                json.dumps({"fingerprint": dataset._fingerprint}),
+                json.dumps({"_fingerprint": dataset._fingerprint}),
                 encoding="utf-8",
             )
 
@@ -206,7 +206,7 @@ def _fake_dependencies() -> glue_builder._Dependencies:
             rows = json.loads((split_root / "rows.json").read_text(encoding="utf-8"))
             fingerprint = json.loads(
                 (split_root / "state.json").read_text(encoding="utf-8")
-            )["fingerprint"]
+            )["_fingerprint"]
             loaded[split] = _FakeDataset(rows, fingerprint=fingerprint)
         return _FakeDatasetDict(loaded)
 
