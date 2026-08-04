@@ -36,6 +36,7 @@ def test_tensor_bundle_round_trip_is_dtype_and_structure_exact(tmp_path: Path) -
         "step": 7,
         "tuple": ("x", None, True),
         "torch": torch.tensor([[1.0, -2.0]], dtype=torch.bfloat16),
+        "scalar": torch.tensor(3.5, dtype=torch.float32),
         "empty": torch.empty((0, 3), dtype=torch.float32),
         "numpy": np.array([1, 2], dtype=">i4"),
     }
@@ -43,11 +44,14 @@ def test_tensor_bundle_round_trip_is_dtype_and_structure_exact(tmp_path: Path) -
     restored, observed = load_tensor_bundle(tmp_path / "object")
 
     assert observed.manifest_sha256 == identity.manifest_sha256
-    assert observed.tensor_count == 3
+    assert observed.tensor_count == 4
     assert restored["step"] == 7
     assert restored["tuple"] == ("x", None, True)
     assert restored["torch"].dtype == torch.bfloat16
     assert torch.equal(restored["torch"], state["torch"])
+    assert restored["scalar"].dtype == torch.float32
+    assert tuple(restored["scalar"].shape) == ()
+    assert restored["scalar"].item() == 3.5
     assert tuple(restored["empty"].shape) == (0, 3)
     assert restored["numpy"].dtype.str == ">i4"
     assert np.array_equal(restored["numpy"], state["numpy"])

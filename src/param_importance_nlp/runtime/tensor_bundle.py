@@ -112,7 +112,7 @@ class _Encoder:
         if tensor.layout != torch.strided:
             raise TypeError(f"TENSOR_UNSUPPORTED_LAYOUT:{tensor.layout}")
         detached = tensor.detach().cpu().contiguous()
-        payload = detached.view(torch.uint8).numpy().tobytes(order="C")
+        payload = detached.reshape(-1).view(torch.uint8).numpy().tobytes(order="C")
         identifier, path = self._next_path()
         _write_file(path, payload)
         relative = path.relative_to(self.root).as_posix()
