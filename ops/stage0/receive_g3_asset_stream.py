@@ -320,7 +320,10 @@ def main() -> int:
                     data_root=data_root,
                     policy=AcquisitionPolicy(
                         max_attempts=1,
-                        request_timeout_seconds=60.0,
+                        # Keep the receiver inactive-read timeout above the
+                        # relay emitter HTTP timeout (90s) so a slow upstream
+                        # response fails cleanly on the emitter side first.
+                        request_timeout_seconds=300.0,
                         overall_timeout_seconds=remaining,
                         initial_backoff_seconds=0.0,
                         max_backoff_seconds=0.0,
@@ -379,7 +382,8 @@ def main() -> int:
                 on_ready=ready,
                 policy=AcquisitionPolicy(
                     max_attempts=1,
-                    request_timeout_seconds=60.0,
+                    # See the migration policy above: 300s > emitter 90s.
+                    request_timeout_seconds=300.0,
                     overall_timeout_seconds=remaining,
                     initial_backoff_seconds=0.0,
                     max_backoff_seconds=0.0,
