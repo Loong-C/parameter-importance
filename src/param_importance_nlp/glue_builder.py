@@ -8,9 +8,12 @@ directory, validates the complete saved result, and publishes with an atomic
 no-clobber directory rename.
 
 The network guard is process-wide.  Construction is therefore serialized in
-the current process while the guard is active, and every socket egress attempt
-is counted and rejected.  Hugging Face dependencies are imported lazily so the
-base package remains usable without the optional ``server`` extra.
+the current process while the guard is active, and every *external* socket
+egress attempt is counted and rejected.  Loopback connections and local
+subprocess machinery used by the Hugging Face datasets multiprocessing
+manager are permitted so the offline build can complete without any external
+network access.  Hugging Face dependencies are imported lazily so the base
+package remains usable without the optional ``server`` extra.
 """
 
 from __future__ import annotations
@@ -20,6 +23,7 @@ from contextlib import contextmanager
 from copy import deepcopy
 from dataclasses import dataclass
 import errno
+import ipaddress
 from numbers import Integral
 import os
 from pathlib import Path
@@ -1147,10 +1151,88 @@ def _discard_owned_staging(staging: Path, tmp_root: Path) -> None:
 @contextmanager
 def _offline_socket_guard(cache_root: Path) -> Iterator[_NetworkCounter]:
     counter = _NetworkCounter()
+    loopback_sockets: set[int] = set()
 
-    def blocked(*_args: Any, **_kwargs: Any) -> Any:
+    def _external(*_args: Any, **_kwargs: Any) -> Any:
         counter.attempts += 1
         raise _NetworkEgressBlocked("NETWORK_EGRESS_BLOCKED")
+
+    def _loopback_host(host: object) -> bool:
+        if host is None:
+            return True
+        if not isinstance(host, str):
+            return False
+        lowered = host.casefold()
+        if lowered in {"", "localhost", "ip6-localhost", "ip6-loopback"}:
+            return True
+        try:
+            return ipaddress.ip_address(lowered).is_loopback
+        except ValueError:
+            return False
+
+    def _loopback_endpoint(address: object) -> bool:
+        if isinstance(address, tuple) and address and _loopback_host(address[0]):
+            return True
+        if isinstance(address, str):
+            return _loopback_host(address)
+        return False
+
+    def _peer_loopback(instance: socket.socket) -> bool:
+        try:
+            return _loopback_endpoint(instance.getpeername())
+        except OSError:
+            return False
+
+    def _wrap_connect(original: Any) -> Any:
+        def connect(
+            instance: socket.socket,
+            address: object,
+            *args: Any,
+            **kwargs: Any,
+        ) -> Any:
+            if _loopback_endpoint(address):
+                result = original(instance, address, *args, **kwargs)
+                if _peer_loopback(instance):
+                    loopback_sockets.add(instance.fileno())
+                return result
+            return _external()
+
+        return connect
+
+    def _wrap_send(original: Any) -> Any:
+        def send(instance: socket.socket, *args: Any, **kwargs: Any) -> Any:
+            if instance.fileno() in loopback_sockets or _peer_loopback(instance):
+                return original(instance, *args, **kwargs)
+            return _external()
+
+        return send
+
+    def _wrap_sendto(original: Any) -> Any:
+        def sendto(instance: socket.socket, *args: Any, **kwargs: Any) -> Any:
+            address = args[1] if len(args) > 1 else kwargs.get("address")
+            if _loopback_endpoint(address):
+                return original(instance, *args, **kwargs)
+            return _external()
+
+        return sendto
+
+    def _wrap_resolver(original: Any) -> Any:
+        def resolve(*args: Any, **kwargs: Any) -> Any:
+            host = args[0] if args else kwargs.get("host")
+            if _loopback_host(host):
+                return original(*args, **kwargs)
+            return _external()
+
+        return resolve
+
+    def _wrap_byaddr(original: Any) -> Any:
+        def byaddr(*args: Any, **kwargs: Any) -> Any:
+            address = args[0] if args else kwargs.get("ip_address")
+            if _loopback_host(address):
+                return original(*args, **kwargs)
+            return _external()
+
+        return byaddr
 
     socket_methods = (
         "connect",
@@ -1161,7 +1243,6 @@ def _offline_socket_guard(cache_root: Path) -> Iterator[_NetworkCounter]:
         "sendmsg",
     )
     module_functions = (
-        "create_connection",
         "getaddrinfo",
         "gethostbyname",
         "gethostbyname_ex",
@@ -1188,7 +1269,6 @@ def _offline_socket_guard(cache_root: Path) -> Iterator[_NetworkCounter]:
             for name in module_functions
             if hasattr(socket, name)
         }
-        previous_popen = subprocess.Popen
         try:
             cache_root.mkdir(parents=True, exist_ok=False)
             os.environ.update(_OFFLINE_ENVIRONMENT)
@@ -1197,13 +1277,21 @@ def _offline_socket_guard(cache_root: Path) -> Iterator[_NetworkCounter]:
             os.environ["TRANSFORMERS_CACHE"] = str(cache_root / "transformers")
             os.environ["HUGGINGFACE_HUB_CACHE"] = str(cache_root / "hub")
             for name in previous_methods:
-                setattr(socket.socket, name, blocked)
+                original = previous_methods[name]
+                if name in {"connect", "connect_ex"}:
+                    setattr(socket.socket, name, _wrap_connect(original))
+                elif name in {"send", "sendall", "sendmsg"}:
+                    setattr(socket.socket, name, _wrap_send(original))
+                elif name == "sendto":
+                    setattr(socket.socket, name, _wrap_sendto(original))
             for name in previous_functions:
-                setattr(socket, name, blocked)
-            subprocess.Popen = blocked  # type: ignore[assignment]
+                original = previous_functions[name]
+                if name == "gethostbyaddr":
+                    setattr(socket, name, _wrap_byaddr(original))
+                else:
+                    setattr(socket, name, _wrap_resolver(original))
             yield counter
         finally:
-            subprocess.Popen = previous_popen
             for name, method in previous_methods.items():
                 setattr(socket.socket, name, method)
             for name, function in previous_functions.items():

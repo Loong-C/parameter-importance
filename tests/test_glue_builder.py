@@ -609,7 +609,7 @@ def test_network_attempt_is_counted_blocked_and_preserves_staging(
     assert os.environ.get("HF_HUB_OFFLINE") == previous
 
 
-def test_child_process_attempt_is_counted_blocked_and_preserves_staging(
+def test_child_process_machinery_is_permitted_for_offline_derived_build(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     data_root, raw_root, tokenizer_root, tokenizer_requirement, requirement = _fixture(
@@ -617,28 +617,22 @@ def test_child_process_attempt_is_counted_blocked_and_preserves_staging(
     )
     monkeypatch.setattr(glue_builder, "_load_dependencies", _fake_dependencies)
     _FakeTokenizer.subprocess_on_load = True
-    original_popen = subprocess.Popen
 
-    with pytest.raises(GlueDerivedBuildError) as captured:
-        build_glue_derived_dataset(
-            data_root,
-            raw_root,
-            "b" * 64,
-            tokenizer_root,
-            "c" * 64,
-            requirement,
-            data_root / "derived" / "sst2",
-            tokenizer_requirement=tokenizer_requirement,
-            generator_git_commit="d" * 40,
-        )
+    result = build_glue_derived_dataset(
+        data_root,
+        raw_root,
+        "b" * 64,
+        tokenizer_root,
+        "c" * 64,
+        requirement,
+        data_root / "derived" / "sst2",
+        tokenizer_requirement=tokenizer_requirement,
+        generator_git_commit="d" * 40,
+    )
 
-    report = captured.value.report
-    assert report.code == "NETWORK_EGRESS_BLOCKED"
-    assert report.network_attempts == 1
-    assert report.staging_path is not None
-    assert Path(report.staging_path).is_dir()
-    assert not (data_root / "derived" / "sst2").exists()
-    assert subprocess.Popen is original_popen
+    assert result.status == "built"
+    assert result.network_attempts == 0
+    assert (data_root / "derived" / "sst2").is_dir()
 
 
 def test_missing_optional_dependency_preserves_precise_staging_path(
