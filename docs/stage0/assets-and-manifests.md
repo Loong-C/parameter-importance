@@ -174,6 +174,7 @@ weights = asset.path_for("model.safetensors")
 
 - `--endpoint-profile official` 是默认源；已核验镜像路径时可显式选择 `--endpoint-profile hf-mirror`。两者都在 lab-pc 进程内根据同一固定 revision 和对象 ID 派生 URL。
 - `--lab-python-profile path` 使用远端 `PATH`；受控 lab-pc 的用户级 Python 3.12 使用 `--lab-python-profile cjl-python312`。profile 是版本化枚举，不接受任意解释器命令。
+- 若 Windows `ssh.exe` 在 Python 双向 stdin/stdout 管道下不能转发 `READY`，使用 `--relay-process lab-pipe`。dispatcher 先以独立 `plan-only` 会话在对象锁内取得精确 resume offset，再用本机 `cmd.exe` 原生字节管道连接 lab emitter 与服务器 receiver；receiver 同时要求锁内 offset 未漂移，竞争或状态变化会失败关闭。
 - relay 不在本机或 lab-pc 落盘对象字节；服务器 receiver 在对象专用锁内复用 `.part`，并在固定字节数和 SHA-256 全部通过后 no-clobber 发布最终文件。
 - 每次中继后仍须运行离线 acquisition、独立 verification 和 READY materialization；中继成功本身不是 G3 Gate PASS。
 
@@ -185,7 +186,7 @@ python ops/stage0/dispatch_g3_relay_via_lab.py `
   --requirements configs/stage0/g3-asset-requirements-v1.json `
   --layout configs/stage0/g3-asset-layout-v1.json `
   --plan configs/stage0/g3-download-plan-v1.json `
-  --relay-process lab `
+  --relay-process lab-pipe `
   --endpoint-profile hf-mirror `
   --lab-python-profile cjl-python312 `
   --object-id huggingface/EleutherAI/pythia-410m-deduped/config.json

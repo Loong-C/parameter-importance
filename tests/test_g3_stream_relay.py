@@ -14,6 +14,7 @@ import pytest
 from ops.stage0 import dispatch_g3_relay_via_lab as dispatcher
 from ops.stage0 import receive_g3_asset_stream as receiver
 from ops.stage0 import relay_g3_object_from_lab as relay
+from param_importance_nlp.asset_acquisition import StreamReceptionPlan
 
 
 _ROOT = Path(__file__).resolve().parents[1]
@@ -54,6 +55,8 @@ def _receiver_args(
         **binding.to_dict(),
         "overall_timeout_seconds": 30.0,
         "legacy_state_action": "none",
+        "expected_offset": None,
+        "plan_only": False,
     }
     values.pop("schema_version")
     values.update(changes)
@@ -218,6 +221,232 @@ def test_dispatcher_uses_only_a_named_lab_python_profile() -> None:
             overall_timeout_seconds=30.0,
             lab_python_profile="arbitrary-command",
         )
+
+
+def test_receiver_expected_offset_is_checked_inside_the_locked_callback() -> None:
+    plan = StreamReceptionPlan(
+        source_id=_FIRST_OBJECT,
+        revision="a" * 40,
+        expected_size=570,
+        expected_sha256="b" * 64,
+        offset=17,
+        already_ready=False,
+    )
+    receiver._check_expected_offset(SimpleNamespace(expected_offset=17), plan)
+    with pytest.raises(receiver.G3StreamReceiverError, match="offset does not match"):
+        receiver._check_expected_offset(SimpleNamespace(expected_offset=18), plan)
+
+
+def test_lab_pipe_command_is_url_free_and_uses_only_native_ssh_pipe(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("COMSPEC", r"C:\Windows\System32\cmd.exe")
+    arguments = _dispatch_args(_FIRST_OBJECT)
+    arguments.relay_process = "lab-pipe"
+    relay_path, _, items = dispatcher._load_specs(arguments)
+    binding = items[0][1]
+    command = dispatcher._pipe_command(
+        relay_path,
+        binding,
+        offset=0,
+        overall_timeout_seconds=30.0,
+        endpoint_profile="hf-mirror",
+        lab_python_profile="cjl-python312",
+    )
+    assert Path(command[0]).name.casefold() == "cmd.exe"
+    assert command[1:4] == ["/d", "/s", "/c"]
+    pipeline = command[4]
+    assert pipeline.count(" | ") == 2
+    assert "type" in pipeline
+    assert dispatcher.LAB_ALIAS in pipeline
+    assert dispatcher.SERVER_ALIAS in pipeline
+    assert "--relay-mode emit" in pipeline
+    assert "--emit-offset 0" in pipeline
+    assert "--expected-offset 0" in pipeline
+    assert "://" not in pipeline and "?" not in pipeline
+
+    complete_part_command = dispatcher._pipe_command(
+        relay_path,
+        binding,
+        offset=binding.expected_size,
+        overall_timeout_seconds=30.0,
+        endpoint_profile="hf-mirror",
+        lab_python_profile="cjl-python312",
+    )
+    complete_part_pipeline = complete_part_command[4]
+    assert complete_part_pipeline.startswith("type NUL | ")
+    assert dispatcher.LAB_ALIAS not in complete_part_pipeline
+    assert f"--expected-offset {binding.expected_size}" in complete_part_pipeline
+
+
+def test_lab_pipe_plan_and_completion_transcripts_are_exact() -> None:
+    arguments = _dispatch_args(_FIRST_OBJECT)
+    arguments.relay_process = "lab-pipe"
+    _, _, items = dispatcher._load_specs(arguments)
+    binding = items[0][1]
+    reception = {
+        "schema_version": "stage0-asset-stream-reception-plan-v1",
+        "source_id": binding.object_id,
+        "revision": binding.revision,
+        "expected_size": binding.expected_size,
+        "expected_sha256": binding.expected_sha256,
+        "offset": 0,
+        "already_ready": False,
+    }
+    ready = {
+        "schema_version": relay.PROTOCOL_VERSION,
+        "phase": "READY",
+        "object_id": binding.object_id,
+        "binding": binding.to_dict(),
+        "reception": reception,
+        "runtime_urls_persisted": False,
+    }
+    plan_complete = {**ready, "phase": "PLAN_COMPLETE"}
+    plan_payload = "".join(
+        json.dumps(value, separators=(",", ":")) + "\n"
+        for value in (ready, plan_complete)
+    ).encode()
+    assert dispatcher._parse_plan_result(
+        plan_payload,
+        binding=binding,
+        returncode=0,
+    ) == reception
+
+    result = {
+        "schema_version": "stage0-asset-acquisition-result-v1",
+        "status": "downloaded",
+        "source_id": binding.object_id,
+        "revision": binding.revision,
+        "size_bytes": binding.expected_size,
+        "sha256": binding.expected_sha256,
+        "attempts": 1,
+        "resumed": False,
+        "network_accessed": True,
+    }
+    complete = {
+        "schema_version": relay.PROTOCOL_VERSION,
+        "phase": "COMPLETE",
+        "object_id": binding.object_id,
+        "binding": binding.to_dict(),
+        "result": result,
+        "runtime_urls_persisted": False,
+    }
+    pipe_payload = "".join(
+        json.dumps(value, separators=(",", ":")) + "\n"
+        for value in (ready, complete)
+    ).encode()
+    assert dispatcher._parse_pipe_result(
+        pipe_payload,
+        binding=binding,
+        returncode=0,
+        expected_offset=0,
+    ) == result
+
+
+def test_dispatcher_runs_plan_then_native_pipe_for_lab_pipe(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("COMSPEC", r"C:\Windows\System32\cmd.exe")
+    monkeypatch.setattr(
+        dispatcher,
+        "resolve_source_git_commit",
+        lambda _root, **_kwargs: "a" * 40,
+    )
+    arguments = _dispatch_args(_FIRST_OBJECT)
+    arguments.relay_process = "lab-pipe"
+    arguments.endpoint_profile = "hf-mirror"
+    arguments.lab_python_profile = "cjl-python312"
+    _, _, items = dispatcher._load_specs(arguments)
+    binding = items[0][1]
+    reception = {
+        "schema_version": "stage0-asset-stream-reception-plan-v1",
+        "source_id": binding.object_id,
+        "revision": binding.revision,
+        "expected_size": binding.expected_size,
+        "expected_sha256": binding.expected_sha256,
+        "offset": 0,
+        "already_ready": False,
+    }
+    ready = {
+        "schema_version": relay.PROTOCOL_VERSION,
+        "phase": "READY",
+        "object_id": binding.object_id,
+        "binding": binding.to_dict(),
+        "reception": reception,
+        "runtime_urls_persisted": False,
+    }
+    plan_payload = "".join(
+        json.dumps(value, separators=(",", ":")) + "\n"
+        for value in (ready, {**ready, "phase": "PLAN_COMPLETE"})
+    ).encode()
+    result = {
+        "schema_version": "stage0-asset-acquisition-result-v1",
+        "status": "downloaded",
+        "source_id": binding.object_id,
+        "revision": binding.revision,
+        "size_bytes": binding.expected_size,
+        "sha256": binding.expected_sha256,
+        "attempts": 1,
+        "resumed": False,
+        "network_accessed": True,
+    }
+    complete = {
+        "schema_version": relay.PROTOCOL_VERSION,
+        "phase": "COMPLETE",
+        "object_id": binding.object_id,
+        "binding": binding.to_dict(),
+        "result": result,
+        "runtime_urls_persisted": False,
+    }
+    pipe_payload = "".join(
+        json.dumps(value, separators=(",", ":")) + "\n"
+        for value in (ready, complete)
+    ).encode()
+    calls: list[list[str]] = []
+
+    def fake_run(command: list[str], **kwargs: Any) -> Any:
+        assert kwargs["check"] is False
+        assert kwargs["stdout"] is dispatcher.subprocess.PIPE
+        assert kwargs["stderr"] is None
+        assert kwargs["timeout"] > 0
+        calls.append(command)
+        payload = plan_payload if "--plan-only" in command[-1] else pipe_payload
+        return SimpleNamespace(returncode=0, stdout=payload)
+
+    monkeypatch.setattr(dispatcher.subprocess, "run", fake_run)
+    results = dispatcher.dispatch(arguments)
+
+    assert len(calls) == 2
+    assert calls[0][0] == "ssh" and "-n" in calls[0]
+    assert Path(calls[1][0]).name.casefold() == "cmd.exe"
+    assert results[0]["result_status"] == "downloaded"
+    assert results[0]["relay_process"] == "lab-pipe"
+
+
+def test_emit_mode_is_single_attempt_and_lab_direct_only() -> None:
+    _, _, items = dispatcher._load_specs(_dispatch_args(_FIRST_OBJECT))
+    binding = items[0][1]
+    values = {
+        key: value
+        for key, value in binding.to_dict().items()
+        if key != "schema_version"
+    }
+    values["route"] = "lab-direct"
+    arguments = argparse.Namespace(
+        **values,
+        max_attempts=1,
+        request_timeout_seconds=1.0,
+        overall_timeout_seconds=2.0,
+        chunk_size=1,
+        server_alias=relay.SERVER_ALIAS,
+        endpoint_profile="hf-mirror",
+        relay_mode="emit",
+        emit_offset=0,
+    )
+    relay._validate(arguments)
+    arguments.max_attempts = 2
+    with pytest.raises(relay.RelayError, match="EMIT_MODE_CONTRACT_INVALID"):
+        relay._validate(arguments)
 
 
 def test_dispatcher_default_selection_is_the_exact_thirteen_object_freeze() -> None:

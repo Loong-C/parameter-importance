@@ -5,7 +5,9 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 from pathlib import Path, PurePosixPath
+import shlex
 import subprocess
 import sys
 import time
@@ -25,6 +27,10 @@ from param_importance_nlp.storage import is_within
 
 
 LAB_ALIAS = "lab-pc"
+SERVER_ALIAS = "sophgo13-via-lab"
+_SERVER_REPO = "/home/sophgo13/cjl/parameter-importance"
+_SERVER_DATA_ROOT = "/home/sophgo13/cjl/storage/parameter-importance"
+_SERVER_PYTHON = f"{_SERVER_DATA_ROOT}/envs/parameter-importance/bin/python"
 _RELAY_SCRIPT_REF = "ops/stage0/relay_g3_object_from_lab.py"
 _PROTOCOL_VERSION = "stage0-g3-ssh-stream-v1"
 _ENDPOINT_PROFILES = ("official", "hf-mirror")
@@ -54,11 +60,11 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--object-id", action="append", default=[])
     parser.add_argument(
         "--relay-process",
-        choices=("local", "lab"),
+        choices=("local", "lab", "lab-pipe"),
         default="local",
         help=(
-            "Run the in-memory HTTP relay locally (default) or feed it to "
-            "python - on lab-pc; both routes use only documented SSH aliases."
+            "Run the duplex relay locally (default), on lab-pc, or use the "
+            "Windows-safe lab-pipe fallback with a native byte pipeline."
         ),
     )
     parser.add_argument(
@@ -145,6 +151,7 @@ def _load_specs(
     route = {
         "local": "local-via-lab",
         "lab": "lab-direct",
+        "lab-pipe": "lab-direct",
     }.get(relay_process)
     if route is None:
         raise G3RelayDispatchError("relay_process is invalid")
@@ -186,11 +193,10 @@ def _load_specs(
     return relay_path, relay_path.read_bytes(), specs
 
 
-def _relay_arguments(
+def _binding_arguments(
     binding: G3RelayBinding,
     *,
     overall_timeout_seconds: float,
-    endpoint_profile: str,
 ) -> list[str]:
     return [
         "--object-id",
@@ -223,6 +229,20 @@ def _relay_arguments(
         binding.route,
         "--overall-timeout-seconds",
         str(overall_timeout_seconds),
+    ]
+
+
+def _relay_arguments(
+    binding: G3RelayBinding,
+    *,
+    overall_timeout_seconds: float,
+    endpoint_profile: str,
+) -> list[str]:
+    return [
+        *_binding_arguments(
+            binding,
+            overall_timeout_seconds=overall_timeout_seconds,
+        ),
         "--endpoint-profile",
         endpoint_profile,
     ]
@@ -285,42 +305,176 @@ def _local_command(
     return command
 
 
-def _parse_relay_result(
-    payload: bytes,
-    *,
+def _ssh_options(*, no_stdin: bool = False) -> list[str]:
+    options = [
+        "ssh",
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        "ConnectTimeout=180",
+        "-o",
+        "ServerAliveInterval=20",
+        "-o",
+        "ServerAliveCountMax=12",
+    ]
+    if no_stdin:
+        options.append("-n")
+    return options
+
+
+def _receiver_remote_command(
     binding: G3RelayBinding,
-    returncode: int,
-) -> dict[str, Any]:
-    lines = payload.splitlines()
-    if len(lines) != 1:
-        raise G3RelayDispatchError("relay emitted an invalid protocol transcript")
-    try:
-        value = json.loads(lines[0].decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError) as error:
-        raise G3RelayDispatchError("relay emitted invalid protocol JSON") from error
+    *,
+    overall_timeout_seconds: float,
+    plan_only: bool = False,
+    expected_offset: int | None = None,
+) -> str:
+    command = [
+        "env",
+        f"PYTHONPATH={_SERVER_REPO}/src:{_SERVER_REPO}",
+        _SERVER_PYTHON,
+        "-m",
+        "ops.stage0.receive_g3_asset_stream",
+        "--source-root",
+        _SERVER_REPO,
+        "--data-root",
+        _SERVER_DATA_ROOT,
+        "--requirements",
+        "configs/stage0/g3-asset-requirements-v1.json",
+        "--layout",
+        "configs/stage0/g3-asset-layout-v1.json",
+        "--plan",
+        "configs/stage0/g3-download-plan-v1.json",
+        *_binding_arguments(
+            binding,
+            overall_timeout_seconds=overall_timeout_seconds,
+        ),
+    ]
+    if plan_only:
+        command.append("--plan-only")
+    if expected_offset is not None:
+        command.extend(("--expected-offset", str(expected_offset)))
+    return shlex.join(command)
+
+
+def _plan_command(
+    binding: G3RelayBinding,
+    *,
+    overall_timeout_seconds: float,
+) -> list[str]:
+    return [
+        *_ssh_options(no_stdin=True),
+        SERVER_ALIAS,
+        _receiver_remote_command(
+            binding,
+            overall_timeout_seconds=overall_timeout_seconds,
+            plan_only=True,
+        ),
+    ]
+
+
+def _cmd_atom(value: str) -> str:
     if (
-        not isinstance(value, dict)
-        or value.get("schema_version") != _PROTOCOL_VERSION
+        not value
+        or any(character in value for character in "\x00\r\n&|<>^%!()")
+        or "://" in value
+        or "?" in value
+    ):
+        raise G3RelayDispatchError("lab-pipe command atom is unsafe")
+    return value
+
+
+def _pipe_command(
+    relay_path: Path,
+    binding: G3RelayBinding,
+    *,
+    offset: int,
+    overall_timeout_seconds: float,
+    endpoint_profile: str,
+    lab_python_profile: str,
+) -> list[str]:
+    if isinstance(offset, bool) or not 0 <= offset <= binding.expected_size:
+        raise G3RelayDispatchError("lab-pipe offset is invalid")
+    lab_python = _LAB_PYTHON_PROFILES.get(lab_python_profile)
+    if lab_python is None:
+        raise G3RelayDispatchError("lab_python_profile is invalid")
+    comspec = Path(os.environ.get("COMSPEC", ""))
+    if not comspec.is_absolute() or comspec.name.casefold() != "cmd.exe":
+        raise G3RelayDispatchError("lab-pipe requires the controlled Windows cmd.exe")
+    left = [
+        *_ssh_options(),
+        LAB_ALIAS,
+        lab_python,
+        "-",
+        *_relay_arguments(
+            binding,
+            overall_timeout_seconds=overall_timeout_seconds,
+            endpoint_profile=endpoint_profile,
+        ),
+        "--relay-mode",
+        "emit",
+        "--emit-offset",
+        str(offset),
+        "--max-attempts",
+        "1",
+    ]
+    right = [
+        *_ssh_options(),
+        SERVER_ALIAS,
+        _receiver_remote_command(
+            binding,
+            overall_timeout_seconds=overall_timeout_seconds,
+            expected_offset=offset,
+        ),
+    ]
+    atoms = [str(relay_path), *right]
+    if offset < binding.expected_size:
+        atoms.extend(left)
+    for atom in atoms:
+        _cmd_atom(atom)
+    if offset == binding.expected_size:
+        pipeline = " | ".join(("type NUL", subprocess.list2cmdline(right)))
+    else:
+        pipeline = " | ".join(
+            (
+                subprocess.list2cmdline(["type", str(relay_path)]),
+                subprocess.list2cmdline(left),
+                subprocess.list2cmdline(right),
+            )
+        )
+    return [str(comspec), "/d", "/s", "/c", pipeline]
+
+
+def _protocol_values(payload: bytes, *, count: int) -> list[dict[str, Any]]:
+    lines = payload.splitlines()
+    if len(lines) != count:
+        raise G3RelayDispatchError("relay emitted an invalid protocol transcript")
+    values: list[dict[str, Any]] = []
+    for line in lines:
+        try:
+            value = json.loads(line.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise G3RelayDispatchError("relay emitted invalid protocol JSON") from error
+        if not isinstance(value, dict):
+            raise G3RelayDispatchError("relay protocol envelope does not match")
+        values.append(value)
+    return values
+
+
+def _validate_protocol_base(value: dict[str, Any], binding: G3RelayBinding) -> None:
+    if (
+        value.get("schema_version") != _PROTOCOL_VERSION
         or value.get("runtime_urls_persisted") is not False
         or value.get("object_id") != binding.object_id
     ):
         raise G3RelayDispatchError("relay protocol envelope does not match")
-    if value.get("phase") == "FAILED":
-        raise G3RelayDispatchError("relay returned a structured failure")
-    if value.get("phase") != "COMPLETE" or returncode != 0:
-        raise G3RelayDispatchError("relay did not complete successfully")
-    if set(value) != {
-        "schema_version",
-        "phase",
-        "object_id",
-        "binding",
-        "result",
-        "runtime_urls_persisted",
-    }:
-        raise G3RelayDispatchError("relay completion fields are not exact")
-    if value.get("binding") != binding.to_dict():
-        raise G3RelayDispatchError("relay completion binding does not match")
-    result = value.get("result")
+
+
+def _validate_acquisition_result(
+    result: object,
+    *,
+    binding: G3RelayBinding,
+) -> dict[str, Any]:
     result_fields = {
         "schema_version",
         "status",
@@ -351,6 +505,119 @@ def _parse_relay_result(
     return result
 
 
+def _validate_reception(
+    reception: object,
+    *,
+    binding: G3RelayBinding,
+) -> dict[str, Any]:
+    expected = {
+        "schema_version": "stage0-asset-stream-reception-plan-v1",
+        "source_id": binding.object_id,
+        "revision": binding.revision,
+        "expected_size": binding.expected_size,
+        "expected_sha256": binding.expected_sha256,
+    }
+    if (
+        not isinstance(reception, dict)
+        or set(reception) != {*expected, "offset", "already_ready"}
+        or any(reception.get(key) != value for key, value in expected.items())
+        or isinstance(reception.get("offset"), bool)
+        or not isinstance(reception.get("offset"), int)
+        or not 0 <= reception["offset"] <= binding.expected_size
+        or not isinstance(reception.get("already_ready"), bool)
+        or (reception["already_ready"] and reception["offset"] != binding.expected_size)
+    ):
+        raise G3RelayDispatchError("receiver reception plan does not match")
+    return reception
+
+
+def _parse_relay_result(
+    payload: bytes,
+    *,
+    binding: G3RelayBinding,
+    returncode: int,
+) -> dict[str, Any]:
+    value = _protocol_values(payload, count=1)[0]
+    _validate_protocol_base(value, binding)
+    if value.get("phase") == "FAILED":
+        raise G3RelayDispatchError("relay returned a structured failure")
+    if value.get("phase") != "COMPLETE" or returncode != 0:
+        raise G3RelayDispatchError("relay did not complete successfully")
+    if set(value) != {
+        "schema_version",
+        "phase",
+        "object_id",
+        "binding",
+        "result",
+        "runtime_urls_persisted",
+    }:
+        raise G3RelayDispatchError("relay completion fields are not exact")
+    if value.get("binding") != binding.to_dict():
+        raise G3RelayDispatchError("relay completion binding does not match")
+    return _validate_acquisition_result(value.get("result"), binding=binding)
+
+
+def _parse_plan_result(
+    payload: bytes,
+    *,
+    binding: G3RelayBinding,
+    returncode: int,
+) -> dict[str, Any]:
+    ready, complete = _protocol_values(payload, count=2)
+    for value in (ready, complete):
+        _validate_protocol_base(value, binding)
+        if value.get("binding") != binding.to_dict():
+            raise G3RelayDispatchError("receiver plan binding does not match")
+    if returncode != 0 or ready.get("phase") != "READY" or complete.get("phase") != "PLAN_COMPLETE":
+        raise G3RelayDispatchError("receiver plan did not complete successfully")
+    expected_fields = {
+        "schema_version",
+        "phase",
+        "object_id",
+        "binding",
+        "reception",
+        "runtime_urls_persisted",
+    }
+    if set(ready) != expected_fields or set(complete) != expected_fields:
+        raise G3RelayDispatchError("receiver plan fields are not exact")
+    reception = _validate_reception(ready.get("reception"), binding=binding)
+    if complete.get("reception") != reception:
+        raise G3RelayDispatchError("receiver plan changed before completion")
+    return reception
+
+
+def _parse_pipe_result(
+    payload: bytes,
+    *,
+    binding: G3RelayBinding,
+    returncode: int,
+    expected_offset: int,
+) -> dict[str, Any]:
+    ready, complete = _protocol_values(payload, count=2)
+    for value in (ready, complete):
+        _validate_protocol_base(value, binding)
+    if ready.get("phase") != "READY":
+        raise G3RelayDispatchError("receiver pipe handshake is invalid")
+    reception = _validate_reception(ready.get("reception"), binding=binding)
+    if reception["offset"] != expected_offset or reception["already_ready"]:
+        raise G3RelayDispatchError("receiver pipe offset changed")
+    if set(ready) != {
+        "schema_version", "phase", "object_id", "binding", "reception",
+        "runtime_urls_persisted",
+    } or ready.get("binding") != binding.to_dict():
+        raise G3RelayDispatchError("receiver pipe handshake fields are not exact")
+    if complete.get("phase") == "FAILED":
+        raise G3RelayDispatchError("receiver pipe returned a structured failure")
+    if returncode != 0 or complete.get("phase") != "COMPLETE":
+        raise G3RelayDispatchError("receiver pipe did not complete successfully")
+    if set(complete) != {
+        "schema_version", "phase", "object_id", "binding", "result",
+        "runtime_urls_persisted",
+    } or complete.get("binding") != binding.to_dict():
+        raise G3RelayDispatchError("receiver pipe completion fields are not exact")
+    return _validate_acquisition_result(complete.get("result"), binding=binding)
+
+
 def dispatch(arguments: argparse.Namespace) -> list[dict[str, Any]]:
     overall_timeout_seconds = getattr(
         arguments,
@@ -373,7 +640,7 @@ def dispatch(arguments: argparse.Namespace) -> list[dict[str, Any]]:
         git_timeout_seconds=min(10.0, load_remaining),
     )
     relay_process = getattr(arguments, "relay_process", "local")
-    if relay_process not in {"local", "lab"}:
+    if relay_process not in {"local", "lab", "lab-pipe"}:
         raise G3RelayDispatchError("relay_process is invalid")
     endpoint_profile = getattr(arguments, "endpoint_profile", "official")
     if endpoint_profile not in _ENDPOINT_PROFILES:
@@ -389,10 +656,12 @@ def dispatch(arguments: argparse.Namespace) -> list[dict[str, Any]]:
         print(
             f"relay={index}/{len(specs)} object_id={spec.source_id} "
             f"expected_size={spec.expected_size} route={binding.route} "
+            f"relay_process={relay_process} "
             f"endpoint_profile={endpoint_profile} "
             f"lab_python_profile={lab_python_profile}",
             flush=True,
         )
+        completed_returncode = 0
         try:
             if relay_process == "lab":
                 completed = subprocess.run(
@@ -408,6 +677,65 @@ def dispatch(arguments: argparse.Namespace) -> list[dict[str, Any]]:
                     stderr=None,
                     timeout=remaining,
                 )
+                protocol_result = _parse_relay_result(
+                    completed.stdout,
+                    binding=binding,
+                    returncode=completed.returncode,
+                )
+                completed_returncode = completed.returncode
+            elif relay_process == "lab-pipe":
+                plan = subprocess.run(
+                    _plan_command(
+                        binding,
+                        overall_timeout_seconds=remaining,
+                    ),
+                    check=False,
+                    stdout=subprocess.PIPE,
+                    stderr=None,
+                    timeout=remaining,
+                )
+                reception = _parse_plan_result(
+                    plan.stdout,
+                    binding=binding,
+                    returncode=plan.returncode,
+                )
+                if reception["already_ready"]:
+                    protocol_result = {
+                        "schema_version": "stage0-asset-acquisition-result-v1",
+                        "status": "already_ready",
+                        "source_id": binding.object_id,
+                        "revision": binding.revision,
+                        "size_bytes": binding.expected_size,
+                        "sha256": binding.expected_sha256,
+                        "attempts": 0,
+                        "resumed": False,
+                        "network_accessed": False,
+                    }
+                else:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise G3RelayDispatchError("relay dispatch deadline expired")
+                    completed = subprocess.run(
+                        _pipe_command(
+                            relay_path,
+                            binding,
+                            offset=int(reception["offset"]),
+                            overall_timeout_seconds=remaining,
+                            endpoint_profile=endpoint_profile,
+                            lab_python_profile=lab_python_profile,
+                        ),
+                        check=False,
+                        stdout=subprocess.PIPE,
+                        stderr=None,
+                        timeout=remaining,
+                    )
+                    protocol_result = _parse_pipe_result(
+                        completed.stdout,
+                        binding=binding,
+                        returncode=completed.returncode,
+                        expected_offset=int(reception["offset"]),
+                    )
+                    completed_returncode = completed.returncode
             else:
                 completed = subprocess.run(
                     _local_command(
@@ -421,24 +749,26 @@ def dispatch(arguments: argparse.Namespace) -> list[dict[str, Any]]:
                     stderr=None,
                     timeout=remaining,
                 )
+                protocol_result = _parse_relay_result(
+                    completed.stdout,
+                    binding=binding,
+                    returncode=completed.returncode,
+                )
+                completed_returncode = completed.returncode
         except subprocess.TimeoutExpired as error:
             raise G3RelayDispatchError("relay dispatch deadline expired") from error
-        protocol_result = _parse_relay_result(
-            completed.stdout,
-            binding=binding,
-            returncode=completed.returncode,
-        )
         result = {
             "object_id": spec.source_id,
             "expected_size": spec.expected_size,
             "expected_sha256": spec.expected_sha256,
-            "returncode": completed.returncode,
+            "returncode": completed_returncode,
             "route": binding.route,
             "source_git_commit": binding.source_git_commit,
             "plan_sha256": binding.plan_sha256,
             "result_status": protocol_result["status"],
             "endpoint_profile": endpoint_profile,
             "lab_python_profile": lab_python_profile,
+            "relay_process": relay_process,
         }
         results.append(result)
     return results

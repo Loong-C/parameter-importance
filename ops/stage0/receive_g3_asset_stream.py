@@ -48,6 +48,14 @@ class G3StreamReceiverError(ValueError):
     """Raised when a relay request is outside the frozen G3 control plane."""
 
 
+class _ReceptionPlanComplete(RuntimeError):
+    """Internal control flow used to close a plan-only receiver session."""
+
+    def __init__(self, plan: StreamReceptionPlan) -> None:
+        self.plan = plan
+        super().__init__("reception plan complete")
+
+
 def _is_link_like(path: Path) -> bool:
     return path.is_symlink() or bool(getattr(path, "is_junction", lambda: False)())
 
@@ -74,6 +82,16 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--source-git-commit")
     parser.add_argument("--route", choices=("lab-direct", "local-via-lab"))
     parser.add_argument("--overall-timeout-seconds", type=float, default=6 * 60 * 60)
+    parser.add_argument(
+        "--expected-offset",
+        type=int,
+        help="Fail closed if the locked receiver offset differs from this value.",
+    )
+    parser.add_argument(
+        "--plan-only",
+        action="store_true",
+        help="Emit the locked reception plan and exit without reading object bytes.",
+    )
     parser.add_argument(
         "--legacy-state-action",
         choices=("none", "inspect", "migrate"),
@@ -247,6 +265,23 @@ def _resolve_request(
     return spec, target, frozen, data_root
 
 
+def _check_expected_offset(
+    arguments: argparse.Namespace,
+    plan: StreamReceptionPlan,
+) -> None:
+    expected = getattr(arguments, "expected_offset", None)
+    if expected is None:
+        return
+    if (
+        isinstance(expected, bool)
+        or not isinstance(expected, int)
+        or expected < 0
+        or expected > plan.expected_size
+        or plan.offset != expected
+    ):
+        raise G3StreamReceiverError("locked reception offset does not match request")
+
+
 def main() -> int:
     arguments = _parser().parse_args()
     deadline: float | None = None
@@ -257,6 +292,8 @@ def main() -> int:
             or arguments.overall_timeout_seconds <= 0
         ):
             raise G3StreamReceiverError("overall timeout is invalid")
+        if arguments.plan_only and arguments.legacy_state_action != "none":
+            raise G3StreamReceiverError("plan-only cannot inspect legacy state")
         deadline = time.monotonic() + arguments.overall_timeout_seconds
 
         if arguments.legacy_state_action != "none":
@@ -319,6 +356,7 @@ def main() -> int:
             raise G3StreamReceiverError("receiver deadline expired")
 
         def ready(plan: StreamReceptionPlan) -> None:
+            _check_expected_offset(arguments, plan)
             _emit(
                 {
                     "schema_version": PROTOCOL_VERSION,
@@ -330,24 +368,40 @@ def main() -> int:
                 },
                 stream=sys.stdout,
             )
+            if arguments.plan_only:
+                raise _ReceptionPlanComplete(plan)
 
-        result = receive_streamed_asset(
-            spec,
-            target,
-            sys.stdin.buffer,
-            on_ready=ready,
-            policy=AcquisitionPolicy(
-                max_attempts=1,
-                request_timeout_seconds=60.0,
-                overall_timeout_seconds=remaining,
-                initial_backoff_seconds=0.0,
-                max_backoff_seconds=0.0,
-                lock_timeout_seconds=60.0,
-                lock_poll_interval_seconds=0.1,
-                chunk_size=4 * 1024 * 1024,
-            ),
-            data_root=data_root,
-        )
+        try:
+            result = receive_streamed_asset(
+                spec,
+                target,
+                sys.stdin.buffer,
+                on_ready=ready,
+                policy=AcquisitionPolicy(
+                    max_attempts=1,
+                    request_timeout_seconds=60.0,
+                    overall_timeout_seconds=remaining,
+                    initial_backoff_seconds=0.0,
+                    max_backoff_seconds=0.0,
+                    lock_timeout_seconds=60.0,
+                    lock_poll_interval_seconds=0.1,
+                    chunk_size=4 * 1024 * 1024,
+                ),
+                data_root=data_root,
+            )
+        except _ReceptionPlanComplete as complete:
+            _emit(
+                {
+                    "schema_version": PROTOCOL_VERSION,
+                    "phase": "PLAN_COMPLETE",
+                    "object_id": arguments.object_id,
+                    "binding": binding.to_dict(),
+                    "reception": complete.plan.to_dict(),
+                    "runtime_urls_persisted": False,
+                },
+                stream=sys.stdout,
+            )
+            return 0
         _emit(
             {
                 "schema_version": PROTOCOL_VERSION,

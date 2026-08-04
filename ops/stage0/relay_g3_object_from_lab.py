@@ -20,6 +20,7 @@ import subprocess
 import sys
 import threading
 import time
+from types import SimpleNamespace
 from typing import Any, BinaryIO, Callable
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote
@@ -98,6 +99,16 @@ def _parser() -> argparse.ArgumentParser:
         default="official",
         help="Named in-memory endpoint origin; runtime URLs are never persisted.",
     )
+    parser.add_argument(
+        "--relay-mode",
+        choices=("duplex", "emit"),
+        default="duplex",
+        help=(
+            "Use the duplex receiver protocol (default) or emit only the fixed "
+            "HTTP byte range for an external native pipe."
+        ),
+    )
+    parser.add_argument("--emit-offset", type=int, default=0)
     parser.add_argument(
         "--server-alias",
         choices=APPROVED_SERVER_ALIASES,
@@ -181,6 +192,20 @@ def _validate(arguments: argparse.Namespace) -> None:
         raise RelayError("ROUTE_ALIAS_MISMATCH")
     if getattr(arguments, "endpoint_profile", "official") not in ENDPOINT_PROFILES:
         raise RelayError("ENDPOINT_PROFILE_INVALID")
+    relay_mode = getattr(arguments, "relay_mode", "duplex")
+    emit_offset = getattr(arguments, "emit_offset", 0)
+    if relay_mode not in {"duplex", "emit"}:
+        raise RelayError("RELAY_MODE_INVALID")
+    if (
+        isinstance(emit_offset, bool)
+        or not isinstance(emit_offset, int)
+        or not 0 <= emit_offset < arguments.expected_size
+    ):
+        raise RelayError("EMIT_OFFSET_INVALID")
+    if relay_mode == "emit" and (
+        arguments.route != "lab-direct" or arguments.max_attempts != 1
+    ):
+        raise RelayError("EMIT_MODE_CONTRACT_INVALID")
 
 
 def _binding(arguments: argparse.Namespace) -> dict[str, Any]:
@@ -608,6 +633,65 @@ def _wait_receiver(
         raise RelayError("OVERALL_TIMEOUT") from None
 
 
+def _open_http_response(
+    arguments: argparse.Namespace,
+    *,
+    offset: int,
+    deadline: float,
+) -> Any:
+    remaining_time = deadline - time.monotonic()
+    if remaining_time <= 0:
+        raise RelayError("OVERALL_TIMEOUT")
+    headers = {
+        "Accept-Encoding": "identity",
+        "User-Agent": "param-importance-lab-stream-relay/1",
+    }
+    if offset:
+        headers["Range"] = f"bytes={offset}-"
+    request = Request(
+        _runtime_url(
+            arguments.object_id,
+            arguments.revision,
+            endpoint_profile=getattr(
+                arguments,
+                "endpoint_profile",
+                "official",
+            ),
+        ),
+        headers=headers,
+        method="GET",
+    )
+    timeout = min(arguments.request_timeout_seconds, remaining_time)
+    try:
+        return _bounded_call(
+            lambda: urlopen(request, timeout=timeout),
+            deadline=deadline,
+        )
+    except HTTPError as error:
+        error.close()
+        raise RelayError(f"HTTP_STATUS_{error.code}") from None
+    except (URLError, TimeoutError, OSError) as error:
+        raise RelayError("HTTP_NETWORK_ERROR") from error
+
+
+def _emit_once(arguments: argparse.Namespace, *, deadline: float) -> None:
+    offset = arguments.emit_offset
+    response = _open_http_response(arguments, offset=offset, deadline=deadline)
+    with response:
+        expected_bytes = _validate_response(
+            response,
+            offset=offset,
+            expected_size=arguments.expected_size,
+        )
+        _stream_response(
+            response,
+            SimpleNamespace(stdin=sys.stdout.buffer),
+            arguments=arguments,
+            expected_bytes=expected_bytes,
+            deadline=deadline,
+        )
+
+
 def _emit(value: dict[str, Any], *, stream: Any = sys.stdout) -> None:
     stream.write(json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n")
     stream.flush()
@@ -640,39 +724,11 @@ def _relay_once(
             flush=True,
         )
         if not already_ready and offset < arguments.expected_size:
-            remaining_time = deadline - time.monotonic()
-            if remaining_time <= 0:
-                raise RelayError("OVERALL_TIMEOUT")
-            headers = {
-                "Accept-Encoding": "identity",
-                "User-Agent": "param-importance-lab-stream-relay/1",
-            }
-            if offset:
-                headers["Range"] = f"bytes={offset}-"
-            request = Request(
-                _runtime_url(
-                    arguments.object_id,
-                    arguments.revision,
-                    endpoint_profile=getattr(
-                        arguments,
-                        "endpoint_profile",
-                        "official",
-                    ),
-                ),
-                headers=headers,
-                method="GET",
+            response = _open_http_response(
+                arguments,
+                offset=offset,
+                deadline=deadline,
             )
-            timeout = min(arguments.request_timeout_seconds, remaining_time)
-            try:
-                response = _bounded_call(
-                    lambda: urlopen(request, timeout=timeout),
-                    deadline=deadline,
-                )
-            except HTTPError as error:
-                error.close()
-                raise RelayError(f"HTTP_STATUS_{error.code}") from None
-            except (URLError, TimeoutError, OSError) as error:
-                raise RelayError("HTTP_NETWORK_ERROR") from error
             with response:
                 expected_bytes = _validate_response(
                     response,
@@ -732,6 +788,26 @@ def main() -> int:
         )
         return 2
     deadline = time.monotonic() + arguments.overall_timeout_seconds
+    if arguments.relay_mode == "emit":
+        try:
+            _emit_once(arguments, deadline=deadline)
+        except (RelayError, OSError, subprocess.SubprocessError) as error:
+            code = error.code if isinstance(error, RelayError) else type(error).__name__
+            failure_code = re.sub(r"[^A-Z0-9_]", "_", code.upper())[:128]
+            print(
+                f"object_id={arguments.object_id} phase=EMIT_FAILED "
+                f"code={failure_code}",
+                file=sys.stderr,
+                flush=True,
+            )
+            return 2
+        print(
+            f"object_id={arguments.object_id} phase=EMIT_COMPLETE "
+            f"offset={arguments.emit_offset} expected_size={arguments.expected_size}",
+            file=sys.stderr,
+            flush=True,
+        )
+        return 0
     for attempt in range(1, arguments.max_attempts + 1):
         try:
             complete = _relay_once(arguments, deadline=deadline)

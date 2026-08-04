@@ -353,3 +353,34 @@ G1-D 有效期、中文动态 Worklog、Stage 1 handoff 和不可覆盖的 `READ
   均退出 0。
 - 上述源码修改形成新提交后，`f9a0c43` 的 bootstrap 自动成为旧提交证据，不得交给后续
   Gate；必须重新快进 GitHub/服务器并从新最终 HEAD 重跑 G0–G10。当前仍是“收尾中”。
+
+## 2026-08-04 11:10 CST — 镜像中继双向管道诊断与原生字节管道修复
+
+- endpoint/Python profile 修复提交为 `88254d2e55038e195c4ea4a03806de08d77232e8`；本机、
+  GitHub、服务器已非强推/`--ff-only` 同步到该提交，增量 bundle 两端均已精确删除，
+  `Agent/` 五文件集合与 SHA-256 继续完全一致。该提交的 G0–G2 bootstrap 使用错误的通用
+  环境时按设计以 `STAGE0_BOOTSTRAP_G2_RUNTIME_MISMATCH` 拒绝且未发布证据；改用 G2 冻结的
+  `/envs/parameter-importance-stage0-1bd963c65f75` 后通过，index 为
+  `evidence/stage0/bootstrap/88254d2e55038e195c4ea4a03806de08d77232e8/index.json`。
+- `hf-mirror + cjl-python312` 的 99 字节正式 duplex relay 在 900 秒 deadline 后失败；120 秒
+  单尝试诊断给出安全失败码 `OVERALL_TIMEOUT`，且从未出现 `READY`。失败后无 receiver/relay
+  残留，中央 `.part` 仍是 0 字节空哈希、单链接，最终目标不存在，advisory lock 可立即取得。
+- lab Python 的 urllib 默认和显式无代理请求都在约 1 秒命中冻结的 99 字节与 SHA-256，故
+  HTTP/镜像不是根因。最小探针定位到 Windows `ssh.exe` 被 Python 同时连接 stdin/stdout
+  管道时不转发短行；相同 alias 从默认 shell 正常，本机 `cmd.exe` 原生双 SSH 管道也以
+  9 字节探针正常收口。
+- 已实现命名 `lab-pipe` fallback：独立 `plan-only` receiver 在锁内给出 resume offset；lab
+  emitter 只输出该固定 Range，本机只做不落盘原生字节管道；正式 receiver 再次锁定并要求
+  offset 精确一致，最终仍由服务器执行大小、SHA-256 和 no-clobber。任何竞争、短流或哈希
+  错误都失败关闭并保留可恢复 `.part`。新增 offset、plan transcript、命令注入边界、emit
+  单尝试、dispatcher 编排与完整 receiver transcript 测试后，中继单文件回归为
+  `27 passed, 0 failed`。三文件组合首轮被 300 秒工具上限终止于 35 个通过点、无失败；
+  拆分复核分别为 `26/26`、`5/5`、`16/16`，加入最终编排测试后以 600 秒上限完成同进程
+  组合回归：`48 passed, 0 failed`（233.05 秒）。
+- 提交前扩展资产状态机回归顺序执行为 `19 passed`，以及 `188 passed, 1 skipped`；skip 仍是
+  既有 Windows 目录 symlink 权限能力，未计作 formal PASS。更宽的 G3 publication/formal
+  组合在 600 秒上限到达时前进至 8 个通过点、无失败；60 秒 faulthandler 栈连续落在不同
+  测试的 Git/source SHA 重放，而非锁死，故该次只记录为工具超时、不计作 PASS。直接相关
+  的 48 项组合和 207 项资产状态机测试均已完整退出 0；最终 Linux formal 链仍须重放 G3。
+- 上述新实现形成下一提交后，`88254d2` 的 bootstrap 将成为旧提交证据；须再次三端快进并
+  从新 HEAD 重跑 bootstrap 与 G3–G10，当前不发布 READY。
