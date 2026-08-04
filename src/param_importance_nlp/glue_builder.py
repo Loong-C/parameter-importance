@@ -1171,10 +1171,11 @@ def _offline_socket_guard(cache_root: Path) -> Iterator[_NetworkCounter]:
             return False
 
     def _loopback_endpoint(address: object) -> bool:
-        if isinstance(address, tuple) and address and _loopback_host(address[0]):
-            return True
+        if isinstance(address, tuple) and address:
+            return _loopback_host(address[0])
         if isinstance(address, str):
-            return _loopback_host(address)
+            # A bare string is an AF_UNIX socket path: purely local.
+            return True
         return False
 
     def _peer_loopback(instance: socket.socket) -> bool:
