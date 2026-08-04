@@ -1,0 +1,86 @@
+{
+  "schema_version": "stage0.g0-g-gpu-final.v1",
+  "generated_at": "2026-08-04T15:15:00+08:00",
+  "host": "sophgo13",
+  "gate": {
+    "id": "G0-G",
+    "status": "PASS",
+    "accepted_path": "B_PERSISTENT_EXACT_FOUR_UUID_EXCLUSION",
+    "boot_id": "1dc04123-4945-4d8b-abcb-27fb84725526",
+    "kernel": "6.8.0-136-generic",
+    "driver_version": "575.57.08"
+  },
+  "allowed_gpus": [
+    {"pci_bdf": "0000:9c:00.0", "uuid": "GPU-5c672d04-4f83-3cc0-80d0-0108b1b63267"},
+    {"pci_bdf": "0000:9d:00.0", "uuid": "GPU-e78c55cd-db97-b761-f559-dc6eae3be81d"},
+    {"pci_bdf": "0000:a0:00.0", "uuid": "GPU-9b2b2a3b-3547-187f-ca29-2c02624e2e4f"},
+    {"pci_bdf": "0000:a4:00.0", "uuid": "GPU-5a81500d-5e9c-b0d7-5607-fdfdaab65ff4"}
+  ],
+  "excluded_gpus": [
+    {"pci_bdf": "0000:4f:00.0", "uuid": "GPU-6ff7389b-eaf8-aefd-b2c6-1611be41fa5d", "disposition": "faulting device remains persistently excluded"},
+    {"pci_bdf": "0000:50:00.0", "uuid": "GPU-dc6cfc60-41dd-7bcf-ed09-b7deb5be342c", "disposition": "ECC/Xid/row-remap affected device remains persistently excluded"},
+    {"pci_bdf": "0000:53:00.0", "uuid": "GPU-180ff767-885a-7dc9-c8a9-921d65a01bbd", "disposition": "healthy spare excluded to enforce the exact-four project scope"},
+    {"pci_bdf": "0000:57:00.0", "uuid": "GPU-d0ce0b43-7e46-6bca-b078-5aa7043928d7", "disposition": "healthy spare excluded to enforce the exact-four project scope"}
+  ],
+  "persistent_configuration": {
+    "path": "/etc/modprobe.d/parameter-importance-stage0-gpu-exclusion.conf",
+    "module_parameter": "NVreg_ExcludedGpus",
+    "proc_parameter_matches_exact_excluded_uuid_order": true
+  },
+  "administrator_finalizer": {
+    "status": "PASS",
+    "run_id": "20260804T065558Z",
+    "path": "/var/lib/parameter-importance/stage0/g0-g-uuid-exclusion/service-finalize/finalize-20260804T065558Z.CBnTsok6",
+    "success_sha256": "97a7af622b96b02aab315e39c5c648a56fd2dfb1483876407b2d86e0bf544665",
+    "checksums_sha256": "398f601dfd7bcb0cba4e2e0c1dfea3462ec261452ff798a0c99dee935b028c85",
+    "response_sha256": "0b834c20ab2983aaac71afc370bbeea2bd8691608b00106ec3321e38e5a1e5e9",
+    "all_listed_checksums_verified": true,
+    "retry_baseline_restored": false
+  },
+  "services": {
+    "nvidia_persistenced": "active/enabled",
+    "containerd": "active/enabled",
+    "docker_service": "active/enabled",
+    "docker_socket": "active/enabled",
+    "snap_lxd_entry_units": "restored",
+    "fabric_manager": "NOT_APPLICABLE_MASKED",
+    "fabric_manager_reason": "No PCI function is bound to the nvidia-nvswitch driver; the topology is PCIe and Fabric Manager reports no applicable fabric."
+  },
+  "health": {
+    "nvml_device_count": 4,
+    "pytorch_device_count": 4,
+    "volatile_uncorrectable_ecc_each": 0,
+    "aggregate_uncorrectable_ecc_each": 0,
+    "row_remap_pending_each": "No",
+    "row_remap_failure_each": "No",
+    "compute_clients_after_validation": 0,
+    "current_boot_critical_gpu_or_pci_events": 0
+  },
+  "cuda_nccl_smoke": {
+    "status": "PASS",
+    "run_id": "20260804T071342Z",
+    "path": "/home/sophgo13/cjl/storage/parameter-importance/operations/stage0/g0-g-uuid-exclusion/cuda-nccl-smoke-20260804T071342Z",
+    "success_sha256": "6e2d7c0262846b23792c55e7a58c7eb52b6a0fffa77dc8470a04cb4d0bac9799",
+    "checksums_sha256": "1bff0e2ccc4fb9ad6e3180c97ae5072776c4c4d45c3e24d82a6500fb0d7fc48c",
+    "per_gpu_tensor_sha256": "fce2da7a35dbc8bb1b1439a4c9eb105713580620bc948cfea361501e6ab7fa56",
+    "nccl_allreduce_sha256": "9f47461e84e8cd4ca92cf3346f66f9c4c90d7017658d5636c30e70ca94cc8194",
+    "torch": "2.12.1+cu126",
+    "cuda_runtime": "12.6",
+    "cudnn_runtime": "9.10.2",
+    "nccl_runtime": "2.29.3",
+    "world_size": 4,
+    "allreduce_message_elements": 1048576,
+    "allreduce_collectives": 3,
+    "allreduce_expected_sum": 10.0,
+    "scope_note": "This is a hardware/environment communication smoke, not the S0.7 G6 distributed-semantics or performance gate."
+  },
+  "scope": {
+    "faulting_devices_repaired": false,
+    "faulting_devices_admitted": false,
+    "project_operates_only_on_allowed_four": true,
+    "stage4_or_stage5_formal_artifacts_in_scope": false,
+    "s0_4_through_s0_12_executed": false
+  },
+  "secrets_included": false,
+  "internal_server_information_included_with_project_owner_approval": true
+}
