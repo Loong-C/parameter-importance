@@ -198,6 +198,7 @@ class TrainingRunSpec:
     log_every_steps: int = 1
     weights_exogenous: bool = False
     common_mean_assumption: bool = False
+    requires_estimator_decision: bool = False
     estimator_decision_hash: str | None = None
     estimator_gate_status: str | None = None
     metadata: Mapping[str, object] = field(default_factory=dict)
@@ -231,7 +232,11 @@ class TrainingRunSpec:
             raise TypeError("TRAINING_IMPORTANCE_ENABLED_NOT_BOOL")
         if type(self.weights_exogenous) is not bool or type(self.common_mean_assumption) is not bool:
             raise TypeError("TRAINING_WEIGHT_ASSUMPTIONS_NOT_BOOL")
-        if self.run_intent == "formal" and self.importance_enabled:
+        if (
+            self.run_intent == "formal"
+            and self.importance_enabled
+            and self.requires_estimator_decision
+        ):
             if self.estimator_decision_hash is None or len(self.estimator_decision_hash) != 64:
                 raise ValueError("FORMAL_TRAINING_ESTIMATOR_DECISION_REQUIRED")
             if self.estimator_gate_status not in _GATE_ACCEPTED:
@@ -296,6 +301,7 @@ class TrainingRunSpec:
             "log_every_steps": self.log_every_steps,
             "weights_exogenous": self.weights_exogenous,
             "common_mean_assumption": self.common_mean_assumption,
+            "requires_estimator_decision": self.requires_estimator_decision,
             "estimator_decision_hash": self.estimator_decision_hash,
             "estimator_gate_status": self.estimator_gate_status,
             "metadata": thaw_json_value(self.metadata),
@@ -331,14 +337,19 @@ class TrainingRunSpec:
             "importance_enabled", "estimator_name", "accumulation_dtype", "max_grad_norm",
             "autocast_dtype", "checkpoint_every_steps", "log_every_steps",
             "weights_exogenous", "common_mean_assumption", "estimator_decision_hash",
-            "estimator_gate_status", "metadata", "checkpoint_segments",
+            "estimator_gate_status", "requires_estimator_decision",
+            "metadata", "checkpoint_segments",
         }
         # 0.3.x 的 wire spec 没有 checkpoint_segments；读取时迁移为空分段，仍按
         # checkpoint_every_steps 工作。写出始终使用新的完整字段集合。
-        if set(value) == expected - {"checkpoint_segments"}:
-            value = {**dict(value), "checkpoint_segments": []}
-        elif set(value) != expected:
+        migrated = dict(value)
+        if "checkpoint_segments" not in migrated:
+            migrated["checkpoint_segments"] = []
+        if "requires_estimator_decision" not in migrated:
+            migrated["requires_estimator_decision"] = False
+        if set(migrated) != expected:
             raise ValueError("TRAINING_RUN_SPEC_FIELDS_MISMATCH")
+        value = migrated
         if not isinstance(value["metadata"], Mapping):
             raise TypeError("TRAINING_RUN_SPEC_METADATA_NOT_OBJECT")
         raw_segments = value["checkpoint_segments"]

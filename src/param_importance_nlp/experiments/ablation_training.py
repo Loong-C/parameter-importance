@@ -1030,6 +1030,7 @@ class ConfiguredAblationTrainingBuilder:
             log_every_steps=int(logging["log_every_steps"]),
             weights_exogenous=bool(data["weights_exogenous"]),
             common_mean_assumption=bool(data["common_mean_assumption"]),
+            requires_estimator_decision=(resolved_config.run_intent == "formal"),
             estimator_decision_hash=decision_hash,
             estimator_gate_status=decision_gate,
             metadata={

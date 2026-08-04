@@ -268,8 +268,21 @@ def test_classification_evaluator_restores_training_mode() -> None:
 
 def test_formal_training_rejects_missing_decision_and_gate() -> None:
     try:
-        TrainingRunSpec("formal", "formal", 1, 1)
+        TrainingRunSpec(
+            "formal",
+            "formal",
+            1,
+            1,
+            requires_estimator_decision=True,
+        )
     except ValueError as exc:
         assert str(exc) == "FORMAL_TRAINING_ESTIMATOR_DECISION_REQUIRED"
-    else:  # pragma: no cover - fail-closed 防线
+    else:
         raise AssertionError("formal training 不应在缺少 decision 时构造成功")
+    TrainingRunSpec(
+        "formal",
+        "formal",
+        1,
+        1,
+        requires_estimator_decision=False,
+    )

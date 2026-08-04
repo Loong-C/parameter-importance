@@ -1252,6 +1252,9 @@ class TrainingTaskRunner(TaskRunner):
             log_every_steps=int(base_logging["log_every_steps"]),
             weights_exogenous=bool(base_data["weights_exogenous"]),
             common_mean_assumption=bool(base_data["common_mean_assumption"]),
+            requires_estimator_decision=(
+                request.task.formal_eligibility.requires_estimator_decision
+            ),
             estimator_decision_hash=decision_hash,
             estimator_gate_status=decision_gate,
             metadata={
