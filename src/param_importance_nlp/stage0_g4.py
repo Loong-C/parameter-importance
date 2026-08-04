@@ -465,9 +465,9 @@ def _publish_g4(
     data_config = base.section("data")
     runtime_config = base.section("runtime")
     if (
-        model_config["asset_id"] != model["asset_id"]
-        or model_config["tokenizer_asset_id"] != tokenizer["asset_id"]
-        or data_config["asset_id"] != data["asset_id"]
+        model_config["asset_id"] != model["logical_name"]
+        or model_config["tokenizer_asset_id"] != tokenizer["logical_name"]
+        or data_config["asset_id"] != data["logical_name"]
         or runtime_config["environment_id"] != environment_id
     ):
         raise Stage0G4Error("G4_CONFIG_PROVENANCE_BINDING_INVALID")
@@ -777,14 +777,14 @@ def build_stage0_g4_config(
                 "cache_root": "cache/stage0",
             },
             "model": {
-                "asset_id": model["asset_id"],
+                "asset_id": model["logical_name"],
                 "revision": model["ready_manifest_sha256"],
-                "tokenizer_asset_id": tokenizer["asset_id"],
+                "tokenizer_asset_id": tokenizer["logical_name"],
                 "initialization_id": model["candidate_id"],
                 "architecture": "gpt-neox",
             },
             "data": {
-                "asset_id": data["asset_id"],
+                "asset_id": data["logical_name"],
                 "revision": data["ready_manifest_sha256"],
                 "split": "train",
                 "sequence_length": 2048,

@@ -453,6 +453,12 @@ def test_g4_formal_runner_publishes_real_contracts_and_pass_gate(
         tmp_path, first.task_output_refs["provenance_record"], require_formal=True
     )
     assert config.payload["schema_version"] == "resolved-config-v2"
+    assert config.payload["base_config"]["model"]["asset_id"] == "pythia-14m-step0"
+    assert (
+        config.payload["base_config"]["model"]["tokenizer_asset_id"]
+        == "pythia-tokenizer"
+    )
+    assert config.payload["base_config"]["data"]["asset_id"] == "pile-selected-prefix"
     assert run.payload["schema_version"] == "run-identity-v1"
     assert len(seed.payload["rank_training"]) == 4
     assert provenance.payload["gate_record"]["status"] == "PASS"
