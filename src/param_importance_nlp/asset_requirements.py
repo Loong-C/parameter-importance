@@ -316,7 +316,7 @@ def _validate_tokenizer(value: Any) -> None:
         "vocab_size": 50254,
         "token_count_with_added_tokens": 50277,
         "vocab_mapping_sha256": (
-            "728db3c8825c64b8de98049c042221ba64b16a89348ada66f8d63c3d12dea84f"
+            "0056c51965ea69bd98fd13ef7e8a07aadfdd7db04546729872abcd50c1910d6b"
         ),
     }
     for field, expected in expected_scalars.items():
