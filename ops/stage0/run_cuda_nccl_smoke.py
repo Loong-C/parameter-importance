@@ -254,6 +254,9 @@ def _nccl_worker(
     port: int,
     result_queue: "mp.Queue[dict[str, Any]]",
 ) -> None:
+    import torch  # noqa: E402
+    import torch.distributed as dist  # noqa: E402
+
     os.environ["MASTER_ADDR"] = "127.0.0.1"
     os.environ["MASTER_PORT"] = str(port)
     os.environ["RANK"] = str(rank)
