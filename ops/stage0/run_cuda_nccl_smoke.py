@@ -117,6 +117,13 @@ def write_json(path: Path, payload: dict[str, Any]) -> None:
     )
 
 
+def load_json(path: Path) -> dict[str, Any]:
+    value = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(value, dict):
+        raise SmokeError(f"JSON root must be an object: {path}")
+    return value
+
+
 def parse_boot_id() -> str:
     boot_id = Path("/proc/sys/kernel/random/boot_id").read_text(encoding="ascii").strip()
     if not re.fullmatch(
@@ -529,6 +536,7 @@ def main(argv: list[str] | None = None) -> int:
     for path in output_root.iterdir():
         path.chmod(0o444)
 
+    per_gpu = load_json(output_root / "per-gpu-tensor.json")
     print(
         json.dumps(
             {
@@ -536,10 +544,10 @@ def main(argv: list[str] | None = None) -> int:
                 "run_id": run_id,
                 "boot_id": boot_id,
                 "evidence": str(output_root),
-                "torch": torch.__version__,
-                "cuda_runtime": torch.version.cuda,
-                "cudnn": torch.backends.cudnn.version(),
-                "nccl": list(torch.cuda.nccl.version()),
+                "torch": per_gpu["torch"],
+                "cuda_runtime": per_gpu["cuda_runtime"],
+                "cudnn": per_gpu["cudnn"],
+                "nccl": per_gpu["nccl"],
             },
             indent=2,
             sort_keys=True,
