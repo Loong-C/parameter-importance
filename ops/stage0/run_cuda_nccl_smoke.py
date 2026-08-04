@@ -349,10 +349,28 @@ def nccl_smoke() -> dict[str, Any]:
     }
 
 
+def run_smoke_worker(output_root: Path) -> None:
+    """Run the CUDA work in a dedicated process with no parent contexts."""
+    import torch  # noqa: E402
+    import torch.distributed as dist  # noqa: E402
+    import torch.multiprocessing as mp  # noqa: E402
+
+    globals()["torch"] = torch
+    globals()["dist"] = dist
+    globals()["mp"] = mp
+
+    _validate_expected_runtime()
+    per_gpu = per_gpu_smoke()
+    nccl = nccl_smoke()
+    write_json(output_root / "per-gpu-tensor.json", per_gpu)
+    write_json(output_root / "nccl-allreduce.json", nccl)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--data-root", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, default=None)
+    parser.add_argument("--smoke-worker", action="store_true")
     arguments = parser.parse_args(argv)
 
     data_root = arguments.data_root.resolve(strict=True)
@@ -370,6 +388,12 @@ def main(argv: list[str] | None = None) -> int:
     output_root = output_root.resolve()
     if not str(output_root).startswith(str(data_root)):
         raise SmokeError("output directory escapes the approved data root")
+    if arguments.smoke_worker:
+        if not output_root.is_dir() or output_root.is_symlink():
+            raise SmokeError(f"worker output is not a real directory: {output_root}")
+        run_smoke_worker(output_root)
+        return 0
+
     if output_root.exists():
         raise SmokeError(f"output directory already exists: {output_root}")
     output_root.mkdir(parents=True, exist_ok=False)
@@ -386,21 +410,32 @@ def main(argv: list[str] | None = None) -> int:
     (output_root / "row-remapper-before.txt").write_text(row_before, encoding="utf-8")
     (output_root / "compute-apps-before.csv").write_text("", encoding="utf-8")
 
-    # Importing a CUDA-enabled torch can create a tiny driver context on this
-    # host.  The before-snapshot therefore must be captured by the same process
-    # before any torch import, so the evidence reflects the idle baseline.
-    import torch  # noqa: E402
-    import torch.distributed as dist  # noqa: E402
-    import torch.multiprocessing as mp  # noqa: E402
-
-    globals()["torch"] = torch
-    globals()["dist"] = dist
-    globals()["mp"] = mp
-
-    _validate_expected_runtime()
-
-    per_gpu = per_gpu_smoke()
-    nccl = nccl_smoke()
+    # CUDA work runs in a dedicated child process so the orchestrator never
+    # creates a driver context and the after-snapshot reflects the true idle
+    # baseline rather than this script's own allocations.
+    try:
+        completed = subprocess.run(
+            [
+                sys.executable,
+                os.path.abspath(__file__),
+                "--smoke-worker",
+                "--data-root",
+                str(data_root),
+                "--output-dir",
+                str(output_root),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=900,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise SmokeError(f"CUDA/NCCL worker failed to run: {error}") from error
+    if completed.returncode != 0:
+        raise SmokeError(
+            f"CUDA/NCCL worker exited {completed.returncode}\n"
+            f"stdout:\n{completed.stdout}\nstderr:\n{completed.stderr}"
+        )
 
     assert_no_compute_apps("after the smoke")
     nvml_after = nvml_csv()
@@ -424,8 +459,6 @@ def main(argv: list[str] | None = None) -> int:
     if critical_lines:
         raise SmokeError(f"critical kernel events during smoke:\n{critical_lines}")
 
-    write_json(output_root / "per-gpu-tensor.json", per_gpu)
-    write_json(output_root / "nccl-allreduce.json", nccl)
     (output_root / "SUCCESS").write_text(
         "\n".join(
             [
