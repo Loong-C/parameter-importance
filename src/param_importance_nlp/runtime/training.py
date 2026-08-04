@@ -1134,11 +1134,13 @@ class TrainingEngine:
         """取得 scaled micro gradients；不写 ``Parameter.grad``。"""
 
         parameters = tuple(self.named_parameters.values())
+        parameter_device = next(iter(parameters)).device
         gradients: list[dict[str, torch.Tensor]] = []
         weights: list[float] = []
         loss_numerator = 0.0
         effective_count = 0
         for microbatch in microbatches:
+            microbatch = microbatch.to(parameter_device)
             # 若 module 是 DistributedDataParallel，所有 microbatch 都放在
             # ``no_sync`` 中；全局 mean 与 U 充分量由项目 reducer 恰好归约一次，
             # 避免 DDP hook 与显式统计归约重复通信/重复除 world size。
