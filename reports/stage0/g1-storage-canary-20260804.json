@@ -1,0 +1,127 @@
+{
+  "canaries": [
+    {
+      "first_sha256": "717ec62cf036322ca100b2a25ea1673b612fa39555bc5179541dd08b4e47d814",
+      "kind": "datasets",
+      "ok": true,
+      "path": "/home/sophgo13/cjl/storage/parameter-importance/datasets/.stage0-canary-d6255b298fa04925bea814209eebdf0d.txt",
+      "published_sha256": "2a1fe020b2d20ad5b33a71bb77b47775b2a2cf80047426af73b40ad03a40a9bb",
+      "published_size": 66
+    },
+    {
+      "first_sha256": "453629767df2275a4d67c5afe30bc870f95e1d5b71ae8b301e3d63b223a8260c",
+      "kind": "models",
+      "ok": true,
+      "path": "/home/sophgo13/cjl/storage/parameter-importance/models/.stage0-canary-465ab1092ce340ab86f2963712fd14e7.txt",
+      "published_sha256": "1c7cb6d94d6ec1bcc6ee1ececb5a82b97debfc929a04a349b63e22169d954c27",
+      "published_size": 64
+    },
+    {
+      "first_sha256": "0f4ec09381d3e5f68b89e84d51c2a0e2da463783b21a0ea704bfa1213f06fe5d",
+      "kind": "cache",
+      "ok": true,
+      "path": "/home/sophgo13/cjl/storage/parameter-importance/cache/.stage0-canary-2b2bcc6fcfab4a0b96a885eae13bb4a4.txt",
+      "published_sha256": "57efb0772cd91b29ff589e6d6cd09cd73f73abcc95675dd64ff0f74c1fff6432",
+      "published_size": 63
+    },
+    {
+      "first_sha256": "5d86c67604a5ec5e0281b0885fea0a773bbe2565f5e5de768147749bc1fdbb26",
+      "kind": "checkpoints",
+      "ok": true,
+      "path": "/home/sophgo13/cjl/storage/parameter-importance/checkpoints/.stage0-canary-68df9501ace24d9ead6311678f0d7022.txt",
+      "published_sha256": "14c0983484732cbdc1ddda845b115fe8cbeb97f6da243bf69cbda275794bcc7e",
+      "published_size": 69
+    },
+    {
+      "first_sha256": "32cf854cc3536dd7f08b9e7854c90c9070afaa373dca401be034e00df46f01b3",
+      "kind": "runs",
+      "ok": true,
+      "path": "/home/sophgo13/cjl/storage/parameter-importance/runs/.stage0-canary-a2334ba74ec8460c88ed72aa7ba6b8c3.txt",
+      "published_sha256": "64feeedbb6639ded1c3c3e928f366300d4c06fb575d896789f946cb6c43f9c54",
+      "published_size": 62
+    },
+    {
+      "first_sha256": "0da1cc5a50c4975d05206c14de14724514835ee2d7da6d67ca00d2d5405c4506",
+      "kind": "results",
+      "ok": true,
+      "path": "/home/sophgo13/cjl/storage/parameter-importance/results/.stage0-canary-9f4ad29a98594296996d83f0fd0cf6f8.txt",
+      "published_sha256": "00f004d4ae7d0ff70d2de32f4e9d43684f616a936a551fadfa8900f2f6818a47",
+      "published_size": 65
+    },
+    {
+      "first_sha256": "1c5d12577cd9858501820b6f177e4a97df4010e4b13b58c69b6c0250baa7f9f5",
+      "kind": "reports",
+      "ok": true,
+      "path": "/home/sophgo13/cjl/storage/parameter-importance/reports/.stage0-canary-8a06d5d4a4ea45979f41ae6412a7866c.txt",
+      "published_sha256": "a456172008c391b45f5ff225fe42945fb31c497ec8cd79db0497f0867cd3a563",
+      "published_size": 65
+    },
+    {
+      "first_sha256": "e369a45f4a4dca60b5e0f7d3174d76d7546108dc9c0bf5507e71172fe7bd18e0",
+      "kind": "manifests",
+      "ok": true,
+      "path": "/home/sophgo13/cjl/storage/parameter-importance/manifests/.stage0-canary-1aed9b7c84014e67aea32e15f48e93db.txt",
+      "published_sha256": "e1a71800b486b760c9b67c3863c5be24a424cb7b4b3b9cf5cc51f4f148c881cb",
+      "published_size": 67
+    },
+    {
+      "first_sha256": "fdb2e0bdf30075da87dece84b309b36379140e0e269a1366ce72b871301f2d98",
+      "kind": "operations",
+      "ok": true,
+      "path": "/home/sophgo13/cjl/storage/parameter-importance/operations/.stage0-canary-22581ac109f047b8b71290cc10c141ea.txt",
+      "published_sha256": "e85ef744309ed2c64fe5168c5d6beba322830851ae8c53f01c69cfd5e0b343d3",
+      "published_size": 68
+    },
+    {
+      "first_sha256": "f4821de8769307f4ac22f14a7cdcb241cdb68203d22da6b3f9d94f0956650602",
+      "kind": "wheelhouse",
+      "ok": true,
+      "path": "/home/sophgo13/cjl/storage/parameter-importance/wheelhouse/.stage0-canary-303b21de54fa4a88a40500c3b24572c0.txt",
+      "published_sha256": "fb07d13bc8d41432d8602f2f5ed31c3d86afd5a41c6426e39a808c79a9ab274b",
+      "published_size": 68
+    },
+    {
+      "first_sha256": "b0c72255a1bef27c46ef9e548abbb6ca4bbf7e323156dbb206431dbc04673c40",
+      "kind": "envs",
+      "ok": true,
+      "path": "/home/sophgo13/cjl/storage/parameter-importance/envs/.stage0-canary-e9a7b89376ab429c8e8fa5c755719f3f.txt",
+      "published_sha256": "6ea50dd6902a41b4532f9f4dd5e89c854cb8c345640a81ae3d4ae909b89a5dfe",
+      "published_size": 62
+    },
+    {
+      "first_sha256": "927575a27c2d275efa9ccd2658f3aaf5e9a71f4479eb62c91da8df748c0b14ec",
+      "kind": "source",
+      "ok": true,
+      "path": "/home/sophgo13/cjl/storage/parameter-importance/source/.stage0-canary-76b8996d043d4b71888af56bd25ecdfb.txt",
+      "published_sha256": "10c8110b022aca29a58dfe12430d711725ba0863a5e32eaa61c2d1276c565ad9",
+      "published_size": 64
+    },
+    {
+      "first_sha256": "feb763a10cbb7da71e337592720dfb508c5a896e1a3750e2bb560b3366f59b0e",
+      "kind": "tmp",
+      "ok": true,
+      "path": "/home/sophgo13/cjl/storage/parameter-importance/tmp/.stage0-canary-592f54fabc4d49d29cf1e4d5ea04c8ed.txt",
+      "published_sha256": "0098b31033468277961fe3a4e86600120bdfda56cef932b01fa8594bca64419f",
+      "published_size": 61
+    }
+  ],
+  "data_root": "/home/sophgo13/cjl/storage/parameter-importance",
+  "directories": [
+    "datasets",
+    "models",
+    "cache",
+    "checkpoints",
+    "runs",
+    "results",
+    "reports",
+    "manifests",
+    "operations",
+    "wheelhouse",
+    "envs",
+    "source",
+    "tmp"
+  ],
+  "failures": [],
+  "ok": true,
+  "schema_version": "stage0.storage-check.v1"
+}

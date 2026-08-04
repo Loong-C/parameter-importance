@@ -1,0 +1,22 @@
+{
+  "budget": {
+    "expected_new_bytes": 620000000000,
+    "name": "stage0",
+    "required_free_bytes": 744000000000,
+    "safety_margin_bytes": 124000000000
+  },
+  "measurement": {
+    "data_free_bytes": 3011151384576,
+    "data_ok": true,
+    "data_required_free_bytes": 744000000000,
+    "inode_free": 233381501,
+    "inode_ok": true,
+    "inode_total": 234422272,
+    "ok": true,
+    "root_free_bytes": 39949303808,
+    "root_minimum_free_bytes": 10737418240,
+    "root_ok": true
+  },
+  "ok": true,
+  "schema_version": "stage0.storage-launch-check.v1"
+}

@@ -1,0 +1,67 @@
+{
+  "schema_version": "stage0.gate-report.v1",
+  "generated_at": "2026-08-04T15:35:00+08:00",
+  "git_commit": "3bb0f5ace2a6832b20ba5ce67feed798d315084a",
+  "canary_implementation_commit": "3bb0f5ace2a6832b20ba5ce67feed798d315084a",
+  "gate": "G1-B",
+  "status": "PASS",
+  "checks": {
+    "authorized_layout": {
+      "status": "PASS",
+      "required_directory_count": 13,
+      "missing_directories": 0,
+      "not_read_write_directories": 0,
+      "implicit_fallback_forbidden": true
+    },
+    "canary": {
+      "status": "PASS",
+      "directory_count": 13,
+      "passed": 13,
+      "failures": 0,
+      "residual_canary_files": 0,
+      "evidence": "reports/stage0/g1-storage-canary-20260804.json",
+      "sha256": "ee24d9865a899068327f7ebdd6b763fa04ae87589cca0b77d3578acdfc0da11a",
+      "server_authoritative_path": "/home/sophgo13/cjl/storage/parameter-importance/tmp/stage0-canary-20260804.json"
+    },
+    "launch_capacity": {
+      "status": "PASS",
+      "stage0_expected_new_bytes": 620000000000,
+      "stage0_required_free_bytes": 744000000000,
+      "data_root_free_bytes": 3011151384576,
+      "root_disk_minimum_free_bytes": 10737418240,
+      "root_disk_free_bytes": 39949303808,
+      "data_root_free_inodes": 233381501,
+      "data_root_inode_use_percent": 1,
+      "analytical_budget_evidence": "reports/stage0/g1-capacity-budget-20260804.json"
+    },
+    "git_guard": {
+      "status": "PASS",
+      "server_command_status": 0,
+      "maximum_unapproved_bytes": 10485760,
+      "forbidden_type_fixture": "PASS",
+      "forbidden_directory_fixture": "PASS",
+      "unknown_binary_fixture": "PASS",
+      "oversize_fixture": "PASS",
+      "full_worktree_scan": "PASS"
+    },
+    "lifecycle_and_retention": {
+      "status": "PASS",
+      "run_overwrite_rejected": true,
+      "attempt_and_session_isolation": true,
+      "terminal_state_restart_rejected": true,
+      "active_part_and_lock_protection": true,
+      "policy": "policies/storage-lifecycle.json"
+    },
+    "tests": {
+      "status": "PASS",
+      "local": "23 passed",
+      "server_at_commit": "23 passed",
+      "server_cpu_only": true
+    }
+  },
+  "active_pile_shard_touched": false,
+  "g1_d_status": "PASS",
+  "g1_d_satisfaction": "TIME_BOUNDED_RISK_ACCEPTANCE",
+  "g1_d_evidence": "reports/stage0/g1-persistence-decision-20260719.json",
+  "g1_overall_status": "PASS"
+}
