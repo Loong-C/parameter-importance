@@ -31,6 +31,11 @@ BINDING_SCHEMA_VERSION = "stage0-g3-relay-binding-v1"
 SERVER_ALIAS = "sophgo13"
 LOCAL_SERVER_ALIAS = "sophgo13-via-lab"
 APPROVED_SERVER_ALIASES = (SERVER_ALIAS, LOCAL_SERVER_ALIAS)
+ENDPOINT_PROFILES = ("official", "hf-mirror")
+_ENDPOINT_ORIGINS = {
+    "official": "https://huggingface.co",
+    "hf-mirror": "https://hf-mirror.com",
+}
 SERVER_REPO = "/home/sophgo13/cjl/parameter-importance"
 SERVER_DATA_ROOT = "/home/sophgo13/cjl/storage/parameter-importance"
 SERVER_PYTHON = f"{SERVER_DATA_ROOT}/envs/parameter-importance/bin/python"
@@ -87,6 +92,12 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--request-timeout-seconds", type=float, default=90.0)
     parser.add_argument("--overall-timeout-seconds", type=float, default=6 * 60 * 60)
     parser.add_argument("--chunk-size", type=int, default=4 * 1024 * 1024)
+    parser.add_argument(
+        "--endpoint-profile",
+        choices=ENDPOINT_PROFILES,
+        default="official",
+        help="Named in-memory endpoint origin; runtime URLs are never persisted.",
+    )
     parser.add_argument(
         "--server-alias",
         choices=APPROVED_SERVER_ALIASES,
@@ -168,6 +179,8 @@ def _validate(arguments: argparse.Namespace) -> None:
         None,
     ):
         raise RelayError("ROUTE_ALIAS_MISMATCH")
+    if getattr(arguments, "endpoint_profile", "official") not in ENDPOINT_PROFILES:
+        raise RelayError("ENDPOINT_PROFILE_INVALID")
 
 
 def _binding(arguments: argparse.Namespace) -> dict[str, Any]:
@@ -181,11 +194,20 @@ def _binding(arguments: argparse.Namespace) -> dict[str, Any]:
     }
 
 
-def _runtime_url(object_id: str, revision: str) -> str:
+def _runtime_url(
+    object_id: str,
+    revision: str,
+    *,
+    endpoint_profile: str = "official",
+) -> str:
+    try:
+        origin = _ENDPOINT_ORIGINS[endpoint_profile]
+    except KeyError as error:
+        raise RelayError("ENDPOINT_PROFILE_INVALID") from error
     owner, repository, *path_parts = object_id[len("huggingface/") :].split("/")
     encoded_path = "/".join(quote(part, safe="") for part in path_parts)
     return (
-        f"https://huggingface.co/{quote(owner, safe='')}/"
+        f"{origin}/{quote(owner, safe='')}/"
         f"{quote(repository, safe='')}/resolve/{quote(revision, safe='')}/"
         f"{encoded_path}"
     )
@@ -628,7 +650,15 @@ def _relay_once(
             if offset:
                 headers["Range"] = f"bytes={offset}-"
             request = Request(
-                _runtime_url(arguments.object_id, arguments.revision),
+                _runtime_url(
+                    arguments.object_id,
+                    arguments.revision,
+                    endpoint_profile=getattr(
+                        arguments,
+                        "endpoint_profile",
+                        "official",
+                    ),
+                ),
                 headers=headers,
                 method="GET",
             )

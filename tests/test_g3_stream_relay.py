@@ -32,6 +32,8 @@ def _dispatch_args(*object_ids: str) -> argparse.Namespace:
         object_id=list(object_ids),
         relay_process="local",
         overall_timeout_seconds=30.0,
+        endpoint_profile="official",
+        lab_python_profile="path",
     )
 
 
@@ -158,6 +160,64 @@ def test_dispatcher_sends_script_over_stdin_and_keeps_urls_out_of_argv(
     assert timeout <= arguments.overall_timeout_seconds
     assert results[0]["route"] == "lab-direct"
     assert results[0]["result_status"] == "downloaded"
+    assert results[0]["endpoint_profile"] == "official"
+    assert results[0]["lab_python_profile"] == "path"
+
+
+def test_relay_endpoint_profile_is_named_and_runtime_only() -> None:
+    official = relay._runtime_url(
+        _FIRST_OBJECT,
+        "a" * 40,
+        endpoint_profile="official",
+    )
+    mirror = relay._runtime_url(
+        _FIRST_OBJECT,
+        "a" * 40,
+        endpoint_profile="hf-mirror",
+    )
+    assert official.startswith("https://huggingface.co/")
+    assert mirror.startswith("https://hf-mirror.com/")
+    assert official.removeprefix("https://huggingface.co") == mirror.removeprefix(
+        "https://hf-mirror.com"
+    )
+    with pytest.raises(relay.RelayError, match="ENDPOINT_PROFILE_INVALID"):
+        relay._runtime_url(_FIRST_OBJECT, "a" * 40, endpoint_profile="invalid")
+
+
+def test_dispatcher_passes_only_the_named_mirror_profile_in_argv() -> None:
+    arguments = _dispatch_args(_FIRST_OBJECT)
+    arguments.relay_process = "lab"
+    arguments.endpoint_profile = "hf-mirror"
+    _, _, items = dispatcher._load_specs(arguments)
+    command = dispatcher._lab_command(
+        items[0][1],
+        overall_timeout_seconds=30.0,
+        endpoint_profile=arguments.endpoint_profile,
+    )
+    profile_index = command.index("--endpoint-profile")
+    assert command[profile_index + 1] == "hf-mirror"
+    assert all("://" not in item and "?" not in item for item in command)
+
+
+def test_dispatcher_uses_only_a_named_lab_python_profile() -> None:
+    arguments = _dispatch_args(_FIRST_OBJECT)
+    arguments.relay_process = "lab"
+    _, _, items = dispatcher._load_specs(arguments)
+    command = dispatcher._lab_command(
+        items[0][1],
+        overall_timeout_seconds=30.0,
+        lab_python_profile="cjl-python312",
+    )
+    assert r"C:\Users\cjl\Apps\Python312\python.exe" in command
+    assert command[command.index(dispatcher.LAB_ALIAS) + 1] == (
+        r"C:\Users\cjl\Apps\Python312\python.exe"
+    )
+    with pytest.raises(dispatcher.G3RelayDispatchError, match="profile is invalid"):
+        dispatcher._lab_command(
+            items[0][1],
+            overall_timeout_seconds=30.0,
+            lab_python_profile="arbitrary-command",
+        )
 
 
 def test_dispatcher_default_selection_is_the_exact_thirteen_object_freeze() -> None:

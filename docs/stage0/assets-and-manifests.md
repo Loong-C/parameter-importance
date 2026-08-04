@@ -167,3 +167,26 @@ weights = asset.path_for("model.safetensors")
 ## 旧资产迁移
 
 带 BOM、缺少固定 revision、类型化元数据、大小/SHA-256、角色/证据或连续状态历史的旧清单都不是 v1 manifest。迁移时保留旧文件作为诊断证据，对最终对象重新执行完整验真，生成新的 v1 候选，并发布到新路径；不得覆盖旧证据或把旧 READY 标记直接沿用为当前 gate 结果。
+
+## G3 受控流式中继
+
+当服务器不能直接取得冻结对象时，使用 `ops/stage0/dispatch_g3_relay_via_lab.py` 经文档规定的 SSH alias 中继。dispatcher 只接受 download plan 中的对象 ID、命名 endpoint profile 和命名 lab-pc Python profile；不得把 URL、签名参数或任意远程命令作为参数写入日志或证据。
+
+- `--endpoint-profile official` 是默认源；已核验镜像路径时可显式选择 `--endpoint-profile hf-mirror`。两者都在 lab-pc 进程内根据同一固定 revision 和对象 ID 派生 URL。
+- `--lab-python-profile path` 使用远端 `PATH`；受控 lab-pc 的用户级 Python 3.12 使用 `--lab-python-profile cjl-python312`。profile 是版本化枚举，不接受任意解释器命令。
+- relay 不在本机或 lab-pc 落盘对象字节；服务器 receiver 在对象专用锁内复用 `.part`，并在固定字节数和 SHA-256 全部通过后 no-clobber 发布最终文件。
+- 每次中继后仍须运行离线 acquisition、独立 verification 和 READY materialization；中继成功本身不是 G3 Gate PASS。
+
+示例：
+
+```powershell
+python ops/stage0/dispatch_g3_relay_via_lab.py `
+  --source-root . `
+  --requirements configs/stage0/g3-asset-requirements-v1.json `
+  --layout configs/stage0/g3-asset-layout-v1.json `
+  --plan configs/stage0/g3-download-plan-v1.json `
+  --relay-process lab `
+  --endpoint-profile hf-mirror `
+  --lab-python-profile cjl-python312 `
+  --object-id huggingface/EleutherAI/pythia-410m-deduped/config.json
+```

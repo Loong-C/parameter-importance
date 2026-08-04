@@ -27,6 +27,11 @@ from param_importance_nlp.storage import is_within
 LAB_ALIAS = "lab-pc"
 _RELAY_SCRIPT_REF = "ops/stage0/relay_g3_object_from_lab.py"
 _PROTOCOL_VERSION = "stage0-g3-ssh-stream-v1"
+_ENDPOINT_PROFILES = ("official", "hf-mirror")
+_LAB_PYTHON_PROFILES = {
+    "path": "python",
+    "cjl-python312": r"C:\Users\cjl\Apps\Python312\python.exe",
+}
 _SUCCESS_STATUSES = frozenset(
     {"downloaded", "already_ready", "published_by_peer"}
 )
@@ -61,6 +66,21 @@ def _parser() -> argparse.ArgumentParser:
         type=float,
         default=6 * 60 * 60,
         help="One monotonic deadline for the complete selected dispatch.",
+    )
+    parser.add_argument(
+        "--endpoint-profile",
+        choices=_ENDPOINT_PROFILES,
+        default="official",
+        help="Named in-memory relay endpoint; no runtime URL enters argv or evidence.",
+    )
+    parser.add_argument(
+        "--lab-python-profile",
+        choices=tuple(_LAB_PYTHON_PROFILES),
+        default="path",
+        help=(
+            "Named lab-pc Python interpreter profile; the controlled host's "
+            "user Python is selected without accepting an arbitrary command."
+        ),
     )
     return parser
 
@@ -170,6 +190,7 @@ def _relay_arguments(
     binding: G3RelayBinding,
     *,
     overall_timeout_seconds: float,
+    endpoint_profile: str,
 ) -> list[str]:
     return [
         "--object-id",
@@ -202,6 +223,8 @@ def _relay_arguments(
         binding.route,
         "--overall-timeout-seconds",
         str(overall_timeout_seconds),
+        "--endpoint-profile",
+        endpoint_profile,
     ]
 
 
@@ -209,7 +232,12 @@ def _lab_command(
     binding: G3RelayBinding,
     *,
     overall_timeout_seconds: float,
+    endpoint_profile: str = "official",
+    lab_python_profile: str = "path",
 ) -> list[str]:
+    lab_python = _LAB_PYTHON_PROFILES.get(lab_python_profile)
+    if lab_python is None:
+        raise G3RelayDispatchError("lab_python_profile is invalid")
     command = [
         "ssh",
         "-o",
@@ -221,11 +249,12 @@ def _lab_command(
         "-o",
         "ServerAliveCountMax=12",
         LAB_ALIAS,
-        "python",
+        lab_python,
         "-",
         *_relay_arguments(
             binding,
             overall_timeout_seconds=overall_timeout_seconds,
+            endpoint_profile=endpoint_profile,
         ),
     ]
     if any("://" in argument or "?" in argument for argument in command):
@@ -238,6 +267,7 @@ def _local_command(
     binding: G3RelayBinding,
     *,
     overall_timeout_seconds: float,
+    endpoint_profile: str = "official",
 ) -> list[str]:
     command = [
         sys.executable,
@@ -245,6 +275,7 @@ def _local_command(
         *_relay_arguments(
             binding,
             overall_timeout_seconds=overall_timeout_seconds,
+            endpoint_profile=endpoint_profile,
         ),
         "--server-alias",
         "sophgo13-via-lab",
@@ -344,6 +375,12 @@ def dispatch(arguments: argparse.Namespace) -> list[dict[str, Any]]:
     relay_process = getattr(arguments, "relay_process", "local")
     if relay_process not in {"local", "lab"}:
         raise G3RelayDispatchError("relay_process is invalid")
+    endpoint_profile = getattr(arguments, "endpoint_profile", "official")
+    if endpoint_profile not in _ENDPOINT_PROFILES:
+        raise G3RelayDispatchError("endpoint_profile is invalid")
+    lab_python_profile = getattr(arguments, "lab_python_profile", "path")
+    if lab_python_profile not in _LAB_PYTHON_PROFILES:
+        raise G3RelayDispatchError("lab_python_profile is invalid")
     results: list[dict[str, Any]] = []
     for index, (spec, binding) in enumerate(specs, start=1):
         remaining = deadline - time.monotonic()
@@ -351,7 +388,9 @@ def dispatch(arguments: argparse.Namespace) -> list[dict[str, Any]]:
             raise G3RelayDispatchError("relay dispatch deadline expired")
         print(
             f"relay={index}/{len(specs)} object_id={spec.source_id} "
-            f"expected_size={spec.expected_size} route={binding.route}",
+            f"expected_size={spec.expected_size} route={binding.route} "
+            f"endpoint_profile={endpoint_profile} "
+            f"lab_python_profile={lab_python_profile}",
             flush=True,
         )
         try:
@@ -360,6 +399,8 @@ def dispatch(arguments: argparse.Namespace) -> list[dict[str, Any]]:
                     _lab_command(
                         binding,
                         overall_timeout_seconds=remaining,
+                        endpoint_profile=endpoint_profile,
+                        lab_python_profile=lab_python_profile,
                     ),
                     input=relay_source,
                     check=False,
@@ -373,6 +414,7 @@ def dispatch(arguments: argparse.Namespace) -> list[dict[str, Any]]:
                         relay_path,
                         binding,
                         overall_timeout_seconds=remaining,
+                        endpoint_profile=endpoint_profile,
                     ),
                     check=False,
                     stdout=subprocess.PIPE,
@@ -395,6 +437,8 @@ def dispatch(arguments: argparse.Namespace) -> list[dict[str, Any]]:
             "source_git_commit": binding.source_git_commit,
             "plan_sha256": binding.plan_sha256,
             "result_status": protocol_result["status"],
+            "endpoint_profile": endpoint_profile,
+            "lab_python_profile": lab_python_profile,
         }
         results.append(result)
     return results

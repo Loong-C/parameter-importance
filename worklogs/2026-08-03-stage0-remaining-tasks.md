@@ -322,3 +322,34 @@ G1-D 有效期、中文动态 Worklog、Stage 1 handoff 和不可覆盖的 `READ
   `44a6317..HEAD` 重跑范围检查和完整 inventory；未通过前仍不生成 bundle 或 READY。
 - GitHub、服务器和 `Agent/` 外发同步仍等待本任务的明确授权；当前状态继续是“收尾中”，
   不生成或复用 `READY`。
+
+## 2026-08-04 10:03 CST — 外发授权、首次三端快进与 G3 缺失资产诊断
+
+- 用户已明确授权本任务将 Stage 0 分支推送 GitHub，并向 `sophgo13-via-lab` 传输完成
+  Stage 0 所需的增量 bundle、源码、配置和非敏感验证产物。同步前 GitHub、服务器都在
+  `44a63177b735bd2b5ecd7d84817d2bef2348837c`，服务器分支正确、工作树干净、origin 正确；
+  `Agent/` 五文件集合和 SHA-256 已与本机完全相同，无需冗余覆盖。
+- 本机/GitHub/服务器曾以非强推、经 SHA-256 验证的 bundle 和 `--ff-only` 同步到
+  `f9a0c43d02e5d93678bf97b6947a900c841e7d29`；本次服务器及本机 bundle 均已按精确路径
+  删除，可由 Git 历史重新生成。该提交上的 G0–G2 bootstrap 通过，index 为
+  `evidence/stage0/bootstrap/f9a0c43d02e5d93678bf97b6947a900c841e7d29/index.json`。
+- G3 acquisition 在 Python socket 离线审计下保留了一次正式失败：报告
+  `operations/stage0/g3-download-f9a0c43d02e5.json` 显示 410M 配置和 1.62 GB 权重为
+  `already_ready`，随后因 tokenizer 缺失触发 6 次被阻断的外连；审计记录 6 次外部 DNS
+  尝试且没有下载。独立只读全清单复核确认 13 个对象只有 2 个通过，缺少 3 个 tokenizer、
+  MNLI 5 个 parquet 和 RTE 3 个 parquet，共 11 个冻结对象。
+- 版本化 `lab-direct` relay 使用官方 Hugging Face endpoint 的 99 字节探针在 900 秒总
+  deadline 后以 `G3RelayDispatchError` 失败；服务器无残留进程、锁可获取、目标不存在、
+  对象专用 `.part` 为 0 字节，因此没有把部分内容冒充正式资产，也没有并发 writer。
+- lab-pc 的既有资产脚本使用 `hf-mirror.com`；不落盘内存探针从该镜像取得同一 99 字节并
+  精确命中冻结 SHA-256 `6f50ab5a...fdae7ad`。为避免运行时篡改版本化 relay，已新增显式
+  `official`/`hf-mirror` endpoint profile：argv 和日志只含枚举 profile 名，运行 URL 仍只
+  在 lab 进程内派生，receiver 的 source commit、plan/spec/control 哈希和 no-clobber 校验
+  保持不变。lab-pc 的系统 `PATH` 只有 WindowsApps alias，因此 dispatcher 还新增版本化
+  `path`/`cjl-python312` 解释器 profile；只允许命名枚举，不接受任意远程命令。relay、
+  acquisition 和 lifecycle 定向回归在 endpoint profile 首轮实现时为
+  `42 passed, 0 failed`；加入解释器 profile 与文档后的最终回归为
+  `43 passed, 0 failed`，`python -m compileall -q src ops tests` 与 `git diff --check`
+  均退出 0。
+- 上述源码修改形成新提交后，`f9a0c43` 的 bootstrap 自动成为旧提交证据，不得交给后续
+  Gate；必须重新快进 GitHub/服务器并从新最终 HEAD 重跑 G0–G10。当前仍是“收尾中”。
