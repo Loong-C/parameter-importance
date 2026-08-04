@@ -166,6 +166,38 @@ def assert_no_compute_apps(label: str) -> None:
         raise SmokeError(f"compute application detected {label}:\n{apps}")
 
 
+def capture_idle_snapshot(
+    label: str,
+    settle_seconds: int = 5,
+    attempts: int = 12,
+) -> tuple[str, str, str]:
+    """Wait until the four GPUs report zero activity and no compute apps."""
+    last_nvml = ""
+    last_apps = ""
+    for attempt in range(attempts):
+        apps = compute_apps()
+        nvml = nvml_csv()
+        busy = bool(apps.strip())
+        if not busy:
+            rows = [line for line in nvml.splitlines() if line.strip()]
+            if len(rows) == 4:
+                for row in rows:
+                    fields = [item.strip() for item in row.split(",")]
+                    if len(fields) == 8 and (fields[5] != "0" or fields[6] != "0"):
+                        busy = True
+        if not busy:
+            row_text = row_remapper()
+            return nvml, row_text, apps
+        last_nvml = nvml
+        last_apps = apps
+        if attempt + 1 < attempts:
+            time.sleep(settle_seconds)
+    raise SmokeError(
+        f"{label}: GPUs did not return to idle\n"
+        f"compute-apps:\n{last_apps}\nnvml:\n{last_nvml}"
+    )
+
+
 def validate_nvml_rows(csv_text: str, label: str) -> None:
     rows = [line for line in csv_text.splitlines() if line.strip()]
     if len(rows) != 4:
@@ -398,17 +430,15 @@ def main(argv: list[str] | None = None) -> int:
         raise SmokeError(f"output directory already exists: {output_root}")
     output_root.mkdir(parents=True, exist_ok=False)
 
-    assert_no_compute_apps("before the smoke")
-    nvml_before = nvml_csv()
+    nvml_before, row_before, apps_before = capture_idle_snapshot("before the smoke")
     validate_nvml_rows(nvml_before, "nvml-before")
-    row_before = row_remapper()
     cursor = journal_cursor()
     (output_root / "journal-cursor-start.txt").write_text(
         cursor + "\n", encoding="utf-8"
     )
     (output_root / "nvml-before.csv").write_text(nvml_before, encoding="utf-8")
     (output_root / "row-remapper-before.txt").write_text(row_before, encoding="utf-8")
-    (output_root / "compute-apps-before.csv").write_text("", encoding="utf-8")
+    (output_root / "compute-apps-before.csv").write_text(apps_before, encoding="utf-8")
 
     # CUDA work runs in a dedicated child process so the orchestrator never
     # creates a driver context and the after-snapshot reflects the true idle
@@ -437,10 +467,12 @@ def main(argv: list[str] | None = None) -> int:
             f"stdout:\n{completed.stdout}\nstderr:\n{completed.stderr}"
         )
 
-    assert_no_compute_apps("after the smoke")
-    nvml_after = nvml_csv()
+    nvml_after, row_after, apps_after = capture_idle_snapshot(
+        "after the smoke",
+        settle_seconds=5,
+        attempts=18,
+    )
     validate_nvml_rows(nvml_after, "nvml-after")
-    row_after = row_remapper()
     kernel_delta = run_command(
         ["journalctl", "-k", f"--after-cursor={cursor}", "--no-pager"],
         timeout=120,
@@ -450,7 +482,7 @@ def main(argv: list[str] | None = None) -> int:
     ]
     (output_root / "nvml-after.csv").write_text(nvml_after, encoding="utf-8")
     (output_root / "row-remapper-after.txt").write_text(row_after, encoding="utf-8")
-    (output_root / "compute-apps-after.csv").write_text("", encoding="utf-8")
+    (output_root / "compute-apps-after.csv").write_text(apps_after, encoding="utf-8")
     (output_root / "kernel-delta.txt").write_text(kernel_delta, encoding="utf-8")
     (output_root / "kernel-critical.txt").write_text(
         "\n".join(critical_lines) + ("\n" if critical_lines else ""),
