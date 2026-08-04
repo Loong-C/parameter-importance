@@ -733,7 +733,7 @@ def _decision_hash(request: TaskExecutionRequest, root: Path) -> tuple[str | Non
     # Stage 0/1 在产生 Stage 2 EstimatorDecision 之前就必须能够运行；只有任务目录
     # 明确声明消费 decision 的 Stage 3+ 执行路径才读取它。v1 配置中的
     # require_decision_for_formal 是全局安全默认值，不能反过来制造时间循环依赖。
-    if not request.task.execution_policy.requires_estimator_decision:
+    if not request.task.formal_eligibility.requires_estimator_decision:
         return None, None
     reference = request.environment.estimator_decision_ref
     if reference is None:

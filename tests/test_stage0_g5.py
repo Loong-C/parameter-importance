@@ -2,10 +2,12 @@ from __future__ import annotations
 
 from copy import deepcopy
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import torch
 
+from param_importance_nlp.experiments.task_runners import _decision_hash
 from param_importance_nlp.runtime import publish_tensor_bundle
 from param_importance_nlp.stage0_g5 import Stage0G5Error, validate_g5_report_set
 
@@ -157,6 +159,15 @@ def test_g5_aggregate_requires_all_fresh_process_measurements(tmp_path: Path) ->
     assert all(item["last_to_first_ratio"] < 0.95 for item in metrics["overfit"])
     assert len(metrics["memory"]) == 3
     assert len(metrics["failure_paths"]) == 5
+
+
+def test_g5_decision_hash_uses_formal_eligibility(tmp_path: Path) -> None:
+    task = SimpleNamespace(
+        formal_eligibility=SimpleNamespace(requires_estimator_decision=False)
+    )
+    config = SimpleNamespace(run_intent="formal")
+    request = SimpleNamespace(task=task, config=config)
+    assert _decision_hash(request, tmp_path) == (None, None)
 
 
 def test_g5_aggregate_rejects_tensor_drift_and_memory_growth(tmp_path: Path) -> None:
