@@ -26,7 +26,7 @@ def _comparison() -> dict[str, object]:
 
 def _collective_report(repeat: int) -> dict[str, object]:
     messages = []
-    for elements, median in ((1, 0.001), (262144, 0.004), (4194304, 0.02)):
+    for elements, median in ((65536, 0.001), (262144, 0.004), (4194304, 0.02)):
         value = median * (1.0 + 0.01 * repeat)
         messages.append(
             {
