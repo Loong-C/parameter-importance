@@ -64,6 +64,20 @@ from .stage0_gate import (
 TASK_ID = "stage0.09_checkpoint_and_resume"
 GATE_ID = "stage0.G7"
 _OUTPUT_KINDS = {"checkpoint_commit", "resume_equivalence_report", "retention_report"}
+_FORMAL_RECOVERY_PROVIDERS: dict[str, JSONValue] = {
+    "kind": "offline_hf",
+    "task_type": "causal_lm",
+    "task_name": "pile",
+    "num_labels": None,
+    "model_manifest_ref": None,
+    "model_root_ref": None,
+    "data_manifest_ref": None,
+    "data_root_ref": None,
+    "tokenizer_manifest_ref": None,
+    "tokenizer_root_ref": None,
+    "local_files_only": True,
+    "trust_remote_code": False,
+}
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _GIT_COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
 _CRITICAL_SOURCE_REFS = (
@@ -331,7 +345,7 @@ def build_stage0_g7_recovery_config(
     v2_overrides.update(
         {
             "scheduler": previous.section("scheduler"),
-            "providers": previous.section("providers"),
+            "providers": dict(_FORMAL_RECOVERY_PROVIDERS),
             "evaluation": {**_mapping(previous.section("evaluation"), field="evaluation"), "enabled": False},
             "profiling": {**_mapping(previous.section("profiling"), field="profiling"), "enabled": False},
             "optimizer_runtime": previous.section("optimizer_runtime"),

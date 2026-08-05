@@ -26,6 +26,7 @@ from param_importance_nlp.stage0_g7_recovery import (
     G7RecoverySourceBinding,
     Stage0G7RecoveryFormalState,
     _config_overrides as _g7_config_overrides,
+    _FORMAL_RECOVERY_PROVIDERS,
 )
 from param_importance_nlp.stage0_g8 import Stage0G8FormalState
 from param_importance_nlp.stage0_g9 import (
@@ -361,6 +362,13 @@ def test_g7_recovery_single_worker_local_launcher_is_contract_valid(
     assert launcher["world_size"] == 1
     assert launcher["init_method"] == "local"
     assert launcher["rendezvous_id"] is None
+
+
+def test_g7_recovery_uses_formal_offline_hf_provider() -> None:
+    assert _FORMAL_RECOVERY_PROVIDERS["kind"] == "offline_hf"
+    assert _FORMAL_RECOVERY_PROVIDERS["task_type"] == "causal_lm"
+    assert _FORMAL_RECOVERY_PROVIDERS["task_name"] == "pile"
+    assert _FORMAL_RECOVERY_PROVIDERS["local_files_only"] is True
 
 
 def test_replay_runbook_has_only_resolvable_repository_links() -> None:
