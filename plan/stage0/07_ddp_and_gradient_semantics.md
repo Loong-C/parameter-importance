@@ -119,7 +119,9 @@
 
 ## 核验标准
 
-- 三次连续四卡 collective 测试均无 hang、NCCL 错误、ECC 增长或残留进程。
+- 三次连续四卡 collective 测试均无 hang、NCCL 错误、uncorrected ECC 增长或残留
+  进程；corrected volatile ECC 仅作诊断记录，不构成 gate 阻断（与 G0-G 的
+  uncorrectable ECC=0 合同一致）。
 - 标量 collective 结果与预期完全一致；三个重复的性能样本均为正值，每个消息规模的
   p95 不超过同一重复中位数的 2 倍，三个重复中位数的变异系数不超过 20%（按协议 v2
   的 50 个样本、每样本 3 次取中位数计），否则必须诊断并重验。

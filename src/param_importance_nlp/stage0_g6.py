@@ -826,18 +826,12 @@ def validate_g6_report_set(
     if not isinstance(before_cards, list) or not isinstance(after_cards, list):
         raise Stage0G6Error("G6_DEVICE_CARD_AUDIT_INVALID")
     before_ecc = {
-        str(item["uuid"]): (
-            int(item["ecc_corrected_volatile"]),
-            int(item["ecc_uncorrected_volatile"]),
-        )
+        str(item["uuid"]): int(item["ecc_uncorrected_volatile"])
         for item in before_cards
         if isinstance(item, Mapping)
     }
     after_ecc = {
-        str(item["uuid"]): (
-            int(item["ecc_corrected_volatile"]),
-            int(item["ecc_uncorrected_volatile"]),
-        )
+        str(item["uuid"]): int(item["ecc_uncorrected_volatile"])
         for item in after_cards
         if isinstance(item, Mapping)
     }
