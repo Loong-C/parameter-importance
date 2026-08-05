@@ -1,2 +1,5 @@
 /legacy/2026-07-stage-ab/** -text
 configs/stage0/http-objects/*.json text eol=lf
+*.json text eol=lf
+*.yaml text eol=lf
+*.yml text eol=lf
