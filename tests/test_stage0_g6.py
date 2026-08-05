@@ -35,6 +35,7 @@ def _collective_report(repeat: int) -> dict[str, object]:
                 "warmup_iterations": 20,
                 "measured_iterations": 50,
                 "samples_per_measurement": 3,
+                "nccl_p2p_level": "PCI",
                 "median_seconds": value,
                 "p95_seconds": value * 1.5,
                 "throughput_bytes_per_second": elements * 16 / value,

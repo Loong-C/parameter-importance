@@ -45,7 +45,8 @@
 3. 验证 broadcast、all-gather 和 barrier 等训练所需操作。
 4. 每个消息规模按统一协议 v2（`stage0-unified-measurement-v2`）执行 20 次 warmup、
    50 个测量样本，每个样本取连续 3 次 collective 的 CUDA Event 中位延迟（每规模共
-   150 次 collective），记录中位延迟、p95、吞吐和波动。
+   150 次 collective），并固定 `NCCL_P2P_LEVEL=PCI` 消除小消息传输路径双峰，记录
+   中位延迟、p95、吞吐和波动。
 5. 重建进程组三次并完成三个独立重复，确认没有 hang、超时或 communicator 残留。
 6. 将三个健康重复的聚合结果设为当前拓扑性能基线；后续较短的 smoke 低于基线 70% 只产生告警并触发完整统一协议复验，只有完整复验仍低于 70% 才阻断并调查。
 
