@@ -337,6 +337,32 @@ def test_layer_projection_rejects_no_required_layer_and_reports_all_pass() -> No
     assert all(item["status"] == "PASS" and item["skipped"] == 0 for item in result)
 
 
+def test_g7_recovery_single_worker_local_launcher_is_contract_valid(
+    tmp_path: Path,
+) -> None:
+    template = _template()
+    base_overrides, v2_overrides = _g7_config_overrides(
+        template.base_config,
+        world_size=1,
+        gpu_uuids=("GPU-fixture-00000000",),
+    )
+    base_overrides["identity"] = {"route": "stage0-g7-recovery-single-contract"}
+    config = build_stage0_formal_config(
+        ROOT,
+        task_id="stage0.09_checkpoint_and_resume",
+        input_refs=("evidence/upstream/commit.json",),
+        output_dir="evidence/g7/task-output",
+        base_overrides=base_overrides,
+        v2_overrides=v2_overrides,
+    )
+    launcher = config.section("launcher")
+    assert launcher["kind"] == "local"
+    assert launcher["backend"] == "local"
+    assert launcher["world_size"] == 1
+    assert launcher["init_method"] == "local"
+    assert launcher["rendezvous_id"] is None
+
+
 def test_replay_runbook_has_only_resolvable_repository_links() -> None:
     result = _validate_runbook(G9SourceBinding(ROOT, "a" * 40, "fixture", {}))
     assert result["status"] == "PASS"

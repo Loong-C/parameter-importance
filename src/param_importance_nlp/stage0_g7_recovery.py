@@ -296,7 +296,11 @@ def _config_overrides(base: Any, *, world_size: int, gpu_uuids: Sequence[str]) -
             "world_size": world_size,
             "init_method": "env" if world_size > 1 else "local",
             "init_ref": None,
-            "rendezvous_id": f"stage0-g7-recovery-{world_size}-{str(gpu_uuids[0])[-8:]}",
+            "rendezvous_id": (
+                None
+                if world_size == 1
+                else f"stage0-g7-recovery-{world_size}-{str(gpu_uuids[0])[-8:]}"
+            ),
             "max_restarts": 0,
         },
         "recovery": {
