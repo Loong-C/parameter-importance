@@ -226,14 +226,17 @@ def _collective_metrics(protocol: Mapping[str, Any]) -> dict[str, JSONValue]:
             tensor.fill_(float(rank + 1))
             dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
         torch.cuda.synchronize(local_rank)
+        start_event = torch.cuda.Event(enable_timing=True)
+        end_event = torch.cuda.Event(enable_timing=True)
         samples: list[float] = []
         for _ in range(measured):
             tensor.fill_(float(rank + 1))
             torch.cuda.synchronize(local_rank)
-            started = time.perf_counter()
+            start_event.record()
             dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
+            end_event.record()
             torch.cuda.synchronize(local_rank)
-            samples.append(time.perf_counter() - started)
+            samples.append(start_event.elapsed_time(end_event) / 1000.0)
         expected_sum = float(sum(range(1, WORLD_SIZE + 1)))
         if float(tensor[0].item()) != expected_sum or float(tensor[-1].item()) != expected_sum:
             raise Stage0G6WorkerError("G6_WORKER_ALL_REDUCE_RESULT_INVALID")
@@ -754,11 +757,20 @@ def run_stage0_g6_worker(*, data_root: str | Path, plan_ref: str) -> None:
         rank_records = _gather_objects(identity)
         run_kind = str(plan["run_kind"])
         if run_kind == "failure_rank":
+            failure_flag = torch.tensor(
+                [1 if dist.get_rank() == 1 else 0],
+                dtype=torch.int64,
+                device=torch.device("cuda", torch.cuda.current_device()),
+            )
+            dist.all_reduce(failure_flag, op=dist.ReduceOp.SUM)
+            dist.barrier()
             if dist.get_rank() == 1:
                 print(FAILURE_MARKER, file=sys.stderr, flush=True)
-                raise Stage0G6WorkerError(FAILURE_MARKER)
-            dist.barrier()
-            raise Stage0G6WorkerError("G6_WORKER_FAILURE_INJECTION_DID_NOT_TERMINATE")
+            if int(failure_flag.item()) != 1:
+                raise Stage0G6WorkerError(
+                    "G6_WORKER_FAILURE_INJECTION_DID_NOT_TERMINATE"
+                )
+            raise Stage0G6WorkerError(FAILURE_MARKER)
         if run_kind == "collective":
             metrics = _collective_metrics(
                 _mapping(plan["collective_protocol"], field="collective_protocol")
