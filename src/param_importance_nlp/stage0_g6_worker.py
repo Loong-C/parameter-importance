@@ -394,7 +394,7 @@ def _run_ddp_step(
     )
     hook_state: dict[str, int] = {"calls": 0}
 
-    def counting_hook(state: dict[str, int], bucket: dist.GradBucket):
+    def counting_hook(state: dict[str, int], bucket):
         state["calls"] += 1
         return allreduce_hook(None, bucket)  # type: ignore[arg-type]
 
