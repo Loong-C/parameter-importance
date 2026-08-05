@@ -33,7 +33,7 @@ from .contracts.jsonio import JSONValue
 from .runtime import TaskExecutionRequest, TaskRuntimeEnvironment, TorchDistributedReducer
 
 
-WORKER_PLAN_SCHEMA = "stage0-g6-worker-plan-v1"
+WORKER_PLAN_SCHEMA = "stage0-g6-worker-plan-v2"
 WORKER_REPORT_SCHEMA = "stage0-g6-worker-report-v1"
 WORLD_SIZE = 4
 FAILURE_MARKER = "STAGE0_G6_INJECTED_RANK_FAILURE"
@@ -212,8 +212,15 @@ def _collective_metrics(protocol: Mapping[str, Any]) -> dict[str, JSONValue]:
     local_rank = int(os.environ["LOCAL_RANK"])
     warmup = int(protocol["warmup_iterations"])
     measured = int(protocol["measured_iterations"])
+    samples_per_measurement = int(protocol["samples_per_measurement"])
     sizes = protocol["tensor_elements"]
-    if warmup != 20 or measured != 50 or not isinstance(sizes, list) or len(sizes) < 3:
+    if (
+        warmup != 20
+        or measured != 50
+        or samples_per_measurement != 3
+        or not isinstance(sizes, list)
+        or len(sizes) < 3
+    ):
         raise Stage0G6WorkerError("G6_WORKER_COLLECTIVE_PROTOCOL_INVALID")
     device = torch.device("cuda", local_rank)
     message_metrics: list[dict[str, JSONValue]] = []
@@ -230,13 +237,16 @@ def _collective_metrics(protocol: Mapping[str, Any]) -> dict[str, JSONValue]:
         end_event = torch.cuda.Event(enable_timing=True)
         samples: list[float] = []
         for _ in range(measured):
-            tensor.fill_(float(rank + 1))
-            torch.cuda.synchronize(local_rank)
-            start_event.record()
-            dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
-            end_event.record()
-            torch.cuda.synchronize(local_rank)
-            samples.append(start_event.elapsed_time(end_event) / 1000.0)
+            timings: list[float] = []
+            for _ in range(samples_per_measurement):
+                tensor.fill_(float(rank + 1))
+                torch.cuda.synchronize(local_rank)
+                start_event.record()
+                dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
+                end_event.record()
+                torch.cuda.synchronize(local_rank)
+                timings.append(start_event.elapsed_time(end_event) / 1000.0)
+            samples.append(statistics.median(timings))
         expected_sum = float(sum(range(1, WORLD_SIZE + 1)))
         if float(tensor[0].item()) != expected_sum or float(tensor[-1].item()) != expected_sum:
             raise Stage0G6WorkerError("G6_WORKER_ALL_REDUCE_RESULT_INVALID")
@@ -248,6 +258,7 @@ def _collective_metrics(protocol: Mapping[str, Any]) -> dict[str, JSONValue]:
                 "message_bytes": elements * 4,
                 "warmup_iterations": warmup,
                 "measured_iterations": measured,
+                "samples_per_measurement": samples_per_measurement,
                 "median_seconds": median,
                 "p95_seconds": p95,
                 "throughput_bytes_per_second": (elements * 4 * WORLD_SIZE) / median,

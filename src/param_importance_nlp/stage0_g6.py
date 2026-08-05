@@ -68,7 +68,7 @@ _CRITICAL_SOURCE_REFS = (
     "src/param_importance_nlp/stage0_g6_worker.py",
     "schemas/stage0-g6-evidence-v1.json",
     "schemas/stage0-g6-formalization-index-v1.json",
-    "schemas/stage0-g6-worker-plan-v1.json",
+    "schemas/stage0-g6-worker-plan-v2.json",
     "schemas/stage0-g6-worker-report-v1.json",
 )
 _REPORT_FIELDS = {
@@ -455,9 +455,10 @@ def _plan_payload(
             "report_ref": report_ref,
             "timeout_seconds": timeout_seconds,
             "collective_protocol": {
-                "protocol_version": "stage0-unified-measurement-v1",
+                "protocol_version": "stage0-unified-measurement-v2",
                 "warmup_iterations": 20,
                 "measured_iterations": 50,
+                "samples_per_measurement": 3,
                 "tensor_elements": [1, 262144, 4194304],
             },
         }
@@ -676,6 +677,7 @@ def validate_g6_report_set(
             if (
                 item.get("warmup_iterations") != 20
                 or item.get("measured_iterations") != 50
+                or item.get("samples_per_measurement") != 3
                 or not isinstance(samples, list)
                 or len(samples) != 50
                 or not math.isfinite(median)
@@ -844,6 +846,7 @@ def validate_g6_report_set(
     return {
         "collective_process_group_rebuilds": 3,
         "collective_median_cv_by_elements": coefficients,
+        "collective_samples_per_measurement": 3,
         "fp32_comparisons": comparisons,
         "no_sync_gradient_collectives": communication["no_sync_calls"],
         "sync_each_gradient_collectives": communication["sync_each_calls"],
@@ -861,7 +864,7 @@ def _checks(metrics: Mapping[str, JSONValue], refs: Sequence[str]) -> tuple[Stag
             "stage0.G6-NCCL",
             Stage0CheckClass.PERFORMANCE,
             Stage0CheckStatus.PASS,
-            "Three independent NCCL process groups passed the frozen 20/50 protocol.",
+            "Three independent NCCL process groups passed the frozen v2 20/50 median-of-3 protocol.",
             measurements={
                 "process_group_rebuilds": metrics["collective_process_group_rebuilds"],
                 "median_cv_by_elements": metrics["collective_median_cv_by_elements"],

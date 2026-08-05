@@ -34,6 +34,7 @@ def _collective_report(repeat: int) -> dict[str, object]:
                 "message_bytes": elements * 4,
                 "warmup_iterations": 20,
                 "measured_iterations": 50,
+                "samples_per_measurement": 3,
                 "median_seconds": value,
                 "p95_seconds": value * 1.5,
                 "throughput_bytes_per_second": elements * 16 / value,
