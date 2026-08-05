@@ -633,6 +633,10 @@ def run_stage0_g7_recovery_worker(*, data_root: str | Path, plan_ref: str) -> di
             engine, trace, cleanup = _build_engine(
                 request, root, plan, rank=rank, event_sink=sink, session_id=session
             )
+            tail_trace: _SampleTrace | None = None
+            if phase == "interrupt":
+                tail_trace = _SampleTrace()
+                engine.register_observer(tail_trace)
             group_load_seconds = 0.0
             if phase == "resume":
                 _barrier(world_size)
@@ -704,6 +708,7 @@ def run_stage0_g7_recovery_worker(*, data_root: str | Path, plan_ref: str) -> di
         local_summary["event_ref"] = event_path.relative_to(root).as_posix()
         rank_summaries = _gather(world_size, local_summary)
         if phase == "interrupt":
+            assert tail_trace is not None
             boundary_summaries = rank_summaries
             tail_session = f"session-orphan-tail-rank-{rank:04d}"
             tail_path = execution_root / "events" / f"rank-{rank:04d}-{tail_session}.jsonl"
@@ -716,8 +721,7 @@ def run_stage0_g7_recovery_worker(*, data_root: str | Path, plan_ref: str) -> di
                 engine.state.last_checkpoint_id,
             )
             engine.session_id = tail_session
-            tail_trace = _SampleTrace()
-            engine.register_observer(tail_trace)
+            tail_trace.steps = []
             with JsonlEventSink(tail_path) as tail_sink:
                 engine.event_sink = tail_sink
                 tail_result = engine.run(until_step=int(plan["boundary_step"]) + 1)
