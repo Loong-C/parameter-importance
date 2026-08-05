@@ -459,7 +459,8 @@ def _plan_payload(
                 "warmup_iterations": 20,
                 "measured_iterations": 50,
                 "samples_per_measurement": 3,
-                "nccl_p2p_level": "PCI",
+                "nccl_shm_disable": 1,
+                "nccl_p2p_disable": 1,
                 "tensor_elements": [1, 262144, 4194304],
             },
         }
@@ -492,7 +493,8 @@ def _run_launch(
     environment = os.environ.copy()
     environment["CUDA_VISIBLE_DEVICES"] = ",".join(selected)
     environment["PARAM_IMPORTANCE_DATA_ROOT"] = str(root)
-    environment["NCCL_P2P_LEVEL"] = "PCI"
+    environment["NCCL_SHM_DISABLE"] = "1"
+    environment["NCCL_P2P_DISABLE"] = "1"
     current_pythonpath = environment.get("PYTHONPATH")
     source_path = str(source.repository / "src")
     environment["PYTHONPATH"] = source_path + (
@@ -680,7 +682,8 @@ def validate_g6_report_set(
                 item.get("warmup_iterations") != 20
                 or item.get("measured_iterations") != 50
                 or item.get("samples_per_measurement") != 3
-                or item.get("nccl_p2p_level") != "PCI"
+                or item.get("nccl_shm_disable") != 1
+                or item.get("nccl_p2p_disable") != 1
                 or not isinstance(samples, list)
                 or len(samples) != 50
                 or not math.isfinite(median)
@@ -867,7 +870,7 @@ def _checks(metrics: Mapping[str, JSONValue], refs: Sequence[str]) -> tuple[Stag
             "stage0.G6-NCCL",
             Stage0CheckClass.PERFORMANCE,
             Stage0CheckStatus.PASS,
-            "Three independent NCCL process groups passed the frozen v2 20/50 median-of-3 protocol with NCCL_P2P_LEVEL=PCI.",
+            "Three independent NCCL process groups passed the frozen v2 20/50 median-of-3 protocol with NCCL_SHM_DISABLE=1 and NCCL_P2P_DISABLE=1.",
             measurements={
                 "process_group_rebuilds": metrics["collective_process_group_rebuilds"],
                 "median_cv_by_elements": metrics["collective_median_cv_by_elements"],

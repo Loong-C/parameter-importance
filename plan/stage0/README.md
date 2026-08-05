@@ -122,7 +122,7 @@
 3. 训练吞吐与日志开销测试每次先执行 10 个 optimizer warmup step，再测量 30 个 optimizer step；以三个全新进程的独立重复为一组。每个重复报告中位数、p95，组报告使用三个重复中位数的中位数，并报告其变异系数。
 4. NCCL 每个消息规模先执行 20 次 warmup，再测量 50 个样本；每个样本取连续 3 次
    collective 的 CUDA Event 中位延迟（每规模共 150 次 collective），并固定
-   `NCCL_P2P_LEVEL=PCI` 以消除小消息传输路径双峰，协议版本
+   `NCCL_SHM_DISABLE=1` 与 `NCCL_P2P_DISABLE=1` 以消除小消息传输路径双峰，协议版本
    `stage0-unified-measurement-v2`；进程组重建三次。延迟报告中位数、p95 和重复间
    变异系数，吞吐使用相同样本计算。
 5. 显存测试在 5 个 warmup step 后重置峰值计数，再测量 20 个 step；做三个全新进程重复。容量 gate 使用三次中观测到的最高峰值，而不是较乐观的中位数。

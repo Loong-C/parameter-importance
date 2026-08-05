@@ -213,14 +213,17 @@ def _collective_metrics(protocol: Mapping[str, Any]) -> dict[str, JSONValue]:
     warmup = int(protocol["warmup_iterations"])
     measured = int(protocol["measured_iterations"])
     samples_per_measurement = int(protocol["samples_per_measurement"])
-    nccl_p2p_level = str(protocol["nccl_p2p_level"])
+    nccl_shm_disable = int(protocol["nccl_shm_disable"])
+    nccl_p2p_disable = int(protocol["nccl_p2p_disable"])
     sizes = protocol["tensor_elements"]
     if (
         warmup != 20
         or measured != 50
         or samples_per_measurement != 3
-        or nccl_p2p_level != "PCI"
-        or os.environ.get("NCCL_P2P_LEVEL") != "PCI"
+        or nccl_shm_disable != 1
+        or nccl_p2p_disable != 1
+        or os.environ.get("NCCL_SHM_DISABLE") != "1"
+        or os.environ.get("NCCL_P2P_DISABLE") != "1"
         or not isinstance(sizes, list)
         or len(sizes) < 3
     ):
@@ -262,7 +265,8 @@ def _collective_metrics(protocol: Mapping[str, Any]) -> dict[str, JSONValue]:
                 "warmup_iterations": warmup,
                 "measured_iterations": measured,
                 "samples_per_measurement": samples_per_measurement,
-                "nccl_p2p_level": nccl_p2p_level,
+                "nccl_shm_disable": nccl_shm_disable,
+                "nccl_p2p_disable": nccl_p2p_disable,
                 "median_seconds": median,
                 "p95_seconds": p95,
                 "throughput_bytes_per_second": (elements * 4 * WORLD_SIZE) / median,
