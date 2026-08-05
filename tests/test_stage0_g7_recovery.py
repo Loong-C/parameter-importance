@@ -21,6 +21,7 @@ from param_importance_nlp.runtime import (
     checkpoint_state_sha256,
 )
 from param_importance_nlp.stage0_g7_recovery import _cpu_fp32_suite
+from param_importance_nlp.stage0_g7_recovery_worker import _IMPORTANCE_ENABLED
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -214,6 +215,10 @@ def test_cpu_fp32_direct_prefetch_and_fresh_resume_are_exact(tmp_path: Path) -> 
     assert all(report["state_fields_exact"].values())
     assert report["direct_num_workers"] == 0
     assert report["formal_num_workers"] == 2
+
+
+def test_g7_recovery_worker_disables_importance_for_single_microbatch() -> None:
+    assert _IMPORTANCE_ENABLED is False
 
 
 def test_recovery_schemas_are_draft_2020_12_valid() -> None:

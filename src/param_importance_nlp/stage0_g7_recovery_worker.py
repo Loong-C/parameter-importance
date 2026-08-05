@@ -9,10 +9,12 @@ from pathlib import Path, PurePosixPath
 import subprocess
 import sys
 import time
-from typing import Any, Mapping, Sequence
+from typing import Any, Final, Mapping, Sequence
 
 import torch
 import torch.distributed as dist
+
+_IMPORTANCE_ENABLED: Final = False
 
 from .atomic import sha256_file
 from .contracts import ResolvedConfigV2, canonical_json_hash, load_canonical_json, write_canonical_json
@@ -339,7 +341,7 @@ def _build_engine(
         run_intent="formal",
         max_steps=int(training["max_steps"]),
         max_attempts=int(training["max_steps"]) + int(execution["max_attempts"]) - 1,
-        importance_enabled=True,
+        importance_enabled=_IMPORTANCE_ENABLED,
         estimator_name=str(base_importance["estimator_name"]),
         accumulation_dtype=str(base.section("precision")["statistic_dtype"]),  # type: ignore[index]
         max_grad_norm=training["gradient_clip_max_norm"],  # type: ignore[arg-type]
