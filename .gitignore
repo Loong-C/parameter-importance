@@ -4,6 +4,7 @@ __pycache__/
 .pytest-tmp-*/
 .codex-tmp/
 .codex-stage0-*/
+ops/monitor/runtime/
 Agent/
 .coverage
 .mypy_cache/
