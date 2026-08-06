@@ -221,7 +221,11 @@ def _rank_identity(plan: Mapping[str, Any]) -> dict[str, JSONValue]:
     }
 
 
+_CONTROL_GROUP: object | None = None
+
+
 def _init_distributed(world_size: int, timeout_seconds: int) -> None:
+    global _CONTROL_GROUP
     if world_size == 1:
         return
     if not dist.is_available() or not dist.is_nccl_available():
@@ -231,11 +235,19 @@ def _init_distributed(world_size: int, timeout_seconds: int) -> None:
         init_method="env://",
         timeout=timedelta(seconds=timeout_seconds),
     )
+    # NCCL all_gather (used by torch object collectives) hangs on this server's
+    # stack (NCCL 2.29.3 / torch 2.12.1+cu126); route control-plane
+    # collectives through a gloo process group instead. Training still uses the
+    # NCCL group for DDP all-reduce.
+    _CONTROL_GROUP = dist.new_group(
+        backend="gloo",
+        timeout=timedelta(seconds=timeout_seconds),
+    )
 
 
 def _barrier(world_size: int) -> None:
     if world_size > 1:
-        dist.barrier()
+        dist.barrier(group=_CONTROL_GROUP)
 
 
 def _broadcast_success(world_size: int, success: bool) -> None:
@@ -243,9 +255,9 @@ def _broadcast_success(world_size: int, success: bool) -> None:
         if not success:
             raise Stage0G7RecoveryWorkerError("G7_RECOVERY_WORKER_GROUP_VALIDATION_FAILED")
         return
-    value = torch.tensor([1 if success else 0], dtype=torch.int64, device=torch.device("cuda", torch.cuda.current_device()))
-    dist.broadcast(value, src=0)
-    if int(value.item()) != 1:
+    values = [success if dist.get_rank() == 0 else None]
+    dist.broadcast_object_list(values, src=0, group=_CONTROL_GROUP)
+    if values[0] is not True:
         raise Stage0G7RecoveryWorkerError("G7_RECOVERY_WORKER_GROUP_VALIDATION_FAILED")
 
 
@@ -253,7 +265,7 @@ def _gather(world_size: int, value: object) -> list[object]:
     if world_size == 1:
         return [value]
     gathered: list[object] = [None for _ in range(world_size)]
-    dist.all_gather_object(gathered, value)
+    dist.all_gather_object(gathered, value, group=_CONTROL_GROUP)
     return gathered
 
 
@@ -263,7 +275,7 @@ def _broadcast_object(world_size: int, value: object | None) -> object:
             raise Stage0G7RecoveryWorkerError("G7_RECOVERY_WORKER_BROADCAST_VALUE_MISSING")
         return value
     values = [value if dist.get_rank() == 0 else None]
-    dist.broadcast_object_list(values, src=0)
+    dist.broadcast_object_list(values, src=0, group=_CONTROL_GROUP)
     if values[0] is None:
         raise Stage0G7RecoveryWorkerError("G7_RECOVERY_WORKER_BROADCAST_VALUE_MISSING")
     return values[0]
