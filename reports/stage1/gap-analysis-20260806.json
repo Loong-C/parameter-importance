@@ -1,0 +1,43 @@
+{
+  "schema_version": "stage1-gap-analysis-v1",
+  "snapshot": {
+    "branch": "feat/stage0-completion",
+    "head": "975f83cc296e6c01deb738492c4e7f00621f5d84",
+    "worktree": "clean",
+    "local_python": "3.12.4",
+    "local_torch": "2.10.0+cpu",
+    "package_import": "ok"
+  },
+  "verdict": "code_and_unit_tests_present_gates_unexecuted",
+  "gates": {
+    "G1-ENTRY": "missing",
+    "G1-CONTRACT": "missing",
+    "G1-REGISTRY": "not_executed",
+    "G1-ORACLE": "not_executed",
+    "G1-GRAD": "not_executed",
+    "G1-EST": "not_executed",
+    "G1-STEP": "not_executed",
+    "G1-SINGLE": "missing",
+    "G1-DDP": "missing",
+    "G1-NUMERIC": "missing",
+    "G1-RESUME": "missing",
+    "G1-EXIT": "missing"
+  },
+  "missing_artifacts": [
+    "worklogs stage1 entry",
+    "dedicated stage1 branch",
+    "entry baseline snapshot json",
+    "stage1 gate evidence under reports/stage1",
+    "tests/stage1 configs/stage1 fixtures/stage1 directories",
+    "pythia-14m fixture manifest",
+    "g10 handoff consumption (FILL_* placeholders)",
+    "server GPU single/ddp/numeric/resume evidence"
+  ],
+  "next_actions": [
+    "S1.1 entry baseline + G1-ENTRY/G1-CONTRACT records",
+    "run CPU gates S1.2-S1.6 and persist formal records",
+    "consume stage0-g10-stage1-handoff-v1 and freeze estimator decision",
+    "S1.7 single-GPU then S1.8/S1.9 then S1.10 on server",
+    "S1.11 exit report + three-end sync"
+  ]
+}

@@ -60,7 +60,8 @@ def test_two_clean_roots_rebuild_identical_stage0_to_9_pipeline(tmp_path: Path) 
     }
     assert set(first.task_artifact_hashes) == expected_tasks
 
-    # Stage 0 的实际训练产物必须包含已提交在线重要性；Stage 2/3 不是占位状态。
+    # Stage 0 smoke 自 e6d6863 起有意关闭重要性跟踪，importance_snapshot 必须为
+    # None；在线重要性接线由 Stage 4 minimal_complete_loop 覆盖，Stage 2/3 不是占位状态。
     smoke_commit = "runs/stage0-06-single-gpu-smoke/commits/training_smoke_result.json"
     smoke = _payload(
         first_root,
@@ -72,7 +73,7 @@ def test_two_clean_roots_rebuild_identical_stage0_to_9_pipeline(tmp_path: Path) 
     assert sum(
         record["status"] == "COMMITTED" for record in training_result["records"]
     ) == 1
-    assert smoke["importance_snapshot"] is not None
+    assert smoke["importance_snapshot"] is None
     stage23 = load_canonical_json(
         first_root / "fixture-output/stage23/local-fixture-result.json"
     )

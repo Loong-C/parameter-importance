@@ -121,9 +121,11 @@ def test_training_runner_cleanup_does_not_mask_primary_error(
 
 
 def test_training_task_is_idempotent_and_publishes_safe_state(tmp_path) -> None:
-    task_id = "stage0.06_single_gpu_smoke"
+    # Stage 0 训练 smoke 自 e6d6863 起有意关闭重要性跟踪（Stage 0 不验证重要性），
+    # 因此重要性 tensor bundle 断言使用 Stage 1 训练任务 stage1.07。
+    task_id = "stage1.07_single_gpu_pythia14m"
     config = ResolvedConfigV2.resolve(
-        _base_config(stage=0, task_id=task_id),
+        _base_config(stage=1, task_id=task_id),
         task_id=task_id,
         overrides={
             "training": {"max_steps": 2},

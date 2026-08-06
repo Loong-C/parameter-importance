@@ -1,0 +1,47 @@
+{
+  "schema_version": "stage1-cpu-test-baseline-v1",
+  "date": "2026-08-06",
+  "scope": "local_fixture",
+  "formal_eligible": false,
+  "command": "python -m pytest -q --tb=line -p no:cacheprovider",
+  "environment": {
+    "python": "3.12.4",
+    "torch": "2.10.0+cpu",
+    "os": "windows"
+  },
+  "totals": {
+    "collected": 977,
+    "passed": 967,
+    "failed": 0,
+    "skipped": 10,
+    "errors": 0
+  },
+  "skips": [
+    {
+      "node_id": "tests/test_assets.py::test_assets_rejects_symlink_escape",
+      "reason": "Creating a directory symlink is not permitted on this platform"
+    },
+    {
+      "node_id": "tests/test_environment_rebuild.py::test_posix_permission_semantics",
+      "reason": "POSIX permission semantics unavailable on Windows"
+    },
+    {
+      "node_id": "tests/test_g3_runtime_assets.py::test_runtime_rejects_symlinked_file",
+      "reason": "file symlinks unavailable: WinError 1314"
+    },
+    {
+      "node_id": "tests/test_local_fixture.py::test_local_fixture_refuses_symlink_escape",
+      "reason": "directory symlink requires elevated privilege: WinError 1314"
+    },
+    {
+      "node_id": "tests/test_runtime_distributed.py::*",
+      "reason": "installed Windows torch wheel reports Gloo but has no supported device (3 skips)"
+    }
+  ],
+  "fixes_applied": [
+    "configs/stage0/g9-test-matrix-v1.json canonicalized (CRLF -> LF)",
+    "tests/test_task_artifacts_and_default_runners.py: importance bundle assertion moved to stage1.07",
+    "tests/test_full_fixture_pipeline.py: stage0.06 importance_snapshot now asserted None",
+    "tests/test_stage79_run_ready_completion.py: pruning input source moved to stage1.07"
+  ]
+}

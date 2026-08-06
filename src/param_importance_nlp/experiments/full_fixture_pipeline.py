@@ -324,8 +324,10 @@ def run_full_fixture_pipeline(
         all_payloads.extend(payloads.values())
         return result
 
-    # Stage 0 的 smoke 走真实 TrainingEngine，已经同时覆盖 Stage 1 在线重要性接线；
-    # Stage 1 再发布独立合同 task，避免为覆盖标签重复训练同一个 tiny 模型。
+    # Stage 0 的 smoke 走真实 TrainingEngine；自 e6d6863 起 Stage 0 有意关闭
+    # 重要性跟踪（importance_enabled = task.stage > 0），在线重要性接线由本流水线
+    # 的 Stage 4 minimal_complete_loop 覆盖。Stage 1 再发布独立合同 task，避免为
+    # 覆盖标签重复训练同一个 tiny 模型。
     execute(
         _config(
             config_path,

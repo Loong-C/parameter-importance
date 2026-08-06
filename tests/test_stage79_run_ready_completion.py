@@ -105,7 +105,9 @@ def test_baseline_producer_exposes_real_methods_and_fail_closed_availability() -
 
 def test_default_runtime_builds_pruning_resources_from_training_output(tmp_path: Path) -> None:
     training = _v2(
-        "stage0.06_single_gpu_smoke",
+        # Stage 0 训练 smoke 自 e6d6863 起关闭重要性跟踪，无法为 Stage 7 提供
+        # importance bundle；改用 Stage 1 训练任务 stage1.07 作为剪枝输入源。
+        "stage1.07_single_gpu_pythia14m",
         "outputs/training",
         training={"max_steps": 2},
         evaluation={
@@ -123,7 +125,7 @@ def test_default_runtime_builds_pruning_resources_from_training_output(tmp_path:
     runtime = build_default_task_runtime(tmp_path)
     training_result = runtime.execute(training)
     assert training_result.status.value == "PASS", training_result.message
-    training_ref = training_result.artifact_refs["training_smoke_result"]
+    training_ref = training_result.artifact_refs["single_gpu_report"]
 
     base = _base("stage7.matrix").to_dict()
     base["pruning"].update(
