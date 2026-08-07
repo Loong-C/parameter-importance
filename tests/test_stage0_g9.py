@@ -311,6 +311,8 @@ def test_layer_projection_rejects_no_required_layer_and_reports_all_pass() -> No
         "learning_rate_sequence_exact": True,
         "shared_state_hashes_exact": True,
         "rank_state_hashes_exact": True,
+        "shared_state_numeric_within_tolerance": True,
+        "rank_state_numeric_within_tolerance": True,
     }
     ddp = {**pair, "world_size": 4}
     result = _layer_results(

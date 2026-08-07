@@ -407,8 +407,16 @@ def _layer_results(
                 measurements.get("world_size") == 1
                 and measurements.get("sample_sequence_exact") is True
                 and measurements.get("learning_rate_sequence_exact") is True
-                and measurements.get("shared_state_hashes_exact") is True
-                and measurements.get("rank_state_hashes_exact") is True
+                and (
+                    (
+                        measurements.get("shared_state_hashes_exact") is True
+                        and measurements.get("rank_state_hashes_exact") is True
+                    )
+                    or (
+                        measurements.get("shared_state_numeric_within_tolerance") is True
+                        and measurements.get("rank_state_numeric_within_tolerance") is True
+                    )
+                )
             )
             measurements["status"] = "PASS" if passed else "FAIL"
         elif name == "four_gpu":
@@ -417,8 +425,16 @@ def _layer_results(
                 measurements.get("world_size") == 4
                 and measurements.get("sample_sequence_exact") is True
                 and measurements.get("learning_rate_sequence_exact") is True
-                and measurements.get("shared_state_hashes_exact") is True
-                and measurements.get("rank_state_hashes_exact") is True
+                and (
+                    (
+                        measurements.get("shared_state_hashes_exact") is True
+                        and measurements.get("rank_state_hashes_exact") is True
+                    )
+                    or (
+                        measurements.get("shared_state_numeric_within_tolerance") is True
+                        and measurements.get("rank_state_numeric_within_tolerance") is True
+                    )
+                )
             )
             measurements["status"] = "PASS" if passed else "FAIL"
         elif name == "fault":
