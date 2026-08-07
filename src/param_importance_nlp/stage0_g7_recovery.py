@@ -260,10 +260,13 @@ def _config_overrides(base: Any, *, world_size: int, gpu_uuids: Sequence[str]) -
         },
         "precision": {
             **precision,
-            "compute_dtype": "bfloat16",
+            # Stage 0 S0.9 equivalence gate is defined on a deterministic FP32
+            # fixture (see plan/stage0/09_checkpoint_and_resume.md). BF16/AMP
+            # is not bit-reproducible across fresh processes on this stack.
+            "compute_dtype": "float32",
             "gradient_dtype": "float32",
             "statistic_dtype": "float32",
-            "amp": True,
+            "amp": False,
         },
         "optimizer": {
             **optimizer,
@@ -281,9 +284,12 @@ def _config_overrides(base: Any, *, world_size: int, gpu_uuids: Sequence[str]) -
             "gradient_clip_max_norm": 1.0,
         },
         "data_loader": {
-            "num_workers": 2,
-            "prefetch_factor": 2,
-            "persistent_workers": True,
+            # Multi-worker/prefetch equivalence has not been proven on GPU;
+            # the formal recoverable config is locked to num_workers=0 per the
+            # S0.9 plan until a verified multi-worker path exists.
+            "num_workers": 0,
+            "prefetch_factor": None,
+            "persistent_workers": False,
             "drop_last": False,
             "cursor_policy": "checkpoint_commit",
         },
@@ -295,8 +301,8 @@ def _config_overrides(base: Any, *, world_size: int, gpu_uuids: Sequence[str]) -
             "save_data_state": True,
         },
         "precision_runtime": {
-            "autocast_enabled": True,
-            "autocast_dtype": "bfloat16",
+            "autocast_enabled": False,
+            "autocast_dtype": "float32",
             "grad_scaler_enabled": False,
             "initial_scale": 65536.0,
             "growth_factor": 2.0,
@@ -1482,12 +1488,12 @@ def _gate_payloads(
     retention = suite["retention_report"]
     metrics: dict[str, JSONValue] = {
         "cpu_fp32_reference": cpu,
-        "single_gpu_bf16": pair_metrics["single"],
-        "four_gpu_bf16": pair_metrics["ddp"],
+        "single_gpu_fp32": pair_metrics["single"],
+        "four_gpu_fp32": pair_metrics["ddp"],
         "fresh_process_launches": 6,
         "intentional_interruptions": 2,
-        "formal_num_workers": 2,
-        "formal_prefetch_factor": 2,
+        "formal_num_workers": 0,
+        "formal_prefetch_factor": 0,
         "fault_rejection_count": len(fault["rejection_reasons"]),
         "derived_reconciliation_passed": fault["commit_without_derived_views_rebuilt"],
         "retention_scope_count": len(retention["scopes"]),
@@ -1527,7 +1533,7 @@ def _gate_payloads(
             "stage0.G7-SINGLE-AND-DDP-RESUME",
             Stage0CheckClass.CORRECTNESS,
             Stage0CheckStatus.PASS,
-            "Real Pythia BF16 single-GPU and four-GPU fresh-process resumes preserve samples, steps, learning rates, state hashes, and canonical lineage.",
+            "Real Pythia FP32 single-GPU and four-GPU fresh-process resumes preserve samples, steps, learning rates, state hashes, and canonical lineage.",
             measurements={
                 "single_gpu": pair_metrics["single"],
                 "four_gpu": pair_metrics["ddp"],
@@ -1577,7 +1583,7 @@ def _gate_payloads(
             "four_gpu_exact": True,
             "fp32_reference_exact": True,
             "canonical_optimizer_steps": 4,
-            "formal_num_workers": 2,
+            "formal_num_workers": 0,
             "fault_rejection_count": len(fault["rejection_reasons"]),
         },
         threshold={

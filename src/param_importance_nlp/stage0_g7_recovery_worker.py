@@ -11,8 +11,17 @@ import sys
 import time
 from typing import Any, Final, Mapping, Sequence
 
+# cuBLAS deterministic mode requires the workspace configuration to be set
+# before the first CUDA math call in each fresh process.
+os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+
 import torch
 import torch.distributed as dist
+
+torch.backends.cuda.matmul.allow_tf32 = False
+torch.backends.cudnn.allow_tf32 = False
+torch.backends.cudnn.benchmark = False
+torch.backends.cudnn.deterministic = True
 
 _IMPORTANCE_ENABLED: Final = False
 
