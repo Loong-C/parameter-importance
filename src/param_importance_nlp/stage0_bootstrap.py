@@ -269,7 +269,7 @@ def inspect_stage0_runtime(
     )
     wheelhouse_verified = wheelhouse_verified and pip_check.returncode == 0
 
-    g0g = _load_report(binding.repository, "reports/stage0/g0-g-gpu-final-20260804.json")
+    g0g = _load_report(binding.repository, _SOURCE_REPORT_REFS[1])
     allowed = _sequence(g0g.get("allowed_gpus"), field="g0g.allowed_gpus")
     expected_uuids = tuple(
         _string(_mapping(item, field="g0g.allowed_gpu").get("uuid"), field="g0g.uuid")
