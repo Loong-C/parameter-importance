@@ -56,10 +56,10 @@ VERIFICATION_SHA = hashlib.sha256(b"verification").hexdigest()
 ACQUISITION_REF = f"manifests/evidence/g3/acquisition/{ACQUISITION_SHA}.json"
 VERIFICATION_REF = f"manifests/evidence/g3/verification/{VERIFICATION_SHA}.json"
 GPU_UUIDS = (
+    "GPU-180ff767-885a-7dc9-c8a9-921d65a01bbd",
     "GPU-5c672d04-4f83-3cc0-80d0-0108b1b63267",
     "GPU-e78c55cd-db97-b761-f559-dc6eae3be81d",
     "GPU-9b2b2a3b-3547-187f-ca29-2c02624e2e4f",
-    "GPU-5a81500d-5e9c-b0d7-5607-fdfdaab65ff4",
 )
 
 
@@ -75,8 +75,8 @@ def _snapshot(tmp_path: Path) -> Stage0RuntimeSnapshot:
     return Stage0RuntimeSnapshot(
         checked_at=CHECKED_AT,
         hostname="sophgo13",
-        boot_id="1dc04123-4945-4d8b-abcb-27fb84725526",
-        kernel="6.8.0-136-generic",
+        boot_id="69a1d6bb-35ec-40b6-9417-4112018985ec",
+        kernel="6.8.0-137-generic",
         data_root=tmp_path.as_posix(),
         python_prefix=(
             "/home/sophgo13/cjl/storage/parameter-importance/envs/"

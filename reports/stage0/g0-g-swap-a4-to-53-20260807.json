@@ -1,0 +1,36 @@
+{
+  "schema_version": "stage0.g0-g-swap-record.v1",
+  "decided_at": "2026-08-07T08:00:00+08:00",
+  "decision": "Replace allowed GPU 0000:a4:00.0 with healthy spare 0000:53:00.0",
+  "administrator": "project owner via Codex agent instruction (2026-08-07, choose any healthy spare)",
+  "reason": "0000:a4:00.0 has persistent aggregate uncorrectable ECC=2 (Xid 63 row-remap history). NVML aggregate counters are lifetime-tracked; nvidia-smi --reset-ecc-errors is unsupported on this device, and neither reboot nor nvidia-smi -r cleared the count. The G0-G hard gate requires aggregate uncorrectable ECC=0, so the device cannot be re-admitted.",
+  "old_allowed": [
+    "GPU-5c672d04-4f83-3cc0-80d0-0108b1b63267",
+    "GPU-e78c55cd-db97-b761-f559-dc6eae3be81d",
+    "GPU-9b2b2a3b-3547-187f-ca29-2c02624e2e4f",
+    "GPU-5a81500d-5e9c-b0d7-5607-fdfdaab65ff4"
+  ],
+  "new_allowed": [
+    "GPU-180ff767-885a-7dc9-c8a9-921d65a01bbd",
+    "GPU-5c672d04-4f83-3cc0-80d0-0108b1b63267",
+    "GPU-e78c55cd-db97-b761-f559-dc6eae3be81d",
+    "GPU-9b2b2a3b-3547-187f-ca29-2c02624e2e4f"
+  ],
+  "old_excluded": [
+    "GPU-6ff7389b-eaf8-aefd-b2c6-1611be41fa5d",
+    "GPU-dc6cfc60-41dd-7bcf-ed09-b7deb5be342c",
+    "GPU-180ff767-885a-7dc9-c8a9-921d65a01bbd",
+    "GPU-d0ce0b43-7e46-6bca-b078-5aa7043928d7"
+  ],
+  "new_excluded": [
+    "GPU-6ff7389b-eaf8-aefd-b2c6-1611be41fa5d",
+    "GPU-dc6cfc60-41dd-7bcf-ed09-b7deb5be342c",
+    "GPU-d0ce0b43-7e46-6bca-b078-5aa7043928d7",
+    "GPU-5a81500d-5e9c-b0d7-5607-fdfdaab65ff4"
+  ],
+  "g0_g_evidence": "reports/stage0/g0-g-gpu-final-20260807.json",
+  "finalizer_run": "/var/lib/parameter-importance/stage0/g0-g-uuid-exclusion/service-finalize/finalize-20260807T001522Z.UmXAlXcj",
+  "cuda_nccl_smoke_run": "/home/sophgo13/cjl/storage/parameter-importance/operations/stage0/g0-g-uuid-exclusion/cuda-nccl-smoke-20260807T001804Z",
+  "supersedes": "reports/stage0/g0-g-gpu-final-20260804.json",
+  "secrets_included": false
+}

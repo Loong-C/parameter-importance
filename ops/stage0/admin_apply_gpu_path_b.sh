@@ -24,19 +24,19 @@ readonly -a ALL_BDFS=(
   "0000:9c:00.0" "0000:9d:00.0" "0000:a0:00.0" "0000:a4:00.0"
 )
 readonly -a ALLOWED_BDFS=(
-  "0000:9c:00.0" "0000:9d:00.0" "0000:a0:00.0" "0000:a4:00.0"
+  "0000:53:00.0" "0000:9c:00.0" "0000:9d:00.0" "0000:a0:00.0"
 )
 readonly -a ALLOWED_UUIDS=(
+  "GPU-180ff767-885a-7dc9-c8a9-921d65a01bbd"
   "GPU-5c672d04-4f83-3cc0-80d0-0108b1b63267"
   "GPU-e78c55cd-db97-b761-f559-dc6eae3be81d"
   "GPU-9b2b2a3b-3547-187f-ca29-2c02624e2e4f"
-  "GPU-5a81500d-5e9c-b0d7-5607-fdfdaab65ff4"
 )
 readonly -a EXCLUDED_BDFS=(
-  "0000:4f:00.0" "0000:50:00.0" "0000:53:00.0" "0000:57:00.0"
+  "0000:4f:00.0" "0000:50:00.0" "0000:57:00.0" "0000:a4:00.0"
 )
 readonly -a SELECTED_DEVICE_NODES=(
-  "/dev/nvidia4" "/dev/nvidia5" "/dev/nvidia6" "/dev/nvidia7"
+  "/dev/nvidia2" "/dev/nvidia4" "/dev/nvidia5" "/dev/nvidia6"
 )
 
 declare -Ar EXPECTED_UUID_BY_BDF=(
@@ -395,7 +395,7 @@ if [[ -n ${RESUME_FROM} ]]; then
       exit 22
     fi
   done
-  for bdf in "0000:53:00.0" "0000:57:00.0" "${ALLOWED_BDFS[@]}"; do
+  for bdf in "0000:57:00.0" "0000:a4:00.0" "${ALLOWED_BDFS[@]}"; do
     if [[ ! -L "/sys/bus/pci/devices/${bdf}/driver" \
           || $(basename "$(readlink -f "/sys/bus/pci/devices/${bdf}/driver")") != nvidia ]]; then
       printf 'ERROR: resume accepts only the state where %s remains bound to NVIDIA.\n' "${bdf}" >&2
@@ -890,16 +890,16 @@ payload = {
     "administrator_execution": "interactive sudo supplied by host account owner",
     "expected_device_count": 4,
     "allowed_devices": [
+        {"pci": "0000:53:00.0", "uuid": "GPU-180ff767-885a-7dc9-c8a9-921d65a01bbd"},
         {"pci": "0000:9c:00.0", "uuid": "GPU-5c672d04-4f83-3cc0-80d0-0108b1b63267"},
         {"pci": "0000:9d:00.0", "uuid": "GPU-e78c55cd-db97-b761-f559-dc6eae3be81d"},
         {"pci": "0000:a0:00.0", "uuid": "GPU-9b2b2a3b-3547-187f-ca29-2c02624e2e4f"},
-        {"pci": "0000:a4:00.0", "uuid": "GPU-5a81500d-5e9c-b0d7-5607-fdfdaab65ff4"},
     ],
     "excluded_devices": [
         {"pci": "0000:4f:00.0", "reason": "repeated RM initialization failure; quarantined"},
         {"pci": "0000:50:00.0", "reason": "uncorrectable ECC, pending row-remap, Xid 95; quarantined"},
-        {"pci": "0000:53:00.0", "reason": "healthy spare excluded to enforce exact four-card scope"},
         {"pci": "0000:57:00.0", "reason": "healthy spare excluded to enforce exact four-card scope"},
+        {"pci": "0000:a4:00.0", "reason": "persistent aggregate uncorrectable ECC=2 and Xid 63 row-remap history; removed 2026-08-07"},
     ],
     "isolation_enforcement": "root-controlled exact PCI unbind from the NVIDIA driver; excluded device nodes remain root-only",
     "invalidation_conditions": [

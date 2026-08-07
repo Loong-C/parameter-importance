@@ -23,22 +23,22 @@ readonly SNAP_LXD_DAEMON_SERVICE="snap.lxd.daemon.service"
 readonly SNAP_LXD_USER_SERVICE="snap.lxd.user-daemon.service"
 
 readonly -a ALLOWED_BDFS=(
-  "0000:9c:00.0" "0000:9d:00.0" "0000:a0:00.0" "0000:a4:00.0"
+  "0000:53:00.0" "0000:9c:00.0" "0000:9d:00.0" "0000:a0:00.0"
 )
 readonly -a ALLOWED_UUIDS=(
+  "GPU-180ff767-885a-7dc9-c8a9-921d65a01bbd"
   "GPU-5c672d04-4f83-3cc0-80d0-0108b1b63267"
   "GPU-e78c55cd-db97-b761-f559-dc6eae3be81d"
   "GPU-9b2b2a3b-3547-187f-ca29-2c02624e2e4f"
-  "GPU-5a81500d-5e9c-b0d7-5607-fdfdaab65ff4"
 )
 readonly -a EXCLUDED_BDFS=(
-  "0000:4f:00.0" "0000:50:00.0" "0000:53:00.0" "0000:57:00.0"
+  "0000:4f:00.0" "0000:50:00.0" "0000:57:00.0" "0000:a4:00.0"
 )
 readonly -a EXCLUDED_UUIDS=(
   "GPU-6ff7389b-eaf8-aefd-b2c6-1611be41fa5d"
   "GPU-dc6cfc60-41dd-7bcf-ed09-b7deb5be342c"
-  "GPU-180ff767-885a-7dc9-c8a9-921d65a01bbd"
   "GPU-d0ce0b43-7e46-6bca-b078-5aa7043928d7"
+  "GPU-5a81500d-5e9c-b0d7-5607-fdfdaab65ff4"
 )
 readonly -a MASKED_ALLOCATOR_UNITS=(
   "containerd.service"

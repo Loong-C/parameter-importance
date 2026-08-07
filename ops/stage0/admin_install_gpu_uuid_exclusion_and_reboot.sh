@@ -14,12 +14,12 @@ readonly PARENT_SCRIPT_SHA256="fe63376201d9ec3e8a379a724a16fc4d8531282938182d697
 readonly PARENT_RUN="/var/lib/parameter-importance/stage0/g0-g-path-b/admin-20260719T121157Z.MtJwlbzw"
 readonly ADMIN_ROOT="/var/lib/parameter-importance/stage0/g0-g-uuid-exclusion"
 readonly CONFIG_PATH="/etc/modprobe.d/parameter-importance-stage0-gpu-exclusion.conf"
-readonly CONFIG_LINE="options nvidia NVreg_ExcludedGpus=GPU-6ff7389b-eaf8-aefd-b2c6-1611be41fa5d,GPU-dc6cfc60-41dd-7bcf-ed09-b7deb5be342c,GPU-180ff767-885a-7dc9-c8a9-921d65a01bbd,GPU-d0ce0b43-7e46-6bca-b078-5aa7043928d7"
+readonly CONFIG_LINE="options nvidia NVreg_ExcludedGpus=GPU-6ff7389b-eaf8-aefd-b2c6-1611be41fa5d,GPU-dc6cfc60-41dd-7bcf-ed09-b7deb5be342c,GPU-d0ce0b43-7e46-6bca-b078-5aa7043928d7,GPU-5a81500d-5e9c-b0d7-5607-fdfdaab65ff4"
 readonly DOWNLOAD_PART="/home/sophgo13/cjl/storage/parameter-importance/datasets/pile-deduped-pythia-preshuffled/document-00009-of-00020.bin.part"
 readonly DOWNLOAD_META="${DOWNLOAD_PART}.meta"
 readonly DOWNLOAD_SCRIPT="/home/sophgo13/cjl/storage/parameter-importance/tmp/pile-full-download/server_xet_download.sh"
 
-readonly -a REQUIRED_KERNELS=("6.8.0-134-generic" "6.8.0-136-generic")
+readonly -a REQUIRED_KERNELS=("6.8.0-134-generic" "6.8.0-136-generic" "6.8.0-137-generic")
 readonly -a ALL_BDFS=(
   "0000:4f:00.0" "0000:50:00.0" "0000:53:00.0" "0000:57:00.0"
   "0000:9c:00.0" "0000:9d:00.0" "0000:a0:00.0" "0000:a4:00.0"

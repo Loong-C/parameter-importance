@@ -49,7 +49,7 @@ _EXPECTED_REPOSITORY = Path("/home/sophgo13/cjl/parameter-importance")
 _EXPECTED_DATA_ROOT = Path("/home/sophgo13/cjl/storage/parameter-importance")
 _SOURCE_REPORT_REFS = (
     "reports/stage0/g0-baseline-20260719.json",
-    "reports/stage0/g0-g-gpu-final-20260804.json",
+    "reports/stage0/g0-g-gpu-final-20260807.json",
     "reports/stage0/g1-storage-mechanism-20260804.json",
     "reports/stage0/g1-persistence-decision-20260719.json",
     "reports/stage0/g2-environment-final-20260804.json",
