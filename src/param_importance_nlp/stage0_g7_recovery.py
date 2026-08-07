@@ -844,12 +844,18 @@ def _records_tolerant_equal(
 
 
 def _load_rank_checkpoint_state(root: Path, group_value: Mapping[str, Any]) -> Any:
-    ranks = _sequence(group_value.get("rank_checkpoints"), field="group.rank_checkpoints")
-    if not ranks:
+    ranks = group_value.get("rank_checkpoints")
+    if not isinstance(ranks, (list, tuple)) or not ranks:
         raise Stage0G7RecoveryError("G7_RECOVERY_GROUP_RANK_CHECKPOINTS_EMPTY")
-    first = _mapping(ranks[0], field="group.rank_checkpoint")
-    store_ref = _string(first.get("checkpoint_store_ref"), field="group.rank.store_ref")
-    checkpoint_id = _string(first.get("checkpoint_id"), field="group.rank.checkpoint_id")
+    first = ranks[0]
+    if not isinstance(first, Mapping):
+        raise Stage0G7RecoveryError("G7_RECOVERY_GROUP_RANK_CHECKPOINT_INVALID")
+    store_ref = first.get("checkpoint_store_ref")
+    checkpoint_id = first.get("checkpoint_id")
+    if not isinstance(store_ref, str) or not store_ref:
+        raise Stage0G7RecoveryError("G7_RECOVERY_GROUP_RANK_STORE_REF_INVALID")
+    if not isinstance(checkpoint_id, str) or not checkpoint_id:
+        raise Stage0G7RecoveryError("G7_RECOVERY_GROUP_RANK_CHECKPOINT_ID_INVALID")
     state, _commit = CheckpointStore(
         _logical_path(root, store_ref, field="group.rank.store")
     ).load(checkpoint_id)
