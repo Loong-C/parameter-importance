@@ -57,3 +57,48 @@
 ### 下一步
 
 - 提交推送换卡改动；bundle 同步服务器；创建新锚点分支；生成新链脚本；备份当前 G3 控制面/GLUE derived 资产；在新锚点执行 bootstrap→G3→G4→G5→G6→G7-LOGGING→G7-RECOVERY 完整链并核验 G7。
+
+## 2026-08-07 13:30 CST — S0.9 完成（G7 完整 gate PASS）
+
+### 目标与范围
+
+- 完成：在新四卡（53/9c/9d/a0）上跑通 S0.9 完整正式链，核验 G7 可恢复性 gate，并完成日志/同步/清理/下载恢复。
+
+### 实际修改与执行
+
+- 修复 S0.9 正式恢复配置与计划不一致的问题：`_config_overrides` 从 BF16+AMP+num_workers=2/prefetch 改为确定性 FP32+num_workers=0（`stage0_g7_recovery.py`），并在 worker 顶部设置 `CUBLAS_WORKSPACE_CONFIG=:4096:8`、关闭 TF32/benchmark、启用 cudnn deterministic。
+- 依据计划“若只能数值一致必须记录具体非确定性来源”，在 `_compare_trajectory_pair` 中实现数值容差等价：模型张量按 `atol=1e-6/rtol=1e-5` 比较，步骤记录对 loss/grad_norm/clip 做容差比较，忽略非确定性的参数哈希；结果写入 pair metrics 与 gate measured。同步放行 `stage0_g9_replay.py` 并更新测试。
+- 修复 `_load_rank_checkpoint_state` 引用不存在辅助函数的问题。
+- 正式链在锚点 `formal/run-c73d8a4`（commit `c73d8a4e143a43b8ef9bff67ac7d42b04b539134`）完整执行：bootstrap→G3→G4→G5→G6→G7-LOGGING→G7-RECOVERY，全部 PASS。
+
+### 实验与验证
+
+| 项目 | 结果 | 证据路径 |
+|---|---|---|
+| 完整正式链 | `CHAIN_STATUS=PASS` | `$DATA_ROOT/tmp/g7-recovery-chain-c73d8a4.log` |
+| G7-RECOVERY 索引 | status=PASS，`next_task_id=stage0.10_capacity_and_operations`，generator commit c73d8a4 | `evidence/stage0/g7-recovery-formal/4ecf7008…/index.json` |
+| G7 gate 记录 | PASS；measured：single/four_gpu_exact=true、shared_state_hashes_exact=false、state_numeric_tolerance_met=true、formal_num_workers=0 | `evidence/stage0/tasks/09-4ecf7008…/commits/resume_equivalence_report.json` |
+| 数值容差 | single/ddp：max_abs_diff=7.45e-09、mismatched_elements=0；max_rel_diff 0.0165/0.00959；非确定性来源已记录 | 同上 gate_report.checks[1].measurements |
+| 环境 | passed_gate_ids 含 stage0.G7 与 stage0.G7-LOGGING | `evidence/stage0/g7-recovery-formal/4ecf7008…/environment.json` |
+
+### 判定
+
+- **S0.9 完成**：G7 完整可恢复性 gate = PASS；新四卡（53/9c/9d/a0）证据链 bootstrap→G7-RECOVERY 全部正式 PASS。
+- Stage 0 当前全部硬 gate（G0-C、G0-G、G1、G2、G3 系列、G4、G5、G6、G7、G7-LOGGING）通过；下一任务为 S0.10。
+
+### 问题、原因与风险
+
+- GPU FP32 训练在此 A100/驱动/torch 组合上存在 ~1e-9 绝对量级的低阶内核非确定性，字节哈希不等；已按计划改为容差等价并记录来源，CPU FP32 参考仍为字节精确。
+- 换卡后的 `0000:53:00.0` 全程无 ECC/row-remap 异常；服务器重启后环境稳定。
+
+### Git 与多端同步
+
+- 本机/GitHub：`feat/stage1-cpu-evidence`（本轮提交 `c73d8a4` 及收尾日志提交后更新）。
+- 服务器：正式证据锚点 `formal/run-c73d8a4` 保留；主分支同步至收尾提交。
+- `Agent/*.md`：不受影响。
+
+### 收尾动作
+
+- 清理 `tmp/repo-sync-975f83c.bundle` 与 `tmp/g3-pre-975f83c-backup-20260806T044840Z`（按前序日志约定）。
+- 恢复 Pile 下载：启动 lab-pc `CjlPileFullSupervisor`，核对 shard 10 `.part` 续传。
+- 下一步：S0.10 容量/运维；随后 G10 handoff → S1.7 配置补齐 → Stage 1 服务器侧正式 GPU gates。
