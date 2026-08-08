@@ -8,10 +8,9 @@ from pathlib import Path
 import subprocess
 import sys
 
-from jsonschema import Draft202012Validator
 import pytest
 
-from param_importance_nlp.cli import _load_mapping
+from param_importance_nlp.cli import _load_mapping, _validate_project_json_schema
 from param_importance_nlp.contracts import ResolvedConfig
 from param_importance_nlp.contracts import canonical_json_hash, load_canonical_json, write_canonical_json
 from param_importance_nlp.contracts.config_v2 import ResolvedConfigV2
@@ -139,14 +138,9 @@ def test_g9_matrix_and_schemas_are_hash_bound_and_valid() -> None:
     schema_paths = sorted((ROOT / "schemas").glob("stage0-g9-*.json"))
     schema_paths.append(ROOT / "schemas/stage0-deterministic-training-fixture-v1.json")
     for path in schema_paths:
-        Draft202012Validator.check_schema(json.loads(path.read_text(encoding="utf-8")))
+        _validate_project_json_schema(json.loads(path.read_text(encoding="utf-8")))
     assert len(list((ROOT / "schemas").glob("stage0-g9-*.json"))) == 5
-    Draft202012Validator(
-        json.loads((ROOT / "schemas/stage0-g9-test-matrix-v1.json").read_text(encoding="utf-8"))
-    ).validate(json.loads((ROOT / "configs/stage0/g9-test-matrix-v1.json").read_text(encoding="utf-8")))
-    Draft202012Validator(
-        json.loads((ROOT / "schemas/stage0-deterministic-training-fixture-v1.json").read_text(encoding="utf-8"))
-    ).validate(json.loads((ROOT / "fixtures/stage0/deterministic-training-v1.json").read_text(encoding="utf-8")))
+    validate_deterministic_fixture(ROOT / "fixtures/stage0/deterministic-training-v1.json")
 
 
 def test_g9_config_binds_g8_inputs_and_g7_real_replay_profile(

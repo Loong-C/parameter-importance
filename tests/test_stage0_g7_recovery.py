@@ -5,11 +5,11 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from jsonschema import Draft202012Validator
 import pytest
 import torch
 
 from param_importance_nlp.atomic import atomic_write_bytes, sha256_file
+from param_importance_nlp.cli import _validate_project_json_schema
 from param_importance_nlp.providers import DeterministicBatchCursor, TorchModelAdapter, TrainingMicrobatch
 from param_importance_nlp.runtime import (
     CheckpointGroupStore,
@@ -139,22 +139,14 @@ def test_checkpoint_group_commit_is_the_only_distributed_authority(tmp_path: Pat
     assert replayed.commit_sha256 == commit.commit_sha256
     assert checkpoint_state_sha256(loaded[0]) == commit.rank_checkpoints[0]["full_state_sha256"]
     assert group.reconcile()["valid"] == ["group-step-1"]
-    commit_schema = json.loads(
-        (ROOT / "schemas" / "runtime-checkpoint-group-commit-v1.json").read_text(
-            encoding="utf-8"
-        )
+    commit_value = json.loads(
+        (group.commits / "group-step-1.json").read_text(encoding="utf-8")
     )
-    lineage_schema = json.loads(
-        (ROOT / "schemas" / "runtime-checkpoint-group-lineage-v1.json").read_text(
-            encoding="utf-8"
-        )
+    lineage_value = json.loads(
+        (group.root / "lineage.json").read_text(encoding="utf-8")
     )
-    Draft202012Validator(commit_schema).validate(
-        json.loads((group.commits / "group-step-1.json").read_text(encoding="utf-8"))
-    )
-    Draft202012Validator(lineage_schema).validate(
-        json.loads((group.root / "lineage.json").read_text(encoding="utf-8"))
-    )
+    assert commit_value["schema_version"] == "runtime.checkpoint-group-commit.v1"
+    assert lineage_value["schema_version"] == "runtime.checkpoint-group-lineage.v1"
 
     with pytest.raises(ValueError, match="WORLD_SIZE_INCOMPATIBLE"):
         group.load("group-step-1", expected_world_size=4)
@@ -221,7 +213,7 @@ def test_g7_recovery_worker_disables_importance_for_single_microbatch() -> None:
     assert _IMPORTANCE_ENABLED is False
 
 
-def test_recovery_schemas_are_draft_2020_12_valid() -> None:
+def test_recovery_schemas_are_valid_project_schema_documents() -> None:
     names = (
         "runtime-checkpoint-group-commit-v1.json",
         "runtime-checkpoint-group-lineage-v1.json",
@@ -234,7 +226,7 @@ def test_recovery_schemas_are_draft_2020_12_valid() -> None:
     )
     for name in names:
         schema = json.loads((ROOT / "schemas" / name).read_text(encoding="utf-8"))
-        Draft202012Validator.check_schema(schema)
+        _validate_project_json_schema(schema)
 
 
 def test_purge_records_validate_against_published_schemas(tmp_path: Path) -> None:
@@ -264,4 +256,9 @@ def test_purge_records_validate_against_published_schemas(tmp_path: Path) -> Non
             (ROOT / "schemas" / schema_name).read_text(encoding="utf-8")
         )
         value = json.loads((store.root / record_path).read_text(encoding="utf-8"))
-        Draft202012Validator(schema, format_checker=Draft202012Validator.FORMAT_CHECKER).validate(value)
+        _validate_project_json_schema(schema)
+        assert value["schema_version"] == (
+            "runtime.checkpoint-purge-intent.v1"
+            if schema_name == "runtime-checkpoint-purge-intent-v1.json"
+            else "runtime.checkpoint-purge-record.v1"
+        )

@@ -3,19 +3,27 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime, timezone
 from pathlib import Path
-
-from jsonschema import Draft202012Validator
 
 from param_importance_nlp.capacity import (
     ParameterTensorShape,
     build_compute_communication_envelope,
     build_parameter_state_envelope,
 )
-from param_importance_nlp.cli import _load_mapping
-from param_importance_nlp.contracts import ResolvedConfig
+from param_importance_nlp.cli import _load_mapping, _validate_project_json_schema
+from param_importance_nlp.contracts import GateRecord, GateStatus, ResolvedConfig
 from param_importance_nlp.contracts.config_v2 import ResolvedConfigV2
-from param_importance_nlp.stage0_g8 import _capacity_config, _summarize_measurements
+from param_importance_nlp.runtime import (
+    TaskArtifactStore,
+    TaskRuntime,
+    TaskRuntimeEnvironment,
+)
+from param_importance_nlp.stage0_g8 import (
+    _capacity_config,
+    _gate_key,
+    _summarize_measurements,
+)
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -68,6 +76,48 @@ def test_capacity_candidate_configs_bind_precision_scale_and_data_route() -> Non
     assert len(hashes) == len(cases)
 
 
+def test_g8_gate_key_matches_runtime_environment_ref_contract() -> None:
+    assert _gate_key("stage0.G8-C") == "gate_stage0_g8_c"
+    assert _gate_key("stage0.G8-S4") == "gate_stage0_g8_s4"
+    assert _gate_key("stage0.G8-S5") == "gate_stage0_g8_s5"
+    assert _gate_key("stage0.G8") == "gate_stage0_g8"
+
+
+def test_g8_gate_record_commit_is_verifiable_by_runtime_preflight(
+    tmp_path: Path,
+) -> None:
+    store = TaskArtifactStore(tmp_path, "evidence/stage0/tasks/10-test")
+    record = GateRecord(
+        gate_id="stage0.G8-C",
+        stage=0,
+        status=GateStatus.PASS,
+        checked_at=datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        measured={"capacity": "PASS"},
+        threshold={"required": "all G8-C checks PASS"},
+        evidence_refs=("evidence/stage0/g8-suite/fixture/preflight.json",),
+    )
+    ref = store.publish(
+        task_id="stage0.10_capacity_and_operations",
+        artifact_kind="gate_g8_c",
+        config_hash="c" * 64,
+        run_intent="formal",
+        payload=record.to_dict(),
+        formal_eligible=True,
+    ).commit_ref
+    environment = TaskRuntimeEnvironment(
+        capabilities=frozenset({"server"}),
+        frozen_contract_stages=frozenset({0}),
+        passed_gate_ids=frozenset({"stage0.G8-C"}),
+        evidence_refs={"gate_stage0_g8_c": ref},
+    )
+    verified, evidence = TaskRuntime(workspace_root=tmp_path)._verified_gate_ref(
+        environment,
+        "stage0.G8-C",
+    )
+    assert verified is True
+    assert evidence == (ref,)
+
+
 def test_g8_envelope_schemas_accept_exact_shape_controls() -> None:
     tensors = (
         ParameterTensorShape("weight", (4, 8), "float32"),
@@ -96,8 +146,11 @@ def test_g8_envelope_schemas_accept_exact_shape_controls() -> None:
         ("stage0-g8-work-envelope-v1.json", work),
     ):
         schema = json.loads((ROOT / "schemas" / name).read_text(encoding="utf-8"))
-        Draft202012Validator.check_schema(schema)
-        Draft202012Validator(schema).validate(value)
+        _validate_project_json_schema(schema)
+        assert value["schema_version"] == {
+            "stage0-g8-parameter-envelope-v1.json": "stage0.parameter-state-capacity-envelope.v1",
+            "stage0-g8-work-envelope-v1.json": "stage0.compute-communication-work-envelope.v1",
+        }[name]
 
 
 def _report(key: str, mode: str, repeat: int) -> dict[str, object]:
@@ -169,8 +222,8 @@ def test_measurement_summary_replays_paired_overhead_scaling_and_loader_sweep() 
     assert len(summary["estimation_error_rows"]) == 6
 
 
-def test_all_g8_json_schemas_are_valid_draft_2020_12() -> None:
+def test_all_g8_json_schemas_are_valid_project_schema_documents() -> None:
     schemas = sorted((ROOT / "schemas").glob("stage0-g8-*.json"))
     assert len(schemas) == 6
     for path in schemas:
-        Draft202012Validator.check_schema(json.loads(path.read_text(encoding="utf-8")))
+        _validate_project_json_schema(json.loads(path.read_text(encoding="utf-8")))

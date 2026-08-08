@@ -102,6 +102,10 @@ _CRITICAL_SOURCE_REFS = (
 )
 
 
+def _gate_key(gate_id: str) -> str:
+    return "gate_" + re.sub(r"[^a-z0-9]+", "_", gate_id.casefold()).strip("_")
+
+
 class Stage0G8Error(RuntimeError):
     """S0.10 capacity, operations, or replay evidence failed closed."""
 
@@ -1802,11 +1806,28 @@ def run_formal_g8_task(
             formal_eligible=True,
             source_refs=evidence_refs,
         ).commit_ref
+    gate_refs: dict[str, str] = {}
+    for gate_id in GATE_IDS:
+        record = records[gate_id]
+        kind = _gate_key(gate_id).removeprefix("gate_stage0_")
+        gate_refs[gate_id] = store.publish(
+            task_id=TASK_ID,
+            artifact_kind=f"gate_{kind}",
+            config_hash=request.config.config_hash,
+            run_intent="formal",
+            payload=record.to_dict(),
+            formal_eligible=True,
+            source_refs=(refs["capacity_envelope"],),
+        ).commit_ref
     return TaskRunResult.passed(
         request,
         artifact_refs=refs,
         message="Stage 0 S0.10 capacity and operations gates passed",
-        metadata={"stage0_g8_specialized": True, "gate_ids": list(GATE_IDS)},
+        metadata={
+            "stage0_g8_specialized": True,
+            "gate_ids": list(GATE_IDS),
+            "gate_refs": gate_refs,
+        },
     )
 
 
@@ -2100,16 +2121,19 @@ def execute_stage0_g8(
     outputs = dict(result.artifact_refs)
     request = TaskExecutionRequest(config, config.task_definition, state.environment)
     gate = validate_formal_g8_outputs(request, root, outputs)
+    gate_refs = result.metadata.get("gate_refs")
+    if not isinstance(gate_refs, dict) or set(gate_refs) != set(GATE_IDS):
+        raise Stage0G8Error("G8_GATE_REFS_INVALID")
     refs = dict(state.environment.evidence_refs)
     refs.update(
         {
             "g8_capacity": outputs["capacity_envelope"],
             "g8_operations": outputs["operations_preflight"],
             "g8_faults": outputs["fault_report"],
-            "gate_stage0_g8_c": outputs["capacity_envelope"],
-            "gate_stage0_g8_s4": outputs["capacity_envelope"],
-            "gate_stage0_g8_s5": outputs["capacity_envelope"],
-            "gate_stage0_g8": outputs["capacity_envelope"],
+            "gate_stage0_g8_c": gate_refs["stage0.G8-C"],
+            "gate_stage0_g8_s4": gate_refs["stage0.G8-S4"],
+            "gate_stage0_g8_s5": gate_refs["stage0.G8-S5"],
+            "gate_stage0_g8": gate_refs["stage0.G8"],
         }
     )
     environment = TaskRuntimeEnvironment(

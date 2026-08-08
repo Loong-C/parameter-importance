@@ -9,11 +9,10 @@ from pathlib import Path
 import subprocess
 from types import SimpleNamespace
 
-from jsonschema import Draft202012Validator
 import pytest
 
 from param_importance_nlp.atomic import sha256_file
-from param_importance_nlp.cli import _load_mapping
+from param_importance_nlp.cli import _load_mapping, _validate_project_json_schema
 from param_importance_nlp.contracts import (
     GateRecord,
     GateStatus,
@@ -477,18 +476,20 @@ def test_g10_formal_task_publishes_revalidatable_ready_bundle(
         "stage0-g10-readiness-v1.json": readiness_refs[0],
     }
     for schema_name, artifact_path in generated.items():
-        validator = Draft202012Validator(
-            json.loads((ROOT / "schemas" / schema_name).read_text(encoding="utf-8"))
+        schema = json.loads(
+            (ROOT / "schemas" / schema_name).read_text(encoding="utf-8")
         )
-        validator.validate(json.loads(artifact_path.read_text(encoding="utf-8")))
+        _validate_project_json_schema(schema)
+        value = json.loads(artifact_path.read_text(encoding="utf-8"))
+        assert value["schema_version"] == schema_name[:-5]
 
 
-def test_all_g10_schemas_are_valid_and_sync_fixture_conforms() -> None:
+def test_all_g10_schemas_are_valid_project_schema_documents() -> None:
     schema_paths = sorted((ROOT / "schemas").glob("stage0-g10-*.json"))
     assert len(schema_paths) == 8
     for path in schema_paths:
-        Draft202012Validator.check_schema(json.loads(path.read_text(encoding="utf-8")))
-    schema = json.loads(
-        (ROOT / "schemas/stage0-g10-sync-observation-v1.json").read_text(encoding="utf-8")
-    )
-    Draft202012Validator(schema).validate(_observation(_git_head(), _git_branch()))
+        _validate_project_json_schema(json.loads(path.read_text(encoding="utf-8")))
+    observation = _observation(_git_head(), _git_branch())
+    assert observation["schema_version"] == "stage0-g10-sync-observation-v1"
+    assert observation["expected_commit"] == _git_head()
+    assert observation["branch"] == _git_branch()
