@@ -1,0 +1,16 @@
+# 由 artifact quadrature-pilot-plan-build 编译；required_unit_ids 必须替换为
+# endpoint/probe builder 产出的真实 path unit ID。
+plan_id: stage3-formal-pilot-v1
+candidate_rules:
+  - midpoint
+  - trapezoid
+  - simpson
+  - gauss_legendre_4
+required_unit_ids:
+  - FILL_PATH_UNIT_ID
+thresholds:
+  max_normalized_l1_error: 0.05
+  max_completeness_absolute_residual: 0.01
+  min_spearman: 0.95
+  min_topk_overlap: 0.9
+  max_unique_nodes: 16

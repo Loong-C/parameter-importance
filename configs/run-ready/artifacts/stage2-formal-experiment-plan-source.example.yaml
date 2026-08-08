@@ -1,0 +1,22 @@
+# 由 artifact stage2-experiment-plan-build 编译。这里的 B/M/R 和阈值仅用于演示
+# 声明格式；正式运行必须以已审核的预注册/pilot 冻结值替换，并传入真实前驱 commits。
+schema_version: stage2-formal-experiment-plan-source-v1
+plan_id: stage2-pilot-freeze-example-v1
+task_id: stage2.06_pilot_and_matrix_freeze
+wave_id: stage2-pilot-wave-example-v1
+cell_id: fixed-state-example-cell
+stream: pilot
+batch_size: 32
+microbatch_counts:
+  - 4
+  - 8
+  - 16
+  - 32
+repetitions: 2
+selection_basis: preregistered_pilot
+pilot_thresholds:
+  bias_margin: 0.05
+  max_corrected_nmse_ratio: 1.0
+  min_spearman: 0.9
+  min_topk_overlap: 0.8
+  max_online_cost_ratio: 1.5

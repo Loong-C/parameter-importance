@@ -43,7 +43,13 @@ def test_resource_sampler_lifecycle_fails_closed() -> None:
     sampler.stop(completed_steps=0, effective_units=0)
 
 
-def test_tensorboard_rebuild_is_explicit_optional_dependency(tmp_path) -> None:
+def test_tensorboard_rebuild_is_explicit_optional_dependency(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def _unavailable(*_args: object, **_kwargs: object) -> None:
+        raise DependencyUnavailable("tensorboard", feature="tensorboard_logging")
+
+    monkeypatch.setattr(telemetry, "load_tensorboard_module", _unavailable)
     with pytest.raises(DependencyUnavailable, match="tensorboard"):
         rebuild_tensorboard_from_jsonl((), tmp_path / "tensorboard")
 

@@ -33,3 +33,6 @@ artifacts/
 *.pth
 *.safetensors
 *.whl
+
+# configs/run-ready/artifacts/ holds versioned source example files required by tests.
+!configs/run-ready/artifacts/

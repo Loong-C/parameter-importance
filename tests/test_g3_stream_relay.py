@@ -4,6 +4,7 @@ import argparse
 import http.client
 from io import BytesIO, StringIO
 import json
+import os
 from pathlib import Path
 from types import SimpleNamespace
 import time
@@ -327,6 +328,7 @@ def test_receiver_expected_offset_is_checked_inside_the_locked_callback() -> Non
         receiver._check_expected_offset(SimpleNamespace(expected_offset=18), plan)
 
 
+@pytest.mark.skipif(os.name != "nt", reason="lab-pipe requires the controlled Windows cmd.exe")
 def test_lab_pipe_command_is_url_free_and_uses_only_native_ssh_pipe(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -435,6 +437,7 @@ def test_lab_pipe_plan_and_completion_transcripts_are_exact() -> None:
     ) == result
 
 
+@pytest.mark.skipif(os.name != "nt", reason="lab-pipe requires the controlled Windows cmd.exe")
 def test_dispatcher_replans_after_a_native_pipe_transport_failure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

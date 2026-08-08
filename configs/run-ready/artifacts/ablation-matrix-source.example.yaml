@@ -1,0 +1,21 @@
+schema_version: ablation-matrix-source-v1
+matrix_id: tiny-local-ablation-example
+base_config:
+  training:
+    batch_size: 32
+  importance:
+    estimator: u
+  path_integration:
+    node_count: 8
+factors:
+  - name: batch_size
+    config_path: [training, batch_size]
+    baseline_value: 32
+    alternatives: [16, 64]
+  - name: quadrature_nodes
+    config_path: [path_integration, node_count]
+    baseline_value: 8
+    alternatives: [4, 16]
+base_seed: 1337
+seed_namespace: stage8-ablation
+scope: local_fixture

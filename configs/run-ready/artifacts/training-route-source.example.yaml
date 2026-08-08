@@ -1,0 +1,34 @@
+schema_version: training-route-source-v1
+route_id: tiny-local-route-example
+run_intent: local_fixture
+phases:
+  - phase_id: pretrain
+    phase_type: pretrain
+    base_initialization_id: tiny-init-v1
+    model_asset_id: tiny-model-v1
+    dataset_asset_id: tiny-pretrain-data-v1
+    output_checkpoint_id: tiny-pretrain-checkpoint-v1
+    checkpoint_frequency_steps: 1
+    parent_phase_id: null
+    input_checkpoint_id: null
+    task_id: null
+    importance_enabled: true
+    metadata:
+      runtime:
+        data_seed_offset: 11
+  - phase_id: finetune
+    phase_type: finetune
+    base_initialization_id: tiny-init-v1
+    model_asset_id: tiny-model-v1
+    dataset_asset_id: tiny-supervised-data-v1
+    output_checkpoint_id: tiny-finetune-checkpoint-v1
+    checkpoint_frequency_steps: 1
+    parent_phase_id: pretrain
+    input_checkpoint_id: tiny-pretrain-checkpoint-v1
+    task_id: tiny-classification
+    importance_enabled: true
+    metadata:
+      runtime:
+        data_seed_offset: 23
+metadata:
+  purpose: CLI builder example; decision artifact is supplied separately
