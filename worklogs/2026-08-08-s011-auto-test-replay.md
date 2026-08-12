@@ -479,3 +479,20 @@ G9_REF=evidence/stage0/g9-formal/314c40fd22aead6104579a54e46b3c3e24166046f15d5cf
 
 - S0.12 仍未完成，状态为 **`IN_PROGRESS/BLOCKED_ON_G3_SIDECAR_REBUILD`**。本轮只确认 d3764d9 bootstrap PASS；不能复用该 bootstrap，G3–G10 与新 `READY` 均不存在。
 - 本节追加会再次改变 generator commit；提交并完成三端同步后，重新从 bootstrap 启动 G0→G5，让 G3 在空 canonical 派生路径上重建当前提交绑定的三个 GLUE 数据集，再推进独立 actor 的 verify/materialize/formal G3/G4/G5。只有新的 G3/G4/G5 完整通过，才进入四卡独占窗口重跑 G6→G9。
+
+## 2026-08-13 05:49 CST — 83ac9ed G0–G5 完整通过
+
+### G0–G5 证据
+
+- 本轮 generator commit 为 `83ac9edca5ee5bc5a705a47faa449abfc43b31fc`；服务器 worktree clean，正式链唯一 PID `911612` 已正常退出，退出后无 attest、verify、materialize、formalizer、worker 或 torchrun 残留，四卡均为 `0 MiB / 0%`。
+- bootstrap PASS：`evidence/stage0/bootstrap/83ac9edca5ee5bc5a705a47faa449abfc43b31fc/index.json`，环境哈希 `35bfc4daa09ccb812d90e5ab3048f64ca16d51680cedabbcda9bdac6402229a9`。
+- G3 attest PASS：13 assets，acquisition ref `manifests/evidence/g3/acquisition/775428144f368870e543d30602656394db87c76e3274b3da5c39c7f0f46741fc.json`，`acquisition_sha256=775428144f368870e543d30602656394db87c76e3274b3da5c39c7f0f46741fc`；G3 verify PASS：同 base ref，`verification_sha256=883c1f4f23af8883a7b967699334ba754700e0b9e203e11c9813af1bc131f59a`。
+- materialize PASS：13 assets，resolution `ae3e736b33fc57d95030281d593f774a084a043f2d6d148aad094cbefbd454c8`，index `reports/stage0/g3/ae3e736b33fc57d95030281d593f774a084a043f2d6d148aad094cbefbd454c8/asset-index.json`。本轮三个 GLUE 派生目录均在空 canonical 路径上重建并发布，避免了旧 READY lineage 冲突。
+- formal G3 PASS：`evidence/stage0/g3-formal/ae3e736b33fc57d95030281d593f774a084a043f2d6d148aad094cbefbd454c8/index.json`；formal G4 PASS：同 resolution 下 `evidence/stage0/g4-formal/ae3e736b33fc57d95030281d593f774a084a043f2d6d148aad094cbefbd454c8/index.json`。
+- formal G5 PASS：`evidence/stage0/g5-formal/bbd4e56ee7fe60f9332fab47bc6286dffd964b8035d53434b69f01a7c8f75820/index.json`；G5 suite `evidence/stage0/g5-suite/83a3ed538787c03b8815bf85e8070f0d6ccf2adcd817e4aeb84356cb11c6f6a6/5f08b6c9cf3a17476353e18d3abe4979fc8f901308aac78625e974fe8103f569/` 下 14/14 worker reports 完整：9 个 PASS、5 个 `EXPECTED_FAILURE_CONFIRMED`，符合 G5 controlled-failure 合同。
+- 证据文件核对：bootstrap/G3/G4/G5 index SHA-256 依次为 `f2ab52ffaa767d77fab6d56956c49a8e77edc9197361612413236f7056b1fe58`、`0dacbf9803af115fe6bcdb640b74dbbf9f75d4197b3b9a670765f8e3a060f393`、`d087895794410514f164453b79b2a9ae0ef9fddc6240c11c42e3ce3535d2718a`、`33c100710b93cb5b0b3afb2da3227a56e312787eebb28973a2e801246a2f2408`；完整链日志 `$DATA_ROOT/tmp/full-chain-83ac9ed-s1.log` SHA-256 `4185c2975b3a2b3d0c06a558e1f136fa714671ac24ac232e2dc26103b11da2f4`，大小 `225724` bytes。
+
+### 当前判定与下一步
+
+- 本轮只能确认当前提交的 **G0–G5 PASS**，不能跨提交复用到下一轮。S0.12 仍为 **`IN_PROGRESS/BLOCKED_ON_G6_NCCL_RETRY`**：G6–G9、G10 与新的 Stage 0 `READY` 尚未完成。
+- 本节 Worklog 追加会改变 generator commit；提交并完成 GitHub/bundle/服务器三端同步后，必须从新 bootstrap 重建有效 G0→G5，再在四卡独占窗口运行带 `NCCL_P2P_DISABLE=1` 的 G6，并确认 G7R 继承同一 transport 合同后继续 G7→G9。
