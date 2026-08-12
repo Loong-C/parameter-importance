@@ -230,3 +230,20 @@ G9_REF=evidence/stage0/g9-formal/314c40fd22aead6104579a54e46b3c3e24166046f15d5cf
 
 - 当前仍无 `32cdad4` 上新的 G3–G9 PASS；S0.12 状态为 **`IN_PROGRESS/BLOCKED_ON_G3_PUBLICATION_REBUILD`**，不能使用旧 G3–G9 拼接完成。
 - 服务器失败日志与 26 文件备份已留存；本地一次性链脚本、归档脚本和输出将在下一次提交前清理。必须将本次记录提交后再次同步三端，并从最终新 commit 完整重跑 bootstrap→G9。
+
+## 2026-08-12 20:25 CST — S0.12 G3 attest 二次派生半成品清理
+
+### 运行与失败
+
+- `d2fc6d7c0323f5ad00f4987891184c5b5644fe00` 上重新启动 bootstrap→G9；bootstrap 在 `2026-08-12T12:22:09Z` PASS，attest 于 `2026-08-12T12:22:14Z` 再次 exit 1，仍为 `GLUE_SIDECAR_IDENTITY_MISMATCH:raw_asset_id`。
+- 失败输出保留在 `$DATA_ROOT/tmp/stage0-chain-s1-d2fc6d7-attest-failure.log`；当时无 attest/materialize/formal/torchrun 残留进程。
+
+### 根因确认与恢复
+
+- 读取三份 `stage0-glue-derived-build.json` 确认：`glue-{sst2,mnli,rte}-pretokenized` 目录中的 sidecar 仍绑定上一轮 `generator_git_commit=32cdad42…` 与旧 `raw_asset_id`；它们是上一轮 materialize 失败后留下的半成品，不是当前 `d2fc6d7` 输入。
+- 将这三份派生目录完整移入 `$DATA_ROOT/tmp/glue-derived-d2fc6d7-backup-20260812T122519Z/`，输出 `ARCHIVED_COUNT=3`，目录规模约 534 MiB、3.2 GiB、22 MiB；原始 `datasets/glue-{sst2,mnli,rte}` 未移动。
+
+### 判定与下一步
+
+- S0.12 仍为 **`IN_PROGRESS/BLOCKED_ON_G3_ASSET_REBUILD`**；当前没有新的 G3–G9 PASS。下一轮最终提交需从 attest 重新开始，重建派生数据、重新 materialize 13 个 READY 后再继续正式 gate 链。
+- 本地临时链脚本、归档脚本和输出在提交前清理；服务器失败日志、两轮派生目录备份和 26 个旧发布物备份均保留在 DATA_ROOT/tmp 供审计与恢复。
