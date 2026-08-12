@@ -309,3 +309,28 @@ G9_REF=evidence/stage0/g9-formal/314c40fd22aead6104579a54e46b3c3e24166046f15d5cf
 
 - S0.12 仍未完成，状态为 **`IN_PROGRESS/BLOCKED_ON_G6_RETRY`**：f51f317 上 G0–G5 PASS 已确认，但没有新的 G6/G7/G7R/G8/G9、三端同步观察、G10 formal 或 READY 产物。
 - 本节记录会形成新提交，因此下一步先提交并同步三端；新提交必须再次从 bootstrap→G5 产生绑定证据，然后在确认四卡独占后重试 G6。当前 G6 失败证据和 3.7 GiB G3 重建备份均保留在 DATA_ROOT/tmp，不覆盖旧证据。
+
+## 2026-08-13 00:03 CST — S0.12 9eb7256 G3 派生成功但 verify actor 约束失败
+
+### 本轮启动与保护
+
+- 本轮代码绑定提交为 `9eb7256000d91d9587494b21c2ccc26b71914507`；启动前本地、GitHub、服务器均在 `feat/stage1-cpu-evidence`，服务器 worktree clean，四张卡均为 `0% / 0 MiB`。
+- 为避免覆盖旧发布物，已先将当前 9eb7256 之前的 3 个派生目录与 26 个 canonical 发布/qualification 文件整体归档到 `$DATA_ROOT/tmp/g3-rebuild-9eb7256-20260812T152500Z/`；归档计数 `29`，约 `3.7 GiB` 数据与 `152 KiB` manifest，原始数据未移动。
+- 正式链以服务器后台 PID `862892` 启动，使用冻结解释器 `$DATA_ROOT/envs/parameter-importance-stage0-1bd963c65f75/bin/python`；未启动第二份链。bootstrap PASS：`evidence/stage0/bootstrap/9eb7256000d91d9587494b21c2ccc26b71914507/index.json`，`environment_hash=baf276a6ce0e62adc92605493841951c9ec7fe2c407424a47fb530e099cd8d8b`。
+
+### G3 attest 与失败证据
+
+- G3 attest 成功重建并发布 `13` 个候选；执行时间约 `2026-08-12T15:32:48Z` 至 `16:03:00Z`，acquisition ref 为 `manifests/evidence/g3/acquisition/92dac060cf648083bd8dfd0e8d2d04e6f635db884ce18c9bc8617f73485ffbf0.json`，`acquisition_sha256=92dac060cf648083bd8dfd0e8d2d04e6f635db884ce18c9bc8617f73485ffbf0`。
+- 三个派生目录均已完整生成：`datasets/glue-sst2-pretokenized`（约 `534 MiB`）、`datasets/glue-mnli-pretokenized`（约 `3.2 GiB`）、`datasets/glue-rte-pretokenized`（约 `22 MiB`）。
+- verify 入口随后退出，exit `1`，根因是本轮脚本错误复用了同一个 `actor_instance_id`：`G3LifecycleEvidenceError: verifier actor_instance_id must differ from the fetcher`。因此没有生成本轮 verification ref，也没有进入 materialize/G3/G4/G5；该失败不是数据内容校验失败。
+- 失败完整输出保留在 `$DATA_ROOT/tmp/full-chain-9eb7256-s1.log`；退出后确认无 attest、verify、materialize、formalizer、torchrun 或 worker 残留，GPU 全部空闲。正式资产未被宣称为本轮 VERIFIED/READY。
+
+### 当前判定与恢复动作
+
+- S0.12 仍未完成，状态保持 **`IN_PROGRESS/BLOCKED_ON_G3_VERIFY_ACTOR_RETRY`**。本轮只证明 9eb7256 的 G3 派生构建成功，不能作为 G3–G9 交付闭环。
+- 下一步先归档本轮新生成的 3 个派生目录与 acquisition 失败链的相关临时产物，保留 sha256 与原始数据不变；随后提交并同步本节 worklog 到 GitHub/服务器，使用独立的 fetcher/verifier actor 重跑 bootstrap→G5，再在四卡独占核验后推进 G6。
+
+### 归档结果
+
+- 本轮 3 个派生目录已整体移入 `$DATA_ROOT/tmp/g3-rebuild-9eb7256-verify-actor-failure-20260812T160500Z/`，`ARCHIVED_COUNT=3`，约 `3.7 GiB`；归档内 `sha256sums.txt` 已生成，原始 `datasets/glue-{sst2,mnli,rte}` 未移动。
+- 归档清单文件 SHA256：`9b4d728dc543eee9cf7aa336f6ba4c4e80a5f94627376b30bb9692ae19df9046`。失败 acquisition 仍保留在 DATA_ROOT 的 immutable manifests 目录，未删除或覆盖。
