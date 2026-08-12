@@ -212,3 +212,21 @@ G9_REF=evidence/stage0/g9-formal/314c40fd22aead6104579a54e46b3c3e24166046f15d5cf
 
 - 本次失败是旧派生 sidecar 与当前 raw asset identity 不一致导致的资产缓存漂移，不是 `0c9cac3` 代码失败；但它使当前 G0–G9 重跑尚未形成任何新的 G3–G9 PASS。
 - S0.12 继续保持 **`IN_PROGRESS/BLOCKED_ON_G3_ASSET_REBUILD`**；派生资产重建后必须从 attest 起按最终提交完整重跑，不能把旧 G3–G9 证据拼入新链。
+
+## 2026-08-12 20:14 CST — S0.12 G3 materialize 旧发布物冲突归档
+
+### 运行与失败
+
+- `32cdad42c821be9f74df175d4701ca0e4489f86f` 上的正式链已完成 bootstrap PASS、attest PASS（13 assets，acquisition `manifests/evidence/g3/acquisition/0bdb873d0fb61933efc0e4c29557dddab24b3e087932b1142c6e06a8b733ce0d.json`）、verify PASS（verification 同一 artifact identity，`verification_sha256=b70d2deb96c464319d7ba12ac3e9fa533f9cbb67a71a3d070faa7fe5ecc3a478`）。
+- materialize 在 `2026-08-12T12:09:17Z` 安全失败，exit 1：`G3AssetPublicationError: existing READY does not descend from the supplied VERIFIED input`。完整输出已保存为 `$DATA_ROOT/tmp/stage0-chain-s1-32cdad4-materialize-failure.log`；没有覆盖旧 READY 或旧 evidence。
+
+### 根因与精确恢复
+
+- 发布器代码明确要求既有 canonical READY 必须由本次 VERIFIED 输入派生；服务器已有 13 个 layout 指定的 READY manifest 与 13 个 qualification 属于旧 acquisition/verification 链，不能与本次新派生链混用。
+- 按 layout 精确归档 26 个发布文件（13 manifest + 13 qualification）到 `$DATA_ROOT/tmp/g3-publications-32cdad4-backup-20260812T121415Z/`，脚本输出 `ARCHIVED_COUNT=26` 且对全部备份文件记录 SHA-256；没有移动 raw/derived 数据、旧 acquisition/verification、旧 G3/G4/G5/G6/G7/G8/G9 evidence。
+- 本轮旧发布物归档是可恢复操作；materialize 后续将从本次 VERIFIED 输入新建 canonical READY/qualification，再继续正式 G3。
+
+### 判定与下一步
+
+- 当前仍无 `32cdad4` 上新的 G3–G9 PASS；S0.12 状态为 **`IN_PROGRESS/BLOCKED_ON_G3_PUBLICATION_REBUILD`**，不能使用旧 G3–G9 拼接完成。
+- 服务器失败日志与 26 文件备份已留存；本地一次性链脚本、归档脚本和输出将在下一次提交前清理。必须将本次记录提交后再次同步三端，并从最终新 commit 完整重跑 bootstrap→G9。
