@@ -19,6 +19,7 @@ from .contracts import (
     RuntimeCapabilityEvidence,
     canonical_json_hash,
     load_canonical_json,
+    loads_strict_json,
     write_canonical_json,
 )
 from .contracts.jsonio import JSONValue
@@ -642,7 +643,13 @@ def _persistence_status(
     now: datetime | None = None,
 ) -> dict[str, JSONValue]:
     decision_path = source.repository / "reports/stage0/g1-persistence-decision-20260719.json"
-    decision = _mapping(load_canonical_json(decision_path), field="persistence_decision")
+    # G1-D predates the canonical one-line publisher and is deliberately kept
+    # byte-for-byte as historical evidence (see stage0_bootstrap._load_report);
+    # parse it with the strict reader and bind its original SHA-256 instead of
+    # rewriting history in place.
+    decision = _mapping(
+        loads_strict_json(decision_path.read_bytes()), field="persistence_decision"
+    )
     current = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
     expires = _parse_time(decision.get("expires_at"), field="persistence.expires_at")
     g1 = gate_records["stage0.G1"]
