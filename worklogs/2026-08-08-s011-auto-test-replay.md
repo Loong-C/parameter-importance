@@ -416,3 +416,21 @@ G9_REF=evidence/stage0/g9-formal/314c40fd22aead6104579a54e46b3c3e24166046f15d5cf
 
 - S0.12 仍未完成，当前状态为 **`IN_PROGRESS/BLOCKED_ON_G7R_NCCL_RETRY`**。本轮只能确认新提交 `344a326` 的 G0–G7 PASS；没有本提交的 G7R/G8/G9、三端同步观察、G10 formal 或 `READY` 产物。
 - G7R 失败 suite 不覆盖、不复用；修复形成新的 generator commit 后必须从 bootstrap 重新生成 G0–G5，再在四卡独占且实际继承 `NCCL_P2P_DISABLE=1` 的窗口完整重跑 G6→G9。
+
+## 2026-08-13 03:50 CST — 37f7934 G3 sidecar identity 失败与可恢复归档
+
+### 本轮启动与失败边界
+
+- G7R transport 修复提交为 `37f793401648979da687fdaf51b64b6c55103a08`，本地、GitHub、服务器分支均已同步，服务器 worktree clean；服务器四卡在链启动前均为 `0 MiB / 0%`，无外部计算进程占用。
+- 正式链 `$DATA_ROOT/tmp/full-chain-37f7934-s1.log` 已从 bootstrap 开始执行。bootstrap PASS：`evidence/stage0/bootstrap/37f793401648979da687fdaf51b64b6c55103a08/index.json`，`environment_hash=96c67ce87856d44b9e2d4134e4d2e854f6f023008108c3845e5467b58ecb88ca`。
+- G3 attest 在 `2026-08-12T19:43:13Z` 进入派生 GLUE 校验时失败，异常为 `GLUE_SIDECAR_IDENTITY_MISMATCH:raw_asset_id`；未生成本轮 G3 verification、materialize、formal G3/G4/G5 或任何 G6/G7/G7R 产物。失败日志 SHA-256 为 `ec5485c8bab25eae1cf132fb8d895eb08605ced55ff94b7b4dc7fe761e62a6af`，大小 `2611` bytes。
+
+### 根因确认与归档
+
+- `datasets/glue-{sst2,mnli,rte}-pretokenized/stage0-glue-derived-build.json` 均绑定上一轮 `generator_git_commit=344a326...` 及上一轮 raw asset identity；当前 lifecycle 从 raw publication 重新计算的 identity 与旧 sidecar 不一致。builder 的只读 sidecar 校验拒绝复用该旧派生资产，符合不可变派生资产合同；没有手工修改 sidecar，也没有移动 raw `datasets/glue-{sst2,mnli,rte}`。
+- 在确认无 attest、formalizer、torchrun、worker 残留后，将三个明确的旧派生目录及本轮唯一失败 staging 目录整体、可逆地移动至 `$DATA_ROOT/tmp/g3-rebuild-37f7934-sidecar-failure-20260812T195028Z/`。归档共 `34` 个文件、`3963538359` bytes；迁移前清单 SHA-256 为 `82d2648954719f57a5f57dc3bac40e87c6749b9c251f6eadbc780b91dce7e886`，迁移后清单 SHA-256 为 `28e1998300b0f9f10f2a2f1198f61b710c8ccbd9bac32f337fe6372230915cd8`。原始 raw 数据保持原路径不变。
+
+### 当前判定与下一步
+
+- S0.12 仍未完成，当前状态为 **`IN_PROGRESS/BLOCKED_ON_G3_SIDECAR_REBUILD`**。`37f7934` 只证明 bootstrap PASS 和本机 G7R 回归，不能形成新的 G0–G5 或 G6–G9 交付闭环。
+- 本段 Worklog 提交后 generator commit 会再次变化，因此不能复用 `37f7934` 的 bootstrap；下一步先完成 GitHub/bundle/服务器同步与 Agent/ 五文件 hash 核对，再以新 commit 从 bootstrap 重新跑 G0→G5，确认派生资产重建和 verification/materialize/formal G3/G4/G5 完成后，才进入四卡独占窗口重跑 G6→G9。
