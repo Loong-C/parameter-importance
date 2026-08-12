@@ -334,3 +334,27 @@ G9_REF=evidence/stage0/g9-formal/314c40fd22aead6104579a54e46b3c3e24166046f15d5cf
 
 - 本轮 3 个派生目录已整体移入 `$DATA_ROOT/tmp/g3-rebuild-9eb7256-verify-actor-failure-20260812T160500Z/`，`ARCHIVED_COUNT=3`，约 `3.7 GiB`；归档内 `sha256sums.txt` 已生成，原始 `datasets/glue-{sst2,mnli,rte}` 未移动。
 - 归档清单文件 SHA256：`9b4d728dc543eee9cf7aa336f6ba4c4e80a5f94627376b30bb9692ae19df9046`。失败 acquisition 仍保留在 DATA_ROOT 的 immutable manifests 目录，未删除或覆盖。
+
+## 2026-08-13 01:19 CST — S0.12 64172a7 G0–G5 通过但 G6 NCCL 重复超时
+
+### 本轮 G0–G5
+
+- `64172a79daeb91cc91a4ddc9f8c6bce6a82f3571` 已在本地、GitHub、服务器同步，服务器 worktree clean；正式链使用冻结 Stage0 venv，且 G3 fetcher/verifier/gate 使用三个不同 UUID。
+- bootstrap PASS：`evidence/stage0/bootstrap/64172a79daeb91cc91a4ddc9f8c6bce6a82f3571/index.json`，`environment_hash=f4f11350592d175fa398cbcee34f2aec41ad97a7108c243cc1dd84c71b49d5ec`。
+- G3 attest PASS：13 assets，acquisition `manifests/evidence/g3/acquisition/f76f8f2692a24b64de742dfafcabf0960c425beaac88db52244694d1fd589a76.json`，`acquisition_sha256=f76f8f2692a24b64de742dfafcabf0960c425beaac88db52244694d1fd589a76`。
+- G3 verify PASS：13 assets，verification `manifests/evidence/g3/verification/f76f8f2692a24b64de742dfafcabf0960c425beaac88db52244694d1fd589a76.json`，`verification_sha256=bd912861a9cbae2b49d595528ac30d14b6c5d26848111e51a42ac677162f26d4`；materialize PASS，resolution `650d98014f57e8790602174c1149302888b430560e1267d11c2e06791b161ac0`。
+- formal G3 PASS：`evidence/stage0/g3-formal/650d98014f57e8790602174c1149302888b430560e1267d11c2e06791b161ac0/index.json`；formal G4 PASS：同 resolution 下 `evidence/stage0/g4-formal/650d98014f57e8790602174c1149302888b430560e1267d11c2e06791b161ac0/index.json`。
+- formal G5 PASS：`evidence/stage0/g5-formal/156fe86328ab3e3581ab37e7285e10d274e404580667bcbf6dcc62c77382c2a0/index.json`，14 个 worker report 完整；父链退出后四卡均为 `0% / 0 MiB`。
+
+### G6 失败证据
+
+- 单独绑定上述 G5 ref 启动 G6，启动前无 compute app，随后四卡各启动一个 worker（PID `877590`–`877593`）。
+- `collective-00` transcript：`$DATA_ROOT/evidence/stage0/g6-suite/04e2c72da172251dc3036cf7e1c7b35a5c76853dbe6e7da2fca1e267704f7ef4/1a73966ee114a34f1e3b1dcd0b654aed42a6e111d2731eb30ce57edb8f20faa2/transcripts/collective-00.json`；artifact hash `bd5fdcab706e5adea7cb4cb1d7e3350ec383145ddc35592865d3cd04a92b36f0`。
+- 运行时间 `2026-08-12T17:05:45.740570Z`–`17:11:55.484915Z`，`duration_seconds=369.744345`，`return_code=1`，`timed_out=false`，无残留 compute PID。rank 1 在 `all_gather_object` 的 NCCL `ALLGATHER` 再次超时：`SeqNum=2`、`NumelIn=394`、`NumelOut=1576`、`Timeout(ms)=300000`；rank 0/2/3 随后收到 watchdog dump 并被 SIGTERM，G6 未生成 formal index。
+- 本轮完整 G6 日志：`$DATA_ROOT/tmp/full-chain-64172a7-g6.log`。退出后确认无 formalize_g6、torchrun 或 worker 残留，四卡恢复 `0% / 0 MiB`。这与 f51f317 轮次相同的 NCCL object-gather timeout，说明当前阻塞是可重复的 G6 通信层问题，不是 G3 actor 约束或 G0–G5 链失败。
+
+### 归档与当前判定
+
+- 失败 suite 已整体移入 `$DATA_ROOT/tmp/g6-failed-64172a7-20260812T171903Z/`，4 files，sha256 清单 `13019e440fdd84fea0dae1219c294909eed7cc8a26867b4fb50aea4d2f333572`。
+- 本轮 3 个派生目录与 26 个 canonical 发布/qualification 文件已整体移入 `$DATA_ROOT/tmp/g3-rebuild-64172a7-g6-failed-20260812T171903Z/`，约 `3.7 GiB`，sha256 清单 `c9a6f508673ea58a2eaf60433a6fc2b7c6dcfa6272234c911cd1ed2f517a69ec`；原始数据未移动。
+- S0.12 仍未完成，状态为 **`IN_PROGRESS/BLOCKED_ON_G6_NCCL_RETRY`**。本轮只能确认 G0–G5 PASS，不能推进 G7/G7R/G8/G9 或 G10/READY。下一步需先把本记录同步三端；随后应针对固定的 `all_gather_object` 小对象启动/通信路径做最小、可审计的修正或诊断，再以新 commit 重跑完整 G0–G5 后重试 G6。
