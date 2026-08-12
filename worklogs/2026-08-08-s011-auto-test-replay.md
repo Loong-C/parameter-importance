@@ -461,3 +461,21 @@ G9_REF=evidence/stage0/g9-formal/314c40fd22aead6104579a54e46b3c3e24166046f15d5cf
 - 本节追加记录形成提交 `f1262c422671e914c4dea900888da2de8f6392ca`（`docs(stage0): record g3 materialize lineage conflict`），本地、GitHub `origin/feat/stage1-cpu-evidence` 与服务器 `/home/sophgo13/cjl/parameter-importance` 均已核对为该 HEAD；服务器分支为 `feat/stage1-cpu-evidence` 且 worktree clean。
 - 本次 Git bundle 使用服务器临时路径 `$DATA_ROOT/tmp/repo-sync-f1262c4.bundle`，本机/服务器 SHA-256 均为 `d76ae095a479bc3fd1207383ae8d4b3511f9fac4bd780b7b20d86554f509e726`，大小 `18062520` bytes；服务器以 `git merge --ff-only` 快进成功。三端确认后，本机与服务器 bundle 均已精确删除。
 - 本机与服务器 `Agent/` 五文件 SHA-256 完全一致：`git.md=183f4ba702d22a3a97a459d4873aed62377d51b666d2515990a2f408ecd856ca`；`remote_access.md=795c677e717827492a30342e5b91a4b5959f0df22c72354f14a506ecb023f7a1`；`server.md=9f2d4370ac64990cd29d33ef13de5c20cca65efb4655e928118ae4f3ca012c68`；`sync.md=1bf84f8379018b918eb1680c49dacb7d6d75d764c306782f5170212ceb190015`；`worklogs.md=4a61b34b02a7070b5d3321b349d13016548615a0f3ce069901d18049072a10da`。
+
+## 2026-08-13 04:49 CST — d3764d9 G3 sidecar identity 再次失败与归档
+
+### 本轮启动与失败边界
+
+- 本轮 generator commit 为 `d3764d9f160b5dd333c344cf48ce8b165b5a2834`；该提交已在本地、GitHub、服务器三端一致，服务器 worktree clean，启动前四卡均为 `0 MiB / 0%`。唯一正式链 PID `910222`，日志 `$DATA_ROOT/tmp/full-chain-d3764d9-s1.log`。
+- bootstrap PASS：`evidence/stage0/bootstrap/d3764d9f160b5dd333c344cf48ce8b165b5a2834/index.json`，`environment_hash=7175ed6823b57f436ffe7e878e0414bfa870500924ec7d524c9722b948120eb9`。
+- G3 attest 在派生 GLUE 数据只读身份校验处失败，异常为 `GLUE_SIDECAR_IDENTITY_MISMATCH:raw_asset_id`；没有生成本轮 acquisition/verification ref，也未进入 materialize、formal G3/G4/G5 或 G6–G9。完整链日志 SHA-256 为 `d1a20a98854ce7d538fe75f26e4c2c788656e61434e269899c8663fe1e62c7ea`，大小 `2611` bytes；退出后无相关进程残留，四卡空闲。
+
+### 旧派生目录归档
+
+- 失败 staging `tmp/glue-derived-sst2-6465b9c1d70643cb9fa5c34be1f33a72/` 为空；三个 canonical 派生目录的 sidecar 均仍绑定 `generator_git_commit=e378299...` 及旧 raw identity，未手工编辑 sidecar。
+- 将三个明确的旧派生目录与该失败 staging 整体、可逆地移动到 `$DATA_ROOT/tmp/g3-rebuild-d3764d9-sidecar-failure-20260812T204800Z/`。归档共 `34` 个文件、`3963538359` bytes；迁移前后清单 SHA-256 均为 `748c8e8e91215f80fbf46ef3a36e62ca11c61c0a839f0d37bae81419c0be3a01`。归档内迁移前/后清单逐文件 `sha256sum -c` 全部通过，canonical 派生路径已确认缺失；raw `datasets/glue-{sst2,mnli,rte}` 未移动。
+
+### 当前判定与下一步
+
+- S0.12 仍未完成，状态为 **`IN_PROGRESS/BLOCKED_ON_G3_SIDECAR_REBUILD`**。本轮只确认 d3764d9 bootstrap PASS；不能复用该 bootstrap，G3–G10 与新 `READY` 均不存在。
+- 本节追加会再次改变 generator commit；提交并完成三端同步后，重新从 bootstrap 启动 G0→G5，让 G3 在空 canonical 派生路径上重建当前提交绑定的三个 GLUE 数据集，再推进独立 actor 的 verify/materialize/formal G3/G4/G5。只有新的 G3/G4/G5 完整通过，才进入四卡独占窗口重跑 G6→G9。
