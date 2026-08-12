@@ -496,3 +496,21 @@ G9_REF=evidence/stage0/g9-formal/314c40fd22aead6104579a54e46b3c3e24166046f15d5cf
 
 - 本轮只能确认当前提交的 **G0–G5 PASS**，不能跨提交复用到下一轮。S0.12 仍为 **`IN_PROGRESS/BLOCKED_ON_G6_NCCL_RETRY`**：G6–G9、G10 与新的 Stage 0 `READY` 尚未完成。
 - 本节 Worklog 追加会改变 generator commit；提交并完成 GitHub/bundle/服务器三端同步后，必须从新 bootstrap 重建有效 G0→G5，再在四卡独占窗口运行带 `NCCL_P2P_DISABLE=1` 的 G6，并确认 G7R 继承同一 transport 合同后继续 G7→G9。
+
+## 2026-08-13 06:00 CST — 9b7fefb G3 sidecar identity 失败与完整归档
+
+### 本轮失败边界
+
+- 本轮 generator commit 为 `9b7fefb912d60c4c4d986e960abb598dd7e27e54`；该提交已在本地、GitHub、服务器三端同步，服务器 worktree clean，唯一正式链 PID `924416`。bootstrap PASS：`evidence/stage0/bootstrap/9b7fefb912d60c4c4d986e960abb598dd7e27e54/index.json`，`environment_hash=118e12d4f8a9de5b30241c0a5ced4df6423c6831d7b56b39a965ada998cb80d6`。
+- G3 attest 在派生 GLUE 数据只读身份校验处失败，异常为 `GLUE_SIDECAR_IDENTITY_MISMATCH:raw_asset_id`；未生成本轮 acquisition/verification、materialize、formal G3/G4/G5 或 G6–G9。完整链日志 `$DATA_ROOT/tmp/full-chain-9b7fefb-s1.log` SHA-256 为 `763545b7ed4f1ac28ad0005cb286218965e30ddb132f3150809d39f531ed6bb4`，大小 `2611` bytes；退出后无相关进程残留，四卡均为 `0 MiB / 0%`。
+- 三个 canonical 派生目录和 26 个 canonical publication/qualification 文件当时均绑定上一轮 `83ac9edca5ee5bc5a705a47faa449abfc43b31fc`；失败 staging 为 `$DATA_ROOT/tmp/glue-derived-sst2-cea5560adf5348f5aaf67b55a49a7e52/`，为空。
+
+### 完整可逆归档
+
+- 将三个派生目录、失败 staging 及 26 个旧 publication/qualification 文件整体移动至 `$DATA_ROOT/tmp/g3-rebuild-9b7fefb-sidecar-failure-20260812T215900Z/`。归档共 `60` 个文件、`3963622088` bytes；迁移前后清单 SHA-256 均为 `695c2c3495c6a5919af333fcae77024e805330be8f6bb27dbc865841a679f081`。
+- 归档内迁移前/后清单逐文件 `sha256sum -c` 全部通过；canonical 派生路径与 26 个 publication/qualification refs 均确认缺失，raw `datasets/glue-{sst2,mnli,rte}` 未移动。归档元数据、文件清单和失败日志均保留于 `$DATA_ROOT/tmp`，未删除。
+
+### 当前判定与下一步
+
+- S0.12 仍未完成，状态为 **`IN_PROGRESS/BLOCKED_ON_G3_SIDECAR_REBUILD`**。本轮只确认 9b7fefb bootstrap PASS，G3–G10 与新 `READY` 均不存在。
+- 本节追加会再次改变 generator commit；完成本节 GitHub/bundle/服务器三端同步和 Agent/ 五文件 hash 核对后，从新 HEAD 重跑 G0→G5。G3 必须在空 canonical 路径上重建当前提交绑定的派生资产并完成新的 verify/materialize/formal G3/G4/G5，之后才进入带固定 `NCCL_P2P_DISABLE=1` 的 G6→G9 重试。
