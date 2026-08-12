@@ -455,3 +455,9 @@ G9_REF=evidence/stage0/g9-formal/314c40fd22aead6104579a54e46b3c3e24166046f15d5cf
 
 - S0.12 仍未完成，当前状态为 **`IN_PROGRESS/BLOCKED_ON_G3_PUBLICATION_REBUILD`**。本轮只确认新提交的 bootstrap、G3 attest、G3 verify 通过；G3 materialize 失败，G4–G10 与新 `READY` 均不存在。
 - 本节记录会形成新的 generator commit，因此不能复用 `e378299` 的 bootstrap 或 G3 refs。下一步先将本节提交并完成 GitHub、Git bundle、服务器三端快进同步及 Agent/ 五文件 hash 核对；然后以新提交从 bootstrap 重新跑 G0→G5。若新提交导致派生 sidecar identity 需要更新，按同一只读校验与可逆归档流程处理后再重试 materialize；只有新的 G3/G4/G5 完整通过，才在四卡独占窗口重跑 G6→G9。
+
+### 记录提交与三端同步
+
+- 本节追加记录形成提交 `f1262c422671e914c4dea900888da2de8f6392ca`（`docs(stage0): record g3 materialize lineage conflict`），本地、GitHub `origin/feat/stage1-cpu-evidence` 与服务器 `/home/sophgo13/cjl/parameter-importance` 均已核对为该 HEAD；服务器分支为 `feat/stage1-cpu-evidence` 且 worktree clean。
+- 本次 Git bundle 使用服务器临时路径 `$DATA_ROOT/tmp/repo-sync-f1262c4.bundle`，本机/服务器 SHA-256 均为 `d76ae095a479bc3fd1207383ae8d4b3511f9fac4bd780b7b20d86554f509e726`，大小 `18062520` bytes；服务器以 `git merge --ff-only` 快进成功。三端确认后，本机与服务器 bundle 均已精确删除。
+- 本机与服务器 `Agent/` 五文件 SHA-256 完全一致：`git.md=183f4ba702d22a3a97a459d4873aed62377d51b666d2515990a2f408ecd856ca`；`remote_access.md=795c677e717827492a30342e5b91a4b5959f0df22c72354f14a506ecb023f7a1`；`server.md=9f2d4370ac64990cd29d33ef13de5c20cca65efb4655e928118ae4f3ca012c68`；`sync.md=1bf84f8379018b918eb1680c49dacb7d6d75d764c306782f5170212ceb190015`；`worklogs.md=4a61b34b02a7070b5d3321b349d13016548615a0f3ce069901d18049072a10da`。
