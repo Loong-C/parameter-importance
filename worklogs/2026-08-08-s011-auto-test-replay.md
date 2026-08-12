@@ -434,3 +434,24 @@ G9_REF=evidence/stage0/g9-formal/314c40fd22aead6104579a54e46b3c3e24166046f15d5cf
 
 - S0.12 仍未完成，当前状态为 **`IN_PROGRESS/BLOCKED_ON_G3_SIDECAR_REBUILD`**。`37f7934` 只证明 bootstrap PASS 和本机 G7R 回归，不能形成新的 G0–G5 或 G6–G9 交付闭环。
 - 本段 Worklog 提交后 generator commit 会再次变化，因此不能复用 `37f7934` 的 bootstrap；下一步先完成 GitHub/bundle/服务器同步与 Agent/ 五文件 hash 核对，再以新 commit 从 bootstrap 重新跑 G0→G5，确认派生资产重建和 verification/materialize/formal G3/G4/G5 完成后，才进入四卡独占窗口重跑 G6→G9。
+
+## 2026-08-13 04:32 CST — e378299 G3 重建通过但 materialize 发布血缘冲突
+
+### 本轮 G0–G3 边界
+
+- 本轮 generator commit 为 `e378299417aa8bbc02c427a17f8cfb7fcd72fb3f`；本地、GitHub、服务器分支均已同步，服务器 worktree clean，启动前四卡空闲。正式链 `$DATA_ROOT/tmp/full-chain-e378299-s1.log` 从 bootstrap 开始执行，未启动第二份链。
+- bootstrap PASS：`evidence/stage0/bootstrap/e378299417aa8bbc02c427a17f8cfb7fcd72fb3f/index.json`，`environment_hash=e6e46a73a4c41464dc66b59335173d7d468eeeb7d5b6d433c4fcef9187ace86b`。
+- G3 attest 成功重建并发布 `13` 个候选；acquisition ref 为 `manifests/evidence/g3/acquisition/35353284e0b4eec46d02a26ccb4a27022fc237b22a5ef82fb1c9ea3fa6eb8cc3.json`，`acquisition_sha256=35353284e0b4eec46d02a26ccb4a27022fc237b22a5ef82fb1c9ea3fa6eb8cc3`。三个 GLUE 派生目录均已按当前 raw identity 与当前提交重建并发布。
+- G3 verify 成功验证 `13` 个候选；verification ref 为 `manifests/evidence/g3/verification/35353284e0b4eec46d02a26ccb4a27022fc237b22a5ef82fb1c9ea3fa6eb8cc3.json`，`verification_sha256=ab774ef2a1d1c648e5a4286067e84c89c48953ac0aac2dd1702c269932c17d13`。
+- materialize 随后失败，异常为 `G3AssetPublicationError: existing READY does not descend from the supplied VERIFIED input`。因此本轮没有生成新的 materialize resolution，也没有进入 formal G3/G4/G5 或 G6–G9；不能将本轮 G3–G9 宣称为通过。
+
+### 冲突发布物的可逆归档
+
+- 只读核对确认当前 13 个旧 manifest 与 13 个旧 qualification 均绑定旧提交 `344a326cd568223e4501692880a74dd5662f3bfb` 及旧 acquisition/verification 血缘，不是本轮 `35353284…` VERIFIED 输入。未手工编辑 manifest、未移动 raw 数据、未覆盖 immutable evidence。
+- 在确认无 attest、verify、materialize、formalizer、torchrun 或 worker 残留后，将这 26 个精确 canonical 发布/资格文件整体移动到 `$DATA_ROOT/tmp/g3-publications-e378299-materialize-failure-20260812T202823Z/`。归档元数据记录 `archived_file_count=26`；迁移前后清单 SHA-256 均为 `4e6d59b13de78aa68b910abbf897182caa46f4dc1e3e5aac25554c637cf1b923`；本轮完整链日志 SHA-256 为 `4376cc9fb4474f849103605453ea915f93c4c1ac577428c8dc14f6b1ac804911`，大小 `223620` bytes。
+- 归档内 26/26 文件以 `sha256sum -c` 逐项通过；相应 canonical refs 已全部确认缺失，下一轮 materialize 可在不覆盖旧 READY 的前提下重新发布。归档保留于 `$DATA_ROOT/tmp`，未删除。
+
+### 当前判定与下一步
+
+- S0.12 仍未完成，当前状态为 **`IN_PROGRESS/BLOCKED_ON_G3_PUBLICATION_REBUILD`**。本轮只确认新提交的 bootstrap、G3 attest、G3 verify 通过；G3 materialize 失败，G4–G10 与新 `READY` 均不存在。
+- 本节记录会形成新的 generator commit，因此不能复用 `e378299` 的 bootstrap 或 G3 refs。下一步先将本节提交并完成 GitHub、Git bundle、服务器三端快进同步及 Agent/ 五文件 hash 核对；然后以新提交从 bootstrap 重新跑 G0→G5。若新提交导致派生 sidecar identity 需要更新，按同一只读校验与可逆归档流程处理后再重试 materialize；只有新的 G3/G4/G5 完整通过，才在四卡独占窗口重跑 G6→G9。
