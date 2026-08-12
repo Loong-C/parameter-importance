@@ -459,6 +459,7 @@ def _plan_payload(
                 "warmup_iterations": 20,
                 "measured_iterations": 50,
                 "samples_per_measurement": 3,
+                "nccl_p2p_disable": 1,
                 "tensor_elements": [65536, 262144, 4194304],
             },
         }
@@ -491,6 +492,7 @@ def _run_launch(
     environment = os.environ.copy()
     environment["CUDA_VISIBLE_DEVICES"] = ",".join(selected)
     environment["PARAM_IMPORTANCE_DATA_ROOT"] = str(root)
+    environment["NCCL_P2P_DISABLE"] = "1"
     current_pythonpath = environment.get("PYTHONPATH")
     source_path = str(source.repository / "src")
     environment["PYTHONPATH"] = source_path + (
@@ -660,6 +662,8 @@ def validate_g6_report_set(
     medians_by_size: dict[int, list[float]] = {}
     for report in collective:
         metrics = _mapping(report["metrics"], field="collective.metrics")
+        if metrics.get("nccl_p2p_disable") != 1:
+            raise Stage0G6Error("G6_COLLECTIVE_TRANSPORT_PROTOCOL_FAILED")
         if not all(
             metrics.get(field) is True
             for field in ("broadcast_pass", "all_gather_pass", "barrier_pass")
@@ -841,6 +845,7 @@ def validate_g6_report_set(
         "collective_process_group_rebuilds": 3,
         "collective_median_cv_by_elements": coefficients,
         "collective_samples_per_measurement": 3,
+        "collective_nccl_p2p_disable": 1,
         "fp32_comparisons": comparisons,
         "no_sync_gradient_collectives": communication["no_sync_calls"],
         "sync_each_gradient_collectives": communication["sync_each_calls"],
@@ -858,10 +863,11 @@ def _checks(metrics: Mapping[str, JSONValue], refs: Sequence[str]) -> tuple[Stag
             "stage0.G6-NCCL",
             Stage0CheckClass.PERFORMANCE,
             Stage0CheckStatus.PASS,
-            "Three independent NCCL process groups passed the frozen v2 20/50 median-of-3 protocol at 256 KiB/1 MiB/16 MiB.",
+            "Three independent NCCL process groups passed the frozen v2 20/50 median-of-3 protocol at 256 KiB/1 MiB/16 MiB with NCCL_P2P_DISABLE=1.",
             measurements={
                 "process_group_rebuilds": metrics["collective_process_group_rebuilds"],
                 "median_cv_by_elements": metrics["collective_median_cv_by_elements"],
+                "nccl_p2p_disable": metrics["collective_nccl_p2p_disable"],
             },
             evidence_refs=evidence,
         ),

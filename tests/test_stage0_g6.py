@@ -51,6 +51,7 @@ def _collective_report(repeat: int) -> dict[str, object]:
             "all_gather_pass": True,
             "barrier_pass": True,
             "scalar_expected_sum": 10,
+            "nccl_p2p_disable": 1,
         },
     }
 
@@ -208,6 +209,13 @@ def test_g6_replay_rejects_collective_instability_and_shard_overlap() -> None:
     semantic = next(item for item in reports if item["run_kind"] == "semantic")
     semantic["metrics"]["data_shards"]["observed_main"][1] = "sample-00"
     with pytest.raises(Stage0G6Error, match="G6_DATA_SHARD_DISJOINTNESS_FAILED"):
+        validate_g6_report_set(reports, audits, device)
+
+
+def test_g6_replay_rejects_transport_protocol_drift() -> None:
+    reports, audits, device = _valid_inputs()
+    reports[0]["metrics"]["nccl_p2p_disable"] = 0
+    with pytest.raises(Stage0G6Error, match="G6_COLLECTIVE_TRANSPORT_PROTOCOL_FAILED"):
         validate_g6_report_set(reports, audits, device)
 
 

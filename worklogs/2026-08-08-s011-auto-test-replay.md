@@ -383,3 +383,9 @@ G9_REF=evidence/stage0/g9-formal/314c40fd22aead6104579a54e46b3c3e24166046f15d5cf
 ### 当前判定
 
 - S0.12 仍未完成，状态保持 **`IN_PROGRESS/BLOCKED_ON_G6_NCCL_RETRY`**。本轮完成了通信层定位和修复决策，尚无新提交上的 G0–G9、G10 formal 或 `READY` 产物。
+
+### 修复实现与本机回归
+
+- 已在工作树实施上述最小修复：G6 formal launcher 固定注入 `NCCL_P2P_DISABLE=1`；worker plan v2、worker report、worker 预检和 collective replay 均要求并回显 `nccl_p2p_disable=1`；Stage 0 G6 计划文档同步记录该冻结 transport 条件。消息规模、20/50/median-of-3、semantic、recovery 和 controlled-failure 合同均未改变。
+- 本机回归：`python -m pytest tests/test_stage0_g6.py -q --basetemp .tmp-pytest-g6-fix -p no:cacheprovider` → **4 passed**；`python -m pytest tests/test_stage0_g10.py -q --basetemp .tmp-pytest-g10-fix -p no:cacheprovider` → **9 passed**；两个 G6 JSON schema 均可由 `python -m json.tool` 解析，相关源文件 `compileall` 通过。
+- 该修复将形成新的 generator commit；此前 `64172a7` 的 G0–G5 evidence 不能跨修复提交复用。修复提交同步后，必须从 bootstrap 重新生成 G0–G5，再在四卡独占、无外部 GPU 竞争的窗口重试 G6→G9。

@@ -129,7 +129,15 @@ def _validate_plan(root: Path, plan_ref: str) -> tuple[dict[str, Any], Path]:
         or launcher.get("world_size") != WORLD_SIZE
     ):
         raise Stage0G6WorkerError("G6_WORKER_CONFIG_OR_ENVIRONMENT_IDENTITY_INVALID")
+    protocol = _mapping(plan["collective_protocol"], field="collective_protocol")
+    if protocol.get("nccl_p2p_disable") != 1:
+        raise Stage0G6WorkerError("G6_WORKER_NCCL_P2P_PROTOCOL_INVALID")
     return plan, plan_path
+
+
+def _validate_nccl_transport_environment() -> None:
+    if os.environ.get("NCCL_P2P_DISABLE") != "1":
+        raise Stage0G6WorkerError("G6_WORKER_NCCL_P2P_ENVIRONMENT_INVALID")
 
 
 def _rank_identity(selected: Sequence[str]) -> dict[str, JSONValue]:
@@ -213,11 +221,14 @@ def _collective_metrics(protocol: Mapping[str, Any]) -> dict[str, JSONValue]:
     warmup = int(protocol["warmup_iterations"])
     measured = int(protocol["measured_iterations"])
     samples_per_measurement = int(protocol["samples_per_measurement"])
+    nccl_p2p_disable = int(protocol["nccl_p2p_disable"])
     sizes = protocol["tensor_elements"]
     if (
         warmup != 20
         or measured != 50
         or samples_per_measurement != 3
+        or nccl_p2p_disable != 1
+        or os.environ.get("NCCL_P2P_DISABLE") != "1"
         or not isinstance(sizes, list)
         or len(sizes) < 3
     ):
@@ -280,6 +291,7 @@ def _collective_metrics(protocol: Mapping[str, Any]) -> dict[str, JSONValue]:
         raise Stage0G6WorkerError("G6_WORKER_AUXILIARY_COLLECTIVE_INVALID")
     return {
         "message_metrics": message_metrics,
+        "nccl_p2p_disable": nccl_p2p_disable,
         "broadcast_pass": True,
         "all_gather_pass": True,
         "barrier_pass": True,
@@ -757,6 +769,7 @@ def run_stage0_g6_worker(*, data_root: str | Path, plan_ref: str) -> None:
 
     root = Path(data_root).resolve(strict=True)
     plan, plan_path = _validate_plan(root, plan_ref)
+    _validate_nccl_transport_environment()
     selected = tuple(str(item) for item in plan["selected_gpu_uuids"])
     started_at = _now()
     identity = _rank_identity(selected)

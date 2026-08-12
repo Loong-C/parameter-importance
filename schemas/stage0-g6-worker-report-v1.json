@@ -39,7 +39,12 @@
       "type": "array", "minItems": 4, "maxItems": 4,
       "items": {"type": "object"}
     },
-    "metrics": {"type": "object"},
+    "metrics": {
+      "type": "object",
+      "properties": {
+        "nccl_p2p_disable": {"const": 1}
+      }
+    },
     "artifact_hash": {"$ref": "#/$defs/sha256"}
   },
   "$defs": {

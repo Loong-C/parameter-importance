@@ -33,13 +33,14 @@
       "type": "object", "additionalProperties": false,
       "required": [
         "protocol_version", "warmup_iterations", "measured_iterations",
-        "samples_per_measurement", "tensor_elements"
+        "samples_per_measurement", "nccl_p2p_disable", "tensor_elements"
       ],
       "properties": {
         "protocol_version": {"const": "stage0-unified-measurement-v2"},
         "warmup_iterations": {"const": 20},
         "measured_iterations": {"const": 50},
         "samples_per_measurement": {"const": 3},
+        "nccl_p2p_disable": {"const": 1},
         "tensor_elements": {
           "type": "array", "minItems": 3, "uniqueItems": true,
           "items": {"type": "integer", "minimum": 1}
