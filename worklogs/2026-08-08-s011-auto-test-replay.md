@@ -286,3 +286,26 @@ G9_REF=evidence/stage0/g9-formal/314c40fd22aead6104579a54e46b3c3e24166046f15d5cf
 
 - 失败没有修改正式资产；其退出输出已保留在 `$DATA_ROOT/tmp/full-chain-96f3216-s1.log`，错误脚本会在修正后清理。
 - S0.12 仍为 **`IN_PROGRESS/BLOCKED_ON_FINAL_CHAIN_RETRY`**。下一步将本节记录提交并同步三端，以新提交使用正式入口从 bootstrap 重新执行；此前归档的 `$DATA_ROOT/tmp/g3-rebuild-96f3216-20260812T140307Z/` 继续保留并作为可恢复审计副本。
+
+## 2026-08-12 23:20 CST — S0.12 f51f317 正式链 G3–G5 通过与 G6 NCCL 失败归档
+
+### 正式链与 G3–G5
+
+- `f51f3174ef4c9b2dbf83bebb4254dba60907f24c` 已在 GitHub、服务器和 Agent 五文件上同步；正式入口使用 Stage0 虚拟环境 `$DATA_ROOT/envs/parameter-importance-stage0-1bd963c65f75/bin/python`。
+- bootstrap PASS：`evidence/stage0/bootstrap/f51f3174ef4c9b2dbf83bebb4254dba60907f24c/index.json`，`environment_hash=68e947b6ba7ed135b9abf981bf0efc47427aa3d36cb9d7729dc6d89ad0e89bb7`。
+- G3 attest PASS（13 assets）：`manifests/evidence/g3/acquisition/a040ed22c66fb27b0817cde2250a8069130b492ef799d9dff10664be92bcdbd7.json`，`acquisition_sha256=a040ed22c66fb27b0817cde2250a8069130b492ef799d9dff10664be92bcdbd7`。
+- G3 verify PASS（13 assets）：`manifests/evidence/g3/verification/a040ed22c66fb27b0817cde2250a8069130b492ef799d9dff10664be92bcdbd7.json`，`verification_sha256=cb0ad5d599486728b2c6cb076f31d89693d84ea003b0d1cda3dec1f85fde487d`。
+- materialize PASS（13 assets）：`reports/stage0/g3/91c8e478d88197c8f4007980926f7380339ff3d1670ddf50e1e16cad9d0f7231/asset-index.json`；formal G3 与 G4 均在同一 `91c8e478…` artifact 目录 PASS。
+- formal G5 PASS：`evidence/stage0/g5-formal/d01618a1ed1d9dabb8bc3aac8581182bcc09c354f9ba0a547b3536f81040c05b/index.json`，14 个 worker report 齐全，GPU 进程结束后已释放。
+
+### G5 并发保护与 G6 失败
+
+- G3→G4 阶段因原始 SSH 会话断开，正式 s1 任务仍在服务器运行；误启动的后台 s2 在 G5 入口因检测到既有 GPU worker，按设计返回 `G5_SELECTED_GPU_NOT_EXCLUSIVE_BEFORE_SUITE`。该并发尝试未进入 G5 suite，失败日志保留在 `$DATA_ROOT/tmp/full-chain-f51f317-s2.log`；正式 s1 未被中断并最终产生上述 G5 PASS。
+- 使用正式 G5 ref 单独启动 G6→G7→G7R 后，G6 `collective-00` 在 `2026-08-12T15:11:33.249466Z` 启动、`2026-08-12T15:17:42.787173Z` 结束，`duration_seconds=369.537707`、`return_code=1`、`timed_out=false`。四卡 NCCL 在 rank 1 的 `all_gather_object` 处失败：`SeqNum=2`、`NumelIn=394`、`NumelOut=1576`、`Timeout(ms)=300000`；四卡均随后退出，未生成 G6 formal index。
+- 失败 transcript 原路径 suite 为 `evidence/stage0/g6-suite/1482d427164518946cecb10296b52c04417e8ef2780453feac94391136e7e4b3/14352f68a03e8060a63472a1f74aeeadad3c9b30b63118fff4b5ff0a211cf3de/`，transcript artifact hash 为 `2d47add9f4bef068795efe9665f123f3df51e25badeba93fbd0c33afd1369e74`，文件 SHA256 为 `0f9641f5c80701b00ce21d18ad684aa65afb2fef8045c4ba39ea8823078ab977`。
+- 确认无 G6 formalizer、torchrun 或 worker 残留，四卡为空闲后，将精确 suite 整体移入 `$DATA_ROOT/tmp/g6-failed-f51f317-20260812T151903Z/`；四个 suite 文件 SHA256 已随归档输出保留。
+
+### 当前判定与下一步
+
+- S0.12 仍未完成，状态为 **`IN_PROGRESS/BLOCKED_ON_G6_RETRY`**：f51f317 上 G0–G5 PASS 已确认，但没有新的 G6/G7/G7R/G8/G9、三端同步观察、G10 formal 或 READY 产物。
+- 本节记录会形成新提交，因此下一步先提交并同步三端；新提交必须再次从 bootstrap→G5 产生绑定证据，然后在确认四卡独占后重试 G6。当前 G6 失败证据和 3.7 GiB G3 重建备份均保留在 DATA_ROOT/tmp，不覆盖旧证据。
