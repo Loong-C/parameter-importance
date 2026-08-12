@@ -247,3 +247,29 @@ G9_REF=evidence/stage0/g9-formal/314c40fd22aead6104579a54e46b3c3e24166046f15d5cf
 
 - S0.12 仍为 **`IN_PROGRESS/BLOCKED_ON_G3_ASSET_REBUILD`**；当前没有新的 G3–G9 PASS。下一轮最终提交需从 attest 重新开始，重建派生数据、重新 materialize 13 个 READY 后再继续正式 gate 链。
 - 本地临时链脚本、归档脚本和输出在提交前清理；服务器失败日志、两轮派生目录备份和 26 个旧发布物备份均保留在 DATA_ROOT/tmp 供审计与恢复。
+
+## 2026-08-12 21:52 CST — S0.12 新最终提交 G3–G5 通过与 G6 transcript 冲突归档
+
+### 本轮提交与 G3–G5 结果
+
+- 本轮最终提交 `19c02a01b2c0e65f7cb7a41236196428479b2a26` 已推送 GitHub，并通过 bundle 快进同步到服务器；本地、GitHub、服务器均位于 `feat/stage1-cpu-evidence`。
+- 在该提交上，bootstrap、G3 attest、G3 verify、G3 materialize、formal G3、formal G4、formal G5 均通过。关键 refs：
+  - G3 acquisition：`manifests/evidence/g3/acquisition/d216848623dc07c167e4937186257ec52b3f6a034577de0787c9ec7227ca9a62.json`
+  - G3 verification：`manifests/evidence/g3/verification/d216848623dc07c167e4937186257ec52b3f6a034577de0787c9ec7227ca9a62.json`，`verification_sha256=c0be24d7e1dda0ec981d88daf350a495ee55249b777c2a4419f90f34984f74be`
+  - G3 materialize：`reports/stage0/g3/2b7c041cb06b86334cdd6ee84c34cfdb3289373075032a4a58fc714a0ea956ef/asset-index.json`
+  - G3 formal：`evidence/stage0/g3-formal/2b7c041cb06b86334cdd6ee84c34cfdb3289373075032a4a58fc714a0ea956ef/index.json`
+  - G4 formal：`evidence/stage0/g4-formal/2b7c041cb06b86334cdd6ee84c34cfdb3289373075032a4a58fc714a0ea956ef/index.json`
+  - G5 formal：`evidence/stage0/g5-formal/6a9c1054baa9733414e959111c5531dde83c5c298b4f618363e7dd5086d5b334/index.json`
+- G5 在 `2026-08-12T13:25:59.715082Z` 完成 PASS；其 `generator_git_commit=19c02a0...`，`g4_index_ref` 指向本轮 G4，未生成 G6/G7/G8/G9 结果。
+
+### G6 失败、重试保护与证据归档
+
+- 首次 G6 formal 在 `2026-08-12T13:26:07Z` 启动，`collective-00` 于 `2026-08-12T13:32:29.133877Z` 结束，`return_code=1`、`duration_seconds=381.885166`、`timed_out=false`。失败根因是四卡 NCCL `ALLREDUCE`：`SeqNum=3`、`Numel=65536`、`Timeout(ms)=300000`；rank 1/0/3 watchdog 均记录超时，随后 torchrun 退出。四卡计算进程均已回收，未产生 G6 formal index。
+- 首次失败留下的 suite 目录为：`evidence/stage0/g6-suite/7ceb409b5ed533f576d57379ba3ed6033afb56357a38618315079088e7e94dfa/7a0c00a8b516e00dc52aeec8feaa3b4cba61a271cff93886ac5282a86a766586/`。其中保留 `environment.json`、`resolved-config.json`、`plans/collective-00.json`、`transcripts/collective-00.json`；transcript SHA256 为 `2bb6a964266377e9d63c160af5c3b21d3aa48ece0cc6ba28fc456a4a7c459b0f`。
+- 随后重试同一 config/environment 时，正式入口检测到既有 `transcripts/collective-00.json`，按设计返回 `G6_LAUNCH_TRANSCRIPT_COLLISION`；这是失败证据保护，不是新的通信结论。确认无 `formalize_g6`、`stage0_g6`、`torchrun` 或 worker 残留，四卡均为 `0 MiB / 0%`。
+- 为避免覆盖失败证据，已将上述精确 suite 目录整体移入：`$DATA_ROOT/tmp/g6-failed-19c02a0-20260812T134955Z/`，并保留四个文件的 SHA256；归档前检查无计算进程。
+
+### 当前判定与下一步
+
+- S0.12 仍未完成，当前为 **`IN_PROGRESS/BLOCKED_ON_G6_RETRY`**：本轮 G3–G5 PASS 已确认，但没有本轮 G6/G7/G7R/G8/G9、三端只读同步观察、G10 formal 或 `READY`/`READY_WITH_APPROVED_EXCEPTIONS`。
+- 由于本节工作记录会形成新 Git 提交，不能继续复用 `19c02a0` 的中间证据作为交付闭环。下一步先完成本记录提交、GitHub push、server bundle 快进同步及 Agent 五文件 hash 核对；再归档本轮派生/发布物并从新提交重新执行 bootstrap→G9，保留失败证据，最后才进行 G10。
