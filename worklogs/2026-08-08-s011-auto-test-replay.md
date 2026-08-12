@@ -273,3 +273,16 @@ G9_REF=evidence/stage0/g9-formal/314c40fd22aead6104579a54e46b3c3e24166046f15d5cf
 
 - S0.12 仍未完成，当前为 **`IN_PROGRESS/BLOCKED_ON_G6_RETRY`**：本轮 G3–G5 PASS 已确认，但没有本轮 G6/G7/G7R/G8/G9、三端只读同步观察、G10 formal 或 `READY`/`READY_WITH_APPROVED_EXCEPTIONS`。
 - 由于本节工作记录会形成新 Git 提交，不能继续复用 `19c02a0` 的中间证据作为交付闭环。下一步先完成本记录提交、GitHub push、server bundle 快进同步及 Agent 五文件 hash 核对；再归档本轮派生/发布物并从新提交重新执行 bootstrap→G9，保留失败证据，最后才进行 G10。
+
+## 2026-08-12 22:08 CST — S0.12 新链环境入口失败记录
+
+### 运行与失败
+
+- `96f3216969c1215337704aa7357aa40d6643f1a0` 已完成 GitHub、服务器 bundle、Agent 五文件同步；服务器分支为 `feat/stage1-cpu-evidence`，工作树干净。
+- 为该提交准备的 G0–G5 链在 bootstrap 入口立即失败：临时脚本错误调用不存在的 `python` 命令，服务器仅提供 `/usr/bin/python3` 及 Stage0 虚拟环境 `$DATA_ROOT/envs/parameter-importance-stage0-1bd963c65f75/bin/python`；退出码 `127`，失败时间 `2026-08-12T14:06:52Z`。
+- 进一步核对确认临时脚本还使用了不存在的简化入口 `bootstrap_stage0.py`、`attest_g3_assets.py`、`materialize_g3_assets.py`；正式链应使用仓库中已验证的 `bootstrap_formal_stage0.py`、`attest_g3_materialization.py`、`materialize_and_publish_g3.py`，并以虚拟环境解释器执行。该错误未启动 GPU、未生成本轮 G0–G5 evidence，也没有留下计算进程。
+
+### 恢复与判定
+
+- 失败没有修改正式资产；其退出输出已保留在 `$DATA_ROOT/tmp/full-chain-96f3216-s1.log`，错误脚本会在修正后清理。
+- S0.12 仍为 **`IN_PROGRESS/BLOCKED_ON_FINAL_CHAIN_RETRY`**。下一步将本节记录提交并同步三端，以新提交使用正式入口从 bootstrap 重新执行；此前归档的 `$DATA_ROOT/tmp/g3-rebuild-96f3216-20260812T140307Z/` 继续保留并作为可恢复审计副本。
