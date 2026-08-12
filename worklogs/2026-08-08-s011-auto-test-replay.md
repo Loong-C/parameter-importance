@@ -389,3 +389,30 @@ G9_REF=evidence/stage0/g9-formal/314c40fd22aead6104579a54e46b3c3e24166046f15d5cf
 - 已在工作树实施上述最小修复：G6 formal launcher 固定注入 `NCCL_P2P_DISABLE=1`；worker plan v2、worker report、worker 预检和 collective replay 均要求并回显 `nccl_p2p_disable=1`；Stage 0 G6 计划文档同步记录该冻结 transport 条件。消息规模、20/50/median-of-3、semantic、recovery 和 controlled-failure 合同均未改变。
 - 本机回归：`python -m pytest tests/test_stage0_g6.py -q --basetemp .tmp-pytest-g6-fix -p no:cacheprovider` → **4 passed**；`python -m pytest tests/test_stage0_g10.py -q --basetemp .tmp-pytest-g10-fix -p no:cacheprovider` → **9 passed**；两个 G6 JSON schema 均可由 `python -m json.tool` 解析，相关源文件 `compileall` 通过。
 - 该修复将形成新的 generator commit；此前 `64172a7` 的 G0–G5 evidence 不能跨修复提交复用。修复提交同步后，必须从 bootstrap 重新生成 G0–G5，再在四卡独占、无外部 GPU 竞争的窗口重试 G6→G9。
+
+## 2026-08-13 03:24 CST — 344a326 G6/G7 通过、G7R DDP NCCL 失败
+
+### 本轮 G0–G7
+
+- 本轮 generator commit 为 `344a326cd568223e4501692880a74dd5662f3bfb`，服务器分支 `feat/stage1-cpu-evidence`，正式链使用冻结 Stage0 venv；启动前四卡均为 `0 MiB / 0%`，服务器仓库 clean。
+- 正式链 `$DATA_ROOT/tmp/full-chain-344a326-s1.log` 输出 `CHAIN_STATUS=G0_G5_PASS`；G3/G4/G5 refs 分别为：
+  - `evidence/stage0/g3-formal/c2177055fa60ab547669b2493f61f7a79aec5c60e4368ff4071c80b77181b5c1/index.json`
+  - `evidence/stage0/g4-formal/c2177055fa60ab547669b2493f61f7a79aec5c60e4368ff4071c80b77181b5c1/index.json`
+  - `evidence/stage0/g5-formal/5c9ba81d383477fee719ef91b44baee602463cc5e2a071e60d731d1f0b15bf44/index.json`
+- G6 formal PASS：`evidence/stage0/g6-formal/b03a3eadf67ac2a047b66628c84bf672d14768d8f919846e274e3cf16225db47/index.json`；G7 formal PASS：`evidence/stage0/g7-formal/145ec391af6ffc26a413f03564c115bba3627d6b9d8db9cbbfb520a3acd4b1eb/index.json`。G6 的 collective、semantic、recovery、failure-rank 全部完成，日志没有 NCCL timeout。
+
+### G7R 失败证据与归档
+
+- G7R formal 使用唯一 suite 根 `evidence/stage0/g7-recovery-suite/a330f2501c6fc4c847737cebf6ba5f4c83548764be4751b13aad49e22866be74/`，在四卡 DDP baseline 的第一条控制面 NCCL `ALLGATHER` 失败：`SeqNum=1`、`NumelIn=1`、`NumelOut=4`、`Timeout(ms)=300000`，时间约为 `2026-08-12T19:23:38Z`。单卡 baseline/resume 已完成，但 G7R 未生成 formal index，不能将 G7R 判为 PASS。
+- 完整失败链日志保留于 `$DATA_ROOT/tmp/full-chain-344a326-s2.log`，SHA-256 为 `2263b5edf19b132684823d2344a7a169717cb65f9868b4dc0efdcbe346473406`，大小 `22809` bytes；失败 suite 已整体移动至 `$DATA_ROOT/tmp/g7-recovery-failed-344a326-20260812T192354Z/suite/`，687 个文件聚合 SHA-256 为 `7b6eb843ce57f6dda140730bc1c07816bab9134eb72153ba1dde87a0936afb9f`。
+- 根因：G6 formal launcher 显式设置了 `NCCL_P2P_DISABLE=1`，但 G7R `_launch_worker` 只复制当前 shell 环境，未将该 transport 条件写入 G7R launcher/worker 合同；G7R worker 仍以默认 NCCL P2P 路径初始化 DDP。该结论由 G6 已通过、G7R 首条四卡 DDP `ALLGATHER` 在相同机器栈 timeout、以及退出后无残留 GPU 进程共同支持。
+
+### G7R 修复与本机回归
+
+- 已实施最小修复：G7R worker plan/report schema 与生成器新增并固定 `nccl_p2p_disable=1`；recovery formal launcher 对所有 fresh process 注入 `NCCL_P2P_DISABLE=1`；worker 在 rank 初始化前拒绝环境变量漂移并在 report 回显该值；S0.9 计划同步记录该 transport 合同。
+- 本机回归：`python -m pytest tests/test_stage0_g7_recovery.py tests/test_stage0_g9.py tests/test_stage0_g10.py -q --basetemp .tmp-pytest-g7r-fix -p no:cacheprovider` → **26 passed in 35.55s**；`compileall`、G7R 两个 JSON schema 解析和 `git diff --check` 均通过。
+
+### 当前判定与下一步
+
+- S0.12 仍未完成，当前状态为 **`IN_PROGRESS/BLOCKED_ON_G7R_NCCL_RETRY`**。本轮只能确认新提交 `344a326` 的 G0–G7 PASS；没有本提交的 G7R/G8/G9、三端同步观察、G10 formal 或 `READY` 产物。
+- G7R 失败 suite 不覆盖、不复用；修复形成新的 generator commit 后必须从 bootstrap 重新生成 G0–G5，再在四卡独占且实际继承 `NCCL_P2P_DISABLE=1` 的窗口完整重跑 G6→G9。

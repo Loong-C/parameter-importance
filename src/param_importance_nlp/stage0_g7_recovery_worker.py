@@ -59,6 +59,7 @@ WORKER_PLAN_SCHEMA = "stage0-g7-recovery-worker-plan-v1"
 WORKER_REPORT_SCHEMA = "stage0-g7-recovery-worker-report-v1"
 BOUNDARY_SCHEMA = "stage0-g7-recovery-boundary-v1"
 INTERRUPTION_MARKER = "STAGE0_G7_RECOVERY_INTENTIONAL_INTERRUPT"
+NCCL_P2P_DISABLE_PROTOCOL: Final = 1
 
 
 class Stage0G7RecoveryWorkerError(RuntimeError):
@@ -99,6 +100,7 @@ def _validate_plan(root: Path, plan_ref: str) -> tuple[dict[str, Any], Path, Tas
         "phase",
         "world_size",
         "selected_gpu_uuids",
+        "nccl_p2p_disable",
         "generator_git_commit",
         "config_ref",
         "config_sha256",
@@ -121,6 +123,8 @@ def _validate_plan(root: Path, plan_ref: str) -> tuple[dict[str, Any], Path, Tas
     if declared != canonical_json_hash(plan):
         raise Stage0G7RecoveryWorkerError("G7_RECOVERY_WORKER_PLAN_HASH_MISMATCH")
     plan["artifact_hash"] = declared
+    if plan.get("nccl_p2p_disable") != NCCL_P2P_DISABLE_PROTOCOL:
+        raise Stage0G7RecoveryWorkerError("G7_RECOVERY_WORKER_NCCL_P2P_PROTOCOL_INVALID")
     if plan.get("trajectory") not in {"baseline", "recovery"}:
         raise Stage0G7RecoveryWorkerError("G7_RECOVERY_WORKER_TRAJECTORY_INVALID")
     if plan.get("phase") not in {"baseline", "interrupt", "resume"}:
@@ -172,6 +176,11 @@ def _validate_plan(root: Path, plan_ref: str) -> tuple[dict[str, Any], Path, Tas
     ):
         raise Stage0G7RecoveryWorkerError("G7_RECOVERY_WORKER_CONFIG_IDENTITY_INVALID")
     return plan, plan_path, TaskExecutionRequest(config, config.task_definition, environment)
+
+
+def _validate_nccl_transport_environment() -> None:
+    if os.environ.get("NCCL_P2P_DISABLE") != str(NCCL_P2P_DISABLE_PROTOCOL):
+        raise Stage0G7RecoveryWorkerError("G7_RECOVERY_WORKER_NCCL_P2P_ENVIRONMENT_INVALID")
 
 
 def _rank_identity(plan: Mapping[str, Any]) -> dict[str, JSONValue]:
@@ -613,6 +622,7 @@ def _write_report(
         "environment_hash": str(plan["environment_hash"]),
         "world_size": int(plan["world_size"]),
         "selected_gpu_uuids": list(plan["selected_gpu_uuids"]),
+        "nccl_p2p_disable": int(plan["nccl_p2p_disable"]),
         "rank_identities": list(identities),
         "total_steps": int(plan["total_steps"]),
         "boundary_step": int(plan["boundary_step"]),
@@ -636,6 +646,7 @@ def _write_report(
 def run_stage0_g7_recovery_worker(*, data_root: str | Path, plan_ref: str) -> dict[str, JSONValue] | None:
     root = Path(data_root).resolve(strict=True)
     plan, plan_path, request = _validate_plan(root, plan_ref)
+    _validate_nccl_transport_environment()
     identity = _rank_identity(plan)
     rank = int(identity["rank"])
     world_size = int(plan["world_size"])

@@ -13,7 +13,7 @@ import signal
 import subprocess
 import sys
 import time
-from typing import Any, Mapping, Sequence
+from typing import Any, Final, Mapping, Sequence
 
 import torch
 
@@ -80,6 +80,7 @@ _FORMAL_RECOVERY_PROVIDERS: dict[str, JSONValue] = {
 }
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _GIT_COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
+NCCL_P2P_DISABLE_PROTOCOL: Final = 1
 _CRITICAL_SOURCE_REFS = (
     "ops/stage0/formalize_g7_recovery.py",
     "ops/stage0/run_g7_recovery_worker.py",
@@ -431,6 +432,7 @@ def _worker_plan(
             "phase": phase,
             "world_size": world_size,
             "selected_gpu_uuids": list(selected[:world_size]),
+            "nccl_p2p_disable": NCCL_P2P_DISABLE_PROTOCOL,
             "generator_git_commit": source.git_commit,
             "config_ref": config_ref,
             "config_sha256": config_sha256,
@@ -509,6 +511,7 @@ def _launch_worker(
     )
     environment = os.environ.copy()
     environment["CUDA_VISIBLE_DEVICES"] = ",".join(selected[:world_size])
+    environment["NCCL_P2P_DISABLE"] = str(NCCL_P2P_DISABLE_PROTOCOL)
     environment["PARAM_IMPORTANCE_DATA_ROOT"] = str(root)
     source_path = str(source.repository / "src")
     environment["PYTHONPATH"] = source_path + (
@@ -710,6 +713,7 @@ def _validate_worker_report(
         "environment_hash",
         "world_size",
         "selected_gpu_uuids",
+        "nccl_p2p_disable",
         "rank_identities",
         "total_steps",
         "boundary_step",
@@ -738,6 +742,7 @@ def _validate_worker_report(
         or report.get("environment_hash") != request.environment.environment_hash
         or report.get("world_size") != world_size
         or report.get("selected_gpu_uuids") != list(selected[:world_size])
+        or report.get("nccl_p2p_disable") != NCCL_P2P_DISABLE_PROTOCOL
         or report.get("total_steps") != 4
         or report.get("boundary_step") != 2
         or report.get("plan_sha256") != sha256_file(_logical_path(root, report["plan_ref"], field="report.plan_ref"))

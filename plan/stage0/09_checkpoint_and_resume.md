@@ -97,12 +97,13 @@
 ### 8. 验证四卡轨迹恢复
 
 1. 使用通过 G6 的四卡确定性配置建立不中断基线。
-2. 在安全 optimizer 边界保存四卡 checkpoint。
-3. 结束全部进程，确认无残留后重新启动四卡运行。
-4. 恢复各 rank RNG、sampler 和数据分片。
-5. 完成剩余步骤并与不中断基线比较。
-6. 验证恢复前后每步全局样本并集连续且不重复。
-7. 若 resolved formal config 使用 `num_workers>0`/prefetch，则用该正式配置验证 checkpoint 游标不会被预取位置提前推进；若选择受支持的 `num_workers=0` 回退，则锁定该配置并把多 worker 精确恢复明确标为未支持，不能把未执行路径写成通过。
+2. Stage 0 正式四卡 recovery launcher 固定使用 `NCCL_P2P_DISABLE=1`；worker plan/report 必须分别声明并回显 `nccl_p2p_disable=1`，worker 在初始化前拒绝环境漂移。
+3. 在安全 optimizer 边界保存四卡 checkpoint。
+4. 结束全部进程，确认无残留后重新启动四卡运行。
+5. 恢复各 rank RNG、sampler 和数据分片。
+6. 完成剩余步骤并与不中断基线比较。
+7. 验证恢复前后每步全局样本并集连续且不重复。
+8. 若 resolved formal config 使用 `num_workers>0`/prefetch，则用该正式配置验证 checkpoint 游标不会被预取位置提前推进；若选择受支持的 `num_workers=0` 回退，则锁定该配置并把多 worker 精确恢复明确标为未支持，不能把未执行路径写成通过。
 
 ### 9. 验证损坏与中断写入
 

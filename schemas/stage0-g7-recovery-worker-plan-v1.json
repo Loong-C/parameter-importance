@@ -4,7 +4,7 @@
   "title": "Stage 0 G7 Recovery Worker Plan v1",
   "type": "object",
   "additionalProperties": false,
-  "required": ["schema_version", "run_id", "trajectory", "phase", "world_size", "selected_gpu_uuids", "generator_git_commit", "config_ref", "config_sha256", "config_hash", "environment_ref", "environment_sha256", "environment_hash", "execution_root_ref", "group_root_ref", "result_ref", "resume_group_checkpoint_id", "total_steps", "boundary_step", "timeout_seconds", "artifact_hash"],
+  "required": ["schema_version", "run_id", "trajectory", "phase", "world_size", "selected_gpu_uuids", "nccl_p2p_disable", "generator_git_commit", "config_ref", "config_sha256", "config_hash", "environment_ref", "environment_sha256", "environment_hash", "execution_root_ref", "group_root_ref", "result_ref", "resume_group_checkpoint_id", "total_steps", "boundary_step", "timeout_seconds", "artifact_hash"],
   "properties": {
     "schema_version": {"const": "stage0-g7-recovery-worker-plan-v1"},
     "run_id": {"type": "string", "minLength": 1},
@@ -12,6 +12,7 @@
     "phase": {"enum": ["baseline", "interrupt", "resume"]},
     "world_size": {"enum": [1, 4]},
     "selected_gpu_uuids": {"type": "array", "minItems": 1, "maxItems": 4, "uniqueItems": true, "items": {"type": "string", "pattern": "^GPU-"}},
+    "nccl_p2p_disable": {"const": 1},
     "generator_git_commit": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
     "config_ref": {"$ref": "#/$defs/ref"},
     "config_sha256": {"$ref": "#/$defs/hash"},

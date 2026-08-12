@@ -4,7 +4,7 @@
   "title": "Stage 0 G7 Recovery Worker Report v1",
   "type": "object",
   "additionalProperties": false,
-  "required": ["schema_version", "run_id", "trajectory", "phase", "status", "completed_at", "generator_git_commit", "plan_ref", "plan_sha256", "config_hash", "environment_hash", "world_size", "selected_gpu_uuids", "rank_identities", "total_steps", "boundary_step", "group_checkpoint_id", "group_root_ref", "rank_summaries", "group_save_seconds", "group_load_seconds", "peak_memory_bytes", "lineage_ref", "canonical_event_ref", "artifact_hash"],
+  "required": ["schema_version", "run_id", "trajectory", "phase", "status", "completed_at", "generator_git_commit", "plan_ref", "plan_sha256", "config_hash", "environment_hash", "world_size", "selected_gpu_uuids", "nccl_p2p_disable", "rank_identities", "total_steps", "boundary_step", "group_checkpoint_id", "group_root_ref", "rank_summaries", "group_save_seconds", "group_load_seconds", "peak_memory_bytes", "lineage_ref", "canonical_event_ref", "artifact_hash"],
   "properties": {
     "schema_version": {"const": "stage0-g7-recovery-worker-report-v1"},
     "run_id": {"type": "string", "minLength": 1},
@@ -19,6 +19,7 @@
     "environment_hash": {"$ref": "#/$defs/hash"},
     "world_size": {"enum": [1, 4]},
     "selected_gpu_uuids": {"type": "array", "minItems": 1, "maxItems": 4, "uniqueItems": true, "items": {"type": "string", "pattern": "^GPU-"}},
+    "nccl_p2p_disable": {"const": 1},
     "rank_identities": {"type": "array", "minItems": 1, "maxItems": 4, "items": {"type": "object"}},
     "total_steps": {"const": 4},
     "boundary_step": {"const": 2},

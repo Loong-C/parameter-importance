@@ -21,7 +21,11 @@ from param_importance_nlp.runtime import (
     checkpoint_state_sha256,
 )
 from param_importance_nlp.stage0_g7_recovery import _cpu_fp32_suite
-from param_importance_nlp.stage0_g7_recovery_worker import _IMPORTANCE_ENABLED
+from param_importance_nlp.stage0_g7_recovery_worker import (
+    _IMPORTANCE_ENABLED,
+    Stage0G7RecoveryWorkerError,
+    _validate_nccl_transport_environment,
+)
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -211,6 +215,17 @@ def test_cpu_fp32_direct_prefetch_and_fresh_resume_are_exact(tmp_path: Path) -> 
 
 def test_g7_recovery_worker_disables_importance_for_single_microbatch() -> None:
     assert _IMPORTANCE_ENABLED is False
+
+
+def test_g7_recovery_worker_freezes_nccl_p2p_transport(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("NCCL_P2P_DISABLE", "0")
+    with pytest.raises(
+        Stage0G7RecoveryWorkerError,
+        match="G7_RECOVERY_WORKER_NCCL_P2P_ENVIRONMENT_INVALID",
+    ):
+        _validate_nccl_transport_environment()
+    monkeypatch.setenv("NCCL_P2P_DISABLE", "1")
+    _validate_nccl_transport_environment()
 
 
 def test_recovery_schemas_are_valid_project_schema_documents() -> None:
