@@ -358,3 +358,28 @@ G9_REF=evidence/stage0/g9-formal/314c40fd22aead6104579a54e46b3c3e24166046f15d5cf
 - 失败 suite 已整体移入 `$DATA_ROOT/tmp/g6-failed-64172a7-20260812T171903Z/`，4 files，sha256 清单 `13019e440fdd84fea0dae1219c294909eed7cc8a26867b4fb50aea4d2f333572`。
 - 本轮 3 个派生目录与 26 个 canonical 发布/qualification 文件已整体移入 `$DATA_ROOT/tmp/g3-rebuild-64172a7-g6-failed-20260812T171903Z/`，约 `3.7 GiB`，sha256 清单 `c9a6f508673ea58a2eaf60433a6fc2b7c6dcfa6272234c911cd1ed2f517a69ec`；原始数据未移动。
 - S0.12 仍未完成，状态为 **`IN_PROGRESS/BLOCKED_ON_G6_NCCL_RETRY`**。本轮只能确认 G0–G5 PASS，不能推进 G7/G7R/G8/G9 或 G10/READY。下一步需先把本记录同步三端；随后应针对固定的 `all_gather_object` 小对象启动/通信路径做最小、可审计的修正或诊断，再以新 commit 重跑完整 G0–G5 后重试 G6。
+
+## 2026-08-13 01:52 CST — S0.12 G6 NCCL 组合拓扑诊断与最小修复决策
+
+### 诊断边界
+
+- 诊断基线为提交 `f6f87ba198cb38fc5c0ebaeb93e23151d95b29d8`，未修改正式 G6 代码或正式 evidence 目录；服务器使用冻结解释器 `$DATA_ROOT/envs/parameter-importance-stage0-1bd963c65f75/bin/python`，PyTorch `2.12.1+cu126`、CUDA runtime `12.6`、NCCL `2.29.3`。
+- GPU0 在整个诊断期间被外部 `/home/sophgo13/lyx` 下的 MAE 训练占用：PID `880257` 及其 worker，`nvidia-smi` 约 `8056 MiB`；该进程不属于本项目，未被终止。正式四卡 G6 未在该竞争状态下启动。
+- 其余 GPU1–3 空闲；系统日志未发现新的 NVIDIA Xid/ECC 错误。拓扑为 PCIe：GPU1↔GPU2 为 `PIX`，GPU1/GPU2/GPU3 的其他连接为 `PXB`，NVLink links inactive。
+
+### 最小复现结果
+
+- 三卡 GPU1–3 重复 3 轮 object-gather 诊断：`$DATA_ROOT/tmp/g6-nccl-diag-f6f87ba-gpu1-3.out`，SHA-256 `20aed680b39db36ebd9a449884fd4b88caa943f89aa7e7b5a06d0629802e0d44`。每轮均未完成；NCCL `all_gather_object` 底层 `ALLGATHER` 在不同轮次分别于第 3 次、第 1 次及初始化后的首个 object gather 超时，失败位置与正式 G6 同类且不依赖四卡 rank 映射。
+- 同一 GPU1–3 组合的拆分诊断 `$DATA_ROOT/tmp/g6-collective-split-f6f87ba.out`，SHA-256 `fe0ed7586cc08330d25cb510f583356c85e77091f705a054c9b4540c11d121c6`：默认 NCCL 纯 tensor `all_reduce` 在第二个 collective 超时；Gloo object gather 连续 20 次、barrier 和退出全部通过（`rc=0`）。
+- 空闲卡逐对 NCCL 诊断 `$DATA_ROOT/tmp/g6-nccl-pairwise-f6f87ba.out`，SHA-256 `c7185305b9c7b6cafc1d5794662b0769725c7789822171394f62273b421819d9`：GPU1–2、GPU1–3、GPU2–3 三对均完成 20 次 tensor `all_reduce`、20 次 tensor `all_gather`、barrier，三组均 `rc=0`。
+- 三卡 transport 矩阵 `$DATA_ROOT/tmp/g6-nccl-transport-matrix-f6f87ba.out`，SHA-256 `7ed0424eb083c550ddebd6f62e1e44106529b71ebfe892a4a839fc6bb15f04de`：默认环境 `rc=124`；仅 `NCCL_P2P_DISABLE=1` `rc=0`；仅 `NCCL_SHM_DISABLE=1` `rc=124`；两者同时设置 `rc=0`。每个变体执行 5 次 tensor `all_reduce`、5 次 tensor `all_gather` 和 barrier。
+
+### 判定与最小修复
+
+- 逐对通过而三卡组合失败，且 `NCCL_P2P_DISABLE=1` 单独即可恢复，说明当前阻塞是本机多卡 PCIe/NCCL P2P transport 选择问题，不是 G6 数据、对象内容、rank 顺序或 G3–G5 语义链问题。该结论仍不替代正式四卡 gate。
+- 采用最小可审计修复：在 G6 formal launcher 显式注入 `NCCL_P2P_DISABLE=1`，并将 `nccl_p2p_disable=1` 写入 worker protocol/schema、由 worker 强制校验并在 collective report 中回显；不改变消息规模、20/50/median-of-3 测量协议、semantic/recovery/failure-rank 测试。
+- 本节不宣称 G6 PASS。修复提交后必须从该新提交重新执行 bootstrap→G5，再在四卡独占且无外部竞争进程时重试 G6→G9；旧 `64172a7` 的 G0–G5 证据不能跨提交复用。
+
+### 当前判定
+
+- S0.12 仍未完成，状态保持 **`IN_PROGRESS/BLOCKED_ON_G6_NCCL_RETRY`**。本轮完成了通信层定位和修复决策，尚无新提交上的 G0–G9、G10 formal 或 `READY` 产物。
