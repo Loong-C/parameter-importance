@@ -772,3 +772,22 @@ G9_REF=evidence/stage0/g9-formal/314c40fd22aead6104579a54e46b3c3e24166046f15d5cf
 - S0.12 当前状态仍为 **`IN_PROGRESS/REQUIRES_FINAL_COMMIT_REPLAY`**，Stage 0 尚未 READY。
 - 已完成的命令结果：S1 正式链退出 `0`；G0、G3、G4、G5 index 均 `status=PASS`；G5 14/14 worker reports 已收敛。
 - 下一步：提交并同步本节 Worklog；完成 local/GitHub/server/Agent 五文件 hash 核验；从新 HEAD 重跑 G0–G5；随后在 `NCCL_P2P_DISABLE=1` 下顺序执行 G6、G7、G7R、G8、G9。只有同一最终 commit 上 G0–G9 全部通过后，才生成三端只读观察与 G10 formal。
+
+## 2026-08-14 01:05 CST — ac9ad00 G3 sidecar 失败与精确归档
+
+### 本轮启动与失败边界
+
+- 本轮 generator commit 为 `ac9ad00211e233b8d0ef46f20974a7dafe5fc39c`；启动前本地、GitHub 与服务器三端 HEAD 一致，服务器 worktree clean，`Agent/` 五文件集合与 SHA-256 一致。
+- G0/bootstrap PASS：`evidence/stage0/bootstrap/ac9ad00211e233b8d0ef46f20974a7dafe5fc39c/index.json`，`environment_hash=de4f0a7886a9c5442907372ca768ba444b587038bde8628a7f3d56a84862c5e2`。
+- 正式链日志为 `$DATA_ROOT/tmp/full-chain-ac9ad00-s1.log`，大小 `2744` bytes，SHA-256 为 `ba4c73ff51e081dda6cced85484824460303de44360089b19b7f5bffccfef857`。G3 attest 在只读 sidecar 校验处退出：`GLUE_SIDECAR_IDENTITY_MISMATCH:raw_asset_id`。本轮没有新的 acquisition、verification、materialize、formal G3/G4/G5 或 G6–G9 证据，退出后无 Stage 0、formalizer、worker 或 torchrun 残留进程。
+
+### 精确归档与核验
+
+- 只读盘点确认冲突范围为 3 个 canonical 派生目录、13 个 manifest 和 13 个 qualification；raw `datasets/glue-{sst2,mnli,rte}` 未纳入归档，历史 immutable evidence 未修改。
+- 29 个明确目标整体可逆移动至 `$DATA_ROOT/tmp/g3-rebuild-ac9ad00-sidecar-failure-20260813T164839Z/`。归档共 `60` 个文件、`3963622088` bytes；`file-list.before.tsv`/`after.tsv` 逐行一致，清单 SHA-256 为 `c08d456bbe5b8b322cd3ed8d600e27d093ca928a94b213f775f5c75312f522c9`；归档文件逐项 SHA-256 与移动前一致，规范化哈希清单 SHA-256 为 `6a2e8a47377d1aed40e0554fbb97b5207b4299c6d49984895824767e39e1f95a`。
+- 首次归档脚本因清单解析 bug 在移动后复核阶段退出，留下的 `$DATA_ROOT/tmp/g3-rebuild-ac9ad00-sidecar-failure-20260813T164717Z/` 仅含两个清单文件、无资产；随后已对实际归档 `164839Z` 重新生成清单并完成全部核验，未发生第二次移动或覆盖。
+
+### 当前判定与下一步
+
+- S0.12 当前仍为 **`IN_PROGRESS/BLOCKED_ON_G3_SIDECAR_REBUILD`**。`ac9ad00` 仅确认 bootstrap PASS，不能与旧 G3–G9 证据拼接。
+- 本节提交并完成 GitHub、bundle、服务器快进同步及 Agent 哈希核对后，必须从新的 generator HEAD 重新执行 bootstrap→G5；G3 应在空 canonical 派生/发布路径上重建本轮资产并完成 verify、materialize、formal G3/G4/G5，再执行固定 `NCCL_P2P_DISABLE=1` 的 G6→G9。若 G0→G9 全部通过，冻结 Git、Agent 和正式 evidence，执行新的三端只读观察与 G10 formal。
