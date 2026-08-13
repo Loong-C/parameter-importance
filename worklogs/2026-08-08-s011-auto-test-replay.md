@@ -688,3 +688,23 @@ G9_REF=evidence/stage0/g9-formal/314c40fd22aead6104579a54e46b3c3e24166046f15d5cf
 
 - 当前状态：**`IN_PROGRESS/BLOCKED_ON_G3_ASSET_REBUILD_RETRY`**。
 - 下一步：提交并完成 GitHub、完整 bundle、服务器快进同步和 `Agent/` 五文件哈希核对；以新提交从 bootstrap 重新生成 G0→G5，确认 G3 重建成功后继续 G6→G9，再执行三端只读观察与 G10 formal。
+
+## 2026-08-13 19:20 CST — 3a59398 G3 materialize ancestry 冲突与 canonical 资产归档
+
+### 本轮失败边界
+
+- 候选提交 `3a59398f7ae5520a81194b6ba1a81f462b3ffff7` 已完成本地、GitHub、服务器三端同步；S1 bootstrap PASS，`environment_hash=cc41f0eee09a8d4b5fe76b8ec1691e3d0477ebad3594ab8b7ab3dedaaecd7d24`，bootstrap ref 为 `evidence/stage0/bootstrap/3a59398f7ae5520a81194b6ba1a81f462b3ffff7/index.json`。
+- G3 attest 在空 canonical derived 路径上完成 13 个资产重建并发布，acquisition ref 为 `manifests/evidence/g3/acquisition/63bda174ae8161738c3f56a7df4480934cd17e32cc59414bad670eaf0f746c18.json`，acquisition SHA-256 为 `63bda174ae8161738c3f56a7df4480934cd17e32cc59414bad670eaf0f746c18`；verify PASS，verification ref 为 `manifests/evidence/g3/verification/63bda174ae8161738c3f56a7df4480934cd17e32cc59414bad670eaf0f746c18.json`，verification SHA-256 为 `b1d808e90e43a364a9d45e5401b37199b2dacae620b57822d8c45097eabcdc13`。
+- materialize 于 `2026-08-13T11:13:53Z` 因既有 READY publication 不属于本次 VERIFIED input 而停止：`existing READY does not descend from the supplied VERIFIED input`。本轮没有生成新的 formal G3/G4/G5，也未进入 G6→G9；四卡和 S1/formalizer/worker 均已退出。
+- 完整失败链日志为 `$DATA_ROOT/tmp/full-chain-3a59398-s1.log`，SHA-256 为 `44e14b78218c4c30d6a88bd9687e330a0eee8fdb60c2e910b235182fe0bc278c`，大小 `223547` bytes。
+
+### canonical publication 与 derived 资产归档
+
+- 按 `configs/stage0/g3-asset-layout-v1.json` 精确识别 13 个 canonical asset 对应的 26 个 publication/qualification 文件（5 model manifest、1 tokenizer manifest、7 data manifest，以及 13 qualification），整体、可逆地移动至 `$DATA_ROOT/tmp/g3-publications-3a59398-backup-20260813T112048Z/`。原文件清单为 26 个；含 `file-list.txt` 与 `sha256sums.txt` 的归档清单为 28 个，`file-list.txt` SHA-256 为 `4962345cee56843206a4a9b4aeb54d7ffd2e6545c7d0af63fc06cbda54414ac5`，归档 `du` 为 `172032` bytes；canonical publication 源路径核验文件数为 `0`。
+- 将本轮 3a59398 生成的 `datasets/glue-sst2-pretokenized`、`datasets/glue-mnli-pretokenized`、`datasets/glue-rte-pretokenized` 三个 canonical derived 目录整体、可逆地移动至 `$DATA_ROOT/tmp/g3-rebuild-3a59398-materialize-failure-20260813T112048Z/`。原文件共 34 个；含清单与哈希的归档清单为 36 个，`file-list.txt` SHA-256 为 `06e98f4efea146d350095ad7d8417dc4941ab54e69580343adfa15cbb60a41ef`，归档 `du` 为 `3963719680` bytes；三个 canonical derived 源路径核验文件数为 `0`，raw `datasets/glue-{sst2,mnli,rte}` 仍保留。
+- 两类归档均只使用 `$DATA_ROOT/tmp` 下的精确目标路径，未删除 immutable evidence、raw 数据或历史失败归档；归档文件可按清单和 SHA-256 恢复。
+
+### 当前判定与下一步
+
+- S0.12 仍未完成，状态为 **`IN_PROGRESS/BLOCKED_ON_G3_PUBLICATION_REBUILD`**。本节会形成新的 generator commit，因此 `3a59398` 的 bootstrap/G3 证据不能与下一候选提交拼接使用。
+- 下一步提交本节并完成 GitHub、完整 bundle、服务器快进同步及 `Agent/` 五文件 SHA-256 核对；从新 HEAD 重新执行 G0→G5，确认 G3 materialize/formal G3/G4/G5 完成后继续固定 `NCCL_P2P_DISABLE=1` 的 G6→G9。若 G0→G9 全部通过，保持 Git、Agent 与正式 evidence 不再变更，执行三端只读观察和 G10 formal。
