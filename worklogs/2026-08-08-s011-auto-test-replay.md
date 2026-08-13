@@ -537,3 +537,21 @@ G9_REF=evidence/stage0/g9-formal/314c40fd22aead6104579a54e46b3c3e24166046f15d5cf
 
 - S0.12 仍未完成，当前状态为 **`IN_PROGRESS/BLOCKED_ON_G8_NCCL_RETRY`**。本轮只能确认 `9bebc91` 的 G0–G7R PASS；G8/G9/G10 与新的 Stage 0 `READY` 均不存在。
 - 本节追加会形成新的 generator commit；提交并完成 GitHub、Git bundle、服务器三端同步以及 `Agent/` 五文件哈希核对后，必须从新 HEAD 重新执行 bootstrap→G5，再在四卡独占窗口验证固定 `NCCL_P2P_DISABLE=1` 的 G6→G8；只有 G8 formal PASS 才能继续 G9、三端同步观察与 G10。
+
+## 2026-08-13 11:08 CST — d3a772c G8/G9 重跑通过与最终交付边界
+
+### 本轮 G0–G9 结果
+
+- 本轮 generator commit 为 `d3a772c89eb984b5601f78f2c1318137b937438b`；本机、GitHub `origin/feat/stage1-cpu-evidence` 和服务器 `feat/stage1-cpu-evidence` 均已同步到该提交，服务器 worktree clean。
+- 使用冻结 Stage 0 虚拟环境和正式入口，从 bootstrap 重新执行完整链；服务器退出后无 Stage 0、formalizer、torchrun 或 worker 残留，四张候选 GPU 均为 `0 MiB / 0%`。
+- bootstrap PASS：`evidence/stage0/bootstrap/d3a772c89eb984b5601f78f2c1318137b937438b/index.json`。
+- G3 attest/verify/materialize、formal G3/G4/G5 均 PASS；本轮 G3 resolution 为 `0cf03af187bfc48daea80f3f8725600493fdfec75e3e13e62a1d7e0783b00d7a`，formal G5 为 `1c50c16e8997f6190aea119ff5adbcf4c311b775a1db0691d4c5a89cb4c8f38d`。
+- G6 PASS：`evidence/stage0/g6-formal/1f19b92bce47578315c7fb252e9cb98e5a3e513642ea9bca520aa5cb2340510c/index.json`；G7 logging PASS：`evidence/stage0/g7-formal/8363021ca5c4cda2a72ce6f34d3669619645554b8bf8b698a32acea9bf84c724/index.json`；G7 recovery PASS：`evidence/stage0/g7-recovery-formal/1b3f42d262901d7292227a93a1f22cb4fa1fed0b148d45eb780273befd578450/index.json`。
+- G8 PASS：`evidence/stage0/g8-formal/b8b460445d4312698a3941c883902244dd96910d351ad7031fa664e792c88df0/index.json`。本轮 fresh worker 已继承并回显 `NCCL_P2P_DISABLE=1`，G8-C、G8-S4、G8-S5 和总 G8 均通过。
+- G9 PASS：`evidence/stage0/g9-formal/08b9258b07aac741e7eada91ebaa7bb43f3ebb243078481449ff4dced083229b/index.json`，独立重放、测试报告和 gate summary 均已生成；本轮链日志为 `$DATA_ROOT/tmp/full-chain-d3a772c-s1.log` 至 `full-chain-d3a772c-s4.log`。
+
+### 当前判定与下一步
+
+- 以上结果证明 `d3a772c` 上 G0–G9 已通过，但本段 Worklog 追加会形成新的 generator commit；因此不能把 `d3a772c` 的 G0–G9 直接作为最终 S0.12 交付证据。
+- S0.12 当前仍为 **`IN_PROGRESS/BLOCKED_ON_FINAL_WORKLOG_COMMIT`**，尚无最终提交上的三端只读观察、G10 formal、`READY` 或 `READY_WITH_APPROVED_EXCEPTIONS`。
+- 下一步：提交本段 Worklog，非强制推送 GitHub，使用经验证的 bundle 快进服务器并核对 `Agent/` 五文件哈希；随后从新最终 HEAD 重新执行 bootstrap→G9，完成三端只读观察和 G10 formal。任何失败证据保留在既有 immutable/evidence 或 `$DATA_ROOT/tmp` 精确归档路径，不覆盖历史结果。
