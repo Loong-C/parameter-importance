@@ -791,3 +791,32 @@ G9_REF=evidence/stage0/g9-formal/314c40fd22aead6104579a54e46b3c3e24166046f15d5cf
 
 - S0.12 当前仍为 **`IN_PROGRESS/BLOCKED_ON_G3_SIDECAR_REBUILD`**。`ac9ad00` 仅确认 bootstrap PASS，不能与旧 G3–G9 证据拼接。
 - 本节提交并完成 GitHub、bundle、服务器快进同步及 Agent 哈希核对后，必须从新的 generator HEAD 重新执行 bootstrap→G5；G3 应在空 canonical 派生/发布路径上重建本轮资产并完成 verify、materialize、formal G3/G4/G5，再执行固定 `NCCL_P2P_DISABLE=1` 的 G6→G9。若 G0→G9 全部通过，冻结 Git、Agent 和正式 evidence，执行新的三端只读观察与 G10 formal。
+
+## 2026-08-14 01:55 CST — 4de3ec4 G0–G5 完成与最终候选资产归档
+
+### 本轮范围与同步元数据
+
+- 本轮 generator commit 为 `4de3ec4c725235456e87fc3811c484bb44a175c4`。本地、GitHub `origin/feat/stage1-cpu-evidence` 与服务器 `/home/sophgo13/cjl/parameter-importance` 三端均已对齐到该提交；服务器分支为 `feat/stage1-cpu-evidence`，worktree clean。
+- 本轮在归档前完成服务器侧 S1 正式链；链日志为 `$DATA_ROOT/tmp/full-chain-4de3ec4-s1.log`，大小 `225654` bytes，SHA-256 为 `9b27b3e0438331a73284d70b7aed52dec63c9e539ddca8c73284fcb085019b79`。链退出后无 Stage 0、formalizer、worker 或 torchrun 残留进程。
+- 本轮 Git bundle 使用精确目标 `$DATA_ROOT/tmp/repo-sync-4de3ec4-branch.bundle` 完成服务器 fast-forward；三端 HEAD 核验后 bundle 已清理。`Agent/` 五个受忽略文件继续按 Agent 规则单独同步并完成 SHA-256 核对。
+
+### G0–G5 正式结果
+
+- G0/bootstrap：`PASS`；index `evidence/stage0/bootstrap/4de3ec4c725235456e87fc3811c484bb44a175c4/index.json`；`environment_hash=a43bbb68ce3bbdd10535183bf556cab733525ae15a9ecd8335784ffcc3eef2da`。
+- G3 attest/verify/materialize：13 assets 全部通过。acquisition ref 为 `manifests/evidence/g3/acquisition/7a726748cbe4db036f940dd91abc6aadb9b17c539da4405d62dd0c449f789f96.json`，acquisition SHA-256 为 `7a726748cbe4db036f940dd91abc6aadb9b17c539da4405d62dd0c449f789f96`；verification ref 使用同一 base ref，verification SHA-256 为 `fc39ad0f9129de967ed846f88116bf2709986f331f676985249bef3661438858`。
+- materialize：`status=PASS assets=13`，正式 resolution 为 `c4745dbf2d02b26b4fa64f309207276715ed476bed9218f85eb6a23167d100f0`，index 为 `reports/stage0/g3/c4745dbf2d02b26b4fa64f309207276715ed476bed9218f85eb6a23167d100f0/asset-index.json`。
+- formal G3：`PASS`，index `evidence/stage0/g3-formal/c4745dbf2d02b26b4fa64f309207276715ed476bed9218f85eb6a23167d100f0/index.json`，`environment_hash=4ae5f3f11f4b8bc0e93646056cfa9cecfb99cedb27e4beb43c960708a45111c5`。
+- formal G4：`PASS`，index `evidence/stage0/g4-formal/c4745dbf2d02b26b4fa64f309207276715ed476bed9218f85eb6a23167d100f0/index.json`，`environment_hash=5f1150a05596a2f72812666ba65b51c31d74497858424c6c5890c78ca6df8927`。
+- formal G5：`PASS`，index `evidence/stage0/g5-formal/900e1ee48ac40cd05e43a0f4ceb96851e838b8f3527ca20495da4558a8093332/index.json`，`environment_hash=3b9f9bbec0d6187eef92f84572ee7006d34001fa3fb8175fe04877607034e5d9`。G5 suite 为 `evidence/stage0/g5-suite/bee20073ef21f5817a272a00fc23da9613476e7ab2b70152a030422cb827b8f0/5f1150a05596a2f72812666ba65b51c31d74497858424c6c5890c78ca6df8927/`，14/14 worker reports 已收敛，其中 `9 PASS`、`5 EXPECTED_FAILURE_CONFIRMED`。
+
+### canonical 派生/发布资产精确归档
+
+- 为使下一提交能够从空 canonical 路径重建，并避免把 `4de3ec4` 的证据与最终候选混接，已在确认无残留进程后将 29 个明确目标整体可逆移动至 `$DATA_ROOT/tmp/g3-rebuild-4de3ec4-final-candidate-20260813T175322Z/`：3 个 `datasets/glue-*-pretokenized` 派生目录、3 个 model manifest、1 个 tokenizer manifest、9 个 data manifest、13 个 qualification 文件。
+- 归档包含 `60` 个文件、`3963622088` bytes；`file-list.before.tsv` 与 `file-list.after.tsv` 完全一致，清单 SHA-256 为 `c08d456bbe5b8b322cd3ed8d600e27d093ca928a94b213f775f5c75312f522c9`。前后 SHA-256 digest 集合一致，规范化 digest 清单 SHA-256 为 `6cbe81e4494e6afe7e388d66746b91fcb14c9400ebb7259f3ce130c4258fba79`。
+- 归档后 29 个 canonical 目标路径均已确认缺失；raw `datasets/glue-sst2`、`datasets/glue-mnli`、`datasets/glue-rte` 均仍存在。历史 immutable evidence 与既有失败归档未修改。
+- 归档脚本末尾曾因比较包含绝对路径的 `sha256sum` 文本而返回非零；该误报未影响已完成的移动。随后以 digest-only 方式复核文件数、字节数、清单和 raw 保留，结果全部通过。
+
+### 当前判定与下一步
+
+- 本轮 S1 的 G0–G5 正式结果有效，但本 Worklog 提交会改变 generator commit，因此 `4de3ec4` 的 G0–G5 不能直接作为最终 Stage 0 交付证据。当前状态为 **`IN_PROGRESS/FINAL_CANDIDATE_READY_FOR_G0_G9`**。
+- 本节提交并完成三端同步后，新的 HEAD 将是最终候选；必须从该 HEAD 重新执行 G0–G5，再在同一 HEAD 上依次执行带 `NCCL_P2P_DISABLE=1` 的 G6、G7、G7R、G8、G9。若 G0–G9 全部通过，将冻结 Git、Agent 与正式 evidence，只做三端只读观察和 G10 formal，不再新增提交。
