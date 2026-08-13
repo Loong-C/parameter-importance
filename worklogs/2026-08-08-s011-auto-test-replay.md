@@ -602,3 +602,21 @@ G9_REF=evidence/stage0/g9-formal/314c40fd22aead6104579a54e46b3c3e24166046f15d5cf
 
 - S0.12 仍未完成，状态为 **`IN_PROGRESS/BLOCKED_ON_FINAL_CHAIN_RETRY`**。本条记录会形成新的 generator commit，因此 `cdf7fe2` 不能作为最终验收提交；归档后的空 canonical 路径已为新提交的 G3 重建准备完毕。
 - 下一步提交并完成 GitHub、服务器 bundle 快进同步及 `Agent/` 五文件哈希核对后，从新 HEAD 重新运行 G0→G9；若全通过，保持 Git/Agent 不再变更，完成三端只读观察与 G10 formal。
+## 2026-08-13 16:23 CST — 083c489 G7R 事件流污染失败与最终重跑准备
+
+### G7R 失败边界
+
+- 本轮 generator commit 为 `083c4897dc74b563fed85ed6e7ec51d391e9b997`，三端 HEAD 一致、服务器仓库干净；G0–G5、G6 和 G7 logging 已在本提交通过，当前可复用 refs 分别为 `evidence/stage0/g5-formal/d5b2840cae3d40020d5c07e62c74a6da8f69c887f609b1f76545081fffa414fd/index.json`、`evidence/stage0/g6-formal/6a77767cae88b178ba614661795999a73338efe043af6c1998cf26ce5280d3f5/index.json` 和 `evidence/stage0/g7-formal/be327254e66f1ef95dda5ad7329b5b7bdc6d2387c5931950f1533c17f61545c9/index.json`。
+- 暂停后以同一 G7 logging ref 重跑 G7R，日志 `$DATA_ROOT/tmp/full-chain-083c489-g7r-retry.log` 保留完整失败输出，失败为 `G7_RECOVERY_FORMAL_TASK_NOT_PASS:FAIL:Stage0G7RecoveryError:G7_RECOVERY_CHILD_FAILED:single-baseline`，底层为 `ValueError: EVENT_SEQUENCE_GAP:expected=10:actual=0`。原因是上次用户暂停留下的固定 suite 路径事件流被下一次 fresh worker 复用；本轮没有生成 G7R formal index，也没有宣称 G7R 通过。
+- 失败时无残留进程，四张 GPU 为 `0 MiB / 0%`。失败日志 `$DATA_ROOT/tmp/full-chain-083c489-g7r-retry.log` SHA-256 为 `352a25a7aa2db7d77dea90efd0555d8a81d92f4b0714e5340497cdd15f74a40a`，大小 `1857` bytes，当前文件由 `$DATA_ROOT/tmp` 精确路径保留。
+
+### 可逆归档与恢复
+
+- 固定失败 suite `evidence/stage0/g7-recovery-suite/a3ec8c51f6c361b73f9f62c270887a02020a716e23bcb39e96bee03eedc5f84d/3a027c7900c53bed1b554e2305b8c5a87e5e8de7ef85115c1dd661fa51cc4fd4/` 已整体移动至 `$DATA_ROOT/tmp/g7r-failed-083c489-20260813T082125Z/`；归档 680 个文件，目录字节数 `450601752`，canonical source 路径已缺失，旧证据不覆盖。
+- 为避免本轮 G3 派生资产和 canonical publication 影响下一次 generator identity，26 个 canonical publication/qualification 文件已归档至 `$DATA_ROOT/tmp/g3-publications-32cdad4-backup-20260813T082244Z/`，3 个 Glue 派生目录（34 个文件）已归档至 `$DATA_ROOT/tmp/glue-derived-0c9cac3-backup-20260813T082244Z/`。三份归档 sidecar SHA-256 为 MNLI `14877367ddb7adb3e8704cb25c6e3ca91fa81ae3d0f17147fb3397aee150d30d`、SST-2 `dd58d8a0dd9aca5816ee6f301cd42908401f213feff8c7d3daa3fe23b4251bbd`、RTE `57c4221eb206024c5f363af7ccb03c29881d16ee6f11f21505c944f3c77caa2b`。
+- 归档后精确核验通过：canonical publication/派生源路径均缺失，raw `datasets/glue-{sst2,mnli,rte}` 仍存在，G7R 失败 suite 备份和历史 immutable evidence 均保留；四卡空闲。
+
+### 当前判定与下一步
+
+- S0.12 仍未完成，状态为 **`IN_PROGRESS/BLOCKED_ON_G7R_EVENT_RETRY`**。本节会形成新 generator commit，因此 `083c489` 的 G0–G7 evidence 不能作为最终闭环；本节提交并完成三端同步后，必须从新 HEAD 重新运行 G0→G5、G6→G7R，再继续 G8→G9。
+- 若新链 G0–G9 全部通过，保持 Git、Agent 和正式 evidence 不再变化，执行三端只读观察与 G10 formal；G10 后仅核验 READY 状态，不再修改任何 Git 内容或 Agent 文件。
