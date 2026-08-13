@@ -24,6 +24,7 @@ from param_importance_nlp.contracts.config_v2 import ResolvedConfigV2
 from param_importance_nlp.runtime import (
     TaskArtifactStore,
     TaskExecutionRequest,
+    TaskRuntime,
     TaskRuntimeEnvironment,
 )
 from param_importance_nlp.stage0_bootstrap import Stage0SourceBinding
@@ -286,6 +287,48 @@ def test_recursive_gate_extraction_rejects_no_embedded_gate() -> None:
     found = _find_gate({"canonical": {"gate_record": gate.to_dict()}}, "stage0.G9")
     assert found == gate
     assert _find_gate({"canonical": {}}, "stage0.G9") is None
+
+
+def test_runtime_preflight_accepts_gate_nested_in_formal_task_output(
+    tmp_path: Path,
+) -> None:
+    gate = GateRecord(
+        gate_id="stage0.G9",
+        stage=0,
+        status=GateStatus.PASS,
+        checked_at="2026-08-03T00:00:00Z",
+        measured={"layers": 6},
+        threshold={"required": "PASS"},
+        evidence_refs=("evidence/g9/replay.json",),
+    )
+    ref = TaskArtifactStore(tmp_path, "evidence/stage0/tasks/11-test").publish(
+        task_id="stage0.11_test_quality_and_replay",
+        artifact_kind="gate_summary",
+        config_hash="c" * 64,
+        run_intent="formal",
+        payload={
+            "schema_version": "stage0-g9-evidence-v1",
+            "canonical_evidence": {
+                "schema_version": "stage0-g9-canonical-evidence-v1",
+                "gate_record": gate.to_dict(),
+            },
+        },
+        formal_eligible=True,
+    ).commit_ref
+    environment = TaskRuntimeEnvironment(
+        capabilities=frozenset({"server"}),
+        frozen_contract_stages=frozenset({0}),
+        passed_gate_ids=frozenset({"stage0.G9"}),
+        evidence_refs={"gate_stage0_g9": ref},
+    )
+
+    verified, evidence = TaskRuntime(workspace_root=tmp_path)._verified_gate_ref(
+        environment,
+        "stage0.G9",
+    )
+
+    assert verified is True
+    assert evidence == (ref,)
 
 
 def test_g10_config_binds_g9_and_sync_observation() -> None:

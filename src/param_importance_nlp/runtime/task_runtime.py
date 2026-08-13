@@ -760,6 +760,31 @@ class TaskRuntime:
     def _gate_evidence_key(gate_id: str) -> str:
         return "gate_" + re.sub(r"[^a-z0-9]+", "_", gate_id.casefold()).strip("_")
 
+    @staticmethod
+    def _find_gate_records(value: object, gate_id: str) -> tuple[GateRecord, ...]:
+        """Find exactly the requested GateRecord inside a formal envelope."""
+
+        found: list[GateRecord] = []
+
+        def visit(node: object) -> None:
+            if isinstance(node, Mapping):
+                if node.get("schema_version") == "gate-record-v1":
+                    try:
+                        gate = GateRecord.from_mapping(dict(node))
+                    except Exception:
+                        return
+                    if gate.gate_id == gate_id:
+                        found.append(gate)
+                    return
+                for child in node.values():
+                    visit(child)
+            elif isinstance(node, Sequence) and not isinstance(node, (str, bytes, bytearray)):
+                for child in node:
+                    visit(child)
+
+        visit(value)
+        return tuple(found)
+
     def _verified_contract_ref(
         self,
         environment: TaskRuntimeEnvironment,
@@ -790,13 +815,12 @@ class TaskRuntime:
             return False, ()
         try:
             loaded = self._load_environment_evidence(reference)
-            value = self._extract_schema_payload(
-                loaded.payload,
-                "gate-record-v1",
-            )
-            gate = GateRecord.from_mapping(dict(value))
+            gates = self._find_gate_records(loaded.payload, gate_id)
         except Exception:
             return False, (reference,)
+        if len(gates) != 1:
+            return False, (reference,)
+        gate = gates[0]
         return gate.gate_id == gate_id and gate.status is GateStatus.PASS, (reference,)
 
     def _verified_capability_ref(
