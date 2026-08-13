@@ -574,3 +574,17 @@ G9_REF=evidence/stage0/g9-formal/314c40fd22aead6104579a54e46b3c3e24166046f15d5cf
 
 - S0.12 仍未完成，状态为 **`IN_PROGRESS/BLOCKED_ON_G3_SIDECAR_REBUILD`**。本轮只确认 `afe0b44` 的 bootstrap PASS；G3–G10 与新的 Stage 0 `READY` 均不存在。
 - 本节追加会形成新的 generator commit，因此 `afe0b44` 的 bootstrap 及后续边界不能作为最终交付证据。下一步提交本节并完成 GitHub、Git bundle、服务器三端快进同步及 `Agent/` 五文件 hash 核对；然后从新的最终候选 HEAD 重新执行 bootstrap→G9。G3 应在空 canonical 派生与发布路径上重建当前提交绑定的 Glue 资产，若 G0–G9 全部通过则直接进行三端只读观察和 G10 formal，不再修改 Git 或 `Agent/`。
+
+## 2026-08-13 12:32 CST — 18ccf9f G6 通过与 G7 开销重试
+
+### 本轮 G6–G7 边界
+
+- 本轮提交为 `18ccf9f185ff72cc1e9f9730172df0b831906bef`；启动前本地、GitHub、服务器三端一致，服务器 worktree clean，`Agent/` 五文件哈希一致。G0–G5 已在本提交上完整通过；G5 formal ref 为 `evidence/stage0/g5-formal/c80bc76a6b0d9ecb7af0107e8cae3ef90016f0621ac81d38e2459131055b0226/index.json`。
+- G6 PASS：`evidence/stage0/g6-formal/a7eea4491a205cc7a1834cffbe44b8d12bbc4bf596c79970bdb0568ff873bede/index.json`。四卡 worker 正常退出，退出后无 Stage 0、formalizer、torchrun 或 worker 残留，四卡均为 `0 MiB / 0%`。本轮 s2 链日志为 `$DATA_ROOT/tmp/full-chain-18ccf9f-s2.log`，SHA-256 为 `a4a87ea7a98cf4ceae90dc82e9f3c6e8011bddabf3c74fde4f0d7d90cd3dab38`，大小 `1668` bytes。
+- G7 logging 的 functional checks、6 个 worker report 均为 PASS，但性能门在 formalizer 汇总时失败：`G7_FORMAL_TASK_NOT_PASS:FAIL:Stage0G7Error: G7_TRACKING_OVERHEAD_EXCEEDED`。失败 suite 保留在不可变路径 `evidence/stage0/g7-suite/7b9ebca790e4ca47eb93d742e427f055bcda398dc98a43367fec2801a1898704/5400a9d4ae038d19c775cdced3c81f3ef409b23a26224fd18bc4759e85918eee/`，共 68 个文件，排序清单 SHA-256 为 `12f6bb27f9ff7f2d545eaf09c4540657b18995cb4c4d13620fe75f9854db1ebf`。
+- 三组 paired fresh-process 测量的 throughput overhead 分别为 `0.1094083739`、`0.1079962212`、`0.0602761073`，合同阈值为 `0.10`；前两组越过阈值导致正式 G7 index 未生成。当前没有 G7 formal、G7R、G8 或 G9 证据，不能把本轮 G7 宣称为通过。
+
+### 当前判定与下一步
+
+- S0.12 仍未完成，状态为 **`IN_PROGRESS/BLOCKED_ON_G7_OVERHEAD_RETRY`**。这是性能测量边界失败，不是 logging correctness、rank isolation、canonical resume lineage 或 TensorBoard failure-truth 校验失败；失败 suite 与链日志均保留，未覆盖历史 evidence。
+- 本节追加会形成新的 generator commit，因此 `18ccf9f` 的 G0–G6 证据不能作为最终交付证据。下一步提交本节并完成 GitHub、Git bundle、服务器三端快进同步及 `Agent/` 五文件 hash 核对；随后从新 HEAD 重跑 G0→G9。若新一轮 G7 通过则继续 G7R→G9、三端只读观察和 G10 formal，不再修改 Git 或 `Agent/`。
