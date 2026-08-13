@@ -725,3 +725,23 @@ G9_REF=evidence/stage0/g9-formal/314c40fd22aead6104579a54e46b3c3e24166046f15d5cf
 
 - S0.12 仍未完成，状态为 **`IN_PROGRESS/BLOCKED_ON_G10_PREFLIGHT_GATE_HANDOFF_FIX`**；未生成 READY/READY_WITH_APPROVED_EXCEPTIONS，也未把旧 G10 观察当作最终证据。
 - 下一步：完成本 Worklog 提交与三端同步、Agent 哈希核对；从 `c2233dc` 重新执行 G0→G9。若新 G9 environment 能被 G10 preflight 验证，冻结 Git/Agent/正式 evidence，重新生成当前观察并执行 G10 formal，最后核验 Stage 0 readiness。
+
+## 2026-08-13 23:29 CST — 837fae6 G3 sidecar identity 失败与精确归档
+
+### 本轮启动与失败边界
+
+- 本轮候选提交为 `837fae6613ad7611d93c24741c0fe35ddff572f7`；启动前本地、GitHub `origin/feat/stage1-cpu-evidence` 与服务器 `feat/stage1-cpu-evidence` 三端一致，服务器 worktree clean，`Agent/` 五文件 SHA-256 一致。
+- 正式链日志为 `$DATA_ROOT/tmp/full-chain-837fae6-s1.log`，bootstrap PASS：`evidence/stage0/bootstrap/837fae6613ad7611d93c24741c0fe35ddff572f7/index.json`，`environment_hash=84825f37a9c2b54cedd11c4ac7fffdd67f28d8fba27f72d5c8fde35558e6b772`。日志 SHA-256 为 `cccf251478a1f154379da1c6a4766f159363f182b963cd4916a93c5026c4b898`，大小 `2611` bytes。
+- G3 attest 随后在派生 GLUE 数据集只读 sidecar 校验处退出，异常为 `GLUE_SIDECAR_IDENTITY_MISMATCH:raw_asset_id`。本轮没有生成新的 acquisition、verification、materialize、formal G3/G4/G5 或 G6–G9 证据；退出后没有 Stage 0/formalizer/worker 残留。
+
+### 旧物料精确归档
+
+- 只读盘点确认冲突来自三个 canonical 派生目录及 26 个 canonical publication/qualification 文件，均属于历史链，不能与本轮新 raw identity 混用；raw `datasets/glue-{sst2,mnli,rte}` 未移动。
+- 已将 29 个明确列出的路径整体可逆移动至 `$DATA_ROOT/tmp/g3-rebuild-837fae6-sidecar-failure-20260813T152123Z/`：3 个派生目录、13 个 manifest 和 13 个 qualification。归档共 `60` 个文件、`3963637174` bytes；归档 `file-list.tsv` SHA-256 为 `4d56b24773184c33d94d54dd8956947da87748720d09625bcddcd06ce5d7ff78`。移动前后逐文件路径、大小和 SHA-256 核对通过，canonical 源路径均已确认缺失。
+- 本轮 bootstrap 因同提交残留目录触发 artifact conflict；已将精确目录移动至 `$DATA_ROOT/tmp/bootstrap-conflict-837fae6-20260813T152405Z/`。归档内 `27` 个文件、bootstrap 子树 `71908` bytes，`file-list.before.tsv` SHA-256 为 `64954d97457a885a3a4ab60224c1e8f3ba735df78f26564848e896cda118eba3`；移动后相对路径和文件内容哈希复核通过，原 bootstrap 路径已确认缺失。
+- G3 唯一失败 staging `tmp/glue-derived-sst2-ac36123449254ce78acb0a9f80208047` 保留在 `$DATA_ROOT/tmp`，未删除或覆盖；历史 immutable evidence 与此前归档均未修改。
+
+### 当前判定与下一步
+
+- S0.12 仍未完成，当前状态为 **`IN_PROGRESS/BLOCKED_ON_G3_SIDECAR_REBUILD`**。`837fae6` 只确认 bootstrap PASS，不能与任何旧 G3–G9 证据拼接。
+- 本节提交并完成 GitHub、bundle、服务器快进同步及 `Agent/` 五文件哈希核对后，必须从新的 generator HEAD 重新执行 bootstrap→G5，确认 G3 重建、verify、materialize、formal G3/G4/G5 完成，再执行固定 `NCCL_P2P_DISABLE=1` 的 G6→G9。若 G0→G9 全部通过，冻结 Git、Agent 和正式 evidence，执行新的三端只读观察与 G10 formal。
