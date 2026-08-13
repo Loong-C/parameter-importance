@@ -620,3 +620,23 @@ G9_REF=evidence/stage0/g9-formal/314c40fd22aead6104579a54e46b3c3e24166046f15d5cf
 
 - S0.12 仍未完成，状态为 **`IN_PROGRESS/BLOCKED_ON_G7R_EVENT_RETRY`**。本节会形成新 generator commit，因此 `083c489` 的 G0–G7 evidence 不能作为最终闭环；本节提交并完成三端同步后，必须从新 HEAD 重新运行 G0→G5、G6→G7R，再继续 G8→G9。
 - 若新链 G0–G9 全部通过，保持 Git、Agent 和正式 evidence 不再变化，执行三端只读观察与 G10 formal；G10 后仅核验 READY 状态，不再修改任何 Git 内容或 Agent 文件。
+
+## 2026-08-13 17:00 CST — 69e2ca6 G8 launch claim 冲突与最终候选重建准备
+
+### 本轮 G0–G7R 与 G8 失败边界
+
+- 本轮 generator commit 为 `69e2ca6469d8aee0017314b2006fea3e04ae2915`；本机、GitHub `origin/feat/stage1-cpu-evidence` 和服务器分支三端一致，服务器 worktree clean。S1 正式链从 bootstrap 重新完成 G0–G5：G3 resolution 为 `401d5eb229ba152b1fd4ed1d115649ccffe1feb3d08e6225ea1d5e731e2cdb19`，formal G3/G4 均 PASS，formal G5 为 `evidence/stage0/g5-formal/48f406d020be370da649eafc262b1da76e92ad7951e7fc7a6673dc3bcac09522/index.json`。
+- S2 使用 `NCCL_P2P_DISABLE=1` 重新完成 G6、G7 logging 和 G7R：G6 为 `evidence/stage0/g6-formal/2be65addee66193727fb81b2d7bcd5d04567e5b8dd7e4e1980547037b2d8e2ec/index.json`，G7 logging 为 `evidence/stage0/g7-formal/33513848f6ff99006d5685f41d4a060ce136cb25db27d7d245232e046b89c08a/index.json`，G7R 为 `evidence/stage0/g7-recovery-formal/44a03cb5639b8c639942bc450d16c467a2f68f323ed0a33c413e4a56bf84d8b9/index.json`。本轮 G7R 使用新的 suite，未复现此前的事件流污染。
+- S3 的 G8 于 `2026-08-13T09:39:52Z` 启动，在第一个 worker `g8-c-14m-fp32-w1-minimal-r0` 启动前失败：`G8_FORMAL_TASK_NOT_PASS:FAIL:RuntimeError: LAUNCH_CLAIM_ALREADY_EXISTS:g8-c-14m-fp32-w1-minimal-r0`。没有生成本轮 G8 formal index；不能把 G8 或后续 G9/G10 宣称为通过。
+- G8 失败链日志为 `$DATA_ROOT/tmp/full-chain-69e2ca6-s3.log`，SHA-256 为 `b793bcf0cb7d83617c088a41eecd3ba00905c903c47408bdfdb8f09235d307e3`，大小 `751` bytes。退出后无 formalizer、torchrun 或 worker 残留，四卡均为 `0% / 0 MiB`。
+
+### 冲突声明与失败 suite 的可逆归档
+
+- 失败前只读核对确认 `$DATA_ROOT/operations/launch-claims` 中存在 `37` 个历史 `*.json` claim，正是本轮第一个 G8 launch ID 的冲突来源；G8 本轮 suite 已生成 `25` 个文件、`229290` bytes。历史 G8 suite 未移动，immutable evidence 与 raw 资产未触碰。
+- 将本轮明确的 G8 suite `evidence/stage0/g8-suite/36a76d64ae2e43e96a64c3a522af05b63c3789304106be32a3e8670d14a2135d/5fe95ad3514c157c88b295dab7cb8961350d67dfa36f4723519334c9d7fcbcd7/` 与 `37` 个冲突 claim 文件整体、可逆地移动至 `$DATA_ROOT/tmp/g8-launch-claim-failure-69e2ca6-20260813T095231Z/`。归档内 suite/launch-claims 文件数为 `25/37`，字节数为 `229290/17238`；归档总字节数为 `257331`（含清单）。
+- 迁移前清单共 `62` 行，SHA-256 为 `1ac8efaf18ad335c80e6309860f6e63538e3a71e6a63c07cdf012e228e380b3c`；迁移后清单共 `62` 行，SHA-256 为 `5068be60fd567bf1f43bdad961d7ba49cb9501adc0a059f4ac7cf0500014091`。源 suite 路径已缺失，launch-claims 目录为空，归档路径存在；服务器四卡再次核验为空闲。
+
+### 当前判定与下一步
+
+- S0.12 仍未完成，状态为 **`IN_PROGRESS/BLOCKED_ON_G8_LAUNCH_CLAIM_RETRY`**。本节追加会形成新的 generator commit，因此 `69e2ca6` 的 G0–G7R 证据不能作为最终闭环；本轮 G8 formal 不存在。
+- 下一步提交本节并完成 GitHub、Git bundle、服务器三端快进同步及 `Agent/` 五文件哈希核对；以新 HEAD 从 bootstrap 重新生成 G0–G5，再在 `NCCL_P2P_DISABLE=1` 下重新执行 G6→G9。若新链 G0–G9 全部通过，保持 Git、Agent 和正式 evidence 不再变化，执行三端只读观察与 G10 formal；G10 后仅核验 READY 状态。
