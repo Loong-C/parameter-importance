@@ -745,3 +745,30 @@ G9_REF=evidence/stage0/g9-formal/314c40fd22aead6104579a54e46b3c3e24166046f15d5cf
 
 - S0.12 仍未完成，当前状态为 **`IN_PROGRESS/BLOCKED_ON_G3_SIDECAR_REBUILD`**。`837fae6` 只确认 bootstrap PASS，不能与任何旧 G3–G9 证据拼接。
 - 本节提交并完成 GitHub、bundle、服务器快进同步及 `Agent/` 五文件哈希核对后，必须从新的 generator HEAD 重新执行 bootstrap→G5，确认 G3 重建、verify、materialize、formal G3/G4/G5 完成，再执行固定 `NCCL_P2P_DISABLE=1` 的 G6→G9。若 G0→G9 全部通过，冻结 Git、Agent 和正式 evidence，执行新的三端只读观察与 G10 formal。
+
+## 2026-08-14 00:45 CST — 3091e5f G0–G5 重跑完成与 materialize 幂等续跑
+
+### 本轮范围与同步元数据
+
+- 本轮 generator commit 为 `3091e5f5f4718e3d12ebd7802ebc87ba8c9ee426`。该提交已完成本地、GitHub `origin/feat/stage1-cpu-evidence`、服务器 `feat/stage1-cpu-evidence` 三端同步；服务器 worktree clean。
+- 正式链日志为 `$DATA_ROOT/tmp/full-chain-3091e5f-s1.log`，服务器记录 `222641` bytes，SHA-256 为 `6e0a91445fc035d5f4a0bf3c90e840e2fb470767a864fe303f39622ce2170355`。链结束后未发现 Stage 0、formalizer、worker 或 torchrun 残留进程。
+
+### G0–G5 结果
+
+- G0/bootstrap PASS：`evidence/stage0/bootstrap/3091e5f5f4718e3d12ebd7802ebc87ba8c9ee426/index.json`；`environment_hash=79cbf14c5a79a2f447e0e5cf790f99215569078a89bccad42ad27a01ce2ae598`。
+- G3 acquisition/verify PASS：13 assets；acquisition ref 为 `manifests/evidence/g3/acquisition/4ae2ce47b655d7cf18a3f043ddb7f8244ddafd2adf9a299291c59ac5291e9aac.json`，verification ref 为 `manifests/evidence/g3/verification/4ae2ce47b655d7cf18a3f043ddb7f8244ddafd2adf9a299291c59ac5291e9aac.json`，verification SHA-256 为 `cfdcbe32df87352295bb59ee2a2d1de18f78ba01902298c058466f4864598c3b`。
+- materialize PASS：13 assets；正式 resolution 为 `a96cc1425d35a830cb3e315c0fb173ff7fef8c64709bc8e33eb2f4992f7d45f5`，index 为 `reports/stage0/g3/a96cc1425d35a830cb3e315c0fb173ff7fef8c64709bc8e33eb2f4992f7d45f5/asset-index.json`。
+- formal G3 PASS：`evidence/stage0/g3-formal/a96cc1425d35a830cb3e315c0fb173ff7fef8c64709bc8e33eb2f4992f7d45f5/index.json`；formal G4 PASS：`evidence/stage0/g4-formal/a96cc1425d35a830cb3e315c0fb173ff7fef8c64709bc8e33eb2f4992f7d45f5/index.json`；formal G5 PASS：`evidence/stage0/g5-formal/7116813fbe1633e31f6fdf23ff6a8020a82a9b5bdade00d44d920c480bad7a83/index.json`。
+- G5 suite 为 `evidence/stage0/g5-suite/010dd04cec90455b26ffb125dc0597a91426b3be7c0d6600061240a4874ad01d/61a9b19d05147792f1a6dba715b6e947e37d062f4ae438a4efbe7e97502ec50b/`；14/14 worker reports 完成，包含 6 PASS 与 8 `EXPECTED_FAILURE_CONFIRMED`。
+
+### materialize 诊断与边界
+
+- 监控期间对同一生命周期运行了独立诊断。使用不同 gate actor 时，no-clobber 保护正确拒绝了已有 READY：`existing READY is bound to a different lifecycle or gate actor`；没有覆盖任何 READY 或 immutable evidence。
+- 使用原 gate actor `5d7625bb-a898-49d6-b76a-e689a47aa7aa` 的幂等续跑返回 `status=PASS assets=13`。另一次独立 replay 生成的 resolution `89a7fe54...` 未纳入正式链；formal G3 以 `G3_FORMAL_RESOLUTION_COMMIT_DRIFT` 拒绝它，正式证据仍以链日志中的 `a96cc142...` 为唯一有效 resolution。
+- 当前判断：S1 的正式 G0–G5 已完整通过；本 Worklog 追加会产生新的 generator commit，因此 `3091e5f` 的正式证据不能直接作为最终 S0.12 交付。下一轮必须从新的 HEAD 重跑 G0–G5，再继续 G6–G9。
+
+### 当前状态与下一步
+
+- S0.12 当前状态仍为 **`IN_PROGRESS/REQUIRES_FINAL_COMMIT_REPLAY`**，Stage 0 尚未 READY。
+- 已完成的命令结果：S1 正式链退出 `0`；G0、G3、G4、G5 index 均 `status=PASS`；G5 14/14 worker reports 已收敛。
+- 下一步：提交并同步本节 Worklog；完成 local/GitHub/server/Agent 五文件 hash 核验；从新 HEAD 重跑 G0–G5；随后在 `NCCL_P2P_DISABLE=1` 下顺序执行 G6、G7、G7R、G8、G9。只有同一最终 commit 上 G0–G9 全部通过后，才生成三端只读观察与 G10 formal。
