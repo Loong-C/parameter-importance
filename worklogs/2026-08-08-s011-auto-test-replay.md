@@ -555,3 +555,22 @@ G9_REF=evidence/stage0/g9-formal/314c40fd22aead6104579a54e46b3c3e24166046f15d5cf
 - 以上结果证明 `d3a772c` 上 G0–G9 已通过，但本段 Worklog 追加会形成新的 generator commit；因此不能把 `d3a772c` 的 G0–G9 直接作为最终 S0.12 交付证据。
 - S0.12 当前仍为 **`IN_PROGRESS/BLOCKED_ON_FINAL_WORKLOG_COMMIT`**，尚无最终提交上的三端只读观察、G10 formal、`READY` 或 `READY_WITH_APPROVED_EXCEPTIONS`。
 - 下一步：提交本段 Worklog，非强制推送 GitHub，使用经验证的 bundle 快进服务器并核对 `Agent/` 五文件哈希；随后从新最终 HEAD 重新执行 bootstrap→G9，完成三端只读观察和 G10 formal。任何失败证据保留在既有 immutable/evidence 或 `$DATA_ROOT/tmp` 精确归档路径，不覆盖历史结果。
+
+## 2026-08-13 11:28 CST — afe0b44 G3 sidecar identity 失败与可逆归档
+
+### 本轮启动与失败边界
+
+- 本轮启动提交为 `afe0b44d79f76248166a3ab8b918f6feaa1b56f8`；启动前本地、GitHub `origin/feat/stage1-cpu-evidence` 和服务器分支均一致，服务器 worktree clean，四张候选 GPU 均为 `0 MiB / 0%`。正式链唯一日志为 `$DATA_ROOT/tmp/full-chain-afe0b44-s1.log`，退出后无 Stage 0、formalizer、torchrun 或 worker 残留。
+- bootstrap PASS：`evidence/stage0/bootstrap/afe0b44d79f76248166a3ab8b918f6feaa1b56f8/index.json`，`environment_hash=4aefc4d13058df3fe6f0fc15a8ab2e6a47193bf9722feb1ff4d4eb88235a3834`。
+- G3 attest 在 Glue 派生数据只读身份校验处失败，异常为 `GLUE_SIDECAR_IDENTITY_MISMATCH:raw_asset_id`；没有生成本轮 acquisition/verification、materialize、formal G3/G4/G5 或 G6–G9。完整链日志保留于 `$DATA_ROOT/tmp/full-chain-afe0b44-s1.log`；本轮不能复用 bootstrap，也不能宣称 G3–G9 通过。
+
+### 旧派生目录与发布物归档
+
+- 失败前核对确认三个 canonical 派生目录中的 sidecar 仍绑定上一轮提交 `d3a772c89eb984b5601f78f2c1318137b937438b`，而不是 `afe0b44`；未手工编辑 sidecar，raw `datasets/glue-{sst2,mnli,rte}` 未移动。
+- 在确认无残留进程且 GPU 空闲后，按既有可逆归档脚本将 13 个 manifest 与 13 个 qualification（共 26 个精确 canonical 文件）移动到 `$DATA_ROOT/tmp/g3-publications-32cdad4-backup-20260813T032237Z/`。归档脚本逐项校验源文件为普通文件、移动后源路径缺失，并输出 26 个文件的 `sha256sum`；未覆盖或删除历史 evidence。
+- 三个派生目录整体移动到 `$DATA_ROOT/tmp/glue-derived-0c9cac3-backup-20260813T032252Z/`，归档内共 34 个文件；`glue-sst2-pretokenized`、`glue-mnli-pretokenized`、`glue-rte-pretokenized` 分别约 534M、3.2G、22M。三个 sidecar 的归档 SHA-256 分别为 `2e8593877d1d2eb118e9a5354d58d73d7d0e3e8343a81f2061eb03f13ca3f38a`、`18044f445e290da1f2c384d6a63779eaa4d9ce942dd201feebb5f66ca3911a77`、`6cd5bddba27d315b988e5f866ba59a1442862496c6259730098b6290da2486d4`；三个 canonical 派生源路径与 26 个发布物源路径均已确认缺失，归档仍保留于 `$DATA_ROOT/tmp`。
+
+### 当前判定与下一步
+
+- S0.12 仍未完成，状态为 **`IN_PROGRESS/BLOCKED_ON_G3_SIDECAR_REBUILD`**。本轮只确认 `afe0b44` 的 bootstrap PASS；G3–G10 与新的 Stage 0 `READY` 均不存在。
+- 本节追加会形成新的 generator commit，因此 `afe0b44` 的 bootstrap 及后续边界不能作为最终交付证据。下一步提交本节并完成 GitHub、Git bundle、服务器三端快进同步及 `Agent/` 五文件 hash 核对；然后从新的最终候选 HEAD 重新执行 bootstrap→G9。G3 应在空 canonical 派生与发布路径上重建当前提交绑定的 Glue 资产，若 G0–G9 全部通过则直接进行三端只读观察和 G10 formal，不再修改 Git 或 `Agent/`。
