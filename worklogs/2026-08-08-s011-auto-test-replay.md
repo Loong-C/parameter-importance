@@ -588,3 +588,17 @@ G9_REF=evidence/stage0/g9-formal/314c40fd22aead6104579a54e46b3c3e24166046f15d5cf
 
 - S0.12 仍未完成，状态为 **`IN_PROGRESS/BLOCKED_ON_G7_OVERHEAD_RETRY`**。这是性能测量边界失败，不是 logging correctness、rank isolation、canonical resume lineage 或 TensorBoard failure-truth 校验失败；失败 suite 与链日志均保留，未覆盖历史 evidence。
 - 本节追加会形成新的 generator commit，因此 `18ccf9f` 的 G0–G6 证据不能作为最终交付证据。下一步提交本节并完成 GitHub、Git bundle、服务器三端快进同步及 `Agent/` 五文件 hash 核对；随后从新 HEAD 重跑 G0→G9。若新一轮 G7 通过则继续 G7R→G9、三端只读观察和 G10 formal，不再修改 Git 或 `Agent/`。
+## 2026-08-13 12:41 CST — cdf7fe2 G3 侧车与 canonical 发布物归档准备
+
+### 归档与核验
+
+- 记录开始时 generator commit 为 `cdf7fe22035a2662eeb7afd66bcdf7a985376860`，本地、GitHub、服务器三端一致，工作树干净；该提交尚未运行本轮 G0–G9。
+- 服务器首次直接执行两个归档脚本返回 `Permission denied`（exit `1`），未发生文件变更；随后显式使用 `bash` 调用同一脚本均成功（exit `0`）。
+- 26 个 canonical publication/qualification 文件已可逆移动至 `$DATA_ROOT/tmp/g3-publications-32cdad4-backup-20260813T043904Z/`，`ARCHIVED_COUNT=26`。代表性归档哈希：`manifests/model/pythia-14m.json=680c797fa5057799f6316df3a355d436e20df4d8ab55189bd1ad794b8e4e2fc1`、`manifests/data/glue-sst2-pretokenized.json=a1932ee4b533f42b25bcd1d89705e90696c61edd573ebce4ade21d20427cd133`、`manifests/qualifications/glue-sst2-pretokenized.json=8cc3c7dbdd0c2147220a4abbad89b2d5f95d72625d6c6e38e363fbf1c9541ff4`。
+- 3 个 Glue 派生目录已可逆移动至 `$DATA_ROOT/tmp/glue-derived-0c9cac3-backup-20260813T043904Z/`，归档文件数为 `34`；目录大小约为 `534M`、`3.2G`、`22M`。三份 sidecar SHA-256 分别为：MNLI `a5ab795252675bc09f82bcb975c0248c2e7ea87356f48a5f5630706370279162`、SST-2 `f8c4d79cae164b53448a3442ca466962429e161082403dd3d5ab1a0fed9858d4`、RTE `3e4c0f2389cbcbb7be5951744485f1c2cef144a421049d12e5dc492ff5b8b049`。
+- 归档后精确核验通过：26 个 publication 文件和 34 个派生目录文件均在备份路径；canonical publication、三个 canonical 派生目录均缺失；raw `datasets/glue-{sst2,mnli,rte}` 仍存在；未触碰历史 immutable evidence。
+
+### 当前判定与下一步
+
+- S0.12 仍未完成，状态为 **`IN_PROGRESS/BLOCKED_ON_FINAL_CHAIN_RETRY`**。本条记录会形成新的 generator commit，因此 `cdf7fe2` 不能作为最终验收提交；归档后的空 canonical 路径已为新提交的 G3 重建准备完毕。
+- 下一步提交并完成 GitHub、服务器 bundle 快进同步及 `Agent/` 五文件哈希核对后，从新 HEAD 重新运行 G0→G9；若全通过，保持 Git/Agent 不再变更，完成三端只读观察与 G10 formal。
