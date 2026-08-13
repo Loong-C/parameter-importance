@@ -708,3 +708,20 @@ G9_REF=evidence/stage0/g9-formal/314c40fd22aead6104579a54e46b3c3e24166046f15d5cf
 
 - S0.12 仍未完成，状态为 **`IN_PROGRESS/BLOCKED_ON_G3_PUBLICATION_REBUILD`**。本节会形成新的 generator commit，因此 `3a59398` 的 bootstrap/G3 证据不能与下一候选提交拼接使用。
 - 下一步提交本节并完成 GitHub、完整 bundle、服务器快进同步及 `Agent/` 五文件 SHA-256 核对；从新 HEAD 重新执行 G0→G5，确认 G3 materialize/formal G3/G4/G5 完成后继续固定 `NCCL_P2P_DISABLE=1` 的 G6→G9。若 G0→G9 全部通过，保持 Git、Agent 与正式 evidence 不再变更，执行三端只读观察和 G10 formal。
+
+## 2026-08-13 22:44 CST — f5935c8 G8/G9 PASS 与 G10 preflight 接力缺陷
+
+### 本轮最终链结果
+
+- 候选提交 `f5935c831d122bd3f5439f8c653ccbe757d2f1cf` 已完成本地、GitHub、服务器三端同步；S1→S4 在同一提交上完成 G0→G9。G8 ref 为 `evidence/stage0/g8-formal/02dc6be01fe773c962430591e0a65f5dff3fa12a43d21be0bfd0d8732bd3e43e/index.json`，G9 ref 为 `evidence/stage0/g9-formal/0b65099be67aa368ab8559af76468bbf6bc3c35f0e614e9582f52e0bfe74e87f/index.json`；G8/G9 日志分别记录 `status=PASS`，四张 GPU 均在阶段结束回到 `0 MiB / 0%`。
+- G10 三端只读同步观察在本地生成并通过校验，artifact hash 为 `b34acdae34d3cb03ad82ffd28fba9a53fd55ec55ce13181ddcdd1e5d8a71159f`，文件 SHA-256 为 `783453fb3ea9639cfdd85e54656dcfabffe86a0dfca7df65c4adb90b0f0400e6`，服务器副本大小为 `2726` bytes；观察确认 local/GitHub/server HEAD 均为 `f5935c8`、worktree clean、fast-forward ancestry、force push 未使用、Agent 5 文件哈希一致、G10 bundle residue absent、`docs/mathematics.md` 保留。
+
+### G10 阻断、诊断与修复
+
+- 首次 G10 formalize 未宣称通过，严格返回 `G10_FORMAL_TASK_NOT_PASS:BLOCKED:task prerequisites are blocked`。只读 preflight 诊断显示唯一 blocker 为 `gate_not_ready/stage0.G9`：G9 environment 的 `gate_stage0_g9` 引用指向合法的 G9 task-output wrapper，但 runtime preflight 只检查 wrapper 顶层/一层嵌套，未找到其中 `canonical_evidence.gate_record` 的 `gate-record-v1`。
+- 已在本地增加 runtime 的递归 GateRecord 提取（仍要求目标 gate 恰好一个、schema/hash/status 均严格验证），并增加 `tests/test_stage0_g10.py` 回归测试；本地 G8/G9/G10 专项回归为 `27 passed`，compileall 与 `git diff --check` 通过。修复提交为 `c2233dc421ec30e6e55cfcc096399789dd3d8e3d`，已推送 GitHub；因此 `f5935c8` 的 G0→G10 不能作为最终证据，必须从 `c2233dc` 新 HEAD 重新执行完整链。
+
+### 当前判定与下一步
+
+- S0.12 仍未完成，状态为 **`IN_PROGRESS/BLOCKED_ON_G10_PREFLIGHT_GATE_HANDOFF_FIX`**；未生成 READY/READY_WITH_APPROVED_EXCEPTIONS，也未把旧 G10 观察当作最终证据。
+- 下一步：完成本 Worklog 提交与三端同步、Agent 哈希核对；从 `c2233dc` 重新执行 G0→G9。若新 G9 environment 能被 G10 preflight 验证，冻结 Git/Agent/正式 evidence，重新生成当前观察并执行 G10 formal，最后核验 Stage 0 readiness。
