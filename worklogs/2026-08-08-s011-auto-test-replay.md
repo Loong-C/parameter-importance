@@ -664,3 +664,27 @@ G9_REF=evidence/stage0/g9-formal/314c40fd22aead6104579a54e46b3c3e24166046f15d5cf
 
 - 当前状态：**`IN_PROGRESS/BLOCKED_ON_BOOTSTRAP_ARTIFACT_RETRY`**。
 - 下一步：提交并同步本节；为下一候选提交生成新的 S1→S4 临时脚本，从 bootstrap 重新执行，不能复用本轮或此前提交的正式 evidence。
+
+## 2026-08-13 18:42 CST — 6717226 G3 sidecar identity 失败与派生资产归档
+
+### 本轮失败边界
+
+- 候选提交 `6717226076f4a0b1eb7a547d87019426accf5c8d` 已完成三端同步；S1 于服务器启动后，bootstrap PASS：`evidence/stage0/bootstrap/6717226076f4a0b1eb7a547d87019426accf5c8d/index.json`，`environment_hash=675ba4aac409e6a305f43e2ab5daf7009d4206702914fd4ea08e3cb0eb2661ff`。
+- G3 attest 在现有 Glue 派生目录只读 sidecar 校验时失败：`GLUE_SIDECAR_IDENTITY_MISMATCH:raw_asset_id`。三份 sidecar 均绑定旧的 `generator_git_commit=69e2ca6469d8aee0017314b2006fea3e04ae2915`，与本轮新 acquisition 的 raw identity 不一致；本轮没有生成新的 G3 acquisition/verification、materialize、formal G3/G4/G5 或后续 G6→G9 证据。
+- 失败链日志为 `$DATA_ROOT/tmp/full-chain-6717226-s1.log`，SHA-256 为 `2083930e0acf8bdebdad311551dc8a271903dcf6475202c6744b3a7205e5c847`，大小 `2611` bytes。退出后无 Stage 0/attest/verify/materialize/formalizer/worker 残留，四卡均为 `0 MiB / 0%`。
+
+### 派生资产归档与核验
+
+- 将三份 canonical 派生目录整体、可逆地移动至 `$DATA_ROOT/tmp/g3-rebuild-6717226-sidecar-failure-20260813T102721Z/`：SST-2 `9` 个文件、`559484928` bytes；MNLI `17` 个文件、`3381456896` bytes；RTE `8` 个文件、`22732800` bytes。
+- 三个目录迁移前后文件清单均保持一致；归档内容文件清单共 `34` 个文件，SHA-256 为 `146da4305e41edf9d145166dc9e73d050dd846439014bacdf82d3c8943d91ec0`；归档目录 `du -s --block-size=1` 为 `3963686912` bytes。
+- 迁移后 canonical 派生目录数量为 `0`，raw `glue-sst2`、`glue-mnli`、`glue-rte` 三个目录仍存在；未触碰历史 immutable evidence 或 raw 数据。
+
+### 命令与退出结果
+
+- S1 后台启动 PID `1060622`，最终因上述 G3 sidecar 校验退出；派生目录归档命令退出 `0`，三组 `LIST_SAME=0`，`SOURCES_REMAIN=0`。
+- 当前不能宣称 S0.12 完成；本节会形成新的 generator commit，因此 `6717226` 的 bootstrap 不能与任何旧 G3–G9 证据拼接使用。
+
+### 状态与下一步
+
+- 当前状态：**`IN_PROGRESS/BLOCKED_ON_G3_ASSET_REBUILD_RETRY`**。
+- 下一步：提交并完成 GitHub、完整 bundle、服务器快进同步和 `Agent/` 五文件哈希核对；以新提交从 bootstrap 重新生成 G0→G5，确认 G3 重建成功后继续 G6→G9，再执行三端只读观察与 G10 formal。
