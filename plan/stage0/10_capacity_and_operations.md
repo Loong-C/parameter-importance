@@ -54,14 +54,15 @@
 ### 3. 实测吞吐与通信
 
 1. 按统一协议的 10 个 warmup、30 个测量 step 和三个全新进程重复记录单卡 tokens/s、samples/s 和 step time。
-2. gate 默认使用 strong scaling：固定每个 optimizer step 的有效 global token 数、sequence length、模型、精度和 optimizer 语义，通过 per-device batch/accumulation 调整单卡与四卡配置。
-3. 将吞吐定义为单位 wall-clock 的有效非 padding、非 ignore token 数；同时报告 samples/s，但不把 padding token 计入 scaling gate。
-4. 用相同 fixture 和协议记录四卡总吞吐，并按 `四卡有效 tokens/s ÷ (4 × 单卡有效 tokens/s)` 计算 strong-scaling efficiency。
-5. 若另做 weak scaling，必须固定每卡有效工作量、单独命名和报告，不与 strong-scaling gate 混用。
-6. 记录 NCCL collective 基线及其波动。
-7. 区分数据读取、计算、通信、日志和 checkpoint 时间。
-8. 在当前拓扑下比较候选四卡组，但不占用其他用户设备或跨越未批准设备。
-9. 将 validated baseline 与硬件/内核/环境 ID 绑定，环境漂移后自动失效。
+2. G8 正式 launcher 与每个 fresh worker 固定使用 `NCCL_P2P_DISABLE=1`；worker plan/report 必须声明并回显 `nccl_p2p_disable=1`，且 worker 在首次 CUDA/NCCL 初始化前拒绝环境漂移。
+3. gate 默认使用 strong scaling：固定每个 optimizer step 的有效 global token 数、sequence length、模型、精度和 optimizer 语义，通过 per-device batch/accumulation 调整单卡与四卡配置。
+4. 将吞吐定义为单位 wall-clock 的有效非 padding、非 ignore token 数；同时报告 samples/s，但不把 padding token 计入 scaling gate。
+5. 用相同 fixture 和协议记录四卡总吞吐，并按 `四卡有效 tokens/s ÷ (4 × 单卡有效 tokens/s)` 计算 strong-scaling efficiency。
+6. 若另做 weak scaling，必须固定每卡有效工作量、单独命名和报告，不与 strong-scaling gate 混用。
+7. 记录 NCCL collective 基线及其波动。
+8. 区分数据读取、计算、通信、日志和 checkpoint 时间。
+9. 在当前拓扑下比较候选四卡组，但不占用其他用户设备或跨越未批准设备。
+10. 将 validated baseline 与硬件/内核/环境 ID 绑定，环境漂移后自动失效。
 
 ### 4. 验证数据加载与文件描述符
 

@@ -6,6 +6,8 @@ import json
 from datetime import datetime, timezone
 from pathlib import Path
 
+import pytest
+
 from param_importance_nlp.capacity import (
     ParameterTensorShape,
     build_compute_communication_envelope,
@@ -23,6 +25,10 @@ from param_importance_nlp.stage0_g8 import (
     _capacity_config,
     _gate_key,
     _summarize_measurements,
+)
+from param_importance_nlp.stage0_g8_worker import (
+    Stage0G8WorkerError,
+    _validate_nccl_transport_environment,
 )
 
 
@@ -81,6 +87,17 @@ def test_g8_gate_key_matches_runtime_environment_ref_contract() -> None:
     assert _gate_key("stage0.G8-S4") == "gate_stage0_g8_s4"
     assert _gate_key("stage0.G8-S5") == "gate_stage0_g8_s5"
     assert _gate_key("stage0.G8") == "gate_stage0_g8"
+
+
+def test_g8_worker_freezes_nccl_p2p_transport(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("NCCL_P2P_DISABLE", "0")
+    with pytest.raises(
+        Stage0G8WorkerError,
+        match="G8_WORKER_NCCL_P2P_ENVIRONMENT_INVALID",
+    ):
+        _validate_nccl_transport_environment()
+    monkeypatch.setenv("NCCL_P2P_DISABLE", "1")
+    _validate_nccl_transport_environment()
 
 
 def test_g8_gate_record_commit_is_verifiable_by_runtime_preflight(

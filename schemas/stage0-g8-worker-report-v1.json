@@ -4,7 +4,7 @@
   "title": "Stage 0 G8 Capacity Worker Report v1",
   "type": "object",
   "additionalProperties": false,
-  "required": ["schema_version", "run_id", "profile_id", "gate_id", "model_id", "mode", "precision_profile", "candidate_stage", "repeat_index", "status", "completed_at", "generator_git_commit", "plan_ref", "plan_sha256", "config_hash", "environment_hash", "parameter_envelope_hash", "work_envelope_hash", "world_size", "selected_gpu_uuids", "rank_identities", "warmup_steps", "measured_steps", "memory_warmup_steps", "memory_measured_steps", "rank_reports", "effective_tokens_per_second", "samples_per_second", "step_median_seconds", "step_p95_seconds", "peak_memory_bytes_max", "peak_memory_fraction_max", "rank_peak_memory_imbalance_fraction", "checkpoint_pause_seconds_max", "checkpoint_bytes_total_max_boundary", "released_scratch_bytes", "open_fds_fraction_max", "synthetic_mathematics_implemented", "all_scratch_removed", "no_unknown_gpu_processes", "artifact_hash"],
+  "required": ["schema_version", "run_id", "profile_id", "gate_id", "model_id", "mode", "precision_profile", "candidate_stage", "repeat_index", "status", "completed_at", "generator_git_commit", "plan_ref", "plan_sha256", "config_hash", "environment_hash", "parameter_envelope_hash", "work_envelope_hash", "world_size", "selected_gpu_uuids", "nccl_p2p_disable", "rank_identities", "warmup_steps", "measured_steps", "memory_warmup_steps", "memory_measured_steps", "rank_reports", "effective_tokens_per_second", "samples_per_second", "step_median_seconds", "step_p95_seconds", "peak_memory_bytes_max", "peak_memory_fraction_max", "rank_peak_memory_imbalance_fraction", "checkpoint_pause_seconds_max", "checkpoint_bytes_total_max_boundary", "released_scratch_bytes", "open_fds_fraction_max", "synthetic_mathematics_implemented", "all_scratch_removed", "no_unknown_gpu_processes", "artifact_hash"],
   "properties": {
     "schema_version": {"const": "stage0-g8-worker-report-v1"},
     "run_id": {"type": "string", "minLength": 1},
@@ -26,6 +26,7 @@
     "work_envelope_hash": {"$ref": "#/$defs/hash"},
     "world_size": {"enum": [1, 4]},
     "selected_gpu_uuids": {"type": "array", "minItems": 1, "maxItems": 4, "uniqueItems": true, "items": {"type": "string", "pattern": "^GPU-"}},
+    "nccl_p2p_disable": {"const": 1},
     "rank_identities": {"type": "array", "minItems": 1, "maxItems": 4, "items": {"type": "object"}},
     "warmup_steps": {"const": 10},
     "measured_steps": {"const": 30},

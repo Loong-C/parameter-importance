@@ -16,7 +16,7 @@ import shutil
 import statistics
 import subprocess
 import time
-from typing import Any, Mapping, Sequence
+from typing import Any, Final, Mapping, Sequence
 
 import torch
 import torch.distributed as dist
@@ -51,6 +51,7 @@ from .runtime.tensor_bundle import publish_tensor_bundle
 
 WORKER_PLAN_SCHEMA = "stage0-g8-worker-plan-v1"
 WORKER_REPORT_SCHEMA = "stage0-g8-worker-report-v1"
+NCCL_P2P_DISABLE_PROTOCOL: Final = 1
 SYNTHETIC_BUFFER_IDS = (
     "raw_accumulator",
     "signed_accumulator",
@@ -104,7 +105,7 @@ def _validate_plan(root: Path, plan_ref: str) -> tuple[dict[str, Any], Path, Tas
     plan = _load_hashed(path, schema=WORKER_PLAN_SCHEMA, field="plan")
     expected = {
         "schema_version", "run_id", "profile_id", "gate_id", "model_id", "mode",
-        "precision_profile", "candidate_stage", "repeat_index", "world_size", "selected_gpu_uuids", "generator_git_commit",
+        "precision_profile", "candidate_stage", "repeat_index", "world_size", "selected_gpu_uuids", "nccl_p2p_disable", "generator_git_commit",
         "config_ref", "config_sha256", "config_hash", "environment_ref",
         "environment_sha256", "environment_hash", "parameter_envelope_ref",
         "parameter_envelope_sha256", "parameter_envelope_hash", "work_envelope_ref",
@@ -115,6 +116,8 @@ def _validate_plan(root: Path, plan_ref: str) -> tuple[dict[str, Any], Path, Tas
     }
     if set(plan) != expected:
         raise Stage0G8WorkerError("G8_WORKER_PLAN_FIELDS_INVALID")
+    if plan.get("nccl_p2p_disable") != NCCL_P2P_DISABLE_PROTOCOL:
+        raise Stage0G8WorkerError("G8_WORKER_NCCL_P2P_PROTOCOL_INVALID")
     if plan.get("profile_id") not in {"g8-c-14m", "g8-s4-160m", "g8-s5-410m"}:
         raise Stage0G8WorkerError("G8_WORKER_PROFILE_INVALID")
     expected_gate = {
@@ -278,6 +281,11 @@ def _rank_identity(plan: Mapping[str, Any]) -> dict[str, JSONValue]:
         "device_name": properties.name,
         "total_memory_bytes": int(properties.total_memory),
     }
+
+
+def _validate_nccl_transport_environment() -> None:
+    if os.environ.get("NCCL_P2P_DISABLE") != str(NCCL_P2P_DISABLE_PROTOCOL):
+        raise Stage0G8WorkerError("G8_WORKER_NCCL_P2P_ENVIRONMENT_INVALID")
 
 
 def _init_distributed(world_size: int, timeout_seconds: int) -> None:
@@ -969,6 +977,7 @@ def _aggregate(
         "work_envelope_hash": str(plan["work_envelope_hash"]),
         "world_size": world_size,
         "selected_gpu_uuids": list(plan["selected_gpu_uuids"]),
+        "nccl_p2p_disable": int(plan["nccl_p2p_disable"]),
         "rank_identities": list(identities),
         "warmup_steps": int(plan["warmup_steps"]),
         "measured_steps": int(plan["measured_steps"]),
@@ -1019,6 +1028,7 @@ def _aggregate(
 def run_stage0_g8_worker(*, data_root: str | Path, plan_ref: str) -> dict[str, JSONValue] | None:
     root = Path(data_root).resolve(strict=True)
     plan, plan_path, request = _validate_plan(root, plan_ref)
+    _validate_nccl_transport_environment()
     output_root = _logical_path(root, plan["output_root_ref"], field="output_root_ref")
     identity = _rank_identity(plan)
     world_size = int(plan["world_size"])
@@ -1065,9 +1075,11 @@ def run_stage0_g8_worker(*, data_root: str | Path, plan_ref: str) -> dict[str, J
 
 
 __all__ = [
+    "NCCL_P2P_DISABLE_PROTOCOL",
     "SYNTHETIC_BUFFER_IDS",
     "Stage0G8WorkerError",
     "WORKER_PLAN_SCHEMA",
     "WORKER_REPORT_SCHEMA",
+    "_validate_nccl_transport_environment",
     "run_stage0_g8_worker",
 ]

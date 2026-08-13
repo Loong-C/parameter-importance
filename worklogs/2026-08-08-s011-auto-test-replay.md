@@ -514,3 +514,26 @@ G9_REF=evidence/stage0/g9-formal/314c40fd22aead6104579a54e46b3c3e24166046f15d5cf
 
 - S0.12 仍未完成，状态为 **`IN_PROGRESS/BLOCKED_ON_G3_SIDECAR_REBUILD`**。本轮只确认 9b7fefb bootstrap PASS，G3–G10 与新 `READY` 均不存在。
 - 本节追加会再次改变 generator commit；完成本节 GitHub/bundle/服务器三端同步和 Agent/ 五文件 hash 核对后，从新 HEAD 重跑 G0→G5。G3 必须在空 canonical 路径上重建当前提交绑定的派生资产并完成新的 verify/materialize/formal G3/G4/G5，之后才进入带固定 `NCCL_P2P_DISABLE=1` 的 G6→G9 重试。
+
+## 2026-08-13 08:00 CST — 9bebc91 G8 NCCL 失败、归档与 transport 修复
+
+### 本轮 G0–G7R 边界
+
+- 本轮 generator commit 为 `9bebc91d8b5f7ce928fe2b3df9f48052a33b64d0`；本地、GitHub、服务器三端已同步，服务器 worktree clean，`Agent/` 五文件哈希一致。当前提交的 G0–G5、G6、G7 与 G7R 均已正式 `PASS`。
+- 当前有效 refs：G3 resolution `reports/stage0/g3/e444122ee91d55263ac8e18a031722bfb762b4c26720fa8211339389c1bfd403/asset-index.json`；formal G3/G4 分别为 `evidence/stage0/g3-formal/e444122ee91d55263ac8e18a031722bfb762b4c26720fa8211339389c1bfd403/index.json` 与 `evidence/stage0/g4-formal/e444122ee91d55263ac8e18a031722bfb762b4c26720fa8211339389c1bfd403/index.json`；formal G5 为 `evidence/stage0/g5-formal/2c5cf75b43a70488c384263dac98dc5fce7dfccdac27624b244cc0853e436050/index.json`；formal G6 为 `evidence/stage0/g6-formal/de56879d4f512f0fb6a831fa76c5ce1b79744ebe3a784752e37d8c0a84db9af8/index.json`；formal G7 logging 为 `evidence/stage0/g7-formal/245d3f05854ee4f5d3e6d39b23873abc1e955b0849908b5ca85dc480963fb3ea/index.json`；formal G7R 为 `evidence/stage0/g7-recovery-formal/05bf985619f21884aa3ec6a007eaaedf5fc62c88f2d30a83a51f6efe787784ef/index.json`。
+
+### G8 失败证据与完整归档
+
+- G8 formal 使用新 suite `evidence/stage0/g8-suite/bddf2914c97f3faf9a6c85305cf6eda9bf0d6e9035ad4b6e1bb710cec2cdc0b0/47c4e005b3f0daae933c96c8c505ba3fdbe54d08fab109ab101f637626e2e7e5/`。G8-C 的 1-GPU 项目已生成 6 个成功 transcript；首个四卡 `g8-c-14m-fp32-w4-minimal-r0` 在 `2026-08-12T23:33:31Z` 启动，持续 `671.539278` 秒后退出，transcript `return_code=1`、`timed_out=false`、`residual_compute_processes=[]`，formalizer 报 `G8_WORKER_LAUNCH_FAILED:g8-c-14m-fp32-w4-minimal-r0`。
+- 失败根因是 G8 fresh worker 未继承已在 G6/G7R 验证有效的 NCCL transport 契约：rank 3 的 `BROADCAST Numel=1` 与 rank 0/1 的 `ALLREDUCE Numel=1` 触发 `Timeout(ms)=600000` watchdog；没有生成本轮 G8 formal index，也未启动 G9/G10。失败链日志 `$DATA_ROOT/tmp/full-chain-9bebc91-s3.log` SHA-256 为 `573c0a0689e696ada82bde42212d21cc7d6798ceff68bb3088bae9e51cf3af20`。
+- 在确认 formalizer、worker、torchrun 均已退出且四卡回到 `0 MiB / 0%` 后，将本轮 G8 suite 与 7 个 launch claim 精确、可逆地移动到 `$DATA_ROOT/tmp/g8-capacity-failed-9bebc91-20260812T235216Z/`。suite 共 77 个文件；`suite-before.tsv` 与迁移后清单 SHA-256 均为 `c827d2fcaa63489721a22f0f9c39d2eabe3659352dcc7985f26a03369a72240c`；未删除历史 evidence 或 raw 资产。
+
+### G8 transport 修复与本机回归
+
+- 已实施最小修复：G8 launcher 对每个 fresh process 注入 `NCCL_P2P_DISABLE=1`；G8 worker plan/report schema 与生成器新增并固定 `nccl_p2p_disable=1`；worker 在首次 CUDA/NCCL 初始化前拒绝环境变量漂移，并在正式 report 回显该字段；S0.10 计划同步记录该 transport 合同。测量步骤、重复次数、模型配置、checkpoint cadence、阈值和 G8 controlled-failure 语义未改变。
+- 本机回归：`python -m pytest tests/test_stage0_g6.py tests/test_stage0_g7_recovery.py tests/test_stage0_g8.py tests/test_stage0_g9.py tests/test_stage0_g10.py -q --basetemp .tmp-pytest-g8-transport-2 -p no:cacheprovider` → **37 passed in 38.39s**；compileall、两个 G8 worker schema JSON 解析及 `git diff --check` 均通过。
+
+### 当前判定与下一步
+
+- S0.12 仍未完成，当前状态为 **`IN_PROGRESS/BLOCKED_ON_G8_NCCL_RETRY`**。本轮只能确认 `9bebc91` 的 G0–G7R PASS；G8/G9/G10 与新的 Stage 0 `READY` 均不存在。
+- 本节追加会形成新的 generator commit；提交并完成 GitHub、Git bundle、服务器三端同步以及 `Agent/` 五文件哈希核对后，必须从新 HEAD 重新执行 bootstrap→G5，再在四卡独占窗口验证固定 `NCCL_P2P_DISABLE=1` 的 G6→G8；只有 G8 formal PASS 才能继续 G9、三端同步观察与 G10。

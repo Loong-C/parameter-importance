@@ -4,7 +4,7 @@
   "title": "Stage 0 G8 Capacity Worker Plan v1",
   "type": "object",
   "additionalProperties": false,
-  "required": ["schema_version", "run_id", "profile_id", "gate_id", "model_id", "mode", "precision_profile", "candidate_stage", "repeat_index", "world_size", "selected_gpu_uuids", "generator_git_commit", "config_ref", "config_sha256", "config_hash", "environment_ref", "environment_sha256", "environment_hash", "parameter_envelope_ref", "parameter_envelope_sha256", "parameter_envelope_hash", "work_envelope_ref", "work_envelope_sha256", "work_envelope_hash", "output_root_ref", "report_ref", "warmup_steps", "measured_steps", "memory_warmup_steps", "memory_measured_steps", "loader_worker_candidates", "run_loader_sweep", "checkpoint_steps", "collective_chunk_elements", "timeout_seconds", "artifact_hash"],
+  "required": ["schema_version", "run_id", "profile_id", "gate_id", "model_id", "mode", "precision_profile", "candidate_stage", "repeat_index", "world_size", "selected_gpu_uuids", "nccl_p2p_disable", "generator_git_commit", "config_ref", "config_sha256", "config_hash", "environment_ref", "environment_sha256", "environment_hash", "parameter_envelope_ref", "parameter_envelope_sha256", "parameter_envelope_hash", "work_envelope_ref", "work_envelope_sha256", "work_envelope_hash", "output_root_ref", "report_ref", "warmup_steps", "measured_steps", "memory_warmup_steps", "memory_measured_steps", "loader_worker_candidates", "run_loader_sweep", "checkpoint_steps", "collective_chunk_elements", "timeout_seconds", "artifact_hash"],
   "properties": {
     "schema_version": {"const": "stage0-g8-worker-plan-v1"},
     "run_id": {"type": "string", "minLength": 1},
@@ -17,6 +17,7 @@
     "repeat_index": {"type": "integer", "minimum": 0, "maximum": 2},
     "world_size": {"enum": [1, 4]},
     "selected_gpu_uuids": {"type": "array", "minItems": 1, "maxItems": 4, "uniqueItems": true, "items": {"type": "string", "pattern": "^GPU-"}},
+    "nccl_p2p_disable": {"const": 1},
     "generator_git_commit": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
     "config_ref": {"$ref": "#/$defs/ref"},
     "config_sha256": {"$ref": "#/$defs/hash"},

@@ -64,7 +64,11 @@ from .stage0_g7_recovery import (
     Stage0G7RecoveryFormalState,
     load_stage0_g7_recovery_formal_state,
 )
-from .stage0_g8_worker import WORKER_PLAN_SCHEMA, WORKER_REPORT_SCHEMA
+from .stage0_g8_worker import (
+    NCCL_P2P_DISABLE_PROTOCOL,
+    WORKER_PLAN_SCHEMA,
+    WORKER_REPORT_SCHEMA,
+)
 from .stage0_gate import (
     Stage0CheckClass,
     Stage0CheckStatus,
@@ -829,6 +833,7 @@ def _launch_worker(
     )
     environment = os.environ.copy()
     environment["CUDA_VISIBLE_DEVICES"] = ",".join(selected[:world_size])
+    environment["NCCL_P2P_DISABLE"] = str(NCCL_P2P_DISABLE_PROTOCOL)
     environment["PARAM_IMPORTANCE_DATA_ROOT"] = str(root)
     environment["HF_HUB_OFFLINE"] = "1"
     environment["TRANSFORMERS_OFFLINE"] = "1"
@@ -936,6 +941,7 @@ def _worker_plan(
             "repeat_index": repeat_index,
             "world_size": world_size,
             "selected_gpu_uuids": list(selected[:world_size]),
+            "nccl_p2p_disable": NCCL_P2P_DISABLE_PROTOCOL,
             "generator_git_commit": source.git_commit,
             "config_ref": config_ref,
             "config_sha256": sha256_file(_logical_path(root, config_ref, field="config_ref")),
@@ -1002,6 +1008,7 @@ def _validate_worker_report(
         or report.get("repeat_index") != plan["repeat_index"]
         or report.get("world_size") != plan["world_size"]
         or report.get("selected_gpu_uuids") != plan["selected_gpu_uuids"]
+        or report.get("nccl_p2p_disable") != NCCL_P2P_DISABLE_PROTOCOL
         or report.get("generator_git_commit") != source.git_commit
         or report.get("plan_ref") != plan_path.relative_to(root).as_posix()
         or report.get("plan_sha256") != sha256_file(plan_path)
