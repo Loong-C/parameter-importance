@@ -640,3 +640,27 @@ G9_REF=evidence/stage0/g9-formal/314c40fd22aead6104579a54e46b3c3e24166046f15d5cf
 
 - S0.12 仍未完成，状态为 **`IN_PROGRESS/BLOCKED_ON_G8_LAUNCH_CLAIM_RETRY`**。本节追加会形成新的 generator commit，因此 `69e2ca6` 的 G0–G7R 证据不能作为最终闭环；本轮 G8 formal 不存在。
 - 下一步提交本节并完成 GitHub、Git bundle、服务器三端快进同步及 `Agent/` 五文件哈希核对；以新 HEAD 从 bootstrap 重新生成 G0–G5，再在 `NCCL_P2P_DISABLE=1` 下重新执行 G6→G9。若新链 G0–G9 全部通过，保持 Git、Agent 和正式 evidence 不再变化，执行三端只读观察与 G10 formal；G10 后仅核验 READY 状态。
+
+## 2026-08-13 18:21 CST — 73a9564 bootstrap artifact 冲突与归档
+
+### 本轮失败边界
+
+- 新候选提交 `73a956431d6c1c23240f759c6dbd6b1a17f15bef` 的 S1 已在服务器启动，正式链从 bootstrap 重新开始；日志在 `2026-08-13T10:14:22Z` 进入 bootstrap 发布阶段。
+- bootstrap 在发布 `source_attestation.json` 时触发不可覆盖保护：`FileExistsError: TASK_ARTIFACT_COMMIT_CONFLICT:evidence/stage0/bootstrap/73a956431d6c1c23240f759c6dbd6b1a17f15bef/commits/source_attestation.json`。本轮没有完成 bootstrap 返回，也没有生成本轮 G3/G4/G5 或后续 G6→G9 formal 证据；不能把 `73a9564` 的部分残留当作 G0→G5 PASS。
+- 失败链日志为 `$DATA_ROOT/tmp/full-chain-73a9564-s1.log`，SHA-256 为 `ea42e4e0073ae0c99d32f33da60739593c14cbf9228780c46804716be95f4cd7`，大小 `1076` bytes。失败进程已退出，未继续执行后续阶段。
+
+### 残留归档与核验
+
+- 冲突目录 `evidence/stage0/bootstrap/73a956431d6c1c23240f759c6dbd6b1a17f15bef/` 已整体、可逆地移动至 `$DATA_ROOT/tmp/bootstrap-conflict-73a9564-20260813T101422Z/`；移动前包含 `28` 个文件，源路径已缺失，归档路径存在。
+- 归档目录当前含 `29` 个文件（新增只读 `file-list.txt`），`du -sb` 为 `76252` bytes；文件清单 SHA-256 为 `ba81d7dfd5c06eafeb39ecf6d1bc25413861a3594895f6dcad8ed649db9345df`。没有覆盖或删除历史 immutable evidence。
+- 本轮仍不能宣称 S0.12 完成；本节会形成新的 generator commit，因此必须在新提交同步到本机、GitHub 和服务器后，从 bootstrap 重新开始完整 G0→G9，再执行三端只读观察与 G10 formal。
+
+### 命令与退出结果
+
+- 服务器链启动：后台进程成功创建（PID `1058020`），退出后日志返回上述冲突；冲突目录归档命令退出 `0`，源路径不存在、目标路径存在。
+- 归档核验：`SOURCE_EXISTS=no`、`TARGET_EXISTS=yes`；四卡和残留进程状态将在提交同步前再次只读核对。
+
+### 状态与下一步
+
+- 当前状态：**`IN_PROGRESS/BLOCKED_ON_BOOTSTRAP_ARTIFACT_RETRY`**。
+- 下一步：提交并同步本节；为下一候选提交生成新的 S1→S4 临时脚本，从 bootstrap 重新执行，不能复用本轮或此前提交的正式 evidence。
