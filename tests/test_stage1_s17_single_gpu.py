@@ -23,7 +23,8 @@ from param_importance_nlp.runtime.training import TrainingStepRecord
 from param_importance_nlp.stage1_single_gpu import (
     EXPECTED_MODEL_CONFIG_VOCAB_SIZE, EXPECTED_TOKENIZER_RUNTIME_VOCAB_SIZE,
     PYTHIA_ACTIVE_DROPOUT_FIELDS, T32_ATOL, T32_NORMALIZED_L2_LIMIT, T32_RTOL,
-    Stage1S17WorkerError, _active_gpt_neox_dropout, _fixed_array_bundle,
+    Stage1S17WorkerError, _active_gpt_neox_dropout, _adamw_group_wire,
+    _fixed_array_bundle, _optimizer_state_tensors, _state_components,
 )
 from param_importance_nlp.stage1_single_gpu_oracle import Stage1S17OracleError, max_error, raw_double_and_u
 
@@ -85,6 +86,65 @@ def test_s17_pythia_runtime_vocab_and_active_dropout_contract() -> None:
     assert set(observed) == set(PYTHIA_ACTIVE_DROPOUT_FIELDS)
     with pytest.raises(Stage1S17WorkerError, match="S17_WORKER_ACTIVE_DROPOUT_FIELD_INVALID:hidden_dropout"):
         _active_gpt_neox_dropout({"attention_dropout": 0.0})
+
+
+def test_s17_optimizer_group_and_state_wires_are_exact_and_named(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model = torch.nn.Linear(2, 2)
+    optimizer = torch.optim.AdamW(
+        model.parameters(), lr=3.0e-4, betas=(0.9, 0.999), eps=1.0e-8,
+        weight_decay=0.01, foreach=False, fused=False,
+    )
+    wire = _adamw_group_wire(model, optimizer)
+    assert wire["betas"] == [0.9, 0.999]
+    assert wire["parameter_names"] == ["weight", "bias"]
+    assert wire["decoupled_weight_decay"] is True
+    assert _optimizer_state_tensors(model, optimizer) == {}
+    monkeypatch.setattr(torch.cuda, "get_rng_state", lambda _device: torch.zeros(8, dtype=torch.uint8))
+    assert len(str(_state_components(model, optimizer)["optimizer_groups_sha256"])) == 64
+    model(torch.ones((1, 2))).sum().backward(); optimizer.step()
+    state = _optimizer_state_tensors(model, optimizer)
+    assert set(state) == {
+        f"{name}:{field}"
+        for name in ("weight", "bias")
+        for field in ("step", "exp_avg", "exp_avg_sq")
+    }
+    assert state["weight:step"].device.type == "cpu"
+    assert state["weight:step"].stride() == ()
+    assert state["weight:exp_avg"].stride() == model.weight.stride()
+    assert len(str(_state_components(model, optimizer)["optimizer_tensors_sha256"])) == 64
+    first_parameter = next(model.parameters())
+    original_exp_avg = optimizer.state[first_parameter]["exp_avg"]
+    optimizer.state[first_parameter]["exp_avg"] = original_exp_avg.t()
+    with pytest.raises(Stage1S17WorkerError, match="S17_WORKER_ADAMW_STATE_LAYOUT_INVALID:weight:exp_avg"):
+        _optimizer_state_tensors(model, optimizer)
+    optimizer.state[first_parameter]["exp_avg"] = original_exp_avg
+    optimizer.state[first_parameter]["unexpected"] = torch.tensor(0.0)
+    with pytest.raises(Stage1S17WorkerError, match="S17_WORKER_ADAMW_STATE_FIELDS_INVALID:weight"):
+        _optimizer_state_tensors(model, optimizer)
+
+
+def test_s17_optimizer_group_wire_rejects_control_and_binding_drift() -> None:
+    model = torch.nn.Linear(2, 1)
+    optimizer = torch.optim.AdamW(
+        model.parameters(), lr=3.0e-4, betas=(0.9, 0.999), eps=1.0e-8,
+        weight_decay=0.01, foreach=False, fused=False,
+    )
+    group = optimizer.param_groups[0]
+    group["betas"] = (0.8, 0.999)
+    with pytest.raises(Stage1S17WorkerError, match="S17_WORKER_ADAMW_BETAS_INVALID"):
+        _adamw_group_wire(model, optimizer)
+    group["betas"] = (0.9, 0.999); group["decoupled_weight_decay"] = False
+    with pytest.raises(Stage1S17WorkerError, match="S17_WORKER_ADAMW_BOOLEAN_OPTION_INVALID:decoupled_weight_decay"):
+        _adamw_group_wire(model, optimizer)
+    group["decoupled_weight_decay"] = True; group["unexpected"] = None
+    with pytest.raises(Stage1S17WorkerError, match="S17_WORKER_ADAMW_GROUP_FIELDS_INVALID"):
+        _adamw_group_wire(model, optimizer)
+    del group["unexpected"]
+    group["params"] = list(reversed(group["params"]))
+    with pytest.raises(Stage1S17WorkerError, match="S17_WORKER_ADAMW_PARAMETER_BINDING_INVALID"):
+        _adamw_group_wire(model, optimizer)
 
 
 def test_s17_yaml_keeps_global_default_but_freezes_local_fixture_contract() -> None:

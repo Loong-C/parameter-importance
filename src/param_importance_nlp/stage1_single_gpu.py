@@ -87,7 +87,120 @@ def _tensor_digest(values: Mapping[str, torch.Tensor]) -> str:
     return digest.hexdigest()
 
 
+_ADAMW_GROUP_KEYS = frozenset({
+    "params", "lr", "betas", "eps", "weight_decay", "amsgrad", "maximize",
+    "foreach", "capturable", "differentiable", "fused",
+    "decoupled_weight_decay",
+})
+
+
+def _adamw_parameter_binding(
+    module: torch.nn.Module, optimizer: torch.optim.Optimizer,
+) -> tuple[list[str], list[torch.nn.Parameter], Mapping[str, object]]:
+    if type(optimizer) is not torch.optim.AdamW or len(optimizer.param_groups) != 1:
+        raise Stage1S17WorkerError("S17_WORKER_ADAMW_GROUP_COUNT_OR_TYPE_INVALID")
+    group = optimizer.param_groups[0]
+    if set(group) != _ADAMW_GROUP_KEYS:
+        raise Stage1S17WorkerError("S17_WORKER_ADAMW_GROUP_FIELDS_INVALID")
+    named = list(module.named_parameters())
+    names = [name for name, _ in named]
+    parameters = [parameter for _, parameter in named]
+    actual = group.get("params")
+    if (
+        not names
+        or not isinstance(actual, list)
+        or len(actual) != len(parameters)
+        or any(observed is not expected for observed, expected in zip(actual, parameters, strict=True))
+        or any(not parameter.requires_grad for parameter in parameters)
+    ):
+        raise Stage1S17WorkerError("S17_WORKER_ADAMW_PARAMETER_BINDING_INVALID")
+    return names, parameters, group
+
+
+def _adamw_group_wire(
+    module: torch.nn.Module, optimizer: torch.optim.Optimizer,
+) -> dict[str, object]:
+    """Freeze the exact single-group AdamW control wire used by S1.7."""
+
+    names, _parameters, group = _adamw_parameter_binding(module, optimizer)
+    expected_numbers = {"lr": 3.0e-4, "eps": 1.0e-8, "weight_decay": 0.01}
+    for key, expected in expected_numbers.items():
+        value = group[key]
+        if type(value) is not float or not math.isfinite(value) or value != expected:
+            raise Stage1S17WorkerError(f"S17_WORKER_ADAMW_NUMERIC_OPTION_INVALID:{key}")
+    betas = group["betas"]
+    if (
+        not isinstance(betas, (list, tuple))
+        or len(betas) != 2
+        or any(type(item) is not float or not math.isfinite(item) for item in betas)
+        or list(betas) != [0.9, 0.999]
+    ):
+        raise Stage1S17WorkerError("S17_WORKER_ADAMW_BETAS_INVALID")
+    expected_booleans = {
+        "amsgrad": False, "maximize": False, "foreach": False,
+        "capturable": False, "differentiable": False, "fused": False,
+        "decoupled_weight_decay": True,
+    }
+    for key, expected in expected_booleans.items():
+        if group[key] is not expected:
+            raise Stage1S17WorkerError(f"S17_WORKER_ADAMW_BOOLEAN_OPTION_INVALID:{key}")
+    return {
+        "optimizer_type": "AdamW",
+        "parameter_names": names,
+        **expected_numbers,
+        "betas": [float(item) for item in betas],
+        **expected_booleans,
+    }
+
+
+def _optimizer_state_tensors(
+    module: torch.nn.Module, optimizer: torch.optim.Optimizer,
+) -> dict[str, torch.Tensor]:
+    """Return the exact empty-or-complete AdamW tensor state by parameter name."""
+
+    names, parameters, _group = _adamw_parameter_binding(module, optimizer)
+    _adamw_group_wire(module, optimizer)
+    if not optimizer.state:
+        return {}
+    expected_ids = {id(parameter) for parameter in parameters}
+    if {id(parameter) for parameter in optimizer.state} != expected_ids:
+        raise Stage1S17WorkerError("S17_WORKER_ADAMW_STATE_PARAMETER_SET_INVALID")
+    tensors: dict[str, torch.Tensor] = {}
+    for name, parameter in zip(names, parameters, strict=True):
+        state = optimizer.state.get(parameter)
+        if not isinstance(state, Mapping) or set(state) != {"step", "exp_avg", "exp_avg_sq"}:
+            raise Stage1S17WorkerError(f"S17_WORKER_ADAMW_STATE_FIELDS_INVALID:{name}")
+        for field in ("step", "exp_avg", "exp_avg_sq"):
+            value = state[field]
+            if not isinstance(value, torch.Tensor) or not bool(torch.isfinite(value).all().item()):
+                raise Stage1S17WorkerError(f"S17_WORKER_ADAMW_STATE_TENSOR_INVALID:{name}:{field}")
+            if field == "step":
+                valid_layout = (
+                    value.ndim == 0
+                    and value.dtype == torch.float32
+                    and value.device.type == "cpu"
+                    and value.layout == torch.strided
+                    and value.stride() == ()
+                    and not value.requires_grad
+                )
+            else:
+                valid_layout = (
+                    value.shape == parameter.shape
+                    and value.dtype == parameter.dtype
+                    and value.device == parameter.device
+                    and value.layout == parameter.layout
+                    and value.stride() == parameter.stride()
+                    and not value.requires_grad
+                )
+            if not valid_layout:
+                raise Stage1S17WorkerError(f"S17_WORKER_ADAMW_STATE_LAYOUT_INVALID:{name}:{field}")
+            tensors[f"{name}:{field}"] = value.detach()
+    return tensors
+
+
 def _state_components(module: torch.nn.Module, optimizer: torch.optim.Optimizer | None = None, scheduler: object | None = None) -> dict[str, object]:
+    if scheduler is not None:
+        raise Stage1S17WorkerError("S17_WORKER_SCHEDULER_MUST_BE_NULL")
     payload: dict[str, object] = {
         "parameters_sha256": _tensor_digest({name: item.detach() for name, item in module.named_parameters()}),
         "buffers_sha256": _tensor_digest({name: item.detach() for name, item in module.named_buffers()}),
@@ -96,19 +209,14 @@ def _state_components(module: torch.nn.Module, optimizer: torch.optim.Optimizer 
         "torch_cuda_rng_sha256": _sha_bytes(torch.cuda.get_rng_state(0).cpu().numpy().tobytes()),
         "python_rng_sha256": _sha_bytes(repr(random.getstate()).encode("utf-8")),
         "numpy_rng_sha256": _sha_bytes(repr(np.random.get_state()).encode("utf-8")),
-        "scheduler": None if scheduler is None else _sha_bytes(repr(scheduler.state_dict()).encode("utf-8")),
+        "scheduler": None,
     }
     if optimizer is not None:
-        optimizer_tensors: dict[str, torch.Tensor] = {}
-        for index, state in enumerate(optimizer.state.values()):
-            for key, value in sorted(state.items(), key=lambda item: str(item[0])):
-                if isinstance(value, torch.Tensor):
-                    optimizer_tensors[f"{index}:{key}"] = value.detach()
+        optimizer_tensors = _optimizer_state_tensors(module, optimizer)
         payload["optimizer_tensors_sha256"] = _tensor_digest(optimizer_tensors)
-        payload["optimizer_groups_sha256"] = canonical_json_hash([
-            {str(key): value for key, value in group.items() if key != "params"}
-            for group in optimizer.param_groups
-        ])
+        payload["optimizer_groups_sha256"] = canonical_json_hash(
+            _adamw_group_wire(module, optimizer)
+        )
     else:
         payload["optimizer_tensors_sha256"] = None; payload["optimizer_groups_sha256"] = None
     return payload
@@ -118,14 +226,13 @@ def _state_digest(module: torch.nn.Module, optimizer: torch.optim.Optimizer | No
     return canonical_json_hash(_state_components(module, optimizer, scheduler))
 
 
-def _optimizer_tensor_values(optimizer: torch.optim.Optimizer) -> dict[str, torch.Tensor]:
+def _optimizer_tensor_values(module: torch.nn.Module, optimizer: torch.optim.Optimizer) -> dict[str, torch.Tensor]:
     """Name optimizer tensors deterministically for post-step parity checks."""
 
-    values: dict[str, torch.Tensor] = {}
-    for state_index, state in enumerate(optimizer.state.values()):
-        for field, tensor in sorted(state.items(), key=lambda item: str(item[0])):
-            if isinstance(tensor, torch.Tensor):
-                values[f"{state_index}:{field}"] = tensor.detach().cpu().clone()
+    values = {
+        name: tensor.detach().cpu().clone()
+        for name, tensor in _optimizer_state_tensors(module, optimizer).items()
+    }
     if not values:
         raise Stage1S17WorkerError("S17_WORKER_OPTIMIZER_STATE_EMPTY_AFTER_STEP")
     return values
@@ -560,7 +667,9 @@ class _S17StepObserver(TrainingStepObserver):
         assert self.rows is not None and self.engine is not None and self.post_parameter_maps is not None and self.post_optimizer_maps is not None
         step = event.transaction.global_step + 1
         self.post_parameter_maps[step] = {name: value.detach().cpu().clone() for name, value in event.parameters_post.items()}
-        self.post_optimizer_maps[step] = _optimizer_tensor_values(self.engine.optimizer)
+        self.post_optimizer_maps[step] = _optimizer_tensor_values(
+            self.engine.model.module, self.engine.optimizer,
+        )
         update_norm = math.sqrt(sum(float(value.detach().to(torch.float64).square().sum().item()) for value in event.outcome.total_delta.values()))
         self.rows.append({
             "step": step, "attempt_index": event.transaction.attempt_index,
