@@ -87,14 +87,16 @@ def produce_baseline_scores(
 
     参数：
         parameters: checkpoint 的最终 eligible 参数，shape/name 决定坐标合同。
-        accumulator_state: :class:`ImportanceAccumulator.state_dict` 的 v2 primitive tree。
+        accumulator_state: current v3 primitive tree; legacy v1/v2 shared baseline fields remain compatible.
         estimator_name: 训练实际使用的 ``u``、``weighted_u``、``double`` 或 ``raw``。
         per_unit_gradients: empirical Fisher 的统计单位梯度，而非 batch 均值平方替代物。
         si_gradients/si_data_updates: 同一步对齐的梯度和纯数据更新。
     """
 
-    if accumulator_state.get("version") not in {1, 2}:
-        raise CoreContractError("baseline producer 只接受 accumulator state v1/v2")
+    # v3 adds actual-update diagnostics; baseline input fields retain the
+    # historical v1/v2 semantics consumed below.
+    if accumulator_state.get("version") not in {1, 2, 3}:
+        raise CoreContractError("baseline producer only accepts accumulator state versions v1, v2, or v3")
     parameters.assert_finite()
     magnitude = final_magnitude(parameters).to(dtype=torch.float64)
     movement = _state_tensor_map(accumulator_state, "data_movement", parameters).to(

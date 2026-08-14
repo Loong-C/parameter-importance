@@ -9,6 +9,7 @@ import numpy as np
 import torch
 
 from param_importance_nlp.contracts import canonical_json_bytes
+from param_importance_nlp.core.losses import LossBatch
 from param_importance_nlp.providers import (
     ClassificationEvaluator,
     DeterministicBatchCursor,
@@ -50,6 +51,52 @@ class _InfiniteReducedLossReducer:
 
     def sum_int(self, value: int) -> int:
         return int(value)
+
+
+class _ScalarGradientModel(torch.nn.Module):
+    """Single-coordinate fixture for sufficient-statistic overflow semantics."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.weight = torch.nn.Parameter(torch.ones((), dtype=torch.float32))
+
+
+class _ScalarGradientAdapter:
+    """Produces finite, explicitly frozen per-micro gradients from payload."""
+
+    task_type = "scalar_gradient_fixture"
+
+    def __init__(self, module: _ScalarGradientModel) -> None:
+        self._module = module
+
+    @property
+    def module(self) -> _ScalarGradientModel:
+        return self._module
+
+    def loss(self, microbatch: TrainingMicrobatch) -> LossBatch:
+        coefficient = microbatch.payload["coefficient"].to(self._module.weight.device)
+        return LossBatch(self._module.weight * coefficient.sum(), int(coefficient.shape[0]), "sample")
+
+
+class _SkipScaleObserver:
+    """Read-only observer to expose the real scaler transition after skip."""
+
+    def __init__(self, scaler: torch.amp.GradScaler) -> None:
+        self.scaler = scaler
+        self.skip_scales: list[float] = []
+
+    def on_gradient_ready(self, event: object) -> None:
+        del event
+
+    def on_parameter_post(self, event: object) -> None:
+        del event
+
+    def on_attempt_commit(self, event: object) -> None:
+        del event
+
+    def on_skip(self, event: object) -> None:
+        del event
+        self.skip_scales.append(float(self.scaler.get_scale()))
 
 
 def test_install_training_rng_restarts_all_runtime_domains_per_rank() -> None:
@@ -146,6 +193,146 @@ def test_training_with_online_u_does_not_perturb_optimizer_updates() -> None:
         assert torch.equal(observed_value, _parameter_state(control)[name])
     assert all(record.parameter_post_state_hash for record in observed_result.records)
     assert all(record.attempt_commit_state_hash for record in observed_result.records)
+
+
+def test_sufficient_statistics_overflow_skips_before_stage_and_preserves_statistics_parity() -> None:
+    """Finite cancelling means must not conceal FP32 G2 overflow at boundary 08."""
+
+    overflow = (
+        TrainingMicrobatch(
+            "overflow-micro-positive",
+            {"coefficient": torch.tensor([2.0e20], dtype=torch.float32)},
+            ("overflow-positive-sample",),
+        ),
+        TrainingMicrobatch(
+            "overflow-micro-negative",
+            {"coefficient": torch.tensor([-2.0e20], dtype=torch.float32)},
+            ("overflow-negative-sample",),
+        ),
+    )
+    finite_before = (
+        TrainingMicrobatch(
+            "finite-before-micro-a",
+            {"coefficient": torch.tensor([1.0], dtype=torch.float32)},
+            ("finite-before-a-sample",),
+        ),
+        TrainingMicrobatch(
+            "finite-before-micro-b",
+            {"coefficient": torch.tensor([3.0], dtype=torch.float32)},
+            ("finite-before-b-sample",),
+        ),
+    )
+    finite_after = (
+        TrainingMicrobatch(
+            "finite-after-micro-a",
+            {"coefficient": torch.tensor([2.0], dtype=torch.float32)},
+            ("finite-after-a-sample",),
+        ),
+        TrainingMicrobatch(
+            "finite-after-micro-b",
+            {"coefficient": torch.tensor([4.0], dtype=torch.float32)},
+            ("finite-after-b-sample",),
+        ),
+    )
+
+    def make_engine(*, importance_enabled: bool, steps: tuple[tuple[TrainingMicrobatch, ...], ...]) -> tuple[TrainingEngine, _ScalarGradientModel, torch.optim.Optimizer, torch.amp.GradScaler, _SkipScaleObserver]:
+        model = _ScalarGradientModel()
+        optimizer = torch.optim.SGD(model.parameters(), lr=0.1, momentum=0.9)
+        scaler = torch.amp.GradScaler("cpu", init_scale=8.0, growth_interval=1)
+        observer = _SkipScaleObserver(scaler)
+        engine = TrainingEngine(
+            spec=TrainingRunSpec(
+                "sufficient-statistics-overflow",
+                "local_fixture",
+                max_steps=2,
+                max_attempts=3,
+                importance_enabled=importance_enabled,
+                estimator_name="u",
+                accumulation_dtype="float32",
+                weights_exogenous=True,
+                common_mean_assumption=True,
+            ),
+            model=_ScalarGradientAdapter(model),
+            optimizer=optimizer,
+            scaler=scaler,
+            cursor=DeterministicBatchCursor(steps),
+            observers=(observer,),
+            capture_boundary_trace=True,
+        )
+        return engine, model, optimizer, scaler, observer
+
+    observed, observed_model, observed_optimizer, observed_scaler, observed_observer = make_engine(
+        importance_enabled=True, steps=(finite_before, overflow, finite_after)
+    )
+    control, control_model, control_optimizer, control_scaler, control_observer = make_engine(
+        importance_enabled=False, steps=(finite_before, overflow, finite_after)
+    )
+    reference, _, _, _, _ = make_engine(
+        importance_enabled=True, steps=(finite_before, finite_after)
+    )
+
+    observed_result = observed.run()
+    control_result = control.run()
+    reference_result = reference.run()
+
+    for result in (observed_result, control_result):
+        assert result.status == "COMPLETE"
+        assert [record.status for record in result.records] == ["COMMITTED", "SKIPPED", "COMMITTED"]
+        assert result.records[1].skip_reason == "NONFINITE_SUFFICIENT_STATISTICS"
+        assert result.state.global_step == 2
+        assert result.state.attempt_index == 3
+        assert result.state.skipped_steps == 1
+
+    # The real CPU scaler gets one found-inf/no-step/backoff transition even
+    # though the cancelled mean .grad itself is finite; the subsequent finite
+    # attempt grows it back under the frozen growth_interval=1 contract.
+    assert observed_observer.skip_scales == control_observer.skip_scales == [8.0]
+    assert float(observed_scaler.get_scale()) == float(control_scaler.get_scale()) == 16.0
+    assert torch.equal(observed_model.weight, control_model.weight)
+    assert torch.equal(
+        observed_optimizer.state[observed_model.weight]["momentum_buffer"],
+        control_optimizer.state[control_model.weight]["momentum_buffer"],
+    )
+
+    assert observed_result.importance_snapshot is not None
+    assert reference_result.importance_snapshot is not None
+    assert observed_result.importance_snapshot.successful_steps == 2
+    assert observed_result.importance_snapshot.skipped_steps == 1
+    # Skip bookkeeping differs by contract; every long-horizon score/movement
+    # view is exactly the reference trajectory that omitted the bad batch.
+    assert (
+        observed_result.importance_snapshot.scalar_summaries
+        == reference_result.importance_snapshot.scalar_summaries
+    )
+
+    execute = [
+        "01_parameters_optimizer_lr_pre", "02_clear_transient_gradients",
+        "03_freeze_loss_scale", "04_local_unscaled_statistics",
+        "05_global_mean_gradient_loss", "06_install_scaled_optimizer_gradient",
+        "07_formal_unscale", "08_global_finite_decision",
+        "10_stage_preclip_scores", "11_install_clipped_gradient",
+        "12_single_optimizer_or_scaler_step", "13_freeze_score_mass_payload",
+        "14_parameter_post", "15_decompose_data_decay_delta",
+        "16_commit_all_long_term_views", "17_scheduler_success_counter",
+        "18_publish_step_log_state",
+    ]
+    skipped = execute[:8] + [
+        "09_skip_discard_and_scaler", "17_skip_control_counter",
+        "18_publish_step_log_state",
+    ]
+    lifecycle = list(observed.boundary_trace)
+    assert [entry["boundary"] for entry in lifecycle] == execute + skipped + execute
+    assert lifecycle[24]["observation"] == {
+        "phase": "SKIPPED",
+        "skip_reason": "NONFINITE_SUFFICIENT_STATISTICS",
+        "sufficient_statistics_finite": False,
+    }
+    assert lifecycle[25]["observation"] == {
+        "parameters_unchanged": True,
+        "optimizer_unchanged": True,
+        "accumulator_long_term_unchanged": True,
+        "scaler_present": True,
+    }
 
 
 def test_training_checkpoint_resume_matches_uninterrupted(tmp_path) -> None:

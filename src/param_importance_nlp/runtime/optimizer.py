@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import math
+from collections.abc import Callable
 from typing import Any, Mapping
 
 
@@ -19,6 +20,9 @@ class StepOutcome:
     data_delta: dict[str, Any]
     weight_decay_delta: dict[str, Any]
     learning_rates: dict[str, float]
+    # Audit-only declaration that the authorised callable was invoked.  It is
+    # deliberately not a claim that GradScaler performed an actual update.
+    optimizer_step_called: bool = True
 
 
 def compute_global_clip_factor(
@@ -107,7 +111,11 @@ class OptimizerBridge:
             if parameter.requires_grad and id(parameter) in self._group_by_identity
         }
 
-    def step(self) -> StepOutcome:
+    def step(
+        self,
+        *,
+        stepper: Callable[[Any], object] | None = None,
+    ) -> StepOutcome:
         import torch
 
         # 完整预检必须发生在 ``optimizer.step`` 之前。这样即使调用方没有通过
@@ -123,7 +131,13 @@ class OptimizerBridge:
             name: parameter.grad is not None
             for name, parameter in self.named_parameters.items()
         }
-        self.optimizer.step()
+        # ``stepper`` is the one officially authorised optimizer invocation for
+        # this attempt.  AMP callers pass ``GradScaler.step`` here; the bridge
+        # never follows it with a second raw ``optimizer.step``.
+        if stepper is None:
+            self.optimizer.step()
+        else:
+            stepper(self.optimizer)
         total: dict[str, Any] = {}
         data: dict[str, Any] = {}
         decay: dict[str, Any] = {}
@@ -149,4 +163,4 @@ class OptimizerBridge:
             total[name] = total_delta.clone()
             data[name] = data_delta.clone()
             decay[name] = decay_delta.clone()
-        return StepOutcome(total, data, decay, rates)
+        return StepOutcome(total, data, decay, rates, optimizer_step_called=True)

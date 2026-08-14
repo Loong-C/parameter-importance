@@ -49,6 +49,13 @@ class ImportanceAccumulator:
         self._total_displacement = TensorMap.zeros_like(template, dtype=accumulation_dtype)
         self._weight_decay_movement = TensorMap.zeros_like(template, dtype=accumulation_dtype)
         self._weight_decay_displacement = TensorMap.zeros_like(template, dtype=accumulation_dtype)
+        # ``-delta_data * mean_gradient`` is deliberately kept separate from
+        # gradient-space raw.  It is an optimizer-dependent diagnostic, not a
+        # replacement for the raw or U estimator.
+        self._actual_update_raw_importance = TensorMap.zeros_like(
+            template, dtype=accumulation_dtype
+        )
+        self._actual_update_raw_importance_available = True
         self._magnitude = TensorMap.zeros_like(template, dtype=accumulation_dtype)
         self._initial_parameters = TensorMap.zeros_like(template, dtype=accumulation_dtype)
         self._last_parameters = TensorMap.zeros_like(template, dtype=accumulation_dtype)
@@ -107,6 +114,22 @@ class ImportanceAccumulator:
         return self._weight_decay_displacement.map(torch.abs)
 
     @property
+    def actual_update_raw_importance(self) -> TensorMap:
+        """累计 ``-delta_data * mean_gradient`` 的实际更新诊断。
+
+        该量允许为负，不能套用 raw importance 的非负约束，也不携带 U 的无偏
+        性声明。
+        """
+
+        return self._actual_update_raw_importance.clone()
+
+    @property
+    def actual_update_raw_importance_available(self) -> bool:
+        """Whether the diagnostic is observed rather than legacy zero-fill."""
+
+        return self._actual_update_raw_importance_available
+
+    @property
     def magnitude(self) -> TensorMap:
         return self._magnitude.clone()
 
@@ -138,6 +161,7 @@ class ImportanceAccumulator:
         data_update: TensorMap | None = None,
         total_update: TensorMap | None = None,
         weight_decay_update: TensorMap | None = None,
+        actual_update_raw_importance: TensorMap | None = None,
         current_parameters: TensorMap | None = None,
     ) -> None:
         """原子式提交一个已成功 optimizer step 的长期统计。
@@ -155,6 +179,7 @@ class ImportanceAccumulator:
                 data_update,
                 total_update,
                 weight_decay_update,
+                actual_update_raw_importance,
                 current_parameters,
             )
             if value is not None
@@ -180,6 +205,11 @@ class ImportanceAccumulator:
             if weight_decay_update is None
             else weight_decay_update.to(dtype=self.accumulation_dtype)
         )
+        converted_actual_update = (
+            None
+            if actual_update_raw_importance is None
+            else actual_update_raw_importance.to(dtype=self.accumulation_dtype)
+        )
         converted_parameters = (
             None if current_parameters is None else current_parameters.to(dtype=self.accumulation_dtype)
         )
@@ -192,6 +222,7 @@ class ImportanceAccumulator:
                 converted_data,
                 converted_total,
                 converted_decay,
+                converted_actual_update,
                 converted_parameters,
             )
             if value is not None
@@ -228,6 +259,14 @@ class ImportanceAccumulator:
             for name, value in converted_decay.items():
                 self._weight_decay_movement[name].add_(value.abs())
                 self._weight_decay_displacement[name].add_(value)
+        if converted_actual_update is not None:
+            for name, value in converted_actual_update.items():
+                self._actual_update_raw_importance[name].add_(value)
+        else:
+            # Availability means every successful historical step was observed.
+            # A missing older value is not recoverable from raw/movement and a
+            # later complete step must not erase that provenance loss.
+            self._actual_update_raw_importance_available = False
         if converted_parameters is not None:
             for name, value in converted_parameters.items():
                 self._magnitude[name].copy_(value.abs())
@@ -299,13 +338,16 @@ class ImportanceAccumulator:
             "data_movement": self.data_movement - previous.data_movement,
             "total_movement": self.total_movement - previous.total_movement,
             "weight_decay_movement": self.weight_decay_movement - previous.weight_decay_movement,
+            "actual_update_raw_importance": (
+                self.actual_update_raw_importance - previous.actual_update_raw_importance
+            ),
         }
 
     def state_dict(self) -> dict[str, object]:
         """返回只含 primitive/TensorMap 的安全状态，不使用 pickle 对象图。"""
 
         return {
-            "version": 2,
+            "version": 3,
             "accumulation_dtype": str(self.accumulation_dtype),
             "successful_steps": self.successful_steps,
             "skipped_steps": self.skipped_steps,
@@ -319,6 +361,8 @@ class ImportanceAccumulator:
             "total_displacement": self._total_displacement.to_dict(clone=True),
             "weight_decay_movement": self._weight_decay_movement.to_dict(clone=True),
             "weight_decay_displacement": self._weight_decay_displacement.to_dict(clone=True),
+            "actual_update_raw_importance": self._actual_update_raw_importance.to_dict(clone=True),
+            "actual_update_raw_importance_available": self._actual_update_raw_importance_available,
             "magnitude": self._magnitude.to_dict(clone=True),
             "initial_parameters": self._initial_parameters.to_dict(clone=True),
             "last_parameters": self._last_parameters.to_dict(clone=True),
@@ -326,17 +370,30 @@ class ImportanceAccumulator:
         }
 
     def load_state_dict(self, state: Mapping[str, object]) -> None:
-        """严格恢复累计状态，并对 0.3.x 的 v1 状态做无损可知字段迁移。
+        """严格恢复累计状态，并对历史 v1/v2 做 fail-closed 的 v3 迁移。
 
         v1 没有 clipped-raw、weight-decay 分解和有符号参数端点；这些量不能从旧
         字段反推，因此迁移时明确置零并保持 ``has_initial_parameters=false``。
-        已存在的 signed/raw/data/total/magnitude 与计数逐位保留，随后写出统一 v2。
+        已存在的 signed/raw/data/total/magnitude 与计数逐位保留。历史状态没有
+        ``actual_update_raw_importance``，迁移时只写入零占位并标为 unavailable；
+        下游不得把这个零当作已观测的 optimizer 诊断。
         """
 
         version = state.get("version")
-        if version not in {1, 2}:
+        if version not in {1, 2, 3}:
             raise CoreContractError("不支持的 ImportanceAccumulator state version")
         normalized: dict[str, object] = dict(state)
+        expected_v3 = {
+            "version", "accumulation_dtype", "successful_steps", "skipped_steps",
+            "positive", "negative_mass", "raw", "raw_clipped", "data_movement",
+            "data_displacement", "total_movement", "total_displacement",
+            "weight_decay_movement", "weight_decay_displacement",
+            "actual_update_raw_importance", "actual_update_raw_importance_available",
+            "magnitude", "initial_parameters", "last_parameters", "has_initial_parameters",
+        }
+        expected_v2 = expected_v3 - {
+            "actual_update_raw_importance", "actual_update_raw_importance_available",
+        }
         if version == 1:
             expected_v1 = {
                 "version", "accumulation_dtype", "successful_steps", "skipped_steps",
@@ -367,6 +424,22 @@ class ImportanceAccumulator:
                     "has_initial_parameters": False,
                 }
             )
+        elif version == 2:
+            if set(normalized) != expected_v2:
+                raise CoreContractError("ImportanceAccumulator v2 字段集合无效")
+        elif set(normalized) != expected_v3:
+            raise CoreContractError("ImportanceAccumulator v3 字段集合无效")
+        if version in {1, 2}:
+            zero_state = {
+                name: torch.zeros_like(value) for name, value in self._positive.items()
+            }
+            normalized.update(
+                {
+                    "version": 3,
+                    "actual_update_raw_importance": zero_state,
+                    "actual_update_raw_importance_available": False,
+                }
+            )
         state = normalized
         expected_dtype = str(self.accumulation_dtype)
         if state.get("accumulation_dtype") != expected_dtype:
@@ -382,6 +455,7 @@ class ImportanceAccumulator:
             "total_displacement": self._total_displacement,
             "weight_decay_movement": self._weight_decay_movement,
             "weight_decay_displacement": self._weight_decay_displacement,
+            "actual_update_raw_importance": self._actual_update_raw_importance,
             "magnitude": self._magnitude,
             "initial_parameters": self._initial_parameters,
             "last_parameters": self._last_parameters,
@@ -415,9 +489,13 @@ class ImportanceAccumulator:
         has_initial = state.get("has_initial_parameters")
         if type(has_initial) is not bool:
             raise CoreContractError("has_initial_parameters 非法")
+        actual_available = state.get("actual_update_raw_importance_available")
+        if type(actual_available) is not bool:
+            raise CoreContractError("actual_update_raw_importance_available 非法")
         for key, destination in destinations.items():
             _copy_into(destination, staged[key])
         self.successful_steps = successful_steps
         self.skipped_steps = skipped_steps
         self._has_initial_parameters = has_initial
+        self._actual_update_raw_importance_available = actual_available
         self.validate_invariants()

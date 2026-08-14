@@ -19,13 +19,13 @@ checkpoint 保存 model/buffer、optimizer、scheduler、scaler、RNG、cursor�
 from __future__ import annotations
 
 from contextlib import nullcontext
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 import hashlib
 import json
 import math
 import random
 from types import MappingProxyType
-from typing import Any, Mapping, Protocol, Sequence, runtime_checkable
+from typing import Any, Callable, Mapping, Protocol, Sequence, runtime_checkable
 
 import numpy as np
 import torch
@@ -42,6 +42,7 @@ from ..core.estimators import (
     double_sample_importance,
     raw_importance,
 )
+from ..core.errors import NumericalError
 from ..core.registry import ParameterRegistry
 from ..core.sufficient_statistics import WeightedSufficientStatistics
 from ..core.tensors import TensorMap
@@ -107,7 +108,7 @@ def _state_tree_hash(value: object) -> str:
             digest.update(b"tensor\0")
             digest.update(str(tensor.dtype).encode("ascii"))
             digest.update(json.dumps(list(tensor.shape), separators=(",", ":")).encode("ascii"))
-            digest.update(tensor.view(torch.uint8).numpy().tobytes(order="C"))
+            digest.update(tensor.reshape(-1).view(torch.uint8).numpy().tobytes(order="C"))
             return
         if isinstance(item, np.ndarray):
             array = np.ascontiguousarray(item)
@@ -473,6 +474,7 @@ class GradientReadyEvent:
     parameters_pre: TensorMap
     mean_gradient: TensorMap
     optimizer_gradient: TensorMap
+    loss_scale: float
     microbatch_ids: tuple[str, ...]
     sample_ids: tuple[str, ...]
 
@@ -501,6 +503,8 @@ class SkippedAttemptEvent:
 
     transaction: StepTransaction
     microbatch_ids: tuple[str, ...]
+    sample_ids: tuple[str, ...]
+    cursor_state: Mapping[str, object]
 
 
 @runtime_checkable
@@ -847,9 +851,16 @@ class OnlineImportanceTracker:
         raw_unclipped: EstimatorResult,
         raw_clipped: EstimatorResult,
         outcome: StepOutcome,
+        *,
+        mean_gradient: TensorMap,
     ) -> None:
         data = TensorMap(outcome.data_delta, registry=self.registry)
         total = TensorMap(outcome.total_delta, registry=self.registry)
+        mean_gradient.assert_compatible(data)
+        # The actual-update diagnostic is intentionally anchored at the
+        # unscaled, *pre-clip* global mean used by raw/U.  Replacing it with an
+        # optimizer moment or clipped gradient would silently change the field.
+        actual_update_raw = -(data * mean_gradient)
         parameters = TensorMap(
             {name: self.registry.parameter(name).detach() for name in self.registry.eligible_names},
             registry=self.registry,
@@ -863,6 +874,7 @@ class OnlineImportanceTracker:
             weight_decay_update=TensorMap(
                 outcome.weight_decay_delta, registry=self.registry
             ),
+            actual_update_raw_importance=actual_update_raw,
             current_parameters=parameters,
         )
 
@@ -885,6 +897,10 @@ class OnlineImportanceTracker:
             "weight_decay_movement": self.accumulator.weight_decay_movement,
             "magnitude": self.accumulator.magnitude,
         }
+        if self.accumulator.actual_update_raw_importance_available:
+            views["actual_update_raw_importance"] = (
+                self.accumulator.actual_update_raw_importance
+            )
         summaries = {
             name: float(value.scalar_sum(dtype=torch.float64).item())
             for name, value in views.items()
@@ -953,6 +969,7 @@ class TrainingEngine:
         session_id: str = "session-0000",
         rank: int = 0,
         observers: Sequence[TrainingStepObserver] = (),
+        capture_boundary_trace: bool = False,
     ) -> None:
         self.spec = spec
         self.model = model
@@ -968,6 +985,9 @@ class TrainingEngine:
         self.session_id = session_id
         self.rank = rank
         self.observers = tuple(observers)
+        if type(capture_boundary_trace) is not bool:
+            raise TypeError("TRAINING_CAPTURE_BOUNDARY_TRACE_NOT_BOOLEAN")
+        self.capture_boundary_trace = capture_boundary_trace
         if any(not isinstance(observer, TrainingStepObserver) for observer in self.observers):
             raise TypeError("TRAINING_STEP_OBSERVER_PROTOCOL_INVALID")
         self.registry = ParameterRegistry.from_model(model.module, optimizer)
@@ -980,6 +1000,29 @@ class TrainingEngine:
         self._records: list[TrainingStepRecord] = []
         self._checkpoint_ids: list[str] = []
         self._importance_points: list[ImportanceTrajectoryPoint] = []
+        self._boundary_trace: list[dict[str, object]] = []
+
+    @property
+    def boundary_trace(self) -> tuple[Mapping[str, object], ...]:
+        """Immutable projection of fixed lifecycle boundaries observed by the engine."""
+
+        return tuple(dict(item) for item in self._boundary_trace)
+
+    def _record_boundary(
+        self, boundary: str, *, attempt_index: int,
+        observation: Mapping[str, object] | Callable[[], Mapping[str, object]] | None = None,
+    ) -> None:
+        if not self.capture_boundary_trace:
+            return
+        payload: dict[str, object] = {
+            "sequence": len(self._boundary_trace) + 1,
+            "boundary": boundary,
+            "attempt_index": attempt_index,
+            "global_step": self.state.global_step,
+        }
+        if observation is not None:
+            payload["observation"] = dict(observation() if callable(observation) else observation)
+        self._boundary_trace.append(payload)
 
     def register_observer(self, observer: TrainingStepObserver) -> None:
         """在训练开始前注册只读事务 observer。
@@ -1111,13 +1154,25 @@ class TrainingEngine:
             raise ValueError("TRAINING_SCALER_SCALE_INVALID")
         return value
 
-    def _scale_loss(self, loss: torch.Tensor) -> torch.Tensor:
+    def _scale_loss(self, loss: torch.Tensor, *, frozen_loss_scale: float) -> torch.Tensor:
+        """Scale with the one scale frozen for this complete training attempt.
+
+        ``GradScaler`` only changes its scale in ``update``.  Checking it both
+        before and after every microbatch makes that lifecycle an executable
+        contract rather than an assumption hidden in the implementation.
+        """
+
         if self.scaler is None:
             return loss
+        if self._loss_scale() != frozen_loss_scale:
+            raise RuntimeError("TRAINING_LOSS_SCALE_CHANGED_WITHIN_ATTEMPT")
         scale = getattr(self.scaler, "scale", None)
         if not callable(scale):
             raise TypeError("TRAINING_SCALER_MISSING_SCALE")
-        return scale(loss)
+        result = scale(loss)
+        if self._loss_scale() != frozen_loss_scale:
+            raise RuntimeError("TRAINING_LOSS_SCALE_CHANGED_WITHIN_ATTEMPT")
+        return result
 
     def _learning_rates(self) -> dict[str, float]:
         values: dict[str, float] = {}
@@ -1129,7 +1184,10 @@ class TrainingEngine:
         return values
 
     def _collect_micro_gradients(
-        self, microbatches: Sequence[TrainingMicrobatch]
+        self,
+        microbatches: Sequence[TrainingMicrobatch],
+        *,
+        loss_scale: float,
     ) -> tuple[list[dict[str, torch.Tensor]], list[float], float, int]:
         """取得 scaled micro gradients；不写 ``Parameter.grad``。"""
 
@@ -1149,7 +1207,7 @@ class TrainingEngine:
             with sync_context:
                 with self._autocast():
                     loss = self.model.loss(microbatch)
-                scaled_loss = self._scale_loss(loss.mean_loss)
+                scaled_loss = self._scale_loss(loss.mean_loss, frozen_loss_scale=loss_scale)
                 values = torch.autograd.grad(
                     scaled_loss,
                     parameters,
@@ -1204,15 +1262,91 @@ class TrainingEngine:
             global_weight,
         )
 
-    def _install_for_unscale(self, mean: Mapping[str, torch.Tensor], loss_scale: float) -> None:
+    def _sufficient_statistics_finite_preflight(
+        self,
+        micro_samples: Sequence[TensorMap],
+        weights: Sequence[float],
+    ) -> str | None:
+        """Fail closed before boundary 08 when FP32/FP64 G1 or G2 overflows.
+
+        The optimizer mean can be finite after cancellation while the same
+        attempt's importance sufficient statistics are not (for example,
+        ``+2e20`` and ``-2e20`` in FP32 have a zero mean but an infinite
+        squared sum).  This deliberately does not depend on ``self.tracker``:
+        statistics-on and statistics-off runs must make the identical
+        optimizer/scaler decision.  Every rank constructs its local snapshot,
+        then the existing integer reducer forms one common decision.  S1.8 can
+        retain this collective decision point while replacing the local reducer
+        with its distributed implementation.
+
+        No tracker, parameter, optimizer, scaler, or RNG state is mutated.
+        ``WeightedSufficientStatistics`` is the single owner of the frozen
+        accumulation-dtype G1/G2 arithmetic, so this preflight cannot drift
+        from the later estimator path.
+        """
+
+        local_nonfinite = False
+        try:
+            WeightedSufficientStatistics.from_samples(
+                micro_samples,
+                weights,
+                accumulation_dtype=_dtype_from_name(self.spec.accumulation_dtype),
+                statistical_unit="microbatch_mean_gradient",
+                weight_unit="effective_loss_units",
+                sampling_design="ordered_disjoint_microbatches",
+                weights_exogenous=self.spec.weights_exogenous,
+                common_mean_assumption=self.spec.common_mean_assumption,
+                metadata={"world_size": self.reducer.capabilities.world_size},  # type: ignore[attr-defined]
+            )
+        except NumericalError:
+            local_nonfinite = True
+        global_nonfinite_ranks = self.reducer.sum_int(int(local_nonfinite))
+        if global_nonfinite_ranks < 0:
+            raise RuntimeError("TRAINING_SUFFICIENT_STATISTICS_PREFLIGHT_REDUCER_INVALID")
+        return (
+            "NONFINITE_SUFFICIENT_STATISTICS"
+            if global_nonfinite_ranks > 0
+            else None
+        )
+
+    def _signal_scaler_preflight_skip(self) -> None:
+        """Feed a preflight failure into the already-frozen scaler transition.
+
+        ``GradScaler`` records found-inf during its one allowed ``unscale_``
+        call.  A G1/G2-only overflow is otherwise invisible to optimizer
+        gradients after cancellation, so immediately before that unscale we
+        mark one transient installed gradient nonfinite.  This is after the
+        boundary-06 observation of the real scaled mean and before any score
+        staging or optimizer mutation.  The scaler therefore performs its
+        standard no-step/backoff update, and the ordinary skip transaction
+        clears the transient value before another attempt may begin.
+        """
+
+        if self.scaler is None:
+            return
+        for parameter in self.named_parameters.values():
+            if parameter.grad is not None:
+                parameter.grad.detach().fill_(float("inf"))
+                return
+        raise RuntimeError("TRAINING_SUFFICIENT_STATISTICS_PREFLIGHT_GRADIENT_MISSING")
+
+    def _install_scaled_optimizer_gradient(self, mean: Mapping[str, torch.Tensor], loss_scale: float) -> None:
         for name, parameter in self.named_parameters.items():
             value = mean[name].to(device=parameter.device, dtype=parameter.dtype) * loss_scale
             parameter.grad = value.detach().clone()
+
+    def _formal_unscale(self) -> None:
         if self.scaler is not None:
             unscale = getattr(self.scaler, "unscale_", None)
             if not callable(unscale):
                 raise TypeError("TRAINING_SCALER_MISSING_UNSCALE")
             unscale(self.optimizer)
+
+    def _install_for_unscale(self, mean: Mapping[str, torch.Tensor], loss_scale: float) -> None:
+        """Compatibility helper; lifecycle code uses the two observable halves."""
+
+        self._install_scaled_optimizer_gradient(mean, loss_scale)
+        self._formal_unscale()
 
     def _update_scaler(self) -> None:
         if self.scaler is not None:
@@ -1220,6 +1354,16 @@ class TrainingEngine:
             if not callable(update):
                 raise TypeError("TRAINING_SCALER_MISSING_UPDATE")
             update()
+
+    def _scaler_step_or_optimizer_step(self) -> StepOutcome:
+        """Run exactly one formal optimizer invocation for an execute attempt."""
+
+        if self.scaler is None:
+            return self.bridge.step()
+        step = getattr(self.scaler, "step", None)
+        if not callable(step):
+            raise TypeError("TRAINING_SCALER_MISSING_STEP")
+        return self.bridge.step(stepper=step)
 
     def _parameter_state(self) -> dict[str, torch.Tensor]:
         return {name: parameter.detach().clone() for name, parameter in self.named_parameters.items()}
@@ -1435,23 +1579,65 @@ class TrainingEngine:
 
     def _run_attempt(self, microbatches: Sequence[TrainingMicrobatch]) -> TrainingStepRecord:
         self.model.module.train(True)
-        self.optimizer.zero_grad(set_to_none=True)
         next_attempt = self.state.attempt_index + 1
+        self._record_boundary("01_parameters_optimizer_lr_pre", attempt_index=next_attempt, observation=lambda: {
+            "parameters_hash": _state_tree_hash(self._parameter_state()),
+            "optimizer_hash": _state_tree_hash(self.optimizer.state_dict()),
+            "learning_rates": self._learning_rates(),
+        })
+        self.optimizer.zero_grad(set_to_none=True)
+        self._record_boundary("02_clear_transient_gradients", attempt_index=next_attempt, observation=lambda: {
+            "all_gradients_none": all(parameter.grad is None for parameter in self.named_parameters.values()),
+        })
         parameters_pre = TensorMap(
             {name: parameter.detach().clone() for name, parameter in self.named_parameters.items()},
             registry=self.registry,
         )
-        scaled_micros, weights, local_loss_numerator, _ = self._collect_micro_gradients(microbatches)
         loss_scale = self._loss_scale()
+        self._record_boundary("03_freeze_loss_scale", attempt_index=next_attempt, observation=lambda: {
+            "loss_scale": loss_scale,
+            "rng_before_sha256": hashlib.sha256(torch.random.get_rng_state().numpy().tobytes()).hexdigest(),
+        })
+        scaled_micros, weights, local_loss_numerator, _ = self._collect_micro_gradients(
+            microbatches,
+            loss_scale=loss_scale,
+        )
         mean_gradient, micro_samples, global_count = self._global_mean_gradient(
             scaled_micros, weights, loss_scale=loss_scale
         )
-        self._install_for_unscale(mean_gradient, loss_scale)
+        sufficient_statistics_skip_reason = self._sufficient_statistics_finite_preflight(
+            micro_samples, weights
+        )
+        # `_global_mean_gradient` produces the detached, manually unscaled
+        # microbatch sufficient-statistic copies before this observable point.
+        self._record_boundary("04_local_unscaled_statistics", attempt_index=next_attempt, observation=lambda: {
+            "microbatch_count": len(micro_samples), "effective_weight": global_count,
+            "samples_hash": _state_tree_hash([sample.to_dict(clone=False) for sample in micro_samples]),
+        })
+        self._record_boundary("05_global_mean_gradient_loss", attempt_index=next_attempt, observation=lambda: {
+            "mean_gradient_hash": _state_tree_hash(mean_gradient), "effective_weight": global_count,
+        })
+        self._install_scaled_optimizer_gradient(mean_gradient, loss_scale)
+        self._record_boundary("06_install_scaled_optimizer_gradient", attempt_index=next_attempt, observation=lambda: {
+            "optimizer_gradient_hash": _state_tree_hash({name: parameter.grad for name, parameter in self.named_parameters.items()}),
+        })
+        if sufficient_statistics_skip_reason is not None:
+            self._signal_scaler_preflight_skip()
+        self._formal_unscale()
+        self._record_boundary("07_formal_unscale", attempt_index=next_attempt, observation=lambda: {
+            "optimizer_gradient_hash": _state_tree_hash({name: parameter.grad for name, parameter in self.named_parameters.items()}),
+        })
         attempt = GradientAttempt.capture(
             {name: parameter.grad for name, parameter in self.named_parameters.items()},
             gradient_scale=loss_scale,
             scaled=False,
         ).check_finite()
+        if sufficient_statistics_skip_reason is not None:
+            attempt = replace(
+                attempt,
+                phase=GradientPhase.SKIPPED,
+                skip_reason=sufficient_statistics_skip_reason,
+            )
         reference_parameter = next(iter(self.named_parameters.values()))
         reduced_loss = self.reducer.sum_tensors(
             {
@@ -1465,18 +1651,47 @@ class TrainingEngine:
         mean_loss_value = float(reduced_loss.detach().cpu().item()) / global_count
         mean_loss = mean_loss_value if math.isfinite(mean_loss_value) else None
         transaction = StepTransaction(self.state.global_step, next_attempt)
+        self._record_boundary("08_global_finite_decision", attempt_index=next_attempt, observation=lambda: {
+            "phase": attempt.phase.value, "skip_reason": attempt.skip_reason,
+            "sufficient_statistics_finite": sufficient_statistics_skip_reason is None,
+        })
         if attempt.phase is GradientPhase.SKIPPED:
             transaction = transaction.skip(attempt.skip_reason or "NONFINITE")
-            self._notify(
-                "on_skip",
-                SkippedAttemptEvent(
-                    transaction,
-                    tuple(batch.batch_id for batch in microbatches),
-                ),
-            )
+            # AMP requires the one formal scaler.step invocation even though
+            # its recorded found-inf state makes it a no-op.  FP32 has no
+            # scaler state machine and explicitly performs no optimizer step.
+            parameters_before_skip = _state_tree_hash(self._parameter_state())
+            optimizer_before_skip = _state_tree_hash(self.optimizer.state_dict())
+            accumulator_before_skip: dict[str, object] | None = None
+            if self.tracker is not None:
+                accumulator_before_skip = self.tracker.accumulator.state_dict()
+            if self.scaler is not None:
+                scaler_step = getattr(self.scaler, "step", None)
+                if not callable(scaler_step):
+                    raise TypeError("TRAINING_SCALER_MISSING_STEP")
+                scaler_step(self.optimizer)
+                if _state_tree_hash(self._parameter_state()) != parameters_before_skip:
+                    raise RuntimeError("TRAINING_SKIP_MUTATED_PARAMETERS")
+                if _state_tree_hash(self.optimizer.state_dict()) != optimizer_before_skip:
+                    raise RuntimeError("TRAINING_SKIP_MUTATED_OPTIMIZER_STATE")
+            self._update_scaler()
+            # The skip counter is itself a durable state transition.  It is
+            # deliberately committed only after the no-mutation checks and the
+            # one scaler update have both succeeded.
             if self.tracker is not None:
                 self.tracker.record_skip()
-            self._update_scaler()
+            accumulator_long_term_unchanged = True
+            if accumulator_before_skip is not None:
+                after = self.tracker.accumulator.state_dict() if self.tracker is not None else {}
+                for key, value in accumulator_before_skip.items():
+                    if key not in {"skipped_steps"} and _state_tree_hash(value) != _state_tree_hash(after.get(key)):
+                        accumulator_long_term_unchanged = False
+            self._record_boundary("09_skip_discard_and_scaler", attempt_index=next_attempt, observation=lambda: {
+                "parameters_unchanged": _state_tree_hash(self._parameter_state()) == parameters_before_skip,
+                "optimizer_unchanged": _state_tree_hash(self.optimizer.state_dict()) == optimizer_before_skip,
+                "accumulator_long_term_unchanged": accumulator_long_term_unchanged,
+                "scaler_present": self.scaler is not None,
+            })
             self.optimizer.zero_grad(set_to_none=True)
             self.state = TrainingState(
                 self.state.global_step,
@@ -1484,6 +1699,19 @@ class TrainingEngine:
                 self.state.skipped_steps + 1,
                 self.state.event_sequence,
                 self.state.last_checkpoint_id,
+            )
+            self._record_boundary("17_skip_control_counter", attempt_index=next_attempt, observation=lambda: {
+                "skipped_steps_after": self.state.skipped_steps, "successful_step_after": self.state.global_step,
+                "cursor_hash": _state_tree_hash(self.cursor.state_dict()),
+            })
+            self._notify(
+                "on_skip",
+                SkippedAttemptEvent(
+                    transaction,
+                    tuple(batch.batch_id for batch in microbatches),
+                    tuple(sample_id for batch in microbatches for sample_id in batch.sample_ids),
+                    dict(self.cursor.state_dict()),
+                ),
             )
             return TrainingStepRecord(
                 next_attempt,
@@ -1510,11 +1738,11 @@ class TrainingEngine:
                 parameters_pre,
                 TensorMap(mean_gradient, registry=self.registry),
                 TensorMap(attempt.gradients, registry=self.registry),
+                loss_scale,
                 tuple(batch.batch_id for batch in microbatches),
                 tuple(sample_id for batch in microbatches for sample_id in batch.sample_ids),
             ),
         )
-        attempt.install(self.named_parameters)
         main: EstimatorResult | None = None
         raw_unclipped: EstimatorResult | None = None
         raw_clipped: EstimatorResult | None = None
@@ -1529,7 +1757,34 @@ class TrainingEngine:
                 reducer=self.reducer,
                 rank=self.rank,
             )
-        outcome = self.bridge.step()
+        self._record_boundary("10_stage_preclip_scores", attempt_index=next_attempt, observation=lambda: {
+            "estimator": None if main is None else main.estimator_name,
+            "staged_scores_hash": None if main is None else _state_tree_hash(main.score.to_dict(clone=False)),
+            "raw_unclipped_hash": None if raw_unclipped is None else _state_tree_hash(raw_unclipped.score.to_dict(clone=False)),
+        })
+        attempt.install(self.named_parameters)
+        self._record_boundary("11_install_clipped_gradient", attempt_index=next_attempt, observation=lambda: {
+            "optimizer_gradient_hash": _state_tree_hash({name: parameter.grad for name, parameter in self.named_parameters.items()}),
+            "clip_factor": clip_factor,
+        })
+        outcome = self._scaler_step_or_optimizer_step()
+        self._record_boundary("12_single_optimizer_or_scaler_step", attempt_index=next_attempt, observation=lambda: {
+            "parameters_post_hash": _state_tree_hash(self._parameter_state()),
+            "optimizer_post_hash": _state_tree_hash(self.optimizer.state_dict()),
+        })
+        # ``optimizer_step_called`` is an audit declaration only; it is not
+        # accepted as proof that a scaler executed an update.  The durable
+        # evidence is the post-parameter boundary, optimizer/scaler state and
+        # transaction below.  A malformed bridge still cannot omit a tracked
+        # coordinate from that boundary.
+        if set(outcome.total_delta) != set(self.named_parameters) or set(outcome.data_delta) != set(self.named_parameters):
+            raise RuntimeError("TRAINING_EXECUTE_OUTCOME_COORDINATES_INVALID")
+        # Scores are staged, not durable, until the joint long-term commit at
+        # boundary 16.  This prevents an exception from exposing half a step.
+        self._record_boundary("13_freeze_score_mass_payload", attempt_index=next_attempt, observation=lambda: {
+            "score_payload_hash": None if main is None else _state_tree_hash(main.score.to_dict(clone=False)),
+            "actual_update_input_hash": _state_tree_hash({"data_delta": outcome.data_delta, "mean_gradient": mean_gradient}),
+        })
         parameter_post_hash = _state_tree_hash(self._parameter_state())
         transaction = transaction.mark_parameter_post(parameter_post_hash)
         self._notify(
@@ -1540,12 +1795,32 @@ class TrainingEngine:
                 outcome,
             ),
         )
+        self._record_boundary("14_parameter_post", attempt_index=next_attempt, observation=lambda: {
+            "parameter_post_hash": parameter_post_hash,
+        })
+        self._record_boundary("15_decompose_data_decay_delta", attempt_index=next_attempt, observation=lambda: {
+            "total_delta_hash": _state_tree_hash(outcome.total_delta),
+            "data_delta_hash": _state_tree_hash(outcome.data_delta),
+            "weight_decay_delta_hash": _state_tree_hash(outcome.weight_decay_delta),
+        })
+        # The scaler's one update belongs to the just-completed optimizer
+        # attempt.  Long-lived importance still remains uncommitted until both
+        # parameter update and scaler transition are successful.
+        self._update_scaler()
         if self.tracker is not None:
             assert main is not None and raw_unclipped is not None and raw_clipped is not None
-            self.tracker.commit(main, raw_unclipped, raw_clipped, outcome)
+            self.tracker.commit(
+                main,
+                raw_unclipped,
+                raw_clipped,
+                outcome,
+                mean_gradient=TensorMap(mean_gradient, registry=self.registry),
+            )
+        self._record_boundary("16_commit_all_long_term_views", attempt_index=next_attempt, observation=lambda: {
+            "accumulator_hash": None if self.tracker is None else _state_tree_hash(self.tracker.accumulator.state_dict()),
+        })
         if self.scheduler is not None:
             self.scheduler.step()  # type: ignore[attr-defined]
-        self._update_scaler()
         self.optimizer.zero_grad(set_to_none=True)
         self.state = TrainingState(
             self.state.global_step + 1,
@@ -1554,6 +1829,10 @@ class TrainingEngine:
             self.state.event_sequence,
             self.state.last_checkpoint_id,
         )
+        self._record_boundary("17_scheduler_success_counter", attempt_index=next_attempt, observation=lambda: {
+            "scheduler_hash": None if self.scheduler is None else _state_tree_hash(self.scheduler.state_dict()),
+            "successful_step_after": self.state.global_step,
+        })
         commit_hash = _state_tree_hash(self._control_state())
         if commit_hash == parameter_post_hash:
             commit_hash = _sha256((commit_hash + ":attempt_commit").encode("ascii"))
@@ -1633,6 +1912,11 @@ class TrainingEngine:
                     }
                 )
                 self._emit(EventType.OPTIMIZER_STEP, event_payload)
+            self._record_boundary("18_publish_step_log_state", attempt_index=record.attempt_index, observation=lambda: {
+                "record_count": len(self._records), "record_status": record.status,
+                "successful_step_after": self.state.global_step, "skipped_steps_after": self.state.skipped_steps,
+                "event_sequence": self.state.event_sequence,
+            })
         if self.state.global_step == self.spec.max_steps:
             status = "COMPLETE"
         elif self.state.global_step == target_step and until_step is not None:

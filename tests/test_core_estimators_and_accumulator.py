@@ -311,5 +311,6 @@ def test_accumulator_migrates_03x_v1_state_without_inventing_new_views() -> None
     torch.testing.assert_close(
         restored.weight_decay_movement["p"], torch.zeros(2, dtype=torch.float64)
     )
-    assert restored.state_dict()["version"] == 2
+    assert restored.state_dict()["version"] == 3
+    assert restored.actual_update_raw_importance_available is False
     assert restored.state_dict()["has_initial_parameters"] is False

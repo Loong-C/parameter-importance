@@ -1,0 +1,36 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://parameter-importance.invalid/schemas/stage1/s1-6-formalization-index-v1.json",
+  "title": "S1.6 formalization index",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "status", "gate_id", "task_id", "fixture_id", "generator_git_commit", "consumer_git_commit", "git_branch", "checked_at", "s1_5_index_ref", "s1_5_index_sha256", "s1_5_gate_artifact_hash", "s1_5_replay_sha256", "s1_5_handoff", "role_refs", "role_sha256", "gate_artifact_hash", "csv_sha256", "svg_sha256", "validation_ref", "validation_sha256", "replay_ref", "replay_sha256", "replay_hash", "next_task_id", "artifact_hash"],
+  "properties": {
+    "schema_version": {"const": "stage1-s1-6-formalization-index-v1"},
+    "status": {"const": "PASS"},
+    "gate_id": {"const": "G1-STEP"},
+    "task_id": {"const": "stage1.06_training_integration_and_accumulators"},
+    "fixture_id": {"const": "stage1-s16-training-fixture-v1"},
+    "generator_git_commit": {"$ref": "#/$defs/commit"}, "consumer_git_commit": {"$ref": "#/$defs/commit"},
+    "git_branch": {"type": "string", "minLength": 1}, "checked_at": {"type": "string", "format": "date-time"},
+    "s1_5_index_ref": {"const": "evidence/stage1/s1-5-formal/36a792b6a89045ae49c32225038a6c10d5082d2c/formal-20260815-s15-schema-r2/index.json"},
+    "s1_5_index_sha256": {"const": "890970c5886821377ca0409ca910184da99063432d3ef35fd3e3713a5e5514c5"},
+    "s1_5_gate_artifact_hash": {"const": "4bee73ef5053d78f77d688f94fd1737cc744cbcf2bb4774f8916fc70e466887a"},
+    "s1_5_replay_sha256": {"$ref": "#/$defs/digest"}, "s1_5_handoff": {"$ref": "#/$defs/handoff"},
+    "role_refs": {"$ref": "#/$defs/roleRefs"}, "role_sha256": {"$ref": "#/$defs/roleHashes"}, "gate_artifact_hash": {"$ref": "#/$defs/digest"},
+    "csv_sha256": {"$ref": "#/$defs/csv"}, "svg_sha256": {"$ref": "#/$defs/svg"},
+    "validation_ref": {"const": "validation.json"}, "validation_sha256": {"$ref": "#/$defs/digest"},
+    "replay_ref": {"const": "replay-validation.json"}, "replay_sha256": {"$ref": "#/$defs/digest"}, "replay_hash": {"$ref": "#/$defs/digest"},
+    "next_task_id": {"const": "stage1.07_single_gpu_pythia14m"}, "artifact_hash": {"$ref": "#/$defs/digest"}
+  },
+  "$defs": {
+    "digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"}, "commit": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+    "roleRefs": {"type": "object", "additionalProperties": false, "required": ["step_report", "oracle_bundle", "trace_bundle", "comparison_table", "gate_record"], "properties": {"step_report": {"const": "step-report.json"}, "oracle_bundle": {"const": "oracle-bundle.json"}, "trace_bundle": {"const": "trace-bundle.json"}, "comparison_table": {"const": "comparison-table.json"}, "gate_record": {"const": "g1-step-record.json"}}},
+    "roleHashes": {"type": "object", "additionalProperties": false, "required": ["step_report", "oracle_bundle", "trace_bundle", "comparison_table", "gate_record"], "properties": {"step_report": {"$ref": "#/$defs/digest"}, "oracle_bundle": {"$ref": "#/$defs/digest"}, "trace_bundle": {"$ref": "#/$defs/digest"}, "comparison_table": {"$ref": "#/$defs/digest"}, "gate_record": {"$ref": "#/$defs/digest"}}},
+    "s15RoleHashes": {"type": "object", "additionalProperties": false, "required": ["estimator_report", "oracle_report", "tensor_bundle", "comparison_table", "gate_record"], "properties": {"estimator_report": {"$ref": "#/$defs/digest"}, "oracle_report": {"$ref": "#/$defs/digest"}, "tensor_bundle": {"$ref": "#/$defs/digest"}, "comparison_table": {"$ref": "#/$defs/digest"}, "gate_record": {"$ref": "#/$defs/digest"}}},
+    "s15RoleRefs": {"type": "object", "additionalProperties": false, "required": ["estimator_report", "oracle_report", "tensor_bundle", "comparison_table", "gate_record"], "properties": {"estimator_report": {"type": "string", "minLength": 1}, "oracle_report": {"type": "string", "minLength": 1}, "tensor_bundle": {"type": "string", "minLength": 1}, "comparison_table": {"type": "string", "minLength": 1}, "gate_record": {"type": "string", "minLength": 1}}},
+    "handoff": {"type": "object", "additionalProperties": false, "required": ["s1_5_index_ref", "s1_5_index_sha256", "s1_5_index_artifact_hash", "s1_5_generator_commit", "s1_5_consumer_commit", "s1_5_gate_artifact_hash", "s1_5_role_refs", "s1_5_role_sha256", "s1_5_report_hash", "s1_5_oracle_hash", "s1_5_bundle_hash", "s1_5_table_hash", "s1_5_replay_ref", "s1_5_replay_sha256", "s1_5_replay_hash", "s1_5_validation_ref", "s1_5_validation_sha256", "s1_5_validation_artifact_hash", "s1_5_numeric_replay_role_count", "s1_5_producer_diff_paths"], "properties": {"s1_5_index_ref": {"const": "evidence/stage1/s1-5-formal/36a792b6a89045ae49c32225038a6c10d5082d2c/formal-20260815-s15-schema-r2/index.json"}, "s1_5_index_sha256": {"const": "890970c5886821377ca0409ca910184da99063432d3ef35fd3e3713a5e5514c5"}, "s1_5_index_artifact_hash": {"const": "69a8281fe0186d0574e9b0faebecfb4dedba44ab960367010c622007ad96deb1"}, "s1_5_generator_commit": {"const": "36a792b6a89045ae49c32225038a6c10d5082d2c"}, "s1_5_consumer_commit": {"const": "36a792b6a89045ae49c32225038a6c10d5082d2c"}, "s1_5_gate_artifact_hash": {"const": "4bee73ef5053d78f77d688f94fd1737cc744cbcf2bb4774f8916fc70e466887a"}, "s1_5_role_refs": {"$ref": "#/$defs/s15RoleRefs"}, "s1_5_role_sha256": {"$ref": "#/$defs/s15RoleHashes"}, "s1_5_report_hash": {"const": "7635dd8c3b69ca80f1ac7d0d5a9956602ad31160a26f7eda0101c34a0373bd87"}, "s1_5_oracle_hash": {"const": "41f1b2e654cdafbb29de45aecd8db3fd11dee3d8f6c260acb574f7803c639b4b"}, "s1_5_bundle_hash": {"const": "55c8b576e9bc71078fbbd214838e493505a2c362ad3eaeacc4720a824d9860f0"}, "s1_5_table_hash": {"const": "8fbade2df149deb7f61eeb64ea3aa76f2b3b6dcceee199e906ed359999b6ee65"}, "s1_5_replay_ref": {"type": "string", "minLength": 1}, "s1_5_replay_sha256": {"$ref": "#/$defs/digest"}, "s1_5_replay_hash": {"const": "b8160d409a1f65d30b33f89f60a08c7792916d43b7962ee7efd7a6ab963bc7dc"}, "s1_5_validation_ref": {"type": "string", "minLength": 1}, "s1_5_validation_sha256": {"$ref": "#/$defs/digest"}, "s1_5_validation_artifact_hash": {"const": "a81d1b286c818a30d9eeab9113ef491dcd7902f91544663ad66fa8a787c56d91"}, "s1_5_numeric_replay_role_count": {"const": 5}, "s1_5_producer_diff_paths": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"type": "string", "minLength": 1}}}},
+    "csv": {"type": "object", "additionalProperties": false, "required": ["accumulator-identities.csv", "movement-stack.csv", "trajectory-parity.csv", "score-masses.csv"], "properties": {"accumulator-identities.csv": {"$ref": "#/$defs/digest"}, "movement-stack.csv": {"$ref": "#/$defs/digest"}, "trajectory-parity.csv": {"$ref": "#/$defs/digest"}, "score-masses.csv": {"$ref": "#/$defs/digest"}}},
+    "svg": {"type": "object", "additionalProperties": false, "required": ["accumulator-identities.svg", "movement-stack.svg", "trajectory-parity.svg", "score-masses.svg"], "properties": {"accumulator-identities.svg": {"$ref": "#/$defs/digest"}, "movement-stack.svg": {"$ref": "#/$defs/digest"}, "trajectory-parity.svg": {"$ref": "#/$defs/digest"}, "score-masses.svg": {"$ref": "#/$defs/digest"}}}
+  }
+}

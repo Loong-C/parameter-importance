@@ -5,6 +5,7 @@ from __future__ import annotations
 from copy import deepcopy
 from pathlib import Path
 
+import pytest
 import torch
 
 from param_importance_nlp.analysis import (
@@ -17,7 +18,7 @@ from param_importance_nlp.cli import _load_mapping
 from param_importance_nlp.contracts import ResolvedConfig, load_canonical_json, write_canonical_json
 from param_importance_nlp.contracts.config_v2 import ResolvedConfigV2
 from param_importance_nlp.contracts.jsonio import canonical_json_hash
-from param_importance_nlp.core import TensorMap, produce_baseline_scores
+from param_importance_nlp.core import CoreContractError, TensorMap, produce_baseline_scores
 from param_importance_nlp.experiments import build_default_task_runtime
 from param_importance_nlp.experiments.ablation import AblationFactor, AblationMatrix
 from param_importance_nlp.experiments.stage789_task_runners import (
@@ -101,6 +102,12 @@ def test_baseline_producer_exposes_real_methods_and_fail_closed_availability() -
     )
     assert "double" in produced_double.scores
     assert produced_double.unavailable["u"] == "training_estimator_not_u"
+
+    for version in (1, 2, 3):
+        compatible = dict(state, version=version)
+        assert "movement" in produce_baseline_scores(parameters, compatible, estimator_name="u").scores
+    with pytest.raises(CoreContractError):
+        produce_baseline_scores(parameters, dict(state, version=99), estimator_name="u")
 
 
 def test_default_runtime_builds_pruning_resources_from_training_output(tmp_path: Path) -> None:

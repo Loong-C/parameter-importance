@@ -1,0 +1,95 @@
+{
+  "schema_version": "stage1-s1-6-training-fixture-v1",
+  "fixture_id": "stage1-s16-training-fixture-v1",
+  "coordinate_order": ["left", "right"],
+  "parameter_to_group": {"left": "group_0000", "right": "group_0001"},
+  "sgd": {
+    "initial_parameters": {"left": [1.0], "right": [-2.0]},
+    "steps": [
+      {
+        "learning_rates": {"group_0000": 0.1, "group_0001": 0.2},
+        "microbatch_gradients": [
+          {"left": [2.0], "right": [1.0]},
+          {"left": [-1.0], "right": [3.0]}
+        ]
+      },
+      {
+        "learning_rates": {"group_0000": 0.05, "group_0001": 0.1},
+        "microbatch_gradients": [
+          {"left": [1.0], "right": [-2.0]},
+          {"left": [3.0], "right": [0.0]}
+        ]
+      }
+    ]
+  },
+  "adamw_cases": [
+    {
+      "case_id": "zero_weight_decay",
+      "initial_parameter": 1.0,
+      "learning_rate": 0.1,
+      "weight_decay": 0.0,
+      "betas": [0.9, 0.999],
+      "epsilon": 1e-8,
+      "gradients": [0.5, 1.0]
+    },
+    {
+      "case_id": "decoupled_weight_decay",
+      "initial_parameter": 1.0,
+      "learning_rate": 0.1,
+      "weight_decay": 0.1,
+      "betas": [0.9, 0.999],
+      "epsilon": 1e-8,
+      "gradients": [0.5, 1.0]
+    }
+  ],
+  "tiny_transformer": {
+    "profile": "T32_SINGLE",
+    "architecture": {"vocab_size": 17, "hidden_size": 8, "num_heads": 2, "max_length": 6, "mlp_multiplier": 2, "dropout": 0.0},
+    "initialization": {"rule": "arithmetic-v1", "scale": 0.0005, "offset_modulus": 23, "bias": -0.004},
+    "optimizer": {"name": "AdamW", "learning_rate": 0.05, "weight_decay": 0.01, "betas": [0.9, 0.999], "epsilon": 1e-8, "foreach": false},
+    "scheduler": {"name": "StepLR", "step_size": 1, "gamma": 0.8},
+    "cursor_seed": 1,
+    "rng_seed": 6106,
+    "microbatches": [
+      [
+        {"batch_id": "s16-transformer-step-0-micro-0", "input_ids": [3,4,5,6,7,8,9,10,11,12,13,14], "labels": [3,4,5,6,7,8,9,10,11,12,13,14], "sample_ids": ["s16-transformer-0-0-0", "s16-transformer-0-0-1"]},
+        {"batch_id": "s16-transformer-step-0-micro-1", "input_ids": [16,0,1,2,3,4,5,6,7,8,9,10], "labels": [16,0,1,2,3,4,5,6,7,8,9,10], "sample_ids": ["s16-transformer-0-1-0", "s16-transformer-0-1-1"]}
+      ],
+      [
+        {"batch_id": "s16-transformer-step-1-micro-0", "input_ids": [10,11,12,13,14,15,16,0,1,2,3,4], "labels": [10,11,12,13,14,15,16,0,1,2,3,4], "sample_ids": ["s16-transformer-1-0-0", "s16-transformer-1-0-1"]},
+        {"batch_id": "s16-transformer-step-1-micro-1", "input_ids": [6,7,8,9,10,11,12,13,14,15,16,0], "labels": [6,7,8,9,10,11,12,13,14,15,16,0], "sample_ids": ["s16-transformer-1-1-0", "s16-transformer-1-1-1"]}
+      ]
+    ]
+  },
+  "scaler": {
+    "device": "cpu",
+    "enabled": true,
+    "init_scale": 8.0,
+    "growth_factor": 2.0,
+    "backoff_factor": 0.5,
+    "growth_interval": 1,
+    "single_process_found_inf": "local_is_global",
+    "tiny_scale_before": [8.0, 16.0],
+    "tiny_scale_after": [16.0, 32.0],
+    "skip_scale_before": [8.0, 16.0, 8.0],
+    "skip_scale_after": [16.0, 8.0, 16.0]
+  },
+  "skip": {
+    "nonfinite_step_index": 1,
+    "consumes_batch": true,
+    "long_term_fields_unchanged": [
+      "signed", "positive", "negative_mass", "absolute", "raw", "raw_clipped",
+      "data_movement", "net_data_movement", "total_movement", "total_endpoint_movement",
+      "weight_decay_movement", "net_weight_decay_movement", "actual_update_raw_importance",
+      "magnitude", "initial_parameters", "last_parameters"
+    ]
+  },
+  "clip": {
+    "max_grad_norm": 0.5,
+    "mean_gradient": {"left": [3.0], "right": [4.0]},
+    "global_norm": 5.0,
+    "clip_epsilon": 1e-12,
+    "clip_factor": 0.09999999999998
+  },
+  "fixture_hash": "5bc3e3f87672a8311c98219fe666b146d3c9b9ffd13430d572b7691b679cca2e"
+}
