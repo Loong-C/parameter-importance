@@ -12,7 +12,8 @@
 - 调试样本全部位于已验证 Pile 前缀范围内。
 - Stage 1 缓存与临时目录已解析到 `$DATA_ROOT/cache` 和 `$DATA_ROOT/tmp/stage1/<run_id>/`；启动前重新检查外部占用并为选定 GPU UUID 取得带 heartbeat 的本次运行租约。项目租约不代表集群所有权。
 - 资源所有者/管理员已确认本次用卡；若发现未知外部占用，只退出并报告，不终止对方进程。
-- 执行代码、配置和数学契约已经提交并完成三端同一 HEAD 同步；dirty executable diff 不计入正式 Gate。
+- 执行代码、配置和数学契约已经提交；GitHub 包含该 `execution_commit`，服务器检出该提交且工作树干净。
+  本机后续 consumer 提交不影响运行身份；dirty executable diff 不计入正式 Gate。
 
 ## 3. 执行步骤
 

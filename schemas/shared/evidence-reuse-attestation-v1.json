@@ -1,0 +1,68 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://parameter-importance.invalid/schemas/shared/evidence-reuse-attestation-v1.json",
+  "title": "Cross-commit evidence reuse attestation",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version", "status", "scope_id", "producer_git_commit",
+    "consumer_git_commit", "consumer_git_branch", "generated_at",
+    "source_evidence_ref", "source_evidence_sha256", "changed_paths",
+    "reviews", "validation_evidence", "preserved_gate_ids", "rerun_gate_ids", "artifact_hash"
+  ],
+  "properties": {
+    "schema_version": {"const": "evidence-reuse-attestation-v1"},
+    "status": {"const": "PASS"},
+    "scope_id": {"type": "string", "minLength": 1},
+    "producer_git_commit": {"$ref": "#/$defs/commit"},
+    "consumer_git_commit": {"$ref": "#/$defs/commit"},
+    "consumer_git_branch": {"type": "string", "minLength": 1},
+    "generated_at": {"type": "string", "format": "date-time"},
+    "source_evidence_ref": {"$ref": "#/$defs/ref"},
+    "source_evidence_sha256": {"$ref": "#/$defs/hash"},
+    "changed_paths": {
+      "type": "array", "uniqueItems": true,
+      "items": {"$ref": "#/$defs/ref"}
+    },
+    "reviews": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["path", "classification", "affected_gate_ids", "rationale", "validation_refs"],
+        "properties": {
+          "path": {"$ref": "#/$defs/ref"},
+          "classification": {"enum": ["metadata_only", "downstream_only", "consumer_only", "validation_only"]},
+          "affected_gate_ids": {"type": "array", "maxItems": 0},
+          "rationale": {"type": "string", "minLength": 1},
+          "validation_refs": {
+            "type": "array", "uniqueItems": true,
+            "items": {"type": "string", "minLength": 1}
+          }
+        }
+      }
+    },
+    "validation_evidence": {
+      "type": "array", "uniqueItems": true,
+      "items": {
+        "type": "object", "additionalProperties": false,
+        "required": ["ref", "sha256"],
+        "properties": {
+          "ref": {"$ref": "#/$defs/ref"},
+          "sha256": {"$ref": "#/$defs/hash"}
+        }
+      }
+    },
+    "preserved_gate_ids": {
+      "type": "array", "minItems": 1, "uniqueItems": true,
+      "items": {"type": "string", "minLength": 1}
+    },
+    "rerun_gate_ids": {"type": "array", "maxItems": 0},
+    "artifact_hash": {"$ref": "#/$defs/hash"}
+  },
+  "$defs": {
+    "commit": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+    "hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "ref": {"type": "string", "minLength": 1, "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.(?:/|$))(?!.*\\\\).+$"}
+  }
+}

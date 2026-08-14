@@ -190,7 +190,7 @@ def test_g10_real_repository_paths_match_git_index_case_exactly() -> None:
     tracked = {item for item in listed.stdout.split("\0") if item}
     assert set(_CRITICAL_SOURCE_REFS) <= tracked
     checked_links = _validate_stage_links(ROOT)
-    assert len(checked_links) == 8
+    assert len(checked_links) == 10
 
 
 def test_repository_inventory_rejects_runtime_artifacts_and_accepts_clean_fixture(
@@ -353,6 +353,7 @@ def test_g10_config_binds_g9_and_sync_observation() -> None:
         index_sha256="1" * 64,
         gate_artifact_hash="2" * 64,
         g8_index_ref="evidence/g8/index.json",
+        generator_git_commit="a" * 40,
     )
     config = build_stage0_g10_config(
         binding=Stage0SourceBinding(ROOT, "a" * 40, "feat/stage0-completion", True),
@@ -361,8 +362,26 @@ def test_g10_config_binds_g9_and_sync_observation() -> None:
     )
     assert config.task_id == "stage0.12_delivery_and_sync"
     assert config.section("orchestration")["matrix_ref"] == "observations/g10.json"
+    assert config.section("orchestration")["route_spec_ref"] == state.index_ref
+    assert config.section("orchestration")["quadrature_decision_ref"] is None
+    assert set(config.section("orchestration")["input_result_refs"]) == set(
+        state.task_output_refs.values()
+    )
     assert config.section("recovery")["mode"] == "manual_external"
     assert set(config.task_definition.formal_eligibility.required_gate_ids) == {"stage0.G9"}
+
+    reused = build_stage0_g10_config(
+        binding=Stage0SourceBinding(ROOT, "b" * 40, "feat/stage0-completion", True),
+        state=state,
+        sync_observation_ref="observations/g10.json",
+        reuse_attestation_ref="evidence/reuse/g9-to-g10.json",
+    )
+    assert reused.section("orchestration")["quadrature_decision_ref"] == (
+        "evidence/reuse/g9-to-g10.json"
+    )
+    assert "evidence/reuse/g9-to-g10.json" in reused.section("orchestration")[
+        "input_result_refs"
+    ]
 
 
 def test_g10_formal_task_publishes_revalidatable_ready_bundle(
@@ -483,7 +502,14 @@ def test_g10_formal_task_publishes_revalidatable_ready_bundle(
         index_sha256="2" * 64,
         gate_artifact_hash="3" * 64,
         g8_index_ref="evidence/g8/index.json",
+        generator_git_commit=commit,
     )
+    g9_index = {
+        "schema_version": "stage0-g9-formalization-index-v1",
+        "generator_git_commit": commit,
+    }
+    g9_index["artifact_hash"] = canonical_json_hash(g9_index)
+    write_canonical_json(tmp_path / state.index_ref, g9_index)
     config = build_stage0_g10_config(
         binding=Stage0SourceBinding(ROOT, commit, branch, True),
         state=state,

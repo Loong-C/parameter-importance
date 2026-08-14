@@ -135,6 +135,18 @@ def test_g9_matrix_and_schemas_are_hash_bound_and_valid() -> None:
     ]
     assert all(item["hard"] for item in matrix["layers"])
     assert matrix["skip_policy"] == "any_unapproved_skip_in_a_hard_layer_fails_g9"
+    triggers = {
+        change: tuple(item["rerun_layers"])
+        for item in matrix["regression_triggers"]
+        for change in item["changes"]
+    }
+    assert triggers["documentation_only"] == ()
+    assert triggers["worklog_only"] == ()
+    assert triggers["downstream_only"] == ()
+    assert triggers["g10_consumer"] == ()
+    assert "local_cpu" not in triggers["driver"]
+    assert "server_cpu" not in triggers["gpu_topology"]
+    assert triggers["logging_only"] == ("local_cpu", "server_cpu", "fault")
     schema_paths = sorted((ROOT / "schemas").glob("stage0-g9-*.json"))
     schema_paths.append(ROOT / "schemas/stage0-deterministic-training-fixture-v1.json")
     for path in schema_paths:
@@ -371,4 +383,4 @@ def test_replay_runbook_has_only_resolvable_repository_links() -> None:
     result = _validate_runbook(G9SourceBinding(ROOT, "a" * 40, "fixture", {}))
     assert result["status"] == "PASS"
     assert result["required_content_count"] == 10
-    assert len(result["checked_links"]) == 3
+    assert len(result["checked_links"]) == 4

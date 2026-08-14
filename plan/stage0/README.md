@@ -129,7 +129,10 @@
 6. loss 下降使用固定的极小过拟合 fixture，连续运行 50 个 optimizer step 并重复三次；每次最后 10 步 loss 中位数至少比最初 10 步低 5%，且全程 loss、梯度和更新均为有限值。
 7. 日志开销采用同一配置的成对 A/B 测试：最小真值日志与正式追踪交替执行，各做三次，按两组吞吐中位数计算相对开销。
 8. correctness、无重复/遗漏、哈希、schema、数值容差和安全边界属于硬标准，不允许豁免。仅性能/容量阈值可在优化无效后由用户和相应资源管理员书面批准例外；例外必须记录原因、替代保护、适用配置和失效日期，单项状态记为 `APPROVED_EXCEPTION` 而不是 `PASS`。gate 汇总器只能把预先声明为可例外的性能/容量项计作“带例外满足”，并必须在总结果中显著保留该状态。
-9. 代码、配置、依赖锁、驱动、内核、GPU 白名单/拓扑或资产身份变化时，受影响的测量组自动失效并重跑。
+9. 代码、配置、依赖锁、驱动、内核、GPU 白名单/拓扑或资产身份变化时，先按
+   [`policies/evidence-validity-and-rerun.md`](../../policies/evidence-validity-and-rerun.md)
+   判定最小影响闭包：只让实际依赖该变化的测量组失效。健康/拓扑变化只刷新对应设备层，
+   文档、worklog、同步和下游代码变化不使既有测量失效。
 
 ## 5. 子任务与执行顺序
 
@@ -196,7 +199,10 @@ Gate 状态统一为 `PASS`、`CONDITIONALLY_ACCEPTED`、`FAIL`、`BLOCKED`、`S
 - **G7 可恢复性 gate**：日志连续、checkpoint 完整、恢复轨迹与不中断轨迹在预定容差内一致。
 - **G8 容量与运维 gate**：显存、内存、磁盘、吞吐、保存频率和失败预算有证据，四卡候选在运行前可安全取得。G8 由基础设施与 synthetic shape fixture 的 **G8-C**、依赖 G3-S4 的 160M 实测 **G8-S4**、依赖 G3-S5 的 410M 实测 **G8-S5** 共同组成；三者都为 `PASS` 时 G8 为 `PASS`，仅含获批性能/容量例外且无失败时为 `CONDITIONALLY_ACCEPTED`。
 - **G9 重放 gate**：新会话仅依靠仓库文档和 manifest 能离线重放单卡、四卡和恢复 smoke test。
-- **G10 最终同步 gate**：工作日志完整，本机/GitHub/服务器同提交，`Agent/` 五文件两端哈希一致；大型资产的权威运行副本只放 `DATA_ROOT`，G1-D 明确授权的备份副本不受此限制。
+- **G10 最终交付 gate**：工作日志完整；本机/GitHub 已发布目标提交，服务器检出声明的
+  `execution_commit` 且工作树干净；允许引用由旧 `producer_commit` 生成、已经过影响分析和哈希复核的
+  G0–G9 证据。`Agent/` 五文件两端哈希一致；大型资产的权威运行副本只放 `DATA_ROOT`，
+  G1-D 明确授权的备份副本不受此限制。
 
 只有 G0–G10 的硬项全部 `PASS`，且每个 gate 为 `PASS` 或按上述规则 `CONDITIONALLY_ACCEPTED`，才能宣称 Stage 0 完成并进入 Stage 1；本计划不设置跳过大型资产、硬件或正确性 gate 的“核心设施”例外。
 

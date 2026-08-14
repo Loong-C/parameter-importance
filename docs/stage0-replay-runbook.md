@@ -88,14 +88,18 @@ orchestrator 只把一个哈希绑定 replay plan 交给全新子进程。子进
 
 ## 7. 环境漂移与回归触发
 
-发生下列环境漂移时，旧 gate 自动失效：
+变化先按 [`policies/evidence-validity-and-rerun.md`](../policies/evidence-validity-and-rerun.md)
+计算最小影响闭包，不把“环境变化”泛化为整层或整链失效：
 
-- 依赖锁、Python、驱动、内核或 GPU 拓扑变化：重跑所有相关 CPU/GPU/故障/replay 层；
-- 配置 schema、training step、loss reduction、日志或 checkpoint 变化：重跑数值与恢复层；
-- 模型、tokenizer 或数据 manifest 变化：重跑服务器 CPU、单卡、四卡和 replay；
-- 只有文档变化：运行链接、结构和一致性检查，不无意义占用 GPU。
+- 依赖锁/Python 变化：重验实际使用该环境的层；驱动、内核、GPU 健康或拓扑变化只刷新设备层和
+  实际依赖它的 GPU/容量层，不重跑本机 CPU、资产获取或无关数值结果；
+- 配置 schema、training step、loss reduction、日志或 checkpoint 变化：分别重验消费相应语义的
+  数值、观测或恢复单元，未受影响的原子单元沿用；
+- 模型、tokenizer 或数据 manifest 变化：仅当具体内容身份或预处理合同变化时，重验消费该资产的单元；
+- 只有文档、worklog、同步或下游代码变化：运行链接、结构和 consumer 回归，不占用 GPU。
 
-正式触发矩阵位于 `configs/stage0/g9-test-matrix-v1.json`，报告必须说明哪些 gate 对当前环境仍有效。
+正式触发矩阵位于 `configs/stage0/g9-test-matrix-v1.json`，报告必须分别说明保留、刷新、失效的 Gate
+及理由；提交不同本身不属于失效理由。
 
 ## 8. 明确禁止
 

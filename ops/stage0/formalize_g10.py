@@ -16,6 +16,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--data-root", type=Path, required=True)
     parser.add_argument("--g9-index-ref", required=True)
     parser.add_argument("--sync-observation-ref", required=True)
+    parser.add_argument("--reuse-attestation-ref")
     parser.add_argument("--repository", type=Path, required=True)
     parser.add_argument("--git-commit", required=True)
     parser.add_argument("--git-branch", required=True)
@@ -30,6 +31,7 @@ def main(argv: list[str] | None = None) -> int:
         data_root=arguments.data_root.resolve(strict=True),
         g9_index_ref=arguments.g9_index_ref,
         sync_observation_ref=arguments.sync_observation_ref,
+        reuse_attestation_ref=arguments.reuse_attestation_ref,
     )
     print(
         json.dumps(

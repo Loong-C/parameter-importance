@@ -70,6 +70,7 @@ _CRITICAL_SOURCE_REFS = (
     "ops/stage0/formalize_g9.py",
     "ops/stage0/run_g9_independent_replay.py",
     "ops/stage0/offline_guard/sitecustomize.py",
+    "policies/evidence-validity-and-rerun.md",
     "src/param_importance_nlp/deterministic_fixture.py",
     "src/param_importance_nlp/experiments/stage01_task_runners.py",
     "src/param_importance_nlp/offline_guard.py",
@@ -117,6 +118,7 @@ class Stage0G9FormalState:
     index_sha256: str
     gate_artifact_hash: str
     g8_index_ref: str
+    generator_git_commit: str = ""
 
 
 def _now() -> str:
@@ -1103,7 +1105,7 @@ def load_stage0_g9_formal_state(
     *,
     data_root: str | Path,
     index_ref: str,
-    expected_git_commit: str,
+    expected_git_commit: str | None = None,
 ) -> Stage0G9FormalState:
     root = Path(data_root).resolve(strict=True)
     index_path = _logical_path(root, index_ref, field="index_ref")
@@ -1117,12 +1119,20 @@ def load_stage0_g9_formal_state(
     }
     if set(raw) != expected_fields:
         raise Stage0G9Error("G9_STATE_INDEX_FIELDS_INVALID")
-    if raw.get("generator_git_commit") != expected_git_commit:
+    generator_git_commit = raw.get("generator_git_commit")
+    if (
+        not isinstance(generator_git_commit, str)
+        or _GIT_COMMIT_RE.fullmatch(generator_git_commit) is None
+        or (
+            expected_git_commit is not None
+            and generator_git_commit != expected_git_commit
+        )
+    ):
         raise Stage0G9Error("G9_STATE_SOURCE_COMMIT_INVALID")
     g8 = load_stage0_g8_formal_state(
         data_root=root,
         index_ref=str(raw["g8_index_ref"]),
-        expected_git_commit=expected_git_commit,
+        expected_git_commit=generator_git_commit,
     )
     config = ResolvedConfigV2.from_mapping(
         _mapping(
@@ -1168,6 +1178,7 @@ def load_stage0_g9_formal_state(
         index_sha256=sha256_file(index_path),
         gate_artifact_hash=gate.artifact_hash,
         g8_index_ref=str(raw["g8_index_ref"]),
+        generator_git_commit=generator_git_commit,
     )
 
 

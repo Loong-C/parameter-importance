@@ -64,7 +64,8 @@ AdamW 完整实际位移的严格无偏路径积分贡献。
 
 ### 4.2 服务器环境与存储
 
-- 服务器仓库 `main` 与本机当前 HEAD 一致，服务器工作树干净。
+- 服务器仓库检出本次声明的 `execution_commit` 且工作树干净；该提交已在 GitHub 可达。
+  本机若已有后续提交，按证据影响政策记录映射，不要求回退或重跑 Stage 0。
 - 现有权威环境位于 `$DATA_ROOT/envs/parameter-importance`：Python 3.12.3、PyTorch 2.12.1+cu126、Transformers 4.57.6、Datasets 4.8.5、Accelerate 1.14.0；实时 `pip check` 通过，A100 支持 BF16。
 - 项目大盘约 3.5 TiB，总可用约 2.9 TiB，权限和 inode 现状满足小规模 Stage 1 调试产物。
 - 当前硬件不能按“8 张健康 A100”规划：系统节点仍能看到 8 个设备痕迹，NVML/PyTorch 只枚举 7 张，其中 1 张实际 CUDA 分配失败；当前只确认 6 张可分配。历史四卡 NCCL 报告已经过时，任何 DDP 任务都必须先重新逐卡和多卡预检。
@@ -250,7 +251,9 @@ $DATA_ROOT
 
 - **进入 Stage 2**：`G1-EXIT` 必须通过；固定 checkpoint、局部 raw/double/U 实现版本、参数 registry、损失契约、采样 seed 空间和参考数据范围必须冻结。Stage 2 只能改变抽样规模和统计实验配置，不能静默修改估计器语义。
 - **进入 Stage 3**：除 `G1-EXIT` 外，常梯度、二次损失、固定 probe 状态和训练状态恢复 smoke test 必须通过。Stage 3 再比较节点数与求积方法，不沿用 Stage 1 的 smoke test 得出精度结论。
-- **进入 Stage 4 及以后**：若代码、依赖、损失 reduction、DDP 归约、AMP、clip、optimizer bridge 或 checkpoint schema 有任何实质变更，必须重跑受影响的 Stage 1 Gate；不能仅凭旧报告继续放大模型。
+- **进入 Stage 4 及以后**：若代码、依赖、损失 reduction、DDP 归约、AMP、clip、optimizer bridge 或
+  checkpoint schema 有实质变更，按依赖闭包重跑受影响的最小 Stage 1 Gate；未受影响 Gate 通过哈希与
+  兼容性记录沿用，不能仅凭旧报告继续放大模型，也不能因无关提交整段重跑。
 
 ## 11. 当前执行阻塞
 

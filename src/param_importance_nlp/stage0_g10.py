@@ -23,6 +23,10 @@ from .contracts import (
     write_canonical_json,
 )
 from .contracts.jsonio import JSONValue
+from .evidence_reuse import (
+    EvidenceReuseError,
+    validate_evidence_reuse_attestation,
+)
 from .experiments import build_default_task_runtime
 from .runtime import (
     TaskArtifactStore,
@@ -76,8 +80,10 @@ _CRITICAL_SOURCE_REFS = (
     "docs/stage0-replay-runbook.md",
     "docs/stage1-handoff.md",
     "ops/stage0/collect_g10_sync_observation.py",
+    "ops/stage0/attest_g9_evidence_reuse.py",
     "ops/stage0/formalize_g10.py",
     "plan/stage0/12_delivery_and_sync.md",
+    "policies/evidence-validity-and-rerun.md",
     "reports/stage0/g1-persistence-decision-20260719.json",
     "schemas/stage0-g10-delivery-manifest-v1.json",
     "schemas/stage0-g10-evidence-v1.json",
@@ -87,6 +93,8 @@ _CRITICAL_SOURCE_REFS = (
     "schemas/stage0-g10-sync-observation-v1.json",
     "schemas/stage0-g10-sync-report-v1.json",
     "schemas/stage0-g10-worklog-v1.json",
+    "schemas/shared/evidence-reuse-attestation-v1.json",
+    "src/param_importance_nlp/evidence_reuse.py",
     "src/param_importance_nlp/experiments/stage01_task_runners.py",
     "src/param_importance_nlp/stage0_g10.py",
     "src/param_importance_nlp/stage0_g10_sync.py",
@@ -684,16 +692,26 @@ def build_stage0_g10_config(
     binding: Stage0SourceBinding,
     state: Stage0G9FormalState,
     sync_observation_ref: str,
+    reuse_attestation_ref: str | None = None,
 ) -> ResolvedConfigV2:
     return build_stage0_formal_config(
         binding.repository,
         task_id=TASK_ID,
-        input_refs=tuple(state.task_output_refs.values()),
+        input_refs=(
+            *tuple(state.task_output_refs.values()),
+            *((reuse_attestation_ref,) if reuse_attestation_ref is not None else ()),
+        ),
         output_dir=f"evidence/stage0/tasks/12-{state.gate_artifact_hash}",
         base_overrides={"identity": {"route": f"stage0-g10-{state.gate_artifact_hash[:12]}"}},
         v2_overrides={
             "execution": {"timeout_seconds": 1800, "max_attempts": 1},
-            "orchestration": {"matrix_ref": sync_observation_ref},
+            "orchestration": {
+                "route_spec_ref": state.index_ref,
+                # This field is the v2 contract's explicit decision reference.
+                # For G10 it binds the reviewed cross-commit reuse decision.
+                "quadrature_decision_ref": reuse_attestation_ref,
+                "matrix_ref": sync_observation_ref,
+            },
             "recovery": {
                 "mode": "manual_external",
                 "resume_ref": None,
@@ -710,6 +728,48 @@ def _observation_ref(request: TaskExecutionRequest) -> str:
     if not isinstance(reference, str):
         raise Stage0G10Error("G10_SYNC_OBSERVATION_REF_MISSING")
     return reference
+
+
+def _validated_reuse_attestation(
+    request: TaskExecutionRequest,
+    root: Path,
+    source: G10SourceBinding,
+) -> tuple[str | None, dict[str, Any] | None]:
+    orchestration = _mapping(request.config.section("orchestration"), field="orchestration")
+    g9_index_ref = orchestration.get("route_spec_ref")
+    reference = orchestration.get("quadrature_decision_ref")
+    input_references = orchestration.get("input_result_refs")
+    if not isinstance(g9_index_ref, str) or not isinstance(input_references, list):
+        raise Stage0G10Error("G10_REUSE_BINDING_MISSING")
+    index = _load_hashed(
+        _logical_path(root, g9_index_ref, field="g9_index_ref"),
+        schema="stage0-g9-formalization-index-v1",
+        field="g9_index",
+    )
+    producer_commit = index.get("generator_git_commit")
+    if not isinstance(producer_commit, str) or _GIT_COMMIT_RE.fullmatch(producer_commit) is None:
+        raise Stage0G10Error("G10_REUSE_PRODUCER_COMMIT_INVALID")
+    if producer_commit == source.git_commit:
+        if reference is not None:
+            raise Stage0G10Error("G10_REUSE_ATTESTATION_UNNECESSARY")
+        return None, None
+    if not isinstance(reference, str) or reference not in input_references:
+        raise Stage0G10Error("G10_REUSE_ATTESTATION_REQUIRED")
+    try:
+        attestation = validate_evidence_reuse_attestation(
+            repository=source.repository,
+            data_root=root,
+            attestation_ref=reference,
+            producer_commit=producer_commit,
+            consumer_commit=source.git_commit,
+            consumer_branch=source.git_branch,
+            scope_id="stage0.G0-G9",
+            source_evidence_ref=g9_index_ref,
+            required_gate_ids=sorted(_REQUIRED_GATES),
+        )
+    except EvidenceReuseError as error:
+        raise Stage0G10Error(f"G10_REUSE_ATTESTATION_INVALID:{error}") from error
+    return reference, attestation
 
 
 def _handoff(
@@ -926,6 +986,7 @@ def _gate_payloads(
     sync_ref: str,
     handoff_ref: str,
     gate_report_ref: str,
+    reuse_attestation_ref: str | None,
 ) -> tuple[GateRecord, Stage0GateReport, tuple[str, ...]]:
     evidence_refs = tuple(
         dict.fromkeys(
@@ -937,6 +998,7 @@ def _gate_payloads(
                 sync_ref,
                 handoff_ref,
                 handoff_ref.removesuffix(".json") + ".md",
+                *((reuse_attestation_ref,) if reuse_attestation_ref is not None else ()),
                 *gate_refs.values(),
             )
         )
@@ -946,9 +1008,19 @@ def _gate_payloads(
             "stage0.G10-UPSTREAM-GATES",
             Stage0CheckClass.CORRECTNESS,
             Stage0CheckStatus.PASS,
-            "Every current Stage 0 G0-G9 hard gate was loaded from its formal committed evidence and is PASS.",
-            measurements={"gate_statuses": {key: value.status.value for key, value in gate_records.items()}},
-            evidence_refs=tuple(dict.fromkeys(gate_refs.values())),
+            "Every Stage 0 G0-G9 hard gate was loaded from formal committed evidence and is PASS; cross-commit reuse, when present, is independently attested.",
+            measurements={
+                "gate_statuses": {key: value.status.value for key, value in gate_records.items()},
+                "cross_commit_reuse": reuse_attestation_ref is not None,
+            },
+            evidence_refs=tuple(
+                dict.fromkeys(
+                    (
+                        *gate_refs.values(),
+                        *((reuse_attestation_ref,) if reuse_attestation_ref is not None else ()),
+                    )
+                )
+            ),
         ),
         Stage0GateCheck(
             "stage0.G10-THREE-END-SYNC",
@@ -1041,6 +1113,11 @@ def run_formal_g10_task(
         raise Stage0G10Error("G10_REQUIRED_CAPABILITIES_MISSING")
     observation_ref = _observation_ref(request)
     observation = validate_sync_observation(root, observation_ref, source)
+    reuse_attestation_ref, _reuse_attestation = _validated_reuse_attestation(
+        request,
+        root,
+        source,
+    )
     gate_records, gate_refs = _validated_gate_records(request.environment, root)
     checked_at = str(observation["observed_at"])
     repository_inventory = _repository_inventory(source, observation)
@@ -1139,6 +1216,7 @@ def run_formal_g10_task(
         sync_ref=sync_ref,
         handoff_ref=handoff_ref,
         gate_report_ref=gate_report_ref,
+        reuse_attestation_ref=reuse_attestation_ref,
     )
     _write_or_verify(
         _logical_path(root, gate_report_ref, field="gate_report_ref"),
@@ -1147,7 +1225,14 @@ def run_formal_g10_task(
     all_gates = {key: value.to_dict() for key, value in gate_records.items()}
     all_gates[GATE_ID] = gate.to_dict()
     readiness_evidence_refs = tuple(
-        dict.fromkeys((*gate_support_refs, gate_report_ref, *source_refs))
+        dict.fromkeys(
+            (
+                *gate_support_refs,
+                gate_report_ref,
+                *source_refs,
+                *((reuse_attestation_ref,) if reuse_attestation_ref is not None else ()),
+            )
+        )
     )
     readiness = _with_hash(
         {
@@ -1520,12 +1605,12 @@ def execute_stage0_g10(
     data_root: str | Path,
     g9_index_ref: str,
     sync_observation_ref: str,
+    reuse_attestation_ref: str | None = None,
 ) -> Stage0G10FormalizationResult:
     root = Path(data_root).resolve(strict=True)
     state = load_stage0_g9_formal_state(
         data_root=root,
         index_ref=g9_index_ref,
-        expected_git_commit=binding.git_commit,
     )
     source = _capture_source()
     if (
@@ -1534,6 +1619,10 @@ def execute_stage0_g10(
         or source.repository != binding.repository
     ):
         raise Stage0G10Error("G10_EXECUTION_SOURCE_BINDING_MISMATCH")
+    if state.generator_git_commit != source.git_commit and reuse_attestation_ref is None:
+        raise Stage0G10Error("G10_CROSS_COMMIT_REUSE_ATTESTATION_REQUIRED")
+    if state.generator_git_commit == source.git_commit and reuse_attestation_ref is not None:
+        raise Stage0G10Error("G10_CROSS_COMMIT_REUSE_ATTESTATION_UNNECESSARY")
     observation = validate_sync_observation(root, sync_observation_ref, source)
     input_environment = _environment_with_github_capability(
         root=root,
@@ -1545,6 +1634,7 @@ def execute_stage0_g10(
         binding=binding,
         state=state,
         sync_observation_ref=sync_observation_ref,
+        reuse_attestation_ref=reuse_attestation_ref,
     )
     formal_dir = f"evidence/stage0/g10-formal/{state.gate_artifact_hash}"
     config_ref = f"{formal_dir}/resolved-config.json"
@@ -1589,6 +1679,15 @@ def execute_stage0_g10(
             "g9_index_ref": state.index_ref,
             "g9_index_sha256": state.index_sha256,
             "g9_gate_artifact_hash": state.gate_artifact_hash,
+            "g9_generator_git_commit": state.generator_git_commit,
+            "reuse_attestation_ref": reuse_attestation_ref,
+            "reuse_attestation_sha256": (
+                None
+                if reuse_attestation_ref is None
+                else sha256_file(
+                    _logical_path(root, reuse_attestation_ref, field="reuse_attestation_ref")
+                )
+            ),
             "sync_observation_ref": sync_observation_ref,
             "sync_observation_sha256": sha256_file(
                 _logical_path(root, sync_observation_ref, field="sync_observation_ref")
@@ -1635,7 +1734,8 @@ def load_stage0_g10_formal_state(
     )
     expected_fields = {
         "schema_version", "generator_git_commit", "checked_at", "g9_index_ref",
-        "g9_index_sha256", "g9_gate_artifact_hash", "sync_observation_ref",
+        "g9_index_sha256", "g9_gate_artifact_hash", "g9_generator_git_commit",
+        "reuse_attestation_ref", "reuse_attestation_sha256", "sync_observation_ref",
         "sync_observation_sha256", "config_ref", "config_hash",
         "input_environment_hash", "task_output_refs", "gate_ref",
         "gate_artifact_hash", "readiness_ref", "readiness_sha256",
@@ -1647,8 +1747,36 @@ def load_stage0_g10_formal_state(
     g9 = load_stage0_g9_formal_state(
         data_root=root,
         index_ref=str(raw["g9_index_ref"]),
-        expected_git_commit=expected_git_commit,
+        expected_git_commit=str(raw["g9_generator_git_commit"]),
     )
+    reuse_ref = raw.get("reuse_attestation_ref")
+    reuse_sha256 = raw.get("reuse_attestation_sha256")
+    if g9.generator_git_commit == expected_git_commit:
+        if reuse_ref is not None or reuse_sha256 is not None:
+            raise Stage0G10Error("G10_STATE_REUSE_ATTESTATION_UNNECESSARY")
+    else:
+        if not isinstance(reuse_ref, str) or not isinstance(reuse_sha256, str):
+            raise Stage0G10Error("G10_STATE_REUSE_ATTESTATION_MISSING")
+        reuse_path = _logical_path(root, reuse_ref, field="reuse_attestation_ref")
+        if sha256_file(reuse_path) != reuse_sha256:
+            raise Stage0G10Error("G10_STATE_REUSE_ATTESTATION_SHA_DRIFT")
+        source = _capture_source()
+        if source.git_commit != expected_git_commit:
+            raise Stage0G10Error("G10_STATE_CONSUMER_SOURCE_MISMATCH")
+        try:
+            validate_evidence_reuse_attestation(
+                repository=source.repository,
+                data_root=root,
+                attestation_ref=reuse_ref,
+                producer_commit=g9.generator_git_commit,
+                consumer_commit=expected_git_commit,
+                consumer_branch=source.git_branch,
+                scope_id="stage0.G0-G9",
+                source_evidence_ref=g9.index_ref,
+                required_gate_ids=sorted(_REQUIRED_GATES),
+            )
+        except EvidenceReuseError as error:
+            raise Stage0G10Error(f"G10_STATE_REUSE_ATTESTATION_INVALID:{error}") from error
     config = ResolvedConfigV2.from_mapping(
         _mapping(
             load_canonical_json(_logical_path(root, raw["config_ref"], field="config_ref")),
@@ -1690,6 +1818,7 @@ def load_stage0_g10_formal_state(
     if (
         raw.get("g9_index_sha256") != g9.index_sha256
         or raw.get("g9_gate_artifact_hash") != g9.gate_artifact_hash
+        or raw.get("g9_generator_git_commit") != g9.generator_git_commit
         or raw.get("sync_observation_sha256")
         != sha256_file(_logical_path(root, raw["sync_observation_ref"], field="sync_ref"))
         or config.config_hash != raw.get("config_hash")
