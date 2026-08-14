@@ -517,6 +517,17 @@ def test_s17_device_uuid_schema_accepts_real_nvidia_wire_and_rejects_drift() -> 
         ):
             with pytest.raises(Exception, match="S1_6_SCHEMA_PATTERN_INVALID"):
                 s16._validate_schema(invalid, schema, registry, document=report, path=f"device.{field}")
+    name_schema = report["definitions"]["device"]["properties"]["device_name"]
+    assert name_schema == {"const": "NVIDIA A100-SXM4-80GB"}
+    s16._validate_schema("NVIDIA A100-SXM4-80GB", name_schema, registry, document=report, path="device.device_name")
+    for invalid in (
+        "NVIDIA A100",
+        "NVIDIA A100-SXM4-40GB",
+        "NVIDIA A100-PCIE-80GB",
+        "NVIDIA A100-SXM4-80GB ",
+    ):
+        with pytest.raises(Exception, match="S1_6_SCHEMA_CONST_INVALID"):
+            s16._validate_schema(invalid, name_schema, registry, document=report, path="device.device_name")
 
 
 def _training_record(*, estimator_name: str | None, clip_factor: float = 1.0) -> dict[str, object]:
