@@ -265,7 +265,10 @@ def execute(
     work_dir.mkdir(parents=True, exist_ok=False)
 
     regression = _run_regression(repository_root, work_dir, timeout_seconds)
-    from param_importance_nlp.stage1_fixtures import build_stage1_s13_evidence
+    from param_importance_nlp.stage1_fixtures import (
+        build_stage1_s13_evidence,
+        validate_stage1_s13_evidence,
+    )
 
     evidence = build_stage1_s13_evidence(
         repository_root,
