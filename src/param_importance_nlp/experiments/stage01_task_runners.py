@@ -1659,6 +1659,7 @@ _STAGE1_ENTRY_REQUIRED_STAGE0_GATES = (
     "stage0.G9",
     "stage0.G10",
 )
+_STAGE1_LOCAL_FIXTURE_CHECKED_AT = "1970-01-01T00:00:00Z"
 
 
 def _stage1_path_text(path: Path | None) -> str | None:
@@ -1940,7 +1941,15 @@ def _stage1_contract_evidence(request: TaskExecutionRequest, root: Path) -> Mapp
     math_path = contract_root / "docs" / "mathematics.md"
     plan_path = contract_root / "plan" / "stage1" / "01_entry_and_contract.md"
     scope = request.config.run_intent
-    checked_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    # Formal evidence records the real observation time.  Local fixture wire
+    # objects use an explicit fixture epoch so resume and clean-root replay are
+    # content-addressed by semantics rather than wall-clock scheduling.  Scope
+    # and formal_eligible continue to make this ineligible as formal evidence.
+    checked_at = (
+        datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        if scope == "formal"
+        else _STAGE1_LOCAL_FIXTURE_CHECKED_AT
+    )
     repository = _stage1_git_snapshot(contract_root)
     g10_reuse, g10_reuse_valid = _stage1_g10_reuse_decision(
         request,
@@ -1987,16 +1996,42 @@ def _stage1_contract_evidence(request: TaskExecutionRequest, root: Path) -> Mapp
     temporary_approved = temporary_root is None or any(
         _stage1_within(temporary_root, parent) for parent in approved_roots
     )
-    write_path_audit: dict[str, JSONValue] = {
-        "repository_root": contract_root.resolve().as_posix(),
-        "data_root": _stage1_path_text(data_root),
-        "output_root": store.root.resolve().as_posix(),
-        "temporary_root": _stage1_path_text(temporary_root),
-        "approved_roots": [path.resolve().as_posix() for path in approved_roots],
-        "output_root_approved": output_approved,
-        "temporary_root_approved": temporary_approved,
-        "write_path_audit_status": "PASS" if output_approved and temporary_approved else "BLOCKED",
-    }
+    if scope == "formal":
+        write_path_audit: dict[str, JSONValue] = {
+            "repository_root": contract_root.resolve().as_posix(),
+            "data_root": _stage1_path_text(data_root),
+            "output_root": store.root.resolve().as_posix(),
+            "temporary_root": _stage1_path_text(temporary_root),
+            "approved_roots": [path.resolve().as_posix() for path in approved_roots],
+            "output_root_approved": output_approved,
+            "temporary_root_approved": temporary_approved,
+            "write_path_audit_status": "PASS" if output_approved and temporary_approved else "BLOCKED",
+        }
+    else:
+        # The approval booleans are still computed from the physical paths
+        # above.  Only the hashed wire representation is projected to stable
+        # roles, preventing temporary workspace names from becoming science
+        # identity while retaining what was checked and whether it passed.
+        write_path_audit = {
+            "path_projection": "logical_path_roles",
+            "repository_root": "source_repository",
+            "data_root": "configured_data_root" if data_root is not None else None,
+            "output_root": "task_artifact_store",
+            "temporary_root": "configured_temporary_root" if temporary_root is not None else None,
+            "approved_roots": [
+                "source_repository",
+                *(["configured_data_root"] if data_root is not None else []),
+            ],
+            "output_root_approved": output_approved,
+            "temporary_root_approved": temporary_approved,
+            "write_path_audit_status": "PASS" if output_approved and temporary_approved else "BLOCKED",
+        }
+    runtime_snapshot = _stage1_runtime_snapshot()
+    if scope == "local_fixture":
+        runtime_snapshot = {
+            **runtime_snapshot,
+            "checked_at_policy": "deterministic_fixture_epoch_not_wall_clock_evidence",
+        }
     stage0_g10_ref = request.environment.evidence_refs.get("gate_stage0_g10")
     formal_entry_checks = {
         "stage0_g10_pass": "stage0.G10" in request.environment.passed_gate_ids and stage0_g10_ref is not None,
@@ -2030,7 +2065,7 @@ def _stage1_contract_evidence(request: TaskExecutionRequest, root: Path) -> Mapp
         "filesystem": filesystem,
         "cache_policy": cache_policy,
         "write_path_audit": write_path_audit,
-        "runtime": _stage1_runtime_snapshot(),
+        "runtime": runtime_snapshot,
         "external_evidence": {
             "passed_gate_ids": sorted(request.environment.passed_gate_ids),
             "frozen_contract_stages": sorted(request.environment.frozen_contract_stages),

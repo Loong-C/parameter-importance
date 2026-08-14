@@ -13,6 +13,7 @@ import pytest
 
 from param_importance_nlp.stage1_estimators import _build_table, _derive_gate_requirements, _hash_role, build_stage1_s15_evidence
 from param_importance_nlp.cli import _validate_project_json_schema
+from param_importance_nlp.contracts.jsonio import loads_strict_json
 from param_importance_nlp.contracts.jsonio import canonical_json_hash
 from param_importance_nlp.stage1_gradient_scale import build_stage1_s14_evidence
 
@@ -192,7 +193,9 @@ def test_s15_all_eight_schemas_are_project_valid_and_source_hashes_are_closed() 
         "s1-5-formalization-index-v1.json", "s1-5-validation-v1.json", "s1-5-fixture-manifest-v1.json",
     )
     for name in names:
-        schema = json.loads((ROOT / "schemas/stage1" / name).read_text(encoding="utf-8"))
+        schema_path = ROOT / "schemas/stage1" / name
+        schema = loads_strict_json(schema_path.read_bytes())
+        assert isinstance(schema, dict)
         _validate_project_json_schema(schema)
         assert schema["type"] == "object"
         assert schema["additionalProperties"] is False

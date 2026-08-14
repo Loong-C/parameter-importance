@@ -213,6 +213,51 @@ def test_local_entry_contract_records_are_never_formal_eligible(tmp_path: Path) 
     assert core["requirements_matrix"]["schema_version"] == "stage1-requirements-matrix-v2"
 
 
+def test_local_entry_contract_wire_projection_is_identical_across_clean_roots(
+    tmp_path: Path,
+) -> None:
+    def execute(root: Path) -> tuple[dict[str, str], dict[str, object]]:
+        runtime = TaskRuntime(workspace_root=root)
+        runtime.register(build_stage01_runner_overrides(root)[RunnerKind.CONTRACT])
+        result = runtime.execute(_config(formal=False, output="runs/local-entry"))
+        assert result.status.value == "PASS"
+        hashes = {
+            role: load_committed_task_artifact(
+                root,
+                reference,
+                require_formal=False,
+            ).identity.artifact_hash
+            for role, reference in result.artifact_refs.items()
+        }
+        stage_contract = load_committed_task_artifact(
+            root,
+            result.artifact_refs["stage_contract"],
+            require_formal=False,
+        )
+        return hashes, dict(stage_contract.payload["core_evidence"])
+
+    first_hashes, first_core = execute(tmp_path / "first-clean-root")
+    second_hashes, second_core = execute(tmp_path / "second-clean-root")
+
+    assert set(first_hashes) == {"stage_contract", "requirements_matrix", "gate_record"}
+    assert first_hashes == second_hashes
+    assert first_core == second_core
+    entry = first_core["entry_snapshot"]
+    assert entry["scope"] == "local_fixture"
+    assert entry["formal_eligible"] is False
+    assert entry["checked_at"] == "1970-01-01T00:00:00Z"
+    assert entry["runtime"]["checked_at_policy"] == (
+        "deterministic_fixture_epoch_not_wall_clock_evidence"
+    )
+    path_audit = entry["write_path_audit"]
+    assert path_audit["path_projection"] == "logical_path_roles"
+    assert path_audit["repository_root"] == "source_repository"
+    assert path_audit["output_root"] == "task_artifact_store"
+    assert path_audit["approved_roots"] == ["source_repository"]
+    assert str(tmp_path.resolve().as_posix()) not in json.dumps(first_core, sort_keys=True)
+    assert ContractFreeze.from_mapping(first_core["contract_freeze"]).formal_eligible is False
+
+
 def test_formal_entry_contract_publishes_freeze_and_two_gate_records(
     tmp_path: Path, monkeypatch
 ) -> None:
@@ -262,6 +307,12 @@ def test_formal_entry_contract_publishes_freeze_and_two_gate_records(
     assert freeze.formal_eligible is True
     assert freeze.formula_version == "stage1-entry-contract-v3"
     assert core["entry_snapshot"]["formal_eligible"] is True
+    assert core["entry_snapshot"]["checked_at"] != "1970-01-01T00:00:00Z"
+    assert "checked_at_policy" not in core["entry_snapshot"]["runtime"]
+    assert "path_projection" not in core["entry_snapshot"]["write_path_audit"]
+    assert core["entry_snapshot"]["write_path_audit"]["data_root"] == (
+        tmp_path.resolve().as_posix()
+    )
     validate_stage1_math_contract(core["contract"])
     validate_stage1_requirements_matrix(core["requirements_matrix"])
     assert core["contract"]["estimators"]["weighted_u"]["field_name"] == (
