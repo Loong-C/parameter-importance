@@ -1,0 +1,41 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://parameter-importance.invalid/schemas/stage1/s1-7-validation-v1.json",
+  "type": "object", "additionalProperties": false,
+  "required": ["schema_version", "status", "task_id", "gate_id", "producer_commit", "checks", "role_sha256", "replay_sha256", "csv_sha256", "svg_sha256", "artifact_hash"],
+  "properties": {
+    "schema_version": {"const": "stage1-s1-7-validation-v1"}, "status": {"const": "PASS"}, "task_id": {"const": "stage1.07_single_gpu_pythia14m"}, "gate_id": {"const": "G1-SINGLE"}, "producer_commit": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+    "checks": {
+      "type": "array", "minItems": 17, "maxItems": 17,
+      "prefixItems": [
+        {"$ref": "#/definitions/s1_6_handoff"}, {"$ref": "#/definitions/qualified_assets"}, {"$ref": "#/definitions/historical_producer_replay"}, {"$ref": "#/definitions/approved_gpu_uuid"}, {"$ref": "#/definitions/gpu_preflight_twice"}, {"$ref": "#/definitions/cuda_minimum_allocation"}, {"$ref": "#/definitions/offline_guard"}, {"$ref": "#/definitions/registry_reload"}, {"$ref": "#/definitions/fixed_state_t32"}, {"$ref": "#/definitions/independent_oracle"}, {"$ref": "#/definitions/statistics_path_parity"}, {"$ref": "#/definitions/two_steps"}, {"$ref": "#/definitions/safetensors_manifest"}, {"$ref": "#/definitions/resource_evidence"}, {"$ref": "#/definitions/failure_markers"}, {"$ref": "#/definitions/charts_exact"}, {"$ref": "#/definitions/catalog_decision_exempt"}
+      ],
+      "items": {"$ref": "#/definitions/check"}
+    },
+    "role_sha256": {"$ref": "#/definitions/role_hashes"}, "replay_sha256": {"$ref": "#/definitions/hash"}, "csv_sha256": {"$ref": "#/definitions/csv_hashes"}, "svg_sha256": {"$ref": "#/definitions/svg_hashes"}, "artifact_hash": {"$ref": "#/definitions/hash"}
+  },
+  "definitions": {
+    "hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "check": {"type": "object", "additionalProperties": false, "required": ["check_id", "status", "detail"], "properties": {"check_id": {"type": "string", "minLength": 1}, "status": {"const": "PASS"}, "detail": {"type": "string", "minLength": 1}}},
+    "s1_6_handoff": {"allOf": [{"$ref": "#/definitions/check"}, {"properties": {"check_id": {"const": "s1_6_handoff"}}}]},
+    "qualified_assets": {"allOf": [{"$ref": "#/definitions/check"}, {"properties": {"check_id": {"const": "qualified_assets"}}}]},
+    "historical_producer_replay": {"allOf": [{"$ref": "#/definitions/check"}, {"properties": {"check_id": {"const": "historical_producer_replay"}}}]},
+    "approved_gpu_uuid": {"allOf": [{"$ref": "#/definitions/check"}, {"properties": {"check_id": {"const": "approved_gpu_uuid"}}}]},
+    "gpu_preflight_twice": {"allOf": [{"$ref": "#/definitions/check"}, {"properties": {"check_id": {"const": "gpu_preflight_twice"}}}]},
+    "cuda_minimum_allocation": {"allOf": [{"$ref": "#/definitions/check"}, {"properties": {"check_id": {"const": "cuda_minimum_allocation"}}}]},
+    "offline_guard": {"allOf": [{"$ref": "#/definitions/check"}, {"properties": {"check_id": {"const": "offline_guard"}}}]},
+    "registry_reload": {"allOf": [{"$ref": "#/definitions/check"}, {"properties": {"check_id": {"const": "registry_reload"}}}]},
+    "fixed_state_t32": {"allOf": [{"$ref": "#/definitions/check"}, {"properties": {"check_id": {"const": "fixed_state_t32"}}}]},
+    "independent_oracle": {"allOf": [{"$ref": "#/definitions/check"}, {"properties": {"check_id": {"const": "independent_oracle"}}}]},
+    "statistics_path_parity": {"allOf": [{"$ref": "#/definitions/check"}, {"properties": {"check_id": {"const": "statistics_path_parity"}}}]},
+    "two_steps": {"allOf": [{"$ref": "#/definitions/check"}, {"properties": {"check_id": {"const": "two_steps"}}}]},
+    "safetensors_manifest": {"allOf": [{"$ref": "#/definitions/check"}, {"properties": {"check_id": {"const": "safetensors_manifest"}}}]},
+    "resource_evidence": {"allOf": [{"$ref": "#/definitions/check"}, {"properties": {"check_id": {"const": "resource_evidence"}}}]},
+    "failure_markers": {"allOf": [{"$ref": "#/definitions/check"}, {"properties": {"check_id": {"const": "failure_markers"}}}]},
+    "charts_exact": {"allOf": [{"$ref": "#/definitions/check"}, {"properties": {"check_id": {"const": "charts_exact"}}}]},
+    "catalog_decision_exempt": {"allOf": [{"$ref": "#/definitions/check"}, {"properties": {"check_id": {"const": "catalog_decision_exempt"}}}]},
+    "role_hashes": {"type": "object", "additionalProperties": false, "required": ["fixture_manifest", "single_gpu_report", "gradient_bundle", "comparison_table", "gate_record"], "properties": {"fixture_manifest": {"$ref": "#/definitions/hash"}, "single_gpu_report": {"$ref": "#/definitions/hash"}, "gradient_bundle": {"$ref": "#/definitions/hash"}, "comparison_table": {"$ref": "#/definitions/hash"}, "gate_record": {"$ref": "#/definitions/hash"}}},
+    "csv_hashes": {"type": "object", "additionalProperties": false, "required": ["gradient-parity.csv", "training-parity.csv", "parameter-error.csv", "resource-timeline.csv", "module-metric-heatmap.csv"], "properties": {"gradient-parity.csv": {"$ref": "#/definitions/hash"}, "training-parity.csv": {"$ref": "#/definitions/hash"}, "parameter-error.csv": {"$ref": "#/definitions/hash"}, "resource-timeline.csv": {"$ref": "#/definitions/hash"}, "module-metric-heatmap.csv": {"$ref": "#/definitions/hash"}}},
+    "svg_hashes": {"type": "object", "additionalProperties": false, "required": ["gradient-parity.svg", "training-parity.svg", "parameter-error.svg", "resource-timeline.svg", "module-metric-heatmap.svg"], "properties": {"gradient-parity.svg": {"$ref": "#/definitions/hash"}, "training-parity.svg": {"$ref": "#/definitions/hash"}, "parameter-error.svg": {"$ref": "#/definitions/hash"}, "resource-timeline.svg": {"$ref": "#/definitions/hash"}, "module-metric-heatmap.svg": {"$ref": "#/definitions/hash"}}}
+  }
+}

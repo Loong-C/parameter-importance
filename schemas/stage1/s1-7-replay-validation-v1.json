@@ -1,0 +1,61 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://parameter-importance.invalid/schemas/stage1/s1-7-replay-validation-v1.json",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "status", "oracle_import_isolated", "checks", "replay_hash"],
+  "properties": {
+    "schema_version": {"const": "stage1-s1-7-offline-replay-v1"},
+    "status": {"const": "PASS"},
+    "oracle_import_isolated": {"const": true},
+    "checks": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["full_vs_offline_mean", "online_vs_offline_mean", "raw_vs_oracle", "double_vs_oracle", "explicit_u_vs_oracle", "streaming_u_vs_oracle"],
+      "properties": {
+        "full_vs_offline_mean": {"$ref": "#/definitions/error"},
+        "online_vs_offline_mean": {"$ref": "#/definitions/error"},
+        "raw_vs_oracle": {"$ref": "#/definitions/error"},
+        "double_vs_oracle": {"$ref": "#/definitions/error"},
+        "explicit_u_vs_oracle": {"$ref": "#/definitions/error"},
+        "streaming_u_vs_oracle": {"$ref": "#/definitions/error"}
+      }
+    },
+    "replay_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+  },
+  "definitions": {
+    "error": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["max_abs_error", "parameter", "index", "max_scaled_error", "normalized_l2_error", "near_zero_coordinates", "violation_count", "within_t32", "per_tensor"],
+      "properties": {
+        "max_abs_error": {"type": "number", "minimum": 0},
+        "parameter": {"type": "string", "minLength": 1},
+        "index": {"type": "array", "items": {"type": "integer", "minimum": 0}},
+        "max_scaled_error": {"type": "number", "minimum": 0},
+        "normalized_l2_error": {"type": "number", "minimum": 0},
+        "near_zero_coordinates": {"type": "integer", "minimum": 0},
+        "violation_count": {"type": "integer", "minimum": 0},
+        "within_t32": {"const": true},
+        "per_tensor": {
+          "type": "object",
+          "minProperties": 1,
+          "maxProperties": 128,
+          "additionalProperties": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["max_abs_error", "max_scaled_error", "normalized_l2_error", "near_zero_coordinates", "violation_count", "within_t32"],
+            "properties": {
+              "max_abs_error": {"type": "number", "minimum": 0},
+              "max_scaled_error": {"type": "number", "minimum": 0},
+              "normalized_l2_error": {"type": "number", "minimum": 0},
+              "near_zero_coordinates": {"type": "integer", "minimum": 0},
+              "violation_count": {"type": "integer", "minimum": 0},
+              "within_t32": {"const": true}
+            }
+          }
+        }
+      }
+    }
+  }
+}

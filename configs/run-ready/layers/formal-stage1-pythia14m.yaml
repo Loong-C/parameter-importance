@@ -11,21 +11,23 @@ runtime:
   dependency_profile: cuda-formal
   device: cuda
   output_root: runs/formal/stage1-pythia14m
-  cache_root: cache/formal/stage1-pythia14m
-  temp_root: runs/formal/stage1-pythia14m/tmp
+  # Formalizer resolves this relative root under DATA_ROOT; keep it inside the
+  # dedicated cache rather than an evidence or attempt directory.
+  cache_root: cache
+  temp_root: tmp/stage1-s1-7
   allow_dirty_worktree: false
 model:
   asset_id: pythia-14m-step0
-  revision: FILL_MODEL_REVISION
+  revision: 56079904bb80b7f36d3b794089f146e7a4d6efae
   tokenizer_asset_id: pythia-tokenizer
-  initialization_id: FILL_BASE_INITIALIZATION_HASH
+  initialization_id: EleutherAI/pythia-14m@56079904bb80b7f36d3b794089f146e7a4d6efae:step0
   architecture: pythia-14m
 data:
   asset_id: pile-selected-prefix
-  revision: FILL_DATA_REVISION
+  revision: 4647773ea142ab1ff5694602fa104bbf49088408
   split: train
   sequence_length: 2048
-  sampler: distributed-shuffle
+  sampler: without_replacement_frozen_epoch
   statistical_unit: sequence
   weight_unit: effective_token
   sampling_design: without_replacement_frozen_epoch
@@ -37,14 +39,16 @@ loss:
   ignore_index: -100
   weighting: effective_token
 batching:
-  global_batch_size: 8
-  per_device_batch_size: 2
+  global_batch_size: 4
+  per_device_batch_size: 1
   microbatch_size: 1
   accumulation_steps: 4
   no_sync: false
 distributed:
   world_size: 1
   backend: local
+  # The formalizer exposes exactly one approved UUID; 0 is logical cuda:0,
+  # never a stable physical GPU index.
   device_ids: [0]
   timeout_seconds: 1800
 precision:
@@ -65,9 +69,9 @@ optimizer:
   parameter_groups: []
 importance:
   estimator_name: u
-  # Stage 1 早于 Stage 2 decision；配置仍保持 formal fail-closed 默认，但本任务
-  # 的任务目录不声明消费未来 decision，避免形成时间循环依赖。
+  # Stage 1 不在任务目录中声明消费未来 Stage 2 decision；runner 以 task catalog
+  # formal_eligibility.requires_estimator_decision 为准，避免时间循环。
   estimator_decision_ref: null
   clip_mode: global_plugin
-  accumulate_views: [signed, positive, negative_mass, absolute, raw, data_movement]
+  accumulate_views: [signed, positive, negative_mass, absolute, raw, data_movement, net_data_movement, total_endpoint_movement, magnitude]
   require_decision_for_formal: true
