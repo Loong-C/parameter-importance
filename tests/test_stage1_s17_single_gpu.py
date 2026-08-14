@@ -187,6 +187,92 @@ def test_s17_historical_patch_uses_full_index_and_real_repository_attests(tmp_pa
     assert attestation["critical_patch_sha256"] == module.EXPECTED_HISTORICAL_G3_PATCH_SHA256
 
 
+def test_s17_historical_replay_binds_ready_manifest_file_bytes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Exercise the detached replay wire that failed before the GPU lease."""
+
+    module = _formalizer_module()
+
+    def completed(command: list[str], **_kwargs: object) -> SimpleNamespace:
+        script = command[2]
+        compile(script, "<historical-g3-replay>", "exec")
+        assert "manifest_files=pile.manifest.get('files')" in script
+        assert "storage['idx']['size_bytes']" not in script
+        assert command[-1] == str(module.EXPECTED_PILE_HASHED_BYTES)
+        output = Path(command[5])
+        fixture = Path(command[6])
+        fixture.write_bytes(b"frozen-fixture")
+        payload = {
+            "schema_version": "stage1-s1-7-historical-g3-replay-v1",
+            "status": "PASS",
+            "model": {},
+            "tokenizer": {},
+            "pile": {},
+            "asset_identity": {},
+            "resolution_commit_artifact_hash": module.EXPECTED_G3_COMMIT_ARTIFACT_HASH,
+            "resolution_artifact_hash": module.EXPECTED_G3_PAYLOAD_HASH,
+            "fixture_file": fixture.name,
+            "fixture_file_sha256": hashlib.sha256(fixture.read_bytes()).hexdigest(),
+            "token_sha256": {},
+            "dropout_probabilities": {},
+            "resolve_hash_seconds": 1.0,
+            "dataset_rehash_seconds": 1.0,
+            "qualified_resolution_hashed_bytes": module.EXPECTED_PILE_HASHED_BYTES,
+            "dataset_rehash_bytes": module.EXPECTED_PILE_HASHED_BYTES,
+            "pile_hash_passes": 2,
+            "network_policy": {
+                "hf_hub_offline": True,
+                "transformers_offline": True,
+                "datasets_offline": True,
+                "cuda_visible_devices": True,
+                "cuda_is_available": False,
+                "operations": [],
+                "external_attempts": [],
+            },
+        }
+        payload["replay_hash"] = module._canonical(payload)
+        output.write_text(json.dumps(payload), encoding="utf-8")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(module.subprocess, "run", completed)
+    replay = module._historical_asset_replay(
+        tmp_path / "checkout",
+        tmp_path / "data",
+        tmp_path,
+        module.EXPECTED_G3_RESOLUTION,
+    )
+    assert replay["qualified_resolution_hashed_bytes"] == 31_757_184_042
+    assert replay["dataset_rehash_bytes"] == 31_757_184_042
+    assert replay["pile_hash_passes"] == 2
+
+
+def test_s17_historical_replay_failure_records_hash_only_diagnostics(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = _formalizer_module()
+    monkeypatch.setattr(
+        module.subprocess,
+        "run",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            returncode=7, stdout="safe stdout", stderr="sensitive diagnostic"
+        ),
+    )
+    with pytest.raises(module.Stage1S17FormalError) as caught:
+        module._historical_asset_replay(
+            tmp_path / "checkout",
+            tmp_path / "data",
+            tmp_path,
+            module.EXPECTED_G3_RESOLUTION,
+        )
+    message = str(caught.value)
+    assert "returncode=7" in message
+    assert "stdout_sha256=" in message and "stderr_sha256=" in message
+    assert "safe stdout" not in message and "sensitive diagnostic" not in message
+    assert (tmp_path / "historical-g3-replay.stdout.txt").read_text(encoding="utf-8") == "safe stdout"
+    assert (tmp_path / "historical-g3-replay.stderr.txt").read_text(encoding="utf-8") == "sensitive diagnostic"
+
+
 def test_s17_fixture_parser_binds_identity_and_provenance_after_rehash() -> None:
     module = _formalizer_module()
     provenance = {

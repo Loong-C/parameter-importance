@@ -56,6 +56,7 @@ EXPECTED_RUNTIME_ASSETS = {
     "tokenizer": {"logical_name": "pythia-tokenizer", "asset_id": "b5eebc43fe88687e5bf692761f1db25f91e8d6f9a8cceaa2342d2624ac1f652d", "revision": "e361f9afd54b3e7856879eead5326d36ff6f32d7", "ready_manifest_sha256": "ea59f3f8e37321208701326b2ea88b7491450a88eae870775beeff027d102794", "vocab_size": 50277},
     "pile": {"logical_name": "pile-selected-prefix", "asset_id": "dbbfeb12bab4027b386bd97d604d8134699e96f79e309cceacff7999a55b5dad", "revision": "4647773ea142ab1ff5694602fa104bbf49088408", "ready_manifest_sha256": "345cd0f49d35ad9543daa3f95118013c55bdd729ed87fdec3c7a7c93ae449f8b"},
 }
+EXPECTED_PILE_HASHED_BYTES = 31_757_184_042
 _COMMIT = re.compile(r"^[0-9a-f]{40}$")
 _DIGEST = re.compile(r"^[0-9a-f]{64}$")
 _ATTEMPT = re.compile(r"^[a-z0-9][a-z0-9-]{0,63}$")
@@ -549,17 +550,37 @@ try:
 finally: dataset.close()
 model_config=json.loads((model.resolved.root/'config.json').read_text(encoding='utf-8'))
 dropout={key:float(value) for key,value in model_config.items() if 'dropout' in key.lower() and isinstance(value,(int,float)) and not isinstance(value,bool)}
-storage=pile.manifest['metadata']['storage']; pile_hashed_bytes=int(storage['idx']['size_bytes'])+sum(int(shard['size_bytes']) for shard in storage['shards'])
+manifest_files=pile.manifest.get('files'); storage=pile.manifest['metadata']['storage']; resolution_entries=assets.resolution.get('entries')
+if not isinstance(manifest_files,list) or len(manifest_files)!=2 or not isinstance(resolution_entries,list): raise RuntimeError('S17_PILE_HASHED_BYTES_WIRE_INVALID')
+expected_file_roles={(storage['idx']['path'],'index')}
+shards=storage.get('shards')
+if not isinstance(shards,list) or len(shards)!=1: raise RuntimeError('S17_PILE_HASHED_BYTES_WIRE_INVALID')
+expected_file_roles.add((shards[0]['path'],'token_shard')); observed_file_roles=set(); pile_hashed_bytes=0
+for descriptor in manifest_files:
+ if not isinstance(descriptor,dict) or set(descriptor)!={'path','role','sha256','size_bytes'}: raise RuntimeError('S17_PILE_HASHED_BYTES_WIRE_INVALID')
+ size=descriptor['size_bytes']; digest=descriptor['sha256']; identity=(descriptor['path'],descriptor['role'])
+ if isinstance(size,bool) or not isinstance(size,int) or size<=0 or not isinstance(digest,str) or len(digest)!=64 or any(character not in '0123456789abcdef' for character in digest) or identity in observed_file_roles: raise RuntimeError('S17_PILE_HASHED_BYTES_WIRE_INVALID')
+ observed_file_roles.add(identity); pile_hashed_bytes+=size
+pile_entries=[entry for entry in resolution_entries if isinstance(entry,dict) and entry.get('logical_name')=='pile-selected-prefix']
+expected_pile_hashed_bytes=int(sys.argv[5])
+if observed_file_roles!=expected_file_roles or len(pile_entries)!=1 or isinstance(pile_entries[0].get('bytes_checked'),bool) or pile_entries[0].get('bytes_checked')!=pile_hashed_bytes or pile_hashed_bytes!=expected_pile_hashed_bytes: raise RuntimeError('S17_PILE_HASHED_BYTES_BINDING_INVALID')
 payload={'schema_version':'stage1-s1-7-historical-g3-replay-v1','status':'PASS','model':model.provenance(),'tokenizer':tokenizer.provenance(),'pile':pile.provenance(),'asset_identity':{'model':{'logical_name':'pythia-14m-step0','asset_id':model.resolved.asset_id,'revision':model.resolved.revision,'ready_manifest_sha256':model.ready_manifest_sha256,'parameter_count':model.manifest['metadata']['parameter_count'],'root':str(model.resolved.root)},'tokenizer':{'logical_name':'pythia-tokenizer','asset_id':tokenizer.resolved.asset_id,'revision':tokenizer.resolved.revision,'ready_manifest_sha256':tokenizer.ready_manifest_sha256,'root':str(tokenizer.resolved.root),'vocab_size':tokenizer.manifest['metadata']['vocab_size']},'pile':{'logical_name':'pile-selected-prefix','asset_id':pile.resolved.asset_id,'revision':pile.resolved.revision,'ready_manifest_sha256':pile.ready_manifest_sha256}},'resolution_commit_artifact_hash':committed.identity.artifact_hash,'resolution_artifact_hash':assets.resolution_artifact_hash,'fixture_file':fixture.name,'fixture_file_sha256':sha_file(fixture),'token_sha256':hashes,'dropout_probabilities':dropout,'resolve_hash_seconds':resolve_seconds,'dataset_rehash_seconds':time.monotonic()-start,'qualified_resolution_hashed_bytes':pile_hashed_bytes,'dataset_rehash_bytes':pile_hashed_bytes,'pile_hash_passes':2,'network_policy':{'hf_hub_offline':os.environ.get('HF_HUB_OFFLINE')=='1','transformers_offline':os.environ.get('TRANSFORMERS_OFFLINE')=='1','datasets_offline':os.environ.get('HF_DATASETS_OFFLINE')=='1','cuda_visible_devices':os.environ.get('CUDA_VISIBLE_DEVICES')=='','cuda_is_available':bool(torch.cuda.is_available()),'operations':['committed-resolution-parse','qualified-local-manifest-parse','local-pile-mmap-hash-and-fixture-extraction'],'external_attempts':[]}}
 payload['replay_hash']=canonical(payload)
 output.write_text(json.dumps(payload,sort_keys=True,separators=(',',':')),encoding='utf-8')'''
     environment = dict(os.environ)
     environment.update({"PYTHONPATH": str(checkout / "src"), "HF_HUB_OFFLINE": "1", "TRANSFORMERS_OFFLINE": "1", "HF_DATASETS_OFFLINE": "1", "CUDA_VISIBLE_DEVICES": ""})
-    completed = subprocess.run([sys.executable, "-c", script, str(data_root), resolution_ref, str(output), str(fixture_path)], cwd=checkout, text=True, capture_output=True, check=False, timeout=3600, env=environment)
-    (work / "historical-g3-replay.stdout.txt").write_text(completed.stdout, encoding="utf-8")
-    (work / "historical-g3-replay.stderr.txt").write_text(completed.stderr, encoding="utf-8")
+    completed = subprocess.run([sys.executable, "-c", script, str(data_root), resolution_ref, str(output), str(fixture_path), str(EXPECTED_PILE_HASHED_BYTES)], cwd=checkout, text=True, capture_output=True, check=False, timeout=3600, env=environment)
+    stdout_path = work / "historical-g3-replay.stdout.txt"
+    stderr_path = work / "historical-g3-replay.stderr.txt"
+    stdout_path.write_text(completed.stdout, encoding="utf-8")
+    stderr_path.write_text(completed.stderr, encoding="utf-8")
     if completed.returncode or not output.is_file() or not fixture_path.is_file():
-        raise Stage1S17FormalError("S17_HISTORICAL_PRODUCER_REPLAY_FAILED")
+        raise Stage1S17FormalError(
+            "S17_HISTORICAL_PRODUCER_REPLAY_FAILED:"
+            f"returncode={completed.returncode}:"
+            f"stdout_sha256={_sha(stdout_path)}:stderr_sha256={_sha(stderr_path)}:"
+            f"output_present={output.is_file()}:fixture_present={fixture_path.is_file()}"
+        )
     replay = _mapping(json.loads(output.read_text(encoding="utf-8")), field="historical_g3_replay")
     expected = {"schema_version", "status", "model", "tokenizer", "pile", "asset_identity", "resolution_commit_artifact_hash", "resolution_artifact_hash", "fixture_file", "fixture_file_sha256", "token_sha256", "dropout_probabilities", "resolve_hash_seconds", "dataset_rehash_seconds", "qualified_resolution_hashed_bytes", "dataset_rehash_bytes", "pile_hash_passes", "network_policy", "replay_hash"}
     if set(replay) != expected or replay.get("schema_version") != "stage1-s1-7-historical-g3-replay-v1" or replay.get("status") != "PASS" or replay.get("replay_hash") != _canonical({key: value for key, value in replay.items() if key != "replay_hash"}):
@@ -569,7 +590,11 @@ output.write_text(json.dumps(payload,sort_keys=True,separators=(',',':')),encodi
     network = _mapping(replay.get("network_policy"), field="historical.network_policy")
     if network.get("external_attempts") != [] or network.get("cuda_is_available") is not False or not all(network.get(key) is True for key in ("hf_hub_offline", "transformers_offline", "datasets_offline", "cuda_visible_devices")):
         raise Stage1S17FormalError("S17_HISTORICAL_PRODUCER_OFFLINE_POLICY_INVALID")
-    if any(not isinstance(replay.get(field), int) or int(replay[field]) <= 0 for field in ("qualified_resolution_hashed_bytes", "dataset_rehash_bytes")):
+    if (
+        replay.get("qualified_resolution_hashed_bytes") != EXPECTED_PILE_HASHED_BYTES
+        or replay.get("dataset_rehash_bytes") != EXPECTED_PILE_HASHED_BYTES
+        or replay.get("pile_hash_passes") != 2
+    ):
         raise Stage1S17FormalError("S17_HISTORICAL_PRODUCER_HASH_BYTES_INVALID")
     return replay
 
