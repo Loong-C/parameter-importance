@@ -803,6 +803,18 @@ def _finite_number(value: object) -> bool:
     return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(float(value))
 
 
+def _executed_u_estimator_name(clip_factor: object) -> str:
+    """Return the public estimator actually staged by TrainingEngine."""
+
+    if not _finite_number(clip_factor) or not 0.0 < float(clip_factor) <= 1.0:
+        raise Stage1S17WorkerError("S17_WORKER_RECORD_CLIP_FACTOR_INVALID")
+    return (
+        "local_gradient_space_importance_u_weighted"
+        if float(clip_factor) == 1.0
+        else "local_gradient_space_importance_u_clipped"
+    )
+
+
 def _training_parity(
     off: Mapping[str, object], on: Mapping[str, object],
     off_parameters: Mapping[int, Mapping[str, torch.Tensor]], on_parameters: Mapping[int, Mapping[str, torch.Tensor]],
@@ -850,7 +862,11 @@ def _training_parity(
         # disabled estimator as if it had executed.
         if left.get("status") != "COMMITTED" or right.get("status") != "COMMITTED":
             raise Stage1S17WorkerError("S17_WORKER_RECORD_STATUS_INVALID")
-        if left.get("estimator_name") is not None or right.get("estimator_name") != "u":
+        if (
+            left.get("estimator_name") is not None
+            or right.get("estimator_name")
+            != _executed_u_estimator_name(right.get("clip_factor"))
+        ):
             raise Stage1S17WorkerError("S17_WORKER_RECORD_ESTIMATOR_WIRE_INVALID")
         for field in ("status", "mean_loss", "effective_count", "global_gradient_norm", "clip_factor", "parameter_post_state_hash", "attempt_commit_state_hash"):
             if left.get(field) != right.get(field): raise Stage1S17WorkerError(f"S17_WORKER_TRAINING_RECORD_DRIFT:{field}")

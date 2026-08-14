@@ -1144,6 +1144,23 @@ def _validate_trace_observer_contract(trace: Mapping[str, Any], *, statistics: b
             raise Stage1S17FormalError("S17_TRAINING_ON_SNAPSHOT_STEP_INVALID")
 
 
+def _formal_u_estimator_name(clip_factor: object) -> str:
+    """Independently derive the public estimator name from persisted clipping."""
+
+    if (
+        isinstance(clip_factor, bool)
+        or not isinstance(clip_factor, (int, float))
+        or not math.isfinite(float(clip_factor))
+        or not 0.0 < float(clip_factor) <= 1.0
+    ):
+        raise Stage1S17FormalError("S17_TRAINING_RECORD_CLIP_FACTOR_INVALID")
+    return (
+        "local_gradient_space_importance_u_weighted"
+        if float(clip_factor) == 1.0
+        else "local_gradient_space_importance_u_clipped"
+    )
+
+
 def _validate_registry_audit(report: Mapping[str, Any]) -> None:
     """Require the persisted audit to prove the fresh-model registry reload."""
 
@@ -1183,18 +1200,20 @@ def _validate_report(
     off = _mapping(training.get("statistics_off"), field="training.statistics_off")
     if on.get("temporary_state_bounded") is not True or not isinstance(on.get("observer_rows"), list) or not isinstance(off.get("observer_rows"), list) or len(on["observer_rows"]) != 6 or len(off["observer_rows"]) != 6 or not isinstance(training.get("per_step_parity"), list) or len(training["per_step_parity"]) != 2:
         raise Stage1S17FormalError("S17_TRAINING_STEP_EVIDENCE_INVALID")
-    for trace, estimator in ((off, None), (on, "u")):
+    for trace, statistics in ((off, False), (on, True)):
         records = trace.get("records")
-        if (
-            not isinstance(records, list) or len(records) != 2
-            or any(
-                not isinstance(record, Mapping)
-                or record.get("status") != "COMMITTED"
-                or record.get("estimator_name") != estimator
-                for record in records
-            )
-        ):
+        if not isinstance(records, list) or len(records) != 2:
             raise Stage1S17FormalError("S17_TRAINING_RECORD_WIRE_INVALID")
+        for record in records:
+            if not isinstance(record, Mapping) or record.get("status") != "COMMITTED":
+                raise Stage1S17FormalError("S17_TRAINING_RECORD_WIRE_INVALID")
+            clip_factor = record.get("clip_factor")
+            if statistics:
+                expected_estimator = _formal_u_estimator_name(clip_factor)
+            else:
+                expected_estimator = None
+            if record.get("estimator_name") != expected_estimator:
+                raise Stage1S17FormalError("S17_TRAINING_RECORD_ESTIMATOR_WIRE_INVALID")
     _validate_trace_observer_contract(off, statistics=False)
     _validate_trace_observer_contract(on, statistics=True)
     component_fields = {"parameters_sha256", "buffers_sha256", "model_modes_sha256", "torch_cpu_rng_sha256", "torch_cuda_rng_sha256", "python_rng_sha256", "numpy_rng_sha256", "scheduler", "optimizer_tensors_sha256", "optimizer_groups_sha256"}

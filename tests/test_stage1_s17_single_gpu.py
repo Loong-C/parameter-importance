@@ -19,12 +19,17 @@ import torch
 import yaml
 
 from param_importance_nlp.contracts.task_catalog import DEFAULT_TASK_CATALOG
-from param_importance_nlp.runtime.training import TrainingStepRecord
+from param_importance_nlp.providers import (
+    DeterministicBatchCursor, TorchModelAdapter, TrainingMicrobatch,
+)
+from param_importance_nlp.runtime.training import (
+    TrainingEngine, TrainingRunSpec, TrainingStepRecord,
+)
 from param_importance_nlp.stage1_single_gpu import (
     EXPECTED_MODEL_CONFIG_VOCAB_SIZE, EXPECTED_TOKENIZER_RUNTIME_VOCAB_SIZE,
     PYTHIA_ACTIVE_DROPOUT_FIELDS, T32_ATOL, T32_NORMALIZED_L2_LIMIT, T32_RTOL,
     Stage1S17WorkerError, _active_gpt_neox_dropout, _adamw_group_wire,
-    _fixed_array_bundle, _optimizer_state_tensors, _state_components,
+    _executed_u_estimator_name, _fixed_array_bundle, _optimizer_state_tensors, _state_components,
     _validate_two_step_training_result,
 )
 from param_importance_nlp.stage1_single_gpu_oracle import Stage1S17OracleError, max_error, raw_double_and_u
@@ -460,14 +465,18 @@ def test_s17_schemas_are_strict_and_bind_fixture_identity_and_next_tasks() -> No
     assert {"historical_producer_attestation", "historical_g3_replay", "historical_g3_replay_stdout", "historical_g3_replay_stderr", "resource_summary"} <= set(index["definitions"]["reproduction_refs"]["required"])
     assert "success_marker" not in index["definitions"]["reproduction_refs"]["required"]
     assert report["definitions"]["training_record"]["properties"]["status"]["const"] == "COMMITTED"
-    assert report["definitions"]["training_record"]["properties"]["estimator_name"]["enum"] == ["u", None]
+    assert report["definitions"]["training_record"]["properties"]["estimator_name"]["enum"] == [
+        "local_gradient_space_importance_u_weighted",
+        "local_gradient_space_importance_u_clipped",
+        None,
+    ]
 
 
-def _training_record(*, estimator_name: str | None) -> dict[str, object]:
+def _training_record(*, estimator_name: str | None, clip_factor: float = 1.0) -> dict[str, object]:
     return TrainingStepRecord(
         attempt_index=1, global_step=1, status="COMMITTED",
         batch_ids=("a", "b", "c", "d"), mean_loss=1.0,
-        effective_count=8192, global_gradient_norm=1.0, clip_factor=1.0,
+        effective_count=8192, global_gradient_norm=1.0, clip_factor=clip_factor,
         estimator_name=estimator_name, parameter_post_state_hash="a" * 64,
         attempt_commit_state_hash="b" * 64,
     ).to_dict()
@@ -481,8 +490,15 @@ def test_s17_training_step_record_schema_uses_actual_committed_wire() -> None:
     assert s16_spec is not None and s16_spec.loader is not None
     s16 = importlib.util.module_from_spec(s16_spec); s16_spec.loader.exec_module(s16)
     registry = {"s1-7-single-gpu-report-v1.json": report_schema, report_schema["$id"]: report_schema}
-    for record in (_training_record(estimator_name=None), _training_record(estimator_name="u")):
+    for record in (
+        _training_record(estimator_name=None),
+        _training_record(estimator_name="local_gradient_space_importance_u_weighted"),
+        _training_record(estimator_name="local_gradient_space_importance_u_clipped", clip_factor=0.5),
+    ):
         s16._validate_schema(record, report_schema["definitions"]["training_record"], registry, document=report_schema, path="record")
+    invalid_estimator = _training_record(estimator_name="u")
+    with pytest.raises(Exception):
+        s16._validate_schema(invalid_estimator, report_schema["definitions"]["training_record"], registry, document=report_schema, path="record")
     invalid = _training_record(estimator_name=None); invalid["status"] = "PASS"
     with pytest.raises(Exception):
         s16._validate_schema(invalid, report_schema["definitions"]["training_record"], registry, document=report_schema, path="record")
@@ -491,6 +507,74 @@ def test_s17_training_step_record_schema_uses_actual_committed_wire() -> None:
         "total_movement", "total_displacement", "weight_decay_movement", "weight_decay_displacement",
         "actual_update_raw_importance", "magnitude", "initial_parameters", "last_parameters",
     }
+
+
+def test_s17_executed_u_estimator_name_tracks_clip_semantics() -> None:
+    formal = _formalizer_module()
+    assert _executed_u_estimator_name(1.0) == "local_gradient_space_importance_u_weighted"
+    assert _executed_u_estimator_name(0.5) == "local_gradient_space_importance_u_clipped"
+    assert formal._formal_u_estimator_name(1.0) == "local_gradient_space_importance_u_weighted"
+    assert formal._formal_u_estimator_name(0.5) == "local_gradient_space_importance_u_clipped"
+    for invalid in (0.0, -0.1, 1.1, True, float("inf")):
+        with pytest.raises(Stage1S17WorkerError, match="S17_WORKER_RECORD_CLIP_FACTOR_INVALID"):
+            _executed_u_estimator_name(invalid)
+        with pytest.raises(formal.Stage1S17FormalError, match="S17_TRAINING_RECORD_CLIP_FACTOR_INVALID"):
+            formal._formal_u_estimator_name(invalid)
+
+
+def test_s17_real_training_engine_distinguishes_configured_and_executed_u_names() -> None:
+    class TinyClassifier(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__(); self.projection = torch.nn.Linear(3, 2)
+
+        def forward(self, features: torch.Tensor) -> torch.Tensor:
+            return self.projection(features)
+
+    def run(*, statistics: bool, max_norm: float, steps: int) -> object:
+        torch.manual_seed(1707)
+        model = TinyClassifier()
+        batches: list[tuple[TrainingMicrobatch, ...]] = []
+        for step in range(steps):
+            micros: list[TrainingMicrobatch] = []
+            for micro in range(2):
+                offset = step * 0.1 + micro * 0.03
+                micros.append(TrainingMicrobatch(
+                    batch_id=f"tiny-{step}-{micro}",
+                    payload={
+                        "features": torch.tensor(
+                            [[1.0 + offset, 0.0, 0.5], [0.0, 1.0 + offset, -0.5]],
+                            dtype=torch.float32,
+                        ),
+                        "labels": torch.tensor([0, 1], dtype=torch.int64),
+                    },
+                    sample_ids=(f"tiny-{step}-{micro}-a", f"tiny-{step}-{micro}-b"),
+                ))
+            batches.append(tuple(micros))
+        optimizer = torch.optim.SGD(model.parameters(), lr=0.01, foreach=False)
+        engine = TrainingEngine(
+            spec=TrainingRunSpec(
+                f"s17-estimator-wire-{statistics}-{max_norm}", "local_fixture",
+                max_steps=steps, max_attempts=steps, importance_enabled=statistics,
+                estimator_name="u", accumulation_dtype="float32",
+                max_grad_norm=max_norm, weights_exogenous=True,
+                common_mean_assumption=True,
+            ),
+            model=TorchModelAdapter(model, task_type="sequence_classification"),
+            optimizer=optimizer, cursor=DeterministicBatchCursor(tuple(batches)),
+        )
+        return engine.run()
+
+    off = run(statistics=False, max_norm=100.0, steps=2)
+    weighted = run(statistics=True, max_norm=100.0, steps=2)
+    clipped = run(statistics=True, max_norm=1.0e-9, steps=1)
+    assert off.status == weighted.status == clipped.status == "COMPLETE"
+    assert [record.estimator_name for record in off.records] == [None, None]
+    assert [record.estimator_name for record in weighted.records] == [
+        "local_gradient_space_importance_u_weighted",
+        "local_gradient_space_importance_u_weighted",
+    ]
+    assert clipped.records[0].estimator_name == "local_gradient_space_importance_u_clipped"
+    assert clipped.records[0].clip_factor is not None and 0.0 < clipped.records[0].clip_factor < 1.0
 
 
 def test_s17_report_context_resource_and_replay_contracts_reject_rehashed_drift() -> None:
