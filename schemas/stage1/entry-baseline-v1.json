@@ -1,0 +1,37 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://parameter-importance.invalid/schemas/stage1/entry-baseline-v1.json",
+  "title": "Stage 1 entry baseline",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "scope",
+    "formal_eligible",
+    "checked_at",
+    "repository",
+    "agent_files",
+    "filesystem",
+    "cache_policy",
+    "write_path_audit",
+    "runtime",
+    "external_evidence",
+    "checks",
+    "failed_checks"
+  ],
+  "properties": {
+    "schema_version": {"const": "stage1-entry-baseline-v1"},
+    "scope": {"enum": ["local_fixture", "formal"]},
+    "formal_eligible": {"type": "boolean"},
+    "checked_at": {"type": "string", "format": "date-time"},
+    "repository": {"type": "object"},
+    "agent_files": {"type": "object"},
+    "filesystem": {"type": "object"},
+    "cache_policy": {"type": "object"},
+    "write_path_audit": {"type": "object"},
+    "runtime": {"type": "object"},
+    "external_evidence": {"type": "object"},
+    "checks": {"type": "object", "additionalProperties": {"type": "boolean"}},
+    "failed_checks": {"type": "array", "items": {"type": "string"}}
+  }
+}

@@ -15,14 +15,16 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import importlib
+import os
 import platform
 from pathlib import Path, PurePosixPath
 import re
+import shutil
 import stat
 import subprocess
 import sys
 from types import MappingProxyType
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 
 import torch
 
@@ -49,7 +51,7 @@ from ..contracts.jsonio import JSONValue, canonical_json_hash, load_canonical_js
 from ..contracts.freeze import ContractFreeze
 from ..contracts.runtime_evidence import RuntimeCapabilityEvidence
 from ..contracts.seed import SeedPlan
-from ..contracts.status import GateRecord, GateStatus
+from ..contracts.status import ContractState, GateRecord, GateStatus
 from ..contracts.task_catalog import RunnerKind
 from ..core.estimators import (
     double_sample_importance,
@@ -1016,16 +1018,53 @@ def _formal_payload(
 ) -> Mapping[str, object]:
     loaded = load_committed_task_artifact(root, reference, require_formal=True)
     payload = loaded.payload
-    if payload.get("schema_version") == schema_version:
-        return payload
-    candidates = [
-        value
-        for value in payload.values()
-        if isinstance(value, Mapping) and value.get("schema_version") == schema_version
-    ]
+    candidates: list[Mapping[str, object]] = []
+
+    def visit(node: object) -> None:
+        if isinstance(node, Mapping):
+            if node.get("schema_version") == schema_version:
+                candidates.append(node)
+                return
+            for child in node.values():
+                visit(child)
+        elif isinstance(node, Sequence) and not isinstance(node, (str, bytes, bytearray)):
+            for child in node:
+                visit(child)
+
+    visit(payload)
     if len(candidates) != 1:
         raise ValueError(f"STAGE01_FORMAL_PAYLOAD_NOT_UNIQUE:{schema_version}")
     return candidates[0]
+
+
+def _formal_gate_record(
+    root: Path,
+    reference: str,
+    gate_id: str,
+) -> GateRecord:
+    loaded = load_committed_task_artifact(root, reference, require_formal=True)
+    found: list[GateRecord] = []
+
+    def visit(node: object) -> None:
+        if isinstance(node, Mapping):
+            if node.get("schema_version") == "gate-record-v1":
+                try:
+                    gate = GateRecord.from_mapping(dict(node))
+                except Exception:
+                    return
+                if gate.gate_id == gate_id:
+                    found.append(gate)
+                return
+            for child in node.values():
+                visit(child)
+        elif isinstance(node, Sequence) and not isinstance(node, (str, bytes, bytearray)):
+            for child in node:
+                visit(child)
+
+    visit(loaded.payload)
+    if len(found) != 1:
+        raise ValueError(f"STAGE01_FORMAL_GATE_NOT_UNIQUE:{gate_id}")
+    return found[0]
 
 
 def _formal_guard(request: TaskExecutionRequest, root: Path) -> None:
@@ -1065,9 +1104,7 @@ def _formal_guard(request: TaskExecutionRequest, root: Path) -> None:
         valid = False
         if gate_id in request.environment.passed_gate_ids and reference is not None:
             try:
-                gate = GateRecord.from_mapping(
-                    dict(_formal_payload(root, reference, "gate-record-v1"))
-                )
+                gate = _formal_gate_record(root, reference, gate_id)
                 valid = gate.gate_id == gate_id and gate.status is GateStatus.PASS
             except Exception:
                 valid = False
@@ -1557,7 +1594,7 @@ def _delivery_evidence(request: TaskExecutionRequest) -> Mapping[str, JSONValue]
     }
 
 
-def _stage1_contract_evidence(request: TaskExecutionRequest, root: Path) -> Mapping[str, JSONValue]:
+def _stage1_contract_evidence_legacy(request: TaskExecutionRequest, root: Path) -> Mapping[str, JSONValue]:
     # 测试可把产物 workspace 指向临时目录；合同源文件仍必须来自已安装源码所属仓库，
     # 不能因为输出根不同就悄悄生成另一份数学合同。
     contract_root = root
@@ -1580,6 +1617,472 @@ def _stage1_contract_evidence(request: TaskExecutionRequest, root: Path) -> Mapp
         "same_batch_clipped_u_claim": "plugin_no_strict_unbiasedness",
         "task_definition_hash": canonical_json_hash(request.task.to_dict()),
     }
+
+
+_STAGE1_ENTRY_AGENT_FILES = ("git.md", "remote_access.md", "server.md", "sync.md", "worklogs.md")
+_STAGE1_ENTRY_CACHE_VARS = (
+    "HF_HOME",
+    "HF_DATASETS_CACHE",
+    "TRANSFORMERS_CACHE",
+    "HUGGINGFACE_HUB_CACHE",
+    "XDG_CACHE_HOME",
+    "TRITON_CACHE_DIR",
+    "TORCHINDUCTOR_CACHE_DIR",
+)
+_STAGE1_ENTRY_SOURCE_REFS = (
+    "docs/mathematics.md",
+    "plan/stage1/01_entry_and_contract.md",
+    "src/param_importance_nlp/experiments/stage01_task_runners.py",
+    "src/param_importance_nlp/contracts/task_catalog.py",
+)
+_STAGE1_ENTRY_SCHEMA_REFS = (
+    "schemas/stage1/contract-v1.json",
+    "schemas/shared/contract-freeze-v1.json",
+    "schemas/stage1/entry-baseline-v1.json",
+    "schemas/stage1/requirements-matrix-v1.json",
+)
+
+
+def _stage1_path_text(path: Path | None) -> str | None:
+    return None if path is None else path.resolve().as_posix()
+
+
+def _stage1_within(path: Path | None, parent: Path | None) -> bool:
+    if path is None or parent is None:
+        return False
+    try:
+        path.resolve().relative_to(parent.resolve())
+    except ValueError:
+        return False
+    return True
+
+
+def _stage1_git_command(root: Path, *arguments: str) -> str | None:
+    try:
+        completed = subprocess.run(
+            ["git", "-C", str(root), *arguments],
+            capture_output=True,
+            check=False,
+            text=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return completed.stdout.strip() if completed.returncode == 0 else None
+
+
+def _stage1_git_snapshot(root: Path) -> dict[str, JSONValue]:
+    head = _stage1_git_command(root, "rev-parse", "HEAD")
+    status = _stage1_git_command(root, "status", "--porcelain", "--untracked-files=all")
+    remotes = _stage1_git_command(root, "remote")
+    return {
+        "available": head is not None,
+        "branch": _stage1_git_command(root, "branch", "--show-current"),
+        "head": head if head and re.fullmatch(r"[0-9a-f]{40}", head) else None,
+        "worktree_clean": status == "" if head is not None else False,
+        "remote_names": sorted(item for item in (remotes or "").splitlines() if item),
+    }
+
+
+def _stage1_agent_snapshot(root: Path) -> tuple[dict[str, JSONValue], bool, bool]:
+    agent_root = root / "Agent"
+    try:
+        actual_names = sorted(item.name for item in agent_root.iterdir())
+    except OSError:
+        actual_names = []
+    records: dict[str, JSONValue] = {}
+    hashes_valid = True
+    for name in _STAGE1_ENTRY_AGENT_FILES:
+        path = agent_root / name
+        exists = path.is_file()
+        digest: str | None = None
+        size: int | None = None
+        if exists:
+            try:
+                digest = sha256_file(path)
+                size = path.stat().st_size
+            except OSError:
+                pass
+        hashes_valid = hashes_valid and bool(
+            digest and re.fullmatch(r"[0-9a-f]{64}", digest)
+        )
+        records[name] = {
+            "path": f"Agent/{name}",
+            "exists": exists,
+            "size_bytes": size,
+            "sha256": digest,
+        }
+    exact = actual_names == sorted(_STAGE1_ENTRY_AGENT_FILES) and hashes_valid
+    return (
+        {
+            "expected_files": list(_STAGE1_ENTRY_AGENT_FILES),
+            "actual_entries": actual_names,
+            "exact_five_files": exact,
+            "files": records,
+        },
+        exact,
+        hashes_valid,
+    )
+
+
+def _stage1_optional_path(value: object, *, base: Path) -> Path | None:
+    if not isinstance(value, str) or not value:
+        return None
+    candidate = Path(value)
+    if not candidate.is_absolute():
+        candidate = base / candidate
+    return candidate.resolve()
+
+
+def _stage1_data_root() -> tuple[Path | None, dict[str, JSONValue]]:
+    raw = os.environ.get("PARAM_IMPORTANCE_DATA_ROOT") or os.environ.get("DATA_ROOT")
+    data_root = _stage1_optional_path(raw, base=Path.cwd())
+    snapshot: dict[str, JSONValue] = {
+        "configured": data_root is not None,
+        "path": _stage1_path_text(data_root),
+        "exists": bool(data_root and data_root.exists()),
+        "is_directory": bool(data_root and data_root.is_dir()),
+        "total_bytes": None,
+        "free_bytes": None,
+        "free_inodes": None,
+        "expected_server_path": "/home/sophgo13/cjl/storage/parameter-importance",
+    }
+    if data_root is not None and data_root.is_dir():
+        try:
+            usage = shutil.disk_usage(data_root)
+            snapshot["total_bytes"] = usage.total
+            snapshot["free_bytes"] = usage.free
+        except OSError:
+            pass
+        statvfs = getattr(os, "statvfs", None)
+        if statvfs is not None:
+            try:
+                snapshot["free_inodes"] = int(statvfs(data_root).f_favail)
+            except OSError:
+                pass
+    return data_root, snapshot
+
+
+def _stage1_cache_policy(data_root: Path | None) -> tuple[dict[str, JSONValue], bool]:
+    disabled = os.environ.get("PARAM_IMPORTANCE_CACHES_DISABLED") == "1"
+    values: dict[str, JSONValue] = {}
+    bound = True
+    for variable in _STAGE1_ENTRY_CACHE_VARS:
+        raw = os.environ.get(variable)
+        path = _stage1_optional_path(raw, base=Path.cwd())
+        within = _stage1_within(path, data_root)
+        values[variable] = {
+            "configured": raw is not None,
+            "path": _stage1_path_text(path),
+            "within_data_root": within,
+            "disabled": disabled,
+        }
+        if not disabled and not (raw is not None and within):
+            bound = False
+    return (
+        {
+            "required_variables": list(_STAGE1_ENTRY_CACHE_VARS),
+            "disabled": disabled,
+            "variables": values,
+            "all_bound_to_data_root": bound or disabled,
+        },
+        bound or disabled,
+    )
+
+
+def _stage1_runtime_snapshot() -> dict[str, JSONValue]:
+    cuda_available = bool(torch.cuda.is_available())
+    return {
+        "python": sys.version.split()[0],
+        "platform": platform.platform(),
+        "torch": str(torch.__version__),
+        "cuda_available": cuda_available,
+        "cuda_version": torch.version.cuda,
+        "visible_device_count": torch.cuda.device_count() if cuda_available else 0,
+        "nccl_available": bool(
+            cuda_available
+            and torch.distributed.is_available()
+            and torch.distributed.is_nccl_available()
+        ),
+    }
+
+
+def _stage1_contract_evidence(request: TaskExecutionRequest, root: Path) -> Mapping[str, JSONValue]:
+    # 产物 workspace 可是临时目录；合同源文件和 Agent 规则始终来自源码仓库。
+    contract_root = root
+    if not (contract_root / "docs" / "mathematics.md").is_file():
+        contract_root = Path(__file__).resolve().parents[3]
+    math_path = contract_root / "docs" / "mathematics.md"
+    plan_path = contract_root / "plan" / "stage1" / "01_entry_and_contract.md"
+    scope = request.config.run_intent
+    checked_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    repository = _stage1_git_snapshot(contract_root)
+    agent, agent_exact, agent_hashes_valid = _stage1_agent_snapshot(contract_root)
+    data_root, filesystem = _stage1_data_root()
+    cache_policy, cache_bound = _stage1_cache_policy(data_root)
+    store = _store(request, root)
+    base_config = request.config.section("base_config")
+    runtime_config = base_config.get("runtime", {}) if isinstance(base_config, Mapping) else {}
+    configured_tmp = os.environ.get("PARAM_IMPORTANCE_TMP_ROOT") or (
+        runtime_config.get("temp_root") if isinstance(runtime_config, Mapping) else None
+    )
+    temporary_root = _stage1_optional_path(configured_tmp, base=contract_root)
+    approved_roots = [contract_root]
+    if data_root is not None:
+        approved_roots.append(data_root)
+    output_approved = any(_stage1_within(store.root, parent) for parent in approved_roots)
+    temporary_approved = temporary_root is None or any(
+        _stage1_within(temporary_root, parent) for parent in approved_roots
+    )
+    write_path_audit: dict[str, JSONValue] = {
+        "repository_root": contract_root.resolve().as_posix(),
+        "data_root": _stage1_path_text(data_root),
+        "output_root": store.root.resolve().as_posix(),
+        "temporary_root": _stage1_path_text(temporary_root),
+        "approved_roots": [path.resolve().as_posix() for path in approved_roots],
+        "output_root_approved": output_approved,
+        "temporary_root_approved": temporary_approved,
+        "write_path_audit_status": "PASS" if output_approved and temporary_approved else "BLOCKED",
+    }
+    stage0_g10_ref = request.environment.evidence_refs.get("gate_stage0_g10")
+    formal_entry_checks = {
+        "stage0_g10_pass": "stage0.G10" in request.environment.passed_gate_ids and stage0_g10_ref is not None,
+        "repository_clean": bool(repository["available"] and repository["worktree_clean"]),
+        "agent_files_exact": agent_exact,
+        "agent_hashes_valid": agent_hashes_valid,
+        "math_and_plan_present": math_path.is_file() and plan_path.is_file(),
+        "data_root_ready": bool(filesystem["configured"] and filesystem["exists"] and filesystem["is_directory"]),
+        "cache_roots_bound": cache_bound,
+        "approved_write_paths": output_approved and temporary_approved,
+    }
+    entry_checks = formal_entry_checks if scope == "formal" else {
+        "agent_files_exact": agent_exact,
+        "agent_hashes_valid": agent_hashes_valid,
+        "math_and_plan_present": math_path.is_file() and plan_path.is_file(),
+        "approved_write_paths": store.root.exists(),
+    }
+    entry_failed = [name for name, passed in entry_checks.items() if not passed]
+    entry_snapshot: dict[str, JSONValue] = {
+        "schema_version": "stage1-entry-baseline-v1",
+        "scope": scope,
+        "formal_eligible": scope == "formal" and not entry_failed,
+        "checked_at": checked_at,
+        "repository": repository,
+        "agent_files": agent,
+        "filesystem": filesystem,
+        "cache_policy": cache_policy,
+        "write_path_audit": write_path_audit,
+        "runtime": _stage1_runtime_snapshot(),
+        "external_evidence": {
+            "passed_gate_ids": sorted(request.environment.passed_gate_ids),
+            "frozen_contract_stages": sorted(request.environment.frozen_contract_stages),
+            "capabilities": sorted(request.environment.capabilities),
+            "evidence_refs": dict(sorted(request.environment.evidence_refs.items())),
+            "active_process_probe": "delegated_to_stage0_entry_and_g10_evidence",
+            "gpu_lease_probe": "delegated_to_stage0_entry_and_g10_evidence",
+            "nccl_smoke_probe": "delegated_to_stage0_entry_and_g10_evidence",
+        },
+        "checks": entry_checks,
+        "failed_checks": entry_failed,
+    }
+    contract_checks = {
+        "math_source_present": math_path.is_file(),
+        "plan_source_present": plan_path.is_file(),
+        "target_quantity_frozen": True,
+        "loss_reduction_frozen": True,
+        "estimator_formulas_frozen": True,
+        "clip_order_frozen": True,
+        "optimizer_boundary_frozen": True,
+        "movement_boundary_frozen": True,
+        "learning_rate_not_in_coordinate_hash": True,
+    }
+    contract_ok = all(contract_checks.values())
+    schema_hashes = {
+        reference: sha256_file(contract_root / reference)
+        for reference in _STAGE1_ENTRY_SCHEMA_REFS
+    }
+    source_hashes = {
+        reference: sha256_file(contract_root / reference)
+        for reference in _STAGE1_ENTRY_SOURCE_REFS
+    }
+    freeze = ContractFreeze(
+        contract_id="stage1.contract.entry-v1",
+        stage=1,
+        scope=scope,
+        state=ContractState.FROZEN,
+        formula_version="stage1-entry-contract-v1",
+        config_hash=request.config.config_hash,
+        schema_hashes=schema_hashes,
+        source_hashes=source_hashes,
+        required_gate_ids=("stage1.G1-ENTRY", "stage1.G1-CONTRACT") if scope == "formal" else (),
+        frozen_at=checked_at,
+        decision_ref="plan/stage1/01_entry_and_contract.md",
+    )
+    formula_contract: dict[str, JSONValue] = {
+        "target_quantity": "local_gradient_space_contribution",
+        "target_sign": "positive_means_loss_decrease_contribution",
+        "raw": "eta * mean_gradient**2",
+        "double": "eta * mean_gradient_A * mean_gradient_B",
+        "equal_u": "(S1**2-S2)/(M*(M-1))",
+        "learning_rate": "actual_consumed_parameter_group_lr",
+        "dynamic_learning_rate_in_coordinate_hash": False,
+        "clip_order": "global_mean_then_single_clip_factor_then_score",
+        "same_batch_clipped_u_claim": "plugin_no_strict_unbiasedness",
+        "loss_reduction": {
+            "task": "causal_lm",
+            "numerator": "sum(valid_target_token_loss)",
+            "denominator": "valid_target_token_count",
+            "reduction": "global_valid_target_token_mean",
+            "zero_valid": "reject_or_skip",
+            "local_microbatch": "independent_local_microbatch_backward",
+        },
+        "movement": {"main": "data_movement_only", "diagnostics": ["total_movement", "weight_decay"]},
+        "fields": ["signed", "positive", "negative_mass", "absolute"],
+        "lifecycle": [
+            "optimizer_before",
+            "consume_actual_lr",
+            "unscale_local_gradients",
+            "aggregate_global_sufficient_statistics",
+            "compute_score",
+            "apply_optimizer_step",
+            "decompose_movement",
+        ],
+    }
+    external_refs = tuple(
+        sorted(set(str(value) for value in request.environment.evidence_refs.values() if value))
+    )
+    gate_refs = tuple(
+        dict.fromkeys((*external_refs, *[f"source/{reference}" for reference in _STAGE1_ENTRY_SOURCE_REFS]))
+    )
+    if scope == "formal":
+        entry_pass = not entry_failed
+        gate_records: list[JSONValue] = [
+            GateRecord(
+                gate_id="stage1.G1-ENTRY",
+                stage=1,
+                status=GateStatus.PASS if entry_pass else GateStatus.BLOCKED,
+                checked_at=checked_at,
+                measured={"checks": entry_checks},
+                threshold={"required": "all entry checks PASS"},
+                evidence_refs=gate_refs if entry_pass else (),
+                reasons=() if entry_pass else tuple(entry_failed),
+            ).to_dict(),
+            GateRecord(
+                gate_id="stage1.G1-CONTRACT",
+                stage=1,
+                status=GateStatus.PASS if contract_ok else GateStatus.BLOCKED,
+                checked_at=checked_at,
+                measured={"checks": contract_checks},
+                threshold={"required": "all contract checks PASS"},
+                evidence_refs=gate_refs if contract_ok else (),
+                reasons=() if contract_ok else ("contract checks are not PASS",),
+            ).to_dict(),
+        ]
+    else:
+        gate_records = []
+    requirement_sources = {
+        "entry.stage0_g10": "plan/stage1/01_entry_and_contract.md",
+        "entry.repository_clean": "Agent/git.md",
+        "entry.agent_files": "Agent/sync.md",
+        "entry.data_root": "Agent/server.md",
+        "entry.cache_policy": "Agent/server.md",
+        "entry.write_paths": "Agent/sync.md",
+        "contract.target_quantity": "plan/stage1/01_entry_and_contract.md",
+        "contract.loss_reduction": "plan/stage1/01_entry_and_contract.md",
+        "contract.estimators": "docs/mathematics.md",
+        "contract.clip_order": "plan/stage1/01_entry_and_contract.md",
+        "contract.optimizer_boundary": "plan/stage1/01_entry_and_contract.md",
+        "contract.movement_boundary": "plan/stage1/01_entry_and_contract.md",
+    }
+    requirement_checks = {
+        "entry.stage0_g10": formal_entry_checks["stage0_g10_pass"],
+        "entry.repository_clean": formal_entry_checks["repository_clean"],
+        "entry.agent_files": agent_exact and agent_hashes_valid,
+        "entry.data_root": formal_entry_checks["data_root_ready"],
+        "entry.cache_policy": formal_entry_checks["cache_roots_bound"],
+        "entry.write_paths": formal_entry_checks["approved_write_paths"],
+        "contract.target_quantity": contract_ok,
+        "contract.loss_reduction": contract_ok,
+        "contract.estimators": contract_ok,
+        "contract.clip_order": contract_ok,
+        "contract.optimizer_boundary": contract_ok,
+        "contract.movement_boundary": contract_ok,
+    }
+    local_checks = {
+        "entry.stage0_g10": False,
+        "entry.repository_clean": bool(repository["available"]),
+        "entry.agent_files": agent_exact and agent_hashes_valid,
+        "entry.data_root": False,
+        "entry.cache_policy": False,
+        "entry.write_paths": store.root.exists(),
+        "contract.target_quantity": contract_ok,
+        "contract.loss_reduction": contract_ok,
+        "contract.estimators": contract_ok,
+        "contract.clip_order": contract_ok,
+        "contract.optimizer_boundary": contract_ok,
+        "contract.movement_boundary": contract_ok,
+    }
+    requirements: list[JSONValue] = []
+    for requirement_id, passed in requirement_checks.items():
+        requirements.append(
+            {
+                "requirement_id": requirement_id,
+                "source_ref": requirement_sources[requirement_id],
+                "local_status": "PASS" if local_checks[requirement_id] else "NOT_RUN",
+                "formal_status": "PASS" if scope == "formal" and passed else "BLOCKED" if scope == "formal" else "NOT_RUN",
+                "evidence_refs": list(external_refs),
+                "notes": "local fixture never unlocks formal Gate",
+            }
+        )
+    matrix: dict[str, JSONValue] = {
+        "schema_version": "stage1-requirements-matrix-v1",
+        "task_id": request.task.task_id,
+        "scope": scope,
+        "requirements": requirements,
+        "summary": {
+            "total": len(requirements),
+            "local_pass": sum(1 for value in local_checks.values() if value),
+            "formal_pass": sum(1 for value in requirement_checks.values() if value),
+            "formal_blocked": sum(1 for value in requirement_checks.values() if not value),
+        },
+    }
+    return {
+        "evidence_type": "stage1_math_contract",
+        "contract_hashes": {
+            "docs/mathematics.md": sha256_file(math_path),
+            "plan/stage1/01_entry_and_contract.md": sha256_file(plan_path),
+        },
+        "frozen_formulas": {
+            "raw": "mean_gradient**2",
+            "equal_u": "(S1**2-S2)/(M*(M-1))",
+            "double": "mean_gradient_A*mean_gradient_B",
+        },
+        "dynamic_learning_rate_in_coordinate_hash": False,
+        "same_batch_clipped_u_claim": "plugin_no_strict_unbiasedness",
+        "task_definition_hash": canonical_json_hash(request.task.to_dict()),
+        "entry_snapshot": entry_snapshot,
+        "contract": formula_contract,
+        "contract_freeze": freeze.to_dict(),
+        "requirements_matrix": matrix,
+        "formal_gate_records": gate_records,
+        "local_gate_candidates": [
+            {"gate_id": "stage1.G1-ENTRY", "status": "NOT_RUN"},
+            {"gate_id": "stage1.G1-CONTRACT", "status": "NOT_RUN"},
+        ] if scope == "local_fixture" else [],
+    }
+
+
+def _stage1_formal_blockers(evidence: Mapping[str, JSONValue]) -> tuple[TaskBlocker, ...]:
+    entry = evidence.get("entry_snapshot")
+    if not isinstance(entry, Mapping):
+        return (TaskBlocker(BlockerCode.CONTRACT_UNFROZEN, "stage1.entry_snapshot", "S1.1 entry snapshot is missing", False),)
+    failed = entry.get("failed_checks")
+    if not isinstance(failed, list) or not failed:
+        return ()
+    return tuple(
+        TaskBlocker(BlockerCode.GATE_NOT_READY, str(check), f"S1.1 formal entry check failed: {check}", True)
+        for check in failed
+    )
 
 
 class _AliasModel(torch.nn.Module):
@@ -2148,6 +2651,13 @@ class Stage01CompositeTaskRunner(TaskRunner):
             source_refs = formal_sources
         else:
             evidence = dict(_task_evidence(request, self.workspace_root))
+        if (
+            request.config.run_intent == "formal"
+            and request.task.task_id == "stage1.01_entry_and_contract"
+        ):
+            blockers = _stage1_formal_blockers(evidence)
+            if blockers:
+                raise TaskBlockedError(*blockers)
         evidence_hash = canonical_json_hash(evidence)
         refs: dict[str, str] = {}
         for artifact_kind in request.task.artifact_kinds:

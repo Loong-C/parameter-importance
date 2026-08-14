@@ -1,0 +1,30 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://parameter-importance.invalid/schemas/stage1/requirements-matrix-v1.json",
+  "title": "Stage 1 entry requirements matrix",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "task_id", "scope", "requirements", "summary"],
+  "properties": {
+    "schema_version": {"const": "stage1-requirements-matrix-v1"},
+    "task_id": {"const": "stage1.01_entry_and_contract"},
+    "scope": {"enum": ["local_fixture", "formal"]},
+    "requirements": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["requirement_id", "source_ref", "local_status", "formal_status"],
+        "properties": {
+          "requirement_id": {"type": "string", "pattern": "^[a-z][a-z0-9_.-]+$"},
+          "source_ref": {"type": "string", "minLength": 1},
+          "local_status": {"enum": ["PASS", "BLOCKED", "NOT_RUN"]},
+          "formal_status": {"enum": ["PASS", "BLOCKED", "NOT_RUN"]},
+          "evidence_refs": {"type": "array", "items": {"type": "string"}},
+          "notes": {"type": "string"}
+        }
+      }
+    },
+    "summary": {"type": "object"}
+  }
+}

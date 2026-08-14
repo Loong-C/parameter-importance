@@ -146,9 +146,10 @@ def test_every_task_freezes_runner_config_artifacts_recovery_and_formal_policy()
         assert task.artifact_kinds
         assert isinstance(task.recovery_mode, RecoveryMode)
         assert task.safe_boundary.value
-        assert task.formal_eligibility.required_contract_stages == tuple(
-            range(task.stage + 1)
+        expected_contract_stages = (
+            (0,) if task.task_id == "stage1.01_entry_and_contract" else tuple(range(task.stage + 1))
         )
+        assert task.formal_eligibility.required_contract_stages == expected_contract_stages
         assert task.to_dict()["schema_version"] == "task-definition-v2"
 
 

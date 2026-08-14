@@ -775,13 +775,19 @@ _CONFIG_PATHS_BY_KIND: Final[dict[RunnerKind, tuple[str, ...]]] = {
 def _formal_policy(
     stage: int,
     *,
+    contract_stages: Sequence[int] | None = None,
     gates: Sequence[str] = (),
     capabilities: Sequence[str] = (),
     estimator_decision: bool = False,
 ) -> FormalEligibilityPolicy:
+    required_contract_stages = (
+        tuple(range(stage + 1))
+        if contract_stages is None
+        else tuple(contract_stages)
+    )
     return FormalEligibilityPolicy(
         supported=True,
-        required_contract_stages=tuple(range(stage + 1)),
+        required_contract_stages=required_contract_stages,
         required_gate_ids=tuple(gates),
         required_capabilities=tuple(capabilities),
         requires_estimator_decision=estimator_decision,
@@ -810,6 +816,7 @@ def _task(
     recovery_mode: RecoveryMode,
     safe_boundary: SafeBoundary,
     *,
+    contract_stages: Sequence[int] | None = None,
     gates: Sequence[str] = (),
     capabilities: Sequence[str] = (),
     estimator_decision: bool = False,
@@ -868,6 +875,7 @@ def _task(
         ),
         formal_eligibility=_formal_policy(
             stage,
+            contract_stages=contract_stages,
             gates=gates,
             capabilities=capabilities,
             estimator_decision=estimator_decision,
@@ -891,7 +899,7 @@ _TASKS_RAW: Final = (
     _task("stage0.12_delivery_and_sync", "交付、工作日志与多端同步", "plan/stage0/12_delivery_and_sync.md", RunnerKind.DELIVERY, ("delivery_manifest", "worklog", "sync_report"), RecoveryMode.MANUAL_EXTERNAL, SafeBoundary.IMMUTABLE_PUBLISH, gates=("stage0.G9",), capabilities=("git", "github", "server")),
 
     # Stage 1：公式正确性、训练 step、真实单卡/DDP 和恢复 Gate。
-    _task("stage1.01_entry_and_contract", "进入条件与数学合同冻结", "plan/stage1/01_entry_and_contract.md", RunnerKind.CONTRACT, ("stage_contract", "requirements_matrix", "gate_record"), RecoveryMode.RESTART_IDEMPOTENT, SafeBoundary.IMMUTABLE_PUBLISH, gates=("stage0.G10",)),
+    _task("stage1.01_entry_and_contract", "进入条件与数学合同冻结", "plan/stage1/01_entry_and_contract.md", RunnerKind.CONTRACT, ("stage_contract", "requirements_matrix", "gate_record"), RecoveryMode.RESTART_IDEMPOTENT, SafeBoundary.IMMUTABLE_PUBLISH, contract_stages=(0,), gates=("stage0.G10",)),
     _task("stage1.02_architecture_and_parameter_registry", "架构边界与参数 registry", "plan/stage1/02_architecture_and_parameter_registry.md", RunnerKind.REGISTRY, ("parameter_registry", "registry_validation_report", "gate_record"), RecoveryMode.RESTART_IDEMPOTENT, SafeBoundary.IMMUTABLE_PUBLISH, gates=("stage1.G1-ENTRY", "stage1.G1-CONTRACT")),
     _task("stage1.03_fixtures_and_oracles", "Fixture 与独立 oracle", "plan/stage1/03_fixtures_and_oracles.md", RunnerKind.ORACLE, ("fixture_manifest", "oracle_bundle", "oracle_validation_report"), RecoveryMode.RESTART_IDEMPOTENT, SafeBoundary.IMMUTABLE_PUBLISH, gates=("stage1.G1-CONTRACT", "stage1.G1-REGISTRY")),
     _task("stage1.04_loss_and_gradient_scale", "Loss reduction 与梯度尺度", "plan/stage1/04_loss_and_gradient_scale.md", RunnerKind.VALIDATION, ("gradient_scale_report", "comparison_table", "gate_record"), RecoveryMode.RESTART_IDEMPOTENT, SafeBoundary.IMMUTABLE_PUBLISH, gates=("stage1.G1-CONTRACT", "stage1.G1-REGISTRY", "stage1.G1-ORACLE")),

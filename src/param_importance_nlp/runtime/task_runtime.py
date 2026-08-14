@@ -742,14 +742,20 @@ class TaskRuntime:
     ) -> Mapping[str, object]:
         """提取精确或唯一嵌套的 schema payload，拒绝歧义候选。"""
 
-        if value.get("schema_version") == schema_version:
-            return value
-        candidates = [
-            item
-            for item in value.values()
-            if isinstance(item, Mapping)
-            and item.get("schema_version") == schema_version
-        ]
+        candidates: list[Mapping[str, object]] = []
+
+        def visit(node: object) -> None:
+            if isinstance(node, Mapping):
+                if node.get("schema_version") == schema_version:
+                    candidates.append(node)
+                    return
+                for child in node.values():
+                    visit(child)
+            elif isinstance(node, Sequence) and not isinstance(node, (str, bytes, bytearray)):
+                for child in node:
+                    visit(child)
+
+        visit(value)
         if len(candidates) != 1:
             raise TaskRuntimeError(
                 f"FORMAL_EVIDENCE_PAYLOAD_NOT_UNIQUE:{schema_version}"
