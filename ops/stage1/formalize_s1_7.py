@@ -537,7 +537,7 @@ import torch
 from safetensors.torch import save_file
 from param_importance_nlp.g3_runtime_assets import FormalG3RuntimeAssets
 from param_importance_nlp.runtime.task_artifacts import load_committed_task_artifact
-from param_importance_nlp.contracts.jsonio import canonical_json_hash
+from param_importance_nlp.contracts.jsonio import canonical_json_hash,write_canonical_json
 root=Path(sys.argv[1]); resolution=sys.argv[2]; output=Path(sys.argv[3]); fixture=Path(sys.argv[4]); repo=Path.cwd()
 def canonical(value): return canonical_json_hash(value)
 def sha_file(path):
@@ -583,7 +583,7 @@ expected_pile_hashed_bytes=int(sys.argv[5])
 if observed_file_roles!=expected_file_roles or len(pile_entries)!=1 or isinstance(pile_entries[0].get('bytes_checked'),bool) or pile_entries[0].get('bytes_checked')!=pile_hashed_bytes or pile_hashed_bytes!=expected_pile_hashed_bytes: raise RuntimeError('S17_PILE_HASHED_BYTES_BINDING_INVALID')
 payload={'schema_version':'stage1-s1-7-historical-g3-replay-v1','status':'PASS','model':model.provenance(),'tokenizer':tokenizer.provenance(),'pile':pile.provenance(),'asset_identity':{'model':{'logical_name':'pythia-14m-step0','asset_id':model.resolved.asset_id,'revision':model.resolved.revision,'ready_manifest_sha256':model.ready_manifest_sha256,'parameter_count':model.manifest['metadata']['parameter_count'],'config_vocab_size':model_vocab_size,'root':str(model.resolved.root)},'tokenizer':{'logical_name':'pythia-tokenizer','asset_id':tokenizer.resolved.asset_id,'revision':tokenizer.resolved.revision,'ready_manifest_sha256':tokenizer.ready_manifest_sha256,'root':str(tokenizer.resolved.root),'vocab_size':tokenizer_vocab_size},'pile':{'logical_name':'pile-selected-prefix','asset_id':pile.resolved.asset_id,'revision':pile.resolved.revision,'ready_manifest_sha256':pile.ready_manifest_sha256}},'resolution_commit_artifact_hash':committed.identity.artifact_hash,'resolution_artifact_hash':assets.resolution_artifact_hash,'fixture_file':fixture.name,'fixture_file_sha256':sha_file(fixture),'token_sha256':hashes,'dropout_probabilities':dropout,'resolve_hash_seconds':resolve_seconds,'dataset_rehash_seconds':time.monotonic()-start,'qualified_resolution_hashed_bytes':pile_hashed_bytes,'dataset_rehash_bytes':pile_hashed_bytes,'pile_hash_passes':2,'network_policy':{'hf_hub_offline':os.environ.get('HF_HUB_OFFLINE')=='1','transformers_offline':os.environ.get('TRANSFORMERS_OFFLINE')=='1','datasets_offline':os.environ.get('HF_DATASETS_OFFLINE')=='1','cuda_visible_devices':os.environ.get('CUDA_VISIBLE_DEVICES')=='','cuda_is_available':bool(torch.cuda.is_available()),'operations':['committed-resolution-parse','qualified-local-manifest-parse','local-pile-mmap-hash-and-fixture-extraction'],'external_attempts':[]}}
 payload['replay_hash']=canonical(payload)
-output.write_text(json.dumps(payload,sort_keys=True,separators=(',',':')),encoding='utf-8')'''
+write_canonical_json(output,payload)'''
     environment = dict(os.environ)
     environment.update({"PYTHONPATH": str(checkout / "src"), "HF_HUB_OFFLINE": "1", "TRANSFORMERS_OFFLINE": "1", "HF_DATASETS_OFFLINE": "1", "CUDA_VISIBLE_DEVICES": ""})
     completed = subprocess.run([sys.executable, "-c", script, str(data_root), resolution_ref, str(output), str(fixture_path), str(EXPECTED_PILE_HASHED_BYTES), str(EXPECTED_MODEL_CONFIG_VOCAB_SIZE), str(EXPECTED_TOKENIZER_RUNTIME_VOCAB_SIZE)], cwd=checkout, text=True, capture_output=True, check=False, timeout=3600, env=environment)
@@ -598,7 +598,8 @@ output.write_text(json.dumps(payload,sort_keys=True,separators=(',',':')),encodi
             f"stdout_sha256={_sha(stdout_path)}:stderr_sha256={_sha(stderr_path)}:"
             f"output_present={output.is_file()}:fixture_present={fixture_path.is_file()}"
         )
-    replay = _mapping(json.loads(output.read_text(encoding="utf-8")), field="historical_g3_replay")
+    from param_importance_nlp.contracts.jsonio import load_canonical_json
+    replay = _mapping(load_canonical_json(output), field="historical_g3_replay")
     expected = {"schema_version", "status", "model", "tokenizer", "pile", "asset_identity", "resolution_commit_artifact_hash", "resolution_artifact_hash", "fixture_file", "fixture_file_sha256", "token_sha256", "dropout_probabilities", "resolve_hash_seconds", "dataset_rehash_seconds", "qualified_resolution_hashed_bytes", "dataset_rehash_bytes", "pile_hash_passes", "network_policy", "replay_hash"}
     if set(replay) != expected or replay.get("schema_version") != "stage1-s1-7-historical-g3-replay-v1" or replay.get("status") != "PASS" or replay.get("replay_hash") != _canonical({key: value for key, value in replay.items() if key != "replay_hash"}):
         raise Stage1S17FormalError("S17_HISTORICAL_PRODUCER_REPLAY_SCHEMA_INVALID")

@@ -307,8 +307,10 @@ def test_s17_historical_replay_binds_ready_manifest_file_bytes(
     def completed(command: list[str], **_kwargs: object) -> SimpleNamespace:
         script = command[2]
         compile(script, "<historical-g3-replay>", "exec")
-        assert "from param_importance_nlp.contracts.jsonio import canonical_json_hash" in script
+        assert "from param_importance_nlp.contracts.jsonio import canonical_json_hash,write_canonical_json" in script
         assert "def canonical(value): return canonical_json_hash(value)" in script
+        assert "write_canonical_json(output,payload)" in script
+        assert "output.write_text(json.dumps" not in script
         assert "token_count_with_added_tokens" in script
         assert "active_dropout_fields=('attention_dropout','hidden_dropout')" in script
         assert "manifest_files=pile.manifest.get('files')" in script
@@ -346,7 +348,8 @@ def test_s17_historical_replay_binds_ready_manifest_file_bytes(
             },
         }
         payload["replay_hash"] = module._canonical(payload)
-        output.write_text(json.dumps(payload), encoding="utf-8")
+        from param_importance_nlp.contracts.jsonio import write_canonical_json
+        write_canonical_json(output, payload)
         return SimpleNamespace(returncode=0, stdout="", stderr="")
 
     monkeypatch.setattr(module.subprocess, "run", completed)
@@ -359,6 +362,27 @@ def test_s17_historical_replay_binds_ready_manifest_file_bytes(
     assert replay["qualified_resolution_hashed_bytes"] == 31_757_184_042
     assert replay["dataset_rehash_bytes"] == 31_757_184_042
     assert replay["pile_hash_passes"] == 2
+    replay_bytes = (tmp_path / "historical-g3-replay.json").read_bytes()
+    assert replay_bytes.endswith(b"\n") and not replay_bytes.endswith(b"\n\n")
+
+    bad_work = tmp_path / "noncanonical-replay"
+    bad_work.mkdir()
+
+    def noncanonical_completed(command: list[str], **kwargs: object) -> SimpleNamespace:
+        result = completed(command, **kwargs)
+        output = Path(command[5])
+        payload = json.loads(output.read_text(encoding="utf-8"))
+        output.write_text(json.dumps(payload, sort_keys=True, separators=(",", ":")), encoding="utf-8")
+        return result
+
+    monkeypatch.setattr(module.subprocess, "run", noncanonical_completed)
+    with pytest.raises(Exception, match="canonical JSON"):
+        module._historical_asset_replay(
+            tmp_path / "checkout",
+            tmp_path / "data",
+            bad_work,
+            module.EXPECTED_G3_RESOLUTION,
+        )
 
 
 def test_s17_historical_replay_failure_records_hash_only_diagnostics(
