@@ -106,6 +106,7 @@ from ..stage1_contract import (
     validate_stage1_math_contract,
 )
 from ..stage1_fixtures import build_stage1_s13_evidence
+from ..stage1_gradient_scale import build_stage1_s14_evidence
 from ..g3_gate import (
     GATE_IDS as G3_GATE_IDS,
     evaluate_stage0_g3,
@@ -2362,37 +2363,14 @@ def _oracle_evidence(
     )
 
 
-def _loss_scale_evidence() -> Mapping[str, JSONValue]:
-    lm_logits = torch.tensor(
-        [[[3.0, 0.0, -1.0], [0.0, 3.0, -1.0], [0.0, -1.0, 3.0]]],
-        dtype=torch.float64,
+def _loss_scale_evidence(root: Path) -> Mapping[str, JSONValue]:
+    repository_root = Path(__file__).resolve().parents[3]
+    producer_commit = _stage1_git_command(repository_root, "rev-parse", "HEAD") or "0" * 40
+    return build_stage1_s14_evidence(
+        repository_root,
+        producer_commit=producer_commit,
+        scope="local_fixture",
     )
-    lm_labels = torch.tensor([[0, 1, 2]])
-    lm = causal_lm_loss(lm_logits, lm_labels, torch.tensor([[1, 1, 1]]))
-    cls = sequence_classification_loss(
-        torch.tensor([[2.0, 0.0], [0.0, 2.0], [1.0, 1.0]], dtype=torch.float64),
-        torch.tensor([0, 1, -100]),
-    )
-    merged = cls.merge(
-        sequence_classification_loss(
-            torch.tensor([[1.0, 0.0]], dtype=torch.float64), torch.tensor([0])
-        )
-    )
-    return {
-        "evidence_type": "loss_and_gradient_scale",
-        "causal_lm": {
-            "effective_count": lm.effective_count,
-            "statistical_unit": lm.statistical_unit,
-            "numerator": float(lm.loss_numerator.item()),
-        },
-        "classification": {
-            "effective_count": cls.effective_count,
-            "statistical_unit": cls.statistical_unit,
-            "numerator": float(cls.loss_numerator.item()),
-        },
-        "merged_effective_count": merged.effective_count,
-        "merge_uses_numerator_denominator": True,
-    }
 
 
 def _estimator_evidence() -> Mapping[str, JSONValue]:
@@ -2520,7 +2498,7 @@ def _task_evidence(request: TaskExecutionRequest, root: Path) -> Mapping[str, JS
     if task_id == "stage1.03_fixtures_and_oracles":
         return _oracle_evidence(request, root)
     if task_id == "stage1.04_loss_and_gradient_scale":
-        return _loss_scale_evidence()
+        return _loss_scale_evidence(root)
     if task_id == "stage1.05_estimators":
         return _estimator_evidence()
     if task_id == "stage1.09_precision_clipping_and_optimizer_boundaries":
@@ -2912,11 +2890,14 @@ class Stage01CompositeTaskRunner(TaskRunner):
         evidence_hash = canonical_json_hash(evidence)
         refs: dict[str, str] = {}
         for artifact_kind in request.task.artifact_kinds:
-            if request.task.task_id == "stage1.03_fixtures_and_oracles":
+            if request.task.task_id in {
+                "stage1.03_fixtures_and_oracles",
+                "stage1.04_loss_and_gradient_scale",
+            }:
                 core_evidence = evidence.get(artifact_kind)
                 if not isinstance(core_evidence, Mapping):
                     raise ValueError(
-                        f"STAGE1_S13_ROLE_EVIDENCE_MISSING:{artifact_kind}"
+                        f"STAGE01_ROLE_EVIDENCE_MISSING:{request.task.task_id}:{artifact_kind}"
                     )
                 role_core_hash = canonical_json_hash(core_evidence)
             else:

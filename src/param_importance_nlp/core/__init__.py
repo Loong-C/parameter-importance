@@ -27,7 +27,12 @@ from .estimators import (
     raw_importance,
     weighted_u_importance,
 )
-from .losses import LossBatch, causal_lm_loss, sequence_classification_loss
+from .losses import (
+    LossBatch,
+    causal_lm_loss,
+    pre_shifted_causal_lm_loss,
+    sequence_classification_loss,
+)
 from .metrics import (
     MetricResult,
     bias,
@@ -185,6 +190,7 @@ __all__ = [
     "net_movement",
     "pearson_correlation",
     "produce_baseline_scores",
+    "pre_shifted_causal_lm_loss",
     "raw_importance",
     "right_rule",
     "select_pruned_coordinates",

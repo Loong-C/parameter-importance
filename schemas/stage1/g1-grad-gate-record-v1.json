@@ -1,0 +1,19 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://parameter-importance.invalid/schemas/stage1/g1-grad-gate-record-v1.json",
+  "title": "Stage 1 G1-GRAD machine gate record",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "task_id", "gate_id", "scope", "status", "report_hash", "comparison_table_hash", "requirements", "artifact_hash"],
+  "properties": {
+    "schema_version": {"const": "stage1-g1-grad-gate-record-v1"},
+    "task_id": {"const": "stage1.04_loss_and_gradient_scale"},
+    "gate_id": {"const": "G1-GRAD"},
+    "scope": {"enum": ["local_fixture", "formal"]},
+    "status": {"enum": ["NOT_RUN", "PASS"]},
+    "report_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "comparison_table_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "requirements": {"type": "object", "additionalProperties": false, "required": ["full_batch_and_per_sample", "per_token_oracle", "equal_microbatch_m_and_permutation", "token_weighted_microbatch", "sum_mean_and_accumulation", "negative_control_detected", "rng_boundary", "all_tensor_rows_pass", "table_projection_exact"], "properties": {"full_batch_and_per_sample": {"const": true}, "per_token_oracle": {"const": true}, "equal_microbatch_m_and_permutation": {"const": true}, "token_weighted_microbatch": {"const": true}, "sum_mean_and_accumulation": {"const": true}, "negative_control_detected": {"const": true}, "rng_boundary": {"const": true}, "all_tensor_rows_pass": {"const": true}, "table_projection_exact": {"const": true}}},
+    "artifact_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+  }
+}

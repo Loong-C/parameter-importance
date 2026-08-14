@@ -1,0 +1,19 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://parameter-importance.invalid/schemas/stage1/s1-4-formalization-index-v1.json",
+  "title": "Stage 1 S1.4 formalization index",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "status", "gate_id", "task_id", "fixture_id", "generator_git_commit", "consumer_git_commit", "git_branch", "checked_at", "s1_3_index_ref", "s1_3_index_sha256", "s1_3_gate_artifact_hash", "s1_3_fixture_manifest_sha256", "s1_3_oracle_bundle_sha256", "s1_3_oracle_validation_report_sha256", "s1_3_replay_sha256", "s1_3_validation_sha256", "s1_3_frozen_gradient_input_hash", "gradient_scale_report_ref", "gradient_scale_report_sha256", "gradient_scale_report_hash", "comparison_table_ref", "comparison_table_sha256", "comparison_table_hash", "gate_record_ref", "gate_record_sha256", "gate_artifact_hash", "csv_sha256", "svg_sha256", "validation_ref", "validation_sha256", "replay_ref", "replay_sha256", "replay_hash", "next_task_id", "artifact_hash"],
+  "properties": {
+    "schema_version": {"const": "stage1-s1-4-formalization-index-v1"}, "status": {"const": "PASS"}, "gate_id": {"const": "G1-GRAD"}, "task_id": {"const": "stage1.04_loss_and_gradient_scale"}, "fixture_id": {"const": "stage1-s14-loss-gradient-fixture-v1"}, "generator_git_commit": {"$ref": "#/$defs/commit"}, "consumer_git_commit": {"$ref": "#/$defs/commit"}, "git_branch": {"type": "string", "minLength": 1}, "checked_at": {"type": "string", "minLength": 1},
+    "s1_3_index_ref": {"type": "string", "minLength": 1}, "s1_3_index_sha256": {"$ref": "#/$defs/digest"}, "s1_3_gate_artifact_hash": {"$ref": "#/$defs/digest"}, "s1_3_fixture_manifest_sha256": {"$ref": "#/$defs/digest"}, "s1_3_oracle_bundle_sha256": {"$ref": "#/$defs/digest"}, "s1_3_oracle_validation_report_sha256": {"$ref": "#/$defs/digest"}, "s1_3_replay_sha256": {"$ref": "#/$defs/digest"}, "s1_3_validation_sha256": {"$ref": "#/$defs/digest"}, "s1_3_frozen_gradient_input_hash": {"$ref": "#/$defs/digest"},
+    "gradient_scale_report_ref": {"const": "gradient-scale-report.json"}, "gradient_scale_report_sha256": {"$ref": "#/$defs/digest"}, "gradient_scale_report_hash": {"$ref": "#/$defs/digest"}, "comparison_table_ref": {"const": "comparison-table.json"}, "comparison_table_sha256": {"$ref": "#/$defs/digest"}, "comparison_table_hash": {"$ref": "#/$defs/digest"}, "gate_record_ref": {"const": "g1-grad-record.json"}, "gate_record_sha256": {"$ref": "#/$defs/digest"}, "gate_artifact_hash": {"$ref": "#/$defs/digest"},
+    "csv_sha256": {"$ref": "#/$defs/csvMap"}, "svg_sha256": {"$ref": "#/$defs/svgMap"}, "validation_ref": {"const": "validation.json"}, "validation_sha256": {"$ref": "#/$defs/digest"}, "replay_ref": {"const": "replay-validation.json"}, "replay_sha256": {"$ref": "#/$defs/digest"}, "replay_hash": {"$ref": "#/$defs/digest"}, "next_task_id": {"const": "stage1.05_estimators"}, "artifact_hash": {"$ref": "#/$defs/digest"}
+  },
+  "$defs": {
+    "commit": {"type": "string", "pattern": "^[0-9a-f]{40}$"}, "digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "csvMap": {"type": "object", "additionalProperties": false, "required": ["tensor-errors.csv", "gradient-scatter.csv", "tensor-error-heatmap.csv", "accumulation-errors.csv"], "properties": {"tensor-errors.csv": {"$ref": "#/$defs/digest"}, "gradient-scatter.csv": {"$ref": "#/$defs/digest"}, "tensor-error-heatmap.csv": {"$ref": "#/$defs/digest"}, "accumulation-errors.csv": {"$ref": "#/$defs/digest"}}},
+    "svgMap": {"type": "object", "additionalProperties": false, "required": ["gradient-scatter.svg", "route-errors.svg", "tensor-error-heatmap.svg", "accumulation-errors.svg"], "properties": {"gradient-scatter.svg": {"$ref": "#/$defs/digest"}, "route-errors.svg": {"$ref": "#/$defs/digest"}, "tensor-error-heatmap.svg": {"$ref": "#/$defs/digest"}, "accumulation-errors.svg": {"$ref": "#/$defs/digest"}}}
+  }
+}

@@ -1,0 +1,24 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://parameter-importance.invalid/schemas/stage1/g1-grad-comparison-table-v1.json",
+  "title": "Stage 1 G1-GRAD per-tensor comparison table",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "fixture_id", "report_hash", "rows", "scatter_rows", "accumulation_rows", "projection_hash", "table_hash"],
+  "properties": {
+    "schema_version": {"const": "stage1-g1-grad-comparison-table-v1"},
+    "fixture_id": {"const": "stage1-s14-loss-gradient-fixture-v1"},
+    "report_hash": {"$ref": "#/$defs/digest"},
+    "rows": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/tensorRow"}},
+    "scatter_rows": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/scatterRow"}},
+    "accumulation_rows": {"type": "array", "minItems": 6, "maxItems": 6, "items": {"$ref": "#/$defs/accumulationRow"}},
+    "projection_hash": {"$ref": "#/$defs/digest"},
+    "table_hash": {"$ref": "#/$defs/digest"}
+  },
+  "$defs": {
+    "digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "tensorRow": {"type": "object", "additionalProperties": false, "required": ["profile", "comparison_id", "object_id", "parameter_name", "passed", "branch", "comparison_dtype", "natural_scale", "atol", "rtol", "normalized_l2_limit", "near_zero_threshold", "absolute_threshold", "max_absolute_error", "scaled_max_error", "normalized_l2_error", "nonfinite_count", "worst_parameter"], "properties": {"profile": {"enum": ["T64_ORACLE", "T32_SINGLE"]}, "comparison_id": {"type": "string"}, "object_id": {"enum": ["mean_gradient", "mean_loss"]}, "parameter_name": {"type": "string"}, "passed": {"const": true}, "branch": {"enum": ["near_zero_absolute", "scaled_nonzero"]}, "comparison_dtype": {"const": "torch.float64_cpu"}, "natural_scale": {"type": "number"}, "atol": {"type": "number"}, "rtol": {"type": "number"}, "normalized_l2_limit": {"type": "number"}, "near_zero_threshold": {"type": "number"}, "absolute_threshold": {"type": "number"}, "max_absolute_error": {"type": ["number", "null"]}, "scaled_max_error": {"type": ["number", "null"]}, "normalized_l2_error": {"type": ["number", "null"]}, "nonfinite_count": {"const": 0}, "worst_parameter": {"type": ["string", "null"]}}},
+    "scatterRow": {"type": "object", "additionalProperties": false, "required": ["profile", "route_id", "parameter_name", "coordinate", "candidate", "reference"], "properties": {"profile": {"enum": ["T64_ORACLE", "T32_SINGLE"]}, "route_id": {"enum": ["equal_microbatch_m2_gradient", "token_weighted_microbatch_gradient"]}, "parameter_name": {"type": "string"}, "coordinate": {"type": "integer", "minimum": 0}, "candidate": {"type": "number"}, "reference": {"type": "number"}}},
+    "accumulationRow": {"type": "object", "additionalProperties": false, "required": ["profile", "split_id", "microbatch_count", "effective_counts", "clear_was_complete", "comparison_id", "normalized_l2_error"], "properties": {"profile": {"enum": ["T64_ORACLE", "T32_SINGLE"]}, "split_id": {"enum": ["accumulation_m2", "accumulation_m4", "accumulation_weighted_m2"]}, "microbatch_count": {"type": "integer", "minimum": 2}, "effective_counts": {"type": "array", "minItems": 2, "items": {"type": "integer", "minimum": 1}}, "clear_was_complete": {"const": true}, "comparison_id": {"type": "string"}, "normalized_l2_error": {"type": ["number", "null"]}}}
+  }
+}
