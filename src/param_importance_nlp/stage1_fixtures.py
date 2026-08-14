@@ -282,11 +282,20 @@ def build_tiny_transformer(
     hidden_size = spec.get("hidden_size")
     if any(isinstance(value, bool) or not isinstance(value, int) or value <= 0 for value in (seed, vocab_size, hidden_size)):
         raise Stage1FixtureError("Tiny Transformer seed/vocab/hidden 配置非法")
-    with torch.random.fork_rng(devices=[]):
-        torch.manual_seed(seed)
-        model = TinyCausalTransformer(vocab_size=vocab_size, hidden_size=hidden_size).to(
-            device="cpu", dtype=torch.float64
-        )
+    model = TinyCausalTransformer(vocab_size=vocab_size, hidden_size=hidden_size).to(
+        device="cpu", dtype=torch.float64
+    )
+    # PyTorch's seeded initializer can change across releases.  The fixture
+    # therefore uses the frozen seed as an input to a small explicit arithmetic
+    # initializer, making the initial state stable across the local and server
+    # runtimes without consuming any global RNG state.
+    with torch.no_grad():
+        for parameter_index, (name, parameter) in enumerate(model.named_parameters()):
+            positions = torch.arange(parameter.numel(), dtype=torch.float64, device="cpu")
+            values = ((positions + float(seed + 17 * parameter_index)) % 29.0 - 14.0) / 10.0
+            if name.endswith("layer_norm.weight") or name.endswith("final_norm.weight"):
+                values = 1.0 + values / 20.0
+            parameter.copy_(values.reshape_as(parameter))
     optimizer = torch.optim.SGD(model.parameters(), lr=float(spec.get("learning_rate", 0.05)), foreach=False)
     registry = ParameterRegistry.from_model(model, optimizer)
     initial = {name: parameter.detach().clone() for name, parameter in model.named_parameters()}
