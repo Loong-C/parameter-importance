@@ -116,6 +116,14 @@ def _load_s1_2_handoff(data_root: Path, index_ref: str) -> dict[str, Any]:
     if not isinstance(report_ref, str) or not isinstance(report_sha256, str):
         raise Stage1S13FormalError("S1_3_S1_2_REPORT_REF_MISSING")
     report_path = _logical_path(data_root, report_ref, field="s1_2_report_ref")
+    if not report_path.is_file():
+        # S1.2 stores short artifact names in its index; those names are
+        # relative to the immutable S1.2 attempt directory, not DATA_ROOT.
+        report_path = (index_path.parent / report_ref).resolve()
+        try:
+            report_path.relative_to(data_root.resolve())
+        except ValueError as error:
+            raise Stage1S13FormalError("S1_3_S1_2_REPORT_REF_ESCAPE") from error
     if report_sha256 != sha256_file(report_path):
         raise Stage1S13FormalError("S1_3_S1_2_REPORT_SHA256_MISMATCH")
     report = load_canonical_json(report_path)
