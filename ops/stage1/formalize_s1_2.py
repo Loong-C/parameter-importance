@@ -238,6 +238,9 @@ def execute(
 ) -> dict[str, str]:
     repository_root = Path(repository).resolve(strict=True)
     data_root_path = Path(data_root).resolve(strict=True)
+    source_root = repository_root / "src"
+    if source_root.is_dir() and str(source_root) not in sys.path:
+        sys.path.insert(0, str(source_root))
     if _COMMIT_RE.fullmatch(_git(repository_root, "rev-parse", "HEAD")) is None:
         raise Stage1S12FormalError("S1_2_REPOSITORY_COMMIT_INVALID")
     if _git(repository_root, "status", "--porcelain", "--untracked-files=all"):
