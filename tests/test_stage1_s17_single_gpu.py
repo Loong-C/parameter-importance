@@ -7,9 +7,11 @@ developer host can still reject a malformed formal implementation.
 
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import json
 from pathlib import Path
+import subprocess
 from types import SimpleNamespace
 
 import pytest
@@ -154,6 +156,35 @@ def test_s17_historical_patch_hash_drift_is_fail_closed(tmp_path: Path, monkeypa
     monkeypatch.setattr(module.subprocess, "run", lambda *_args, **_kwargs: SimpleNamespace(returncode=0))
     with pytest.raises(module.Stage1S17FormalError, match="S17_HISTORICAL_PRODUCER_PATCH_DRIFT"):
         module._historical_source_attestation(tmp_path / "current", checkout)
+
+
+def test_s17_historical_patch_uses_full_index_and_real_repository_attests(tmp_path: Path) -> None:
+    """Pin a host-independent patch form, then attest the real source history."""
+
+    module = _formalizer_module()
+    root = Path(__file__).resolve().parents[1]
+    command = ["git", "-C", str(root), "diff", "--binary", "--full-index"]
+    range_and_paths = [
+        module.HISTORICAL_G3_PRODUCER, "HEAD", "--",
+        *module.HISTORICAL_G3_CRITICAL_SOURCE_REFS,
+    ]
+    # --full-index must make an otherwise caller-selectable abbreviation width
+    # irrelevant to the bytes that are hash-bound in the attestation.
+    short = subprocess.check_output([*command, "--abbrev=7", *range_and_paths])
+    long = subprocess.check_output([*command, "--abbrev=12", *range_and_paths])
+    assert short == long
+    assert hashlib.sha256(short).hexdigest() == module.EXPECTED_HISTORICAL_G3_PATCH_SHA256
+
+    checkout = tmp_path / "historical-54b1"
+    for ref in module.HISTORICAL_G3_CRITICAL_SOURCE_REFS:
+        target = checkout / ref
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(subprocess.check_output([
+            "git", "-C", str(root), "show", f"{module.HISTORICAL_G3_PRODUCER}:{ref}",
+        ]))
+    attestation = module._historical_source_attestation(root, checkout)
+    assert attestation["status"] == "PASS"
+    assert attestation["critical_patch_sha256"] == module.EXPECTED_HISTORICAL_G3_PATCH_SHA256
 
 
 def test_s17_fixture_parser_binds_identity_and_provenance_after_rehash() -> None:

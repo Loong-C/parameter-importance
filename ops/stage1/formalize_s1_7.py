@@ -40,9 +40,12 @@ EXPECTED_GPU_CAPABILITY_REF = "evidence/stage0/bootstrap/a15f0e2970b7cae6951dd60
 EXPECTED_GPU_CAPABILITY_ARTIFACT_HASH = "a536e191cd59318325289d238db727f8939767e384bfccd961ae7ca1c6a11ce4"
 EXPECTED_GPU_CAPABILITY_FILE_SHA256 = "1d5f28369f4119c1e46072a687d217e2b2ad2de0bd02269acd42f14083c14b1f"
 # The only permitted historical-producer-to-consumer drift.  This is the
-# SHA-256 of the exact Git binary patch for the three names below on Linux;
-# checking names alone would silently accept later semantic changes.
-EXPECTED_HISTORICAL_G3_PATCH_SHA256 = "35083ab283a871f4d09ec383ebc902d186aaec1f729a2ef0c774868a15a93d0e"
+# SHA-256 of the exact Git binary patch for the three names below with
+# ``--full-index``.  Full object IDs are essential: Git otherwise abbreviates
+# index lines according to the local object database, yielding different bytes
+# for the same semantic patch on separate hosts.  Checking names alone would
+# silently accept later semantic changes.
+EXPECTED_HISTORICAL_G3_PATCH_SHA256 = "308db1c1e38135e5a65d37fa92566ac9cd5136220b4ffbb143a7e2f323d1ee0b"
 HISTORICAL_G3_CRITICAL_SOURCE_REFS = (
     "src/param_importance_nlp/assets.py",
     "src/param_importance_nlp/contracts/__init__.py",
@@ -494,7 +497,7 @@ def _historical_source_attestation(repository: Path, checkout: Path) -> dict[str
     }
     if set(changed) != expected_changed:
         raise Stage1S17FormalError("S17_HISTORICAL_PRODUCER_DIFF_ATTESTATION_FAILED")
-    patch = _git_bytes(repository, "diff", "--binary", HISTORICAL_G3_PRODUCER, "HEAD", "--", *HISTORICAL_G3_CRITICAL_SOURCE_REFS)
+    patch = _git_bytes(repository, "diff", "--binary", "--full-index", HISTORICAL_G3_PRODUCER, "HEAD", "--", *HISTORICAL_G3_CRITICAL_SOURCE_REFS)
     patch_sha256 = hashlib.sha256(patch).hexdigest()
     if patch_sha256 != EXPECTED_HISTORICAL_G3_PATCH_SHA256:
         raise Stage1S17FormalError("S17_HISTORICAL_PRODUCER_PATCH_DRIFT")
