@@ -93,7 +93,7 @@ from .quadrature import (
     simpson_rule,
     trapezoid_rule,
 )
-from .registry import REGISTRY_SCHEMA_VERSION, ParameterRecord, ParameterRegistry
+from .registry import BUFFER_POLICY, REGISTRY_SCHEMA_VERSION, ParameterRecord, ParameterRegistry
 from .state import (
     ACTUAL_UPDATE_SLOT,
     ImportanceState,
@@ -107,6 +107,7 @@ from .tensors import TensorMap
 __all__ = [
     "CoordinateSelection",
     "BaselineProduction",
+    "BUFFER_POLICY",
     "ConstantGradientFixture",
     "CoreContractError",
     "EqualSufficientStatistics",

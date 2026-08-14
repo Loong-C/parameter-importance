@@ -33,6 +33,7 @@ from .errors import RegistryError
 
 
 REGISTRY_SCHEMA_VERSION = "parameter-registry-v1"
+BUFFER_POLICY = "excluded_from_parameter_registry-v1"
 _SHA256_LENGTH = 64
 
 
@@ -225,7 +226,9 @@ class ParameterRegistry(Sequence[ParameterRecord]):
     推荐通过 :meth:`from_model` 构造。默认只允许 optimizer 中出现模型已命名的
     参数，并拒绝跨参数组重复、重叠 storage、稀疏参数或当前稀疏梯度。冻结参数与
     未进入 optimizer 的参数仍会出现在记录中，但 ``eligible=False``；纯估计器只
-    消费 :attr:`eligible_records`。
+    消费 :attr:`eligible_records`。模型 ``named_buffers`` 明确不属于参数坐标：它们
+    不进入 records、不会被 alias 解析，也不能被重要性 state 或 optimizer bridge
+    累计。该固定边界由 :data:`BUFFER_POLICY` 与 G1-REGISTRY report 共同声明。
     """
 
     def __init__(

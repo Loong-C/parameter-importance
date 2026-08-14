@@ -11,6 +11,7 @@ import torch
 import param_importance_nlp.assets as assets
 from param_importance_nlp.assets import AssetActorRole, AssetFile, AssetState
 from param_importance_nlp.core import (
+    BUFFER_POLICY,
     CoreContractError,
     ImportanceState,
     ParameterRegistry,
@@ -72,6 +73,23 @@ def test_registry_records_aliases_labels_and_expected_gradient_absence() -> None
     model.attention.weight.grad = torch.ones_like(model.attention.weight)
     result = registry.validate_model_gradients()
     assert result["present"] == ("attention.weight",)
+
+
+def test_registry_explicitly_excludes_buffers_from_coordinate_contract() -> None:
+    model = torch.nn.Module()
+    model.weight = torch.nn.Parameter(torch.ones(2))
+    model.register_buffer("running_mean", torch.zeros(2))
+    optimizer = torch.optim.SGD([model.weight], lr=0.1)
+    registry = ParameterRegistry.from_model(model, optimizer)
+
+    assert BUFFER_POLICY == "excluded_from_parameter_registry-v1"
+    assert registry.eligible_names == ("weight",)
+    assert all(
+        record["canonical_name"] != "running_mean"
+        for record in registry.to_manifest()["records"]
+    )
+    with pytest.raises(RegistryError, match="未知参数名称"):
+        registry.canonical_name("running_mean")
 
 
 def test_registry_save_reload_and_runtime_contract_reject_shape_or_lr_drift(tmp_path: Path) -> None:
@@ -210,3 +228,13 @@ def test_stage1_manifest_reader_separates_parse_bom_revision_files_and_hash_chec
 
     with pytest.raises(Stage1ManifestEncodingError):
         parse_stage1_manifest_bytes(b"\xff\xfe{\"x\": 1}")
+
+    missing = deepcopy(manifest)
+    del missing["metadata"]
+    with pytest.raises(Stage1ManifestValidationError, match="Stage 0 asset manifest"):
+        parse_stage1_manifest_bytes(json.dumps(missing).encode("utf-8"))
+
+    with pytest.raises(Stage1ManifestEncodingError, match="UTF-8 JSON"):
+        parse_stage1_manifest_bytes(b'{"duplicate":1,"duplicate":2}')
+    with pytest.raises(Stage1ManifestEncodingError, match="UTF-8 JSON"):
+        parse_stage1_manifest_bytes(b'{"value":NaN}')

@@ -1,0 +1,96 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://parameter-importance.invalid/schemas/stage1/s1-2-config-field-behavior-coverage-v2.json",
+  "title": "S1.2 public resolved-config v1 and v2 behavior coverage v2",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "schema_sha256", "config_contracts", "coverage_groups", "artifact_hash"],
+  "properties": {
+    "schema_version": {"const": "stage1-config-field-behavior-coverage-v2"},
+    "schema_sha256": {"$ref": "#/$defs/digest"},
+    "config_contracts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["resolved-config-v1", "resolved-config-v2"],
+      "properties": {
+        "resolved-config-v1": {"$ref": "#/$defs/configContractV1"},
+        "resolved-config-v2": {"$ref": "#/$defs/configContractV2"}
+      }
+    },
+    "coverage_groups": {
+      "type": "array",
+      "minItems": 1,
+      "items": {"$ref": "#/$defs/coverageGroup"}
+    },
+    "artifact_hash": {"$ref": "#/$defs/digest"}
+  },
+  "$defs": {
+    "digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "v1SharedSchemaHashes": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["resolved-config-v1"],
+      "properties": {
+        "resolved-config-v1": {"$ref": "#/$defs/digest"}
+      }
+    },
+    "v2SharedSchemaHashes": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["resolved-config-v1", "resolved-config-v2"],
+      "properties": {
+        "resolved-config-v1": {"$ref": "#/$defs/digest"},
+        "resolved-config-v2": {"$ref": "#/$defs/digest"}
+      }
+    },
+    "configContractV1": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_version", "schema_hash", "shared_schema_hashes"],
+      "properties": {
+        "schema_version": {"type": "string", "minLength": 1},
+        "schema_hash": {"$ref": "#/$defs/digest"},
+        "shared_schema_hashes": {"$ref": "#/$defs/v1SharedSchemaHashes"}
+      }
+    },
+    "configContractV2": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_version", "schema_hash", "shared_schema_hashes"],
+      "properties": {
+        "schema_version": {"type": "string", "minLength": 1},
+        "schema_hash": {"$ref": "#/$defs/digest"},
+        "shared_schema_hashes": {"$ref": "#/$defs/v2SharedSchemaHashes"}
+      }
+    },
+    "coverageGroup": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["config_family", "field_paths", "behavior_id", "test_id"],
+      "properties": {
+        "config_family": {"enum": ["resolved-config-v1", "resolved-config-v2"]},
+        "field_paths": {
+          "type": "array",
+          "minItems": 1,
+          "items": {"type": "string", "pattern": "^[a-z0-9_]+(\\[\\])?(\\.[a-z0-9_]+(\\[\\])?)*$"}
+        },
+        "behavior_id": {
+          "enum": [
+            "accepted_component_behavior_and_semantic_identity",
+            "accepted_alternate_full_identity_only",
+            "accepted_component_behavior_and_full_identity_only",
+            "paired_component_behavior_and_semantic_identity",
+            "paired_component_behavior_and_full_identity_only",
+            "frozen_rejection_guard"
+          ]
+        },
+        "test_id": {
+          "enum": [
+            "tests.test_stage1_s12_config_coverage::test_v1_public_fields_have_executable_alternate_or_guard_behavior",
+            "tests.test_stage1_s12_config_coverage::test_v2_public_fields_have_executable_alternate_or_guard_behavior"
+          ]
+        }
+      }
+    }
+  }
+}

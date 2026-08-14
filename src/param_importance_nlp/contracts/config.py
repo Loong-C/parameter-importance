@@ -20,7 +20,8 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from copy import deepcopy
 from dataclasses import dataclass
-from pathlib import PurePosixPath
+import hashlib
+from pathlib import Path, PurePosixPath
 from typing import Any, Final
 
 from .errors import ConfigContractError
@@ -55,6 +56,8 @@ def _rule(
 
 
 CONFIG_SCHEMA_VERSION: Final = "resolved-config-v1"
+RESOLVED_CONFIG_V1_SCHEMA_REF: Final = "schemas/shared/resolved-config-v1.json"
+_V1_VALIDATOR_CONTRACT_VERSION: Final = "resolved-config-v1-parser-rules-v1"
 CONFIG_SECTIONS: Final = (
     "identity",
     "runtime",
@@ -237,6 +240,106 @@ _FIELD_RULES: Final[dict[str, dict[str, FieldRule]]] = {
         "source_table_hash": _rule(str, type(None), default=None),
     },
 }
+
+
+def public_config_field_paths() -> tuple[str, ...]:
+    """返回所有公开 resolved-config 叶字段的稳定、完整列表。
+
+    S1.2 的配置字段—行为覆盖合同使用此函数，而不是复制一份容易漂移的字段
+    清单。新增、移除或改名公开字段时，覆盖 manifest 必须随之更新，否则验证会
+    fail-closed。
+    """
+
+    return tuple(
+        f"{section}.{field}"
+        for section in CONFIG_SECTIONS
+        for field in _FIELD_RULES[section]
+    )
+
+
+def _default_shared_schema_path(reference: str) -> Path:
+    """Resolve a checked-in shared schema for coverage/formalization only."""
+
+    repository_root = Path(__file__).resolve().parents[3]
+    return repository_root.joinpath(*reference.split("/"))
+
+
+def _shared_schema_identity(
+    *,
+    reference: str,
+    path: str | Path | None,
+) -> dict[str, str]:
+    schema_path = _default_shared_schema_path(reference) if path is None else Path(path)
+    if not schema_path.is_file():
+        raise ConfigContractError(f"shared config schema is unavailable: {reference}")
+    return {
+        "ref": reference,
+        "sha256": hashlib.sha256(schema_path.read_bytes()).hexdigest(),
+    }
+
+
+def config_schema_contract_payload(
+    *,
+    shared_schema_path: str | Path | None = None,
+) -> dict[str, Any]:
+    """返回所有公开字段及其解析规则的可哈希合同 payload。
+
+    该 payload 是配置实现的语义边界，不包含函数实现细节；字段类型、默认值、
+    枚举、非空约束和 required 状态任一改变都会改变摘要。
+    """
+
+    sections: dict[str, list[dict[str, Any]]] = {}
+    for section in CONFIG_SECTIONS:
+        rows: list[dict[str, Any]] = []
+        for name, rule in _FIELD_RULES[section].items():
+            row: dict[str, Any] = {
+                "name": name,
+                "types": [item.__name__ for item in rule.types],
+                "required": rule.default is _MISSING,
+                "choices": (
+                    None
+                    if rule.choices is None
+                    else sorted(rule.choices, key=canonical_json_bytes)
+                ),
+                "non_empty": rule.non_empty,
+            }
+            if rule.default is not _MISSING:
+                row["default"] = deepcopy(rule.default)
+            rows.append(row)
+        sections[section] = rows
+    return {
+        "schema_version": CONFIG_SCHEMA_VERSION,
+        "validator_contract_version": _V1_VALIDATOR_CONTRACT_VERSION,
+        "shared_schema": _shared_schema_identity(
+            reference=RESOLVED_CONFIG_V1_SCHEMA_REF,
+            path=shared_schema_path,
+        ),
+        "sections": sections,
+        "cross_field_rule_ids": [
+            "formal_eligibility_derived",
+            "local_fixture_runtime_boundary",
+            "logical_path_and_stable_identifier",
+            "batch_arithmetic_and_distributed_layout",
+            "optimizer_safety_and_parameter_groups",
+            "checkpoint_two_phase_commit",
+            "importance_views_and_formal_decision",
+            "frozen_sampling_grids",
+            "path_integration_requirements",
+            "pruning_requirements",
+            "analysis_statistical_bounds",
+        ],
+    }
+
+
+def config_schema_contract_hash(
+    *,
+    shared_schema_path: str | Path | None = None,
+) -> str:
+    """返回公开配置 schema 合同的 canonical SHA-256。"""
+
+    return canonical_json_hash(
+        config_schema_contract_payload(shared_schema_path=shared_schema_path)
+    )
 
 _NON_SEMANTIC_PATHS: Final = frozenset(
     {

@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 from datetime import datetime, timezone
 import hashlib
+import json
 from pathlib import Path, PurePosixPath
 import re
 import subprocess
@@ -22,11 +23,17 @@ from typing import Any
 
 _COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
 _DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
-INDEX_SCHEMA = "stage1-s1-2-formalization-index-v1"
-REPORT_SCHEMA = "g1-registry-report-v1"
+INDEX_SCHEMA = "stage1-s1-2-formalization-index-v2"
+REPORT_SCHEMA = "g1-registry-report-v2"
 VALIDATION_SCHEMA = "stage1-s1-2-validation-v1"
 TASK_ID = "stage1.02_architecture_and_parameter_registry"
 REQUIRED_UPSTREAM_GATES = ("stage1.G1-ENTRY", "stage1.G1-CONTRACT")
+CONFIG_COVERAGE_MANIFEST_REF = (
+    "configs/stage1/s1-2-config-field-behavior-coverage-v2.json"
+)
+CONFIG_COVERAGE_SCHEMA_REF = (
+    "schemas/stage1/s1-2-config-field-behavior-coverage-v2.json"
+)
 
 
 class Stage1S12FormalError(RuntimeError):
@@ -101,10 +108,15 @@ def _load_upstream_handoff(data_root: Path, index_ref: str) -> dict[str, Any]:
     return raw
 
 
-def _direct_contract_probe(work_root: Path) -> tuple[dict[str, Any], dict[str, Any]]:
+def _direct_contract_probe(
+    work_root: Path,
+    repository_root: Path,
+) -> tuple[dict[str, Any], dict[str, Any]]:
     import torch
 
-    from param_importance_nlp.core import ImportanceState, ParameterRegistry
+    from param_importance_nlp.contracts import ResolvedConfig, ResolvedConfigV2
+    from param_importance_nlp.core import BUFFER_POLICY, ImportanceState, ParameterRegistry
+    from param_importance_nlp.stage1_config_behavior import compile_config_behavior
 
     class OrderModel(torch.nn.Module):
         def __init__(self, *, reverse: bool = False) -> None:
@@ -159,6 +171,48 @@ def _direct_contract_probe(work_root: Path) -> tuple[dict[str, Any], dict[str, A
         not frozen_registry.record("locked").eligible
         and frozen_registry.record("locked").eligibility_reason == "requires_grad_false",
         frozen_registry.record("locked").eligibility_reason,
+    )
+
+    buffer_model = torch.nn.Module()
+    buffer_model.weight = torch.nn.Parameter(torch.ones(2))
+    buffer_model.register_buffer("running_mean", torch.zeros(2))
+    buffer_optimizer = torch.optim.SGD([buffer_model.weight], lr=0.1)
+    buffer_registry = ParameterRegistry.from_model(buffer_model, buffer_optimizer)
+    check(
+        "buffer_excluded",
+        BUFFER_POLICY == "excluded_from_parameter_registry-v1"
+        and buffer_registry.eligible_names == ("weight",)
+        and all(
+            record["canonical_name"] != "running_mean"
+            for record in buffer_registry.to_manifest()["records"]
+        ),
+        BUFFER_POLICY,
+    )
+
+    fixture_path = repository_root / "configs" / "local-fixtures" / "resolved-config-v1.json"
+    if not fixture_path.is_file():
+        raise Stage1S12FormalError("S1_2_CONFIG_BEHAVIOR_FIXTURE_MISSING")
+    base_config = ResolvedConfig.from_mapping(
+        json.loads(fixture_path.read_text(encoding="utf-8"))
+    )
+    execution_default = ResolvedConfigV2.resolve(
+        base_config,
+        task_id="stage0.05_config_run_identity_and_seeds",
+    )
+    execution_dry = ResolvedConfigV2.resolve(
+        base_config,
+        task_id="stage0.05_config_run_identity_and_seeds",
+        overrides={"execution": {"dry_run": True, "fail_on_blocked": True}},
+    )
+    default_behavior = compile_config_behavior(execution_default)
+    dry_behavior = compile_config_behavior(execution_dry)
+    check(
+        "config_behavior_component_branches",
+        default_behavior["execution_action"] == "execute"
+        and dry_behavior["execution_action"] == "plan_only"
+        and default_behavior["blocked_input_action"] == "record_blocked"
+        and dry_behavior["blocked_input_action"] == "raise",
+        "dry_run/fail_on_blocked compile to execution decisions",
     )
 
     model_a.a.weight.grad = torch.ones_like(model_a.a.weight)
@@ -220,11 +274,40 @@ def _direct_contract_probe(work_root: Path) -> tuple[dict[str, Any], dict[str, A
         "consumer_commit": "",
         "registry_manifest": manifest,
         "state_schema": state_schema,
+        "buffer_policy": BUFFER_POLICY,
     }
     return report, {
         "coordinate_registry_hash": registry_a.coordinate_registry_hash,
         "eligible_numel": sum(record.numel for record in registry_a.eligible_records),
         "state_bundle_manifest_sha256": state_bundle.manifest_sha256,
+    }
+
+
+def _load_config_coverage(repository_root: Path) -> dict[str, Any]:
+    """读取 S1.2 coverage manifest，并将其 schema/content 身份写入正式 evidence。"""
+
+    from param_importance_nlp.atomic import sha256_file
+    from param_importance_nlp.stage1_config_coverage import (
+        coverage_summary,
+        load_config_field_behavior_coverage,
+    )
+
+    manifest_path = repository_root / CONFIG_COVERAGE_MANIFEST_REF
+    schema_path = repository_root / CONFIG_COVERAGE_SCHEMA_REF
+    if not manifest_path.is_file() or not schema_path.is_file():
+        raise Stage1S12FormalError("S1_2_CONFIG_COVERAGE_INPUT_MISSING")
+    schema_sha256 = sha256_file(schema_path)
+    coverage = load_config_field_behavior_coverage(
+        manifest_path,
+        expected_schema_sha256=schema_sha256,
+    )
+    summary = coverage_summary(coverage)
+    return {
+        "manifest_ref": CONFIG_COVERAGE_MANIFEST_REF,
+        "manifest_sha256": sha256_file(manifest_path),
+        "schema_ref": CONFIG_COVERAGE_SCHEMA_REF,
+        "schema_sha256": schema_sha256,
+        **summary,
     }
 
 
@@ -269,6 +352,7 @@ def execute(
         "tests/test_core_registry_and_loss.py",
         "tests/test_core_estimators_and_accumulator.py",
         "tests/test_contracts_config.py",
+        "tests/test_stage1_s12_config_coverage.py",
         "tests/test_artifact_schemas_and_loaders.py",
         "tests/test_assets.py",
     ]
@@ -298,9 +382,11 @@ def execute(
     validation_path = work_dir / "validation.json"
     _write_new(validation_path, validation)
 
-    report, probe_summary = _direct_contract_probe(work_dir)
+    config_coverage = _load_config_coverage(repository_root)
+    report, probe_summary = _direct_contract_probe(work_dir, repository_root)
     report["producer_commit"] = commit
     report["consumer_commit"] = commit
+    report["config_field_behavior_coverage"] = config_coverage
     report_path = work_dir / "g1-registry-report.json"
     _write_new(report_path, report)
 
@@ -325,6 +411,19 @@ def execute(
         "validation_sha256": sha256_file(validation_path),
         "report_ref": "g1-registry-report.json",
         "report_sha256": sha256_file(report_path),
+        "config_field_behavior_coverage_manifest_ref": CONFIG_COVERAGE_MANIFEST_REF,
+        "config_field_behavior_coverage_manifest_sha256": config_coverage["manifest_sha256"],
+        "config_field_behavior_coverage_artifact_hash": config_coverage["artifact_hash"],
+        "config_field_behavior_coverage_schema_ref": CONFIG_COVERAGE_SCHEMA_REF,
+        "config_field_behavior_coverage_schema_sha256": config_coverage["schema_sha256"],
+        "config_contract_hashes": {
+            family: contract["schema_hash"]
+            for family, contract in config_coverage["config_contracts"].items()
+        },
+        "config_shared_schema_hashes": {
+            family: contract["shared_schema_hashes"]
+            for family, contract in config_coverage["config_contracts"].items()
+        },
         "probe_summary": probe_summary,
         "next_task_id": "stage1.03_fixtures_and_oracles",
     }

@@ -17,11 +17,18 @@ from __future__ import annotations
 from collections.abc import Mapping
 from copy import deepcopy
 from dataclasses import dataclass
+import hashlib
 import math
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
 from typing import Any, Final
 
-from .config import CONFIG_SCHEMA_VERSION, ResolvedConfig
+from .config import (
+    CONFIG_SCHEMA_VERSION,
+    RESOLVED_CONFIG_V1_SCHEMA_REF,
+    ResolvedConfig,
+    config_schema_contract_hash,
+    public_config_field_paths,
+)
 from .errors import ConfigContractError
 from .jsonio import JSONValue, canonical_json_bytes, canonical_json_hash
 from .task_catalog import (
@@ -34,6 +41,8 @@ from .task_catalog import (
 
 
 CONFIG_V2_SCHEMA_VERSION: Final = "resolved-config-v2"
+RESOLVED_CONFIG_V2_SCHEMA_REF: Final = "schemas/shared/resolved-config-v2.json"
+_V2_VALIDATOR_CONTRACT_VERSION: Final = "resolved-config-v2-parser-rules-v1"
 
 _TOP_LEVEL_FIELDS: Final = {
     "schema_version",
@@ -217,6 +226,199 @@ _ARTIFACT_FIELDS: Final = {
     "required_kinds",
     "publish_partial",
 }
+
+# These paths deliberately describe the public *leaf* contract rather than the
+# wire-object containers.  In particular, the two list-valued execution
+# sections expose their element contract with ``[]``; callers must not infer a
+# stable list length from the field enumeration.  S1.2 consumes this one source
+# of truth when checking that every public v1 and v2 setting has an executable
+# behavior test.
+_PUBLIC_V2_LEAF_PATHS: Final[tuple[str, ...]] = (
+    "schema_version",
+    "task_id",
+    *(f"base_config.{path}" for path in public_config_field_paths()),
+    "execution.runner_kind",
+    "execution.timeout_seconds",
+    "execution.max_attempts",
+    "execution.dry_run",
+    "execution.fail_on_blocked",
+    "training.max_steps",
+    "training.max_epochs",
+    "training.validation_every_steps",
+    "training.gradient_clip_max_norm",
+    "training.deterministic_algorithms",
+    "scheduler.kind",
+    "scheduler.warmup_steps",
+    "scheduler.total_steps",
+    "data_loader.num_workers",
+    "data_loader.prefetch_factor",
+    "data_loader.persistent_workers",
+    "data_loader.drop_last",
+    "data_loader.cursor_policy",
+    "providers.kind",
+    "providers.model_manifest_ref",
+    "providers.model_root_ref",
+    "providers.data_manifest_ref",
+    "providers.data_root_ref",
+    "providers.tokenizer_manifest_ref",
+    "providers.tokenizer_root_ref",
+    "providers.task_type",
+    "providers.task_name",
+    "providers.num_labels",
+    "providers.local_files_only",
+    "providers.trust_remote_code",
+    "evaluation.enabled",
+    "evaluation.split",
+    "evaluation.every_steps",
+    "evaluation.batch_size",
+    "evaluation.max_batches",
+    "evaluation.metrics[]",
+    "evaluation.save_predictions",
+    "profiling.enabled",
+    "profiling.warmup_steps",
+    "profiling.measure_steps",
+    "profiling.repetitions",
+    "profiling.capture_memory",
+    "profiling.capture_throughput",
+    "profiling.capture_communication",
+    "profiling.synchronize_device",
+    "checkpoint_schedule.segments[].start_step",
+    "checkpoint_schedule.segments[].end_step",
+    "checkpoint_schedule.segments[].every_steps",
+    "checkpoint_schedule.save_on_phase_end",
+    "checkpoint_schedule.save_optimizer",
+    "checkpoint_schedule.save_rng",
+    "checkpoint_schedule.save_data_state",
+    "precision_runtime.autocast_enabled",
+    "precision_runtime.autocast_dtype",
+    "precision_runtime.grad_scaler_enabled",
+    "precision_runtime.initial_scale",
+    "precision_runtime.growth_factor",
+    "precision_runtime.backoff_factor",
+    "precision_runtime.growth_interval",
+    "precision_runtime.global_found_inf_reduce",
+    "optimizer_runtime.betas[]",
+    "optimizer_runtime.eps",
+    "optimizer_runtime.amsgrad",
+    "optimizer_runtime.dampening",
+    "optimizer_runtime.nesterov",
+    "optimizer_runtime.maximize",
+    "optimizer_runtime.capturable",
+    "optimizer_runtime.differentiable",
+    "launcher.kind",
+    "launcher.backend",
+    "launcher.world_size",
+    "launcher.init_method",
+    "launcher.init_ref",
+    "launcher.rendezvous_id",
+    "launcher.max_restarts",
+    "orchestration.route_spec_ref",
+    "orchestration.quadrature_decision_ref",
+    "orchestration.matrix_ref",
+    "orchestration.paired_design.enabled",
+    "orchestration.paired_design.design",
+    "orchestration.paired_design.mapping_ref",
+    "orchestration.paired_design.budget_unit",
+    "orchestration.input_result_refs[]",
+    "recovery.mode",
+    "recovery.resume_ref",
+    "recovery.max_restarts",
+    "recovery.safe_boundary",
+    "artifacts.output_dir",
+    "artifacts.required_kinds[]",
+    "artifacts.publish_partial",
+)
+
+
+def public_config_v2_field_paths() -> tuple[str, ...]:
+    """Return the stable public v2 leaf enumeration, including embedded v1.
+
+    ``config_hash`` and ``full_hash`` are intentionally excluded: they are
+    derived wire assertions, not user-configurable execution fields.  They are
+    separately checked by :meth:`ResolvedConfigV2.from_mapping`.
+    """
+
+    return _PUBLIC_V2_LEAF_PATHS
+
+
+def _default_shared_schema_path(reference: str) -> Path:
+    repository_root = Path(__file__).resolve().parents[3]
+    return repository_root.joinpath(*reference.split("/"))
+
+
+def _shared_schema_identity(
+    *,
+    reference: str,
+    path: str | Path | None,
+) -> dict[str, str]:
+    schema_path = _default_shared_schema_path(reference) if path is None else Path(path)
+    if not schema_path.is_file():
+        raise ConfigContractError(f"shared config schema is unavailable: {reference}")
+    return {
+        "ref": reference,
+        "sha256": hashlib.sha256(schema_path.read_bytes()).hexdigest(),
+    }
+
+
+def config_v2_schema_contract_payload(
+    *,
+    v1_shared_schema_path: str | Path | None = None,
+    v2_shared_schema_path: str | Path | None = None,
+) -> dict[str, Any]:
+    """Return the hashable public v2 execution-contract descriptor.
+
+    The descriptor records the stable leaf enumeration and binds it to the v1
+    configuration contract embedded under ``base_config``.  Any public-field,
+    nesting, or wire-version drift therefore changes the S1.2 coverage input.
+    """
+
+    return {
+        "schema_version": CONFIG_V2_SCHEMA_VERSION,
+        "validator_contract_version": _V2_VALIDATOR_CONTRACT_VERSION,
+        "base_config_schema_version": CONFIG_SCHEMA_VERSION,
+        "base_config_schema_hash": config_schema_contract_hash(
+            shared_schema_path=v1_shared_schema_path
+        ),
+        "shared_schemas": {
+            "resolved-config-v1": _shared_schema_identity(
+                reference=RESOLVED_CONFIG_V1_SCHEMA_REF,
+                path=v1_shared_schema_path,
+            ),
+            "resolved-config-v2": _shared_schema_identity(
+                reference=RESOLVED_CONFIG_V2_SCHEMA_REF,
+                path=v2_shared_schema_path,
+            ),
+        },
+        "public_leaf_paths": list(public_config_v2_field_paths()),
+        "derived_wire_fields": ["config_hash", "full_hash"],
+        "parser_rule_ids": [
+            "task_catalog_stage_runner_recovery_artifact_binding",
+            "execution_and_training_bounds",
+            "scheduler_data_loader_provider_coupling",
+            "evaluation_and_profiling_enablement",
+            "checkpoint_schedule_contiguity_and_training_bundle",
+            "precision_runtime_base_amp_and_formal_guard",
+            "optimizer_runtime_base_optimizer_safety",
+            "launcher_distributed_and_formal_capabilities",
+            "orchestration_paired_and_task_inputs",
+            "recovery_and_artifact_publication",
+        ],
+    }
+
+
+def config_v2_schema_contract_hash(
+    *,
+    v1_shared_schema_path: str | Path | None = None,
+    v2_shared_schema_path: str | Path | None = None,
+) -> str:
+    """Return the canonical SHA-256 of the public v2 execution contract."""
+
+    return canonical_json_hash(
+        config_v2_schema_contract_payload(
+            v1_shared_schema_path=v1_shared_schema_path,
+            v2_shared_schema_path=v2_shared_schema_path,
+        )
+    )
 
 _OVERRIDABLE_SECTIONS: Final = {
     "execution": _EXECUTION_FIELDS,
@@ -1384,5 +1586,8 @@ def load_resolved_config_compatible(
 __all__ = [
     "CONFIG_V2_SCHEMA_VERSION",
     "ResolvedConfigV2",
+    "config_v2_schema_contract_hash",
+    "config_v2_schema_contract_payload",
     "load_resolved_config_compatible",
+    "public_config_v2_field_paths",
 ]

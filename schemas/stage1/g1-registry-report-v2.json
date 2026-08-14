@@ -1,0 +1,106 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://parameter-importance.invalid/schemas/stage1/g1-registry-report-v2.json",
+  "title": "G1-REGISTRY machine-readable validation report v2",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "gate_id", "status", "execution_scope", "registry", "checks", "producer_commit", "consumer_commit", "buffer_policy", "config_field_behavior_coverage"],
+  "properties": {
+    "schema_version": {"const": "g1-registry-report-v2"},
+    "gate_id": {"const": "G1-REGISTRY"},
+    "status": {"enum": ["PASS", "FAIL", "NOT_RUN"]},
+    "execution_scope": {"enum": ["local_cpu_contract_only", "formal_server_cpu"]},
+    "registry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["coordinate_registry_hash", "optimizer_contract_hash", "runtime_layout_hash", "record_count", "eligible_numel"],
+      "properties": {
+        "coordinate_registry_hash": {"$ref": "#/$defs/digest"},
+        "optimizer_contract_hash": {"$ref": "#/$defs/digest"},
+        "runtime_layout_hash": {"$ref": "#/$defs/digest"},
+        "record_count": {"type": "integer", "minimum": 1},
+        "eligible_numel": {"type": "integer", "minimum": 1}
+      }
+    },
+    "checks": {"type": "array", "items": {"type": "object"}},
+    "registry_manifest": {"type": "object"},
+    "state_schema": {"type": "object"},
+    "buffer_policy": {"const": "excluded_from_parameter_registry-v1"},
+    "config_field_behavior_coverage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_version", "artifact_hash", "config_contracts", "covered_field_counts", "behavior_counts", "full_identity_only_v1_paths", "scope", "manifest_ref", "manifest_sha256", "schema_ref", "schema_sha256"],
+      "properties": {
+        "schema_version": {"const": "stage1-config-field-behavior-coverage-v2"},
+        "artifact_hash": {"$ref": "#/$defs/digest"},
+        "config_contracts": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["resolved-config-v1", "resolved-config-v2"],
+          "properties": {
+            "resolved-config-v1": {"$ref": "#/$defs/configContractV1"},
+            "resolved-config-v2": {"$ref": "#/$defs/configContractV2"}
+          }
+        },
+        "covered_field_counts": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["resolved-config-v1", "resolved-config-v2"],
+          "properties": {
+            "resolved-config-v1": {"type": "integer", "minimum": 1},
+            "resolved-config-v2": {"type": "integer", "minimum": 1}
+          }
+        },
+        "behavior_counts": {"type": "object", "additionalProperties": {"type": "integer", "minimum": 1}},
+        "full_identity_only_v1_paths": {"type": "array", "items": {"type": "string"}},
+        "scope": {"const": "compiled_component_behavior_or_frozen_guard"},
+        "manifest_ref": {"type": "string", "minLength": 1},
+        "manifest_sha256": {"$ref": "#/$defs/digest"},
+        "schema_ref": {"type": "string", "minLength": 1},
+        "schema_sha256": {"$ref": "#/$defs/digest"}
+      }
+    },
+    "producer_commit": {"type": "string", "pattern": "^[0-9a-f]{40,64}$"},
+    "consumer_commit": {"type": "string", "pattern": "^[0-9a-f]{40,64}$"}
+  },
+  "$defs": {
+    "digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "v1SharedSchemaHashes": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["resolved-config-v1"],
+      "properties": {
+        "resolved-config-v1": {"$ref": "#/$defs/digest"}
+      }
+    },
+    "v2SharedSchemaHashes": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["resolved-config-v1", "resolved-config-v2"],
+      "properties": {
+        "resolved-config-v1": {"$ref": "#/$defs/digest"},
+        "resolved-config-v2": {"$ref": "#/$defs/digest"}
+      }
+    },
+    "configContractV1": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_version", "schema_hash", "shared_schema_hashes"],
+      "properties": {
+        "schema_version": {"type": "string", "minLength": 1},
+        "schema_hash": {"$ref": "#/$defs/digest"},
+        "shared_schema_hashes": {"$ref": "#/$defs/v1SharedSchemaHashes"}
+      }
+    },
+    "configContractV2": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_version", "schema_hash", "shared_schema_hashes"],
+      "properties": {
+        "schema_version": {"type": "string", "minLength": 1},
+        "schema_hash": {"$ref": "#/$defs/digest"},
+        "shared_schema_hashes": {"$ref": "#/$defs/v2SharedSchemaHashes"}
+      }
+    }
+  }
+}
