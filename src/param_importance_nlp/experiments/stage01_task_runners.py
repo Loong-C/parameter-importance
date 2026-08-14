@@ -98,6 +98,7 @@ from ..runtime.task_runtime import (
     TaskRunner,
 )
 from ..runtime.tensor_bundle import load_tensor_bundle
+from ..stage1_fixtures import build_stage1_s13_evidence
 from ..g3_gate import (
     GATE_IDS as G3_GATE_IDS,
     evaluate_stage0_g3,
@@ -2355,21 +2356,25 @@ def _registry_evidence(root: Path) -> Mapping[str, JSONValue]:
     }
 
 
-def _oracle_evidence() -> Mapping[str, JSONValue]:
-    samples = _gradient_samples()
-    mean = fp64_mean_gradient_oracle(samples)
-    statistics = EqualSufficientStatistics.from_samples(samples, accumulation_dtype=torch.float64)
-    production = equal_u_importance(statistics)
-    oracle = fp64_equal_u_oracle(samples)
-    comparison = compare_tensor_maps_fp64(production, oracle, natural_scale=4.0)
-    return {
-        "evidence_type": "fp64_fixture_oracle",
-        "sample_count": len(samples),
-        "mean_gradient": _tensor_values(mean),
-        "u_oracle": _tensor_values(oracle),
-        "comparison": comparison.to_dict(),
-        "fixture_scope": "local_fixture",
+def _oracle_evidence(
+    request: TaskExecutionRequest,
+    root: Path,
+) -> Mapping[str, JSONValue]:
+    repository_root = Path(__file__).resolve().parents[3]
+    producer_commit = _stage1_git_command(repository_root, "rev-parse", "HEAD") or "0" * 40
+    upstream = {
+        "passed_gate_ids": sorted(request.environment.passed_gate_ids),
+        "evidence_refs": dict(sorted(request.environment.evidence_refs.items())),
     }
+    # The fixture/oracle generator is repository-owned, not workspace-owned;
+    # this keeps temporary TaskRuntime directories from changing the source
+    # manifest or the producer identity.
+    return build_stage1_s13_evidence(
+        repository_root,
+        producer_commit=producer_commit,
+        scope=request.config.run_intent,
+        upstream_evidence=upstream,
+    )
 
 
 def _loss_scale_evidence() -> Mapping[str, JSONValue]:
@@ -2528,7 +2533,7 @@ def _task_evidence(request: TaskExecutionRequest, root: Path) -> Mapping[str, JS
     if task_id == "stage1.02_architecture_and_parameter_registry":
         return _registry_evidence(root)
     if task_id == "stage1.03_fixtures_and_oracles":
-        return _oracle_evidence()
+        return _oracle_evidence(request, root)
     if task_id == "stage1.04_loss_and_gradient_scale":
         return _loss_scale_evidence()
     if task_id == "stage1.05_estimators":
@@ -2922,6 +2927,16 @@ class Stage01CompositeTaskRunner(TaskRunner):
         evidence_hash = canonical_json_hash(evidence)
         refs: dict[str, str] = {}
         for artifact_kind in request.task.artifact_kinds:
+            if request.task.task_id == "stage1.03_fixtures_and_oracles":
+                core_evidence = evidence.get(artifact_kind)
+                if not isinstance(core_evidence, Mapping):
+                    raise ValueError(
+                        f"STAGE1_S13_ROLE_EVIDENCE_MISSING:{artifact_kind}"
+                    )
+                role_core_hash = canonical_json_hash(core_evidence)
+            else:
+                core_evidence = evidence
+                role_core_hash = evidence_hash
             payload: dict[str, JSONValue] = {
                 "schema_version": "stage01-task-evidence-v1",
                 "task_id": request.task.task_id,
@@ -2934,8 +2949,8 @@ class Stage01CompositeTaskRunner(TaskRunner):
                 "config_hash": request.config.config_hash,
                 "task_definition_hash": canonical_json_hash(request.task.to_dict()),
                 "input_evidence": inputs,
-                "core_evidence_hash": evidence_hash,
-                "core_evidence": evidence,
+                "core_evidence_hash": role_core_hash,
+                "core_evidence": dict(core_evidence),
                 "role_evidence": dict(_role_evidence(request.task.task_id, artifact_kind)),
             }
             published = store.publish(

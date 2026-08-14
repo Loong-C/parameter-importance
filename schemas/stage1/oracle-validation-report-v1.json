@@ -1,0 +1,42 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://parameter-importance.invalid/schemas/stage1/oracle-validation-report-v1.json",
+  "title": "Stage 1 S1.3 G1-ORACLE validation report",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "gate_id",
+    "status",
+    "scope",
+    "formal_eligible",
+    "producer_commit",
+    "fixture_manifest_hash",
+    "oracle_bundle_hash",
+    "upstream_evidence",
+    "checks",
+    "check_count",
+    "passed_check_count",
+    "pythia_14m",
+    "replay_contract",
+    "report_hash"
+  ],
+  "properties": {
+    "schema_version": {"const": "stage1-oracle-validation-report-v1"},
+    "gate_id": {"const": "G1-ORACLE"},
+    "status": {"enum": ["PASS", "FAIL"]},
+    "scope": {"enum": ["local_fixture", "formal"]},
+    "formal_eligible": {"type": "boolean"},
+    "producer_commit": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+    "fixture_manifest_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "oracle_bundle_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "upstream_evidence": {"type": "object"},
+    "source_file_hashes": {"type": "object"},
+    "checks": {"type": "array", "minItems": 1, "items": {"type": "object"}},
+    "check_count": {"type": "integer", "minimum": 1},
+    "passed_check_count": {"type": "integer", "minimum": 0},
+    "pythia_14m": {"type": "object", "minProperties": 1},
+    "replay_contract": {"type": "object", "minProperties": 1},
+    "report_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+  }
+}

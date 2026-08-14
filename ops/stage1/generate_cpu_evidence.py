@@ -12,7 +12,6 @@
 from __future__ import annotations
 
 import argparse
-import shutil
 import sys
 import tempfile
 from copy import deepcopy
@@ -123,7 +122,10 @@ def main() -> int:
 
     evidence_root = ROOT / "reports/stage1" / f"cpu-evidence-{args.date}"
     if evidence_root.exists():
-        shutil.rmtree(evidence_root)
+        raise SystemExit(
+            f"Refusing to overwrite existing evidence directory: {evidence_root}. "
+            "Choose a new --date/attempt suffix."
+        )
     evidence_root.mkdir(parents=True)
 
     summary: dict[str, JSONValue] = {
