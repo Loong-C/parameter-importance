@@ -53,6 +53,9 @@ ARRAY_MANIFEST_SCHEMA = "stage1-s1-7-safetensors-manifest-v1"
 T32_ATOL = 1.0e-7
 T32_RTOL = 1.0e-5
 T32_NORMALIZED_L2_LIMIT = 1.0e-5
+EXPECTED_MODEL_CONFIG_VOCAB_SIZE = 50_304
+EXPECTED_TOKENIZER_RUNTIME_VOCAB_SIZE = 50_277
+PYTHIA_ACTIVE_DROPOUT_FIELDS = ("attention_dropout", "hidden_dropout")
 ACCUMULATOR_FIELDS = (
     "actual_update_raw_importance", "data_displacement", "data_movement",
     "initial_parameters", "last_parameters", "magnitude", "negative_mass",
@@ -213,7 +216,7 @@ def _validate_plan(path: Path) -> dict[str, Any]:
         raise Stage1S17WorkerError("S17_WORKER_RECORD_FIXTURE_INVALID")
     fixture_identity = _require_object(fixture.get("asset_identity"), field="fixture.asset_identity")
     if fixture_identity != {
-        "model": {"logical_name": "pythia-14m-step0", "asset_id": "11dd681a22649a451b9be53c255bb4e9f83207c3f22f75f1eec53a33b7776fd2", "revision": "56079904bb80b7f36d3b794089f146e7a4d6efae", "ready_manifest_sha256": "7d3404906f3dd00c0d0314863f706c5df01f1db1fc0e0b4cf501353b88963d1e", "parameter_count": 14067712},
+        "model": {"logical_name": "pythia-14m-step0", "asset_id": "11dd681a22649a451b9be53c255bb4e9f83207c3f22f75f1eec53a33b7776fd2", "revision": "56079904bb80b7f36d3b794089f146e7a4d6efae", "ready_manifest_sha256": "7d3404906f3dd00c0d0314863f706c5df01f1db1fc0e0b4cf501353b88963d1e", "parameter_count": 14067712, "config_vocab_size": EXPECTED_MODEL_CONFIG_VOCAB_SIZE},
         "tokenizer": {"logical_name": "pythia-tokenizer", "asset_id": "b5eebc43fe88687e5bf692761f1db25f91e8d6f9a8cceaa2342d2624ac1f652d", "revision": "e361f9afd54b3e7856879eead5326d36ff6f32d7", "ready_manifest_sha256": "ea59f3f8e37321208701326b2ea88b7491450a88eae870775beeff027d102794", "vocab_size": 50277},
         "pile": {"logical_name": "pile-selected-prefix", "asset_id": "dbbfeb12bab4027b386bd97d604d8134699e96f79e309cceacff7999a55b5dad", "revision": "4647773ea142ab1ff5694602fa104bbf49088408", "ready_manifest_sha256": "345cd0f49d35ad9543daa3f95118013c55bdd729ed87fdec3c7a7c93ae449f8b"},
     }:
@@ -221,13 +224,14 @@ def _validate_plan(path: Path) -> dict[str, Any]:
     contract = _require_object(fixture.get("execution_contract"), field="fixture.execution_contract")
     expected_contract = {"model_mode": "train", "random_layer_policy": "all_pythia_dropout_probabilities_zero", "precision": {"compute": "float32", "gradient": "float32", "statistics": "float32", "reference": "float64", "amp": False}, "loss": {"task_type": "causal_lm", "reduction": "mean", "valid_tokens_per_microbatch": 2048, "ignore_index": -100}, "optimizer": {"type": "AdamW", "learning_rate": 0.0003, "weight_decay": 0.01, "betas": [0.9, 0.999], "epsilon": 1e-8, "foreach": False, "fused": False}, "gradient_clip_max_norm": 1.0, "scheduler": None, "statistical_contract": {"estimator_name": "u", "statistical_unit": "microbatch_mean_gradient", "weight_unit": "effective_target_tokens", "sampling_design": "ordered_disjoint_microbatches", "weights_exogenous": True, "common_mean_assumption": True}, "determinism": {"model_seed": 1707, "training_seed": 2707, "deterministic_algorithms": True, "allow_tf32": False, "cublas_workspace_config": ":4096:8"}}
     actual_without_dropout = {key: value for key, value in contract.items() if key != "dropout_probabilities"}
-    if actual_without_dropout != expected_contract or not isinstance(contract.get("dropout_probabilities"), Mapping) or not contract["dropout_probabilities"] or any(value != 0.0 for value in contract["dropout_probabilities"].values()):
+    declared_dropout = contract.get("dropout_probabilities")
+    if actual_without_dropout != expected_contract or not isinstance(declared_dropout, Mapping) or set(declared_dropout) != set(PYTHIA_ACTIVE_DROPOUT_FIELDS) or any(isinstance(value, bool) or not isinstance(value, (int, float)) or value != 0.0 for value in declared_dropout.values()):
         raise Stage1S17WorkerError("S17_WORKER_EXECUTION_CONTRACT_INVALID")
     assets = _require_object(value["assets"], field="assets")
     if set(assets) != {"model", "tokenizer", "pile"}:
         raise Stage1S17WorkerError("S17_WORKER_ASSET_ROLE_SET_INVALID")
     expected_assets = {
-        "model": {"parameter_count": 14067712, "revision": "56079904bb80b7f36d3b794089f146e7a4d6efae", "asset_id": "11dd681a22649a451b9be53c255bb4e9f83207c3f22f75f1eec53a33b7776fd2", "ready_manifest_sha256": "7d3404906f3dd00c0d0314863f706c5df01f1db1fc0e0b4cf501353b88963d1e"},
+        "model": {"parameter_count": 14067712, "config_vocab_size": EXPECTED_MODEL_CONFIG_VOCAB_SIZE, "revision": "56079904bb80b7f36d3b794089f146e7a4d6efae", "asset_id": "11dd681a22649a451b9be53c255bb4e9f83207c3f22f75f1eec53a33b7776fd2", "ready_manifest_sha256": "7d3404906f3dd00c0d0314863f706c5df01f1db1fc0e0b4cf501353b88963d1e"},
         "tokenizer": {"revision": "e361f9afd54b3e7856879eead5326d36ff6f32d7", "asset_id": "b5eebc43fe88687e5bf692761f1db25f91e8d6f9a8cceaa2342d2624ac1f652d", "ready_manifest_sha256": "ea59f3f8e37321208701326b2ea88b7491450a88eae870775beeff027d102794"},
     }
     if any(_require_object(assets.get(role), field=f"assets.{role}") != expected for role, expected in expected_assets.items()):
@@ -403,6 +407,18 @@ def _encode_arrays(path: Path, arrays: Mapping[str, Mapping[str, torch.Tensor]])
     return body
 
 
+def _active_gpt_neox_dropout(config: Mapping[str, Any]) -> dict[str, float]:
+    """Return the only stochastic GPTNeoX CausalLM config fields used in forward."""
+
+    values: dict[str, float] = {}
+    for key in PYTHIA_ACTIVE_DROPOUT_FIELDS:
+        value = config.get(key)
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise Stage1S17WorkerError(f"S17_WORKER_ACTIVE_DROPOUT_FIELD_INVALID:{key}")
+        values[key] = float(value)
+    return values
+
+
 def _load_model(plan: Mapping[str, Any]) -> tuple[TorchModelAdapter, object]:
     try:
         from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -414,13 +430,13 @@ def _load_model(plan: Mapping[str, Any]) -> tuple[TorchModelAdapter, object]:
     metadata = _require_object(_require_object(plan["assets"], field="assets").get("model"), field="assets.model")
     expected_count = metadata.get("parameter_count")
     count = sum(parameter.numel() for parameter in model.parameters())
-    if count != expected_count or int(getattr(model.config, "vocab_size", -1)) != 50277 or len(tokenizer) != 50277:
+    if count != expected_count or metadata.get("config_vocab_size") != EXPECTED_MODEL_CONFIG_VOCAB_SIZE or int(getattr(model.config, "vocab_size", -1)) != metadata["config_vocab_size"] or len(tokenizer) != EXPECTED_TOKENIZER_RUNTIME_VOCAB_SIZE:
         raise Stage1S17WorkerError("S17_WORKER_MODEL_OR_TOKENIZER_IDENTITY_DRIFT")
     if model.__class__.__name__ != "GPTNeoXForCausalLM":
         raise Stage1S17WorkerError("S17_WORKER_MODEL_ARCHITECTURE_DRIFT")
     declared_dropout = _require_object(_require_object(plan["fixture"], field="fixture").get("execution_contract"), field="execution_contract").get("dropout_probabilities")
-    observed_dropout = {key: float(value) for key, value in model.config.to_dict().items() if "dropout" in key.lower() and isinstance(value, (int, float)) and not isinstance(value, bool)}
-    if observed_dropout != declared_dropout or any(value != 0.0 for value in observed_dropout.values()) or model.training is not True:
+    observed_dropout = _active_gpt_neox_dropout(model.config.to_dict())
+    if declared_dropout != {key: 0.0 for key in PYTHIA_ACTIVE_DROPOUT_FIELDS} or observed_dropout != declared_dropout or any(value != 0.0 for value in observed_dropout.values()) or model.training is not True:
         raise Stage1S17WorkerError("S17_WORKER_MODEL_RANDOM_OR_MODE_DRIFT")
     return TorchModelAdapter(model, task_type="causal_lm"), tokenizer
 

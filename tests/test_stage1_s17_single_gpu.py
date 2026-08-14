@@ -20,7 +20,11 @@ import yaml
 
 from param_importance_nlp.contracts.task_catalog import DEFAULT_TASK_CATALOG
 from param_importance_nlp.runtime.training import TrainingStepRecord
-from param_importance_nlp.stage1_single_gpu import T32_ATOL, T32_NORMALIZED_L2_LIMIT, T32_RTOL, _fixed_array_bundle
+from param_importance_nlp.stage1_single_gpu import (
+    EXPECTED_MODEL_CONFIG_VOCAB_SIZE, EXPECTED_TOKENIZER_RUNTIME_VOCAB_SIZE,
+    PYTHIA_ACTIVE_DROPOUT_FIELDS, T32_ATOL, T32_NORMALIZED_L2_LIMIT, T32_RTOL,
+    Stage1S17WorkerError, _active_gpt_neox_dropout, _fixed_array_bundle,
+)
 from param_importance_nlp.stage1_single_gpu_oracle import Stage1S17OracleError, max_error, raw_double_and_u
 
 
@@ -67,6 +71,20 @@ def test_s17_frozen_t32_and_task_catalog_decision_exemption() -> None:
     assert (T32_ATOL, T32_RTOL, T32_NORMALIZED_L2_LIMIT) == (1.0e-7, 1.0e-5, 1.0e-5)
     task = DEFAULT_TASK_CATALOG.get("stage1.07_single_gpu_pythia14m")
     assert task.formal_eligibility.requires_estimator_decision is False
+
+
+def test_s17_pythia_runtime_vocab_and_active_dropout_contract() -> None:
+    """Mirror the frozen Transformers GPTNeoX CausalLM stochastic wire."""
+
+    assert (EXPECTED_MODEL_CONFIG_VOCAB_SIZE, EXPECTED_TOKENIZER_RUNTIME_VOCAB_SIZE) == (50_304, 50_277)
+    observed = _active_gpt_neox_dropout({
+        "attention_dropout": 0.0, "hidden_dropout": 0.0,
+        "classifier_dropout": 0.1,
+    })
+    assert observed == {"attention_dropout": 0.0, "hidden_dropout": 0.0}
+    assert set(observed) == set(PYTHIA_ACTIVE_DROPOUT_FIELDS)
+    with pytest.raises(Stage1S17WorkerError, match="S17_WORKER_ACTIVE_DROPOUT_FIELD_INVALID:hidden_dropout"):
+        _active_gpt_neox_dropout({"attention_dropout": 0.0})
 
 
 def test_s17_yaml_keeps_global_default_but_freezes_local_fixture_contract() -> None:
@@ -197,9 +215,13 @@ def test_s17_historical_replay_binds_ready_manifest_file_bytes(
     def completed(command: list[str], **_kwargs: object) -> SimpleNamespace:
         script = command[2]
         compile(script, "<historical-g3-replay>", "exec")
+        assert "from param_importance_nlp.contracts.jsonio import canonical_json_hash" in script
+        assert "def canonical(value): return canonical_json_hash(value)" in script
+        assert "token_count_with_added_tokens" in script
+        assert "active_dropout_fields=('attention_dropout','hidden_dropout')" in script
         assert "manifest_files=pile.manifest.get('files')" in script
         assert "storage['idx']['size_bytes']" not in script
-        assert command[-1] == str(module.EXPECTED_PILE_HASHED_BYTES)
+        assert command[-3:] == [str(module.EXPECTED_PILE_HASHED_BYTES), str(module.EXPECTED_MODEL_CONFIG_VOCAB_SIZE), str(module.EXPECTED_TOKENIZER_RUNTIME_VOCAB_SIZE)]
         output = Path(command[5])
         fixture = Path(command[6])
         fixture.write_bytes(b"frozen-fixture")
@@ -291,7 +313,7 @@ def test_s17_fixture_parser_binds_identity_and_provenance_after_rehash() -> None
         "batching": {"global_batch_size": 4, "microbatch_size": 1, "accumulation_steps": 4, "world_size": 1},
         "records": {"a": [0, 1, 2, 3], "b": [4, 5, 6, 7], "training": [[8, 9, 10, 11], [12, 13, 14, 15]]},
         "token_sha256": {str(index): "a" * 64 for index in range(16)},
-        "execution_contract": {"model_mode": "train", "dropout_probabilities": {"attention_dropout": 0.0}, "random_layer_policy": "all_pythia_dropout_probabilities_zero", "precision": {"compute": "float32", "gradient": "float32", "statistics": "float32", "reference": "float64", "amp": False}, "loss": {"task_type": "causal_lm", "reduction": "mean", "valid_tokens_per_microbatch": 2048, "ignore_index": -100}, "optimizer": {"type": "AdamW", "learning_rate": 0.0003, "weight_decay": 0.01, "betas": [0.9, 0.999], "epsilon": 1e-8, "foreach": False, "fused": False}, "gradient_clip_max_norm": 1.0, "scheduler": None, "statistical_contract": {"estimator_name": "u", "statistical_unit": "microbatch_mean_gradient", "weight_unit": "effective_target_tokens", "sampling_design": "ordered_disjoint_microbatches", "weights_exogenous": True, "common_mean_assumption": True}, "determinism": {"model_seed": 1707, "training_seed": 2707, "deterministic_algorithms": True, "allow_tf32": False, "cublas_workspace_config": ":4096:8"}},
+        "execution_contract": {"model_mode": "train", "dropout_probabilities": {"attention_dropout": 0.0, "hidden_dropout": 0.0}, "random_layer_policy": "all_pythia_dropout_probabilities_zero", "precision": {"compute": "float32", "gradient": "float32", "statistics": "float32", "reference": "float64", "amp": False}, "loss": {"task_type": "causal_lm", "reduction": "mean", "valid_tokens_per_microbatch": 2048, "ignore_index": -100}, "optimizer": {"type": "AdamW", "learning_rate": 0.0003, "weight_decay": 0.01, "betas": [0.9, 0.999], "epsilon": 1e-8, "foreach": False, "fused": False}, "gradient_clip_max_norm": 1.0, "scheduler": None, "statistical_contract": {"estimator_name": "u", "statistical_unit": "microbatch_mean_gradient", "weight_unit": "effective_target_tokens", "sampling_design": "ordered_disjoint_microbatches", "weights_exogenous": True, "common_mean_assumption": True}, "determinism": {"model_seed": 1707, "training_seed": 2707, "deterministic_algorithms": True, "allow_tf32": False, "cublas_workspace_config": ":4096:8"}},
     }
     fixture["fixture_hash"] = module._canonical(fixture)
     assert module._validate_fixture_manifest(fixture)["fixture_id"] == module.FIXTURE_ID
@@ -307,8 +329,12 @@ def test_s17_schemas_are_strict_and_bind_fixture_identity_and_next_tasks() -> No
     report = json.loads((root / "schemas" / "stage1" / "s1-7-single-gpu-report-v1.json").read_text(encoding="utf-8"))
     index = json.loads((root / "schemas" / "stage1" / "s1-7-formalization-index-v1.json").read_text(encoding="utf-8"))
     assert fixture["definitions"]["model_identity"]["properties"]["asset_id"]["const"].startswith("11dd681a")
+    assert fixture["definitions"]["model_identity"]["properties"]["config_vocab_size"]["const"] == 50_304
     assert fixture["definitions"]["provenance"]["properties"]["directory_content_sha256"]["type"] == ["string", "null"]
     assert "observer" not in report["definitions"]
+    report_model = report["definitions"]["assets"]["properties"]["model"]
+    assert "config_vocab_size" in report_model["required"]
+    assert report_model["properties"]["config_vocab_size"]["const"] == 50_304
     for row in ("gradient_ready_row", "parameter_post_row", "attempt_commit_row"):
         assert report["definitions"][row]["additionalProperties"] is False
     assert index["properties"]["next_task_ids"]["const"] == ["stage1.08_ddp_and_gradient_accumulation", "stage1.09_precision_clipping_and_optimizer_boundaries"]
