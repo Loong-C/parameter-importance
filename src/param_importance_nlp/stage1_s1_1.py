@@ -35,10 +35,15 @@ from .runtime import (
     load_committed_task_artifact,
 )
 from .stage0_g10 import (
+    DELIVERY_SCHEMA,
+    HANDOFF_SCHEMA,
     READINESS_SCHEMA,
+    SYNC_REPORT_SCHEMA,
+    WORKLOG_SCHEMA,
     Stage0G10FormalState,
-    validate_formal_g10_outputs,
+    _load_canonical_from_outputs,
 )
+from .stage0_gate import Stage0GateReport
 
 
 TASK_ID = "stage1.01_entry_and_contract"
@@ -155,6 +160,177 @@ def _write_or_verify(path: Path, value: Mapping[str, object]) -> None:
 def _yaml_mapping(path: Path, *, field: str) -> dict[str, Any]:
     value = yaml.safe_load(path.read_text(encoding="utf-8"))
     return _mapping(value, field=field)
+
+
+def _validate_immutable_g10_outputs(
+    *,
+    request: TaskExecutionRequest,
+    data_root: Path,
+    outputs: Mapping[str, str],
+    generator_git_commit: str,
+    sync_observation_ref: str,
+) -> GateRecord:
+    """Validate historical G10 bytes without comparing them to current sources."""
+
+    canonical = _load_canonical_from_outputs(request, data_root, outputs)
+    source_hashes = canonical.get("critical_source_hashes")
+    if (
+        canonical.get("status") != "PASS"
+        or canonical.get("generator_git_commit") != generator_git_commit
+        or canonical.get("config_hash") != request.config.config_hash
+        or canonical.get("environment_hash") != request.environment.environment_hash
+        or canonical.get("sync_observation_ref") != sync_observation_ref
+        or not isinstance(source_hashes, Mapping)
+        or not source_hashes
+        or any(
+            not isinstance(reference, str)
+            or not reference
+            or not isinstance(digest, str)
+            or re.fullmatch(r"[0-9a-f]{64}", digest) is None
+            for reference, digest in source_hashes.items()
+        )
+    ):
+        raise Stage1S11Error("S1_1_G10_CANONICAL_IDENTITY_INVALID")
+    observation = _load_hashed(
+        _logical_path(
+            data_root, sync_observation_ref, field="g10_sync_observation_ref"
+        ),
+        schema="stage0-g10-sync-observation-v1",
+        field="g10_sync_observation",
+    )
+    if canonical.get("sync_observation_artifact_hash") != observation["artifact_hash"]:
+        raise Stage1S11Error("S1_1_G10_SYNC_OBSERVATION_DRIFT")
+
+    upstream_raw = _mapping(
+        canonical.get("upstream_gate_records"), field="g10_upstream_gates"
+    )
+    expected_upstream = set(REQUIRED_STAGE0_GATE_IDS) - {"stage0.G10"}
+    if set(upstream_raw) != expected_upstream:
+        raise Stage1S11Error("S1_1_G10_UPSTREAM_GATE_SET_INVALID")
+    upstream = {
+        gate_id: GateRecord.from_mapping(
+            _mapping(value, field=f"g10_upstream_gate:{gate_id}")
+        )
+        for gate_id, value in upstream_raw.items()
+    }
+    if any(
+        gate.gate_id != gate_id or gate.status is not GateStatus.PASS
+        for gate_id, gate in upstream.items()
+    ):
+        raise Stage1S11Error("S1_1_G10_UPSTREAM_GATE_NOT_PASS")
+
+    artifacts = _mapping(canonical.get("artifacts"), field="g10_artifacts")
+    expected_schemas = {
+        "delivery_manifest": DELIVERY_SCHEMA,
+        "sync_report": SYNC_REPORT_SCHEMA,
+        "worklog": WORKLOG_SCHEMA,
+        "stage1_handoff": HANDOFF_SCHEMA,
+        "readiness": READINESS_SCHEMA,
+        "gate_report": "stage0-gate-report-v1",
+    }
+    if set(artifacts) != set(expected_schemas):
+        raise Stage1S11Error("S1_1_G10_ARTIFACT_SET_INVALID")
+    loaded: dict[str, dict[str, Any]] = {}
+    for name, schema in expected_schemas.items():
+        descriptor = _mapping(artifacts[name], field=f"g10_artifact:{name}")
+        path = _logical_path(
+            data_root, descriptor.get("ref"), field=f"g10_artifact_ref:{name}"
+        )
+        if not path.is_file() or sha256_file(path) != descriptor.get("sha256"):
+            raise Stage1S11Error(f"S1_1_G10_ARTIFACT_SHA_DRIFT:{name}")
+        value = _load_hashed(path, schema=schema, field=f"g10_artifact:{name}")
+        if value.get("artifact_hash") != descriptor.get("artifact_hash"):
+            raise Stage1S11Error(f"S1_1_G10_ARTIFACT_HASH_DRIFT:{name}")
+        loaded[name] = value
+
+    delivery = loaded["delivery_manifest"]
+    sync = loaded["sync_report"]
+    worklog = loaded["worklog"]
+    handoff = loaded["stage1_handoff"]
+    if (
+        delivery.get("status") != "PASS"
+        or delivery.get("generator_git_commit") != generator_git_commit
+        or delivery.get("gate_records") != {
+            key: value.to_dict() for key, value in upstream.items()
+        }
+        or delivery.get("large_runtime_artifacts_in_git") is not False
+        or delivery.get("authoritative_runtime_copy_described_as_backup") is not False
+        or sync.get("status") != "PASS"
+        or sync.get("generator_git_commit") != generator_git_commit
+        or sync.get("sync_observation_ref") != sync_observation_ref
+        or sync.get("sync_observation_artifact_hash") != observation["artifact_hash"]
+        or sync.get("local_head") != generator_git_commit
+        or sync.get("github_head") != generator_git_commit
+        or sync.get("server_head") != generator_git_commit
+        or sync.get("fast_forward_only") is not True
+        or sync.get("force_push_used") is not False
+        or worklog.get("status") != "PASS"
+        or worklog.get("git_commit") != generator_git_commit
+        or worklog.get("secrets_included") is not False
+        or worklog.get("temporary_download_urls_included") is not False
+        or handoff.get("status") != "READY_FOR_STAGE1_ENTRY"
+        or handoff.get("generator_git_commit") != generator_git_commit
+        or handoff.get("environment_id") != request.environment.environment_hash
+    ):
+        raise Stage1S11Error("S1_1_G10_DELIVERY_OR_HANDOFF_INVALID")
+
+    gate = GateRecord.from_mapping(
+        _mapping(canonical.get("gate_record"), field="g10_gate_record")
+    )
+    canonical_gate_report = Stage0GateReport.from_mapping(
+        _mapping(canonical.get("gate_report"), field="g10_gate_report")
+    )
+    stored_gate_report = Stage0GateReport.from_mapping(loaded["gate_report"])
+    if (
+        gate.gate_id != "stage0.G10"
+        or gate.status is not GateStatus.PASS
+        or canonical_gate_report != stored_gate_report
+        or canonical_gate_report.status.value != "PASS"
+        or canonical_gate_report.generator_git_commit != generator_git_commit
+        or canonical_gate_report.environment_id != request.environment.environment_hash
+    ):
+        raise Stage1S11Error("S1_1_G10_GATE_INVALID")
+    for item in canonical_gate_report.input_evidence:
+        path = _logical_path(data_root, item.ref, field="g10_gate_input")
+        if not path.is_file() or sha256_file(path) != item.sha256:
+            raise Stage1S11Error("S1_1_G10_GATE_INPUT_DRIFT")
+
+    readiness = loaded["readiness"]
+    readiness_gates_raw = _mapping(
+        readiness.get("gate_records"), field="g10_readiness_gates"
+    )
+    if (
+        readiness.get("status") != "READY"
+        or readiness.get("stage") != 0
+        or readiness.get("generator_git_commit") != generator_git_commit
+        or readiness.get("environment_hash") != request.environment.environment_hash
+        or readiness.get("all_hard_gates_pass") is not True
+        or readiness.get("approved_exceptions") != []
+        or set(readiness_gates_raw) != set(REQUIRED_STAGE0_GATE_IDS)
+    ):
+        raise Stage1S11Error("S1_1_G10_READINESS_INVALID")
+    readiness_gates = {
+        gate_id: GateRecord.from_mapping(
+            _mapping(value, field=f"g10_readiness_gate:{gate_id}")
+        )
+        for gate_id, value in readiness_gates_raw.items()
+    }
+    if any(
+        item.gate_id != gate_id or item.status is not GateStatus.PASS
+        for gate_id, item in readiness_gates.items()
+    ) or readiness_gates["stage0.G10"] != gate:
+        raise Stage1S11Error("S1_1_G10_READINESS_GATE_INVALID")
+    evidence = readiness.get("evidence")
+    if not isinstance(evidence, list) or not evidence:
+        raise Stage1S11Error("S1_1_G10_READINESS_EVIDENCE_INVALID")
+    for item in evidence:
+        descriptor = _mapping(item, field="g10_readiness_evidence")
+        path = _logical_path(
+            data_root, descriptor.get("ref"), field="g10_readiness_evidence_ref"
+        )
+        if not path.is_file() or sha256_file(path) != descriptor.get("sha256"):
+            raise Stage1S11Error("S1_1_G10_READINESS_EVIDENCE_DRIFT")
+    return gate
 
 
 def load_stage0_g10_handoff_snapshot(
@@ -321,7 +497,16 @@ def load_stage0_g10_handoff_snapshot(
         evidence_refs=input_refs,
     )
     request = TaskExecutionRequest(config, config.task_definition, input_environment)
-    gate = validate_formal_g10_outputs(request, root, outputs)
+    sync_observation_ref = raw.get("sync_observation_ref")
+    if not isinstance(sync_observation_ref, str):
+        raise Stage1S11Error("S1_1_G10_SYNC_OBSERVATION_REF_INVALID")
+    gate = _validate_immutable_g10_outputs(
+        request=request,
+        data_root=root,
+        outputs=outputs,
+        generator_git_commit=generator,
+        sync_observation_ref=sync_observation_ref,
+    )
     readiness_path = _logical_path(
         root, raw["readiness_ref"], field="g10_readiness_ref"
     )
