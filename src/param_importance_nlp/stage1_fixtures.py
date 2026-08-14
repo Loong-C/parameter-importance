@@ -39,11 +39,18 @@ from .core.registry import ParameterRegistry
 from .core.tensors import TensorMap
 
 
-FIXTURE_SCHEMA = "stage1-fixture-manifest-v1"
-ORACLE_SCHEMA = "stage1-oracle-bundle-v1"
-VALIDATION_SCHEMA = "stage1-oracle-validation-report-v1"
-FIXTURE_SET_ID = "stage1-s13-deterministic-v1"
+FIXTURE_SCHEMA = "stage1-fixture-manifest-v2"
+ORACLE_SCHEMA = "stage1-oracle-bundle-v2"
+VALIDATION_SCHEMA = "stage1-oracle-validation-report-v2"
+GRADIENT_MATRIX_SCHEMA = "stage1-gradient-matrix-fixture-v2"
+FIXTURE_SET_ID = "stage1-s13-deterministic-v2"
 PYTHIA_STEP0_REVISION = "56079904bb80b7f36d3b794089f146e7a4d6efae"
+T64_ATOL = 1e-12
+T64_RTOL = 1e-10
+T64_NORMALIZED_L2_LIMIT = 1e-10
+REPLAY_COMPARISON_PROFILE = "T64_ORACLE"
+REPLAY_OBJECTS = ("raw_oracle", "double_sample_oracle", "equal_u_oracle", "weighted_u_oracle")
+FIXED_GRADIENT_CASE_IDS = ("zero-m2", "equal-m3", "negative-u-m2", "varied-m4", "m1-boundary")
 
 
 class Stage1FixtureError(ValueError):
@@ -72,12 +79,17 @@ def _tensor_to_wire(value: torch.Tensor) -> dict[str, JSONValue]:
 def _tensor_from_wire(value: object, *, field: str) -> torch.Tensor:
     if not isinstance(value, Mapping):
         raise Stage1FixtureError(f"{field} 必须是 tensor wire object")
+    if set(value) != {"dtype", "shape", "values"}:
+        raise Stage1FixtureError(f"{field} 的 wire 字段必须且只能为 dtype/shape/values")
+    if value["dtype"] != "torch.float64":
+        raise Stage1FixtureError(f"{field}.dtype 必须为 torch.float64")
     shape = value.get("shape")
     values = value.get("values")
     if (
         not isinstance(shape, list)
         or any(isinstance(item, bool) or not isinstance(item, int) or item < 0 for item in shape)
         or not isinstance(values, list)
+        or any(isinstance(item, bool) or not isinstance(item, (int, float)) or not math.isfinite(float(item)) for item in values)
     ):
         raise Stage1FixtureError(f"{field} 的 shape/values 非法")
     tensor = _as_float_tensor(values, field=f"{field}.values")
@@ -131,7 +143,7 @@ def _manifest_without_hash(value: Mapping[str, Any]) -> dict[str, Any]:
 
 
 def _load_manifest(source_root: str | Path) -> dict[str, Any]:
-    path = Path(source_root) / "fixtures/stage1/stage1-s13-v1.json"
+    path = Path(source_root) / "fixtures/stage1/stage1-s13-v2.json"
     try:
         raw = load_canonical_json(path)
     except Exception as error:
@@ -168,13 +180,13 @@ def _load_manifest(source_root: str | Path) -> dict[str, Any]:
 
 def _git_source_hashes(source_root: Path) -> dict[str, JSONValue]:
     paths = (
-        "fixtures/stage1/stage1-s13-v1.json",
+        "fixtures/stage1/stage1-s13-v2.json",
         "plan/stage1/03_fixtures_and_oracles.md",
-        "schemas/stage1/fixture-manifest-v1.json",
-        "schemas/stage1/oracle-bundle-v1.json",
-        "schemas/stage1/oracle-validation-report-v1.json",
-        "schemas/stage1/s1-3-formalization-index-v1.json",
-        "schemas/stage1/s1-3-validation-v1.json",
+        "schemas/stage1/fixture-manifest-v2.json",
+        "schemas/stage1/oracle-bundle-v2.json",
+        "schemas/stage1/oracle-validation-report-v2.json",
+        "schemas/stage1/s1-3-formalization-index-v2.json",
+        "schemas/stage1/s1-3-validation-v2.json",
         "src/param_importance_nlp/stage1_fixtures.py",
         "src/param_importance_nlp/experiments/stage01_task_runners.py",
         "tests/test_stage1_s13_fixtures.py",
@@ -208,6 +220,24 @@ def _explicit_raw(samples: Sequence[TensorMap]) -> TensorMap:
     if not samples:
         raise Stage1FixtureError("explicit raw oracle 不能处理空样本")
     return _explicit_mean(samples).map(torch.square)
+
+
+def _explicit_double_sample_oracle(
+    samples_a: Sequence[TensorMap],
+    samples_b: Sequence[TensorMap],
+) -> TensorMap:
+    """Compute the independent-A/B double-sample product in explicit FP64."""
+
+    mean_a = _explicit_mean(samples_a)
+    mean_b = _explicit_mean(samples_b)
+    mean_a.assert_compatible(mean_b)
+    return TensorMap(
+        {
+            name: mean_a[name].to(dtype=torch.float64, device="cpu")
+            * mean_b[name].to(dtype=torch.float64, device="cpu")
+            for name in mean_a
+        }
+    )
 
 
 def _explicit_pair_oracle(
@@ -387,14 +417,16 @@ def _reset_model(model: nn.Module, initial: Mapping[str, torch.Tensor]) -> None:
 
 
 def _compare(actual: TensorMap, expected: TensorMap, *, natural_scale: float = 1.0) -> dict[str, JSONValue]:
-    return compare_tensor_maps_fp64(
+    comparison = compare_tensor_maps_fp64(
         actual,
         expected,
         natural_scale=natural_scale,
-        atol=1e-11,
-        rtol=1e-9,
-        normalized_l2_limit=1e-9,
+        atol=T64_ATOL,
+        rtol=T64_RTOL,
+        normalized_l2_limit=T64_NORMALIZED_L2_LIMIT,
     ).to_dict()
+    comparison["comparison_profile"] = REPLAY_COMPARISON_PROFILE
+    return comparison
 
 
 def _check(check_id: str, comparison: Mapping[str, Any] | bool, *, detail: str = "") -> dict[str, JSONValue]:
@@ -408,6 +440,42 @@ def _check(check_id: str, comparison: Mapping[str, Any] | bool, *, detail: str =
     if not isinstance(comparison, bool):
         result["comparison"] = dict(comparison)
     return result
+
+
+def _parse_gradient_samples(
+    raw_samples: object,
+    *,
+    case_id: str,
+    collection: str,
+    shapes: Mapping[str, tuple[int, ...]],
+) -> tuple[TensorMap, ...]:
+    if not isinstance(raw_samples, list) or not raw_samples:
+        raise Stage1FixtureError(f"gradient_matrix case {case_id} {collection} 样本为空")
+    parsed: list[TensorMap] = []
+    for sample_index, sample in enumerate(raw_samples):
+        if not isinstance(sample, Mapping) or set(sample) != set(shapes):
+            raise Stage1FixtureError(f"gradient_matrix case {case_id} {collection} 参数集合错误")
+        tensors = {
+            name: _as_float_tensor(sample[name], field=f"{case_id}.{collection}[{sample_index}].{name}")
+            for name in shapes
+        }
+        for name, tensor in tensors.items():
+            if tuple(tensor.shape) != shapes[name]:
+                raise Stage1FixtureError(f"{case_id}.{collection}.{name} shape 错误")
+        parsed.append(TensorMap(tensors))
+    return tuple(parsed)
+
+
+def _natural_gradient_scale(value: object, *, field: str) -> float:
+    if isinstance(value, bool):
+        raise Stage1FixtureError(f"{field} 必须是严格正的有限数")
+    try:
+        scale = float(value)
+    except (TypeError, ValueError) as error:
+        raise Stage1FixtureError(f"{field} 必须是严格正的有限数") from error
+    if not math.isfinite(scale) or scale <= 0.0:
+        raise Stage1FixtureError(f"{field} 必须是严格正的有限数")
+    return scale
 
 
 def _gradient_cases(manifest: Mapping[str, Any]) -> tuple[dict[str, Any], dict[str, tuple[int, ...]]]:
@@ -430,31 +498,88 @@ def _gradient_cases(manifest: Mapping[str, Any]) -> tuple[dict[str, Any], dict[s
         if not isinstance(raw_case, Mapping) or not isinstance(raw_case.get("case_id"), str):
             raise Stage1FixtureError("gradient_matrix case 标识非法")
         case_id = str(raw_case["case_id"])
-        samples = raw_case.get("samples")
-        if not isinstance(samples, list) or not samples:
-            raise Stage1FixtureError(f"gradient_matrix case {case_id} 样本为空")
-        parsed: list[TensorMap] = []
-        for sample_index, sample in enumerate(samples):
-            if not isinstance(sample, Mapping) or set(sample) != set(shapes):
-                raise Stage1FixtureError(f"gradient_matrix case {case_id} 参数集合错误")
-            tensors = {name: _as_float_tensor(sample[name], field=f"{case_id}.samples[{sample_index}].{name}") for name in shapes}
-            for name, tensor in tensors.items():
-                if tuple(tensor.shape) != shapes[name]:
-                    raise Stage1FixtureError(f"{case_id}.{name} shape 错误")
-            parsed.append(TensorMap(tensors))
+        if case_id in cases:
+            raise Stage1FixtureError(f"gradient_matrix case {case_id} 重复")
+        parsed = _parse_gradient_samples(
+            raw_case.get("samples"),
+            case_id=case_id,
+            collection="samples",
+            shapes=shapes,
+        )
         weights = raw_case.get("weights")
         if weights is not None:
             if not isinstance(weights, list) or len(weights) != len(parsed):
                 raise Stage1FixtureError(f"gradient_matrix case {case_id} 权重数量错误")
             normalized_weights = tuple(float(item) for item in weights)
+            if any(not math.isfinite(item) or item <= 0.0 for item in normalized_weights):
+                raise Stage1FixtureError(f"gradient_matrix case {case_id} 权重非法")
         else:
             normalized_weights = None
         cases[case_id] = {
-            "samples": tuple(parsed),
+            "samples": parsed,
             "weights": normalized_weights,
             "purpose": str(raw_case.get("purpose", "")),
+            "natural_gradient_scale": _natural_gradient_scale(
+                raw_case.get("natural_gradient_scale"),
+                field=f"gradient_matrix case {case_id}.natural_gradient_scale",
+            ),
         }
+    if tuple(cases) != FIXED_GRADIENT_CASE_IDS:
+        raise Stage1FixtureError("gradient_matrix case ID 或顺序与冻结合同不一致")
     return cases, shapes
+
+
+def _double_source_identity(value: object, *, field: str) -> dict[str, JSONValue]:
+    if not isinstance(value, Mapping) or set(value) != {"stream_id", "seed"}:
+        raise Stage1FixtureError(f"{field} 必须且只能含 stream_id/seed")
+    stream_id = value["stream_id"]
+    seed = value["seed"]
+    if not isinstance(stream_id, str) or not stream_id or isinstance(seed, bool) or not isinstance(seed, int):
+        raise Stage1FixtureError(f"{field} 的 stream_id/seed 非法")
+    return {"stream_id": stream_id, "seed": seed}
+
+
+def _independent_double_sample_case(
+    manifest: Mapping[str, Any],
+    shapes: Mapping[str, tuple[int, ...]],
+) -> dict[str, Any]:
+    section = manifest["gradient_matrix"]
+    if not isinstance(section, Mapping):
+        raise Stage1FixtureError("gradient_matrix section 类型错误")
+    raw = section.get("independent_double_sample")
+    if not isinstance(raw, Mapping) or not isinstance(raw.get("case_id"), str):
+        raise Stage1FixtureError("gradient_matrix independent_double_sample 缺失")
+    case_id = str(raw["case_id"])
+    samples_a = _parse_gradient_samples(
+        raw.get("samples_a"),
+        case_id=case_id,
+        collection="samples_a",
+        shapes=shapes,
+    )
+    samples_b = _parse_gradient_samples(
+        raw.get("samples_b"),
+        case_id=case_id,
+        collection="samples_b",
+        shapes=shapes,
+    )
+    if canonical_json_hash(raw.get("samples_a")) == canonical_json_hash(raw.get("samples_b")):
+        raise Stage1FixtureError("independent_double_sample 的 A/B 样本集合不得相同")
+    source_a = _double_source_identity(raw.get("source_a"), field="independent_double_sample.source_a")
+    source_b = _double_source_identity(raw.get("source_b"), field="independent_double_sample.source_b")
+    if source_a == source_b:
+        raise Stage1FixtureError("independent_double_sample 的 A/B source identity 不得相同")
+    return {
+        "case_id": case_id,
+        "purpose": str(raw.get("purpose", "")),
+        "samples_a": samples_a,
+        "samples_b": samples_b,
+        "source_a": source_a,
+        "source_b": source_b,
+        "natural_gradient_scale": _natural_gradient_scale(
+            raw.get("natural_gradient_scale"),
+            field="gradient_matrix independent_double_sample.natural_gradient_scale",
+        ),
+    }
 
 
 def _analytic_evidence(manifest: Mapping[str, Any]) -> tuple[dict[str, JSONValue], list[dict[str, JSONValue]]]:
@@ -778,39 +903,44 @@ def _noise_evidence(manifest: Mapping[str, Any]) -> tuple[dict[str, JSONValue], 
 
 def _gradient_matrix_evidence(manifest: Mapping[str, Any]) -> tuple[dict[str, JSONValue], list[dict[str, JSONValue]]]:
     cases, shapes = _gradient_cases(manifest)
+    double_case = _independent_double_sample_case(manifest, shapes)
     results: dict[str, JSONValue] = {}
     checks: list[dict[str, JSONValue]] = []
     for case_id, case in cases.items():
         samples = case["samples"]
         weights = case["weights"]
+        natural_gradient_scale = float(case["natural_gradient_scale"])
+        natural_score_scale = natural_gradient_scale**2
         mean = _explicit_mean(samples)
         record: dict[str, JSONValue] = {
+            "case_id": case_id,
             "sample_count": len(samples),
             "purpose": case["purpose"],
+            "natural_gradient_scale": natural_gradient_scale,
             "mean_gradient": _tensor_map_to_wire(mean),
             "samples": [_tensor_map_to_wire(sample) for sample in samples],
         }
         if len(samples) >= 2:
             pair_oracle = _explicit_pair_oracle(samples)
             raw_oracle = _explicit_raw(samples)
-            raw_comparison = _compare(raw_oracle, mean.map(torch.square), natural_scale=1e10)
-            u_comparison = _compare(pair_oracle, _explicit_pair_oracle(samples), natural_scale=1e10)
+            raw_comparison = _compare(raw_oracle, mean.map(torch.square), natural_scale=natural_score_scale)
+            u_comparison = _compare(pair_oracle, _explicit_pair_oracle(samples), natural_scale=natural_score_scale)
             record.update(
                 {
                     "raw_oracle": _tensor_map_to_wire(raw_oracle),
-                    "u_oracle": _tensor_map_to_wire(pair_oracle),
+                    "equal_u_oracle": _tensor_map_to_wire(pair_oracle),
                     "raw_identity_comparison": raw_comparison,
-                    "u_identity_comparison": u_comparison,
+                    "equal_u_identity_comparison": u_comparison,
                 }
             )
             checks.append(_check(f"gradient_{case_id}_raw", raw_comparison))
-            checks.append(_check(f"gradient_{case_id}_u", u_comparison))
+            checks.append(_check(f"gradient_{case_id}_equal_u", u_comparison))
             if weights is not None:
                 weighted_oracle = _explicit_pair_oracle(samples, weights)
                 weighted_comparison = _compare(
                     weighted_oracle,
                     _explicit_pair_oracle(samples, weights),
-                    natural_scale=1e10,
+                    natural_scale=natural_score_scale,
                 )
                 record["weights"] = list(weights)
                 record["weighted_u_oracle"] = _tensor_map_to_wire(weighted_oracle)
@@ -830,7 +960,7 @@ def _gradient_matrix_evidence(manifest: Mapping[str, Any]) -> tuple[dict[str, JS
     negative_case = results.get("negative-u-m2")
     negative_values: list[float] = []
     if isinstance(negative_case, Mapping):
-        oracle = negative_case.get("u_oracle")
+        oracle = negative_case.get("equal_u_oracle")
         if isinstance(oracle, Mapping):
             for item in oracle.values():
                 if isinstance(item, Mapping):
@@ -842,18 +972,41 @@ def _gradient_matrix_evidence(manifest: Mapping[str, Any]) -> tuple[dict[str, JS
     permutation_source = cases.get("varied-m4")
     if permutation_source is not None:
         baseline = _explicit_pair_oracle(permutation_source["samples"])
+        permutation_scale = float(permutation_source["natural_gradient_scale"]) ** 2
         permutation_results: list[dict[str, JSONValue]] = []
         for order in ((3, 1, 0, 2), (2, 0, 3, 1), (1, 3, 2, 0)):
             permuted = tuple(permutation_source["samples"][index] for index in order)
-            comparison = _compare(_explicit_pair_oracle(permuted), baseline, natural_scale=1e10)
+            comparison = _compare(_explicit_pair_oracle(permuted), baseline, natural_scale=permutation_scale)
             permutation_results.append({"order": list(order), "comparison": comparison})
         results["permutations"] = permutation_results
         checks.append(_check("gradient_order_permutation_invariance", all(item["comparison"]["passed"] for item in permutation_results)))
+
+    double_scale = float(double_case["natural_gradient_scale"])
+    mean_a = _explicit_mean(double_case["samples_a"])
+    mean_b = _explicit_mean(double_case["samples_b"])
+    double_oracle = _explicit_double_sample_oracle(double_case["samples_a"], double_case["samples_b"])
+    double_identity = TensorMap({name: mean_a[name] * mean_b[name] for name in mean_a})
+    double_comparison = _compare(double_oracle, double_identity, natural_scale=double_scale**2)
+    double_record: dict[str, JSONValue] = {
+        "case_id": double_case["case_id"],
+        "purpose": double_case["purpose"],
+        "natural_gradient_scale": double_scale,
+        "samples_a": [_tensor_map_to_wire(sample) for sample in double_case["samples_a"]],
+        "samples_b": [_tensor_map_to_wire(sample) for sample in double_case["samples_b"]],
+        "source_a": double_case["source_a"],
+        "source_b": double_case["source_b"],
+        "mean_a": _tensor_map_to_wire(mean_a),
+        "mean_b": _tensor_map_to_wire(mean_b),
+        "double_sample_oracle": _tensor_map_to_wire(double_oracle),
+        "double_sample_identity_comparison": double_comparison,
+    }
+    checks.append(_check(f"gradient_{double_case['case_id']}_double_sample", double_comparison))
     return (
         {
-            "schema_version": "stage1-gradient-matrix-fixture-v1",
+            "schema_version": GRADIENT_MATRIX_SCHEMA,
             "coordinate_shapes": {name: list(shape) for name, shape in shapes.items()},
             "cases": results,
+            "independent_double_sample": double_record,
         },
         checks,
     )
@@ -863,6 +1016,133 @@ def _bundle_hash(value: Mapping[str, Any]) -> str:
     body = dict(value)
     body.pop("bundle_hash", None)
     return canonical_json_hash(body)
+
+
+def _manifest_gradient_input_contract(manifest: Mapping[str, Any]) -> dict[str, JSONValue]:
+    cases, shapes = _gradient_cases(manifest)
+    double = _independent_double_sample_case(manifest, shapes)
+    serialized_cases: dict[str, JSONValue] = {}
+    for case_id, case in cases.items():
+        record: dict[str, JSONValue] = {
+            "case_id": case_id,
+            "purpose": str(case["purpose"]),
+            "natural_gradient_scale": float(case["natural_gradient_scale"]),
+            "samples": [_tensor_map_to_wire(sample) for sample in case["samples"]],
+        }
+        if case["weights"] is not None:
+            record["weights"] = list(case["weights"])
+        serialized_cases[case_id] = record
+    return {
+        "coordinate_shapes": {name: list(shape) for name, shape in shapes.items()},
+        "cases": serialized_cases,
+        "independent_double_sample": {
+            "case_id": str(double["case_id"]),
+            "purpose": str(double["purpose"]),
+            "natural_gradient_scale": float(double["natural_gradient_scale"]),
+            "samples_a": [_tensor_map_to_wire(sample) for sample in double["samples_a"]],
+            "samples_b": [_tensor_map_to_wire(sample) for sample in double["samples_b"]],
+            "source_a": double["source_a"],
+            "source_b": double["source_b"],
+        },
+    }
+
+
+def _bundle_gradient_input_contract(bundle: Mapping[str, Any]) -> dict[str, JSONValue]:
+    matrix = bundle.get("gradient_matrix")
+    if not isinstance(matrix, Mapping) or set(matrix) != {
+        "schema_version",
+        "coordinate_shapes",
+        "cases",
+        "independent_double_sample",
+    }:
+        raise Stage1FixtureError("oracle bundle gradient_matrix 结构不完整")
+    if matrix.get("schema_version") != GRADIENT_MATRIX_SCHEMA:
+        raise Stage1FixtureError("oracle bundle gradient_matrix schema_version 错误")
+    coordinates = matrix.get("coordinate_shapes")
+    cases = matrix.get("cases")
+    if (
+        not isinstance(coordinates, Mapping)
+        or not isinstance(cases, Mapping)
+        or set(cases) != {*FIXED_GRADIENT_CASE_IDS, "permutations"}
+    ):
+        raise Stage1FixtureError("oracle bundle gradient_matrix case identity 错误")
+    serialized_cases: dict[str, JSONValue] = {}
+    for case_id in FIXED_GRADIENT_CASE_IDS:
+        raw = cases[case_id]
+        if not isinstance(raw, Mapping):
+            raise Stage1FixtureError(f"oracle bundle case {case_id} 类型错误")
+        required = {"case_id", "purpose", "natural_gradient_scale", "sample_count", "samples"}
+        if not required.issubset(raw):
+            raise Stage1FixtureError(f"oracle bundle case {case_id} 输入字段缺失")
+        samples = _replay_samples(raw.get("samples"), field=f"bundle.gradient_matrix.cases.{case_id}.samples")
+        if raw.get("case_id") != case_id or raw.get("sample_count") != len(samples):
+            raise Stage1FixtureError(f"oracle bundle case {case_id} identity/count 错误")
+        record: dict[str, JSONValue] = {
+            "case_id": case_id,
+            "purpose": str(raw["purpose"]),
+            "natural_gradient_scale": _replay_natural_gradient_scale(
+                raw,
+                field=f"bundle.gradient_matrix.cases.{case_id}",
+            ),
+            "samples": [_tensor_map_to_wire(sample) for sample in samples],
+        }
+        if "weights" in raw:
+            weights = raw["weights"]
+            if not isinstance(weights, list) or len(weights) != len(samples):
+                raise Stage1FixtureError(f"oracle bundle case {case_id} weights 错误")
+            normalized = [float(value) for value in weights]
+            if any(not math.isfinite(value) or value <= 0.0 for value in normalized):
+                raise Stage1FixtureError(f"oracle bundle case {case_id} weights 非法")
+            record["weights"] = normalized
+        serialized_cases[case_id] = record
+
+    raw_double = matrix["independent_double_sample"]
+    if not isinstance(raw_double, Mapping):
+        raise Stage1FixtureError("oracle bundle independent_double_sample 类型错误")
+    required_double = {
+        "case_id",
+        "purpose",
+        "natural_gradient_scale",
+        "samples_a",
+        "samples_b",
+        "source_a",
+        "source_b",
+    }
+    if not required_double.issubset(raw_double):
+        raise Stage1FixtureError("oracle bundle independent_double_sample 输入字段缺失")
+    samples_a = _replay_samples(raw_double["samples_a"], field="bundle.gradient_matrix.independent_double_sample.samples_a")
+    samples_b = _replay_samples(raw_double["samples_b"], field="bundle.gradient_matrix.independent_double_sample.samples_b")
+    source_a = _double_source_identity(raw_double["source_a"], field="bundle.gradient_matrix.independent_double_sample.source_a")
+    source_b = _double_source_identity(raw_double["source_b"], field="bundle.gradient_matrix.independent_double_sample.source_b")
+    if canonical_json_hash(raw_double["samples_a"]) == canonical_json_hash(raw_double["samples_b"]) or source_a == source_b:
+        raise Stage1FixtureError("oracle bundle independent_double_sample A/B identity 错误")
+    return {
+        "coordinate_shapes": {str(name): list(shape) for name, shape in coordinates.items()},
+        "cases": serialized_cases,
+        "independent_double_sample": {
+            "case_id": str(raw_double["case_id"]),
+            "purpose": str(raw_double["purpose"]),
+            "natural_gradient_scale": _replay_natural_gradient_scale(
+                raw_double,
+                field="bundle.gradient_matrix.independent_double_sample",
+            ),
+            "samples_a": [_tensor_map_to_wire(sample) for sample in samples_a],
+            "samples_b": [_tensor_map_to_wire(sample) for sample in samples_b],
+            "source_a": source_a,
+            "source_b": source_b,
+        },
+    }
+
+
+def _validate_manifest_bound_gradient_inputs(manifest: Mapping[str, Any], bundle: Mapping[str, Any]) -> str:
+    expected = _manifest_gradient_input_contract(manifest)
+    expected_hash = canonical_json_hash(expected)
+    if bundle.get("frozen_gradient_input_hash") != expected_hash:
+        raise Stage1FixtureError("oracle bundle 未绑定 manifest frozen gradient inputs")
+    actual = _bundle_gradient_input_contract(bundle)
+    if canonical_json_hash(actual) != expected_hash:
+        raise Stage1FixtureError("oracle bundle gradient inputs 与 fixture manifest 不一致")
+    return expected_hash
 
 
 def _validation_hash(value: Mapping[str, Any]) -> str:
@@ -882,6 +1162,7 @@ def build_stage1_s13_evidence(
 
     root = Path(source_root).resolve()
     manifest = _load_manifest(root)
+    frozen_gradient_input_hash = canonical_json_hash(_manifest_gradient_input_contract(manifest))
     matrix, matrix_checks = _gradient_matrix_evidence(manifest)
     analytic, analytic_checks = _analytic_evidence(manifest)
     tiny, tiny_checks = _tiny_evidence(manifest)
@@ -902,6 +1183,7 @@ def build_stage1_s13_evidence(
         "producer_commit": producer_commit,
         "scope": scope,
         "fixture_manifest_hash": str(manifest["manifest_hash"]),
+        "frozen_gradient_input_hash": frozen_gradient_input_hash,
         "gradient_matrix": matrix,
         "analytic": analytic,
         "tiny_transformer": tiny,
@@ -910,6 +1192,9 @@ def build_stage1_s13_evidence(
             "algorithm": "explicit_fp64_loops_over_serialized_inputs",
             "formal_estimator_imported": False,
             "recomputed_from_saved_values": True,
+            "comparison_profile": REPLAY_COMPARISON_PROFILE,
+            "saved_oracles_compared": True,
+            "objects": list(REPLAY_OBJECTS),
         },
     }
     oracle_bundle["bundle_hash"] = _bundle_hash(oracle_bundle)
@@ -921,6 +1206,7 @@ def build_stage1_s13_evidence(
         "formal_eligible": scope == "formal",
         "producer_commit": producer_commit,
         "fixture_manifest_hash": str(manifest["manifest_hash"]),
+        "frozen_gradient_input_hash": frozen_gradient_input_hash,
         "oracle_bundle_hash": str(oracle_bundle["bundle_hash"]),
         "upstream_evidence": dict(upstream_evidence or {}),
         "source_file_hashes": _git_source_hashes(root),
@@ -935,6 +1221,14 @@ def build_stage1_s13_evidence(
         "replay_contract": {
             "saved_bundle_can_be_recomputed_without_sampling": True,
             "saved_bundle_can_be_recomputed_without_training_loop": True,
+            "comparison_profile": REPLAY_COMPARISON_PROFILE,
+            "saved_oracles_compared": True,
+            "objects": {
+                "raw_oracle": True,
+                "double_sample_oracle": True,
+                "equal_u_oracle": True,
+                "weighted_u_oracle": True,
+            },
         },
     }
     validation["report_hash"] = _validation_hash(validation)
@@ -945,11 +1239,39 @@ def build_stage1_s13_evidence(
     }
 
 
-def recompute_serialized_oracle_bundle(bundle: Mapping[str, Any]) -> dict[str, JSONValue]:
-    """Recompute core matrix/U values from an already saved bundle.
+def _replay_natural_gradient_scale(record: Mapping[str, Any], *, field: str) -> float:
+    return _natural_gradient_scale(record.get("natural_gradient_scale"), field=f"{field}.natural_gradient_scale")
 
-    This intentionally uses only explicit Python loops and the serialised gradient
-    arrays.  It is used by the offline replay test and by the formal publisher.
+
+def _replay_compare_saved_oracle(
+    actual: TensorMap,
+    expected_wire: object,
+    *,
+    field: str,
+    natural_scale: float,
+) -> dict[str, JSONValue]:
+    expected = _tensor_map_from_wire(expected_wire, field=field)
+    comparison = _compare(actual, expected, natural_scale=natural_scale)
+    if comparison.get("passed") is not True:
+        raise Stage1FixtureError(f"serialized replay 与保存的 {field} 不一致")
+    return comparison
+
+
+def _replay_samples(raw_samples: object, *, field: str) -> tuple[TensorMap, ...]:
+    if not isinstance(raw_samples, list) or not raw_samples:
+        raise Stage1FixtureError(f"{field} samples 缺失")
+    return tuple(
+        _tensor_map_from_wire(sample, field=f"{field}[{index}]")
+        for index, sample in enumerate(raw_samples)
+    )
+
+
+def recompute_serialized_oracle_bundle(bundle: Mapping[str, Any]) -> dict[str, JSONValue]:
+    """Fail-closed replay of saved raw/double/equal-U/weighted-U FP64 oracles.
+
+    The replay uses only serialized gradient inputs and explicit Python loops.  It
+    must recompute and compare every saved estimator oracle under ``T64_ORACLE``;
+    a self-consistently rehashed but numerically corrupted bundle is rejected.
     """
 
     if bundle.get("schema_version") != ORACLE_SCHEMA:
@@ -960,34 +1282,112 @@ def recompute_serialized_oracle_bundle(bundle: Mapping[str, Any]) -> dict[str, J
     matrix = bundle.get("gradient_matrix")
     if not isinstance(matrix, Mapping):
         raise Stage1FixtureError("oracle bundle 缺少 gradient_matrix")
-    replay: dict[str, JSONValue] = {}
+    replay_cases: dict[str, JSONValue] = {}
     cases = matrix.get("cases")
     if not isinstance(cases, Mapping):
         raise Stage1FixtureError("oracle bundle gradient cases 类型错误")
-    for case_id, raw_case in cases.items():
-        if case_id == "permutations" or not isinstance(raw_case, Mapping):
-            continue
-        raw_samples = raw_case.get("samples")
-        if not isinstance(raw_samples, list):
-            raise Stage1FixtureError(f"oracle bundle case {case_id} samples 缺失")
-        samples = tuple(
-            _tensor_map_from_wire(sample, field=f"bundle.gradient_matrix.cases.{case_id}.samples[{index}]")
-            for index, sample in enumerate(raw_samples)
-        )
-        entry: dict[str, JSONValue] = {"mean_gradient": _tensor_map_to_wire(_explicit_mean(samples))}
+    if set(cases) != {*FIXED_GRADIENT_CASE_IDS, "permutations"}:
+        raise Stage1FixtureError("oracle bundle gradient cases 未满足冻结 case ID 合同")
+    for case_id in FIXED_GRADIENT_CASE_IDS:
+        raw_case = cases[case_id]
+        if not isinstance(raw_case, Mapping):
+            raise Stage1FixtureError(f"oracle bundle gradient case {case_id} 类型错误")
+        samples = _replay_samples(raw_case.get("samples"), field=f"bundle.gradient_matrix.cases.{case_id}.samples")
+        natural_score_scale = _replay_natural_gradient_scale(
+            raw_case,
+            field=f"bundle.gradient_matrix.cases.{case_id}",
+        ) ** 2
+        mean = _explicit_mean(samples)
+        entry: dict[str, JSONValue] = {
+            "mean_gradient": _tensor_map_to_wire(mean),
+            "comparison_profile": REPLAY_COMPARISON_PROFILE,
+            "comparisons": {},
+        }
         if len(samples) >= 2:
-            entry["u_oracle"] = _tensor_map_to_wire(_explicit_pair_oracle(samples))
+            raw_actual = _explicit_raw(samples)
+            raw_comparison = _replay_compare_saved_oracle(
+                raw_actual,
+                raw_case.get("raw_oracle"),
+                field=f"bundle.gradient_matrix.cases.{case_id}.raw_oracle",
+                natural_scale=natural_score_scale,
+            )
+            equal_u_actual = _explicit_pair_oracle(samples)
+            equal_u_comparison = _replay_compare_saved_oracle(
+                equal_u_actual,
+                raw_case.get("equal_u_oracle"),
+                field=f"bundle.gradient_matrix.cases.{case_id}.equal_u_oracle",
+                natural_scale=natural_score_scale,
+            )
+            entry["raw_oracle"] = _tensor_map_to_wire(raw_actual)
+            entry["equal_u_oracle"] = _tensor_map_to_wire(equal_u_actual)
+            entry["comparisons"] = {
+                "raw_oracle": raw_comparison,
+                "equal_u_oracle": equal_u_comparison,
+            }
             weights = raw_case.get("weights")
             if isinstance(weights, list):
-                entry["weighted_u_oracle"] = _tensor_map_to_wire(
-                    _explicit_pair_oracle(samples, [float(item) for item in weights])
+                weighted_actual = _explicit_pair_oracle(samples, [float(item) for item in weights])
+                weighted_comparison = _replay_compare_saved_oracle(
+                    weighted_actual,
+                    raw_case.get("weighted_u_oracle"),
+                    field=f"bundle.gradient_matrix.cases.{case_id}.weighted_u_oracle",
+                    natural_scale=natural_score_scale,
                 )
-        replay[str(case_id)] = entry
+                entry["weighted_u_oracle"] = _tensor_map_to_wire(weighted_actual)
+                entry["comparisons"]["weighted_u_oracle"] = weighted_comparison
+        replay_cases[str(case_id)] = entry
+
+    raw_double = matrix.get("independent_double_sample")
+    if not isinstance(raw_double, Mapping):
+        raise Stage1FixtureError("oracle bundle 缺少 independent_double_sample")
+    double_scale = _replay_natural_gradient_scale(
+        raw_double,
+        field="bundle.gradient_matrix.independent_double_sample",
+    ) ** 2
+    samples_a = _replay_samples(
+        raw_double.get("samples_a"),
+        field="bundle.gradient_matrix.independent_double_sample.samples_a",
+    )
+    samples_b = _replay_samples(
+        raw_double.get("samples_b"),
+        field="bundle.gradient_matrix.independent_double_sample.samples_b",
+    )
+    if canonical_json_hash(raw_double.get("samples_a")) == canonical_json_hash(raw_double.get("samples_b")):
+        raise Stage1FixtureError("serialized double-sample A/B 集合不得相同")
+    source_a = _double_source_identity(
+        raw_double.get("source_a"),
+        field="bundle.gradient_matrix.independent_double_sample.source_a",
+    )
+    source_b = _double_source_identity(
+        raw_double.get("source_b"),
+        field="bundle.gradient_matrix.independent_double_sample.source_b",
+    )
+    if source_a == source_b:
+        raise Stage1FixtureError("serialized double-sample A/B source identity 不得相同")
+    double_actual = _explicit_double_sample_oracle(samples_a, samples_b)
+    double_comparison = _replay_compare_saved_oracle(
+        double_actual,
+        raw_double.get("double_sample_oracle"),
+        field="bundle.gradient_matrix.independent_double_sample.double_sample_oracle",
+        natural_scale=double_scale,
+    )
+    replay_double: dict[str, JSONValue] = {
+        "case_id": str(raw_double.get("case_id")),
+        "comparison_profile": REPLAY_COMPARISON_PROFILE,
+        "double_sample_oracle": _tensor_map_to_wire(double_actual),
+        "comparisons": {"double_sample_oracle": double_comparison},
+    }
     return {
-        "schema_version": "stage1-oracle-replay-v1",
+        "schema_version": "stage1-oracle-replay-v2",
         "fixture_set_id": bundle.get("fixture_set_id"),
         "source_bundle_hash": expected_hash,
-        "gradient_matrix": replay,
+        "frozen_gradient_input_hash": bundle.get("frozen_gradient_input_hash"),
+        "comparison_profile": REPLAY_COMPARISON_PROFILE,
+        "recomputed_objects": list(REPLAY_OBJECTS),
+        "gradient_matrix": {
+            "cases": replay_cases,
+            "independent_double_sample": replay_double,
+        },
     }
 
 
@@ -1001,14 +1401,39 @@ def validate_stage1_s13_evidence(evidence: Mapping[str, Any]) -> dict[str, JSONV
         raise Stage1FixtureError("S1.3 evidence 三个 payload 不完整")
     if manifest.get("schema_version") != FIXTURE_SCHEMA:
         raise Stage1FixtureError("S1.3 evidence manifest schema 错误")
+    if manifest.get("fixture_set_id") != FIXTURE_SET_ID:
+        raise Stage1FixtureError("S1.3 evidence manifest fixture_set_id 错误")
     manifest_body = dict(manifest)
     manifest_hash = manifest_body.pop("manifest_hash", None)
     if not isinstance(manifest_hash, str) or manifest_hash != canonical_json_hash(manifest_body):
         raise Stage1FixtureError("S1.3 evidence manifest hash 不匹配")
     if bundle.get("fixture_manifest_hash") != manifest.get("manifest_hash"):
         raise Stage1FixtureError("S1.3 bundle 未绑定 manifest hash")
+    if bundle.get("schema_version") != ORACLE_SCHEMA or bundle.get("fixture_set_id") != FIXTURE_SET_ID:
+        raise Stage1FixtureError("S1.3 oracle bundle schema/fixture_set 错误")
+    frozen_gradient_input_hash = _validate_manifest_bound_gradient_inputs(manifest, bundle)
     if report.get("oracle_bundle_hash") != bundle.get("bundle_hash"):
         raise Stage1FixtureError("S1.3 report 未绑定 bundle hash")
+    if (
+        report.get("schema_version") != VALIDATION_SCHEMA
+        or report.get("fixture_manifest_hash") != manifest.get("manifest_hash")
+        or report.get("frozen_gradient_input_hash") != frozen_gradient_input_hash
+    ):
+        raise Stage1FixtureError("S1.3 validation report schema/input binding 错误")
+    expected_replay_contract = {
+        "saved_bundle_can_be_recomputed_without_sampling": True,
+        "saved_bundle_can_be_recomputed_without_training_loop": True,
+        "comparison_profile": REPLAY_COMPARISON_PROFILE,
+        "saved_oracles_compared": True,
+        "objects": {
+            "raw_oracle": True,
+            "double_sample_oracle": True,
+            "equal_u_oracle": True,
+            "weighted_u_oracle": True,
+        },
+    }
+    if report.get("replay_contract") != expected_replay_contract:
+        raise Stage1FixtureError("S1.3 replay contract 不完整")
     report_hash = report.get("report_hash")
     if not isinstance(report_hash, str) or report_hash != _validation_hash(report):
         raise Stage1FixtureError("S1.3 validation report hash 不匹配")
@@ -1022,9 +1447,12 @@ def validate_stage1_s13_evidence(evidence: Mapping[str, Any]) -> dict[str, JSONV
     ):
         raise Stage1FixtureError("S1.3 validation report 未通过全部 checks")
     replay = recompute_serialized_oracle_bundle(bundle)
+    if replay.get("recomputed_objects") != list(REPLAY_OBJECTS):
+        raise Stage1FixtureError("S1.3 replay 未覆盖全部 estimator oracle")
     return {
-        "schema_version": "stage1-oracle-replay-validation-v1",
+        "schema_version": "stage1-oracle-replay-validation-v2",
         "manifest_hash": manifest.get("manifest_hash"),
+        "frozen_gradient_input_hash": frozen_gradient_input_hash,
         "bundle_hash": bundle.get("bundle_hash"),
         "report_hash": report.get("report_hash"),
         "replay_hash": canonical_json_hash(replay),

@@ -1,0 +1,29 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://parameter-importance.invalid/schemas/stage1/s1-3-validation-v2.json",
+  "title": "Stage 1 S1.3 formal validation record v2",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "status", "gate_id", "task_id", "execution_scope", "fixture_set_id", "fixture_manifest_schema_version", "oracle_bundle_schema_version", "oracle_validation_report_schema_version", "producer_commit", "consumer_commit", "upstream", "regression", "direct_checks", "role_sha256", "frozen_gradient_input_hash", "replay_sha256", "replay_hash", "artifact_hash"],
+  "properties": {
+    "schema_version": {"const": "stage1-s1-3-validation-v2"},
+    "status": {"const": "PASS"},
+    "gate_id": {"const": "G1-ORACLE"},
+    "task_id": {"const": "stage1.03_fixtures_and_oracles"},
+    "execution_scope": {"const": "formal_server_cpu"},
+    "fixture_set_id": {"const": "stage1-s13-deterministic-v2"},
+    "fixture_manifest_schema_version": {"const": "stage1-fixture-manifest-v2"},
+    "oracle_bundle_schema_version": {"const": "stage1-oracle-bundle-v2"},
+    "oracle_validation_report_schema_version": {"const": "stage1-oracle-validation-report-v2"},
+    "producer_commit": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+    "consumer_commit": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+    "upstream": {"type": "object", "minProperties": 1},
+    "regression": {"type": "object", "minProperties": 1},
+    "direct_checks": {"type": "array", "minItems": 1, "items": {"type": "object"}},
+    "role_sha256": {"type": "object", "minProperties": 3},
+    "frozen_gradient_input_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "replay_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "replay_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "artifact_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+  }
+}

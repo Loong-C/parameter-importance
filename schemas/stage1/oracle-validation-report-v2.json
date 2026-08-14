@@ -1,0 +1,72 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://parameter-importance.invalid/schemas/stage1/oracle-validation-report-v2.json",
+  "title": "Stage 1 S1.3 G1-ORACLE validation report v2",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "gate_id", "status", "scope", "formal_eligible", "producer_commit", "fixture_manifest_hash", "frozen_gradient_input_hash", "oracle_bundle_hash", "upstream_evidence", "source_file_hashes", "checks", "check_count", "passed_check_count", "pythia_14m", "replay_contract", "report_hash"],
+  "properties": {
+    "schema_version": {"const": "stage1-oracle-validation-report-v2"},
+    "gate_id": {"const": "G1-ORACLE"},
+    "status": {"const": "PASS"},
+    "scope": {"enum": ["local_fixture", "formal"]},
+    "formal_eligible": {"type": "boolean"},
+    "producer_commit": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+    "fixture_manifest_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "frozen_gradient_input_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "oracle_bundle_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "upstream_evidence": {"type": "object"},
+    "source_file_hashes": {"type": "object", "minProperties": 1, "additionalProperties": {"type": "string", "pattern": "^[0-9a-f]{64}$"}},
+    "checks": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/check"}},
+    "check_count": {"type": "integer", "minimum": 1},
+    "passed_check_count": {"type": "integer", "minimum": 1},
+    "pythia_14m": {"$ref": "#/$defs/pythia"},
+    "replay_contract": {"$ref": "#/$defs/replay_contract"},
+    "report_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+  },
+  "$defs": {
+    "check": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["check_id", "status"],
+      "properties": {
+        "check_id": {"type": "string", "minLength": 1},
+        "status": {"const": "PASS"},
+        "detail": {"type": "string"},
+        "comparison": {"type": "object", "minProperties": 1}
+      }
+    },
+    "pythia": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "model_revision", "consumed_by_gate"],
+      "properties": {
+        "status": {"const": "DEFERRED_TO_S1.7"},
+        "model_revision": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+        "consumed_by_gate": {"const": false}
+      }
+    },
+    "replay_contract": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["saved_bundle_can_be_recomputed_without_sampling", "saved_bundle_can_be_recomputed_without_training_loop", "comparison_profile", "saved_oracles_compared", "objects"],
+      "properties": {
+        "saved_bundle_can_be_recomputed_without_sampling": {"const": true},
+        "saved_bundle_can_be_recomputed_without_training_loop": {"const": true},
+        "comparison_profile": {"const": "T64_ORACLE"},
+        "saved_oracles_compared": {"const": true},
+        "objects": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["raw_oracle", "double_sample_oracle", "equal_u_oracle", "weighted_u_oracle"],
+          "properties": {
+            "raw_oracle": {"const": true},
+            "double_sample_oracle": {"const": true},
+            "equal_u_oracle": {"const": true},
+            "weighted_u_oracle": {"const": true}
+          }
+        }
+      }
+    }
+  }
+}

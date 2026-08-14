@@ -1,0 +1,95 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://parameter-importance.invalid/schemas/stage1/fixture-manifest-v2.json",
+  "title": "Stage 1 S1.3 deterministic fixture manifest v2",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "fixture_set_id", "generator_version", "seed_plan", "gradient_matrix", "analytic", "tiny_transformer", "noise", "pythia_14m", "manifest_hash"],
+  "properties": {
+    "schema_version": {"const": "stage1-fixture-manifest-v2"},
+    "fixture_set_id": {"const": "stage1-s13-deterministic-v2"},
+    "generator_version": {"const": "s1.3-fixtures-v2"},
+    "seed_plan": {"type": "object", "minProperties": 1},
+    "gradient_matrix": {"$ref": "#/$defs/gradient_matrix"},
+    "analytic": {"type": "object", "minProperties": 1},
+    "tiny_transformer": {"type": "object", "minProperties": 1},
+    "noise": {"type": "array", "minItems": 1},
+    "pythia_14m": {"type": "object", "minProperties": 1},
+    "manifest_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+  },
+  "$defs": {
+    "gradient_sample": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["attention.bias", "embedding.weight", "head.weight"],
+      "properties": {
+        "attention.bias": {"type": "array", "minItems": 2, "maxItems": 2, "items": {"type": "number"}},
+        "embedding.weight": {"type": "array", "minItems": 2, "maxItems": 2, "items": {"type": "array", "minItems": 2, "maxItems": 2, "items": {"type": "number"}}},
+        "head.weight": {"type": "array", "minItems": 1, "maxItems": 1, "items": {"type": "array", "minItems": 3, "maxItems": 3, "items": {"type": "number"}}}
+      }
+    },
+    "case": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["case_id", "purpose", "natural_gradient_scale", "samples"],
+      "properties": {
+        "case_id": {"type": "string", "minLength": 1},
+        "purpose": {"type": "string", "minLength": 1},
+        "natural_gradient_scale": {"type": "number", "exclusiveMinimum": 0},
+        "samples": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/gradient_sample"}},
+        "weights": {"type": "array", "minItems": 1, "items": {"type": "number", "exclusiveMinimum": 0}}
+      }
+    },
+    "source_identity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["stream_id", "seed"],
+      "properties": {
+        "stream_id": {"type": "string", "minLength": 1},
+        "seed": {"type": "integer"}
+      }
+    },
+    "gradient_matrix": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["coordinate_shapes", "cases", "independent_double_sample"],
+      "properties": {
+        "coordinate_shapes": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["attention.bias", "embedding.weight", "head.weight"],
+          "properties": {
+            "attention.bias": {"const": [2]},
+            "embedding.weight": {"const": [2, 2]},
+            "head.weight": {"const": [1, 3]}
+          }
+        },
+        "cases": {
+          "type": "array",
+          "prefixItems": [
+            {"allOf": [{"$ref": "#/$defs/case"}, {"properties": {"case_id": {"const": "zero-m2"}}}]},
+            {"allOf": [{"$ref": "#/$defs/case"}, {"properties": {"case_id": {"const": "equal-m3"}}}]},
+            {"allOf": [{"$ref": "#/$defs/case"}, {"properties": {"case_id": {"const": "negative-u-m2"}}}]},
+            {"allOf": [{"$ref": "#/$defs/case"}, {"required": ["weights"], "properties": {"case_id": {"const": "varied-m4"}}}]},
+            {"allOf": [{"$ref": "#/$defs/case"}, {"properties": {"case_id": {"const": "m1-boundary"}}}]}
+          ],
+          "items": false
+        },
+        "independent_double_sample": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["case_id", "purpose", "natural_gradient_scale", "samples_a", "samples_b", "source_a", "source_b"],
+          "properties": {
+            "case_id": {"const": "independent-ab-v1"},
+            "purpose": {"type": "string", "minLength": 1},
+            "natural_gradient_scale": {"type": "number", "exclusiveMinimum": 0},
+            "samples_a": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/gradient_sample"}},
+            "samples_b": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/gradient_sample"}},
+            "source_a": {"$ref": "#/$defs/source_identity"},
+            "source_b": {"$ref": "#/$defs/source_identity"}
+          }
+        }
+      }
+    }
+  }
+}
