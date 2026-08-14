@@ -28,12 +28,17 @@ from .evidence_reuse import (
 )
 from .experiments import build_default_task_runtime
 from .runtime import (
+    TaskExecutionRequest,
     TaskRunResult,
     TaskRunStatus,
     TaskRuntimeEnvironment,
     load_committed_task_artifact,
 )
-from .stage0_g10 import Stage0G10FormalState, load_stage0_g10_formal_state
+from .stage0_g10 import (
+    READINESS_SCHEMA,
+    Stage0G10FormalState,
+    validate_formal_g10_outputs,
+)
 
 
 TASK_ID = "stage1.01_entry_and_contract"
@@ -150,6 +155,219 @@ def _write_or_verify(path: Path, value: Mapping[str, object]) -> None:
 def _yaml_mapping(path: Path, *, field: str) -> dict[str, Any]:
     value = yaml.safe_load(path.read_text(encoding="utf-8"))
     return _mapping(value, field=field)
+
+
+def load_stage0_g10_handoff_snapshot(
+    *,
+    repository: str | Path,
+    data_root: str | Path,
+    index_ref: str,
+) -> Stage0G10FormalState:
+    """Validate the immutable G10 closure without replaying G0--G9.
+
+    A downstream consumer needs G10's committed outputs, Gate, readiness bundle,
+    and exact G9 lineage. Re-evaluating every historical producer against mutable
+    current manifests would conflate evidence identity with present-day asset
+    qualification. S1.1 validates the current assets separately in
+    :func:`_handoff_assets`.
+    """
+
+    repository_root = Path(repository).resolve(strict=True)
+    root = Path(data_root).resolve(strict=True)
+    index_path = _logical_path(root, index_ref, field="g10_index_ref")
+    raw = _load_hashed(
+        index_path,
+        schema="stage0-g10-formalization-index-v1",
+        field="g10_index",
+    )
+    current_fields = {
+        "schema_version",
+        "generator_git_commit",
+        "checked_at",
+        "g9_index_ref",
+        "g9_index_sha256",
+        "g9_gate_artifact_hash",
+        "g9_generator_git_commit",
+        "reuse_attestation_ref",
+        "reuse_attestation_sha256",
+        "sync_observation_ref",
+        "sync_observation_sha256",
+        "config_ref",
+        "config_hash",
+        "input_environment_hash",
+        "task_output_refs",
+        "gate_ref",
+        "gate_artifact_hash",
+        "readiness_ref",
+        "readiness_sha256",
+        "readiness_artifact_hash",
+        "environment_ref",
+        "environment_hash",
+        "next_task_id",
+        "next_input_refs",
+        "artifact_hash",
+    }
+    legacy_fields = current_fields - {
+        "g9_generator_git_commit",
+        "reuse_attestation_ref",
+        "reuse_attestation_sha256",
+    }
+    actual_fields = frozenset(raw)
+    legacy_index = actual_fields == frozenset(legacy_fields)
+    generator = raw.get("generator_git_commit")
+    if (
+        actual_fields not in {frozenset(current_fields), frozenset(legacy_fields)}
+        or not isinstance(generator, str)
+        or _COMMIT_RE.fullmatch(generator) is None
+    ):
+        raise Stage1S11Error("S1_1_G10_INDEX_FIELDS_INVALID")
+
+    g9_ref = raw.get("g9_index_ref")
+    g9_path = _logical_path(root, g9_ref, field="g9_index_ref")
+    g9 = _load_hashed(
+        g9_path,
+        schema="stage0-g9-formalization-index-v1",
+        field="g9_index",
+    )
+    g9_generator = g9.get("generator_git_commit")
+    g9_gate_hash = g9.get("gate_artifact_hash")
+    if (
+        not isinstance(g9_generator, str)
+        or _COMMIT_RE.fullmatch(g9_generator) is None
+        or not isinstance(g9_gate_hash, str)
+        or re.fullmatch(r"[0-9a-f]{64}", g9_gate_hash) is None
+    ):
+        raise Stage1S11Error("S1_1_G9_LINEAGE_INVALID")
+    declared_g9_generator = generator if legacy_index else raw.get(
+        "g9_generator_git_commit"
+    )
+    reuse_ref = None if legacy_index else raw.get("reuse_attestation_ref")
+    reuse_sha = None if legacy_index else raw.get("reuse_attestation_sha256")
+    if declared_g9_generator != g9_generator:
+        raise Stage1S11Error("S1_1_G9_GENERATOR_BINDING_INVALID")
+    if g9_generator == generator:
+        if reuse_ref is not None or reuse_sha is not None:
+            raise Stage1S11Error("S1_1_G10_REUSE_ATTESTATION_UNNECESSARY")
+    else:
+        if not isinstance(reuse_ref, str) or not isinstance(reuse_sha, str):
+            raise Stage1S11Error("S1_1_G10_REUSE_ATTESTATION_MISSING")
+        reuse_path = _logical_path(root, reuse_ref, field="g10_reuse_attestation_ref")
+        reuse_raw = _mapping(
+            load_canonical_json(reuse_path), field="g10_reuse_attestation"
+        )
+        reuse_branch = reuse_raw.get("consumer_git_branch")
+        if sha256_file(reuse_path) != reuse_sha or not isinstance(reuse_branch, str):
+            raise Stage1S11Error("S1_1_G10_REUSE_ATTESTATION_IDENTITY_INVALID")
+        try:
+            validate_evidence_reuse_attestation(
+                repository=repository_root,
+                data_root=root,
+                attestation_ref=reuse_ref,
+                producer_commit=g9_generator,
+                consumer_commit=generator,
+                consumer_branch=reuse_branch,
+                scope_id="stage0.G0-G9",
+                source_evidence_ref=str(g9_ref),
+                required_gate_ids=sorted(
+                    gate_id
+                    for gate_id in REQUIRED_STAGE0_GATE_IDS
+                    if gate_id != "stage0.G10"
+                ),
+            )
+        except EvidenceReuseError as error:
+            raise Stage1S11Error(
+                f"S1_1_G10_REUSE_ATTESTATION_INVALID:{error}"
+            ) from error
+
+    config = ResolvedConfigV2.from_mapping(
+        _mapping(
+            load_canonical_json(
+                _logical_path(root, raw["config_ref"], field="g10_config_ref")
+            ),
+            field="g10_config",
+        )
+    )
+    environment = TaskRuntimeEnvironment.from_mapping(
+        _mapping(
+            load_canonical_json(
+                _logical_path(
+                    root, raw["environment_ref"], field="g10_environment_ref"
+                )
+            ),
+            field="g10_environment",
+        )
+    )
+    outputs_raw = _mapping(raw.get("task_output_refs"), field="g10_task_outputs")
+    if set(outputs_raw) != set(config.task_definition.artifact_kinds):
+        raise Stage1S11Error("S1_1_G10_TASK_OUTPUT_SET_INVALID")
+    outputs = {
+        kind: str(outputs_raw[kind]) for kind in config.task_definition.artifact_kinds
+    }
+    input_refs = dict(environment.evidence_refs)
+    for key in (
+        "g10_delivery_manifest",
+        "g10_worklog",
+        "g10_sync_report",
+        "gate_stage0_g10",
+        "stage0_readiness",
+        "stage1_handoff",
+    ):
+        input_refs.pop(key, None)
+    input_environment = TaskRuntimeEnvironment(
+        capabilities=environment.capabilities,
+        frozen_contract_stages=environment.frozen_contract_stages,
+        passed_gate_ids=environment.passed_gate_ids - frozenset({"stage0.G10"}),
+        estimator_decision_ref=environment.estimator_decision_ref,
+        evidence_refs=input_refs,
+    )
+    request = TaskExecutionRequest(config, config.task_definition, input_environment)
+    gate = validate_formal_g10_outputs(request, root, outputs)
+    readiness_path = _logical_path(
+        root, raw["readiness_ref"], field="g10_readiness_ref"
+    )
+    readiness = _load_hashed(
+        readiness_path,
+        schema=READINESS_SCHEMA,
+        field="g10_readiness",
+    )
+    next_inputs = raw.get("next_input_refs")
+    if (
+        raw.get("g9_index_sha256") != sha256_file(g9_path)
+        or raw.get("g9_gate_artifact_hash") != g9_gate_hash
+        or raw.get("sync_observation_sha256")
+        != sha256_file(
+            _logical_path(
+                root, raw["sync_observation_ref"], field="g10_sync_observation_ref"
+            )
+        )
+        or config.config_hash != raw.get("config_hash")
+        or input_environment.environment_hash != raw.get("input_environment_hash")
+        or environment.environment_hash != raw.get("environment_hash")
+        or "stage0.G10" not in environment.passed_gate_ids
+        or raw.get("gate_ref") != outputs["sync_report"]
+        or raw.get("gate_artifact_hash") != gate.artifact_hash
+        or raw.get("readiness_sha256") != sha256_file(readiness_path)
+        or raw.get("readiness_artifact_hash") != readiness["artifact_hash"]
+        or raw.get("next_task_id") != TASK_ID
+        or not isinstance(next_inputs, list)
+        or set(next_inputs) != set(outputs.values())
+    ):
+        raise Stage1S11Error("S1_1_G10_HANDOFF_INVALID")
+    return Stage0G10FormalState(
+        environment=environment,
+        task_output_refs=outputs,
+        config=config,
+        config_ref=str(raw["config_ref"]),
+        environment_ref=str(raw["environment_ref"]),
+        index_ref=index_ref,
+        index_sha256=sha256_file(index_path),
+        gate_artifact_hash=gate.artifact_hash,
+        readiness_ref=str(raw["readiness_ref"]),
+        readiness_artifact_hash=str(readiness["artifact_hash"]),
+        g9_index_ref=str(g9_ref),
+        generator_git_commit=generator,
+        legacy_index=legacy_index,
+    )
 
 
 def _handoff_assets(
@@ -447,7 +665,8 @@ def load_stage1_s1_1_formalization(
     ):
         raise Stage1S11Error("S1_1_INDEX_FIELDS_OR_SOURCE_INVALID")
     binding = Stage1S11SourceBinding(repository_root, commit, branch)
-    state = load_stage0_g10_formal_state(
+    state = load_stage0_g10_handoff_snapshot(
+        repository=repository_root,
         data_root=root,
         index_ref=str(index["g10_index_ref"]),
     )
@@ -527,7 +746,11 @@ def execute_stage1_s1_1(
         raise Stage1S11Error("S1_1_ATTEMPT_ID_INVALID")
     binding = capture_stage1_s1_1_source(repository)
     root = Path(data_root).resolve(strict=True)
-    state = load_stage0_g10_formal_state(data_root=root, index_ref=g10_index_ref)
+    state = load_stage0_g10_handoff_snapshot(
+        repository=binding.repository,
+        data_root=root,
+        index_ref=g10_index_ref,
+    )
     attestation = validate_stage0_g10_reuse(
         binding=binding,
         data_root=root,
@@ -628,6 +851,7 @@ __all__ = [
     "capture_stage1_s1_1_source",
     "execute_stage1_s1_1",
     "load_stage1_s1_1_formalization",
+    "load_stage0_g10_handoff_snapshot",
     "validate_formal_stage1_s1_1_outputs",
     "validate_stage0_g10_reuse",
 ]
