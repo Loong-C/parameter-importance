@@ -34,6 +34,7 @@ from param_importance_nlp.assets import (
     validate_asset_path,
     validate_g3_manifest,
     validate_g3_qualification,
+    validate_qualified_ready_manifest,
     validate_manifest,
     validate_state_transition,
     verify_only,
@@ -986,6 +987,14 @@ def test_g3_qualification_admission_and_qualified_resolution(tmp_path: Path) -> 
     assert final_event["actor_role"] == "gate"
     assert final_event["evidence_ref"] == _QUALIFICATION_REF
     assert final_event["evidence_sha256"] == qualification["artifact_hash"]
+
+    validated = validate_qualified_ready_manifest(
+        ready,
+        qualification,
+        qualification_ref=_QUALIFICATION_REF,
+        requirements_artifact_hash=_REQUIREMENTS_SHA256,
+    )
+    assert validated == ready
 
     asset_root = tmp_path / "g3-model"
     asset_root.mkdir()

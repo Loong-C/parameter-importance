@@ -12,6 +12,7 @@ from typing import Any, Mapping
 import yaml
 
 from .atomic import sha256_file
+from .assets import AssetManifestError, validate_qualified_ready_manifest
 from .contracts import (
     ContractFreeze,
     GateRecord,
@@ -558,6 +559,7 @@ def load_stage0_g10_handoff_snapshot(
 def _handoff_assets(
     data_root: Path,
     state: Stage0G10FormalState,
+    repository: Path,
 ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any], dict[str, Any]]:
     handoff_ref = state.environment.evidence_refs.get("stage1_handoff")
     if handoff_ref is None:
@@ -595,28 +597,39 @@ def _handoff_assets(
             or manifest.get("revision") != descriptor.get("revision")
         ):
             raise Stage1S11Error(f"S1_1_HANDOFF_ASSET_IDENTITY_DRIFT:{name}")
+        qualification_ref = f"manifests/qualifications/{name}.json"
         qualification = _load_hashed(
             _logical_path(
                 data_root,
-                f"manifests/qualifications/{name}.json",
+                qualification_ref,
                 field=f"qualification:{name}",
             ),
             schema="stage0-asset-qualification-v1",
             field=f"qualification:{name}",
         )
-        checks = qualification.get("checks")
-        if (
-            qualification.get("formal") is not True
-            or qualification.get("asset_id") != manifest.get("asset_id")
-            or qualification.get("verified_manifest_sha256") != sha256_file(manifest_path)
-            or not isinstance(checks, list)
-            or not checks
-            or any(
-                not isinstance(check, Mapping) or check.get("status") != "PASS"
-                for check in checks
-            )
-        ):
+        requirements_ref = qualification.get("requirements_ref")
+        if not isinstance(requirements_ref, str):
             raise Stage1S11Error(f"S1_1_ASSET_QUALIFICATION_INVALID:{name}")
+        requirements = _load_hashed(
+            _logical_path(
+                repository,
+                requirements_ref,
+                field=f"qualification_requirements:{name}",
+            ),
+            schema="stage0-asset-requirements-v1",
+            field=f"qualification_requirements:{name}",
+        )
+        try:
+            validate_qualified_ready_manifest(
+                manifest,
+                qualification,
+                qualification_ref=qualification_ref,
+                requirements_artifact_hash=str(requirements["artifact_hash"]),
+            )
+        except (AssetManifestError, KeyError, TypeError, ValueError) as error:
+            raise Stage1S11Error(
+                f"S1_1_ASSET_QUALIFICATION_INVALID:{name}:{error}"
+            ) from error
         return manifest
 
     return (
@@ -669,7 +682,9 @@ def build_stage1_s1_1_config(
     output_dir: str,
 ) -> ResolvedConfigV2:
     root = Path(data_root).resolve(strict=True)
-    _handoff, model, data, tokenizer = _handoff_assets(root, state)
+    _handoff, model, data, tokenizer = _handoff_assets(
+        root, state, binding.repository
+    )
     science = _yaml_mapping(
         binding.repository / "configs/run-ready/layers/formal-stage1-pythia14m.yaml",
         field="science_layer",

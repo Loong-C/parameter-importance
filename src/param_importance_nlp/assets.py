@@ -2919,6 +2919,34 @@ def resolve_qualified_asset(
 ) -> ResolvedAsset:
     """Resolve a G3 READY asset bound to its formal qualification artifact."""
 
+    value = validate_qualified_ready_manifest(
+        manifest,
+        qualification,
+        qualification_ref=qualification_ref,
+        requirements_artifact_hash=requirements_artifact_hash,
+    )
+    supplied_root = Path(asset_root)
+    files = _verify_files(value, supplied_root)
+    resolved_root = supplied_root.resolve(strict=True)
+    return ResolvedAsset(
+        asset_id=value["asset_id"],
+        asset_type=AssetType(value["asset_type"]),
+        name=value["name"],
+        revision=value["revision"],
+        root=resolved_root,
+        files=files,
+    )
+
+
+def validate_qualified_ready_manifest(
+    manifest: Mapping[str, Any] | str | Path,
+    qualification: Mapping[str, Any],
+    *,
+    qualification_ref: str,
+    requirements_artifact_hash: str,
+) -> dict[str, Any]:
+    """Validate G3 READY admission metadata without rehashing asset payload files."""
+
     value = _coerce_manifest(manifest)
     if not _uses_g3_profile(value):
         raise AssetNotReadyError("Qualified resolution requires a G3 manifest")
@@ -2960,17 +2988,7 @@ def resolve_qualified_asset(
         qualification,
         requirements_artifact_hash=requirements_artifact_hash,
     )
-    supplied_root = Path(asset_root)
-    files = _verify_files(value, supplied_root)
-    resolved_root = supplied_root.resolve(strict=True)
-    return ResolvedAsset(
-        asset_id=value["asset_id"],
-        asset_type=AssetType(value["asset_type"]),
-        name=value["name"],
-        revision=value["revision"],
-        root=resolved_root,
-        files=files,
-    )
+    return value
 
 
 # Explicit aliases keep call sites readable without weakening the single
