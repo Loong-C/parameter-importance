@@ -2303,7 +2303,10 @@ def _registry_evidence(root: Path) -> Mapping[str, JSONValue]:
         registry,
         include_actual_update=True,
     ).schema_manifest()
-    head = _stage1_git_command(root, "rev-parse", "HEAD") or "0" * 40
+    repository_root = Path(__file__).resolve().parents[3]
+    head = _stage1_git_command(repository_root, "rev-parse", "HEAD")
+    if head is None:
+        head = _stage1_git_command(root, "rev-parse", "HEAD") or "0" * 40
     checks = [
         {
             "check_id": "manifest_roundtrip_hashes",

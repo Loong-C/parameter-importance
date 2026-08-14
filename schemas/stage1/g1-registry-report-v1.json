@@ -4,11 +4,12 @@
   "title": "G1-REGISTRY machine-readable validation report v1",
   "type": "object",
   "additionalProperties": false,
-  "required": ["schema_version", "gate_id", "status", "registry", "checks", "producer_commit", "consumer_commit"],
+  "required": ["schema_version", "gate_id", "status", "execution_scope", "registry", "checks", "producer_commit", "consumer_commit"],
   "properties": {
     "schema_version": {"const": "g1-registry-report-v1"},
     "gate_id": {"const": "G1-REGISTRY"},
     "status": {"enum": ["PASS", "FAIL", "NOT_RUN"]},
+    "execution_scope": {"const": "local_cpu_contract_only"},
     "registry": {
       "type": "object",
       "additionalProperties": false,
