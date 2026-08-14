@@ -1,0 +1,28 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://parameter-importance.invalid/schemas/stage1/g1-registry-report-v1.json",
+  "title": "G1-REGISTRY machine-readable validation report v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "gate_id", "status", "registry", "checks", "producer_commit", "consumer_commit"],
+  "properties": {
+    "schema_version": {"const": "g1-registry-report-v1"},
+    "gate_id": {"const": "G1-REGISTRY"},
+    "status": {"enum": ["PASS", "FAIL", "NOT_RUN"]},
+    "registry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["coordinate_registry_hash", "optimizer_contract_hash", "runtime_layout_hash", "record_count", "eligible_numel"],
+      "properties": {
+        "coordinate_registry_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "optimizer_contract_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "runtime_layout_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "record_count": {"type": "integer", "minimum": 1},
+        "eligible_numel": {"type": "integer", "minimum": 1}
+      }
+    },
+    "checks": {"type": "array", "items": {"type": "object"}},
+    "producer_commit": {"type": "string", "pattern": "^[0-9a-f]{40,64}$"},
+    "consumer_commit": {"type": "string", "pattern": "^[0-9a-f]{40,64}$"}
+  }
+}

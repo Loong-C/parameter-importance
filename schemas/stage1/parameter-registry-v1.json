@@ -1,0 +1,72 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://parameter-importance.invalid/schemas/stage1/parameter-registry-v1.json",
+  "title": "Stage 1 parameter registry manifest v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version", "coordinate_registry_hash", "optimizer_contract_hash",
+    "runtime_layout_hash", "optimizer_type", "records", "optimizer_groups"
+  ],
+  "properties": {
+    "schema_version": {"const": "parameter-registry-v1"},
+    "coordinate_registry_hash": {"$ref": "#/$defs/digest"},
+    "optimizer_contract_hash": {"$ref": "#/$defs/digest"},
+    "runtime_layout_hash": {"$ref": "#/$defs/digest"},
+    "optimizer_type": {"type": "string", "minLength": 1},
+    "records": {
+      "type": "array",
+      "minItems": 1,
+      "items": {"$ref": "#/$defs/record"}
+    },
+    "optimizer_groups": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/optimizerGroup"}
+    }
+  },
+  "$defs": {
+    "digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "nonNegative": {"type": "number", "minimum": 0},
+    "optionalNonNegative": {
+      "oneOf": [{"type": "null"}, {"$ref": "#/$defs/nonNegative"}]
+    },
+    "record": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "canonical_name", "aliases", "shape", "numel", "order", "eligible",
+        "eligibility_reason", "group_id", "tags", "dtype", "device", "layout",
+        "stride", "learning_rate", "weight_decay"
+      ],
+      "properties": {
+        "canonical_name": {"type": "string", "minLength": 1},
+        "aliases": {"type": "array", "items": {"type": "string", "minLength": 1}},
+        "shape": {"type": "array", "items": {"type": "integer", "minimum": 0}},
+        "numel": {"type": "integer", "minimum": 0},
+        "order": {"type": "integer", "minimum": 0},
+        "eligible": {"type": "boolean"},
+        "eligibility_reason": {"type": "string", "minLength": 1},
+        "group_id": {"oneOf": [{"type": "null"}, {"type": "string", "minLength": 1}]},
+        "tags": {"type": "object", "additionalProperties": {"type": "string"}},
+        "dtype": {"type": "string"},
+        "device": {"type": "string"},
+        "layout": {"type": "string"},
+        "stride": {"type": "array", "items": {"type": "integer"}},
+        "learning_rate": {"$ref": "#/$defs/optionalNonNegative"},
+        "weight_decay": {"$ref": "#/$defs/optionalNonNegative"}
+      }
+    },
+    "optimizerGroup": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["group_id", "parameter_names", "learning_rate", "weight_decay", "static_options"],
+      "properties": {
+        "group_id": {"type": "string", "minLength": 1},
+        "parameter_names": {"type": "array", "items": {"type": "string", "minLength": 1}},
+        "learning_rate": {"$ref": "#/$defs/nonNegative"},
+        "weight_decay": {"$ref": "#/$defs/nonNegative"},
+        "static_options": {"type": "object"}
+      }
+    }
+  }
+}

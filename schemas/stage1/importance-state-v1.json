@@ -1,0 +1,45 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://parameter-importance.invalid/schemas/stage1/importance-state-v1.json",
+  "title": "Stage 1 importance state manifest v1",
+  "description": "Metadata contract for the raw tensor state tree; tensor bytes are validated by runtime.tensor-bundle.v1.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "registry_hash", "accumulation_dtype", "byte_order", "slot_names", "slots"],
+  "properties": {
+    "schema_version": {"const": "stage1-importance-state-v1"},
+    "registry_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "accumulation_dtype": {"enum": ["float32", "float64"]},
+    "byte_order": {"enum": ["little", "big"]},
+    "slot_names": {"type": "array", "minItems": 2, "items": {"type": "string", "minLength": 1}},
+    "slots": {
+      "type": "object",
+      "minProperties": 2,
+      "additionalProperties": {"$ref": "#/$defs/slot"}
+    }
+  },
+  "$defs": {
+    "slot": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["dtype", "fields"],
+      "properties": {
+        "dtype": {"enum": ["float32", "float64"]},
+        "fields": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["canonical_name", "shape", "numel"],
+            "properties": {
+              "canonical_name": {"type": "string", "minLength": 1},
+              "shape": {"type": "array", "items": {"type": "integer", "minimum": 0}},
+              "numel": {"type": "integer", "minimum": 0}
+            }
+          }
+        }
+      }
+    }
+  }
+}

@@ -67,6 +67,7 @@ from ..core.oracles import (
     fp64_raw_oracle,
 )
 from ..core.registry import ParameterRegistry
+from ..core.state import ImportanceState
 from ..core.sufficient_statistics import EqualSufficientStatistics
 from ..core.tensors import TensorMap
 from ..evidence_reuse import (
@@ -2292,25 +2293,58 @@ class _AliasModel(torch.nn.Module):
         self.bias = torch.nn.Parameter(torch.tensor([0.0, 1.0]))
 
 
-def _registry_evidence() -> Mapping[str, JSONValue]:
+def _registry_evidence(root: Path) -> Mapping[str, JSONValue]:
     model = _AliasModel()
     optimizer = torch.optim.SGD(model.parameters(), lr=0.1, foreach=False)
     registry = ParameterRegistry.from_model(model, optimizer)
-    records = [
+    manifest = registry.to_manifest()
+    roundtrip = ParameterRegistry.from_manifest(manifest)
+    state_schema = ImportanceState(
+        registry,
+        include_actual_update=True,
+    ).schema_manifest()
+    head = _stage1_git_command(root, "rev-parse", "HEAD") or "0" * 40
+    checks = [
         {
-            "canonical_name": record.canonical_name,
-            "aliases": list(record.aliases),
-            "shape": list(record.shape),
-            "order": record.order,
-            "eligible": record.eligible,
-            "group_id": record.group_id,
-        }
-        for record in registry
+            "check_id": "manifest_roundtrip_hashes",
+            "status": "PASS" if roundtrip.to_manifest() == manifest else "FAIL",
+        },
+        {
+            "check_id": "canonical_alias_resolution",
+            "status": "PASS" if registry.canonical_name("weight_alias") == "weight" else "FAIL",
+        },
+        {
+            "check_id": "eligible_numel_sum",
+            "status": "PASS" if sum(record.numel for record in registry.eligible_records) == 6 else "FAIL",
+        },
+        {
+            "check_id": "state_schema_registry_binding",
+            "status": "PASS" if state_schema["registry_hash"] == registry.coordinate_registry_hash else "FAIL",
+        },
     ]
+    validation_report = {
+        "schema_version": "g1-registry-report-v1",
+        "gate_id": "G1-REGISTRY",
+        "status": "NOT_RUN",
+        "execution_scope": "local_cpu_contract_only",
+        "registry": {
+            "coordinate_registry_hash": registry.coordinate_registry_hash,
+            "optimizer_contract_hash": registry.optimizer_contract_hash,
+            "runtime_layout_hash": registry.runtime_layout_hash,
+            "record_count": len(registry),
+            "eligible_numel": sum(record.numel for record in registry.eligible_records),
+        },
+        "checks": checks,
+        "producer_commit": head,
+        "consumer_commit": head,
+    }
     return {
         "evidence_type": "parameter_registry",
-        "records": records,
+        "registry_manifest": manifest,
+        "registry_validation_report": validation_report,
+        "state_schema": state_schema,
         "eligible_names": list(registry.eligible_names),
+        "eligible_numel": sum(record.numel for record in registry.eligible_records),
         "coordinate_registry_hash": registry.coordinate_registry_hash,
         "optimizer_contract_hash": registry.optimizer_contract_hash,
         "runtime_layout_hash": registry.runtime_layout_hash,
@@ -2489,7 +2523,7 @@ def _task_evidence(request: TaskExecutionRequest, root: Path) -> Mapping[str, JS
     if task_id == "stage1.01_entry_and_contract":
         return _stage1_contract_evidence(request, root)
     if task_id == "stage1.02_architecture_and_parameter_registry":
-        return _registry_evidence()
+        return _registry_evidence(root)
     if task_id == "stage1.03_fixtures_and_oracles":
         return _oracle_evidence()
     if task_id == "stage1.04_loss_and_gradient_scale":

@@ -93,7 +93,14 @@ from .quadrature import (
     simpson_rule,
     trapezoid_rule,
 )
-from .registry import ParameterRecord, ParameterRegistry
+from .registry import REGISTRY_SCHEMA_VERSION, ParameterRecord, ParameterRegistry
+from .state import (
+    ACTUAL_UPDATE_SLOT,
+    ImportanceState,
+    LONG_TERM_SLOTS,
+    STATE_SCHEMA_VERSION,
+    TEMPORARY_SLOTS,
+)
 from .sufficient_statistics import EqualSufficientStatistics, WeightedSufficientStatistics
 from .tensors import TensorMap
 
@@ -106,6 +113,7 @@ __all__ = [
     "EstimatorResult",
     "FP64Comparison",
     "ImportanceAccumulator",
+    "ImportanceState",
     "LossBatch",
     "MetricResult",
     "NO_UNBIASEDNESS_CLAIM",
@@ -113,6 +121,7 @@ __all__ = [
     "PLUGIN_SAME_BATCH_CLIP",
     "ParameterRecord",
     "ParameterRegistry",
+    "REGISTRY_SCHEMA_VERSION",
     "PathIntegralResult",
     "PathSpec",
     "PruningContext",
@@ -122,6 +131,10 @@ __all__ = [
     "RegistryError",
     "TensorMap",
     "TensorMapError",
+    "STATE_SCHEMA_VERSION",
+    "TEMPORARY_SLOTS",
+    "LONG_TERM_SLOTS",
+    "ACTUAL_UPDATE_SLOT",
     "UNBIASED_FIXED_STATE",
     "WeightedSufficientStatistics",
     "ZeroMeanNoiseFixture",
