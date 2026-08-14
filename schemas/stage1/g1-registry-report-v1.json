@@ -9,7 +9,7 @@
     "schema_version": {"const": "g1-registry-report-v1"},
     "gate_id": {"const": "G1-REGISTRY"},
     "status": {"enum": ["PASS", "FAIL", "NOT_RUN"]},
-    "execution_scope": {"const": "local_cpu_contract_only"},
+    "execution_scope": {"enum": ["local_cpu_contract_only", "formal_server_cpu"]},
     "registry": {
       "type": "object",
       "additionalProperties": false,
@@ -23,6 +23,8 @@
       }
     },
     "checks": {"type": "array", "items": {"type": "object"}},
+    "registry_manifest": {"type": "object"},
+    "state_schema": {"type": "object"},
     "producer_commit": {"type": "string", "pattern": "^[0-9a-f]{40,64}$"},
     "consumer_commit": {"type": "string", "pattern": "^[0-9a-f]{40,64}$"}
   }

@@ -1,0 +1,39 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://parameter-importance.invalid/schemas/stage1/s1-2-formalization-index-v1.json",
+  "title": "Formal S1.2 G1-REGISTRY evidence index v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version", "status", "gate_id", "task_id", "generator_git_commit",
+    "git_branch", "checked_at", "s1_1_index_ref", "s1_1_index_sha256",
+    "s1_1_gate_artifact_hashes", "validation_ref", "validation_sha256",
+    "report_ref", "report_sha256", "probe_summary", "next_task_id", "artifact_hash"
+  ],
+  "properties": {
+    "schema_version": {"const": "stage1-s1-2-formalization-index-v1"},
+    "status": {"const": "PASS"},
+    "gate_id": {"const": "G1-REGISTRY"},
+    "task_id": {"const": "stage1.02_architecture_and_parameter_registry"},
+    "generator_git_commit": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+    "git_branch": {"type": "string", "minLength": 1},
+    "checked_at": {"type": "string", "minLength": 1},
+    "s1_1_index_ref": {"type": "string", "minLength": 1},
+    "s1_1_index_sha256": {"$ref": "#/$defs/digest"},
+    "s1_1_gate_artifact_hashes": {
+      "type": "object",
+      "additionalProperties": {"$ref": "#/$defs/digest"},
+      "minProperties": 2
+    },
+    "validation_ref": {"type": "string", "minLength": 1},
+    "validation_sha256": {"$ref": "#/$defs/digest"},
+    "report_ref": {"type": "string", "minLength": 1},
+    "report_sha256": {"$ref": "#/$defs/digest"},
+    "probe_summary": {"type": "object"},
+    "next_task_id": {"const": "stage1.03_fixtures_and_oracles"},
+    "artifact_hash": {"$ref": "#/$defs/digest"}
+  },
+  "$defs": {
+    "digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+  }
+}
