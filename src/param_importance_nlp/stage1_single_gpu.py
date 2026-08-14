@@ -700,6 +700,67 @@ class _S17StepObserver(TrainingStepObserver):
         raise Stage1S17WorkerError(f"S17_WORKER_UNEXPECTED_SKIP:{event.transaction.attempt_index}")
 
 
+def _validate_two_step_training_result(result: object) -> None:
+    """Bind the S1.7 run to TrainingEngine's real terminal wire."""
+
+    state = getattr(result, "state", None)
+    records = getattr(result, "records", None)
+    status = getattr(result, "status", None)
+    global_step = getattr(state, "global_step", None)
+    attempt_index = getattr(state, "attempt_index", None)
+    skipped_steps = getattr(state, "skipped_steps", None)
+    record_count = len(records) if isinstance(records, (list, tuple)) else None
+    record_statuses = (
+        [getattr(record, "status", None) for record in records]
+        if isinstance(records, (list, tuple))
+        else None
+    )
+    record_attempts = (
+        [getattr(record, "attempt_index", None) for record in records]
+        if isinstance(records, (list, tuple))
+        else None
+    )
+    record_steps = (
+        [getattr(record, "global_step", None) for record in records]
+        if isinstance(records, (list, tuple))
+        else None
+    )
+    effective_counts = (
+        [getattr(record, "effective_count", None) for record in records]
+        if isinstance(records, (list, tuple))
+        else None
+    )
+    batch_ids = (
+        [getattr(record, "batch_ids", None) for record in records]
+        if isinstance(records, (list, tuple))
+        else None
+    )
+    expected_batch_ids = [
+        tuple(f"s17:train-{step}-{micro}" for micro in range(4))
+        for step in range(2)
+    ]
+    if (
+        status != "COMPLETE"
+        or global_step != 2
+        or attempt_index != 2
+        or skipped_steps != 0
+        or record_count != 2
+        or record_statuses != ["COMMITTED", "COMMITTED"]
+        or record_attempts != [1, 2]
+        or record_steps != [1, 2]
+        or effective_counts != [8192, 8192]
+        or batch_ids != expected_batch_ids
+    ):
+        raise Stage1S17WorkerError(
+            "S17_WORKER_TWO_STEP_TRAINING_FAILED:"
+            f"status={status}:global_step={global_step}:attempt_index={attempt_index}:"
+            f"skipped_steps={skipped_steps}:record_count={record_count}:"
+            f"record_statuses={record_statuses}:record_attempts={record_attempts}:"
+            f"record_steps={record_steps}:effective_counts={effective_counts}:"
+            f"batch_ids={batch_ids}"
+        )
+
+
 def _training_run(adapter: TorchModelAdapter, tokens: Mapping[int, torch.Tensor], *, statistics: bool) -> tuple[dict[str, object], dict[str, torch.Tensor], dict[int, dict[str, torch.Tensor]], dict[int, dict[str, torch.Tensor]]]:
     optimizer = torch.optim.AdamW(adapter.module.parameters(), lr=3e-4, betas=(0.9, 0.999), eps=1e-8, weight_decay=0.01, foreach=False, fused=False)
     spec = TrainingRunSpec(run_id=f"s17-{'on' if statistics else 'off'}", run_intent="formal", max_steps=2, max_attempts=2, importance_enabled=statistics, estimator_name="u", accumulation_dtype="float32", max_grad_norm=1.0, weights_exogenous=True, common_mean_assumption=True, requires_estimator_decision=False, metadata={"task_id": TASK_ID, "decision_exempt": True})
@@ -707,8 +768,7 @@ def _training_run(adapter: TorchModelAdapter, tokens: Mapping[int, torch.Tensor]
     engine = TrainingEngine(spec=spec, model=adapter, optimizer=optimizer, cursor=DeterministicBatchCursor(batches), experiment_id=f"s17-{'on' if statistics else 'off'}")
     observer = _S17StepObserver(); observer.bind(engine); engine.register_observer(observer)
     result = engine.run()
-    if result.status != "PASS" or result.state.global_step != 2 or len(result.records) != 2:
-        raise Stage1S17WorkerError("S17_WORKER_TWO_STEP_TRAINING_FAILED")
+    _validate_two_step_training_result(result)
     accumulator: dict[str, torch.Tensor] = {}
     accumulator_fields: list[str] = []
     if statistics:

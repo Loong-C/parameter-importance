@@ -25,6 +25,7 @@ from param_importance_nlp.stage1_single_gpu import (
     PYTHIA_ACTIVE_DROPOUT_FIELDS, T32_ATOL, T32_NORMALIZED_L2_LIMIT, T32_RTOL,
     Stage1S17WorkerError, _active_gpt_neox_dropout, _adamw_group_wire,
     _fixed_array_bundle, _optimizer_state_tensors, _state_components,
+    _validate_two_step_training_result,
 )
 from param_importance_nlp.stage1_single_gpu_oracle import Stage1S17OracleError, max_error, raw_double_and_u
 
@@ -145,6 +146,32 @@ def test_s17_optimizer_group_wire_rejects_control_and_binding_drift() -> None:
     group["params"] = list(reversed(group["params"]))
     with pytest.raises(Stage1S17WorkerError, match="S17_WORKER_ADAMW_PARAMETER_BINDING_INVALID"):
         _adamw_group_wire(model, optimizer)
+
+
+def test_s17_two_step_result_uses_training_engine_complete_wire() -> None:
+    committed = tuple(
+        SimpleNamespace(
+            status="COMMITTED", attempt_index=step + 1, global_step=step + 1,
+            effective_count=8192,
+            batch_ids=tuple(f"s17:train-{step}-{micro}" for micro in range(4)),
+        )
+        for step in range(2)
+    )
+    result = SimpleNamespace(
+        status="COMPLETE",
+        state=SimpleNamespace(global_step=2, attempt_index=2, skipped_steps=0),
+        records=committed,
+    )
+    _validate_two_step_training_result(result)
+    result.status = "PASS"
+    with pytest.raises(
+        Stage1S17WorkerError,
+        match="S17_WORKER_TWO_STEP_TRAINING_FAILED:status=PASS:global_step=2",
+    ):
+        _validate_two_step_training_result(result)
+    result.status = "COMPLETE"; result.state.skipped_steps = 1
+    with pytest.raises(Stage1S17WorkerError, match="skipped_steps=1"):
+        _validate_two_step_training_result(result)
 
 
 def test_s17_yaml_keeps_global_default_but_freezes_local_fixture_contract() -> None:
