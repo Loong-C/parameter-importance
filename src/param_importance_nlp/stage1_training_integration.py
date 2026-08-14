@@ -9,13 +9,17 @@ isolated from every production training component.
 from __future__ import annotations
 
 from collections.abc import Mapping
+from contextlib import contextmanager
+from functools import wraps
 import hashlib
 import json
 import math
 from pathlib import Path
+import random
 import re
 from typing import Any
 
+import numpy as np
 import torch
 
 from .atomic import sha256_file
@@ -91,6 +95,72 @@ _REQUIREMENTS = (
 
 class Stage1TrainingIntegrationError(RuntimeError):
     """S1.6 evidence is malformed or cannot support G1-STEP."""
+
+
+@contextmanager
+def _s16_deterministic_runtime(seed: int):
+    """Install a private CPU evidence RNG/runtime domain and restore its caller.
+
+    ``TrainingEngine`` deliberately includes Python, NumPy, CPU Torch and CUDA
+    generator state in its commit-control hash.  The S1.6 evidence builders
+    are therefore not allowed to inherit any of those streams from a caller:
+    two consecutive builds must yield identical *persisted control hashes*.
+    The fixture executes on CPU.  CUDA RNG is captured/restored only when the
+    caller already initialised CUDA, matching the generic engine control
+    state without creating a device context merely for evidence serialization.
+
+    A one-thread deterministic CPU section also makes the small attention
+    fixture independent of a process's caller-selected intra-op setting.  All
+    mutated global state is restored in ``finally`` so evidence generation
+    cannot perturb a surrounding test or training process.
+    """
+
+    if isinstance(seed, bool) or not isinstance(seed, int) or seed < 0:
+        raise Stage1TrainingIntegrationError("S1_6_RUNTIME_SEED_INVALID")
+    python_state = random.getstate()
+    numpy_state = np.random.get_state()
+    torch_state = torch.random.get_rng_state()
+    # Do not probe an available accelerator from this CPU-only formal fixture:
+    # that can initialise CUDA merely to serialize an otherwise unused RNG.
+    # A process which already initialised CUDA is still preserved exactly.
+    cuda_states = tuple(state.cpu() for state in torch.cuda.get_rng_state_all()) if torch.cuda.is_initialized() else ()
+    thread_count = torch.get_num_threads()
+    deterministic = torch.are_deterministic_algorithms_enabled()
+    deterministic_warn_only = torch.is_deterministic_algorithms_warn_only_enabled()
+    try:
+        # ``fork_rng`` additionally protects Torch's CPU stream should a
+        # future fixture return/raise across a nested generator operation.
+        with torch.random.fork_rng(devices=[]):
+            random.seed(seed)
+            np.random.seed(seed % (2**32))
+            torch.manual_seed(seed)
+            if cuda_states:
+                torch.cuda.manual_seed_all(seed)
+            torch.set_num_threads(1)
+            torch.use_deterministic_algorithms(True, warn_only=False)
+            yield
+    finally:
+        # Restore policy before the caller resumes, even if construction or a
+        # formal engine lifecycle raises halfway through an attempt.
+        torch.use_deterministic_algorithms(deterministic, warn_only=deterministic_warn_only)
+        torch.set_num_threads(thread_count)
+        random.setstate(python_state)
+        np.random.set_state(numpy_state)
+        torch.random.set_rng_state(torch_state)
+        if cuda_states:
+            torch.cuda.set_rng_state_all(list(cuda_states))
+
+
+def _s16_runtime_transaction(seed: int):
+    """Decorate a public evidence trace builder with a private runtime domain."""
+
+    def decorate(function: Any) -> Any:
+        @wraps(function)
+        def wrapped(*args: Any, **kwargs: Any) -> Any:
+            with _s16_deterministic_runtime(seed):
+                return function(*args, **kwargs)
+        return wrapped
+    return decorate
 
 
 def _hash_role(value: Mapping[str, Any], *, field: str) -> str:
@@ -505,6 +575,7 @@ def _skip_microbatch(step: int, micro: int, value: float) -> TrainingMicrobatch:
     )
 
 
+@_s16_runtime_transaction(6107)
 def build_s16_nonfinite_skip_trace(scaler_contract: Mapping[str, Any] | None = None) -> dict[str, Any]:
     """Execute finite → nonfinite skip → finite through the production engine."""
 
@@ -625,6 +696,7 @@ def build_s16_nonfinite_skip_trace(scaler_contract: Mapping[str, Any] | None = N
     return result_wire
 
 
+@_s16_runtime_transaction(6106)
 def build_s16_tiny_transformer_parity_trace(contract: Mapping[str, Any] | None = None, scaler_contract: Mapping[str, Any] | None = None) -> dict[str, Any]:
     """Run stats on/off through the real TrainingEngine and compare each boundary.
 
@@ -749,6 +821,7 @@ def _sgd_engine_microbatch(step: int, micro: int, gradient: Mapping[str, Any]) -
     )
 
 
+@_s16_runtime_transaction(6108)
 def build_s16_sgd_training_engine_trace(fixture: Mapping[str, Any]) -> dict[str, Any]:
     """Run the frozen two-group SGD fixture through the production engine.
 
@@ -811,6 +884,7 @@ def build_s16_sgd_training_engine_trace(fixture: Mapping[str, Any]) -> dict[str,
     }
 
 
+@_s16_runtime_transaction(6109)
 def build_s16_clip_training_engine_trace(fixture: Mapping[str, Any]) -> dict[str, Any]:
     """Exercise a nontrivial norm clip through the real TrainingEngine."""
 

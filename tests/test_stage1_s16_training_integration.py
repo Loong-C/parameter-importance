@@ -6,7 +6,9 @@ import builtins
 import importlib.util
 import json
 from pathlib import Path
+import random
 
+import numpy as np
 import pytest
 import torch
 
@@ -25,6 +27,96 @@ from param_importance_nlp.stage1_training_oracle import build_stage1_s16_oracle
 
 def _root() -> Path:
     return Path(__file__).resolve().parents[1]
+
+
+def _numpy_rng_state_equal(left: tuple[object, ...], right: tuple[object, ...]) -> bool:
+    return (
+        left[0] == right[0]
+        and np.array_equal(left[1], right[1])
+        and left[2:] == right[2:]
+    )
+
+
+def _assert_s16_builder_runtime_unchanged(
+    *, python_state: object, numpy_state: tuple[object, ...], torch_state: torch.Tensor,
+    thread_count: int, deterministic: bool, warn_only: bool,
+) -> None:
+    assert random.getstate() == python_state
+    assert _numpy_rng_state_equal(np.random.get_state(), numpy_state)
+    assert torch.equal(torch.random.get_rng_state(), torch_state)
+    assert torch.get_num_threads() == thread_count
+    assert torch.are_deterministic_algorithms_enabled() is deterministic
+    assert torch.is_deterministic_algorithms_warn_only_enabled() is warn_only
+
+
+def test_s16_evidence_builder_is_repeatable_and_does_not_pollute_runtime_domains() -> None:
+    """Three builds stay identical across caller thread counts and RNG states."""
+
+    root = _root()
+    original_python, original_numpy = random.getstate(), np.random.get_state()
+    original_torch = torch.random.get_rng_state()
+    original_threads = torch.get_num_threads()
+    original_deterministic = torch.are_deterministic_algorithms_enabled()
+    original_warn_only = torch.is_deterministic_algorithms_warn_only_enabled()
+    try:
+        random.seed(9921); np.random.seed(9921); torch.manual_seed(9921)
+        torch.set_num_threads(1)
+        first_caller = dict(
+            python_state=random.getstate(), numpy_state=np.random.get_state(),
+            torch_state=torch.random.get_rng_state(), thread_count=1,
+            deterministic=torch.are_deterministic_algorithms_enabled(),
+            warn_only=torch.is_deterministic_algorithms_warn_only_enabled(),
+        )
+        first = build_stage1_s16_evidence(
+            root, producer_commit="d21b084faa7b9c13cdd22aa09253ea0cca75c3de"
+        )
+        _assert_s16_builder_runtime_unchanged(**first_caller)
+
+        # The evidence domain always runs at its own deterministic intra-op
+        # setting; the caller's distinct setting must survive unchanged.
+        torch.set_num_threads(2)
+        second_caller = dict(
+            python_state=random.getstate(), numpy_state=np.random.get_state(),
+            torch_state=torch.random.get_rng_state(), thread_count=2,
+            deterministic=torch.are_deterministic_algorithms_enabled(),
+            warn_only=torch.is_deterministic_algorithms_warn_only_enabled(),
+        )
+        second = build_stage1_s16_evidence(
+            root, producer_commit="d21b084faa7b9c13cdd22aa09253ea0cca75c3de"
+        )
+        third = build_stage1_s16_evidence(
+            root, producer_commit="d21b084faa7b9c13cdd22aa09253ea0cca75c3de"
+        )
+        _assert_s16_builder_runtime_unchanged(**second_caller)
+        assert first == second == third
+    finally:
+        random.setstate(original_python)
+        np.random.set_state(original_numpy)
+        torch.random.set_rng_state(original_torch)
+        torch.use_deterministic_algorithms(original_deterministic, warn_only=original_warn_only)
+        torch.set_num_threads(original_threads)
+
+
+def test_s16_cpu_evidence_never_initializes_cuda_for_rng_capture(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A visible GPU must not make a CPU evidence build touch CUDA RNG state."""
+
+    import param_importance_nlp.runtime.training as training_runtime
+
+    calls = 0
+
+    def forbidden_cuda_rng_state() -> list[torch.Tensor]:
+        nonlocal calls
+        calls += 1
+        raise AssertionError("CPU S1.6 fixture must not capture CUDA RNG")
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "is_initialized", lambda: False)
+    monkeypatch.setattr(torch.cuda, "get_rng_state_all", forbidden_cuda_rng_state)
+    assert training_runtime._capture_rng_state()["torch_cuda"] == ()
+    build_stage1_s16_evidence(
+        _root(), producer_commit="d21b084faa7b9c13cdd22aa09253ea0cca75c3de"
+    )
+    assert calls == 0
 
 
 def test_s16_fixture_oracle_production_trace_and_replay_are_independent() -> None:

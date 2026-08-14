@@ -143,7 +143,10 @@ def _capture_rng_state() -> dict[str, object]:
     """捕获 Python/NumPy/Torch CPU/CUDA RNG，不把设备可用性当成 Gate。"""
 
     cuda_states: tuple[torch.Tensor, ...] = ()
-    if torch.cuda.is_available():
+    # CPU-only engines must not initialise CUDA merely because a host happens
+    # to expose an accelerator.  Once a GPU training engine has initialised
+    # CUDA, retain the complete per-device generator state for resume.
+    if torch.cuda.is_initialized():
         cuda_states = tuple(state.cpu() for state in torch.cuda.get_rng_state_all())
     return {
         "python": random.getstate(),
