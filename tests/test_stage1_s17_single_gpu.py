@@ -19,6 +19,7 @@ import torch
 import yaml
 
 from param_importance_nlp.contracts.task_catalog import DEFAULT_TASK_CATALOG
+from param_importance_nlp.core.registry import ParameterRegistry
 from param_importance_nlp.providers import (
     DeterministicBatchCursor, TorchModelAdapter, TrainingMicrobatch,
 )
@@ -528,6 +529,78 @@ def test_s17_device_uuid_schema_accepts_real_nvidia_wire_and_rejects_drift() -> 
     ):
         with pytest.raises(Exception, match="S1_6_SCHEMA_CONST_INVALID"):
             s16._validate_schema(invalid, name_schema, registry, document=report, path="device.device_name")
+
+
+def test_s17_registry_optimizer_type_schema_matches_production_wire() -> None:
+    root = Path(__file__).resolve().parents[1]
+    report = json.loads((root / "schemas" / "stage1" / "s1-7-single-gpu-report-v1.json").read_text(encoding="utf-8"))
+    s16_spec = importlib.util.spec_from_file_location("s17_s16_optimizer_schema", root / "ops" / "stage1" / "formalize_s1_6.py")
+    assert s16_spec is not None and s16_spec.loader is not None
+    s16 = importlib.util.module_from_spec(s16_spec); s16_spec.loader.exec_module(s16)
+    module = torch.nn.Linear(3, 2)
+    optimizer = torch.optim.AdamW(module.parameters(), lr=3e-4, betas=(0.9, 0.999), eps=1e-8, weight_decay=0.01, foreach=False, fused=False)
+    production = ParameterRegistry.from_model(module, optimizer).to_manifest()
+    assert production["optimizer_type"] == "torch.optim.adamw.AdamW"
+    registry = {"s1-7-single-gpu-report-v1.json": report, report["$id"]: report}
+    optimizer_schema = report["definitions"]["registry"]["properties"]["optimizer_type"]
+    assert optimizer_schema == {"const": "torch.optim.adamw.AdamW"}
+    s16._validate_schema(production["optimizer_type"], optimizer_schema, registry, document=report, path="registry.optimizer_type")
+    for invalid in ("AdamW", "torch.optim.AdamW", "torch.optim.adam.Adam"):
+        with pytest.raises(Exception, match="S1_6_SCHEMA_CONST_INVALID"):
+            s16._validate_schema(invalid, optimizer_schema, registry, document=report, path="registry.optimizer_type")
+
+
+def test_s17_comparison_cardinalities_bind_real_pythia_wire() -> None:
+    """AdamW has three saved state tensors for each of Pythia's 76 parameters."""
+
+    root = Path(__file__).resolve().parents[1]
+    report = json.loads((root / "schemas" / "stage1" / "s1-7-single-gpu-report-v1.json").read_text(encoding="utf-8"))
+    table = json.loads((root / "schemas" / "stage1" / "s1-7-comparison-table-v1.json").read_text(encoding="utf-8"))
+    s16_spec = importlib.util.spec_from_file_location("s17_s16_cardinality_schema", root / "ops" / "stage1" / "formalize_s1_6.py")
+    assert s16_spec is not None and s16_spec.loader is not None
+    s16 = importlib.util.module_from_spec(s16_spec); s16_spec.loader.exec_module(s16)
+    report_registry = {"s1-7-single-gpu-report-v1.json": report, report["$id"]: report}
+
+    tensor_error = {
+        "max_abs_error": 0.0, "max_scaled_error": 0.0,
+        "normalized_l2_error": 0.0, "near_zero_coordinates": 0,
+        "violation_count": 0, "within_t32": True,
+    }
+
+    def comparison(count: int) -> dict[str, object]:
+        return {
+            "max_abs_error": 0.0, "parameter": "parameter_000", "index": [0],
+            "max_scaled_error": 0.0, "normalized_l2_error": 0.0,
+            "near_zero_coordinates": 0, "violation_count": 0, "within_t32": True,
+            "per_tensor": {f"state_{index:03d}": dict(tensor_error) for index in range(count)},
+        }
+
+    optimizer_schema = report["definitions"]["optimizer_state_comparison"]
+    assert optimizer_schema["properties"]["per_tensor"]["minProperties"] == 228
+    assert optimizer_schema["properties"]["per_tensor"]["maxProperties"] == 228
+    s16._validate_schema(comparison(228), optimizer_schema, report_registry, document=report, path="optimizer_state_error")
+    for invalid_count in (227, 229):
+        with pytest.raises(Exception, match="S1_6_SCHEMA_(?:MIN|MAX)PROPERTIES_INVALID"):
+            s16._validate_schema(comparison(invalid_count), optimizer_schema, report_registry, document=report, path="optimizer_state_error")
+
+    generic_schema = report["definitions"]["comparison"]
+    assert generic_schema["properties"]["per_tensor"]["maxProperties"] == 128
+    s16._validate_schema(comparison(128), generic_schema, report_registry, document=report, path="parameter_post_error")
+    with pytest.raises(Exception, match="S1_6_SCHEMA_MAXPROPERTIES_INVALID"):
+        s16._validate_schema(comparison(129), generic_schema, report_registry, document=report, path="parameter_post_error")
+
+    row = {
+        "scope": "global", "metric": "full_vs_online", "module": "__global__", "layer": "__global__",
+        "max_abs_error": 0.0, "max_scaled_error": 0.0, "normalized_l2_error": 0.0,
+        "parameter": "parameter_000", "index": [0], "violation_count": 0, "status": "PASS",
+    }
+    rows_schema = table["properties"]["rows"]
+    table_registry = {"s1-7-comparison-table-v1.json": table, table["$id"]: table}
+    assert rows_schema["minItems"] == rows_schema["maxItems"] == 616
+    s16._validate_schema([dict(row) for _ in range(616)], rows_schema, table_registry, document=table, path="comparison_table.rows")
+    for invalid_count in (615, 617):
+        with pytest.raises(Exception, match="S1_6_SCHEMA_ITEM_COUNT_INVALID"):
+            s16._validate_schema([dict(row) for _ in range(invalid_count)], rows_schema, table_registry, document=table, path="comparison_table.rows")
 
 
 def _training_record(*, estimator_name: str | None, clip_factor: float = 1.0) -> dict[str, object]:
