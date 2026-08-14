@@ -496,6 +496,29 @@ def test_s17_schemas_are_strict_and_bind_fixture_identity_and_next_tasks() -> No
     ]
 
 
+def test_s17_device_uuid_schema_accepts_real_nvidia_wire_and_rejects_drift() -> None:
+    root = Path(__file__).resolve().parents[1]
+    report = json.loads((root / "schemas" / "stage1" / "s1-7-single-gpu-report-v1.json").read_text(encoding="utf-8"))
+    s16_spec = importlib.util.spec_from_file_location("s17_s16_uuid_schema", root / "ops" / "stage1" / "formalize_s1_6.py")
+    assert s16_spec is not None and s16_spec.loader is not None
+    s16 = importlib.util.module_from_spec(s16_spec); s16_spec.loader.exec_module(s16)
+    actual = "GPU-5c672d04-4f83-3cc0-80d0-0108b1b63267"
+    expected_pattern = r"^GPU-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+    registry = {"s1-7-single-gpu-report-v1.json": report, report["$id"]: report}
+    for field in ("physical_gpu_uuid", "cuda_visible_devices"):
+        schema = report["definitions"]["device"]["properties"][field]
+        assert schema["pattern"] == expected_pattern
+        s16._validate_schema(actual, schema, registry, document=report, path=f"device.{field}")
+        for invalid in (
+            actual.upper(),
+            actual.replace("GPU-", "gpu-"),
+            actual[:-1],
+            f"{actual}-extra",
+        ):
+            with pytest.raises(Exception, match="S1_6_SCHEMA_PATTERN_INVALID"):
+                s16._validate_schema(invalid, schema, registry, document=report, path=f"device.{field}")
+
+
 def _training_record(*, estimator_name: str | None, clip_factor: float = 1.0) -> dict[str, object]:
     return TrainingStepRecord(
         attempt_index=1, global_step=1, status="COMMITTED",
