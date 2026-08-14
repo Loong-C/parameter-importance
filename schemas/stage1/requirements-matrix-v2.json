@@ -1,0 +1,85 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://parameter-importance.invalid/schemas/stage1/requirements-matrix-v2.json",
+  "title": "Stage 1 S1.1 requirements-to-test-to-artifact matrix",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "task_id", "scope", "requirements", "summary"],
+  "properties": {
+    "schema_version": {"const": "stage1-requirements-matrix-v2"},
+    "task_id": {"const": "stage1.01_entry_and_contract"},
+    "scope": {"enum": ["local_fixture", "formal"]},
+    "requirements": {
+      "type": "array",
+      "minItems": 1,
+      "items": {"$ref": "#/$defs/requirement"}
+    },
+    "summary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["total", "local_pass", "formal_pass", "formal_blocked"],
+      "properties": {
+        "total": {"type": "integer", "minimum": 0},
+        "local_pass": {"type": "integer", "minimum": 0},
+        "formal_pass": {"type": "integer", "minimum": 0},
+        "formal_blocked": {"type": "integer", "minimum": 0}
+      }
+    }
+  },
+  "$defs": {
+    "nonEmptyString": {"type": "string", "minLength": 1},
+    "stringArray": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {"$ref": "#/$defs/nonEmptyString"}
+    },
+    "requirement": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "requirement_id", "math_field", "source_ref", "implementation_modules", "independent_oracles",
+        "device_dtype_profiles", "test_ids", "artifact_roles", "downstream_gate_ids", "minimal_repro_bundle",
+        "local_status", "formal_status", "evidence_refs", "notes"
+      ],
+      "properties": {
+        "requirement_id": {"type": "string", "pattern": "^[a-z][a-z0-9_.-]+$"},
+        "math_field": {"oneOf": [{"type": "null"}, {"type": "string", "minLength": 1}]},
+        "source_ref": {"$ref": "#/$defs/nonEmptyString"},
+        "implementation_modules": {"$ref": "#/$defs/stringArray"},
+        "independent_oracles": {"$ref": "#/$defs/stringArray"},
+        "device_dtype_profiles": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["device", "dtype", "tolerance_profile"],
+            "properties": {
+              "device": {"$ref": "#/$defs/nonEmptyString"},
+              "dtype": {"$ref": "#/$defs/nonEmptyString"},
+              "tolerance_profile": {"$ref": "#/$defs/nonEmptyString"}
+            }
+          }
+        },
+        "test_ids": {"$ref": "#/$defs/stringArray"},
+        "artifact_roles": {"$ref": "#/$defs/stringArray"},
+        "downstream_gate_ids": {"$ref": "#/$defs/stringArray"},
+        "minimal_repro_bundle": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["fixture_id", "command_id", "expected_gate_ids"],
+          "properties": {
+            "fixture_id": {"$ref": "#/$defs/nonEmptyString"},
+            "command_id": {"$ref": "#/$defs/nonEmptyString"},
+            "expected_gate_ids": {"$ref": "#/$defs/stringArray"}
+          }
+        },
+        "local_status": {"enum": ["PASS", "NOT_RUN"]},
+        "formal_status": {"enum": ["PASS", "BLOCKED", "NOT_RUN"]},
+        "evidence_refs": {"type": "array", "items": {"$ref": "#/$defs/nonEmptyString"}},
+        "notes": {"$ref": "#/$defs/nonEmptyString"}
+      }
+    }
+  }
+}

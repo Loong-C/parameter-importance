@@ -98,6 +98,13 @@ from ..runtime.task_runtime import (
     TaskRunner,
 )
 from ..runtime.tensor_bundle import load_tensor_bundle
+from ..stage1_contract import (
+    STAGE1_REQUIREMENT_IDS,
+    Stage1ContractError,
+    build_stage1_math_contract,
+    build_stage1_requirements_matrix,
+    validate_stage1_math_contract,
+)
 from ..stage1_fixtures import build_stage1_s13_evidence
 from ..g3_gate import (
     GATE_IDS as G3_GATE_IDS,
@@ -1645,14 +1652,16 @@ _STAGE1_ENTRY_SOURCE_REFS = (
     "policies/evidence-validity-and-rerun.md",
     "src/param_importance_nlp/evidence_reuse.py",
     "src/param_importance_nlp/experiments/stage01_task_runners.py",
+    "src/param_importance_nlp/stage1_contract.py",
     "src/param_importance_nlp/stage1_s1_1.py",
     "src/param_importance_nlp/contracts/task_catalog.py",
 )
 _STAGE1_ENTRY_SCHEMA_REFS = (
     "schemas/stage1/contract-v1.json",
+    "schemas/stage1/math-contract-v1.json",
     "schemas/shared/contract-freeze-v1.json",
     "schemas/stage1/entry-baseline-v1.json",
-    "schemas/stage1/requirements-matrix-v1.json",
+    "schemas/stage1/requirements-matrix-v2.json",
     "schemas/stage1/s1-1-formalization-index-v1.json",
 )
 _STAGE1_ENTRY_REQUIRED_STAGE0_GATES = (
@@ -2063,19 +2072,12 @@ def _stage1_contract_evidence(request: TaskExecutionRequest, root: Path) -> Mapp
         "checks": entry_checks,
         "failed_checks": entry_failed,
     }
-    contract_checks = {
-        "math_source_present": math_path.is_file(),
-        "plan_source_present": plan_path.is_file(),
-        "target_quantity_frozen": True,
-        "loss_reduction_frozen": True,
-        "estimator_formulas_frozen": True,
-        "clip_order_frozen": True,
-        "optimizer_boundary_frozen": True,
-        "movement_boundary_frozen": True,
-        "learning_rate_not_in_coordinate_hash": True,
-        "causal_lm_config_bound": scientific_config_bound,
-    }
-    contract_ok = all(contract_checks.values())
+    formula_contract = build_stage1_math_contract()
+    contract_validation_errors: list[str] = []
+    try:
+        validate_stage1_math_contract(formula_contract)
+    except Stage1ContractError as error:
+        contract_validation_errors.append(str(error))
     schema_hashes = {
         reference: sha256_file(contract_root / reference)
         for reference in _STAGE1_ENTRY_SCHEMA_REFS
@@ -2083,49 +2085,6 @@ def _stage1_contract_evidence(request: TaskExecutionRequest, root: Path) -> Mapp
     source_hashes = {
         reference: sha256_file(contract_root / reference)
         for reference in _STAGE1_ENTRY_SOURCE_REFS
-    }
-    freeze = ContractFreeze(
-        contract_id="stage1.contract.entry-v1",
-        stage=1,
-        scope=scope,
-        state=ContractState.FROZEN,
-        formula_version="stage1-entry-contract-v1",
-        config_hash=request.config.config_hash,
-        schema_hashes=schema_hashes,
-        source_hashes=source_hashes,
-        required_gate_ids=("stage1.G1-ENTRY", "stage1.G1-CONTRACT") if scope == "formal" else (),
-        frozen_at=checked_at,
-        decision_ref="plan/stage1/01_entry_and_contract.md",
-    )
-    formula_contract: dict[str, JSONValue] = {
-        "target_quantity": "local_gradient_space_contribution",
-        "target_sign": "positive_means_loss_decrease_contribution",
-        "raw": "eta * mean_gradient**2",
-        "double": "eta * mean_gradient_A * mean_gradient_B",
-        "equal_u": "eta * (S1**2-S2)/(M*(M-1))",
-        "learning_rate": "actual_consumed_parameter_group_lr",
-        "dynamic_learning_rate_in_coordinate_hash": False,
-        "clip_order": "global_mean_then_single_clip_factor_then_score",
-        "same_batch_clipped_u_claim": "plugin_no_strict_unbiasedness",
-        "loss_reduction": {
-            "task": "causal_lm",
-            "numerator": "sum(valid_target_token_loss)",
-            "denominator": "valid_target_token_count",
-            "reduction": "global_valid_target_token_mean",
-            "zero_valid": "reject_or_skip",
-            "local_microbatch": "independent_local_microbatch_backward",
-        },
-        "movement": {"main": "data_movement_only", "diagnostics": ["total_movement", "weight_decay"]},
-        "fields": ["signed", "positive", "negative_mass", "absolute"],
-        "lifecycle": [
-            "optimizer_before",
-            "consume_actual_lr",
-            "unscale_local_gradients",
-            "aggregate_global_sufficient_statistics",
-            "compute_score",
-            "apply_optimizer_step",
-            "decompose_movement",
-        ],
     }
     reuse_refs = tuple(
         str(value)
@@ -2142,6 +2101,104 @@ def _stage1_contract_evidence(request: TaskExecutionRequest, root: Path) -> Mapp
                 *reuse_refs,
             }
         )
+    )
+    requirement_sources = {
+        "entry.stage0_g10": "plan/stage1/01_entry_and_contract.md",
+        "entry.stage0_g10_reuse": "policies/evidence-validity-and-rerun.md",
+        "entry.repository_clean": "Agent/git.md",
+        "entry.agent_files": "Agent/sync.md",
+        "entry.data_root": "Agent/server.md",
+        "entry.cache_policy": "Agent/server.md",
+        "entry.write_paths": "Agent/sync.md",
+        "entry.scientific_config": "configs/run-ready/layers/formal-stage1-pythia14m.yaml",
+        "contract.target_quantity": "plan/stage1/01_entry_and_contract.md",
+        "contract.loss_reduction": "plan/stage1/01_entry_and_contract.md",
+        "contract.lifecycle": "plan/stage1/01_entry_and_contract.md",
+    }
+    for requirement_id in STAGE1_REQUIREMENT_IDS:
+        if not requirement_id.startswith("contract.field."):
+            continue
+        field_name = requirement_id.removeprefix("contract.field.")
+        requirement_sources[requirement_id] = (
+            "plan/stage1/06_training_integration_and_accumulators.md"
+            if field_name == "actual_update_raw_importance" or field_name.startswith("parameter_") or field_name.startswith("importance_")
+            else "docs/mathematics.md"
+        )
+    formula_contract_valid = not contract_validation_errors
+    requirement_checks = {
+        "entry.stage0_g10": formal_entry_checks["stage0_g10_pass"],
+        "entry.stage0_g10_reuse": (
+            formal_entry_checks["stage0_gate_set_complete"]
+            and formal_entry_checks["stage0_g10_reuse_valid"]
+        ),
+        "entry.repository_clean": formal_entry_checks["repository_clean"],
+        "entry.agent_files": agent_exact and agent_hashes_valid,
+        "entry.data_root": formal_entry_checks["data_root_ready"],
+        "entry.cache_policy": formal_entry_checks["cache_roots_bound"],
+        "entry.write_paths": formal_entry_checks["approved_write_paths"],
+        "entry.scientific_config": formal_entry_checks["scientific_config_bound"],
+        "contract.target_quantity": formula_contract_valid,
+        "contract.loss_reduction": formula_contract_valid,
+        "contract.lifecycle": formula_contract_valid,
+        **{
+            requirement_id: formula_contract_valid
+            for requirement_id in STAGE1_REQUIREMENT_IDS
+            if requirement_id.startswith("contract.field.")
+        },
+    }
+    local_checks = {
+        "entry.stage0_g10": False,
+        "entry.stage0_g10_reuse": False,
+        "entry.repository_clean": bool(repository["available"]),
+        "entry.agent_files": agent_exact and agent_hashes_valid,
+        "entry.data_root": False,
+        "entry.cache_policy": False,
+        "entry.write_paths": store.root.exists(),
+        "entry.scientific_config": scientific_config_bound,
+        "contract.target_quantity": formula_contract_valid,
+        "contract.loss_reduction": formula_contract_valid,
+        "contract.lifecycle": formula_contract_valid,
+        **{
+            requirement_id: formula_contract_valid
+            for requirement_id in STAGE1_REQUIREMENT_IDS
+            if requirement_id.startswith("contract.field.")
+        },
+    }
+    try:
+        matrix = build_stage1_requirements_matrix(
+            scope=scope,
+            requirement_checks=requirement_checks,
+            local_checks=local_checks,
+            source_refs=requirement_sources,
+            external_refs=external_refs,
+        )
+    except Stage1ContractError as error:
+        matrix = None
+        contract_validation_errors.append(str(error))
+    matrix_valid = matrix is not None
+    contract_checks = {
+        "math_source_present": math_path.is_file(),
+        "plan_source_present": plan_path.is_file(),
+        "math_contract_schema_bound": "schemas/stage1/math-contract-v1.json" in schema_hashes,
+        "math_contract_payload_valid": formula_contract_valid,
+        "requirements_matrix_schema_bound": "schemas/stage1/requirements-matrix-v2.json" in schema_hashes,
+        "requirements_matrix_payload_valid": matrix_valid,
+        "causal_lm_config_bound": scientific_config_bound,
+    }
+    contract_ok = all(contract_checks.values())
+    freeze = ContractFreeze(
+        contract_id="stage1.contract.entry-v2",
+        stage=1,
+        scope=scope,
+        state=ContractState.FROZEN if contract_ok else ContractState.BLOCKED,
+        formula_version=str(formula_contract["formula_version"]),
+        config_hash=request.config.config_hash,
+        schema_hashes=schema_hashes,
+        source_hashes=source_hashes,
+        required_gate_ids=("stage1.G1-ENTRY", "stage1.G1-CONTRACT") if scope == "formal" and contract_ok else (),
+        frozen_at=checked_at if contract_ok else None,
+        reason=None if contract_ok else "; ".join(contract_validation_errors) or "S1.1 contract checks are not PASS",
+        decision_ref="plan/stage1/01_entry_and_contract.md",
     )
     gate_refs = tuple(
         dict.fromkeys((*external_refs, *[f"source/{reference}" for reference in _STAGE1_ENTRY_SOURCE_REFS]))
@@ -2164,89 +2221,16 @@ def _stage1_contract_evidence(request: TaskExecutionRequest, root: Path) -> Mapp
                 stage=1,
                 status=GateStatus.PASS if contract_ok else GateStatus.BLOCKED,
                 checked_at=checked_at,
-                measured={"checks": contract_checks},
+                measured={"checks": contract_checks, "validation_errors": contract_validation_errors},
                 threshold={"required": "all contract checks PASS"},
                 evidence_refs=gate_refs if contract_ok else (),
-                reasons=() if contract_ok else ("contract checks are not PASS",),
+                reasons=() if contract_ok else tuple(contract_validation_errors) or ("contract checks are not PASS",),
             ).to_dict(),
         ]
     else:
         gate_records = []
-    requirement_sources = {
-        "entry.stage0_g10": "plan/stage1/01_entry_and_contract.md",
-        "entry.stage0_g10_reuse": "policies/evidence-validity-and-rerun.md",
-        "entry.repository_clean": "Agent/git.md",
-        "entry.agent_files": "Agent/sync.md",
-        "entry.data_root": "Agent/server.md",
-        "entry.cache_policy": "Agent/server.md",
-        "entry.write_paths": "Agent/sync.md",
-        "entry.scientific_config": "configs/run-ready/layers/formal-stage1-pythia14m.yaml",
-        "contract.target_quantity": "plan/stage1/01_entry_and_contract.md",
-        "contract.loss_reduction": "plan/stage1/01_entry_and_contract.md",
-        "contract.estimators": "docs/mathematics.md",
-        "contract.clip_order": "plan/stage1/01_entry_and_contract.md",
-        "contract.optimizer_boundary": "plan/stage1/01_entry_and_contract.md",
-        "contract.movement_boundary": "plan/stage1/01_entry_and_contract.md",
-    }
-    requirement_checks = {
-        "entry.stage0_g10": formal_entry_checks["stage0_g10_pass"],
-        "entry.stage0_g10_reuse": (
-            formal_entry_checks["stage0_gate_set_complete"]
-            and formal_entry_checks["stage0_g10_reuse_valid"]
-        ),
-        "entry.repository_clean": formal_entry_checks["repository_clean"],
-        "entry.agent_files": agent_exact and agent_hashes_valid,
-        "entry.data_root": formal_entry_checks["data_root_ready"],
-        "entry.cache_policy": formal_entry_checks["cache_roots_bound"],
-        "entry.write_paths": formal_entry_checks["approved_write_paths"],
-        "entry.scientific_config": formal_entry_checks["scientific_config_bound"],
-        "contract.target_quantity": contract_ok,
-        "contract.loss_reduction": contract_ok,
-        "contract.estimators": contract_ok,
-        "contract.clip_order": contract_ok,
-        "contract.optimizer_boundary": contract_ok,
-        "contract.movement_boundary": contract_ok,
-    }
-    local_checks = {
-        "entry.stage0_g10": False,
-        "entry.stage0_g10_reuse": False,
-        "entry.repository_clean": bool(repository["available"]),
-        "entry.agent_files": agent_exact and agent_hashes_valid,
-        "entry.data_root": False,
-        "entry.cache_policy": False,
-        "entry.write_paths": store.root.exists(),
-        "entry.scientific_config": scientific_config_bound,
-        "contract.target_quantity": contract_ok,
-        "contract.loss_reduction": contract_ok,
-        "contract.estimators": contract_ok,
-        "contract.clip_order": contract_ok,
-        "contract.optimizer_boundary": contract_ok,
-        "contract.movement_boundary": contract_ok,
-    }
-    requirements: list[JSONValue] = []
-    for requirement_id, passed in requirement_checks.items():
-        requirements.append(
-            {
-                "requirement_id": requirement_id,
-                "source_ref": requirement_sources[requirement_id],
-                "local_status": "PASS" if local_checks[requirement_id] else "NOT_RUN",
-                "formal_status": "PASS" if scope == "formal" and passed else "BLOCKED" if scope == "formal" else "NOT_RUN",
-                "evidence_refs": list(external_refs),
-                "notes": "local fixture never unlocks formal Gate",
-            }
-        )
-    matrix: dict[str, JSONValue] = {
-        "schema_version": "stage1-requirements-matrix-v1",
-        "task_id": request.task.task_id,
-        "scope": scope,
-        "requirements": requirements,
-        "summary": {
-            "total": len(requirements),
-            "local_pass": sum(1 for value in local_checks.values() if value),
-            "formal_pass": sum(1 for value in requirement_checks.values() if value),
-            "formal_blocked": sum(1 for value in requirement_checks.values() if not value),
-        },
-    }
+    if matrix is None:
+        raise Stage1ContractError("S1.1 requirements matrix did not pass validation")
     return {
         "evidence_type": "stage1_math_contract",
         "contract_hashes": {
@@ -2254,9 +2238,10 @@ def _stage1_contract_evidence(request: TaskExecutionRequest, root: Path) -> Mapp
             "plan/stage1/01_entry_and_contract.md": sha256_file(plan_path),
         },
         "frozen_formulas": {
-            "raw": "eta * mean_gradient**2",
-            "equal_u": "eta * (S1**2-S2)/(M*(M-1))",
-            "double": "eta * mean_gradient_A*mean_gradient_B",
+            "raw": formula_contract["estimators"]["raw"]["formula"],
+            "equal_u": formula_contract["estimators"]["equal_u"]["formula"],
+            "weighted_u": formula_contract["estimators"]["weighted_u"]["formula"],
+            "double": formula_contract["estimators"]["double_sample"]["formula"],
         },
         "dynamic_learning_rate_in_coordinate_hash": False,
         "same_batch_clipped_u_claim": "plugin_no_strict_unbiasedness",

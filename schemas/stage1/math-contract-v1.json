@@ -1,0 +1,105 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://parameter-importance.invalid/schemas/stage1/math-contract-v1.json",
+  "title": "Stage 1 S1.1 machine-readable mathematics contract",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version", "formula_version", "target", "sign_convention",
+    "loss_reduction", "estimators", "accumulators", "step_lifecycle",
+    "nonfinite_policy", "exclusions"
+  ],
+  "properties": {
+    "schema_version": {"const": "stage1-math-contract-v1"},
+    "formula_version": {"const": "stage1-entry-contract-v3"},
+    "target": {"$ref": "#/$defs/target"},
+    "sign_convention": {"const": "positive_means_loss_decrease_contribution"},
+    "loss_reduction": {"$ref": "#/$defs/lossReduction"},
+    "estimators": {"$ref": "#/$defs/estimators"},
+    "accumulators": {"$ref": "#/$defs/accumulators"},
+    "step_lifecycle": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {"type": "string", "minLength": 1}
+    },
+    "nonfinite_policy": {"type": "string", "minLength": 1},
+    "exclusions": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {"type": "string", "minLength": 1}
+    }
+  },
+  "$defs": {
+    "target": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "formula", "unit", "interpretation_boundary"],
+      "properties": {
+        "name": {"type": "string", "minLength": 1},
+        "formula": {"type": "string", "minLength": 1},
+        "unit": {"type": "string", "minLength": 1},
+        "interpretation_boundary": {"type": "string", "minLength": 1}
+      }
+    },
+    "lossReduction": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["task", "numerator", "denominator", "reduction", "zero_valid", "local_microbatch"],
+      "properties": {
+        "task": {"type": "string", "minLength": 1},
+        "numerator": {"type": "string", "minLength": 1},
+        "denominator": {"type": "string", "minLength": 1},
+        "reduction": {"type": "string", "minLength": 1},
+        "zero_valid": {"type": "string", "minLength": 1},
+        "local_microbatch": {"type": "string", "minLength": 1}
+      }
+    },
+    "fieldDefinition": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["field_name", "formula", "unit", "parameter_time", "gradient_time", "sample_time", "interpretation_boundary"],
+      "properties": {
+        "field_name": {"type": "string", "minLength": 1},
+        "formula": {"type": "string", "minLength": 1},
+        "unit": {"type": "string", "minLength": 1},
+        "parameter_time": {"type": "string", "minLength": 1},
+        "gradient_time": {"type": "string", "minLength": 1},
+        "sample_time": {"type": "string", "minLength": 1},
+        "interpretation_boundary": {"type": "string", "minLength": 1}
+      }
+    },
+    "estimators": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["raw", "raw_clipped", "double_sample", "equal_u", "weighted_u", "u_clipped", "actual_update_raw"],
+      "properties": {
+        "raw": {"$ref": "#/$defs/fieldDefinition"},
+        "raw_clipped": {"$ref": "#/$defs/fieldDefinition"},
+        "double_sample": {"$ref": "#/$defs/fieldDefinition"},
+        "equal_u": {"$ref": "#/$defs/fieldDefinition"},
+        "weighted_u": {"$ref": "#/$defs/fieldDefinition"},
+        "u_clipped": {"$ref": "#/$defs/fieldDefinition"},
+        "actual_update_raw": {"$ref": "#/$defs/fieldDefinition"}
+      }
+    },
+    "accumulators": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["signed", "positive", "negative_mass", "absolute", "movement_data", "net_movement_data", "movement_total", "net_movement_total", "movement_weight_decay", "net_movement_weight_decay", "magnitude"],
+      "properties": {
+        "signed": {"$ref": "#/$defs/fieldDefinition"},
+        "positive": {"$ref": "#/$defs/fieldDefinition"},
+        "negative_mass": {"$ref": "#/$defs/fieldDefinition"},
+        "absolute": {"$ref": "#/$defs/fieldDefinition"},
+        "movement_data": {"$ref": "#/$defs/fieldDefinition"},
+        "net_movement_data": {"$ref": "#/$defs/fieldDefinition"},
+        "movement_total": {"$ref": "#/$defs/fieldDefinition"},
+        "net_movement_total": {"$ref": "#/$defs/fieldDefinition"},
+        "movement_weight_decay": {"$ref": "#/$defs/fieldDefinition"},
+        "net_movement_weight_decay": {"$ref": "#/$defs/fieldDefinition"},
+        "magnitude": {"$ref": "#/$defs/fieldDefinition"}
+      }
+    }
+  }
+}

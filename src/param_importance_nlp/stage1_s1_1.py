@@ -45,6 +45,11 @@ from .stage0_g10 import (
     _load_canonical_from_outputs,
 )
 from .stage0_gate import Stage0GateReport
+from .stage1_contract import (
+    Stage1ContractError,
+    validate_stage1_math_contract,
+    validate_stage1_requirements_matrix,
+)
 
 
 TASK_ID = "stage1.01_entry_and_contract"
@@ -793,9 +798,16 @@ def validate_formal_stage1_s1_1_outputs(
     statuses = {gate.gate_id: gate for gate in gates}
     matrix = _mapping(core.get("requirements_matrix"), field="requirements_matrix")
     summary = _mapping(matrix.get("summary"), field="requirements_matrix.summary")
+    math_contract = _mapping(core.get("contract"), field="math_contract")
+    try:
+        validate_stage1_math_contract(math_contract)
+        validate_stage1_requirements_matrix(matrix)
+    except Stage1ContractError as error:
+        raise Stage1S11Error(f"S1_1_CONTRACT_OR_MATRIX_INVALID:{error}") from error
     if (
         not freeze.formal_eligible
         or freeze.stage != 1
+        or freeze.formula_version != "stage1-entry-contract-v3"
         or entry.get("formal_eligible") is not True
         or entry.get("failed_checks") != []
         or repository.get("head") != expected_git_commit
