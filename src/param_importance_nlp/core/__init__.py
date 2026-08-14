@@ -16,15 +16,19 @@ from .baselines import (
 )
 from .errors import CoreContractError, NumericalError, RegistryError, TensorMapError
 from .estimators import (
+    DoubleSampleProvenance,
     NO_UNBIASEDNESS_CLAIM,
     PLUGIN_SAME_BATCH_CLIP,
     UNBIASED_FIXED_STATE,
     EstimatorResult,
     cross_u_importance,
     double_sample_importance,
+    explicit_ordered_pair_u_reference,
+    explicit_unordered_pair_u_reference,
     equal_u_importance,
     global_clip_factor,
     raw_importance,
+    validate_double_sample_inputs,
     weighted_u_importance,
 )
 from .losses import (
@@ -115,6 +119,7 @@ __all__ = [
     "BUFFER_POLICY",
     "ConstantGradientFixture",
     "CoreContractError",
+    "DoubleSampleProvenance",
     "EqualSufficientStatistics",
     "EstimatorResult",
     "FP64Comparison",
@@ -162,6 +167,8 @@ __all__ = [
     "damage_auc",
     "default_quadrature_rules",
     "double_sample_importance",
+    "explicit_ordered_pair_u_reference",
+    "explicit_unordered_pair_u_reference",
     "effective_parameter_count",
     "empirical_fisher",
     "entropy",
@@ -204,5 +211,6 @@ __all__ = [
     "top_q_mass",
     "trapezoid_rule",
     "variance",
+    "validate_double_sample_inputs",
     "weighted_u_importance",
 ]

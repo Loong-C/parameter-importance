@@ -13,6 +13,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import math
+import re
 from types import MappingProxyType
 from typing import Mapping, Sequence
 
@@ -27,6 +28,7 @@ from .tensors import TensorMap
 UNBIASED_FIXED_STATE = "unbiased_fixed_state_under_declared_sampling_assumptions"
 PLUGIN_SAME_BATCH_CLIP = "plugin_same_batch_clip_no_strict_unbiasedness"
 NO_UNBIASEDNESS_CLAIM = "no_unbiasedness_claim"
+_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 
 _STRICT_FIXED_STATE_ESTIMATORS = {
     "local_gradient_space_importance_u",
@@ -34,6 +36,110 @@ _STRICT_FIXED_STATE_ESTIMATORS = {
     "double_sample_gradient_importance",
     "cross_u_gradient_importance",
 }
+
+
+@dataclass(frozen=True, slots=True)
+class DoubleSampleProvenance:
+    """已冻结的双采样来源合同。
+
+    数值 kernel 无法从两个梯度张量推断抽样独立性。调用层因此必须把两个
+    batch 对象和 sampler stream 的身份与 product-sampling 设计一起传入可审计
+    的记录。样本 ID 可以偶然相同；这里刻意不把它当作独立性的判据。
+    """
+
+    batch_object_a: str
+    batch_object_b: str
+    sampler_state_a: str
+    sampler_state_b: str
+    sampling_design: str
+    product_sampling: bool
+    sample_ids_may_overlap: bool = True
+    rng_stream_a: str = ""
+    rng_stream_b: str = ""
+    rng_seed_a: int = 0
+    rng_seed_b: int = 0
+    rng_state_digest_a: str = ""
+    rng_state_digest_b: str = ""
+
+    def __post_init__(self) -> None:
+        for field_name in (
+            "batch_object_a",
+            "batch_object_b",
+            "sampler_state_a",
+            "sampler_state_b",
+            "sampling_design",
+            "rng_stream_a",
+            "rng_stream_b",
+            "rng_state_digest_a",
+            "rng_state_digest_b",
+        ):
+            value = getattr(self, field_name)
+            if not isinstance(value, str) or not value:
+                raise CoreContractError(f"双采样 provenance {field_name} 必须是非空字符串")
+        if self.batch_object_a == self.batch_object_b:
+            raise CoreContractError("双采样 A/B 不得复用同一 batch 对象")
+        if self.sampler_state_a == self.sampler_state_b:
+            raise CoreContractError("双采样 A/B 不得共享 sampler state")
+        if self.rng_stream_a == self.rng_stream_b:
+            raise CoreContractError("双采样 A/B 不得共享 RNG stream")
+        if type(self.rng_seed_a) is not int or type(self.rng_seed_b) is not int or self.rng_seed_a < 0 or self.rng_seed_b < 0:
+            raise CoreContractError("双采样 RNG seed 必须是非负整数")
+        if _SHA256_RE.fullmatch(self.rng_state_digest_a) is None or _SHA256_RE.fullmatch(self.rng_state_digest_b) is None:
+            raise CoreContractError("double-sample RNG state digest must be a SHA-256 hex digest")
+        if self.rng_state_digest_a == self.rng_state_digest_b:
+            raise CoreContractError("双采样 A/B 不得共享 RNG state digest")
+        if self.sampling_design != "with_replacement_product_sampling":
+            raise CoreContractError("double-sample sampling_design must declare with-replacement product sampling")
+        if type(self.product_sampling) is not bool or self.product_sampling is not True:
+            raise CoreContractError("双采样必须显式声明 product_sampling=true")
+        if type(self.sample_ids_may_overlap) is not bool or self.sample_ids_may_overlap is not True:
+            raise CoreContractError("sample_ids_may_overlap must explicitly permit accidental overlap")
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "batch_object_a": self.batch_object_a,
+            "batch_object_b": self.batch_object_b,
+            "sampler_state_a": self.sampler_state_a,
+            "sampler_state_b": self.sampler_state_b,
+            "sampling_design": self.sampling_design,
+            "product_sampling": self.product_sampling,
+            "sample_ids_may_overlap": self.sample_ids_may_overlap,
+            "rng_stream_a": self.rng_stream_a,
+            "rng_stream_b": self.rng_stream_b,
+            "rng_seed_a": self.rng_seed_a,
+            "rng_seed_b": self.rng_seed_b,
+            "rng_state_digest_a": self.rng_state_digest_a,
+            "rng_state_digest_b": self.rng_state_digest_b,
+        }
+
+
+def _assert_floating_gradients(tensors: TensorMap, *, field: str) -> None:
+    tensors.assert_finite()
+    for name, value in tensors.items():
+        if value.dtype not in {torch.float32, torch.float64}:
+            raise CoreContractError(f"{field}[{name!r}] must use FP32 or FP64")
+
+
+def validate_double_sample_inputs(
+    mean_gradient_a: TensorMap,
+    mean_gradient_b: TensorMap,
+    *,
+    provenance: DoubleSampleProvenance | None = None,
+) -> None:
+    """验证双采样乘法因子与可选的独立来源合同。
+
+    ``TensorMap`` 的对象身份检查只拦截最危险的 ``double(g, g)`` 配置错误；
+    provenance 存在时进一步拒绝同一 batch/source sampler 的重用。相同样本 ID
+    在有放回 product sampling 下合法，故不在这里拒绝。
+    """
+
+    if mean_gradient_a is mean_gradient_b:
+        raise CoreContractError("双采样 A/B 不得传入同一个 mean-gradient 对象")
+    mean_gradient_a.assert_compatible(mean_gradient_b, require_dtype_device=True)
+    _assert_floating_gradients(mean_gradient_a, field="mean_gradient_a")
+    _assert_floating_gradients(mean_gradient_b, field="mean_gradient_b")
+    if provenance is not None and not isinstance(provenance, DoubleSampleProvenance):
+        raise CoreContractError("double-sample provenance 类型错误")
 
 
 def _square(tensors: TensorMap) -> TensorMap:
@@ -49,19 +155,23 @@ def raw_importance(mean_gradient: TensorMap) -> TensorMap:
     作为 U-statistic 的别名。
     """
 
-    mean_gradient.assert_finite()
+    _assert_floating_gradients(mean_gradient, field="mean_gradient")
     return _square(mean_gradient)
 
 
 def double_sample_importance(
     mean_gradient_a: TensorMap,
     mean_gradient_b: TensorMap,
+    *,
+    provenance: DoubleSampleProvenance | None = None,
 ) -> TensorMap:
     """返回两个独立样本均值梯度的逐坐标乘积。"""
 
-    mean_gradient_a.assert_compatible(mean_gradient_b)
-    mean_gradient_a.assert_finite()
-    mean_gradient_b.assert_finite()
+    validate_double_sample_inputs(
+        mean_gradient_a,
+        mean_gradient_b,
+        provenance=provenance,
+    )
     result = mean_gradient_a * mean_gradient_b
     result.assert_finite()
     return result
@@ -78,6 +188,49 @@ def equal_u_importance(statistics: EqualSufficientStatistics) -> TensorMap:
         raise CoreContractError("等权 U-statistic 至少需要两个统计单元")
     denominator = statistics.count * (statistics.count - 1)
     result = (statistics.s1 * statistics.s1 - statistics.s2) / denominator
+    result.assert_finite()
+    return result
+
+
+def explicit_ordered_pair_u_reference(samples: Sequence[TensorMap]) -> TensorMap:
+    """小 fixture 专用的 ordered-pair U 显式参考路径。
+
+    该函数故意不用 ``S1/S2`` 恒等式，避免流式生产路径与参考路径共享同一个
+    代数错误。它不应进入训练热路径。
+    """
+
+    if len(samples) < 2:
+        raise CoreContractError("ordered-pair U 至少需要两个统计单元")
+    reference = samples[0]
+    _assert_floating_gradients(reference, field="samples[0]")
+    for index, sample in enumerate(samples[1:], start=1):
+        reference.assert_compatible(sample, require_dtype_device=True)
+        _assert_floating_gradients(sample, field=f"samples[{index}]")
+    total = TensorMap.zeros_like(reference)
+    for left_index, left in enumerate(samples):
+        for right_index, right in enumerate(samples):
+            if left_index != right_index:
+                total = total + left * right
+    result = total / (len(samples) * (len(samples) - 1))
+    result.assert_finite()
+    return result
+
+
+def explicit_unordered_pair_u_reference(samples: Sequence[TensorMap]) -> TensorMap:
+    """小 fixture 专用的 unordered-pair U 显式参考路径（每项乘二）。"""
+
+    if len(samples) < 2:
+        raise CoreContractError("unordered-pair U 至少需要两个统计单元")
+    reference = samples[0]
+    _assert_floating_gradients(reference, field="samples[0]")
+    for index, sample in enumerate(samples[1:], start=1):
+        reference.assert_compatible(sample, require_dtype_device=True)
+        _assert_floating_gradients(sample, field=f"samples[{index}]")
+    total = TensorMap.zeros_like(reference)
+    for left_index in range(len(samples)):
+        for right_index in range(left_index + 1, len(samples)):
+            total = total + (samples[left_index] * samples[right_index]) * 2.0
+    result = total / (len(samples) * (len(samples) - 1))
     result.assert_finite()
     return result
 
@@ -208,7 +361,7 @@ class EstimatorResult:
     metadata: Mapping[str, object] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
-        self.core.assert_compatible(self.score)
+        self.core.assert_compatible(self.score, require_dtype_device=True)
         self.core.assert_finite()
         self.score.assert_finite()
         if not self.estimator_name:
@@ -279,6 +432,19 @@ class EstimatorResult:
             if not math.isfinite(lr) or lr < 0:
                 raise CoreContractError(f"学习率 {key!r} 必须为有限非负数")
             normalized_lr[str(key)] = lr
+        if core.registry is not None:
+            if any(record.group_id is None for record in core.registry.eligible_records):
+                raise CoreContractError("eligible 参数缺少 optimizer group ID")
+            expected_groups = {
+                record.group_id
+                for record in core.registry.eligible_records
+                if record.group_id is not None
+            }
+            if set(normalized_lr) != expected_groups:
+                raise CoreContractError(
+                    "实际学习率映射必须与 eligible 参数组精确一致: "
+                    f"expected={sorted(expected_groups)}, actual={sorted(normalized_lr)}"
+                )
         for name, value in core.items():
             lr = _learning_rate_for_name(core, name, normalized_lr)
             scaled[name] = value * lr * float(clip_factor)

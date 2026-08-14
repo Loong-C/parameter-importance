@@ -50,9 +50,15 @@ def _ensure_samples(samples: Sequence[TensorMap]) -> None:
     if not samples:
         raise CoreContractError("至少需要一个梯度统计单元")
     reference = samples[0]
+    for name, tensor in reference.items():
+        if not tensor.is_floating_point():
+            raise CoreContractError(f"gradient sample[0][{name!r}] 必须是浮点张量")
     reference.assert_finite()
     for sample in samples[1:]:
-        reference.assert_compatible(sample)
+        reference.assert_compatible(sample, require_dtype_device=True)
+        for name, tensor in sample.items():
+            if not tensor.is_floating_point():
+                raise CoreContractError(f"gradient sample[{name!r}] 必须是浮点张量")
         sample.assert_finite()
 
 
@@ -72,7 +78,7 @@ class EqualSufficientStatistics:
         if isinstance(self.count, bool) or not isinstance(self.count, int) or self.count <= 0:
             raise CoreContractError("EqualSufficientStatistics.count 必须为正")
         _validate_accumulation_dtype(self.accumulation_dtype)
-        self.s1.assert_compatible(self.s2)
+        self.s1.assert_compatible(self.s2, require_dtype_device=True)
         _validate_tensor_map_dtype(
             self.s1, expected=self.accumulation_dtype, field="s1"
         )
@@ -169,7 +175,7 @@ class WeightedSufficientStatistics:
             raise NumericalError("权重充分统计量 n1/n2 必须有限")
         if self.n1 <= 0 or self.n2 <= 0:
             raise CoreContractError("权重必须为正，因此 n1/n2 必须为正")
-        self.g1.assert_compatible(self.g2)
+        self.g1.assert_compatible(self.g2, require_dtype_device=True)
         _validate_tensor_map_dtype(
             self.g1, expected=self.accumulation_dtype, field="g1"
         )

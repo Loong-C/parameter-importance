@@ -1,0 +1,41 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://parameter-importance.invalid/schemas/stage1/s1-5-fixture-manifest-v1.json",
+  "title": "Stage 1 S1.5 repository-owned immutable estimator inputs",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "fixture_id", "coordinate_contract", "estimator_input_contract", "learning_rates", "clip_factor", "weights", "weighted_statistical_contract", "double_provenance", "double_sample_ids_a", "double_sample_ids_b", "microbatch_samples", "identical_gradient_samples", "permutation_orders", "double_samples_a", "double_samples_b", "negative_samples", "zero_samples", "manifest_hash"],
+  "properties": {
+    "schema_version": {"const": "stage1-s1-5-fixture-manifest-v1"},
+    "fixture_id": {"const": "stage1-s15-estimator-fixture-v1"},
+    "coordinate_contract": {"$ref": "#/$defs/coordinateContract"},
+    "estimator_input_contract": {"$ref": "#/$defs/inputContract"},
+    "learning_rates": {"$ref": "#/$defs/groupLrs"},
+    "clip_factor": {"const": 0.4},
+    "weights": {"const": [1.0, 3.0, 2.0, 4.0]},
+    "weighted_statistical_contract": {"$ref": "#/$defs/weightedContract"},
+    "double_provenance": {"$ref": "#/$defs/provenance"},
+    "double_sample_ids_a": {"const": ["overlap-0", "a-only-1"]},
+    "double_sample_ids_b": {"const": ["overlap-0", "b-only-1"]},
+    "microbatch_samples": {"type": "array", "minItems": 4, "maxItems": 4, "items": {"$ref": "#/$defs/wireMap"}},
+    "identical_gradient_samples": {"type": "array", "minItems": 3, "maxItems": 3, "items": {"$ref": "#/$defs/wireMap"}},
+    "permutation_orders": {"$ref": "#/$defs/permutationOrders"},
+    "double_samples_a": {"type": "array", "minItems": 2, "maxItems": 2, "items": {"$ref": "#/$defs/wireMap"}},
+    "double_samples_b": {"type": "array", "minItems": 2, "maxItems": 2, "items": {"$ref": "#/$defs/wireMap"}},
+    "negative_samples": {"type": "array", "minItems": 2, "maxItems": 2, "items": {"$ref": "#/$defs/wireMap"}},
+    "zero_samples": {"type": "array", "minItems": 2, "maxItems": 2, "items": {"$ref": "#/$defs/wireMap"}},
+    "manifest_hash": {"$ref": "#/$defs/digest"}
+  },
+  "$defs": {
+    "digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "groupLrs": {"type": "object", "additionalProperties": false, "required": ["group_0000", "group_0001"], "properties": {"group_0000": {"const": 0.25}, "group_0001": {"const": 0.05}}},
+    "groupMap": {"type": "object", "additionalProperties": false, "required": ["bias", "head", "weight"], "properties": {"bias": {"const": "group_0000"}, "head": {"const": "group_0001"}, "weight": {"const": "group_0000"}}},
+    "coordinateContract": {"type": "object", "additionalProperties": false, "required": ["identity", "coordinate_order", "coordinate_shapes", "coordinate_registry_hash", "parameter_to_group"], "properties": {"identity": {"const": "stage1-s15-fixture-coordinate-contract-v1"}, "coordinate_order": {"const": ["bias", "head", "weight"]}, "coordinate_shapes": {"type": "object", "additionalProperties": false, "required": ["bias", "head", "weight"], "properties": {"bias": {"const": [2]}, "head": {"const": [1]}, "weight": {"const": [3]}}}, "coordinate_registry_hash": {"const": "261d83bc71045cb1d8ed374c6442a01dd0c113ee2af2d5b69796214300564ca1"}, "parameter_to_group": {"$ref": "#/$defs/groupMap"}}},
+    "inputContract": {"type": "object", "additionalProperties": false, "required": ["gradient_semantics", "gradient_scale_restored", "device", "world_size", "rank", "reduction", "collective", "coordinate_registry_hash", "profile_dtypes"], "properties": {"gradient_semantics": {"type": "object", "additionalProperties": false, "required": ["raw_double_boundary", "u_statistical_input"], "properties": {"raw_double_boundary": {"const": "global_mean_gradient"}, "u_statistical_input": {"const": "local_microbatch_mean_gradient"}}}, "gradient_scale_restored": {"const": true}, "device": {"const": "cpu"}, "world_size": {"const": 1}, "rank": {"const": 0}, "reduction": {"const": "no_collective_local_mean"}, "collective": {"const": "none"}, "coordinate_registry_hash": {"const": "261d83bc71045cb1d8ed374c6442a01dd0c113ee2af2d5b69796214300564ca1"}, "profile_dtypes": {"type": "object", "additionalProperties": false, "required": ["T64_ORACLE", "T32_SINGLE"], "properties": {"T64_ORACLE": {"const": "torch.float64"}, "T32_SINGLE": {"const": "torch.float32"}}}}},
+    "weightedContract": {"type": "object", "additionalProperties": false, "required": ["statistical_unit", "weight_unit", "sampling_design", "weights_exogenous", "common_mean_assumption"], "properties": {"statistical_unit": {"const": "microbatch"}, "weight_unit": {"const": "effective_target_tokens"}, "sampling_design": {"const": "with_replacement_product_sampling"}, "weights_exogenous": {"const": true}, "common_mean_assumption": {"const": true}}},
+    "permutationOrders": {"type": "object", "additionalProperties": false, "required": ["reverse", "rotate"], "properties": {"reverse": {"const": [3, 2, 1, 0]}, "rotate": {"const": [1, 2, 3, 0]}}},
+    "provenance": {"type": "object", "additionalProperties": false, "required": ["batch_object_a", "batch_object_b", "sampler_state_a", "sampler_state_b", "sampling_design", "product_sampling", "sample_ids_may_overlap", "rng_stream_a", "rng_stream_b", "rng_seed_a", "rng_seed_b", "rng_state_digest_a", "rng_state_digest_b"], "properties": {"batch_object_a": {"const": "s15-double-batch-a"}, "batch_object_b": {"const": "s15-double-batch-b"}, "sampler_state_a": {"const": "s15-sampler-stream-a"}, "sampler_state_b": {"const": "s15-sampler-stream-b"}, "sampling_design": {"const": "with_replacement_product_sampling"}, "product_sampling": {"const": true}, "sample_ids_may_overlap": {"const": true}, "rng_stream_a": {"const": "s15-rng-stream-a"}, "rng_stream_b": {"const": "s15-rng-stream-b"}, "rng_seed_a": {"const": 1729}, "rng_seed_b": {"const": 9173}, "rng_state_digest_a": {"$ref": "#/$defs/digest"}, "rng_state_digest_b": {"$ref": "#/$defs/digest"}}},
+    "wireCoordinate": {"type": "object", "additionalProperties": false, "required": ["dtype", "shape", "values"], "properties": {"dtype": {"const": "torch.float64"}, "shape": {"type": "array", "minItems": 1, "items": {"type": "integer", "minimum": 1}}, "values": {"type": "array", "minItems": 1, "items": {"type": "number"}}}},
+    "wireMap": {"type": "object", "additionalProperties": false, "required": ["bias", "head", "weight"], "properties": {"bias": {"allOf": [{"$ref": "#/$defs/wireCoordinate"}, {"type": "object", "properties": {"shape": {"const": [2]}}}]}, "head": {"allOf": [{"$ref": "#/$defs/wireCoordinate"}, {"type": "object", "properties": {"shape": {"const": [1]}}}]}, "weight": {"allOf": [{"$ref": "#/$defs/wireCoordinate"}, {"type": "object", "properties": {"shape": {"const": [3]}}}]}}}
+  }
+}

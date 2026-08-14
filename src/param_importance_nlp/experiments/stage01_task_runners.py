@@ -53,23 +53,9 @@ from ..contracts.runtime_evidence import RuntimeCapabilityEvidence
 from ..contracts.seed import SeedPlan
 from ..contracts.status import ContractState, GateRecord, GateStatus
 from ..contracts.task_catalog import RunnerKind
-from ..core.estimators import (
-    double_sample_importance,
-    equal_u_importance,
-    raw_importance,
-)
 from ..core.losses import causal_lm_loss, sequence_classification_loss
-from ..core.oracles import (
-    compare_tensor_maps_fp64,
-    fp64_double_sample_oracle,
-    fp64_equal_u_oracle,
-    fp64_mean_gradient_oracle,
-    fp64_raw_oracle,
-)
 from ..core.registry import ParameterRegistry
 from ..core.state import ImportanceState
-from ..core.sufficient_statistics import EqualSufficientStatistics
-from ..core.tensors import TensorMap
 from ..evidence_reuse import (
     EvidenceReuseError,
     validate_evidence_reuse_attestation,
@@ -106,6 +92,7 @@ from ..stage1_contract import (
     validate_stage1_math_contract,
 )
 from ..stage1_fixtures import build_stage1_s13_evidence
+from ..stage1_estimators import build_stage1_s15_evidence
 from ..stage1_gradient_scale import build_stage1_s14_evidence
 from ..g3_gate import (
     GATE_IDS as G3_GATE_IDS,
@@ -1275,22 +1262,6 @@ def _run_formal_g3_task(
     )
 
 
-def _tensor_values(value: TensorMap) -> dict[str, JSONValue]:
-    return {
-        name: tensor.detach().to(device="cpu", dtype=torch.float64).reshape(-1).tolist()
-        for name, tensor in value.items()
-    }
-
-
-def _gradient_samples() -> list[TensorMap]:
-    return [
-        TensorMap({"weight": torch.tensor([1.0, -1.0], dtype=torch.float64)}),
-        TensorMap({"weight": torch.tensor([3.0, 1.0], dtype=torch.float64)}),
-        TensorMap({"weight": torch.tensor([2.0, 0.0], dtype=torch.float64)}),
-        TensorMap({"weight": torch.tensor([4.0, 2.0], dtype=torch.float64)}),
-    ]
-
-
 def _baseline_evidence(root: Path) -> Mapping[str, JSONValue]:
     source_root = root
     if not (source_root / "Agent").is_dir() or not (source_root / "plan").is_dir():
@@ -2374,34 +2345,17 @@ def _loss_scale_evidence(root: Path) -> Mapping[str, JSONValue]:
 
 
 def _estimator_evidence() -> Mapping[str, JSONValue]:
-    samples = _gradient_samples()
-    statistics = EqualSufficientStatistics.from_samples(samples, accumulation_dtype=torch.float64)
-    mean_a = fp64_mean_gradient_oracle(samples[:2])
-    mean_b = fp64_mean_gradient_oracle(samples[2:])
-    raw = raw_importance(statistics.mean_gradient)
-    double = double_sample_importance(mean_a, mean_b)
-    u = equal_u_importance(statistics)
-    comparisons = {
-        "raw": compare_tensor_maps_fp64(
-            raw, fp64_raw_oracle(statistics.mean_gradient), natural_scale=4.0
-        ).to_dict(),
-        "double": compare_tensor_maps_fp64(
-            double, fp64_double_sample_oracle(mean_a, mean_b), natural_scale=4.0
-        ).to_dict(),
-        "u": compare_tensor_maps_fp64(
-            u, fp64_equal_u_oracle(samples), natural_scale=4.0
-        ).to_dict(),
-    }
-    return {
-        "evidence_type": "importance_estimators",
-        "raw": _tensor_values(raw),
-        "double": _tensor_values(double),
-        "u": _tensor_values(u),
-        "comparisons": comparisons,
-        "u_can_be_negative": any(value < 0 for values in _tensor_values(u).values() for value in values),
-        "unclipped_u_claim": "unbiased_fixed_state_under_declared_sampling_assumptions",
-        "same_batch_clipped_u_claim": "plugin_same_batch_clip_no_strict_unbiasedness",
-    }
+    """Use the G1-EST evidence builder; local runners cannot claim formal PASS."""
+
+    repository_root = Path(__file__).resolve().parents[3]
+    producer_commit = _stage1_git_command(repository_root, "rev-parse", "HEAD")
+    if producer_commit is None:
+        raise RuntimeError("S1_5_RUNNER_GIT_HEAD_UNAVAILABLE")
+    return build_stage1_s15_evidence(
+        repository_root,
+        producer_commit=producer_commit,
+        scope="local_fixture",
+    )
 
 
 def _numeric_boundary_evidence() -> Mapping[str, JSONValue]:

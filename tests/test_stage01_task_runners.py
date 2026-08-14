@@ -17,6 +17,7 @@ from param_importance_nlp.experiments.stage01_task_runners import (
     build_stage01_runner_overrides,
 )
 from param_importance_nlp.runtime import TaskArtifactStore, TaskRuntime
+from param_importance_nlp.stage1_estimators import replay_stage1_s15_evidence
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -147,7 +148,7 @@ def test_checkpoint_runner_executes_two_phase_resume_and_restores_from_task_comm
     assert core["active_after_retention"] == ["state-0002"]
 
 
-def test_estimator_runner_uses_production_kernels_and_independent_fp64_oracles(
+def test_estimator_runner_publishes_the_replayable_local_g1_est_role_set(
     tmp_path: Path,
 ) -> None:
     task_id = "stage1.05_estimators"
@@ -158,9 +159,18 @@ def test_estimator_runner_uses_production_kernels_and_independent_fp64_oracles(
 
     payload = _load_payload(tmp_path, output, result.artifact_refs["estimator_validation_report"])
     core = payload["core_evidence"]
-    assert core["evidence_type"] == "importance_estimators"
-    assert all(item["passed"] for item in core["comparisons"].values())
-    assert core["same_batch_clipped_u_claim"] == "plugin_same_batch_clip_no_strict_unbiasedness"
+    assert set(core) == {
+        "estimator_report", "oracle_report", "tensor_bundle", "comparison_table", "gate_record"
+    }
+    report = core["estimator_report"]
+    bundle = core["tensor_bundle"]
+    gate = core["gate_record"]
+    assert report["gate_status"] == "NOT_RUN"
+    assert gate["status"] == "NOT_RUN"
+    assert report["fixture_manifest_hash"] == bundle["fixture_manifest_hash"]
+    assert report["estimator_input_contract"] == bundle["estimator_input_contract"]
+    assert report["estimator_input_contract"]["gradient_scale_restored"] is True
+    assert replay_stage1_s15_evidence(core, source_root=ROOT)["status"] == "PASS"
 
 
 def test_replay_core_hash_is_identical_in_two_empty_output_directories(tmp_path: Path) -> None:
