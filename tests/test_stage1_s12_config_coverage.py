@@ -8,7 +8,6 @@ import json
 from pathlib import Path
 from typing import Any
 
-import jsonschema
 import pytest
 
 from param_importance_nlp.contracts import (
@@ -149,9 +148,81 @@ def _v1_schema_public_leaf_paths() -> set[str]:
     return leaves
 
 
-def _schema_validator(path: Path) -> jsonschema.Draft202012Validator:
-    return jsonschema.Draft202012Validator(
-        json.loads(path.read_text(encoding="utf-8"))
+def _resolve_schema_reference(root: dict[str, Any], node: dict[str, Any]) -> dict[str, Any]:
+    """Resolve the local schema references used by the exact hash-map contract."""
+
+    reference = node.get("$ref")
+    assert isinstance(reference, str) and reference.startswith("#/")
+    target: Any = root
+    for part in reference.removeprefix("#/").split("/"):
+        target = target[part]
+    assert isinstance(target, dict)
+    return target
+
+
+def _exact_digest_map_keys(root: dict[str, Any], node: dict[str, Any]) -> set[str]:
+    """Read an ``additionalProperties: false`` digest-map contract from schema."""
+
+    definition = _resolve_schema_reference(root, node)
+    required = definition.get("required")
+    properties = definition.get("properties")
+    assert definition.get("type") == "object"
+    assert definition.get("additionalProperties") is False
+    assert isinstance(required, list) and isinstance(properties, dict)
+    expected = set(required)
+    assert set(properties) == expected
+    for key in expected:
+        assert properties[key] == {"$ref": "#/$defs/digest"}
+    return expected
+
+
+def _validate_exact_digest_map(value: Any, expected_keys: set[str]) -> None:
+    """Fail-closed structural validator used because jsonschema is not locked."""
+
+    if not isinstance(value, dict) or set(value) != expected_keys:
+        raise ValueError("shared_schema_hashes keys do not match the schema contract")
+    for key in expected_keys:
+        digest = value[key]
+        if (
+            not isinstance(digest, str)
+            or len(digest) != 64
+            or any(character not in "0123456789abcdef" for character in digest)
+        ):
+            raise ValueError(f"shared_schema_hashes.{key} is not a SHA-256")
+
+
+def _config_contract_shared_hash_key_sets(
+    schema_path: Path,
+    *,
+    coverage_container: tuple[str, ...],
+) -> tuple[set[str], set[str]]:
+    """Return exact v1/v2 shared-map keys declared in coverage/report schemas."""
+
+    root = json.loads(schema_path.read_text(encoding="utf-8"))
+    container: dict[str, Any] = root
+    for property_name in coverage_container:
+        properties = container.get("properties")
+        assert isinstance(properties, dict)
+        child = properties[property_name]
+        assert isinstance(child, dict)
+        container = child
+    properties = container.get("properties")
+    assert isinstance(properties, dict)
+    v1_contract = _resolve_schema_reference(root, properties["resolved-config-v1"])
+    v2_contract = _resolve_schema_reference(root, properties["resolved-config-v2"])
+    return (
+        _exact_digest_map_keys(root, v1_contract["properties"]["shared_schema_hashes"]),
+        _exact_digest_map_keys(root, v2_contract["properties"]["shared_schema_hashes"]),
+    )
+
+
+def _index_shared_hash_key_sets(schema_path: Path) -> tuple[set[str], set[str]]:
+    root = json.loads(schema_path.read_text(encoding="utf-8"))
+    properties = root["properties"]["config_shared_schema_hashes"]["properties"]
+    assert isinstance(properties, dict)
+    return (
+        _exact_digest_map_keys(root, properties["resolved-config-v1"]),
+        _exact_digest_map_keys(root, properties["resolved-config-v2"]),
     )
 
 
@@ -831,59 +902,116 @@ def test_config_field_coverage_schema_declares_v1_v2_hash_bound_contract() -> No
 
 
 def test_shared_schema_hash_maps_are_exact_in_all_s12_json_schemas() -> None:
-    """JSON Schema itself rejects missing or invented shared-schema families."""
+    """Locked-test structural checks enforce the three schema map contracts."""
 
-    coverage_validator = _schema_validator(COVERAGE_SCHEMA)
+    expected_v1 = {"resolved-config-v1"}
+    expected_v2 = {"resolved-config-v1", "resolved-config-v2"}
+    coverage_key_sets = _config_contract_shared_hash_key_sets(
+        COVERAGE_SCHEMA,
+        coverage_container=("config_contracts",),
+    )
+    assert coverage_key_sets == (expected_v1, expected_v2)
     coverage = _coverage()
-    coverage_validator.validate(coverage)
+    _validate_exact_digest_map(
+        coverage["config_contracts"]["resolved-config-v1"]["shared_schema_hashes"],
+        coverage_key_sets[0],
+    )
+    _validate_exact_digest_map(
+        coverage["config_contracts"]["resolved-config-v2"]["shared_schema_hashes"],
+        coverage_key_sets[1],
+    )
     coverage_unknown = deepcopy(coverage)
     coverage_unknown["config_contracts"]["resolved-config-v1"][
         "shared_schema_hashes"
     ]["unexpected-schema"] = "0" * 64
-    with pytest.raises(jsonschema.ValidationError):
-        coverage_validator.validate(coverage_unknown)
+    with pytest.raises(ValueError, match="keys"):
+        _validate_exact_digest_map(
+            coverage_unknown["config_contracts"]["resolved-config-v1"][
+                "shared_schema_hashes"
+            ],
+            coverage_key_sets[0],
+        )
     coverage_missing = deepcopy(coverage)
     coverage_missing["config_contracts"]["resolved-config-v2"][
         "shared_schema_hashes"
     ].pop("resolved-config-v2")
-    with pytest.raises(jsonschema.ValidationError):
-        coverage_validator.validate(coverage_missing)
+    with pytest.raises(ValueError, match="keys"):
+        _validate_exact_digest_map(
+            coverage_missing["config_contracts"]["resolved-config-v2"][
+                "shared_schema_hashes"
+            ],
+            coverage_key_sets[1],
+        )
 
-    report_validator = _schema_validator(
-        ROOT / "schemas" / "stage1" / "g1-registry-report-v2.json"
+    report_key_sets = _config_contract_shared_hash_key_sets(
+        ROOT / "schemas" / "stage1" / "g1-registry-report-v2.json",
+        coverage_container=("config_field_behavior_coverage", "config_contracts"),
     )
+    assert report_key_sets == (expected_v1, expected_v2)
     report = _report_schema_example()
-    report_validator.validate(report)
+    report_contracts = report["config_field_behavior_coverage"]["config_contracts"]
+    _validate_exact_digest_map(
+        report_contracts["resolved-config-v1"]["shared_schema_hashes"],
+        report_key_sets[0],
+    )
+    _validate_exact_digest_map(
+        report_contracts["resolved-config-v2"]["shared_schema_hashes"],
+        report_key_sets[1],
+    )
     report_unknown = deepcopy(report)
     report_unknown["config_field_behavior_coverage"]["config_contracts"][
         "resolved-config-v1"
     ]["shared_schema_hashes"]["unexpected-schema"] = "0" * 64
-    with pytest.raises(jsonschema.ValidationError):
-        report_validator.validate(report_unknown)
+    with pytest.raises(ValueError, match="keys"):
+        _validate_exact_digest_map(
+            report_unknown["config_field_behavior_coverage"]["config_contracts"][
+                "resolved-config-v1"
+            ]["shared_schema_hashes"],
+            report_key_sets[0],
+        )
     report_missing = deepcopy(report)
     report_missing["config_field_behavior_coverage"]["config_contracts"][
         "resolved-config-v2"
     ]["shared_schema_hashes"].pop("resolved-config-v2")
-    with pytest.raises(jsonschema.ValidationError):
-        report_validator.validate(report_missing)
+    with pytest.raises(ValueError, match="keys"):
+        _validate_exact_digest_map(
+            report_missing["config_field_behavior_coverage"]["config_contracts"][
+                "resolved-config-v2"
+            ]["shared_schema_hashes"],
+            report_key_sets[1],
+        )
 
-    index_validator = _schema_validator(
+    index_key_sets = _index_shared_hash_key_sets(
         ROOT / "schemas" / "stage1" / "s1-2-formalization-index-v2.json"
     )
+    assert index_key_sets == (expected_v1, expected_v2)
     index = _index_schema_example()
-    index_validator.validate(index)
+    _validate_exact_digest_map(
+        index["config_shared_schema_hashes"]["resolved-config-v1"],
+        index_key_sets[0],
+    )
+    _validate_exact_digest_map(
+        index["config_shared_schema_hashes"]["resolved-config-v2"],
+        index_key_sets[1],
+    )
     index_unknown = deepcopy(index)
     index_unknown["config_shared_schema_hashes"]["resolved-config-v1"][
         "unexpected-schema"
     ] = "0" * 64
-    with pytest.raises(jsonschema.ValidationError):
-        index_validator.validate(index_unknown)
+    with pytest.raises(ValueError, match="keys"):
+        _validate_exact_digest_map(
+            index_unknown["config_shared_schema_hashes"]["resolved-config-v1"],
+            index_key_sets[0],
+        )
     index_missing = deepcopy(index)
     index_missing["config_shared_schema_hashes"]["resolved-config-v2"].pop(
         "resolved-config-v2"
     )
-    with pytest.raises(jsonschema.ValidationError):
-        index_validator.validate(index_missing)
+    with pytest.raises(ValueError, match="keys"):
+        _validate_exact_digest_map(
+            index_missing["config_shared_schema_hashes"]["resolved-config-v2"],
+            index_key_sets[1],
+        )
 
 
 def test_public_field_registries_exactly_match_shared_schema_leaves() -> None:
