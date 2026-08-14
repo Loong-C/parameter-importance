@@ -299,11 +299,20 @@ def test_s17_fixture_parser_binds_identity_and_provenance_after_rehash() -> None
     module = _formalizer_module()
     provenance = {
         role: {
+            "schema_version": "qualified-g3-runtime-provenance-v1",
             "logical_asset_id": frozen["logical_name"], "asset_id": frozen["asset_id"],
+            "manifest_ref": f"manifests/{role}.json",
             "ready_manifest_sha256": frozen["ready_manifest_sha256"],
+            "asset_root_ref": f"assets/{role}",
+            "qualification_ref": f"qualifications/{role}.json",
+            "qualification_artifact_hash": "b" * 64,
+            "acquisition_ref": f"acquisition/{role}.json", "acquisition_sha256": "c" * 64,
+            "verification_ref": f"verification/{role}.json", "verification_sha256": "d" * 64,
             "g3_resolution_ref": module.EXPECTED_G3_RESOLUTION,
             "g3_resolution_artifact_hash": module.EXPECTED_G3_PAYLOAD_HASH,
             "source_git_commit": module.HISTORICAL_G3_PRODUCER,
+            "storage_kind": "pythia_mmap_shards" if role == "pile" else None,
+            "directory_content_sha256": None,
         }
         for role, frozen in module.EXPECTED_RUNTIME_ASSETS.items()
     }
@@ -317,6 +326,25 @@ def test_s17_fixture_parser_binds_identity_and_provenance_after_rehash() -> None
     }
     fixture["fixture_hash"] = module._canonical(fixture)
     assert module._validate_fixture_manifest(fixture)["fixture_id"] == module.FIXTURE_ID
+    module._validate_role_schemas(Path(__file__).resolve().parents[1], {"fixture_manifest": fixture})
+    fixture["assets"]["model"]["storage_kind"] = "pythia_mmap_shards"
+    fixture["fixture_hash"] = module._canonical({key: value for key, value in fixture.items() if key != "fixture_hash"})
+    with pytest.raises(module.Stage1S17FormalError, match="S17_FIXTURE_PROVENANCE_IDENTITY_INVALID:model"):
+        module._validate_fixture_manifest(fixture)
+    with pytest.raises(module.Stage1S17FormalError, match="S17_SCHEMA_VALIDATION_FAILED:fixture_manifest"):
+        module._validate_role_schemas(Path(__file__).resolve().parents[1], {"fixture_manifest": fixture})
+    fixture["assets"]["model"]["storage_kind"] = None
+    for role, invalid_kind, restored_kind in (
+        ("pile", None, "pythia_mmap_shards"),
+        ("model", "unknown_storage", None),
+    ):
+        fixture["assets"][role]["storage_kind"] = invalid_kind
+        fixture["fixture_hash"] = module._canonical({key: value for key, value in fixture.items() if key != "fixture_hash"})
+        with pytest.raises(module.Stage1S17FormalError, match=f"S17_FIXTURE_PROVENANCE_IDENTITY_INVALID:{role}"):
+            module._validate_fixture_manifest(fixture)
+        with pytest.raises(module.Stage1S17FormalError, match="S17_SCHEMA_VALIDATION_FAILED:fixture_manifest"):
+            module._validate_role_schemas(Path(__file__).resolve().parents[1], {"fixture_manifest": fixture})
+        fixture["assets"][role]["storage_kind"] = restored_kind
     fixture["assets"]["model"]["ready_manifest_sha256"] = "0" * 64
     fixture["fixture_hash"] = module._canonical({key: value for key, value in fixture.items() if key != "fixture_hash"})
     with pytest.raises(module.Stage1S17FormalError, match="S17_FIXTURE_PROVENANCE_IDENTITY_INVALID:model"):
@@ -331,6 +359,10 @@ def test_s17_schemas_are_strict_and_bind_fixture_identity_and_next_tasks() -> No
     assert fixture["definitions"]["model_identity"]["properties"]["asset_id"]["const"].startswith("11dd681a")
     assert fixture["definitions"]["model_identity"]["properties"]["config_vocab_size"]["const"] == 50_304
     assert fixture["definitions"]["provenance"]["properties"]["directory_content_sha256"]["type"] == ["string", "null"]
+    assert fixture["properties"]["assets"]["properties"]["model"]["$ref"].endswith("/local_provenance")
+    assert fixture["properties"]["assets"]["properties"]["pile"]["$ref"].endswith("/pile_provenance")
+    assert fixture["definitions"]["local_provenance"]["allOf"][1]["properties"]["storage_kind"]["const"] is None
+    assert fixture["definitions"]["pile_provenance"]["allOf"][1]["properties"]["storage_kind"]["const"] == "pythia_mmap_shards"
     assert "observer" not in report["definitions"]
     report_model = report["definitions"]["assets"]["properties"]["model"]
     assert "config_vocab_size" in report_model["required"]

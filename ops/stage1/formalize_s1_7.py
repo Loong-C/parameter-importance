@@ -428,6 +428,11 @@ def _validate_fixture_manifest(value: object) -> dict[str, Any]:
     provenances = _mapping(fixture.get("assets"), field="fixture.assets")
     if set(provenances) != set(EXPECTED_RUNTIME_ASSETS):
         raise Stage1S17FormalError("S17_FIXTURE_PROVENANCE_ROLE_SET_INVALID")
+    expected_storage_kind = {
+        "model": None,
+        "tokenizer": None,
+        "pile": "pythia_mmap_shards",
+    }
     for role, frozen in EXPECTED_RUNTIME_ASSETS.items():
         provenance = _mapping(provenances.get(role), field=f"fixture.assets.{role}")
         if (
@@ -437,6 +442,7 @@ def _validate_fixture_manifest(value: object) -> dict[str, Any]:
             or provenance.get("g3_resolution_ref") != EXPECTED_G3_RESOLUTION
             or provenance.get("g3_resolution_artifact_hash") != EXPECTED_G3_PAYLOAD_HASH
             or provenance.get("source_git_commit") != HISTORICAL_G3_PRODUCER
+            or provenance.get("storage_kind") != expected_storage_kind[role]
         ):
             raise Stage1S17FormalError(f"S17_FIXTURE_PROVENANCE_IDENTITY_INVALID:{role}")
     if _mapping(fixture.get("batching"), field="fixture.batching") != {"global_batch_size": 4, "microbatch_size": 1, "accumulation_steps": 4, "world_size": 1}:
