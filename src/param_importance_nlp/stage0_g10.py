@@ -155,6 +155,8 @@ class Stage0G10FormalState:
     readiness_ref: str
     readiness_artifact_hash: str
     g9_index_ref: str
+    generator_git_commit: str
+    legacy_index: bool
 
 
 def _now() -> str:
@@ -1723,7 +1725,7 @@ def load_stage0_g10_formal_state(
     *,
     data_root: str | Path,
     index_ref: str,
-    expected_git_commit: str,
+    expected_git_commit: str | None = None,
 ) -> Stage0G10FormalState:
     root = Path(data_root).resolve(strict=True)
     index_path = _logical_path(root, index_ref, field="index_ref")
@@ -1732,7 +1734,7 @@ def load_stage0_g10_formal_state(
         schema="stage0-g10-formalization-index-v1",
         field="g10_index",
     )
-    expected_fields = {
+    current_fields = {
         "schema_version", "generator_git_commit", "checked_at", "g9_index_ref",
         "g9_index_sha256", "g9_gate_artifact_hash", "g9_generator_git_commit",
         "reuse_attestation_ref", "reuse_attestation_sha256", "sync_observation_ref",
@@ -1742,16 +1744,39 @@ def load_stage0_g10_formal_state(
         "readiness_artifact_hash", "environment_ref", "environment_hash",
         "next_task_id", "next_input_refs", "artifact_hash",
     }
-    if set(raw) != expected_fields or raw.get("generator_git_commit") != expected_git_commit:
+    legacy_fields = current_fields - {
+        "g9_generator_git_commit",
+        "reuse_attestation_ref",
+        "reuse_attestation_sha256",
+    }
+    actual_fields = frozenset(raw)
+    legacy_index = actual_fields == frozenset(legacy_fields)
+    generator_git_commit = raw.get("generator_git_commit")
+    if (
+        actual_fields not in {frozenset(current_fields), frozenset(legacy_fields)}
+        or not isinstance(generator_git_commit, str)
+        or _GIT_COMMIT_RE.fullmatch(generator_git_commit) is None
+        or (
+            expected_git_commit is not None
+            and generator_git_commit != expected_git_commit
+        )
+    ):
         raise Stage0G10Error("G10_STATE_INDEX_FIELDS_OR_SOURCE_INVALID")
+    # G10 v1 在证据沿用政策落地前没有显式记录这三个字段。该历史格式只允许
+    # 表达同提交 G9 -> G10；不能借兼容分支补造跨提交沿用关系。
+    g9_generator_git_commit = (
+        generator_git_commit
+        if legacy_index
+        else str(raw["g9_generator_git_commit"])
+    )
     g9 = load_stage0_g9_formal_state(
         data_root=root,
         index_ref=str(raw["g9_index_ref"]),
-        expected_git_commit=str(raw["g9_generator_git_commit"]),
+        expected_git_commit=g9_generator_git_commit,
     )
-    reuse_ref = raw.get("reuse_attestation_ref")
-    reuse_sha256 = raw.get("reuse_attestation_sha256")
-    if g9.generator_git_commit == expected_git_commit:
+    reuse_ref = None if legacy_index else raw.get("reuse_attestation_ref")
+    reuse_sha256 = None if legacy_index else raw.get("reuse_attestation_sha256")
+    if g9.generator_git_commit == generator_git_commit:
         if reuse_ref is not None or reuse_sha256 is not None:
             raise Stage0G10Error("G10_STATE_REUSE_ATTESTATION_UNNECESSARY")
     else:
@@ -1761,7 +1786,7 @@ def load_stage0_g10_formal_state(
         if sha256_file(reuse_path) != reuse_sha256:
             raise Stage0G10Error("G10_STATE_REUSE_ATTESTATION_SHA_DRIFT")
         source = _capture_source()
-        if source.git_commit != expected_git_commit:
+        if source.git_commit != generator_git_commit:
             raise Stage0G10Error("G10_STATE_CONSUMER_SOURCE_MISMATCH")
         try:
             validate_evidence_reuse_attestation(
@@ -1769,7 +1794,7 @@ def load_stage0_g10_formal_state(
                 data_root=root,
                 attestation_ref=reuse_ref,
                 producer_commit=g9.generator_git_commit,
-                consumer_commit=expected_git_commit,
+                consumer_commit=generator_git_commit,
                 consumer_branch=source.git_branch,
                 scope_id="stage0.G0-G9",
                 source_evidence_ref=g9.index_ref,
@@ -1818,7 +1843,7 @@ def load_stage0_g10_formal_state(
     if (
         raw.get("g9_index_sha256") != g9.index_sha256
         or raw.get("g9_gate_artifact_hash") != g9.gate_artifact_hash
-        or raw.get("g9_generator_git_commit") != g9.generator_git_commit
+        or g9_generator_git_commit != g9.generator_git_commit
         or raw.get("sync_observation_sha256")
         != sha256_file(_logical_path(root, raw["sync_observation_ref"], field="sync_ref"))
         or config.config_hash != raw.get("config_hash")
@@ -1846,6 +1871,8 @@ def load_stage0_g10_formal_state(
         readiness_ref=str(raw["readiness_ref"]),
         readiness_artifact_hash=str(readiness["artifact_hash"]),
         g9_index_ref=str(raw["g9_index_ref"]),
+        generator_git_commit=generator_git_commit,
+        legacy_index=legacy_index,
     )
 
 

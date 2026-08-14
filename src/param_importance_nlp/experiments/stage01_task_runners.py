@@ -69,6 +69,10 @@ from ..core.oracles import (
 from ..core.registry import ParameterRegistry
 from ..core.sufficient_statistics import EqualSufficientStatistics
 from ..core.tensors import TensorMap
+from ..evidence_reuse import (
+    EvidenceReuseError,
+    validate_evidence_reuse_attestation,
+)
 from ..runtime.checkpoint import CheckpointRetentionPolicy, CheckpointStore
 from ..runtime.events import (
     EventRecord,
@@ -1630,9 +1634,16 @@ _STAGE1_ENTRY_CACHE_VARS = (
     "TORCHINDUCTOR_CACHE_DIR",
 )
 _STAGE1_ENTRY_SOURCE_REFS = (
+    "configs/run-ready/layers/formal-stage1-pythia14m.yaml",
+    "configs/run-ready/v2/stage1-pythia14m-formal.yaml",
     "docs/mathematics.md",
+    "ops/stage1/attest_g10_evidence_reuse.py",
+    "ops/stage1/formalize_s1_1.py",
     "plan/stage1/01_entry_and_contract.md",
+    "policies/evidence-validity-and-rerun.md",
+    "src/param_importance_nlp/evidence_reuse.py",
     "src/param_importance_nlp/experiments/stage01_task_runners.py",
+    "src/param_importance_nlp/stage1_s1_1.py",
     "src/param_importance_nlp/contracts/task_catalog.py",
 )
 _STAGE1_ENTRY_SCHEMA_REFS = (
@@ -1640,6 +1651,30 @@ _STAGE1_ENTRY_SCHEMA_REFS = (
     "schemas/shared/contract-freeze-v1.json",
     "schemas/stage1/entry-baseline-v1.json",
     "schemas/stage1/requirements-matrix-v1.json",
+    "schemas/stage1/s1-1-formalization-index-v1.json",
+)
+_STAGE1_ENTRY_REQUIRED_STAGE0_GATES = (
+    "stage0.G0-C",
+    "stage0.G0-G",
+    "stage0.G1",
+    "stage0.G2",
+    "stage0.G3",
+    "stage0.G3-S1",
+    "stage0.G3-S2",
+    "stage0.G3-S4",
+    "stage0.G3-S5",
+    "stage0.G3-S6",
+    "stage0.G4",
+    "stage0.G5",
+    "stage0.G6",
+    "stage0.G7",
+    "stage0.G7-LOGGING",
+    "stage0.G8",
+    "stage0.G8-C",
+    "stage0.G8-S4",
+    "stage0.G8-S5",
+    "stage0.G9",
+    "stage0.G10",
 )
 
 
@@ -1807,6 +1842,113 @@ def _stage1_runtime_snapshot() -> dict[str, JSONValue]:
     }
 
 
+def _stage1_g10_reuse_decision(
+    request: TaskExecutionRequest,
+    *,
+    workspace_root: Path,
+    repository_root: Path,
+    repository_snapshot: Mapping[str, JSONValue],
+) -> tuple[dict[str, JSONValue], bool]:
+    """Validate the exact G10 producer -> S1.1 consumer boundary.
+
+    G10 is a historical producer artifact. A later S1.1 implementation may consume it,
+    but only after the real Git delta and the immutable G10 index are bound by a reuse
+    attestation. The same-commit case rejects a redundant attestation.
+    """
+
+    if request.config.run_intent != "formal":
+        return ({"status": "NOT_RUN", "reason": "local fixture"}, True)
+    orchestration = request.config.section("orchestration")
+    if not isinstance(orchestration, Mapping):
+        return ({"status": "BLOCKED", "reason": "orchestration_invalid"}, False)
+    index_ref = orchestration.get("route_spec_ref")
+    attestation_ref = orchestration.get("quadrature_decision_ref")
+    consumer_commit = repository_snapshot.get("head")
+    consumer_branch = repository_snapshot.get("branch")
+    if (
+        not isinstance(index_ref, str)
+        or not isinstance(consumer_commit, str)
+        or not isinstance(consumer_branch, str)
+    ):
+        return ({"status": "BLOCKED", "reason": "g10_reuse_binding_missing"}, False)
+    try:
+        index_path = _resolve(workspace_root, index_ref, field="g10_index_ref")
+        raw = load_canonical_json(index_path)
+        if not isinstance(raw, Mapping):
+            raise EvidenceReuseError("S1_1_G10_INDEX_NOT_OBJECT")
+        index = dict(raw)
+        declared_hash = index.pop("artifact_hash", None)
+        producer_commit = index.get("generator_git_commit")
+        if (
+            declared_hash != canonical_json_hash(index)
+            or not isinstance(producer_commit, str)
+            or re.fullmatch(r"[0-9a-f]{40}", producer_commit) is None
+            or raw.get("schema_version") != "stage0-g10-formalization-index-v1"
+            or raw.get("next_task_id") != "stage1.01_entry_and_contract"
+        ):
+            raise EvidenceReuseError("S1_1_G10_INDEX_IDENTITY_INVALID")
+        required_gates = sorted(_STAGE1_ENTRY_REQUIRED_STAGE0_GATES)
+        if not set(required_gates).issubset(request.environment.passed_gate_ids):
+            raise EvidenceReuseError("S1_1_G10_GATE_SET_INCOMPLETE")
+        if producer_commit == consumer_commit:
+            if attestation_ref is not None:
+                raise EvidenceReuseError("S1_1_G10_REUSE_ATTESTATION_UNNECESSARY")
+            return (
+                {
+                    "status": "PASS",
+                    "scope_id": "stage0.G0-G10",
+                    "producer_git_commit": producer_commit,
+                    "consumer_git_commit": consumer_commit,
+                    "g10_index_ref": index_ref,
+                    "g10_index_sha256": sha256_file(index_path),
+                    "reuse_attestation_ref": None,
+                    "reuse_attestation_sha256": None,
+                },
+                True,
+            )
+        if not isinstance(attestation_ref, str):
+            raise EvidenceReuseError("S1_1_G10_REUSE_ATTESTATION_REQUIRED")
+        attestation = validate_evidence_reuse_attestation(
+            repository=repository_root,
+            data_root=workspace_root,
+            attestation_ref=attestation_ref,
+            producer_commit=producer_commit,
+            consumer_commit=consumer_commit,
+            consumer_branch=consumer_branch,
+            scope_id="stage0.G0-G10",
+            source_evidence_ref=index_ref,
+            required_gate_ids=required_gates,
+        )
+        return (
+            {
+                "status": "PASS",
+                "scope_id": "stage0.G0-G10",
+                "producer_git_commit": producer_commit,
+                "consumer_git_commit": consumer_commit,
+                "g10_index_ref": index_ref,
+                "g10_index_sha256": sha256_file(index_path),
+                "reuse_attestation_ref": attestation_ref,
+                "reuse_attestation_sha256": sha256_file(
+                    _resolve(workspace_root, attestation_ref, field="reuse_attestation_ref")
+                ),
+                "reuse_artifact_hash": str(attestation["artifact_hash"]),
+            },
+            True,
+        )
+    except (EvidenceReuseError, OSError, ValueError) as error:
+        return (
+            {
+                "status": "BLOCKED",
+                "g10_index_ref": index_ref,
+                "reuse_attestation_ref": (
+                    attestation_ref if isinstance(attestation_ref, str) else None
+                ),
+                "reason": str(error),
+            },
+            False,
+        )
+
+
 def _stage1_contract_evidence(request: TaskExecutionRequest, root: Path) -> Mapping[str, JSONValue]:
     # 产物 workspace 可是临时目录；合同源文件和 Agent 规则始终来自源码仓库。
     contract_root = root
@@ -1817,12 +1959,40 @@ def _stage1_contract_evidence(request: TaskExecutionRequest, root: Path) -> Mapp
     scope = request.config.run_intent
     checked_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
     repository = _stage1_git_snapshot(contract_root)
+    g10_reuse, g10_reuse_valid = _stage1_g10_reuse_decision(
+        request,
+        workspace_root=root,
+        repository_root=contract_root,
+        repository_snapshot=repository,
+    )
     agent, agent_exact, agent_hashes_valid = _stage1_agent_snapshot(contract_root)
     data_root, filesystem = _stage1_data_root()
     cache_policy, cache_bound = _stage1_cache_policy(data_root)
     store = _store(request, root)
     base_config = request.config.section("base_config")
     runtime_config = base_config.get("runtime", {}) if isinstance(base_config, Mapping) else {}
+    loss_config = base_config.get("loss", {}) if isinstance(base_config, Mapping) else {}
+    data_config = base_config.get("data", {}) if isinstance(base_config, Mapping) else {}
+    model_config = base_config.get("model", {}) if isinstance(base_config, Mapping) else {}
+    provider_config = request.config.section("providers")
+    scientific_config_bound = bool(
+        isinstance(loss_config, Mapping)
+        and loss_config.get("task_type") == "causal_lm"
+        and loss_config.get("reduction") == "mean"
+        and loss_config.get("weighting") == "effective_token"
+        and isinstance(data_config, Mapping)
+        and data_config.get("sequence_length") == 2048
+        and data_config.get("statistical_unit") == "sequence"
+        and data_config.get("weight_unit") == "effective_token"
+        and isinstance(model_config, Mapping)
+        and model_config.get("asset_id") not in {None, "synthetic:model:v1"}
+        and isinstance(provider_config, Mapping)
+        and provider_config.get("kind") == "offline_hf"
+        and provider_config.get("task_type") == "causal_lm"
+        and provider_config.get("task_name") == "pile"
+        and provider_config.get("local_files_only") is True
+        and provider_config.get("trust_remote_code") is False
+    )
     configured_tmp = os.environ.get("PARAM_IMPORTANCE_TMP_ROOT") or (
         runtime_config.get("temp_root") if isinstance(runtime_config, Mapping) else None
     )
@@ -1847,6 +2017,10 @@ def _stage1_contract_evidence(request: TaskExecutionRequest, root: Path) -> Mapp
     stage0_g10_ref = request.environment.evidence_refs.get("gate_stage0_g10")
     formal_entry_checks = {
         "stage0_g10_pass": "stage0.G10" in request.environment.passed_gate_ids and stage0_g10_ref is not None,
+        "stage0_gate_set_complete": set(_STAGE1_ENTRY_REQUIRED_STAGE0_GATES).issubset(
+            request.environment.passed_gate_ids
+        ),
+        "stage0_g10_reuse_valid": g10_reuse_valid,
         "repository_clean": bool(repository["available"] and repository["worktree_clean"]),
         "agent_files_exact": agent_exact,
         "agent_hashes_valid": agent_hashes_valid,
@@ -1854,6 +2028,7 @@ def _stage1_contract_evidence(request: TaskExecutionRequest, root: Path) -> Mapp
         "data_root_ready": bool(filesystem["configured"] and filesystem["exists"] and filesystem["is_directory"]),
         "cache_roots_bound": cache_bound,
         "approved_write_paths": output_approved and temporary_approved,
+        "scientific_config_bound": scientific_config_bound,
     }
     entry_checks = formal_entry_checks if scope == "formal" else {
         "agent_files_exact": agent_exact,
@@ -1878,6 +2053,7 @@ def _stage1_contract_evidence(request: TaskExecutionRequest, root: Path) -> Mapp
             "frozen_contract_stages": sorted(request.environment.frozen_contract_stages),
             "capabilities": sorted(request.environment.capabilities),
             "evidence_refs": dict(sorted(request.environment.evidence_refs.items())),
+            "g10_reuse": g10_reuse,
             "active_process_probe": "delegated_to_stage0_entry_and_g10_evidence",
             "gpu_lease_probe": "delegated_to_stage0_entry_and_g10_evidence",
             "nccl_smoke_probe": "delegated_to_stage0_entry_and_g10_evidence",
@@ -1895,6 +2071,7 @@ def _stage1_contract_evidence(request: TaskExecutionRequest, root: Path) -> Mapp
         "optimizer_boundary_frozen": True,
         "movement_boundary_frozen": True,
         "learning_rate_not_in_coordinate_hash": True,
+        "causal_lm_config_bound": scientific_config_bound,
     }
     contract_ok = all(contract_checks.values())
     schema_hashes = {
@@ -1923,7 +2100,7 @@ def _stage1_contract_evidence(request: TaskExecutionRequest, root: Path) -> Mapp
         "target_sign": "positive_means_loss_decrease_contribution",
         "raw": "eta * mean_gradient**2",
         "double": "eta * mean_gradient_A * mean_gradient_B",
-        "equal_u": "(S1**2-S2)/(M*(M-1))",
+        "equal_u": "eta * (S1**2-S2)/(M*(M-1))",
         "learning_rate": "actual_consumed_parameter_group_lr",
         "dynamic_learning_rate_in_coordinate_hash": False,
         "clip_order": "global_mean_then_single_clip_factor_then_score",
@@ -1948,8 +2125,21 @@ def _stage1_contract_evidence(request: TaskExecutionRequest, root: Path) -> Mapp
             "decompose_movement",
         ],
     }
+    reuse_refs = tuple(
+        str(value)
+        for value in (
+            g10_reuse.get("g10_index_ref"),
+            g10_reuse.get("reuse_attestation_ref"),
+        )
+        if isinstance(value, str) and value
+    )
     external_refs = tuple(
-        sorted(set(str(value) for value in request.environment.evidence_refs.values() if value))
+        sorted(
+            {
+                *(str(value) for value in request.environment.evidence_refs.values() if value),
+                *reuse_refs,
+            }
+        )
     )
     gate_refs = tuple(
         dict.fromkeys((*external_refs, *[f"source/{reference}" for reference in _STAGE1_ENTRY_SOURCE_REFS]))
@@ -1982,11 +2172,13 @@ def _stage1_contract_evidence(request: TaskExecutionRequest, root: Path) -> Mapp
         gate_records = []
     requirement_sources = {
         "entry.stage0_g10": "plan/stage1/01_entry_and_contract.md",
+        "entry.stage0_g10_reuse": "policies/evidence-validity-and-rerun.md",
         "entry.repository_clean": "Agent/git.md",
         "entry.agent_files": "Agent/sync.md",
         "entry.data_root": "Agent/server.md",
         "entry.cache_policy": "Agent/server.md",
         "entry.write_paths": "Agent/sync.md",
+        "entry.scientific_config": "configs/run-ready/layers/formal-stage1-pythia14m.yaml",
         "contract.target_quantity": "plan/stage1/01_entry_and_contract.md",
         "contract.loss_reduction": "plan/stage1/01_entry_and_contract.md",
         "contract.estimators": "docs/mathematics.md",
@@ -1996,11 +2188,16 @@ def _stage1_contract_evidence(request: TaskExecutionRequest, root: Path) -> Mapp
     }
     requirement_checks = {
         "entry.stage0_g10": formal_entry_checks["stage0_g10_pass"],
+        "entry.stage0_g10_reuse": (
+            formal_entry_checks["stage0_gate_set_complete"]
+            and formal_entry_checks["stage0_g10_reuse_valid"]
+        ),
         "entry.repository_clean": formal_entry_checks["repository_clean"],
         "entry.agent_files": agent_exact and agent_hashes_valid,
         "entry.data_root": formal_entry_checks["data_root_ready"],
         "entry.cache_policy": formal_entry_checks["cache_roots_bound"],
         "entry.write_paths": formal_entry_checks["approved_write_paths"],
+        "entry.scientific_config": formal_entry_checks["scientific_config_bound"],
         "contract.target_quantity": contract_ok,
         "contract.loss_reduction": contract_ok,
         "contract.estimators": contract_ok,
@@ -2010,11 +2207,13 @@ def _stage1_contract_evidence(request: TaskExecutionRequest, root: Path) -> Mapp
     }
     local_checks = {
         "entry.stage0_g10": False,
+        "entry.stage0_g10_reuse": False,
         "entry.repository_clean": bool(repository["available"]),
         "entry.agent_files": agent_exact and agent_hashes_valid,
         "entry.data_root": False,
         "entry.cache_policy": False,
         "entry.write_paths": store.root.exists(),
+        "entry.scientific_config": scientific_config_bound,
         "contract.target_quantity": contract_ok,
         "contract.loss_reduction": contract_ok,
         "contract.estimators": contract_ok,
@@ -2053,9 +2252,9 @@ def _stage1_contract_evidence(request: TaskExecutionRequest, root: Path) -> Mapp
             "plan/stage1/01_entry_and_contract.md": sha256_file(plan_path),
         },
         "frozen_formulas": {
-            "raw": "mean_gradient**2",
-            "equal_u": "(S1**2-S2)/(M*(M-1))",
-            "double": "mean_gradient_A*mean_gradient_B",
+            "raw": "eta * mean_gradient**2",
+            "equal_u": "eta * (S1**2-S2)/(M*(M-1))",
+            "double": "eta * mean_gradient_A*mean_gradient_B",
         },
         "dynamic_learning_rate_in_coordinate_hash": False,
         "same_batch_clipped_u_claim": "plugin_no_strict_unbiasedness",
@@ -2658,6 +2857,31 @@ class Stage01CompositeTaskRunner(TaskRunner):
             blockers = _stage1_formal_blockers(evidence)
             if blockers:
                 raise TaskBlockedError(*blockers)
+            entry = evidence.get("entry_snapshot")
+            external = entry.get("external_evidence") if isinstance(entry, Mapping) else None
+            reuse = external.get("g10_reuse") if isinstance(external, Mapping) else None
+            if not isinstance(reuse, Mapping) or reuse.get("status") != "PASS":
+                raise TaskBlockedError(
+                    TaskBlocker(
+                        BlockerCode.GATE_NOT_READY,
+                        "stage0.G10.reuse",
+                        "S1.1 formal 缺少已通过的 G10 沿用判定",
+                        True,
+                    )
+                )
+            source_refs = tuple(
+                dict.fromkeys(
+                    (
+                        *source_refs,
+                        str(reuse["g10_index_ref"]),
+                        *(
+                            (str(reuse["reuse_attestation_ref"]),)
+                            if reuse.get("reuse_attestation_ref") is not None
+                            else ()
+                        ),
+                    )
+                )
+            )
         evidence_hash = canonical_json_hash(evidence)
         refs: dict[str, str] = {}
         for artifact_kind in request.task.artifact_kinds:

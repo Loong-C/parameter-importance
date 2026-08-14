@@ -1,0 +1,87 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://parameter-importance.invalid/schemas/stage1/s1-1-formalization-index-v1.json",
+  "title": "Stage 1 S1.1 formalization index v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "status",
+    "generator_git_commit",
+    "git_branch",
+    "checked_at",
+    "g10_generator_git_commit",
+    "g10_index_ref",
+    "g10_index_sha256",
+    "g10_legacy_index",
+    "reuse_attestation_ref",
+    "reuse_attestation_sha256",
+    "reuse_artifact_hash",
+    "config_ref",
+    "config_hash",
+    "environment_ref",
+    "environment_hash",
+    "result_ref",
+    "result_hash",
+    "task_output_refs",
+    "gate_artifact_hashes",
+    "next_task_id",
+    "artifact_hash"
+  ],
+  "properties": {
+    "schema_version": {"const": "stage1-s1-1-formalization-index-v1"},
+    "status": {"const": "PASS"},
+    "generator_git_commit": {"$ref": "#/$defs/commit"},
+    "git_branch": {"type": "string", "minLength": 1},
+    "checked_at": {"type": "string", "format": "date-time"},
+    "g10_generator_git_commit": {"$ref": "#/$defs/commit"},
+    "g10_index_ref": {"$ref": "#/$defs/ref"},
+    "g10_index_sha256": {"$ref": "#/$defs/hash"},
+    "g10_legacy_index": {"type": "boolean"},
+    "reuse_attestation_ref": {
+      "oneOf": [{"type": "null"}, {"$ref": "#/$defs/ref"}]
+    },
+    "reuse_attestation_sha256": {
+      "oneOf": [{"type": "null"}, {"$ref": "#/$defs/hash"}]
+    },
+    "reuse_artifact_hash": {
+      "oneOf": [{"type": "null"}, {"$ref": "#/$defs/hash"}]
+    },
+    "config_ref": {"$ref": "#/$defs/ref"},
+    "config_hash": {"$ref": "#/$defs/hash"},
+    "environment_ref": {"$ref": "#/$defs/ref"},
+    "environment_hash": {"$ref": "#/$defs/hash"},
+    "result_ref": {"$ref": "#/$defs/ref"},
+    "result_hash": {"$ref": "#/$defs/hash"},
+    "task_output_refs": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["stage_contract", "gate_record", "requirements_matrix"],
+      "properties": {
+        "stage_contract": {"$ref": "#/$defs/ref"},
+        "gate_record": {"$ref": "#/$defs/ref"},
+        "requirements_matrix": {"$ref": "#/$defs/ref"}
+      }
+    },
+    "gate_artifact_hashes": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["stage1.G1-ENTRY", "stage1.G1-CONTRACT"],
+      "properties": {
+        "stage1.G1-ENTRY": {"$ref": "#/$defs/hash"},
+        "stage1.G1-CONTRACT": {"$ref": "#/$defs/hash"}
+      }
+    },
+    "next_task_id": {"const": "stage1.02_architecture_and_parameter_registry"},
+    "artifact_hash": {"$ref": "#/$defs/hash"}
+  },
+  "$defs": {
+    "commit": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+    "hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "ref": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.(?:/|$))(?!.*\\\\).+$"
+    }
+  }
+}
