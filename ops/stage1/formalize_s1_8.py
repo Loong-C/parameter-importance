@@ -328,6 +328,23 @@ def _validate_worker_candidate_contract(route_key: str, report: Mapping[str, Any
         rank_records = row.get("rank_records")
         if not isinstance(rank_records, list) or len(rank_records) != ROUTE_WORLD[route] or sorted(_mapping(record, field="candidate.worker.rank").get("rank") for record in rank_records) != list(range(ROUTE_WORLD[route])):
             raise Stage1S18FormalError("S18_CANDIDATE_WORKER_RANK_CARDINALITY_INVALID:" + route_key)
+        for rank, (record_raw, expected_ids) in enumerate(zip(rank_records, partitions, strict=True)):
+            record = _mapping(record_raw, field="candidate.worker.rank")
+            if record.get("rank") != rank or record.get("local_microbatch_ids") != expected_ids:
+                raise Stage1S18FormalError("S18_CANDIDATE_WORKER_RANK_PARTITION_INVALID:" + route_key)
+            gradients = record.get("local_gradient_checksums")
+            expected_gradient_count = 1 if route == "A" else len(expected_ids)
+            if (
+                not isinstance(gradients, list)
+                or len(gradients) != expected_gradient_count
+                or any(
+                    not isinstance(value, str)
+                    or len(value) != 64
+                    or any(character not in "0123456789abcdef" for character in value)
+                    for value in gradients
+                )
+            ):
+                raise Stage1S18FormalError("S18_CANDIDATE_WORKER_LOCAL_GRADIENT_CHECKSUM_INVALID:" + route_key)
         has_u, has_accumulator = any("/u_" in key for key in keys), any(key.startswith("accumulator/") for key in keys)
         if route == "A":
             if accumulator is not None or has_u or has_accumulator or any(key.startswith(("scores/", "stats/")) for key in keys) or not all(any(key.startswith(f"a-reference/{row['case']}/{field}/") for key in keys) for field in ("mean_gradient", "raw_core", "raw_score", "raw_score_clipped", "data_update", "magnitude")):

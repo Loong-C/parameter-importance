@@ -361,7 +361,12 @@ def _validate_rank_contract(*, route: str, report: Mapping[str, Any], row: Mappi
         if isinstance(tokens, bool) or not isinstance(tokens, int) or tokens <= 0 or isinstance(loss, bool) or not isinstance(loss, (int, float)) or not math.isfinite(float(loss)):
             raise Stage1S18OracleError(f"S18_ORACLE_RANK_LOSS_OR_COUNT_INVALID:{case}:{route}:{rank}")
         gradients = record.get("local_gradient_checksums")
-        if not isinstance(gradients, list) or len(gradients) != len(ids) or any(not isinstance(value, str) or len(value) != 64 or any(char not in "0123456789abcdef" for char in value) for value in gradients):
+        # Route A performs one full-global-batch backward while retaining all
+        # eight source IDs in its sample-layout record.  B/C/D perform one
+        # backward per listed statistical unit, so only those routes have a
+        # one-checksum-per-ID contract.
+        expected_gradient_count = 1 if route == "A" else len(ids)
+        if not isinstance(gradients, list) or len(gradients) != expected_gradient_count or any(not isinstance(value, str) or len(value) != 64 or any(char not in "0123456789abcdef" for char in value) for value in gradients):
             raise Stage1S18OracleError(f"S18_ORACLE_RANK_GRADIENT_CHECKSUM_INVALID:{case}:{route}:{rank}")
         effective_total += tokens
         local_losses.append(float(loss))
