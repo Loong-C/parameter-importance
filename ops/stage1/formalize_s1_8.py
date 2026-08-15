@@ -1117,9 +1117,12 @@ def _session_member_stat(pid: int) -> dict[str, Any]:
     """Read the minimum race-safe state needed to classify a session member.
 
     A SID can retain a zombie after its environment/executable is no longer
-    readable.  Only a fully parsed ``Z`` state is treated as an exited member;
-    malformed records are ownership failures, while an unavailable record is
-    reported distinctly so the caller can re-audit one already-known PID.
+    readable.  A fully parsed ``Z`` is excluded only for a known exact member.
+    The caller separately recognizes the frozen-host's tightly bounded
+    procfs-owner transition (the stat inode UID alone becomes zero) for an
+    already token-bound exiting task.  Malformed records are ownership
+    failures, while an unavailable record is reported distinctly so the caller
+    can re-audit one already-known PID.
     """
 
     try:
@@ -1134,6 +1137,59 @@ def _same_session_stat_identity(expected: Mapping[str, Any], observed: Mapping[s
     """Compare stat-only fields that prove a known PID was not reused."""
 
     return all(expected.get(field) == observed.get(field) for field in ("pid", "uid", "pgid", "sid", "start_ticks"))
+
+
+_SESSION_STAT_IDENTITY_FIELDS = ("pid", "uid", "pgid", "sid", "start_ticks")
+
+
+def _session_stat_identity_differences(expected: Mapping[str, Any], observed: Mapping[str, Any]) -> dict[str, dict[str, object]]:
+    """Return stable, no-command-text evidence for a stat identity drift."""
+
+    return {
+        field: {"expected": expected.get(field), "observed": observed.get(field)}
+        for field in _SESSION_STAT_IDENTITY_FIELDS
+        if expected.get(field) != observed.get(field)
+    }
+
+
+def _session_stat_identity_drift_error(member_pid: int, expected: Mapping[str, Any], observed: Mapping[str, Any]) -> Stage1S18ManualInterventionRequired:
+    """Make state and changed fields visible without broadening ownership."""
+
+    differences = _session_stat_identity_differences(expected, observed)
+    state = observed.get("state")
+    fields = ",".join(differences) if differences else "none"
+    return Stage1S18ManualInterventionRequired(
+        f"S18_PROCESS_SESSION_STAT_IDENTITY_DRIFT:pid={member_pid}:state={state}:fields={fields}"
+    )
+
+
+def _is_known_procfs_owner_exit_transition(
+    *, expected: Mapping[str, Any], earlier: Mapping[str, Any], member_stat: Mapping[str, Any],
+) -> bool:
+    """Recognize the observed Linux exit-owner UID transition, and nothing else.
+
+    A bounded frozen-host probe observed an exiting task's ``/proc/<pid>/stat``
+    inode owner transition from the launch UID to root while PID, PGID, SID and
+    start ticks remained exact (states ``R``/``Z`` only).  This proves neither
+    a new identity nor ownership by itself; it only lets an *already
+    token-bound* member take the narrowly defined exit path below.
+    """
+
+    differences = _session_stat_identity_differences(earlier, member_stat)
+    prior_uid, expected_uid, observed_uid = earlier.get("uid"), expected.get("uid"), member_stat.get("uid")
+    return (
+        earlier.get("environment_run_token") == expected.get("environment_run_token")
+        and isinstance(prior_uid, int)
+        and not isinstance(prior_uid, bool)
+        and isinstance(expected_uid, int)
+        and not isinstance(expected_uid, bool)
+        and prior_uid != 0
+        and prior_uid == expected_uid
+        and expected_uid != 0
+        and observed_uid == 0
+        and member_stat.get("state") in {"R", "Z"}
+        and set(differences) == {"uid"}
+    )
 
 
 def _same_process_identity(expected: Mapping[str, Any], observed: Mapping[str, Any]) -> bool:
@@ -1296,7 +1352,8 @@ def _audit_exact_process_group(
     nevertheless inspect every live member of every involved SID and reject a
     session containing an unrelated process.  A fully parsed zombie is
     excluded only if it was already fully token-bound and its stat identity
-    exactly matches that first fingerprint.  A newly visible direct descendant
+    either exactly matches that first fingerprint or exhibits the frozen
+    UID-only procfs owner exit transition.  A newly visible direct descendant
     gets one provisional retry only after stat/UID/ancestry checks; it cannot
     enter the known tree or be signalled until exact-token discovery on that
     retry.  A never-token PID, including a zombie, is never promoted.
@@ -1336,7 +1393,7 @@ def _audit_exact_process_group(
         raise Stage1S18ManualInterventionRequired("S18_PROCESS_LAUNCHER_FINGERPRINT_DRIFT")
     depths = _tree_depths(expected=expected, observed=observed, known_members=previous)
     newly_provisional: dict[int, dict[str, Any]] = {}
-    launcher_exit_candidate = False
+    launcher_exit_candidate: str | None = None
     for member_sid in sorted({int(item["sid"]) for item in observed.values()}):
         for member_pid in _session_members(member_sid):
             earlier = previous.get(member_pid)
@@ -1351,10 +1408,63 @@ def _audit_exact_process_group(
                         _session_membership_rechecked=True,
                     )
                 raise Stage1S18ManualInterventionRequired("S18_PROCESS_SESSION_MEMBER_STATE_UNVERIFIABLE") from None
+            stat_identity_matches = isinstance(earlier, Mapping) and _same_session_stat_identity(earlier, member_stat)
+            owner_exit_transition = isinstance(earlier, Mapping) and _is_known_procfs_owner_exit_transition(
+                expected=expected,
+                earlier=earlier,
+                member_stat=member_stat,
+            )
             if member_stat["state"] == "Z":
-                if not isinstance(earlier, Mapping) or not _same_session_stat_identity(earlier, member_stat):
+                # Linux can retain an unexecutable zombie whose procfs stat
+                # inode owner has transitioned to root.  This is safe only
+                # for a member attested in an earlier pass, with exactly the
+                # frozen UID-only transition.  Unknown/provisional zombies
+                # remain fail-closed regardless of how quickly they vanish.
+                if not isinstance(earlier, Mapping):
                     raise Stage1S18ManualInterventionRequired("S18_PROCESS_SESSION_TOKEN_MEMBERSHIP_DRIFT")
-                continue
+                if stat_identity_matches or owner_exit_transition:
+                    continue
+                raise _session_stat_identity_drift_error(member_pid, earlier, member_stat)
+            observed_member = observed.get(member_pid)
+            if (
+                not isinstance(earlier, Mapping)
+                and isinstance(observed_member, Mapping)
+                and not _same_session_stat_identity(observed_member, member_stat)
+            ):
+                # Exact-token discovery does not make a contradictory procfs
+                # identity safe.  In particular, a UID-zero transition is an
+                # exit exception only for a member attested in an earlier
+                # complete pass; it can never promote a new/provisional PID.
+                raise _session_stat_identity_drift_error(member_pid, observed_member, member_stat)
+            # Check the minimal procfs identity before a fresh environ read:
+            # otherwise a readable token could mask PID reuse or an owner
+            # transition that must be confirmed as an exit, never live work.
+            if not isinstance(earlier, Mapping):
+                stat_identity_matches = False
+            if isinstance(earlier, Mapping) and not stat_identity_matches:
+                if owner_exit_transition:
+                    if member_pid == expected_pid and _same_live_fingerprint(expected, earlier):
+                        launcher_exit_candidate = (
+                            "S18_PROCESS_LAUNCHER_PROCFS_OWNER_EXIT_CANDIDATE:"
+                            f"pid={member_pid}:state={member_stat['state']}:fields=uid"
+                        )
+                        continue
+                    # A non-zombie worker can pass through the same kernel
+                    # owner transition.  It gets exactly one complete audit:
+                    # recovery, disappearance, or a known zombie is okay;
+                    # remaining live UID-zero state is not.
+                    if not _session_membership_rechecked:
+                        time.sleep(SESSION_MEMBER_REVALIDATION_SECONDS)
+                        return _audit_exact_process_group(
+                            expected,
+                            known_members=previous,
+                            _session_membership_rechecked=True,
+                        )
+                    raise Stage1S18ManualInterventionRequired(
+                        "S18_PROCESS_SESSION_WORKER_OWNER_EXIT_UNRESOLVED:"
+                        f"pid={member_pid}:state={member_stat['state']}"
+                    )
+                raise _session_stat_identity_drift_error(member_pid, earlier, member_stat)
             try:
                 session_member = _fingerprint(member_pid, token)
             except (OSError, ProcessLookupError):
@@ -1377,8 +1487,6 @@ def _audit_exact_process_group(
                     # reached its sibling first.
                     newly_provisional[member_pid] = candidate
                     continue
-                if not _same_session_stat_identity(earlier, member_stat):
-                    raise Stage1S18ManualInterventionRequired("S18_PROCESS_SESSION_TOKEN_MEMBERSHIP_DRIFT")
                 if session_member is not None and not _same_live_fingerprint(earlier, session_member):
                     raise Stage1S18ManualInterventionRequired("S18_PROCESS_SESSION_TOKEN_MEMBERSHIP_DRIFT")
                 # A successful launcher can exit between the token directory
@@ -1394,7 +1502,7 @@ def _audit_exact_process_group(
                     # Finish auditing every other member first.  A launcher
                     # exit can never excuse a foreign/unknown sibling in its
                     # session from the normal fail-closed checks.
-                    launcher_exit_candidate = True
+                    launcher_exit_candidate = "S18_PROCESS_LAUNCHER_NATURAL_EXIT_CANDIDATE"
                     continue
                 if not _session_membership_rechecked:
                     # Only a previously attested PID reaches this retry.  The
@@ -1415,7 +1523,7 @@ def _audit_exact_process_group(
             _session_membership_rechecked=True,
             _provisional_members={**provisional, **newly_provisional},
         )
-    if launcher_exit_candidate:
+    if launcher_exit_candidate is not None:
         if not _session_membership_rechecked:
             time.sleep(SESSION_MEMBER_REVALIDATION_SECONDS)
             return _audit_exact_process_group(
@@ -1423,7 +1531,7 @@ def _audit_exact_process_group(
                 known_members=previous,
                 _session_membership_rechecked=True,
             )
-        raise _LauncherNaturalExitCandidate("S18_PROCESS_LAUNCHER_NATURAL_EXIT_CANDIDATE")
+        raise _LauncherNaturalExitCandidate(launcher_exit_candidate)
     members = [observed[pid] for pid in sorted(observed)]
     return {
         "pgid": pgid, "sid": sid, "members": members, "member_pids": sorted(observed),
@@ -1630,7 +1738,9 @@ def _audit_or_confirmed_launcher_exit(process: subprocess.Popen[str], fingerprin
         try:
             process.wait(timeout=LAUNCHER_EXIT_CONFIRMATION_TIMEOUT_SECONDS)
         except subprocess.TimeoutExpired:
-            raise Stage1S18ManualInterventionRequired("S18_PROCESS_LAUNCHER_NATURAL_EXIT_UNCONFIRMED") from audit_error
+            raise Stage1S18ManualInterventionRequired(
+                "S18_PROCESS_LAUNCHER_NATURAL_EXIT_UNCONFIRMED:" + str(audit_error)
+            ) from audit_error
         return None
     except ProcessLookupError as audit_error:
         # /proc can reap the launcher just before Popen's non-blocking poll

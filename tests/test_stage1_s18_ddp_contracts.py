@@ -692,6 +692,159 @@ def test_transient_session_member_recovery_requires_fresh_token_and_ancestry_aud
     assert sleeps == [formalizer.SESSION_MEMBER_REVALIDATION_SECONDS]
 
 
+def test_known_launcher_procfs_owner_exit_requires_one_exit_confirmation_candidate(monkeypatch: pytest.MonkeyPatch) -> None:
+    formalizer = _formalizer(); token = "b" * 64
+    launcher = {"pid": 100, "ppid": 1, "uid": 7, "pgid": 100, "sid": 100, "start_ticks": "10", "exe": "/usr/bin/python", "cmdline_sha256": "a" * 64, "environment_run_token": token}
+    terminal = {"pid": 100, "uid": 0, "pgid": 100, "sid": 100, "start_ticks": "10", "state": "R"}
+    assert formalizer._session_stat_identity_differences(launcher, terminal) == {
+        "uid": {"expected": 7, "observed": 0},
+    }
+    assert formalizer._is_known_procfs_owner_exit_transition(expected=launcher, earlier=launcher, member_stat=terminal)
+    assert not formalizer._is_known_procfs_owner_exit_transition(
+        expected={**launcher, "uid": 0}, earlier=launcher, member_stat=terminal,
+    )
+    monkeypatch.setattr(formalizer, "_token_process_ids", lambda _: [100])
+    monkeypatch.setattr(formalizer, "_fingerprint", lambda _pid, _token: launcher)
+    monkeypatch.setattr(formalizer, "_session_members", lambda _sid: [100])
+    monkeypatch.setattr(formalizer, "_session_member_stat", lambda _pid: terminal)
+    sleeps: list[float] = []
+    monkeypatch.setattr(formalizer.time, "sleep", lambda seconds: sleeps.append(seconds))
+    with pytest.raises(formalizer._LauncherNaturalExitCandidate, match="S18_PROCESS_LAUNCHER_PROCFS_OWNER_EXIT_CANDIDATE:pid=100:state=R:fields=uid"):
+        formalizer._audit_exact_process_group(launcher, known_members={100: launcher})
+    assert sleeps == [formalizer.SESSION_MEMBER_REVALIDATION_SECONDS]
+
+
+def test_known_zombie_procfs_owner_exit_is_excluded_without_retry(monkeypatch: pytest.MonkeyPatch) -> None:
+    formalizer = _formalizer(); token = "b" * 64
+    launcher = {"pid": 100, "ppid": 1, "uid": 7, "pgid": 100, "sid": 100, "start_ticks": "10", "exe": "/usr/bin/python", "cmdline_sha256": "a" * 64, "environment_run_token": token}
+    live_worker = {**launcher, "pid": 101, "ppid": 100, "pgid": 101, "sid": 201, "start_ticks": "11"}
+    exited_worker = {**launcher, "pid": 102, "ppid": 100, "pgid": 102, "sid": 201, "start_ticks": "12"}
+    records = {100: launcher, 101: live_worker, 102: exited_worker}
+    monkeypatch.setattr(formalizer, "_token_process_ids", lambda _: [100, 101])
+    monkeypatch.setattr(formalizer, "_fingerprint", lambda pid, _token: records[pid])
+    monkeypatch.setattr(formalizer, "_session_members", lambda sid: [100] if sid == 100 else [101, 102])
+    monkeypatch.setattr(
+        formalizer,
+        "_session_member_stat",
+        lambda pid: {
+            key: records[pid][key] for key in ("pid", "uid", "pgid", "sid", "start_ticks")
+        } | ({"uid": 0, "state": "Z"} if pid == 102 else {"state": "S"}),
+    )
+    sleeps: list[float] = []
+    monkeypatch.setattr(formalizer.time, "sleep", lambda seconds: sleeps.append(seconds))
+    audit = formalizer._audit_exact_process_group(
+        launcher,
+        known_members={100: launcher, 102: exited_worker},
+    )
+    assert audit["member_pids"] == [100, 101]
+    assert sleeps == []
+
+
+def test_known_worker_procfs_owner_exit_reaudits_then_recovers(monkeypatch: pytest.MonkeyPatch) -> None:
+    formalizer = _formalizer(); token = "b" * 64
+    launcher = {"pid": 100, "ppid": 1, "uid": 7, "pgid": 100, "sid": 100, "start_ticks": "10", "exe": "/usr/bin/python", "cmdline_sha256": "a" * 64, "environment_run_token": token}
+    worker = {**launcher, "pid": 101, "ppid": 100, "pgid": 101, "sid": 201, "start_ticks": "11"}
+    stat_passes = [
+        {"pid": 101, "uid": 0, "pgid": 101, "sid": 201, "start_ticks": "11", "state": "R"},
+        {key: worker[key] for key in ("pid", "uid", "pgid", "sid", "start_ticks")} | {"state": "S"},
+    ]
+    monkeypatch.setattr(formalizer, "_token_process_ids", lambda _: [100, 101])
+    monkeypatch.setattr(formalizer, "_fingerprint", lambda pid, _token: launcher if pid == 100 else worker)
+    monkeypatch.setattr(formalizer, "_session_members", lambda sid: [100] if sid == 100 else [101])
+    def stat(pid: int) -> dict[str, object]:
+        if pid == 100:
+            return {key: launcher[key] for key in ("pid", "uid", "pgid", "sid", "start_ticks")} | {"state": "S"}
+        return stat_passes.pop(0)
+    monkeypatch.setattr(formalizer, "_session_member_stat", stat)
+    sleeps: list[float] = []
+    monkeypatch.setattr(formalizer.time, "sleep", lambda seconds: sleeps.append(seconds))
+    audit = formalizer._audit_exact_process_group(launcher, known_members={100: launcher, 101: worker})
+    assert audit["member_pids"] == [100, 101]
+    assert sleeps == [formalizer.SESSION_MEMBER_REVALIDATION_SECONDS]
+
+
+def test_known_live_worker_procfs_owner_exit_twice_is_manual(monkeypatch: pytest.MonkeyPatch) -> None:
+    formalizer = _formalizer(); token = "b" * 64
+    launcher = {"pid": 100, "ppid": 1, "uid": 7, "pgid": 100, "sid": 100, "start_ticks": "10", "exe": "/usr/bin/python", "cmdline_sha256": "a" * 64, "environment_run_token": token}
+    worker = {**launcher, "pid": 101, "ppid": 100, "pgid": 101, "sid": 201, "start_ticks": "11"}
+    terminal = {"pid": 101, "uid": 0, "pgid": 101, "sid": 201, "start_ticks": "11", "state": "R"}
+    monkeypatch.setattr(formalizer, "_token_process_ids", lambda _: [100, 101])
+    monkeypatch.setattr(formalizer, "_fingerprint", lambda pid, _token: launcher if pid == 100 else worker)
+    monkeypatch.setattr(formalizer, "_session_members", lambda sid: [100] if sid == 100 else [101])
+    monkeypatch.setattr(
+        formalizer,
+        "_session_member_stat",
+        lambda pid: ({key: launcher[key] for key in ("pid", "uid", "pgid", "sid", "start_ticks")} | {"state": "S"}) if pid == 100 else terminal,
+    )
+    sleeps: list[float] = []
+    monkeypatch.setattr(formalizer.time, "sleep", lambda seconds: sleeps.append(seconds))
+    with pytest.raises(
+        formalizer.Stage1S18ManualInterventionRequired,
+        match="S18_PROCESS_SESSION_WORKER_OWNER_EXIT_UNRESOLVED:pid=101:state=R",
+    ):
+        formalizer._audit_exact_process_group(launcher, known_members={100: launcher, 101: worker})
+    assert sleeps == [formalizer.SESSION_MEMBER_REVALIDATION_SECONDS]
+
+
+def test_procfs_owner_exit_transition_rejects_other_known_identity_drift(monkeypatch: pytest.MonkeyPatch) -> None:
+    formalizer = _formalizer(); token = "b" * 64
+    launcher = {"pid": 100, "ppid": 1, "uid": 7, "pgid": 100, "sid": 100, "start_ticks": "10", "exe": "/usr/bin/python", "cmdline_sha256": "a" * 64, "environment_run_token": token}
+
+    monkeypatch.setattr(formalizer, "_token_process_ids", lambda _: [100])
+    monkeypatch.setattr(formalizer, "_fingerprint", lambda _pid, _token: launcher)
+    monkeypatch.setattr(formalizer, "_session_members", lambda _sid: [100])
+
+    # No X/PGID/SID shortcut is permitted: frozen observations require only
+    # R/Z plus exact PGID/SID/start ticks and an owner UID transition.
+    cases = [
+        (
+            {"pid": 100, "uid": 7, "pgid": 0, "sid": 0, "start_ticks": "10", "state": "X"},
+            "S18_PROCESS_SESSION_STAT_IDENTITY_DRIFT:pid=100:state=X:fields=pgid,sid",
+        ),
+        (
+            {"pid": 100, "uid": 8, "pgid": 100, "sid": 100, "start_ticks": "10", "state": "R"},
+            "S18_PROCESS_SESSION_STAT_IDENTITY_DRIFT:pid=100:state=R:fields=uid",
+        ),
+        (
+            {"pid": 100, "uid": 0, "pgid": 100, "sid": 100, "start_ticks": "11", "state": "R"},
+            "S18_PROCESS_SESSION_STAT_IDENTITY_DRIFT:pid=100:state=R:fields=uid,start_ticks",
+        ),
+    ]
+    for member_stat, message in cases:
+        monkeypatch.setattr(formalizer, "_session_member_stat", lambda _pid, value=member_stat: value)
+        with pytest.raises(formalizer.Stage1S18ManualInterventionRequired, match=message):
+            formalizer._audit_exact_process_group(launcher, known_members={100: launcher})
+
+
+def test_procfs_owner_exit_transition_never_promotes_unknown_member(monkeypatch: pytest.MonkeyPatch) -> None:
+    formalizer = _formalizer(); token = "b" * 64
+    launcher = {"pid": 100, "ppid": 1, "uid": 7, "pgid": 100, "sid": 100, "start_ticks": "10", "exe": "/usr/bin/python", "cmdline_sha256": "a" * 64, "environment_run_token": token}
+    newcomer = {**launcher, "pid": 101, "ppid": 100, "pgid": 101, "start_ticks": "11"}
+    exact_launcher_stat = {key: launcher[key] for key in ("pid", "uid", "pgid", "sid", "start_ticks")} | {"state": "S"}
+    uid_zero_live = {key: newcomer[key] for key in ("pid", "uid", "pgid", "sid", "start_ticks")} | {"uid": 0, "state": "R"}
+    monkeypatch.setattr(formalizer, "_token_process_ids", lambda _: [100, 101])
+    monkeypatch.setattr(formalizer, "_fingerprint", lambda pid, _token: launcher if pid == 100 else newcomer)
+    monkeypatch.setattr(formalizer, "_session_members", lambda _sid: [100, 101])
+    monkeypatch.setattr(formalizer, "_session_member_stat", lambda pid: exact_launcher_stat if pid == 100 else uid_zero_live)
+    sleeps: list[float] = []
+    monkeypatch.setattr(formalizer.time, "sleep", lambda seconds: sleeps.append(seconds))
+    with pytest.raises(
+        formalizer.Stage1S18ManualInterventionRequired,
+        match="S18_PROCESS_SESSION_STAT_IDENTITY_DRIFT:pid=101:state=R:fields=uid",
+    ):
+        formalizer._audit_exact_process_group(launcher, known_members={100: launcher})
+    assert sleeps == []
+
+    unknown_zombie = {"pid": 999, "uid": 0, "pgid": 999, "sid": 100, "start_ticks": "12", "state": "Z"}
+    monkeypatch.setattr(formalizer, "_token_process_ids", lambda _: [100])
+    monkeypatch.setattr(formalizer, "_fingerprint", lambda _pid, _token: launcher)
+    monkeypatch.setattr(formalizer, "_session_members", lambda _sid: [100, 999])
+    monkeypatch.setattr(formalizer, "_session_member_stat", lambda pid: exact_launcher_stat if pid == 100 else unknown_zombie)
+    with pytest.raises(formalizer.Stage1S18ManualInterventionRequired, match="S18_PROCESS_SESSION_TOKEN_MEMBERSHIP_DRIFT"):
+        formalizer._audit_exact_process_group(launcher, known_members={100: launcher})
+    assert sleeps == []
+
+
 def test_known_launcher_token_loss_is_natural_exit_candidate_only_after_one_retry(monkeypatch: pytest.MonkeyPatch) -> None:
     formalizer = _formalizer(); token = "b" * 64
     launcher = {"pid": 100, "ppid": 1, "uid": 7, "pgid": 100, "sid": 100, "start_ticks": "10", "exe": "/usr/bin/python", "cmdline_sha256": "a" * 64, "environment_run_token": token}
@@ -784,6 +937,89 @@ def test_launch_initial_tree_never_accepts_launcher_exit_candidate(tmp_path: Pat
     from param_importance_nlp.contracts.jsonio import load_canonical_json
     marker = formalizer._mapping(load_canonical_json(tmp_path / "initial-manual-intervention.json"), field="initial.manual")
     assert marker["reason"] == "S18_PROCESS_INITIAL_TREE_LAUNCHER_EXIT_UNCONFIRMED"
+
+
+@pytest.mark.skipif(os.name != "posix" or not Path("/proc").is_dir(), reason="requires Linux /proc")
+def test_real_linux_procfs_owner_exit_transition_is_known_member_only(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Reproduce the frozen host's UID-only procfs exit transition.
+
+    ``Popen.poll`` is deliberately avoided until after sampling because it can
+    reap the child and remove `/proc/<pid>` before the kernel transition is
+    observed.  The bounded repetitions make the short exit window reliable on
+    the frozen server while keeping all children owned and synchronously reaped.
+    """
+
+    formalizer = _formalizer()
+    captured: tuple[subprocess.Popen[bytes], dict[str, object], dict[str, object]] | None = None
+    for attempt in range(128):
+        token = hashlib.sha256(f"s18-procfs-owner-exit-{attempt}".encode("ascii")).hexdigest()
+        environment = dict(os.environ); environment["PARAM_IMPORTANCE_S18_RUN_TOKEN"] = token
+        process = subprocess.Popen(
+            [sys.executable, "-c", "import sys; sys.stdin.buffer.read(1)"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            env=environment,
+            start_new_session=True,
+        )
+        selected = False
+        try:
+            expected = formalizer._fingerprint(process.pid, token)
+            if expected["uid"] == 0:
+                pytest.skip("procfs owner transition requires a non-root launch UID")
+            assert process.stdin is not None
+            process.stdin.write(b"x"); process.stdin.flush(); process.stdin.close()
+            deadline = time.monotonic() + 0.05
+            while time.monotonic() < deadline:
+                try:
+                    observed = formalizer._session_member_stat(process.pid)
+                except formalizer._SessionMemberStatUnavailable:
+                    break
+                if formalizer._is_known_procfs_owner_exit_transition(
+                    expected=expected,
+                    earlier=expected,
+                    member_stat=observed,
+                ):
+                    captured = (process, expected, observed)
+                    selected = True
+                    break
+        finally:
+            if not selected:
+                if process.stdin is not None and not process.stdin.closed:
+                    process.stdin.close()
+                process.wait(timeout=2)
+        if selected:
+            break
+    assert captured is not None, "frozen Linux host did not expose its attested UID-only procfs exit transition"
+
+    process, expected, observed = captured
+    token = str(expected["environment_run_token"])
+    pid = int(expected["pid"])
+    monkeypatch.setattr(formalizer, "_token_process_ids", lambda _: [pid])
+    monkeypatch.setattr(formalizer, "_fingerprint", lambda _pid, _token: expected)
+    monkeypatch.setattr(formalizer, "_session_members", lambda _sid: [pid])
+    monkeypatch.setattr(formalizer, "_session_member_stat", lambda _pid: observed)
+    sleeps: list[float] = []
+    monkeypatch.setattr(formalizer.time, "sleep", lambda seconds: sleeps.append(seconds))
+    try:
+        if observed["state"] == "R":
+            assert formalizer._audit_or_confirmed_launcher_exit(
+                process,
+                expected,
+                {pid: expected},
+            ) is None
+            assert sleeps == [formalizer.SESSION_MEMBER_REVALIDATION_SECONDS]
+        else:
+            assert observed["state"] == "Z"
+            audit = formalizer._audit_exact_process_group(expected, known_members={pid: expected})
+            assert audit["member_pids"] == [pid]
+            process.wait(timeout=2)
+        with pytest.raises(formalizer.Stage1S18ManualInterventionRequired):
+            formalizer._audit_exact_process_group(expected, known_members={})
+    finally:
+        if process.poll() is None:
+            process.kill()
+        process.wait(timeout=2)
 
 
 @pytest.mark.skipif(os.name != "posix" or not Path("/proc").is_dir() or not hasattr(os, "pidfd_open") or not hasattr(signal, "pidfd_send_signal"), reason="requires Linux /proc and pidfd")
