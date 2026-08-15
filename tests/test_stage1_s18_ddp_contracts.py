@@ -336,9 +336,18 @@ def test_launch_audit_allows_only_confirmed_natural_exit_race(monkeypatch: pytes
     formalizer = _formalizer()
     fingerprint = {"pid": 100, "ppid": 1, "uid": 7, "pgid": 100, "sid": 100, "start_ticks": "10", "exe": "/usr/bin/python", "cmdline_sha256": "a" * 64, "environment_run_token": "b" * 64}
     monkeypatch.setattr(formalizer, "_audit_exact_process_group", lambda *_args, **_kwargs: (_ for _ in ()).throw(ProcessLookupError(100)))
-    assert formalizer._audit_or_confirmed_launcher_exit(SimpleNamespace(poll=lambda: 0), fingerprint, {100: fingerprint}) is None
+    immediate_waits: list[float] = []
+    immediate_exit = SimpleNamespace(poll=lambda: 0, wait=lambda *, timeout: immediate_waits.append(timeout) or 0)
+    assert formalizer._audit_or_confirmed_launcher_exit(immediate_exit, fingerprint, {100: fingerprint}) is None
+    assert immediate_waits == [formalizer.LAUNCHER_EXIT_CONFIRMATION_TIMEOUT_SECONDS]
+    delayed_waits: list[float] = []
+    delayed_exit = SimpleNamespace(poll=lambda: None, wait=lambda *, timeout: delayed_waits.append(timeout) or 0)
+    assert formalizer._audit_or_confirmed_launcher_exit(delayed_exit, fingerprint, {100: fingerprint}) is None
+    assert delayed_waits == [formalizer.LAUNCHER_EXIT_CONFIRMATION_TIMEOUT_SECONDS]
+    def _still_live(*, timeout: float) -> int:
+        raise subprocess.TimeoutExpired(cmd="torchrun", timeout=timeout)
     with pytest.raises(ProcessLookupError):
-        formalizer._audit_or_confirmed_launcher_exit(SimpleNamespace(poll=lambda: None), fingerprint, {100: fingerprint})
+        formalizer._audit_or_confirmed_launcher_exit(SimpleNamespace(poll=lambda: None, wait=_still_live), fingerprint, {100: fingerprint})
 
 
 @pytest.mark.skipif(os.name != "posix" or not Path("/proc").is_dir() or not hasattr(os, "pidfd_open") or not hasattr(signal, "pidfd_send_signal"), reason="requires Linux /proc and pidfd")

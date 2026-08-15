@@ -113,6 +113,10 @@ PERMUTATIONS = ("rank_swap", "local_reverse")
 _DIGEST = set("0123456789abcdef")
 GPU_UUID_RE = re.compile(r"GPU-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
 _USED_LOOPBACK_RENDEZVOUS_PORTS: set[int] = set()
+# A /proc entry can disappear immediately before Popen observes the launcher's
+# exit.  One bounded wait distinguishes that benign reaping race from a live
+# process whose token/identity can no longer be audited.
+LAUNCHER_EXIT_CONFIRMATION_TIMEOUT_SECONDS = 1.0
 PILE_DOWNLOADER_CMDLINE_SIGNATURES = (
     b"server_xet_download.sh",
     b"pile-full-download",
@@ -1439,13 +1443,15 @@ def _audit_or_confirmed_launcher_exit(process: subprocess.Popen[str], fingerprin
 
     try:
         return _audit_exact_process_group(fingerprint, known_members=known_members)
-    except ProcessLookupError:
-        # ``poll()`` may have observed the launcher before it exited while
-        # /proc has already reaped it.  This is safe only when the immediate
-        # re-check confirms termination; a still-live launcher remains a
-        # fail-closed process-identity error.
-        if process.poll() is None:
-            raise
+    except ProcessLookupError as audit_error:
+        # /proc can reap the launcher just before Popen's non-blocking poll
+        # observes that exit.  Confirm natural termination with one frozen,
+        # bounded wait; accepting a timeout would turn a live identity drift
+        # into a cleanup bypass, so preserve the original audit failure.
+        try:
+            process.wait(timeout=LAUNCHER_EXIT_CONFIRMATION_TIMEOUT_SECONDS)
+        except subprocess.TimeoutExpired:
+            raise audit_error from None
         return None
 
 
