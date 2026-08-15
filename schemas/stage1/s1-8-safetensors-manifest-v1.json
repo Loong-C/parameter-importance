@@ -1,0 +1,5 @@
+{
+  "$id":"stage1-s1-8-safetensors-manifest-v1.json","$schema":"https://json-schema.org/draft/2020-12/schema","type":"object","additionalProperties":false,
+  "required":["schema_version","file","file_sha256","file_size_bytes","tensors","artifact_hash"],
+  "properties":{"schema_version":{"const":"stage1-s1-8-safetensors-manifest-v1"},"file":{"type":"string","pattern":"^route-[ABCD]\\.safetensors$"},"file_sha256":{"type":"string","pattern":"^[0-9a-f]{64}$"},"file_size_bytes":{"type":"integer","exclusiveMinimum":0},"tensors":{"type":"object","minProperties":1,"propertyNames":{"type":"string","minLength":1},"additionalProperties":{"type":"object","additionalProperties":false,"required":["sha256","dtype","shape"],"properties":{"sha256":{"type":"string","pattern":"^[0-9a-f]{64}$"},"dtype":{"const":"torch.float32"},"shape":{"type":"array","minItems":1,"items":{"type":"integer","minimum":1}}}}},"artifact_hash":{"type":"string","pattern":"^[0-9a-f]{64}$"}}
+}

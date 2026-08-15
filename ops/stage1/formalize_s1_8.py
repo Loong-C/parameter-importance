@@ -1,0 +1,1252 @@
+"""Fail-closed formalizer for S1.8 real DDP/no-sync accumulation evidence.
+
+The command is deliberately inert until an operator supplies four approved GPU
+UUIDs.  It never accepts a physical GPU index, refreshes topology immediately
+before the lease, runs an independent pre-route scale oracle before constructing
+the fixture, and publishes no success marker after any controlled failure.
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+from datetime import datetime, timezone
+import hashlib
+import html
+import importlib.util
+import json
+import math
+import os
+from pathlib import Path, PurePosixPath
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import time
+from typing import Any, Mapping, Sequence
+
+
+TASK_ID = "stage1.08_ddp_and_gradient_accumulation"
+GATE_ID = "G1-DDP"
+EXPECTED_S1_7_PRODUCER = "dcc92506947c3ea30bed75542e006a26d5a2af1b"
+EXPECTED_S1_7_INDEX_SHA256 = "4ca26c82d3e6246e0b99c7fc7a35882f712fc1142fa8f3fe9f5191bce64c2a7f"
+EXPECTED_S1_7_ARTIFACT_HASH = "21b14bdec009bee827dea5d604b363c6ce46ce55c06334d0409a2dc4400292cb"
+EXPECTED_G1_SINGLE_HASH = "0c8d91dc010533a5c99229fe0c8577e10278f41d0f3fd754d885749c511e7f37"
+EXPECTED_MODEL_READY_SHA256 = "7d3404906f3dd00c0d0314863f706c5df01f1db1fc0e0b4cf501353b88963d1e"
+EXPECTED_PILE_LOGICAL_ASSET_ID = "pile-selected-prefix"
+EXPECTED_PILE_READY_SHA256 = "345cd0f49d35ad9543daa3f95118013c55bdd729ed87fdec3c7a7c93ae449f8b"
+EXPECTED_PILE_STORAGE_KIND = "pythia_mmap_shards"
+EXPECTED_PILE_PROVENANCE = {
+    "acquisition_ref": "manifests/evidence/g3/acquisition/9a51688c24143b98f56151551265efc8a9a5ad9767517de65cf915ef7b667b5a.json",
+    "acquisition_sha256": "9a51688c24143b98f56151551265efc8a9a5ad9767517de65cf915ef7b667b5a",
+    "asset_id": "dbbfeb12bab4027b386bd97d604d8134699e96f79e309cceacff7999a55b5dad",
+    "asset_root_ref": "datasets/pile-deduped-pythia-preshuffled",
+    "directory_content_sha256": None,
+    "g3_resolution_artifact_hash": "a3bc369bcb6f7dd2ba7dbd83a59d518d64d4431e355150c92d8a0cda02cb2a92",
+    "g3_resolution_ref": "evidence/stage0/tasks/04-a3bc369bcb6f7dd2ba7dbd83a59d518d64d4431e355150c92d8a0cda02cb2a92/commits/asset_resolution.json",
+    "logical_asset_id": EXPECTED_PILE_LOGICAL_ASSET_ID,
+    "manifest_ref": "manifests/data/pile-pretokenized.json",
+    "qualification_artifact_hash": "b86c8b6eec6f915e62d568cfbc3cb4493df3ec0397a1adbfe2947941b7ec686a",
+    "qualification_ref": "manifests/qualifications/pile-selected-prefix.json",
+    "ready_manifest_sha256": EXPECTED_PILE_READY_SHA256,
+    "schema_version": "qualified-g3-runtime-provenance-v1",
+    "source_git_commit": "54b1c7f87eda0533b29622b39cc8a7ec90646d0b",
+    "storage_kind": EXPECTED_PILE_STORAGE_KIND,
+    "verification_ref": "manifests/evidence/g3/verification/9a51688c24143b98f56151551265efc8a9a5ad9767517de65cf915ef7b667b5a.json",
+    "verification_sha256": "2bc057850d5e7daf5da03c5c1e60c18c1281e7117fd13b677b964db95e20e605",
+}
+EXPECTED_GPU_CAPABILITY_REF = "evidence/stage0/bootstrap/a15f0e2970b7cae6951dd606ebd396a8df68255c/commits/capability_cuda.json"
+EXPECTED_GPU_CAPABILITY_ARTIFACT_HASH = "a536e191cd59318325289d238db727f8939767e384bfccd961ae7ca1c6a11ce4"
+EXPECTED_GPU_CAPABILITY_FILE_SHA256 = "1d5f28369f4119c1e46072a687d217e2b2ad2de0bd02269acd42f14083c14b1f"
+ROUTE_WORLD = {"A": 1, "B": 1, "C": 2, "D": 4}
+PERMUTATIONS = ("rank_swap", "local_reverse")
+_DIGEST = set("0123456789abcdef")
+GPU_UUID_RE = re.compile(r"GPU-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
+GATE_CHECK_IDS = (
+    "s1_7_handoff", "consumer_diff", "approved_four_uuid_topology", "nccl_smoke", "pre_route_scale_oracle",
+    "real_routes_equal_and_weighted", "rank_partition_and_no_sync", "manual_collective_contract",
+    "independent_fp64_replay", "optimizer_and_accumulator", "rank_and_order_permutations",
+    "ordinary_sync_negative", "controlled_rank_failure", "array_manifest", "resource_summary", "lease_release_reacquire",
+    "charts_no_a_u_reference", "schemas_and_atomic_publication",
+)
+IMPLEMENTATION_SOURCE_FILES = (
+    "ops/stage1/formalize_s1_8.py", "ops/stage1/run_s1_8_worker.py", "ops/stage1/run_s1_8_scale_oracle.py", "ops/stage1/run_s1_8_nccl_smoke.py",
+    "ops/stage1/formalize_s1_6.py",
+    "src/param_importance_nlp/stage1_ddp.py", "src/param_importance_nlp/stage1_ddp_oracle.py", "src/param_importance_nlp/stage1_ddp_scale_oracle.py",
+    "src/param_importance_nlp/atomic.py", "src/param_importance_nlp/contracts/errors.py", "src/param_importance_nlp/contracts/jsonio.py", "src/param_importance_nlp/contracts/runtime_evidence.py",
+    "src/param_importance_nlp/core/accumulator.py", "src/param_importance_nlp/core/errors.py", "src/param_importance_nlp/core/tensors.py",
+    "src/param_importance_nlp/g3_runtime_assets.py", "src/param_importance_nlp/runtime/operations.py", "src/param_importance_nlp/runtime/task_artifacts.py",
+    "configs/stage0/g3-asset-requirements-v1.json", "configs/stage0/g3-asset-layout-v1.json",
+    "schemas/stage1/s1-8-array-bundle-v1.json", "schemas/stage1/s1-8-comparison-table-v1.json", "schemas/stage1/s1-8-ddp-report-v1.json", "schemas/stage1/s1-8-fixture-manifest-v1.json", "schemas/stage1/s1-8-formalization-index-v1.json", "schemas/stage1/s1-8-gate-record-v1.json", "schemas/stage1/s1-8-replay-validation-v1.json", "schemas/stage1/s1-8-safetensors-manifest-v1.json", "schemas/stage1/s1-8-validation-v1.json", "schemas/stage1/s1-8-worker-report-v1.json",
+)
+
+
+class Stage1S18FormalError(RuntimeError):
+    """A formal prerequisite, worker observation, or publication check failed."""
+
+
+class Stage1S18ManualInterventionRequired(Stage1S18FormalError):
+    """A process fingerprint drift makes a signal/lease release unsafe."""
+
+
+def _now() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _sha(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _implementation_source_map(repository: Path) -> dict[str, str]:
+    result: dict[str, str] = {}
+    for reference in IMPLEMENTATION_SOURCE_FILES:
+        file = repository / reference
+        if not file.is_file():
+            raise Stage1S18FormalError("S18_IMPLEMENTATION_SOURCE_MISSING:" + reference)
+        result[reference] = _sha(file)
+    return result
+
+
+def _mapping(value: object, *, field: str) -> dict[str, Any]:
+    if not isinstance(value, Mapping) or any(not isinstance(key, str) for key in value):
+        raise Stage1S18FormalError(f"S18_FORMAL_OBJECT_INVALID:{field}")
+    return dict(value)
+
+
+def _canonical(value: object) -> str:
+    from param_importance_nlp.contracts.jsonio import canonical_json_hash
+    return canonical_json_hash(value)
+
+
+def _with_hash(value: Mapping[str, Any]) -> dict[str, Any]:
+    body = dict(value)
+    if "artifact_hash" in body:
+        raise Stage1S18FormalError("S18_FORMAL_ARTIFACT_HASH_DERIVED")
+    body["artifact_hash"] = _canonical(body)
+    return body
+
+
+def _self_hash(value: Mapping[str, Any]) -> bool:
+    body = dict(value); declared = body.pop("artifact_hash", None)
+    return isinstance(declared, str) and declared == _canonical(body)
+
+
+def _write(path: Path, value: Mapping[str, Any]) -> None:
+    from param_importance_nlp.contracts.jsonio import write_canonical_json
+    if path.exists():
+        raise Stage1S18FormalError(f"S18_FORMAL_IMMUTABLE_COLLISION:{path}")
+    write_canonical_json(path, dict(value))
+
+
+def _validate_output_schemas(repository: Path, objects: Mapping[str, Mapping[str, Any]]) -> None:
+    """Validate every published role with the project's strict schema subset."""
+
+    from param_importance_nlp.contracts.jsonio import loads_strict_json
+    validator_path = repository / "ops" / "stage1" / "formalize_s1_6.py"
+    spec = importlib.util.spec_from_file_location("_s18_schema_subset", validator_path)
+    if spec is None or spec.loader is None:
+        raise Stage1S18FormalError("S18_SCHEMA_VALIDATOR_LOAD_FAILED")
+    module = importlib.util.module_from_spec(spec); spec.loader.exec_module(module)
+    registry: dict[str, Mapping[str, Any]] = {}
+    for path in sorted((repository / "schemas" / "stage1").glob("s1-8-*.json")):
+        value = loads_strict_json(path.read_bytes())
+        if not isinstance(value, Mapping) or not isinstance(value.get("$id"), str):
+            raise Stage1S18FormalError("S18_SCHEMA_REGISTRY_INVALID:" + path.name)
+        registry[path.name] = value; registry[str(value["$id"])] = value
+    filenames = {
+        "fixture_manifest": "s1-8-fixture-manifest-v1.json", "ddp_report": "s1-8-ddp-report-v1.json",
+        "array_bundle": "s1-8-array-bundle-v1.json", "comparison_table": "s1-8-comparison-table-v1.json",
+        "gate_record": "s1-8-gate-record-v1.json", "replay": "s1-8-replay-validation-v1.json",
+        "validation": "s1-8-validation-v1.json", "index": "s1-8-formalization-index-v1.json",
+        "worker_report": "s1-8-worker-report-v1.json", "safetensors_manifest": "s1-8-safetensors-manifest-v1.json",
+    }
+    for role, value in objects.items():
+        schema = registry.get(filenames.get(role, ""))
+        if schema is None:
+            raise Stage1S18FormalError("S18_SCHEMA_ROLE_UNKNOWN:" + role)
+        try:
+            module._validate_schema(value, schema, registry, document=schema, path=role)
+        except Exception as error:
+            raise Stage1S18FormalError("S18_SCHEMA_VALIDATION_FAILED:" + role) from error
+
+
+def _schema_prepublication_check(repository: Path, objects: Mapping[str, Mapping[str, Any]]) -> bool:
+    """Validate real role instances and reject schemas with naked objects."""
+
+    from param_importance_nlp.contracts.jsonio import loads_strict_json
+    expected = {
+        "s1-8-array-bundle-v1.json", "s1-8-comparison-table-v1.json", "s1-8-ddp-report-v1.json",
+        "s1-8-fixture-manifest-v1.json", "s1-8-formalization-index-v1.json", "s1-8-gate-record-v1.json",
+        "s1-8-replay-validation-v1.json", "s1-8-safetensors-manifest-v1.json", "s1-8-validation-v1.json", "s1-8-worker-report-v1.json",
+    }
+    paths = {path.name: path for path in (repository / "schemas" / "stage1").glob("s1-8-*.json")}
+    if set(paths) != expected:
+        raise Stage1S18FormalError("S18_SCHEMA_SET_INVALID")
+    def strict(node: object, *, location: str) -> None:
+        if isinstance(node, Mapping):
+            additional = node.get("additionalProperties")
+            if node.get("type") == "object" and "properties" not in node and (not isinstance(additional, Mapping) or not additional):
+                raise Stage1S18FormalError("S18_SCHEMA_BARE_OBJECT:" + location)
+            for key, value in node.items(): strict(value, location=location + "." + str(key))
+        elif isinstance(node, list):
+            for index, value in enumerate(node): strict(value, location=location + f"[{index}]")
+    for name, path in paths.items(): strict(loads_strict_json(path.read_bytes()), location=name)
+    _validate_output_schemas(repository, objects)
+    return True
+
+
+def _canonical_file_sha(value: Mapping[str, Any]) -> str:
+    """Return the SHA-256 of the exact canonical file bytes for ``value``."""
+
+    from param_importance_nlp.contracts.jsonio import canonical_json_bytes
+    return hashlib.sha256(canonical_json_bytes(dict(value))).hexdigest()
+
+
+def _require_sha256(value: object, *, field: str) -> str:
+    if not isinstance(value, str) or len(value) != 64 or set(value) - _DIGEST:
+        raise Stage1S18FormalError("S18_CANDIDATE_SHA256_INVALID:" + field)
+    return value
+
+
+def _validate_worker_candidate_contract(route_key: str, report: Mapping[str, Any]) -> None:
+    """Apply route-specific semantics that JSON Schema cannot express alone."""
+
+    route, cases = report.get("route"), report.get("cases")
+    if not isinstance(route, str) or route not in ROUTE_WORLD or not isinstance(cases, list) or [row.get("case") if isinstance(row, Mapping) else None for row in cases] != ["equal", "weighted"]:
+        raise Stage1S18FormalError("S18_CANDIDATE_WORKER_CASE_CARDINALITY_INVALID:" + route_key)
+    if (route_key in ROUTE_WORLD and route_key != route) or (route_key.startswith("D-") and route != "D") or report.get("world_size") != ROUTE_WORLD[route]:
+        raise Stage1S18FormalError("S18_CANDIDATE_WORKER_ROUTE_WORLD_INVALID:" + route_key)
+    visible, rank_uuids = report.get("visible_gpu_uuids"), report.get("rank_to_gpu_uuid")
+    if not isinstance(visible, list) or not isinstance(rank_uuids, list) or visible != rank_uuids or len(visible) != ROUTE_WORLD[route] or len(set(visible)) != len(visible) or any(not isinstance(value, str) or GPU_UUID_RE.fullmatch(value) is None for value in visible):
+        raise Stage1S18FormalError("S18_CANDIDATE_WORKER_UUID_INVALID:" + route_key)
+    layout = _mapping(report.get("route_layout"), field="candidate.worker.route_layout")
+    partitions = layout.get("rank_microbatch_ids")
+    if layout.get("route") != route or layout.get("world_size") != ROUTE_WORLD[route] or not isinstance(partitions, list) or len(partitions) != ROUTE_WORLD[route] or sorted(item for part in partitions if isinstance(part, list) for item in part) != list(range(8)):
+        raise Stage1S18FormalError("S18_CANDIDATE_WORKER_LAYOUT_INVALID:" + route_key)
+    for ordinal, row_raw in enumerate(cases, start=1):
+        row = _mapping(row_raw, field="candidate.worker.case")
+        keys, accumulator = row.get("array_keys"), row.get("accumulator")
+        if not isinstance(keys, list) or any(not isinstance(key, str) for key in keys):
+            raise Stage1S18FormalError("S18_CANDIDATE_WORKER_ARRAY_KEY_INVALID:" + route_key)
+        rank_records = row.get("rank_records")
+        if not isinstance(rank_records, list) or len(rank_records) != ROUTE_WORLD[route] or sorted(_mapping(record, field="candidate.worker.rank").get("rank") for record in rank_records) != list(range(ROUTE_WORLD[route])):
+            raise Stage1S18FormalError("S18_CANDIDATE_WORKER_RANK_CARDINALITY_INVALID:" + route_key)
+        has_u, has_accumulator = any("/u_" in key for key in keys), any(key.startswith("accumulator/") for key in keys)
+        if route == "A":
+            if accumulator is not None or has_u or has_accumulator or any(key.startswith(("scores/", "stats/")) for key in keys) or not all(any(key.startswith(f"a-reference/{row['case']}/{field}/") for key in keys) for field in ("mean_gradient", "raw_core", "raw_score", "raw_score_clipped", "data_update", "magnitude")):
+                raise Stage1S18FormalError("S18_CANDIDATE_A_U_OR_ACCUMULATOR_FORBIDDEN")
+            continue
+        summary = _mapping(accumulator, field="candidate.worker.accumulator")
+        expected_summary = {"successful_steps", "skipped_steps", "signed_identity", "absolute_identity", "contribution_checksums", "cumulative_checksums"}
+        if set(summary) != expected_summary or summary.get("successful_steps") != ordinal or summary.get("skipped_steps") != 0 or summary.get("signed_identity") is not True or summary.get("absolute_identity") is not True or not has_u or not has_accumulator:
+            raise Stage1S18FormalError("S18_CANDIDATE_U_ACCUMULATOR_REQUIRED:" + route_key)
+        contribution = _mapping(summary.get("contribution_checksums"), field="candidate.worker.contribution_checksums")
+        cumulative = _mapping(summary.get("cumulative_checksums"), field="candidate.worker.cumulative_checksums")
+        if set(contribution) != {"signed", "raw", "raw_clipped", "data_update", "total_update", "weight_decay_update", "actual_update_raw_importance"} or set(cumulative) != {"signed", "positive", "negative_mass", "absolute", "raw", "raw_clipped", "data_movement", "net_data_movement", "total_movement", "total_endpoint_movement", "weight_decay_movement", "net_weight_decay_movement", "actual_update_raw_importance", "magnitude"} or any(_require_sha256(value, field="accumulator_checksum") != value for value in (*contribution.values(), *cumulative.values())):
+            raise Stage1S18FormalError("S18_CANDIDATE_ACCUMULATOR_CHECKSUM_SET_INVALID:" + route_key)
+        statistic_keys = {"s1", "s2"} if row.get("case") == "equal" else {"g1", "g2"}
+        if set(_mapping(row.get("global_statistic_checksums"), field="candidate.worker.statistics")) != statistic_keys or not all(any(key.startswith(f"stats/{row['case']}/{field}/") for key in keys) for field in statistic_keys) or not all(any(key.startswith(f"scores/{row['case']}/{field}/") for key in keys) for field in ("mean_gradient", "raw_core", "u_core", "raw_score", "u_score", "u_score_clipped")):
+            raise Stage1S18FormalError("S18_CANDIDATE_WORKER_STATISTICS_OR_ARRAYS_INVALID:" + route_key)
+
+
+def _candidate_publication_check(
+    *,
+    repository: Path,
+    objects: Mapping[str, Mapping[str, Any]],
+    worker_reports: Mapping[str, Mapping[str, Any]],
+    manifests: Mapping[str, Mapping[str, Any]],
+    source_files: Mapping[str, Path],
+) -> bool:
+    """Strictly validate the complete candidate before staging can succeed.
+
+    This deliberately checks the in-memory objects *and* their prospective
+    canonical file identities.  It is called before a PASS gate is emitted and
+    again after the byte-identical staging copy.  A later role cannot turn a
+    successful gate into a schema surprise.
+    """
+
+    expected_roles = {
+        "fixture_manifest", "ddp_report", "array_bundle", "comparison_table",
+        "gate_record", "replay", "validation", "index",
+    }
+    if set(objects) != expected_roles:
+        raise Stage1S18FormalError("S18_CANDIDATE_ROLE_SET_INVALID")
+    _schema_prepublication_check(repository, objects)
+    if set(worker_reports) != {"A", "B", "C", "D", "D-rank_swap", "D-local_reverse"} or set(manifests) != set(worker_reports):
+        raise Stage1S18FormalError("S18_CANDIDATE_WORKER_ROUTE_SET_INVALID")
+    for route_key in sorted(worker_reports):
+        report, manifest = worker_reports[route_key], manifests[route_key]
+        _validate_output_schemas(repository, {"worker_report": report, "safetensors_manifest": manifest})
+        if not _self_hash(report) or not _self_hash(manifest):
+            raise Stage1S18FormalError("S18_CANDIDATE_WORKER_SELF_HASH_INVALID:" + route_key)
+        if _mapping(report.get("arrays"), field="candidate.worker.arrays") != manifest:
+            raise Stage1S18FormalError("S18_CANDIDATE_WORKER_MANIFEST_CROSSREF_INVALID:" + route_key)
+        _validate_worker_candidate_contract(route_key, report)
+
+    fixture, ddp, bundle, table, gate, replay_record, validation, index = (
+        objects["fixture_manifest"], objects["ddp_report"], objects["array_bundle"],
+        objects["comparison_table"], objects["gate_record"], objects["replay"],
+        objects["validation"], objects["index"],
+    )
+    if any(not _self_hash(value) for value in objects.values()):
+        raise Stage1S18FormalError("S18_CANDIDATE_SELF_HASH_INVALID")
+    role_names = {
+        "fixture_manifest": "fixture-manifest.json", "ddp_report": "ddp-report.json",
+        "array_bundle": "array-bundle.json", "comparison_table": "comparison-table.json",
+        "gate_record": "g1-ddp-record.json",
+    }
+    role_refs, role_sha = _mapping(index.get("role_refs"), field="candidate.index.role_refs"), _mapping(index.get("role_sha256"), field="candidate.index.role_sha256")
+    if role_refs != role_names or set(role_sha) != set(role_names):
+        raise Stage1S18FormalError("S18_CANDIDATE_ROLE_REFERENCE_SET_INVALID")
+    for role, name in role_names.items():
+        digest = _canonical_file_sha(objects[role])
+        if _require_sha256(role_sha.get(role), field="role_sha." + role) != digest:
+            raise Stage1S18FormalError("S18_CANDIDATE_ROLE_HASH_DRIFT:" + role)
+        if _mapping(validation.get("role_sha256"), field="candidate.validation.role_sha256").get(role) != digest:
+            raise Stage1S18FormalError("S18_CANDIDATE_VALIDATION_ROLE_HASH_DRIFT:" + role)
+        if name not in source_files and role != "gate_record":
+            # The five public roles are not reproduction inputs.  Their exact
+            # identities are checked above rather than requiring duplication.
+            continue
+
+    requirements = _mapping(gate.get("requirements"), field="candidate.gate.requirements")
+    checks = validation.get("checks")
+    if set(requirements) != set(GATE_CHECK_IDS) or any(value is not True for value in requirements.values()):
+        raise Stage1S18FormalError("S18_CANDIDATE_GATE_REQUIREMENTS_INVALID")
+    if not isinstance(checks, list) or [entry.get("check_id") if isinstance(entry, Mapping) else None for entry in checks] != list(GATE_CHECK_IDS):
+        raise Stage1S18FormalError("S18_CANDIDATE_VALIDATION_CHECK_ORDER_INVALID")
+    if any(not isinstance(entry, Mapping) or entry.get("status") != "PASS" for entry in checks):
+        raise Stage1S18FormalError("S18_CANDIDATE_VALIDATION_CHECK_STATUS_INVALID")
+    if index.get("gate_artifact_hash") != gate.get("artifact_hash") or index.get("validation_ref") != "validation.json" or index.get("validation_sha256") != _canonical_file_sha(validation) or index.get("replay_ref") != "replay-validation.json" or index.get("replay_sha256") != _canonical_file_sha(replay_record):
+        raise Stage1S18FormalError("S18_CANDIDATE_INDEX_ROLE_CROSSREF_INVALID")
+    if ddp.get("fixture_hash") != fixture.get("fixture_hash") or table.get("status") != "PASS" or replay_record.get("status") != "PASS":
+        raise Stage1S18FormalError("S18_CANDIDATE_FIXTURE_OR_REPLAY_CROSSREF_INVALID")
+    if index.get("implementation_source_sha256") != ddp.get("implementation_source_sha256"):
+        raise Stage1S18FormalError("S18_CANDIDATE_SOURCE_MAP_CROSSREF_INVALID")
+    source_map = _mapping(index.get("implementation_source_sha256"), field="candidate.source_map")
+    if set(source_map) != set(IMPLEMENTATION_SOURCE_FILES) or any(_require_sha256(value, field="source_map." + key) != value for key, value in source_map.items()):
+        raise Stage1S18FormalError("S18_CANDIDATE_SOURCE_MAP_INVALID")
+    capability = _mapping(index.get("gpu_capability"), field="candidate.gpu_capability")
+    handoff = _mapping(index.get("s1_7_handoff"), field="candidate.s1_7_handoff")
+    if capability.get("artifact_hash") != EXPECTED_GPU_CAPABILITY_ARTIFACT_HASH or handoff.get("producer_commit") != EXPECTED_S1_7_PRODUCER or handoff.get("index_sha256") != EXPECTED_S1_7_INDEX_SHA256 or handoff.get("gate_artifact_hash") != EXPECTED_G1_SINGLE_HASH:
+        raise Stage1S18FormalError("S18_CANDIDATE_UPSTREAM_OR_CAPABILITY_DRIFT")
+
+    refs, hashes = _mapping(index.get("reproduction_role_refs"), field="candidate.reproduction.refs"), _mapping(index.get("reproduction_role_sha256"), field="candidate.reproduction.hashes")
+    if set(refs) != set(hashes) or not refs:
+        raise Stage1S18FormalError("S18_CANDIDATE_REPRODUCTION_ROLE_SET_INVALID")
+    published_names: set[str] = set()
+    for role, name in refs.items():
+        if not isinstance(name, str) or name in published_names or name not in source_files:
+            raise Stage1S18FormalError("S18_CANDIDATE_REPRODUCTION_REF_INVALID:" + str(role))
+        published_names.add(name)
+        source = source_files[name]
+        if not source.is_file() or _require_sha256(hashes.get(role), field="reproduction." + str(role)) != _sha(source):
+            raise Stage1S18FormalError("S18_CANDIDATE_REPRODUCTION_HASH_DRIFT:" + str(role))
+    descriptors = _mapping(bundle.get("route_artifacts"), field="candidate.array_bundle.routes")
+    if set(descriptors) != set(worker_reports):
+        raise Stage1S18FormalError("S18_CANDIDATE_ARRAY_DESCRIPTOR_SET_INVALID")
+    for route_key, raw in descriptors.items():
+        descriptor = _mapping(raw, field="candidate.array_bundle." + route_key)
+        artifact_ref, manifest_ref = descriptor.get("artifact_ref"), descriptor.get("manifest_ref")
+        if not isinstance(artifact_ref, str) or not isinstance(manifest_ref, str) or artifact_ref not in source_files or manifest_ref not in source_files:
+            raise Stage1S18FormalError("S18_CANDIDATE_ARRAY_REFERENCE_INVALID:" + route_key)
+        manifest = manifests[route_key]
+        if _sha(source_files[artifact_ref]) != descriptor.get("file_sha256") or source_files[artifact_ref].stat().st_size != descriptor.get("file_size_bytes") or _sha(source_files[manifest_ref]) != _canonical_file_sha(worker_reports[route_key]) or descriptor.get("manifest_hash") != manifest.get("artifact_hash"):
+            raise Stage1S18FormalError("S18_CANDIDATE_ARRAY_DESCRIPTOR_DRIFT:" + route_key)
+    return True
+
+
+def _path(root: Path, reference: object, *, field: str) -> Path:
+    if not isinstance(reference, str) or not reference or "\\" in reference:
+        raise Stage1S18FormalError(f"S18_FORMAL_REF_INVALID:{field}")
+    logical = PurePosixPath(reference)
+    if logical.is_absolute() or any(part in {"", ".", ".."} for part in logical.parts):
+        raise Stage1S18FormalError(f"S18_FORMAL_REF_ESCAPE:{field}")
+    candidate = root.joinpath(*logical.parts).resolve()
+    try:
+        candidate.relative_to(root.resolve())
+    except ValueError as error:
+        raise Stage1S18FormalError(f"S18_FORMAL_REF_ESCAPE:{field}") from error
+    return candidate
+
+
+def _candidate(root: Path, index_path: Path, reference: object, *, field: str) -> Path:
+    direct = _path(root, reference, field=field)
+    if direct.is_file():
+        return direct
+    if not isinstance(reference, str):
+        raise Stage1S18FormalError(f"S18_FORMAL_ROLE_REF_INVALID:{field}")
+    relative = (index_path.parent / reference).resolve()
+    try:
+        relative.relative_to(root.resolve())
+    except ValueError as error:
+        raise Stage1S18FormalError(f"S18_FORMAL_ROLE_REF_ESCAPE:{field}") from error
+    return relative
+
+
+def _git(repository: Path, *args: str) -> str:
+    done = subprocess.run(["git", "-C", str(repository), *args], text=True, capture_output=True, timeout=30, check=False)
+    if done.returncode:
+        raise Stage1S18FormalError(f"S18_FORMAL_GIT_FAILED:{args[0]}")
+    return done.stdout.strip()
+
+
+def _audit_consumer_diff(repository: Path) -> tuple[str, ...]:
+    """A historical S1.7 gate is invalidated by unrelated semantic drift."""
+
+    if _git(repository, "status", "--porcelain=v1"):
+        raise Stage1S18FormalError("S18_FORMAL_WORKTREE_NOT_CLEAN")
+    changed = tuple(filter(None, _git(repository, "diff", "--name-only", EXPECTED_S1_7_PRODUCER, "HEAD").splitlines()))
+    allowed = (
+        "worklogs/2026-08-15-s1.7-single-gpu-pythia14m.md",
+        "ops/stage1/formalize_s1_8.py", "ops/stage1/run_s1_8_worker.py", "ops/stage1/run_s1_8_scale_oracle.py", "ops/stage1/run_s1_8_nccl_smoke.py",
+    )
+    def owned(name: str) -> bool:
+        return name in allowed or (
+            name.startswith("src/param_importance_nlp/stage1_ddp") and name.endswith(".py")
+        ) or (name.startswith("schemas/stage1/s1-8-") and name.endswith(".json")) or (
+            name.startswith("tests/test_stage1_s18_") and name.endswith(".py")
+        )
+    rejected = [name for name in changed if not owned(name)]
+    if rejected:
+        raise Stage1S18FormalError("S18_S17_CONSUMER_DIFF_UNAUTHORIZED:" + ",".join(rejected))
+    return changed
+
+
+def _validate_frozen_pile_provenance(model_asset: Mapping[str, Any], pile_asset: Mapping[str, Any]) -> None:
+    """Bind the S1.7 Pile READY asset before any S1.8 lease exists."""
+
+    if (
+        dict(pile_asset) != EXPECTED_PILE_PROVENANCE
+        or pile_asset.get("g3_resolution_ref") != model_asset.get("g3_resolution_ref")
+        or pile_asset.get("g3_resolution_artifact_hash") != model_asset.get("g3_resolution_artifact_hash")
+    ):
+        raise Stage1S18FormalError("S18_S17_PILE_PROVENANCE_INVALID")
+
+
+def load_s1_7_handoff(*, data_root: Path, index_ref: str, repository: Path) -> dict[str, Any]:
+    """Consume only the exact approved S1.7 index, gate, roles and fixture."""
+
+    from param_importance_nlp.contracts.jsonio import load_canonical_json
+    _audit_consumer_diff(repository)
+    index_path = _path(data_root, index_ref, field="s1_7_index_ref")
+    if not index_path.is_file() or _sha(index_path) != EXPECTED_S1_7_INDEX_SHA256:
+        raise Stage1S18FormalError("S18_S17_INDEX_HASH_NOT_CURRENT")
+    index = _mapping(load_canonical_json(index_path), field="s1_7.index")
+    if not _self_hash(index) or index.get("schema_version") != "stage1-s1-7-formalization-index-v1" or index.get("status") != "PASS" or index.get("task_id") != "stage1.07_single_gpu_pythia14m" or index.get("generator_git_commit") != EXPECTED_S1_7_PRODUCER or index.get("gate_artifact_hash") != EXPECTED_G1_SINGLE_HASH or index.get("artifact_hash") != EXPECTED_S1_7_ARTIFACT_HASH:
+        raise Stage1S18FormalError("S18_S17_INDEX_IDENTITY_INVALID")
+    next_ids = index.get("next_task_ids")
+    if not isinstance(next_ids, list) or TASK_ID not in next_ids:
+        raise Stage1S18FormalError("S18_S17_NEXT_TASK_NOT_AUTHORIZED")
+    refs = _mapping(index.get("role_refs"), field="s1_7.role_refs")
+    hashes = _mapping(index.get("role_sha256"), field="s1_7.role_sha256")
+    expected_roles = {"fixture_manifest", "single_gpu_report", "gradient_bundle", "comparison_table", "gate_record"}
+    if set(refs) != expected_roles or set(hashes) != expected_roles:
+        raise Stage1S18FormalError("S18_S17_ROLE_SET_INVALID")
+    roles: dict[str, Mapping[str, Any]] = {}
+    for role in sorted(expected_roles):
+        file = _candidate(data_root, index_path, refs[role], field=f"s1_7.{role}")
+        expected = hashes[role]
+        if not isinstance(expected, str) or len(expected) != 64 or not file.is_file() or _sha(file) != expected:
+            raise Stage1S18FormalError(f"S18_S17_ROLE_HASH_INVALID:{role}")
+        roles[role] = _mapping(load_canonical_json(file), field=f"s1_7.{role}")
+    gate = roles["gate_record"]
+    if not _self_hash(gate) or gate.get("status") != "PASS" or gate.get("artifact_hash") != EXPECTED_G1_SINGLE_HASH:
+        raise Stage1S18FormalError("S18_S17_GATE_INVALID")
+    reproduce_refs = _mapping(index.get("reproduction_role_refs"), field="s1_7.reproduction_role_refs")
+    reproduce_hashes = _mapping(index.get("reproduction_role_sha256"), field="s1_7.reproduction_role_sha256")
+    token_ref, token_hash = reproduce_refs.get("fixture_inputs"), reproduce_hashes.get("fixture_inputs")
+    token_file = _candidate(data_root, index_path, token_ref, field="s1_7.fixture_inputs")
+    if not isinstance(token_hash, str) or not token_file.is_file() or _sha(token_file) != token_hash:
+        raise Stage1S18FormalError("S18_S17_FIXTURE_INPUT_HASH_INVALID")
+    fixture = roles["fixture_manifest"]
+    fixture_hash = fixture.get("fixture_hash")
+    if not isinstance(fixture_hash, str) or len(fixture_hash) != 64:
+        raise Stage1S18FormalError("S18_S17_FIXTURE_HASH_INVALID")
+    assets = _mapping(fixture.get("assets"), field="s1_7.fixture.assets")
+    model_asset = _mapping(assets.get("model"), field="s1_7.fixture.assets.model")
+    pile_asset = _mapping(assets.get("pile"), field="s1_7.fixture.assets.pile")
+    resolution_ref = model_asset.get("g3_resolution_ref")
+    if (
+        not isinstance(resolution_ref, str)
+        or model_asset.get("logical_asset_id") != "pythia-14m-step0"
+        or model_asset.get("ready_manifest_sha256") != EXPECTED_MODEL_READY_SHA256
+    ):
+        raise Stage1S18FormalError("S18_S17_MODEL_PROVENANCE_INVALID")
+    _validate_frozen_pile_provenance(model_asset, pile_asset)
+    tokens = fixture.get("token_sha256")
+    if not isinstance(tokens, Mapping) or set(tokens) != {str(index) for index in range(16)}:
+        raise Stage1S18FormalError("S18_S17_TOKEN_HASH_SET_INVALID")
+    return {
+        "index_ref": index_ref, "index_sha256": EXPECTED_S1_7_INDEX_SHA256, "index_artifact_hash": EXPECTED_S1_7_ARTIFACT_HASH,
+        "producer_commit": EXPECTED_S1_7_PRODUCER, "gate_artifact_hash": EXPECTED_G1_SINGLE_HASH,
+        "fixture_hash": fixture_hash, "token_file": token_file, "token_file_sha256": token_hash,
+        "model_resolution_ref": resolution_ref,
+        "model_provenance": model_asset,
+        "pile_provenance": pile_asset,
+        "token_sha256": {str(key): str(value) for key, value in tokens.items()},
+        "role_refs": {str(key): str(value) for key, value in refs.items()}, "role_sha256": {str(key): str(value) for key, value in hashes.items()},
+    }
+
+
+def _audit_pile_download_activity(handoff: Mapping[str, Any], *, proc_root: Path | None = None) -> dict[str, Any]:
+    """Reject project Pile downloader activity without retaining command text."""
+
+    pile = _mapping(handoff.get("pile_provenance"), field="pile.provenance")
+    records: list[dict[str, object]] = []
+    proc_root = Path("/proc") if proc_root is None else proc_root
+    if proc_root.is_dir():
+        for entry in proc_root.iterdir():
+            if not entry.name.isdigit():
+                continue
+            try:
+                cmdline = (entry / "cmdline").read_bytes()
+                if b"parameter" not in cmdline.lower() or b"pile" not in cmdline.lower():
+                    continue
+                stat = (entry / "stat").read_text(encoding="utf-8").split()
+                records.append({"pid": int(entry.name), "uid": (entry / "stat").stat().st_uid, "pgid": os.getpgid(int(entry.name)), "start_ticks": stat[21], "cmdline_sha256": hashlib.sha256(cmdline).hexdigest(), "role": "project_pile_downloader"})
+            except (OSError, ProcessLookupError, IndexError):
+                continue
+    if records:
+        raise Stage1S18FormalError("S18_PILE_DOWNLOAD_ACTIVITY_PRESENT")
+    return {"status": "PASS", "pile_logical_asset_id": pile["logical_asset_id"], "pile_ready_manifest_sha256": pile["ready_manifest_sha256"], "active_count": 0, "process_fingerprints": []}
+
+
+def _frozen_model_and_cache_root(repository: Path, data_root: Path, handoff: Mapping[str, Any]) -> tuple[str, str, dict[str, Any]]:
+    """Freshly re-resolve the S1.7 frozen qualified model, including files."""
+
+    from param_importance_nlp.g3_runtime_assets import FormalG3RuntimeAssets
+
+    cache = _path(data_root, "cache", field="controlled_cache_root")
+    resolution_ref = handoff.get("model_resolution_ref")
+    if not isinstance(resolution_ref, str) or not cache.is_dir():
+        raise Stage1S18FormalError("S18_FROZEN_MODEL_OR_CACHE_INVALID")
+    try:
+        assets = FormalG3RuntimeAssets.load(
+            data_root, resolution_ref,
+            requirements_path=repository / "configs" / "stage0" / "g3-asset-requirements-v1.json",
+            layout_path=repository / "configs" / "stage0" / "g3-asset-layout-v1.json",
+        )
+        model = assets.resolve("pythia-14m-step0", expected_kind="model")
+    except (OSError, TypeError, ValueError) as error:
+        raise Stage1S18FormalError("S18_FROZEN_MODEL_QUALIFIED_RESOLUTION_FAILED") from error
+    if (
+        model.ready_manifest_sha256 != EXPECTED_MODEL_READY_SHA256
+        or model.resolved.asset_id != "11dd681a22649a451b9be53c255bb4e9f83207c3f22f75f1eec53a33b7776fd2"
+        or model.resolved.revision != "56079904bb80b7f36d3b794089f146e7a4d6efae"
+        or model.provenance() != handoff.get("model_provenance")
+    ):
+        raise Stage1S18FormalError("S18_FROZEN_MODEL_IDENTITY_OR_PROVENANCE_DRIFT")
+    summary = {
+        "provenance": model.provenance(),
+        "resolution_ref": resolution_ref,
+        "resolution_artifact_hash": assets.resolution_artifact_hash,
+        "files_checked": len(model.resolved.files),
+        "bytes_checked": sum(item.size_bytes for item in model.resolved.files),
+        "content_hashes": {item.relative_path: item.sha256 for item in model.resolved.files},
+    }
+    return str(model.resolved.root), str(cache), summary
+
+
+def _run(command: Sequence[str], *, timeout: int = 30) -> str:
+    done = subprocess.run(list(command), text=True, capture_output=True, check=False, timeout=timeout)
+    if done.returncode:
+        raise Stage1S18FormalError(f"S18_FORMAL_COMMAND_FAILED:{Path(command[0]).name}:{done.stderr[-300:]}")
+    return done.stdout
+
+
+def _load_capability(data_root: Path, reference: str, approved: Sequence[str]) -> dict[str, Any]:
+    """Consume only the committed, formal CUDA capability record used by S1.7."""
+
+    from param_importance_nlp.runtime.task_artifacts import load_committed_task_artifact
+    from param_importance_nlp.contracts.runtime_evidence import RuntimeCapabilityEvidence
+    if reference != EXPECTED_GPU_CAPABILITY_REF:
+        raise Stage1S18FormalError("S18_GPU_CAPABILITY_REF_NOT_FROZEN")
+    file = _path(data_root, reference, field="gpu_capability_ref")
+    if not file.is_file() or _sha(file) != EXPECTED_GPU_CAPABILITY_FILE_SHA256:
+        raise Stage1S18FormalError("S18_GPU_CAPABILITY_FILE_DRIFT")
+    try:
+        artifact = load_committed_task_artifact(data_root, reference, require_formal=True)
+        evidence = RuntimeCapabilityEvidence.from_mapping(_mapping(artifact.payload, field="gpu_capability.payload"))
+    except (OSError, TypeError, ValueError) as error:
+        raise Stage1S18FormalError("S18_GPU_CAPABILITY_INVALID") from error
+    allowed = _mapping(evidence.metadata, field="gpu_capability.metadata").get("allowed_gpu_uuids")
+    if artifact.identity.task_id != "stage0.01_baseline_and_safety" or artifact.identity.artifact_kind != "capability_cuda" or artifact.identity.artifact_hash != EXPECTED_GPU_CAPABILITY_ARTIFACT_HASH or evidence.capability != "cuda" or evidence.status != "VERIFIED" or not isinstance(allowed, list) or any(uuid not in allowed for uuid in approved):
+        raise Stage1S18FormalError("S18_GPU_CAPABILITY_UUID_NOT_QUALIFIED")
+    return {"commit_ref": artifact.identity.commit_ref, "object_ref": artifact.identity.object_ref, "task_id": artifact.identity.task_id, "artifact_kind": artifact.identity.artifact_kind, "artifact_hash": artifact.identity.artifact_hash, "config_hash": artifact.identity.config_hash, "source_refs": list(artifact.source_refs), "allowed_gpu_uuids": allowed}
+
+
+def discover_approved_gpus(approved_gpu_uuids: Sequence[str]) -> dict[str, Any]:
+    """Resolve exact UUIDs freshly; physical indices are evidence only."""
+
+    values = tuple(approved_gpu_uuids)
+    if len(values) != 4 or len(set(values)) != 4 or any(not isinstance(value, str) or GPU_UUID_RE.fullmatch(value) is None for value in values):
+        raise Stage1S18FormalError("S18_APPROVED_GPU_UUID_SET_INVALID")
+    output = _run(["nvidia-smi", "--query-gpu=index,uuid,name,memory.total,memory.used,utilization.gpu,temperature.gpu,compute_cap", "--format=csv,noheader,nounits"])
+    inventory: dict[str, dict[str, Any]] = {}
+    for line in output.splitlines():
+        fields = [field.strip() for field in line.split(",")]
+        if len(fields) != 8 or not fields[0].isdigit() or GPU_UUID_RE.fullmatch(fields[1]) is None:
+            raise Stage1S18FormalError("S18_GPU_DISCOVERY_PARSE_INVALID")
+        inventory[fields[1]] = {"physical_index": int(fields[0]), "uuid": fields[1], "name": fields[2], "memory_total_mib": int(fields[3]), "memory_used_mib": int(fields[4]), "utilization_percent": int(fields[5]), "temperature_c": int(fields[6]), "compute_capability": fields[7]}
+    selected = []
+    for uuid in values:
+        row = inventory.get(uuid)
+        if row is None or not str(row["name"]).startswith("NVIDIA A100") or int(row["memory_total_mib"]) < 70000 or int(row["memory_used_mib"]) != 0 or int(row["utilization_percent"]) != 0 or int(row["temperature_c"]) >= 85 or str(row["compute_capability"]) != "8.0":
+            raise Stage1S18FormalError("S18_GPU_NOT_IDLE_A100:" + uuid)
+        selected.append(row)
+    processes = _run(["nvidia-smi", "--query-compute-apps=gpu_uuid,pid", "--format=csv,noheader,nounits"])
+    occupied = [line for line in processes.splitlines() if any(uuid in line for uuid in values)]
+    if occupied:
+        raise Stage1S18FormalError("S18_GPU_COMPUTE_PROCESS_PRESENT")
+    return {"selected": selected, "requested_uuid_order": list(values), "compute_apps": []}
+
+
+def _fingerprint(pid: int, run_token: str) -> dict[str, Any]:
+    stat, cmdline, executable = Path(f"/proc/{pid}/stat"), Path(f"/proc/{pid}/cmdline"), Path(f"/proc/{pid}/exe")
+    if not stat.is_file() or not cmdline.is_file() or not executable.exists():
+        raise ProcessLookupError(pid)
+    parts = stat.read_text(encoding="utf-8").split()
+    if len(parts) <= 21:
+        raise ProcessLookupError(pid)
+    environment = Path(f"/proc/{pid}/environ").read_bytes().split(b"\0")
+    token_values = [item.split(b"=", 1)[1].decode("ascii") for item in environment if item.startswith(b"PARAM_IMPORTANCE_S18_RUN_TOKEN=")]
+    if token_values != [run_token]:
+        raise ProcessLookupError(pid)
+    return {"pid": pid, "ppid": int(parts[3]), "uid": stat.stat().st_uid, "pgid": os.getpgid(pid), "sid": os.getsid(pid), "start_ticks": parts[21], "exe": os.readlink(executable), "cmdline_sha256": hashlib.sha256(cmdline.read_bytes()).hexdigest(), "environment_run_token": token_values[0]}
+
+
+def _pgid_members(pgid: int) -> list[int]:
+    members: list[int] = []
+    for entry in Path("/proc").iterdir():
+        if not entry.name.isdigit():
+            continue
+        try:
+            if os.getpgid(int(entry.name)) == pgid:
+                members.append(int(entry.name))
+        except ProcessLookupError:
+            continue
+    return sorted(members)
+
+
+def _audit_exact_process_group(expected: Mapping[str, Any]) -> dict[str, Any]:
+    """Fail closed unless every member is demonstrably this launch tree."""
+
+    pgid, token = expected.get("pgid"), expected.get("environment_run_token")
+    if not isinstance(pgid, int) or not isinstance(token, str):
+        raise Stage1S18ManualInterventionRequired("S18_PROCESS_AUDIT_EXPECTED_INVALID")
+    member_ids = _pgid_members(pgid)
+    observed: list[dict[str, Any]] = []
+    for pid in member_ids:
+        try:
+            fingerprint = _fingerprint(pid, token)
+        except (OSError, ProcessLookupError):
+            raise Stage1S18ManualInterventionRequired("S18_PROCESS_GROUP_MEMBER_UNVERIFIABLE") from None
+        if fingerprint["uid"] != expected.get("uid") or fingerprint["pgid"] != pgid or fingerprint["sid"] != expected.get("sid"):
+            raise Stage1S18ManualInterventionRequired("S18_PROCESS_GROUP_MEMBER_IDENTITY_DRIFT")
+        observed.append(fingerprint)
+    launcher = next((item for item in observed if item["pid"] == expected.get("pid")), None)
+    if launcher != dict(expected):
+        raise Stage1S18ManualInterventionRequired("S18_PROCESS_LAUNCHER_FINGERPRINT_DRIFT")
+    member_set = {item["pid"] for item in observed}
+    if any(item["pid"] != expected["pid"] and item["ppid"] not in member_set for item in observed):
+        raise Stage1S18ManualInterventionRequired("S18_PROCESS_GROUP_TREE_PARENT_DRIFT")
+    return {"pgid": pgid, "members": observed, "member_pids": sorted(member_set)}
+
+
+def _manual_intervention(work: Path, label: str, expected: Mapping[str, Any], *, reason: str, observed: object) -> None:
+    _write(work / f"{label}-manual-intervention.json", _with_hash({"schema_version": "stage1-s1-8-manual-intervention-v1", "status": "BLOCKED", "reason": reason, "expected_fingerprint": dict(expected), "observed": observed, "action": "NO_SIGNAL_NO_LEASE_RELEASE"}))
+
+
+def _terminate_exact(process: subprocess.Popen[str], expected: Mapping[str, Any], work: Path, *, label: str) -> None:
+    try:
+        audit = _audit_exact_process_group(expected)
+    except Stage1S18ManualInterventionRequired as error:
+        _manual_intervention(work, label, expected, reason=str(error), observed={"pgid_members": _pgid_members(int(expected["pgid"]))})
+        raise
+    except ProcessLookupError:
+        survivors = _pgid_members(int(expected["pgid"]))
+        if survivors:
+            _manual_intervention(work, label, expected, reason="S18_LAUNCHER_GONE_PROCESS_GROUP_REMAINS", observed={"pgid_members": survivors})
+            raise Stage1S18ManualInterventionRequired("S18_LAUNCHER_GONE_PROCESS_GROUP_REMAINS")
+        return
+    _write(work / f"{label}-termination-audit.json", _with_hash({"schema_version": "stage1-s1-8-process-tree-audit-v1", "status": "PASS", "phase": "pre_signal", "expected_launcher": dict(expected), "observed_tree": audit}))
+    os.killpg(int(expected["pgid"]), signal.SIGTERM)
+    try:
+        process.wait(timeout=30)
+    except subprocess.TimeoutExpired:
+        try:
+            audit = _audit_exact_process_group(expected)
+        except Stage1S18ManualInterventionRequired as error:
+            _manual_intervention(work, label, expected, reason=str(error), observed={"pgid_members": _pgid_members(int(expected["pgid"]))})
+            raise
+        os.killpg(int(expected["pgid"]), signal.SIGKILL)
+        process.wait(timeout=30)
+    residual = _pgid_members(int(expected["pgid"]))
+    if residual:
+        _manual_intervention(work, label, expected, reason="S18_PROCESS_GROUP_RESIDUAL_AFTER_TERMINATION", observed={"pgid_members": residual})
+        raise Stage1S18ManualInterventionRequired("S18_PROCESS_GROUP_RESIDUAL_AFTER_TERMINATION")
+
+
+def _launch(
+    *, repository: Path, work: Path, label: str, command: Sequence[str], environment: Mapping[str, str],
+    run_token: str, timeout_seconds: int, lease: object, expected_success: bool,
+) -> dict[str, Any]:
+    stdout_path, stderr_path = work / f"{label}.stdout.txt", work / f"{label}.stderr.txt"
+    env = dict(environment); env["PARAM_IMPORTANCE_S18_RUN_TOKEN"] = run_token
+    with stdout_path.open("w", encoding="utf-8") as stdout, stderr_path.open("w", encoding="utf-8") as stderr:
+        process = subprocess.Popen(list(command), cwd=repository, text=True, stdout=stdout, stderr=stderr, env=env, start_new_session=True)
+        fingerprint = _fingerprint(process.pid, run_token)
+        initial_tree = _audit_exact_process_group(fingerprint)
+        _write(work / f"{label}-process-tree-initial.json", _with_hash({"schema_version": "stage1-s1-8-process-tree-audit-v1", "status": "PASS", "phase": "launch", "expected_launcher": fingerprint, "observed_tree": initial_tree}))
+        started = time.monotonic()
+        while process.poll() is None:
+            if time.monotonic() - started > timeout_seconds:
+                _terminate_exact(process, fingerprint, work, label=label)
+                raise Stage1S18FormalError(f"S18_{label.upper()}_TIMEOUT")
+            lease.heartbeat()
+            time.sleep(2)
+        process.wait(timeout=30)
+    residual = _pgid_members(int(fingerprint["pgid"]))
+    if residual:
+        _manual_intervention(work, label, fingerprint, reason=f"S18_{label.upper()}_PROCESS_GROUP_RESIDUAL", observed={"pgid_members": residual})
+        raise Stage1S18ManualInterventionRequired(f"S18_{label.upper()}_PROCESS_GROUP_RESIDUAL")
+    outcome = _with_hash({"schema_version": "stage1-s1-8-process-outcome-v1", "label": label, "command": list(command), "rendezvous_id": run_token, "returncode": process.returncode, "fingerprint": fingerprint, "initial_tree": initial_tree, "termination_audit_ref": f"{label}-termination-audit.json" if (work / f"{label}-termination-audit.json").is_file() else None, "stdout_sha256": _sha(stdout_path), "stderr_sha256": _sha(stderr_path), "expected_success": expected_success, "residual_pgid_members": []})
+    _write(work / f"{label}.process.json", outcome)
+    if (process.returncode == 0) != expected_success:
+        raise Stage1S18FormalError(f"S18_{label.upper()}_UNEXPECTED_EXIT")
+    return outcome
+
+
+def _load_arrays(route_dir: Path, report: Mapping[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+    try:
+        from safetensors import safe_open
+    except ImportError as error:  # pragma: no cover - server runtime dependency
+        raise Stage1S18FormalError("S18_SAFETENSORS_UNAVAILABLE") from error
+    manifest = _mapping(report.get("arrays"), field="route.arrays")
+    if not _self_hash(manifest) or manifest.get("schema_version") != "stage1-s1-8-safetensors-manifest-v1":
+        raise Stage1S18FormalError("S18_ARRAY_MANIFEST_INVALID")
+    file = route_dir / str(manifest.get("file"))
+    if not file.is_file() or _sha(file) != manifest.get("file_sha256") or file.stat().st_size != manifest.get("file_size_bytes"):
+        raise Stage1S18FormalError("S18_ARRAY_FILE_DRIFT")
+    tensors = _mapping(manifest.get("tensors"), field="route.arrays.tensors")
+    values: dict[str, Any] = {}
+    with safe_open(str(file), framework="pt", device="cpu") as handle:
+        if handle.metadata() != {"schema_version": "stage1-s1-8-safetensors-manifest-v1"} or set(handle.keys()) != set(tensors):
+            raise Stage1S18FormalError("S18_ARRAY_METADATA_OR_KEY_DRIFT")
+        for name in sorted(tensors):
+            meta = _mapping(tensors[name], field=f"route.arrays.{name}")
+            tensor = handle.get_tensor(name)
+            raw = tensor.contiguous().numpy().tobytes(order="C")
+            if meta != {"sha256": hashlib.sha256(raw).hexdigest(), "dtype": str(tensor.dtype), "shape": list(tensor.shape)}:
+                raise Stage1S18FormalError(f"S18_ARRAY_TENSOR_MANIFEST_DRIFT:{name}")
+            values[name] = tensor
+    return values, manifest
+
+
+def _staged_array_bundle_replay(repository: Path, staging: Path) -> None:
+    """Resolve every published flattened array solely through its descriptor."""
+
+    from param_importance_nlp.contracts.jsonio import load_canonical_json
+    from param_importance_nlp.stage1_ddp_oracle import replay
+    try:
+        from safetensors.torch import load_file
+    except ImportError as error:  # pragma: no cover - formal host dependency
+        raise Stage1S18FormalError("S18_SAFETENSORS_UNAVAILABLE") from error
+    fixture = _mapping(load_canonical_json(staging / "fixture-manifest.json"), field="staged.fixture")
+    ddp = _mapping(load_canonical_json(staging / "ddp-report.json"), field="staged.ddp")
+    bundle = _mapping(load_canonical_json(staging / "array-bundle.json"), field="staged.array_bundle")
+    descriptors = _mapping(bundle.get("route_artifacts"), field="staged.route_artifacts")
+    if not _self_hash(bundle) or set(descriptors) != {"A", "B", "C", "D", "D-rank_swap", "D-local_reverse"}:
+        raise Stage1S18FormalError("S18_STAGED_ARRAY_BUNDLE_IDENTITY_INVALID")
+    reports = _mapping(ddp.get("baseline_routes"), field="staged.baseline_routes")
+    permutations = _mapping(ddp.get("permutation_routes"), field="staged.permutation_routes")
+    loaded: dict[str, Mapping[str, Any]] = {}
+    for key, descriptor_raw in descriptors.items():
+        descriptor = _mapping(descriptor_raw, field="staged.descriptor." + key)
+        artifact = _path(staging, descriptor.get("artifact_ref"), field="staged.artifact." + key)
+        report_path = _path(staging, descriptor.get("manifest_ref"), field="staged.manifest." + key)
+        report = _mapping(load_canonical_json(report_path), field="staged.worker_report." + key)
+        manifest = _mapping(report.get("arrays"), field="staged.worker_arrays." + key)
+        if not artifact.is_file() or _sha(artifact) != descriptor.get("file_sha256") or artifact.stat().st_size != descriptor.get("file_size_bytes") or manifest.get("artifact_hash") != descriptor.get("manifest_hash") or manifest.get("file_sha256") != descriptor.get("file_sha256") or manifest.get("file_size_bytes") != descriptor.get("file_size_bytes"):
+            raise Stage1S18FormalError("S18_STAGED_ARRAY_DESCRIPTOR_DRIFT:" + key)
+        _validate_output_schemas(repository, {"worker_report": report, "safetensors_manifest": manifest})
+        loaded[key] = load_file(str(artifact), device="cpu")
+    result = replay(route_arrays={key: loaded[key] for key in ROUTE_WORLD}, fixture=fixture, route_reports={key: _mapping(reports.get(key), field="staged.baseline." + key) for key in ROUTE_WORLD})
+    if result.get("status") != "PASS":
+        raise Stage1S18FormalError("S18_STAGED_BASELINE_REPLAY_FAILED")
+    for permutation in PERMUTATIONS:
+        arrays = {key: loaded[key] for key in ROUTE_WORLD}; arrays["D"] = loaded["D-" + permutation]
+        route_reports = {key: _mapping(reports.get(key), field="staged.baseline." + key) for key in ROUTE_WORLD}
+        route_reports["D"] = _mapping(permutations.get(permutation), field="staged.permutation." + permutation)
+        if replay(route_arrays=arrays, fixture=fixture, route_reports=route_reports).get("status") != "PASS":
+            raise Stage1S18FormalError("S18_STAGED_PERMUTATION_REPLAY_FAILED:" + permutation)
+
+
+def _finite_chart(value: object, *, field: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+        raise Stage1S18FormalError("S18_CHART_NUMERIC_INVALID:" + field)
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError) as error:
+        raise Stage1S18FormalError("S18_CHART_NUMERIC_INVALID:" + field) from error
+    if not math.isfinite(parsed):
+        raise Stage1S18FormalError("S18_CHART_NUMERIC_INVALID:" + field)
+    return parsed
+
+
+def _write_chart_csv(work: Path, filename: str, columns: Sequence[str], rows: Sequence[Mapping[str, object]]) -> list[dict[str, str]]:
+    """Write a strict data projection and prove the persisted CSV round-trips."""
+
+    path = work / filename
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(columns), extrasaction="raise")
+        writer.writeheader()
+        for row in rows:
+            if set(row) != set(columns):
+                raise Stage1S18FormalError("S18_CHART_ROW_FIELD_DRIFT:" + filename)
+            writer.writerow(dict(row))
+    with path.open("r", encoding="utf-8", newline="") as handle:
+        parsed = list(csv.DictReader(handle))
+    if not parsed or len(parsed) != len(rows):
+        raise Stage1S18FormalError("S18_CHART_CSV_READBACK_INVALID:" + filename)
+    return parsed
+
+
+def _svg_from_csv(work: Path, *, csv_name: str, svg_name: str, title: str, value_column: str) -> None:
+    """Render every mark from a re-read CSV value (not from in-memory rows)."""
+
+    with (work / csv_name).open("r", encoding="utf-8", newline="") as handle:
+        rows = list(csv.DictReader(handle))
+    if not rows or value_column not in rows[0]:
+        raise Stage1S18FormalError("S18_CHART_CSV_COLUMN_INVALID:" + csv_name)
+    values = [_finite_chart(row[value_column], field=f"{csv_name}:{index}") for index, row in enumerate(rows)]
+    low, high = min(values), max(values)
+    span = high - low
+    marks: list[str] = []
+    for index, (row, value) in enumerate(zip(rows, values, strict=True)):
+        label = " | ".join(row.get(key, "") for key in tuple(row)[:3])
+        if "A U" in label or (row.get("route") == "A" and "u_" in label.lower()):
+            raise Stage1S18FormalError("S18_CHART_A_U_REFERENCE_FORBIDDEN")
+        x = 60.0 if len(values) == 1 else 60.0 + 840.0 * index / (len(values) - 1)
+        y = 120.0 if span == 0.0 else 210.0 - 170.0 * (value - low) / span
+        marks.append(f'<circle cx="{x:.9g}" cy="{y:.9g}" r="3" data-row="{index}" data-value="{value:.17g}" data-label="{html.escape(label, quote=True)}"/>')
+    output = ('<svg xmlns="http://www.w3.org/2000/svg" width="960" height="260" '
+              f'data-source="{html.escape(csv_name, quote=True)}" data-value-column="{html.escape(value_column, quote=True)}">'
+              '<line x1="40" y1="210" x2="920" y2="210"/><line x1="40" y1="30" x2="40" y2="210"/>'
+              f'<text x="45" y="22">{html.escape(title)}</text><text x="45" y="235">{html.escape(value_column)}</text>' + "".join(marks) + "</svg>")
+    (work / svg_name).write_text(output, encoding="utf-8")
+    rendered = (work / svg_name).read_text(encoding="utf-8")
+    projected = [float(item) for item in re.findall(r'data-value="([^" ]+)"', rendered)]
+    if len(projected) != len(values) or any(left != right for left, right in zip(projected, values, strict=True)):
+        raise Stage1S18FormalError("S18_CHART_SVG_PROJECTION_DRIFT:" + svg_name)
+
+
+def _tensor_max_abs(value: object, *, field: str) -> float:
+    try:
+        import torch
+        if not isinstance(value, torch.Tensor):
+            raise TypeError
+        return _finite_chart(float(value.detach().to(torch.float64).abs().max().item()), field=field)
+    except (ImportError, TypeError, ValueError, RuntimeError) as error:
+        raise Stage1S18FormalError("S18_CHART_TENSOR_INVALID:" + field) from error
+
+
+def _charts(work: Path, replay: Mapping[str, Any], ddp_report: Mapping[str, Any], route_arrays: Mapping[str, Mapping[str, Any]]) -> tuple[dict[str, str], dict[str, str]]:
+    """Build five materially different projections; A never participates in U."""
+
+    comparisons = replay.get("comparison_rows")
+    baseline = ddp_report.get("baseline_routes")
+    if not isinstance(comparisons, list) or not comparisons or not isinstance(baseline, Mapping) or set(route_arrays) != set(ROUTE_WORLD):
+        raise Stage1S18FormalError("S18_CHART_INPUT_INVALID")
+    scatter: list[dict[str, object]] = []
+    deltas: list[dict[str, object]] = []
+    for route, arrays in sorted(route_arrays.items()):
+        prefix = "a-reference/equal" if route == "A" else "scores/equal"
+        mean = {key.removeprefix(prefix + "/mean_gradient/"): value for key, value in arrays.items() if key.startswith(prefix + "/mean_gradient/")}
+        raw = {key.removeprefix(prefix + "/raw_core/"): value for key, value in arrays.items() if key.startswith(prefix + "/raw_core/")}
+        pre = {key.removeprefix("pre/equal/"): value for key, value in arrays.items() if key.startswith("pre/equal/")}
+        post = {key.removeprefix("post/weighted/"): value for key, value in arrays.items() if key.startswith("post/weighted/")}
+        movement = {key.removeprefix("accumulator/weighted/cumulative/data_movement/"): value for key, value in arrays.items() if key.startswith("accumulator/weighted/cumulative/data_movement/")}
+        if set(mean) != set(raw) or set(pre) != set(post):
+            raise Stage1S18FormalError("S18_CHART_ARRAY_SET_DRIFT:" + route)
+        for parameter in sorted(mean):
+            scatter.append({"route": route, "parameter": parameter, "mean_gradient_max_abs": f"{_tensor_max_abs(mean[parameter], field=route + ':' + parameter + ':mean'):.17g}", "raw_core_max_abs": f"{_tensor_max_abs(raw[parameter], field=route + ':' + parameter + ':raw'):.17g}"})
+        for parameter in sorted(pre):
+            delta = _tensor_max_abs(post[parameter] - pre[parameter], field=route + ':' + parameter + ':delta')
+            moved = _tensor_max_abs(movement[parameter], field=route + ':' + parameter + ':movement') if route != "A" and parameter in movement else 0.0
+            deltas.append({"route": route, "parameter": parameter, "two_step_parameter_delta_max_abs": f"{delta:.17g}", "cumulative_data_movement_max_abs": f"{moved:.17g}"})
+    heatmap = [{"comparison": str(row.get("comparison")), "parameter": str(row.get("parameter")), "max_scaled_error": f"{_finite_chart(row.get('max_scaled_error'), field='heatmap'):.17g}"} for row in comparisons if isinstance(row, Mapping)]
+    series = [{"comparison": str(row.get("comparison")), "parameter": str(row.get("parameter")), "max_abs_error": f"{_finite_chart(row.get('max_abs_error'), field='series.abs'):.17g}", "normalized_l2_error": f"{_finite_chart(row.get('normalized_l2_error'), field='series.l2'):.17g}"} for row in comparisons if isinstance(row, Mapping)]
+    ranks: list[dict[str, object]] = []
+    for route in sorted(ROUTE_WORLD):
+        report = _mapping(baseline.get(route), field="chart.report." + route)
+        for case in report.get("cases", []):
+            observed = _mapping(case, field="chart.case")
+            for record in observed.get("rank_records", []):
+                rank = _mapping(record, field="chart.rank")
+                ranks.append({"route": route, "case": str(observed["case"]), "rank": str(rank["rank"]), "local_microbatch_ids": ";".join(str(item) for item in rank["local_microbatch_ids"]), "local_effective_tokens": str(rank["local_effective_tokens"]), "global_microbatch_count": str(observed["global_microbatch_count"]), "global_n1": str(observed["global_n1"]), "global_n2": str(observed["global_n2"])})
+    specs = {
+        "gradient-raw-scatter.csv": (("route", "parameter", "mean_gradient_max_abs", "raw_core_max_abs"), scatter, "raw_core_max_abs", "gradient-raw-scatter.svg", "mean-gradient / raw-core maxima"),
+        "error-heatmap.csv": (("comparison", "parameter", "max_scaled_error"), heatmap, "max_scaled_error", "error-heatmap.svg", "comparison scaled-error heatmap"),
+        "error-series.csv": (("comparison", "parameter", "max_abs_error", "normalized_l2_error"), series, "normalized_l2_error", "error-series.svg", "comparison normalized L2 error"),
+        "rank-diagnostics.csv": (("route", "case", "rank", "local_microbatch_ids", "local_effective_tokens", "global_microbatch_count", "global_n1", "global_n2"), ranks, "global_n2", "rank-diagnostics.svg", "observed rank partition/token statistics"),
+        "parameter-deltas.csv": (("route", "parameter", "two_step_parameter_delta_max_abs", "cumulative_data_movement_max_abs"), deltas, "two_step_parameter_delta_max_abs", "parameter-deltas.svg", "two-step parameter displacement"),
+    }
+    for csv_name, (columns, rows, value_column, svg_name, title) in specs.items():
+        _write_chart_csv(work, csv_name, columns, rows)
+        _svg_from_csv(work, csv_name=csv_name, svg_name=svg_name, title=title, value_column=value_column)
+    return {name: _sha(work / name) for name in specs}, {spec[3]: _sha(work / spec[3]) for spec in specs.values()}
+
+
+def _resource_summary(work: Path, *, estimated_peak_bytes: int, preflight: Mapping[str, Any], post_gpu: Mapping[str, Any]) -> dict[str, Any]:
+    files = [path for path in work.rglob("*") if path.is_file() and path.name != "resource-summary.json"]
+    return _with_hash({"schema_version": "stage1-s1-8-resource-summary-v1", "status": "PASS", "scope": "pre-staging-complete-attempt-files-excluding-resource-summary", "estimated_peak_bytes": estimated_peak_bytes, "actual_attempt_bytes": sum(path.stat().st_size for path in files), "free_bytes_after": shutil.disk_usage(work).free, "file_count": len(files), "preflight_gpu": preflight, "post_gpu": post_gpu})
+
+
+def _release_lease_transaction(lease: object, *, outcome: str, work: Path, label: str) -> Path:
+    """Release the exact held lease or leave an explicit review record.
+
+    ``close`` only drops an OS lock and is never an acceptable substitute for
+    removing the authenticated current lease record.
+    """
+
+    errors: list[str] = []
+    for attempt in (1, 2):
+        try:
+            history = lease.release(outcome=outcome if attempt == 1 else outcome + "_RETRY")
+            current = getattr(lease, "current_path", None)
+            if not isinstance(history, Path) or not history.is_file() or (isinstance(current, Path) and current.exists()):
+                raise Stage1S18FormalError("S18_LEASE_RELEASE_READBACK_INVALID")
+            return history
+        except BaseException as error:
+            errors.append(f"{type(error).__name__}:{error}")
+    _write(work / f"{label}-lease-release-failed.json", _with_hash({"schema_version": "stage1-s1-8-lease-release-failure-v1", "status": "FAILED", "outcome": outcome, "attempt_errors": errors, "current_record_present": bool(getattr(lease, "current_path", Path(".")).exists())}))
+    raise Stage1S18ManualInterventionRequired("S18_LEASE_RELEASE_UNCONFIRMED")
+
+
+def _route_plan(*, fixture: Mapping[str, Any], execution_commit: str, route: str, visible: Sequence[str], work: Path, data_root: Path, token_sha: str, model_root: str, cache_root: str, run_token: str, permutation: str = "identity", execution_mode: str = "formal") -> dict[str, Any]:
+    from param_importance_nlp.stage1_ddp import WORKER_PLAN_SCHEMA, with_artifact_hash
+    route_work = work / f"route-{route}-{permutation}-{execution_mode}"
+    route_work.mkdir()
+    return with_artifact_hash({"schema_version": WORKER_PLAN_SCHEMA, "task_id": TASK_ID, "execution_commit": execution_commit, "route": route, "fixture": dict(fixture), "fixture_tokens_ref": "../fixture-inputs.safetensors", "fixture_tokens_sha256": token_sha, "data_root": str(data_root), "model_root": model_root, "cache_root": cache_root, "run_token": run_token, "visible_gpu_uuids": list(visible), "output_dir": "route-output", "permutation": permutation, "execution_mode": execution_mode})
+
+
+def _offline_environment(cache_root: str) -> tuple[dict[str, str], dict[str, object]]:
+    """Constrain every HuggingFace cache and record the no-network contract."""
+
+    root = Path(cache_root).resolve(strict=True)
+    hf_home, transformers = root / "hf", root / "transformers"
+    hf_home.mkdir(exist_ok=True); transformers.mkdir(exist_ok=True)
+    values = {"HF_HOME": str(hf_home), "TRANSFORMERS_CACHE": str(transformers), "HF_HUB_OFFLINE": "1", "TRANSFORMERS_OFFLINE": "1", "HF_DATASETS_OFFLINE": "1", "PARAM_IMPORTANCE_OFFLINE_GUARD": "1"}
+    return values, {"cache_root": str(root), "allowed_cache_roots": [str(hf_home), str(transformers)], "hf_hub_offline": True, "transformers_offline": True, "datasets_offline": True, "external_attempts": []}
+
+
+def _run_route(*, repository: Path, work: Path, plan: Mapping[str, Any], timeout_seconds: int, lease: object, expect_success: bool) -> tuple[Mapping[str, Any] | None, Path, Mapping[str, Any]]:
+    from param_importance_nlp.contracts.jsonio import load_canonical_json, write_canonical_json
+    route = str(plan["route"]); permutation = str(plan["permutation"]); mode = str(plan["execution_mode"])
+    route_work = work / f"route-{route}-{permutation}-{mode}"
+    plan_path = route_work / "worker-plan.json"; write_canonical_json(plan_path, dict(plan))
+    environment = dict(os.environ); offline, _ = _offline_environment(str(plan["cache_root"])); environment.update(offline); environment.update({"CUDA_VISIBLE_DEVICES": ",".join(plan["visible_gpu_uuids"]), "CUBLAS_WORKSPACE_CONFIG": ":4096:8"})
+    command = [sys.executable, "-m", "torch.distributed.run", "--rdzv-id", str(plan["run_token"]), "--rdzv-endpoint", "127.0.0.1:0", "--nproc_per_node", str(ROUTE_WORLD[route]), str(repository / "ops" / "stage1" / "run_s1_8_worker.py"), "--plan", str(plan_path)]
+    label = f"{route}-{permutation}-{mode}"
+    outcome = _launch(repository=repository, work=work, label=label, command=command, environment=environment, run_token=str(plan["run_token"]), timeout_seconds=timeout_seconds, lease=lease, expected_success=expect_success)
+    report_path = route_work / "route-output" / "route-report.json"
+    if not expect_success:
+        if report_path.exists() or (route_work / "route-output" / "success.json").exists():
+            raise Stage1S18FormalError("S18_NEGATIVE_CONTROL_PUBLISHED_SUCCESS")
+        return None, route_work, outcome
+    if not report_path.is_file():
+        raise Stage1S18FormalError("S18_ROUTE_REPORT_MISSING")
+    report = _mapping(load_canonical_json(report_path), field=f"route.{route}.report")
+    if not _self_hash(report) or report.get("status") != "PASS" or report.get("execution_mode") != "formal" or report.get("route") != route or report.get("permutation") != permutation:
+        raise Stage1S18FormalError("S18_ROUTE_REPORT_INVALID")
+    return report, route_work / "route-output", outcome
+
+
+def _scale_oracle(*, repository: Path, work: Path, handoff: Mapping[str, Any], model_root: str, cache_root: str, uuid: str, execution_commit: str, run_token: str, timeout_seconds: int, lease: object) -> Mapping[str, Any]:
+    from param_importance_nlp.contracts.jsonio import load_canonical_json, write_canonical_json
+    from param_importance_nlp.stage1_ddp_scale_oracle import PLAN_SCHEMA
+    selected = {str(index): handoff["token_sha256"][str(index)] for index in range(8)}
+    plan = {"schema_version": PLAN_SCHEMA, "task_id": TASK_ID, "execution_commit": execution_commit, "fixture_tokens_ref": "fixture-inputs.safetensors", "fixture_tokens_sha256": handoff["token_file_sha256"], "selected_token_sha256": selected, "upstream_token_sha256": handoff["token_sha256"], "cases": {"equal": {"label_ignore_suffixes": [0] * 8}, "weighted": {"label_ignore_suffixes": [0, 16, 32, 48, 64, 80, 96, 112]}}, "model_root": model_root, "output_file": "pre-route-scale.json", "run_token": run_token, "visible_gpu_uuids": [uuid]}
+    body = dict(plan); body["artifact_hash"] = _canonical(body)
+    plan_path = work / "pre-route-scale-plan.json"; write_canonical_json(plan_path, body)
+    env = dict(os.environ); offline, _ = _offline_environment(cache_root); env.update(offline); env.update({"CUDA_VISIBLE_DEVICES": uuid, "CUBLAS_WORKSPACE_CONFIG": ":4096:8"})
+    _launch(repository=repository, work=work, label="pre-route-scale", command=[sys.executable, str(repository / "ops" / "stage1" / "run_s1_8_scale_oracle.py"), "--plan", str(plan_path)], environment=env, run_token=run_token, timeout_seconds=timeout_seconds, lease=lease, expected_success=True)
+    report = _mapping(load_canonical_json(work / "pre-route-scale.json"), field="pre_route_scale")
+    needed = {"schema_version", "status", "task_id", "execution_commit", "run_token", "fixture_tokens_sha256", "selected_token_sha256", "upstream_token_sha256", "visible_gpu_uuid", "method", "unit_count", "unit_records", "maximum_unit_gradient_abs", "maximum_case", "maximum_microbatch_id", "maximum_parameter", "maximum_abs_data_update", "maximum_data_update_case", "maximum_data_update_parameter", "parameter_registry_hash", "case_pre_parameter_checksums", "case_post_parameter_checksums", "artifact_hash"}
+    if set(report) != needed or not _self_hash(report) or report.get("status") != "PASS" or report.get("visible_gpu_uuid") != uuid or report.get("unit_count") != 16 or report.get("method") != "independent_pre_route_single_gpu_autograd_oracle" or not isinstance(report.get("maximum_unit_gradient_abs"), (int, float)) or float(report["maximum_unit_gradient_abs"]) <= 0 or not isinstance(report.get("maximum_abs_data_update"), (int, float)) or float(report["maximum_abs_data_update"]) <= 0:
+        raise Stage1S18FormalError("S18_PRE_ROUTE_SCALE_REPORT_INVALID")
+    pre_checks, post_checks = report.get("case_pre_parameter_checksums"), report.get("case_post_parameter_checksums")
+    if not isinstance(pre_checks, Mapping) or not isinstance(post_checks, Mapping) or set(pre_checks) != {"equal", "weighted"} or set(post_checks) != {"equal", "weighted"} or pre_checks.get("weighted") != post_checks.get("equal") or not isinstance(report.get("parameter_registry_hash"), str) or len(str(report["parameter_registry_hash"])) != 64:
+        raise Stage1S18FormalError("S18_PRE_ROUTE_SCALE_STATE_SEQUENCE_INVALID")
+    if report.get("selected_token_sha256") != selected or report.get("upstream_token_sha256") != handoff["token_sha256"]:
+        raise Stage1S18FormalError("S18_PRE_ROUTE_SCALE_TOKEN_BINDING_INVALID")
+    return report
+
+
+def prelease_dry_chain(*, repository: Path, data_root: Path, s1_7_index_ref: str, gpu_capability_ref: str, approved_gpu_uuids: Sequence[str]) -> dict[str, object]:
+    """Run every no-GPU formal prerequisite and stop before discovery/lease."""
+
+    repository, data_root = repository.resolve(strict=True), data_root.resolve(strict=True)
+    handoff = load_s1_7_handoff(data_root=data_root, index_ref=s1_7_index_ref, repository=repository)
+    capability = _load_capability(data_root, gpu_capability_ref, approved_gpu_uuids)
+    model_root, cache_root, qualification = _frozen_model_and_cache_root(repository, data_root, handoff)
+    pile = _audit_pile_download_activity(handoff)
+    return {"status": "PASS", "s1_7_handoff": {key: value for key, value in handoff.items() if key != "token_file"}, "gpu_capability": capability, "model_root": model_root, "cache_root": cache_root, "model_qualification": qualification, "pile_download_audit": pile}
+
+
+def execute(*, repository: Path, data_root: Path, s1_7_index_ref: str, gpu_capability_ref: str, approved_gpu_uuids: Sequence[str], attempt_id: str, lease_owner: str, timeout_seconds: int = 3600) -> dict[str, str]:
+    """Execute the formal producer only after explicit four-UUID approval."""
+
+    from param_importance_nlp.contracts.jsonio import load_canonical_json
+    from param_importance_nlp.runtime.operations import GpuLeaseIdentity, ProjectGpuLease
+    from param_importance_nlp.stage1_ddp import build_fixture, build_route_layout, permute_route_layout, tensor_map_digest, validate_fixture
+    from param_importance_nlp.stage1_ddp_oracle import replay
+    repository, data_root = repository.resolve(strict=True), data_root.resolve(strict=True)
+    if not attempt_id or not lease_owner or timeout_seconds <= 0:
+        raise Stage1S18FormalError("S18_FORMAL_ARGUMENT_INVALID")
+    commit = _git(repository, "rev-parse", "HEAD")
+    handoff = load_s1_7_handoff(data_root=data_root, index_ref=s1_7_index_ref, repository=repository)
+    capability = _load_capability(data_root, gpu_capability_ref, approved_gpu_uuids)
+    model_root, cache_root, model_qualification = _frozen_model_and_cache_root(repository, data_root, handoff)
+    target = data_root / "evidence" / "stage1" / "s1-8-formal" / commit / attempt_id
+    work = data_root / "tmp" / "stage1-s1-8" / attempt_id
+    if target.exists() or work.exists():
+        raise Stage1S18FormalError("S18_FORMAL_ATTEMPT_COLLISION")
+    work.mkdir(parents=True)
+    estimated_peak_bytes = 80 * 1024**3
+    disk = shutil.disk_usage(work)
+    if disk.free < estimated_peak_bytes:
+        raise Stage1S18FormalError("S18_DISK_CAPACITY_INSUFFICIENT")
+    shutil.copy2(handoff["token_file"], work / "fixture-inputs.safetensors")
+    _write(work / "model-qualified-resolution.json", _with_hash({"schema_version": "stage1-s1-8-model-qualified-resolution-v1", "status": "PASS", "model": model_qualification}))
+    _, offline_policy = _offline_environment(cache_root)
+    _write(work / "offline-policy.json", _with_hash({"schema_version": "stage1-s1-8-offline-policy-v1", "status": "PASS", "policy": offline_policy}))
+    lease: ProjectGpuLease | None = None; release_started = False; release_attempted = False; phase = "preflight"; staging: Path | None = None
+    try:
+        pile_download_audit = _audit_pile_download_activity(handoff)
+        preflight = discover_approved_gpus(approved_gpu_uuids); _write(work / "preflight.json", _with_hash({"schema_version": "stage1-s1-8-gpu-preflight-v1", "status": "PASS", "gpu": preflight, "capability": capability, "pile_download_audit": pile_download_audit}))
+        identity = GpuLeaseIdentity(run_id=f"stage1-s1-8-{attempt_id}", lease_id=f"s1-8-{attempt_id}", gpu_uuids=tuple(approved_gpu_uuids), owner=lease_owner, config_hash=_canonical({"task_id": TASK_ID, "commit": commit, "attempt_id": attempt_id}), environment_hash=_canonical(preflight))
+        phase = "lease_acquire"; lease = ProjectGpuLease(data_root, identity); lease.acquire(); lease.heartbeat()
+        post_lease = discover_approved_gpus(approved_gpu_uuids); _write(work / "post-lease-gpu.json", _with_hash({"schema_version": "stage1-s1-8-gpu-preflight-v1", "status": "PASS", "gpu": post_lease}))
+        run_token = hashlib.sha256(f"{commit}:{attempt_id}:{time.time_ns()}".encode()).hexdigest()
+        os.environ["PARAM_IMPORTANCE_S18_RUN_TOKEN"] = run_token
+        _write(work / "attempt-start.json", _with_hash({"schema_version": "stage1-s1-8-attempt-start-v1", "status": "STARTED", "run_token": run_token, "parent_fingerprint": _fingerprint(os.getpid(), run_token), "lease": identity.to_dict()}))
+        phase = "nccl_smoke"; smoke_env = dict(os.environ); smoke_env.update({"CUDA_VISIBLE_DEVICES": ",".join(approved_gpu_uuids), "CUBLAS_WORKSPACE_CONFIG": ":4096:8"})
+        smoke = _launch(repository=repository, work=work, label="nccl-smoke", command=[sys.executable, "-m", "torch.distributed.run", "--rdzv-id", run_token, "--rdzv-endpoint", "127.0.0.1:0", "--nproc_per_node", "4", str(repository / "ops" / "stage1" / "run_s1_8_nccl_smoke.py"), "--report", str(work / "nccl-smoke-report.json")], environment=smoke_env, run_token=run_token, timeout_seconds=min(timeout_seconds, 300), lease=lease, expected_success=True)
+        smoke_report = _mapping(load_canonical_json(work / "nccl-smoke-report.json"), field="nccl_smoke")
+        if not _self_hash(smoke_report) or smoke_report.get("backend") != "nccl" or smoke_report.get("world_size") != 4 or smoke_report.get("allocation_probe") != "torch.empty.float32.256" or smoke_report.get("rank_records") != [{"rank": index, "uuid": approved_gpu_uuids[index], "input": index + 1, "output": 10, "cuda_initialized": True, "allocation_bytes": 1024} for index in range(4)]:
+            raise Stage1S18FormalError("S18_NCCL_SMOKE_REPORT_INVALID")
+        phase = "pre_route_scale"; scale = _scale_oracle(repository=repository, work=work, handoff=handoff, model_root=model_root, cache_root=cache_root, uuid=approved_gpu_uuids[0], execution_commit=commit, run_token=run_token, timeout_seconds=timeout_seconds, lease=lease)
+        fixture = build_fixture(token_sha256=handoff["token_sha256"], upstream_fixture_hash=str(handoff["fixture_hash"]), gradient_design_scale=float(scale["maximum_unit_gradient_abs"]), optimizer_delta_design_scale=float(scale["maximum_abs_data_update"]), pre_route_scale_oracle_hash=str(scale["artifact_hash"]), pre_route_parameter_registry_hash=str(scale["parameter_registry_hash"]), pre_route_case_state_checksums=_mapping(scale["case_pre_parameter_checksums"], field="scale.case_pre_parameter_checksums"))
+        validate_fixture(fixture); _write(work / "fixture-manifest.json", fixture)
+        baseline_reports: dict[str, Mapping[str, Any]] = {}; baseline_arrays: dict[str, Mapping[str, Any]] = {}; manifests: dict[str, Mapping[str, Any]] = {}
+        for route, world in ROUTE_WORLD.items():
+            phase = f"route_{route}"; plan = _route_plan(fixture=fixture, execution_commit=commit, route=route, visible=approved_gpu_uuids[:world], work=work, data_root=data_root, token_sha=str(handoff["token_file_sha256"]), model_root=model_root, cache_root=cache_root, run_token=run_token)
+            report, route_dir, _ = _run_route(repository=repository, work=work, plan=plan, timeout_seconds=timeout_seconds, lease=lease, expect_success=True)
+            if report is None: raise Stage1S18FormalError("S18_BASELINE_REPORT_NONE")
+            expected_layout = fixture["routes"][route]
+            if report.get("world_size") != world or report.get("visible_gpu_uuids") != list(approved_gpu_uuids[:world]) or report.get("rank_to_gpu_uuid") != list(approved_gpu_uuids[:world]) or report.get("route_layout") != expected_layout or report.get("parameter_registry_hash") != fixture["pre_route_gradient_scale"]["parameter_registry_hash"]:
+                raise Stage1S18FormalError("S18_ROUTE_IDENTITY_OR_REGISTRY_DRIFT:" + route)
+            arrays, manifest = _load_arrays(route_dir, report)
+            _validate_output_schemas(repository, {"worker_report": report, "safetensors_manifest": manifest})
+            baseline_reports[route] = report; baseline_arrays[route] = arrays; manifests[route] = manifest
+        permutation_reports: dict[str, Mapping[str, Any]] = {}
+        for permutation in PERMUTATIONS:
+            phase = f"D_{permutation}"; plan = _route_plan(fixture=fixture, execution_commit=commit, route="D", visible=approved_gpu_uuids, work=work, data_root=data_root, token_sha=str(handoff["token_file_sha256"]), model_root=model_root, cache_root=cache_root, run_token=run_token, permutation=permutation)
+            report, route_dir, _ = _run_route(repository=repository, work=work, plan=plan, timeout_seconds=timeout_seconds, lease=lease, expect_success=True)
+            if report is None: raise Stage1S18FormalError("S18_PERMUTATION_REPORT_NONE")
+            expected_permutation_layout = permute_route_layout(build_route_layout("D"), permutation=permutation).to_dict()
+            if (
+                not _self_hash(report) or report.get("status") != "PASS" or report.get("execution_commit") != commit
+                or report.get("run_token") != run_token or report.get("fixture_hash") != fixture["fixture_hash"]
+                or report.get("execution_mode") != "formal" or report.get("route") != "D" or report.get("permutation") != permutation
+                or report.get("world_size") != 4 or report.get("visible_gpu_uuids") != list(approved_gpu_uuids)
+                or report.get("rank_to_gpu_uuid") != list(approved_gpu_uuids) or report.get("route_layout") != expected_permutation_layout
+                or report.get("parameter_registry_hash") != fixture["pre_route_gradient_scale"]["parameter_registry_hash"]
+            ):
+                raise Stage1S18FormalError("S18_PERMUTATION_ROUTE_IDENTITY_DRIFT")
+            arrays, manifest = _load_arrays(route_dir, report)
+            _validate_output_schemas(repository, {"worker_report": report, "safetensors_manifest": manifest})
+            candidate_arrays = dict(baseline_arrays); candidate_reports = dict(baseline_reports); candidate_arrays["D"] = arrays; candidate_reports["D"] = report
+            result = replay(route_arrays=candidate_arrays, fixture=fixture, route_reports=candidate_reports)
+            if result.get("status") != "PASS": raise Stage1S18FormalError("S18_PERMUTATION_REPLAY_FAILED")
+            permutation_reports[permutation] = report; manifests[f"D-{permutation}"] = manifest
+        negative: dict[str, Mapping[str, Any]] = {}
+        for mode, marker in (("ordinary_sync_negative", "S18_NO_SYNC_DDP_COLLECTIVE_DETECTED"), ("inject_rank_failure", "S18_INJECTED_RANK_FAILURE")):
+            phase = mode; plan = _route_plan(fixture=fixture, execution_commit=commit, route="D", visible=approved_gpu_uuids, work=work, data_root=data_root, token_sha=str(handoff["token_file_sha256"]), model_root=model_root, cache_root=cache_root, run_token=run_token, execution_mode=mode)
+            _, route_dir, outcome = _run_route(repository=repository, work=work, plan=plan, timeout_seconds=timeout_seconds, lease=lease, expect_success=False)
+            stderr = (work / f"D-identity-{mode}.stderr.txt").read_text(encoding="utf-8")
+            if marker not in stderr: raise Stage1S18FormalError("S18_NEGATIVE_MARKER_MISSING:" + mode)
+            negative[mode] = {"process": outcome, "marker": marker, "route_work": str(route_dir.relative_to(work)), "success_marker_absent": True}
+        phase = "post_gpu"; post_gpu = discover_approved_gpus(approved_gpu_uuids); _write(work / "post-worker-gpu.json", _with_hash({"schema_version": "stage1-s1-8-gpu-preflight-v1", "status": "PASS", "gpu": post_gpu}))
+        release_started = True; first_history = _release_lease_transaction(lease, outcome="GPU_PHASE_SUCCESS", work=work, label="first"); release_attempted = True; lease = None; shutil.copy2(first_history, work / "lease-history-first.json")
+        post_release = discover_approved_gpus(approved_gpu_uuids); _write(work / "post-release-gpu.json", _with_hash({"schema_version": "stage1-s1-8-gpu-preflight-v1", "status": "PASS", "gpu": post_release}))
+        # The exact set must be reacquirable immediately after release; no GPU
+        # worker is launched under the second lease.
+        second = ProjectGpuLease(data_root, identity); second_held = False
+        try:
+            second.acquire(); second_held = True; second.heartbeat(); second_history = _release_lease_transaction(second, outcome="RELEASE_REACQUIRE_CHECK", work=work, label="reacquire"); second_held = False
+        except Stage1S18ManualInterventionRequired:
+            # The transaction persisted a review marker and deliberately did
+            # not pretend a current record was released.
+            raise
+        except BaseException:
+            if second_held:
+                # A non-process error after acquisition must still remove the
+                # exact current record.  ``close`` alone is never a release.
+                _release_lease_transaction(second, outcome="REACQUIRE_CHECK_FAILED", work=work, label="reacquire-failure")
+                second_held = False
+            else:
+                second.close()
+            raise
+        shutil.copy2(second_history, work / "lease-history-reacquire.json")
+        phase = "offline_replay"; result = replay(route_arrays=baseline_arrays, fixture=fixture, route_reports=baseline_reports)
+        if result.get("status") != "PASS": raise Stage1S18FormalError("S18_FP64_REPLAY_FAILED")
+        replay_record = _with_hash(dict(result)); _write(work / "replay-validation.json", replay_record)
+        table = _with_hash({"schema_version": "stage1-s1-8-comparison-table-v1", "status": "PASS", "rows": result["comparison_rows"]}); _write(work / "comparison-table.json", table)
+        source_hashes = _implementation_source_map(repository)
+        ddp_report = _with_hash({"schema_version": "stage1-s1-8-ddp-report-v1", "status": "PASS", "task_id": TASK_ID, "fixture_hash": fixture["fixture_hash"], "implementation_source_sha256": source_hashes, "baseline_routes": baseline_reports, "permutation_routes": permutation_reports, "negative_controls": negative}); _write(work / "ddp-report.json", ddp_report)
+        csv_hashes, svg_hashes = _charts(work, result, ddp_report, baseline_arrays)
+        # It is intentionally written only after every worker output, replay,
+        # report and chart exists, and excludes itself from the measured scope.
+        _write(work / "resource-summary.json", _resource_summary(work, estimated_peak_bytes=estimated_peak_bytes, preflight=preflight, post_gpu=post_gpu))
+        role_files = {"fixture_manifest": "fixture-manifest.json", "ddp_report": "ddp-report.json", "array_bundle": "array-bundle.json", "comparison_table": "comparison-table.json", "gate_record": "g1-ddp-record.json"}
+        reproduction = {"fixture_inputs": "fixture-inputs.safetensors", "model_qualified_resolution": "model-qualified-resolution.json", "offline_policy": "offline-policy.json", "pre_route_scale_plan": "pre-route-scale-plan.json", "pre_route_scale": "pre-route-scale.json", "preflight": "preflight.json", "post_lease_gpu": "post-lease-gpu.json", "post_worker_gpu": "post-worker-gpu.json", "post_release_gpu": "post-release-gpu.json", "resource_summary": "resource-summary.json", "nccl_smoke_report": "nccl-smoke-report.json", "nccl_smoke_process": "nccl-smoke.process.json", "nccl_smoke_stdout": "nccl-smoke.stdout.txt", "nccl_smoke_stderr": "nccl-smoke.stderr.txt", "lease_history_first": "lease-history-first.json", "lease_history_reacquire": "lease-history-reacquire.json", "attempt_start": "attempt-start.json"}
+        reproduction_sources: dict[str, Path] = {published: work / published for published in reproduction.values()}
+        for source in sorted(list(work.glob("*.process.json")) + list(work.glob("*.stdout.txt")) + list(work.glob("*.stderr.txt")) + list(work.glob("*-process-tree-initial.json")) + list(work.glob("*-termination-audit.json"))):
+            published = "run__root__" + source.name
+            key = "run_root_" + hashlib.sha256(source.name.encode("utf-8")).hexdigest()[:16]
+            if published in reproduction_sources or key in reproduction:
+                raise Stage1S18FormalError("S18_REPRODUCTION_ROOT_LOG_COLLISION")
+            reproduction[key] = published; reproduction_sources[published] = source
+        # Preserve every plan/report/process log/marker and each actual route
+        # safetensors file.  Flattened names are deterministic and prevent the
+        # six D runs from overwriting one another during publication.
+        for source in sorted(work.glob("route-*/*")) + sorted(work.glob("route-*/*/*")):
+            if not source.is_file():
+                continue
+            relative = source.relative_to(work).as_posix()
+            published = "run__" + relative.replace("/", "__")
+            key = "run_" + hashlib.sha256(relative.encode("utf-8")).hexdigest()[:16]
+            if published in reproduction_sources or key in reproduction:
+                raise Stage1S18FormalError("S18_REPRODUCTION_NAME_COLLISION")
+            reproduction[key] = published; reproduction_sources[published] = source
+        array_descriptors: dict[str, object] = {}
+        route_paths = {**{route: work / f"route-{route}-identity-formal" / "route-output" for route in ROUTE_WORLD}, **{f"D-{permutation}": work / f"route-D-{permutation}-formal" / "route-output" for permutation in PERMUTATIONS}}
+        if set(manifests) != set(route_paths):
+            raise Stage1S18FormalError("S18_ARRAY_DESCRIPTOR_ROUTE_SET_INVALID")
+        for route_key, directory in route_paths.items():
+            manifest = manifests[route_key]; source = directory / str(manifest["file"])
+            relative = source.relative_to(work).as_posix(); published = "run__" + relative.replace("/", "__")
+            if reproduction_sources.get(published) != source:
+                raise Stage1S18FormalError("S18_ARRAY_PUBLISHED_REF_MISSING:" + route_key)
+            report_source = directory / "route-report.json"
+            report_relative = report_source.relative_to(work).as_posix(); report_published = "run__" + report_relative.replace("/", "__")
+            if reproduction_sources.get(report_published) != report_source:
+                raise Stage1S18FormalError("S18_ARRAY_MANIFEST_PUBLISHED_REF_MISSING:" + route_key)
+            array_descriptors[route_key] = {"artifact_ref": published, "manifest_ref": report_published, "file_sha256": manifest["file_sha256"], "file_size_bytes": manifest["file_size_bytes"], "manifest_hash": manifest["artifact_hash"]}
+        arrays_bundle = _with_hash({"schema_version": "stage1-s1-8-array-bundle-v1", "status": "PASS", "route_artifacts": array_descriptors})
+        _write(work / "array-bundle.json", arrays_bundle)
+        all_worker_reports = {**baseline_reports, **{f"D-{permutation}": report for permutation, report in permutation_reports.items()}}
+        base_requirements = {
+            "s1_7_handoff": handoff["gate_artifact_hash"] == EXPECTED_G1_SINGLE_HASH,
+            "consumer_diff": isinstance(_audit_consumer_diff(repository), tuple),
+            "approved_four_uuid_topology": capability["artifact_hash"] == EXPECTED_GPU_CAPABILITY_ARTIFACT_HASH and set(approved_gpu_uuids).issubset(set(capability["allowed_gpu_uuids"])) and preflight["requested_uuid_order"] == list(approved_gpu_uuids) == post_gpu["requested_uuid_order"],
+            "nccl_smoke": smoke["returncode"] == 0 and smoke["residual_pgid_members"] == [] and smoke_report.get("status") == "PASS",
+            "pre_route_scale_oracle": scale["case_pre_parameter_checksums"]["weighted"] == scale["case_post_parameter_checksums"]["equal"],
+            "real_routes_equal_and_weighted": set(baseline_reports) == set(ROUTE_WORLD) and all(len(report["cases"]) == 2 for report in baseline_reports.values()),
+            "rank_partition_and_no_sync": all(all(row["ordinary_ddp_gradient_collectives"] == 0 for row in report["cases"]) for route, report in baseline_reports.items() if route != "A"),
+            "manual_collective_contract": result.get("status") == "PASS",
+            "independent_fp64_replay": replay_record.get("oracle_reference_dtype") == "torch.float64" and replay_record.get("production_candidate_dtype") == "torch.float32",
+            "optimizer_and_accumulator": any("accumulator:cumulative:absolute" in key for key in result["checks"]),
+            "rank_and_order_permutations": set(permutation_reports) == set(PERMUTATIONS),
+            "ordinary_sync_negative": negative["ordinary_sync_negative"]["marker"] == "S18_NO_SYNC_DDP_COLLECTIVE_DETECTED",
+            "controlled_rank_failure": negative["inject_rank_failure"]["marker"] == "S18_INJECTED_RANK_FAILURE",
+            "array_manifest": all(_self_hash(value) for value in manifests.values()),
+            "lease_release_reacquire": (work / "lease-history-first.json").is_file() and (work / "lease-history-reacquire.json").is_file(),
+            "resource_summary": _self_hash(_mapping(load_canonical_json(work / "resource-summary.json"), field="resource_summary")),
+            "charts_no_a_u_reference": all("A U" not in (work / name).read_text(encoding="utf-8") for name in svg_hashes),
+        }
+        if set(base_requirements) != set(GATE_CHECK_IDS) - {"schemas_and_atomic_publication"} or not all(base_requirements.values()):
+            raise Stage1S18FormalError("S18_GATE_REQUIREMENT_FAILED")
+        reproduction_sha = {role: _sha(reproduction_sources[name]) for role, name in reproduction.items()}
+        handoff_for_index = {key: value for key, value in handoff.items() if key != "token_file"}
+
+        def build_candidate(schema_result: bool) -> tuple[dict[str, Any], dict[str, str], dict[str, Any], dict[str, Any], dict[str, Any]]:
+            requirements = {**base_requirements, "schemas_and_atomic_publication": schema_result}
+            gate_value = _with_hash({"schema_version": "stage1-s1-8-gate-record-v1", "status": "PASS", "gate_id": GATE_ID, "task_id": TASK_ID, "requirements": requirements})
+            role_hashes = {role: _canonical_file_sha(value) for role, value in {"fixture_manifest": fixture, "ddp_report": ddp_report, "array_bundle": arrays_bundle, "comparison_table": table, "gate_record": gate_value}.items()}
+            validation_value = _with_hash({"schema_version": "stage1-s1-8-validation-v1", "status": "PASS", "task_id": TASK_ID, "gate_id": GATE_ID, "producer_commit": commit, "checks": [{"check_id": identifier, "status": "PASS", "detail": identifier.replace("_", " ")} for identifier in GATE_CHECK_IDS], "role_sha256": role_hashes})
+            index_value = _with_hash({"schema_version": "stage1-s1-8-formalization-index-v1", "status": "PASS", "gate_id": GATE_ID, "task_id": TASK_ID, "generator_git_commit": commit, "consumer_git_commit": commit, "gpu_capability": capability, "implementation_source_sha256": source_hashes, "s1_7_handoff": handoff_for_index, "role_refs": role_files, "role_sha256": role_hashes, "reproduction_role_refs": reproduction, "reproduction_role_sha256": reproduction_sha, "gate_artifact_hash": gate_value["artifact_hash"], "validation_ref": "validation.json", "validation_sha256": _canonical_file_sha(validation_value), "replay_ref": "replay-validation.json", "replay_sha256": _canonical_file_sha(replay_record), "next_task_ids": ["stage1.10_checkpoint_resume_and_artifacts"]})
+            values = {"fixture_manifest": fixture, "ddp_report": ddp_report, "array_bundle": arrays_bundle, "comparison_table": table, "gate_record": gate_value, "replay": replay_record, "validation": validation_value, "index": index_value}
+            return values, role_hashes, gate_value, validation_value, index_value
+
+        # The preliminary object is byte-identical to the final one if and
+        # only if real schema/cross-reference validation succeeds.  This makes
+        # the last gate predicate evidence-derived rather than a literal.
+        candidate_objects, role_sha, gate, validation, index = build_candidate(True)
+        schema_evidence = _candidate_publication_check(repository=repository, objects=candidate_objects, worker_reports=all_worker_reports, manifests=manifests, source_files=reproduction_sources)
+        candidate_objects, role_sha, gate, validation, index = build_candidate(schema_evidence)
+        if not _candidate_publication_check(repository=repository, objects=candidate_objects, worker_reports=all_worker_reports, manifests=manifests, source_files=reproduction_sources):
+            raise Stage1S18FormalError("S18_CANDIDATE_SCHEMA_EVIDENCE_FALSE")
+        _write(work / "g1-ddp-record.json", gate); _write(work / "validation.json", validation); _write(work / "index.json", index)
+        if any(_sha(work / role_files[role]) != digest for role, digest in role_sha.items()) or _sha(work / "validation.json") != _canonical_file_sha(validation) or _sha(work / "index.json") != _canonical_file_sha(index):
+            raise Stage1S18FormalError("S18_CANDIDATE_FILE_WRITEBACK_DRIFT")
+        target.parent.mkdir(parents=True, exist_ok=True); staging = target.parent / f".{attempt_id}.publishing"
+        if staging.exists(): raise Stage1S18FormalError("S18_PUBLISH_STAGING_COLLISION")
+        staging.mkdir()
+        publish = set(role_files.values()) | {"replay-validation.json", "validation.json", "index.json"} | set(csv_hashes) | set(svg_hashes) | set(reproduction_sources)
+        for name in sorted(publish):
+            source = reproduction_sources.get(name, work / name)
+            if not source.is_file():
+                raise Stage1S18FormalError("S18_PUBLISH_SOURCE_MISSING:" + name)
+            shutil.copy2(source, staging / name)
+        staged_objects = {"fixture_manifest": _mapping(load_canonical_json(staging / "fixture-manifest.json"), field="staged.fixture"), "ddp_report": _mapping(load_canonical_json(staging / "ddp-report.json"), field="staged.ddp"), "array_bundle": _mapping(load_canonical_json(staging / "array-bundle.json"), field="staged.bundle"), "comparison_table": _mapping(load_canonical_json(staging / "comparison-table.json"), field="staged.table"), "gate_record": _mapping(load_canonical_json(staging / "g1-ddp-record.json"), field="staged.gate"), "replay": _mapping(load_canonical_json(staging / "replay-validation.json"), field="staged.replay"), "validation": _mapping(load_canonical_json(staging / "validation.json"), field="staged.validation"), "index": _mapping(load_canonical_json(staging / "index.json"), field="staged.index")}
+        staged_worker_reports: dict[str, Mapping[str, Any]] = {}
+        for route_key, raw in _mapping(staged_objects["array_bundle"].get("route_artifacts"), field="staged.bundle.routes").items():
+            descriptor = _mapping(raw, field="staged.bundle.route." + route_key)
+            staged_worker_reports[route_key] = _mapping(load_canonical_json(_path(staging, descriptor.get("manifest_ref"), field="staged.manifest." + route_key)), field="staged.worker." + route_key)
+        staged_manifests = {route_key: _mapping(report.get("arrays"), field="staged.arrays." + route_key) for route_key, report in staged_worker_reports.items()}
+        staged_sources = {name: staging / name for name in reproduction_sources}
+        _candidate_publication_check(repository=repository, objects=staged_objects, worker_reports=staged_worker_reports, manifests=staged_manifests, source_files=staged_sources)
+        if (staging / "success.json").exists() or any(_sha(staging / role_files[role]) != digest for role, digest in role_sha.items()) or any(_sha(staging / reproduction[role]) != digest for role, digest in reproduction_sha.items()):
+            raise Stage1S18FormalError("S18_STAGED_PUBLICATION_VERIFICATION_FAILED")
+        _staged_array_bundle_replay(repository, staging)
+        _write(staging / "success.json", _with_hash({"schema_version": "stage1-s1-8-success-v1", "status": "PASS", "gate_artifact_hash": gate["artifact_hash"], "validation_sha256": _sha(work / "validation.json")}))
+        os.replace(staging, target); staging = None
+        return {"index_ref": (target / "index.json").relative_to(data_root).as_posix(), "validation_ref": (target / "validation.json").relative_to(data_root).as_posix()}
+    except BaseException as error:
+        if staging is not None and (staging / "success.json").exists(): (staging / "success.json").unlink()
+        _write(work / "failed.json", _with_hash({"schema_version": "stage1-s1-8-failure-v1", "status": "FAILED", "phase": phase, "error_type": type(error).__name__, "error": str(error)}))
+        if lease is not None:
+            if isinstance(error, Stage1S18ManualInterventionRequired): lease.close()
+            elif release_attempted:
+                # A completed release has no current record; this only closes
+                # the already-retired descriptor.
+                lease.close()
+            elif not release_started:
+                release_started = True
+                _release_lease_transaction(lease, outcome="FAILED", work=work, label="failure")
+                release_attempted = True
+        raise
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--repository", type=Path, required=True); parser.add_argument("--data-root", type=Path, required=True)
+    parser.add_argument("--s1-7-index-ref", required=True); parser.add_argument("--gpu-capability-ref", required=True); parser.add_argument("--approved-gpu-uuid", action="append", dest="uuids", required=True)
+    parser.add_argument("--attempt-id", required=True); parser.add_argument("--lease-owner", required=True); parser.add_argument("--timeout-seconds", type=int, default=3600)
+    args = parser.parse_args(argv)
+    print(execute(repository=args.repository, data_root=args.data_root, s1_7_index_ref=args.s1_7_index_ref, gpu_capability_ref=args.gpu_capability_ref, approved_gpu_uuids=args.uuids, attempt_id=args.attempt_id, lease_owner=args.lease_owner, timeout_seconds=args.timeout_seconds))
+    return 0
+
+
+if __name__ == "__main__":  # pragma: no cover - executable entry point
+    raise SystemExit(main())

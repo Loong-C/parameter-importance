@@ -1,0 +1,5 @@
+{
+  "$id": "stage1-s1-8-array-bundle-v1.json", "$schema": "https://json-schema.org/draft/2020-12/schema", "type": "object",
+  "required": ["schema_version", "status", "route_artifacts", "artifact_hash"],
+  "properties": {"schema_version": {"const": "stage1-s1-8-array-bundle-v1"}, "status": {"const": "PASS"}, "route_artifacts": {"type": "object", "minProperties": 6, "maxProperties": 6, "propertyNames": {"enum": ["A", "B", "C", "D", "D-rank_swap", "D-local_reverse"]}, "additionalProperties": {"type": "object", "required": ["artifact_ref", "manifest_ref", "file_sha256", "file_size_bytes", "manifest_hash"], "properties": {"artifact_ref": {"type": "string", "pattern": "^run__"}, "manifest_ref": {"type": "string", "pattern": "^run__"}, "file_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}, "file_size_bytes": {"type": "integer", "exclusiveMinimum": 0}, "manifest_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"}}, "additionalProperties": false}}, "artifact_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"}}, "additionalProperties": false
+}
