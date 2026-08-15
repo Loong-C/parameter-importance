@@ -5,7 +5,12 @@ from __future__ import annotations
 import math
 import importlib.util
 import copy
+import os
 from pathlib import Path
+import signal
+import subprocess
+import sys
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -190,8 +195,8 @@ def test_unknown_process_group_member_never_signals_and_persists_manual_marker(t
     formalizer = _formalizer()
     expected = {"pid": 12, "ppid": 1, "uid": 1000, "pgid": 44, "sid": 44, "start_ticks": "99", "exe": "/usr/bin/python", "cmdline_sha256": "a" * 64, "environment_run_token": "b" * 64}
     signals: list[tuple[int, int]] = []
-    monkeypatch.setattr(formalizer, "_audit_exact_process_group", lambda _: (_ for _ in ()).throw(formalizer.Stage1S18ManualInterventionRequired("S18_PROCESS_GROUP_MEMBER_UNVERIFIABLE")))
-    monkeypatch.setattr(formalizer, "_pgid_members", lambda _: [12, 13])
+    monkeypatch.setattr(formalizer, "_audit_exact_process_group", lambda _expected, **_kwargs: (_ for _ in ()).throw(formalizer.Stage1S18ManualInterventionRequired("S18_PROCESS_GROUP_MEMBER_UNVERIFIABLE")))
+    monkeypatch.setattr(formalizer, "_residual_launch_tree", lambda _expected, **_kwargs: {"session_members": [], "token_members": []})
     monkeypatch.setattr(formalizer.os, "killpg", lambda pgid, sig: signals.append((pgid, sig)), raising=False)
     with pytest.raises(formalizer.Stage1S18ManualInterventionRequired):
         formalizer._terminate_exact(SimpleNamespace(wait=lambda timeout: None), expected, tmp_path, label="unknown-member")
@@ -223,6 +228,149 @@ def test_child_fingerprint_remains_strict_for_missing_or_wrong_inherited_token(m
             formalizer._fingerprint(12, token)
     monkeypatch.setattr(formalizer, "_process_environment", lambda pid: [b"PARAM_IMPORTANCE_S18_RUN_TOKEN=" + token.encode("ascii")])
     assert formalizer._fingerprint(12, token) == {**base, "environment_run_token": token}
+
+
+def test_torchrun_endpoint_is_nonzero_loopback_and_never_reused() -> None:
+    formalizer = _formalizer()
+    command = [
+        "python", "-m", "torch.distributed.run", "--rdzv-id", "a" * 64,
+        "--rdzv-endpoint", "127.0.0.1:0", "--nproc_per_node", "4", "worker.py",
+    ]
+    first_command, first_reservation, first_endpoint = formalizer._prepare_rendezvous_command(command, run_token="a" * 64)
+    second_command, second_reservation, second_endpoint = formalizer._prepare_rendezvous_command(command, run_token="a" * 64)
+    try:
+        assert first_reservation is not None and second_reservation is not None
+        assert formalizer._is_nonzero_loopback_endpoint(first_endpoint)
+        assert formalizer._is_nonzero_loopback_endpoint(second_endpoint)
+        assert first_endpoint != second_endpoint
+        assert first_command[first_command.index("--rdzv-endpoint") + 1] == first_endpoint
+        assert second_command[second_command.index("--rdzv-endpoint") + 1] == second_endpoint
+    finally:
+        if first_reservation is not None:
+            first_reservation.close()
+        if second_reservation is not None:
+            second_reservation.close()
+
+
+def test_independent_worker_sessions_are_discovered_by_token_and_historical_ancestry(monkeypatch: pytest.MonkeyPatch) -> None:
+    formalizer = _formalizer(); token = "b" * 64
+    def fingerprint(pid: int, requested: str) -> dict[str, object]:
+        assert requested == token
+        values = {
+            100: {"pid": 100, "ppid": 1, "uid": 7, "pgid": 100, "sid": 100, "start_ticks": "10"},
+            101: {"pid": 101, "ppid": 100, "uid": 7, "pgid": 101, "sid": 201, "start_ticks": "11"},
+            102: {"pid": 102, "ppid": 101, "uid": 7, "pgid": 102, "sid": 202, "start_ticks": "12"},
+        }
+        return {**values[pid], "exe": "/usr/bin/python", "cmdline_sha256": "a" * 64, "environment_run_token": token}
+    expected = fingerprint(100, token)
+    monkeypatch.setattr(formalizer, "_token_process_ids", lambda _: [100, 101, 102])
+    monkeypatch.setattr(formalizer, "_fingerprint", fingerprint)
+    monkeypatch.setattr(formalizer, "_session_members", lambda sid: {100: [100], 201: [101], 202: [102]}[sid])
+    audit = formalizer._audit_exact_process_group(expected, known_members={100: expected})
+    assert audit["member_pids"] == [100, 101, 102]
+    assert audit["ancestry_depths"] == {"100": 0, "101": 1, "102": 2}
+    assert [member["sid"] for member in audit["members"]] == [100, 201, 202]
+    signalled: list[int] = []
+    monkeypatch.setattr(formalizer, "_signal_exact_member", lambda member, _signal: signalled.append(member["pid"]) or True)
+    assert formalizer._signal_exact_tree(audit, 15) == [102, 101, 100]
+    assert signalled == [102, 101, 100]
+
+
+def test_unknown_member_in_worker_session_blocks_without_signal(monkeypatch: pytest.MonkeyPatch) -> None:
+    formalizer = _formalizer(); token = "b" * 64
+    base = {"pid": 100, "ppid": 1, "uid": 7, "pgid": 100, "sid": 100, "start_ticks": "10", "exe": "/usr/bin/python", "cmdline_sha256": "a" * 64, "environment_run_token": token}
+    worker = {**base, "pid": 101, "ppid": 100, "pgid": 101, "sid": 201, "start_ticks": "11"}
+    monkeypatch.setattr(formalizer, "_token_process_ids", lambda _: [100, 101])
+    monkeypatch.setattr(formalizer, "_fingerprint", lambda pid, _: base if pid == 100 else worker if pid == 101 else (_ for _ in ()).throw(ProcessLookupError(pid)))
+    monkeypatch.setattr(formalizer, "_session_members", lambda sid: [100] if sid == 100 else [101, 999])
+    with pytest.raises(formalizer.Stage1S18ManualInterventionRequired, match="S18_PROCESS_SESSION_TOKEN_MEMBERSHIP_DRIFT"):
+        formalizer._audit_exact_process_group(base, known_members={100: base})
+
+
+@pytest.mark.skipif(os.name != "posix" or not Path("/proc").is_dir() or not hasattr(os, "pidfd_open") or not hasattr(signal, "pidfd_send_signal"), reason="requires Linux /proc and pidfd")
+def test_real_linux_elastic_style_child_session_is_audited_and_pidfd_terminated() -> None:
+    """Exercise actual /proc ownership, not just a mocked independent SID."""
+
+    formalizer = _formalizer(); token = "d" * 64
+    child_code = "import time; time.sleep(8)"
+    launcher_code = (
+        "import subprocess,sys,time; "
+        f"subprocess.Popen([sys.executable, '-c', {child_code!r}], start_new_session=True); "
+        "time.sleep(8)"
+    )
+    environment = dict(os.environ); environment["PARAM_IMPORTANCE_S18_RUN_TOKEN"] = token
+    launcher = subprocess.Popen([sys.executable, "-c", launcher_code], env=environment, start_new_session=True)
+    known: dict[int, dict[str, object]] = {}
+    try:
+        expected = formalizer._fingerprint(launcher.pid, token); known[launcher.pid] = expected
+        deadline, audit = time.monotonic() + 4.0, None
+        while time.monotonic() < deadline:
+            audit = formalizer._audit_exact_process_group(expected, known_members=known)
+            for member in audit["members"]:
+                known.setdefault(member["pid"], member)
+            if len(audit["members"]) == 2:
+                break
+            time.sleep(0.05)
+        assert audit is not None and len(audit["members"]) == 2
+        assert len({member["sid"] for member in audit["members"]}) == 2
+        assert len({member["pgid"] for member in audit["members"]}) == 2
+        assert sorted(audit["ancestry_depths"].values()) == [0, 1]
+        assert len(formalizer._signal_exact_tree(audit, signal.SIGTERM)) == 2
+        launcher.wait(timeout=5)
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline and formalizer._residual_launch_tree(expected, known_members=known)["session_members"]:
+            time.sleep(0.05)
+        assert formalizer._residual_launch_tree(expected, known_members=known) == {"session_members": [], "token_members": []}
+    finally:
+        if launcher.poll() is None:
+            launcher.kill(); launcher.wait(timeout=5)
+
+
+def test_process_outcome_requires_exact_endpoint_handoff_and_independent_worker_tree() -> None:
+    formalizer = _formalizer(); token = "e" * 64
+    def member(pid: int, *, parent: int, sid: int, start: int) -> dict[str, object]:
+        return {"pid": pid, "ppid": parent, "uid": 7, "pgid": sid, "sid": sid, "start_ticks": str(start), "exe": "/usr/bin/python", "cmdline_sha256": "a" * 64, "environment_run_token": token}
+    launcher = member(100, parent=1, sid=100, start=10)
+    workers = [member(pid, parent=100, sid=pid, start=11) for pid in range(101, 105)]
+    initial = {"pgid": 100, "sid": 100, "members": [launcher], "member_pids": [100], "ancestry_depths": {"100": 0}}
+    known = {"pgid": 100, "sid": 100, "members": [launcher, *workers], "member_pids": [100, 101, 102, 103, 104], "ancestry_depths": {"100": 0, "101": 1, "102": 1, "103": 1, "104": 1}}
+    outcome = formalizer._with_hash({
+        "schema_version": "stage1-s1-8-process-outcome-v1", "label": "negative", "command": ["python", "-m", "torch.distributed.run", "--rdzv-id", token, "--rdzv-endpoint", "127.0.0.1:43123", "--nproc_per_node", "4", "worker.py"],
+        "rendezvous_id": token, "rendezvous_endpoint": "127.0.0.1:43123", "rendezvous_handoff": {"reservation_held_to_popen": True, "single_attempt": True, "silent_retry": False}, "returncode": 1,
+        "fingerprint": launcher, "initial_tree": initial, "known_tree": known, "termination_audit_ref": None, "stdout_sha256": "b" * 64, "stderr_sha256": "c" * 64, "expected_success": False, "residual_launch_tree": {"session_members": [], "token_members": []},
+    })
+    formalizer._validate_process_outcome_contract(outcome)
+    # Route A/B use one worker (launcher + 1), C uses two (launcher + 2),
+    # and smoke/D use four (launcher + 4); no route shares a hard-coded five.
+    for nproc in (1, 2):
+        route_outcome = copy.deepcopy(outcome)
+        route_outcome["command"][route_outcome["command"].index("--nproc_per_node") + 1] = str(nproc)
+        route_outcome["known_tree"]["members"] = [launcher, *workers[:nproc]]
+        route_outcome["known_tree"]["member_pids"] = [100, *range(101, 101 + nproc)]
+        route_outcome["known_tree"]["ancestry_depths"] = {"100": 0, **{str(pid): 1 for pid in range(101, 101 + nproc)}}
+        route_outcome["artifact_hash"] = formalizer._canonical({key: value for key, value in route_outcome.items() if key != "artifact_hash"})
+        formalizer._validate_process_outcome_contract(route_outcome)
+    drifted = copy.deepcopy(outcome); drifted["rendezvous_handoff"]["silent_retry"] = True; drifted["artifact_hash"] = formalizer._canonical({key: value for key, value in drifted.items() if key != "artifact_hash"})
+    with pytest.raises(formalizer.Stage1S18FormalError, match="S18_PROCESS_RENDEZVOUS_OUTCOME_INVALID"):
+        formalizer._validate_process_outcome_contract(drifted)
+
+
+def test_non_distributed_scale_outcome_requires_one_known_process() -> None:
+    formalizer = _formalizer(); token = "f" * 64
+    launcher = {"pid": 100, "ppid": 1, "uid": 7, "pgid": 100, "sid": 100, "start_ticks": "10", "exe": "/usr/bin/python", "cmdline_sha256": "a" * 64, "environment_run_token": token}
+    tree = {"pgid": 100, "sid": 100, "members": [launcher], "member_pids": [100], "ancestry_depths": {"100": 0}}
+    outcome = formalizer._with_hash({
+        "schema_version": "stage1-s1-8-process-outcome-v1", "label": "pre-route-scale", "command": ["python", "scale.py"],
+        "rendezvous_id": token, "rendezvous_endpoint": None, "rendezvous_handoff": {"reservation_held_to_popen": False, "single_attempt": True, "silent_retry": False}, "returncode": 0,
+        "fingerprint": launcher, "initial_tree": tree, "known_tree": tree, "termination_audit_ref": None, "stdout_sha256": "b" * 64, "stderr_sha256": "c" * 64, "expected_success": True, "residual_launch_tree": {"session_members": [], "token_members": []},
+    })
+    formalizer._validate_process_outcome_contract(outcome)
+    drifted = copy.deepcopy(outcome)
+    extra = {**launcher, "pid": 101, "ppid": 100, "pgid": 101, "sid": 101, "start_ticks": "11"}
+    drifted["known_tree"] = {"pgid": 100, "sid": 100, "members": [launcher, extra], "member_pids": [100, 101], "ancestry_depths": {"100": 0, "101": 1}}
+    drifted["artifact_hash"] = formalizer._canonical({key: value for key, value in drifted.items() if key != "artifact_hash"})
+    with pytest.raises(formalizer.Stage1S18FormalError, match="S18_CANDIDATE_PROCESS_TREE_MEMBER_COUNT_INVALID"):
+        formalizer._validate_process_outcome_contract(drifted)
 
 
 def test_release_failure_is_manual_not_a_close_only_success(tmp_path: Path) -> None:

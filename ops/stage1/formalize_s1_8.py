@@ -21,6 +21,7 @@ from pathlib import Path, PurePosixPath
 import re
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import time
@@ -111,6 +112,7 @@ ROUTE_WORLD = {"A": 1, "B": 1, "C": 2, "D": 4}
 PERMUTATIONS = ("rank_swap", "local_reverse")
 _DIGEST = set("0123456789abcdef")
 GPU_UUID_RE = re.compile(r"GPU-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
+_USED_LOOPBACK_RENDEZVOUS_PORTS: set[int] = set()
 PILE_DOWNLOADER_CMDLINE_SIGNATURES = (
     b"server_xet_download.sh",
     b"pile-full-download",
@@ -306,6 +308,84 @@ def _validate_worker_candidate_contract(route_key: str, report: Mapping[str, Any
             raise Stage1S18FormalError("S18_CANDIDATE_WORKER_STATISTICS_OR_ARRAYS_INVALID:" + route_key)
 
 
+def _validate_recorded_launch_tree(*, fingerprint: Mapping[str, Any], tree: Mapping[str, Any], expected_member_count: int | None) -> None:
+    """Validate serialized ownership evidence without trusting process output.
+
+    The formal report preserves first-captured PPIDs as historical ancestry,
+    because elastic's ``start_new_session=True`` makes worker sessions distinct
+    from torchrun and later re-parenting is legitimate.  This check deliberately
+    does not require a common SID/PGID; it proves the stored tree instead.
+    """
+
+    required_tree = {"pgid", "sid", "members", "member_pids", "ancestry_depths"}
+    required_fingerprint = {"pid", "ppid", "uid", "pgid", "sid", "start_ticks", "exe", "cmdline_sha256", "environment_run_token"}
+    if set(tree) != required_tree or set(fingerprint) != required_fingerprint:
+        raise Stage1S18FormalError("S18_CANDIDATE_PROCESS_TREE_KEYS_INVALID")
+    members, pids, depths = tree.get("members"), tree.get("member_pids"), tree.get("ancestry_depths")
+    launcher_pid, launcher_uid, launcher_start = fingerprint.get("pid"), fingerprint.get("uid"), fingerprint.get("start_ticks")
+    if not isinstance(members, list) or not isinstance(pids, list) or not isinstance(depths, Mapping) or not isinstance(launcher_pid, int) or not isinstance(launcher_uid, int) or not isinstance(launcher_start, str) or not launcher_start.isdigit():
+        raise Stage1S18FormalError("S18_CANDIDATE_PROCESS_TREE_SHAPE_INVALID")
+    by_pid = {member.get("pid"): member for member in members if isinstance(member, Mapping) and set(member) == required_fingerprint and isinstance(member.get("pid"), int)}
+    if len(by_pid) != len(members) or pids != sorted(by_pid) or set(depths) != {str(pid) for pid in by_pid}:
+        raise Stage1S18FormalError("S18_CANDIDATE_PROCESS_TREE_CARDINALITY_INVALID")
+    launcher = by_pid.get(launcher_pid)
+    if launcher is None or dict(launcher) != dict(fingerprint) or tree.get("pgid") != fingerprint.get("pgid") or tree.get("sid") != fingerprint.get("sid"):
+        raise Stage1S18FormalError("S18_CANDIDATE_PROCESS_TREE_LAUNCHER_INVALID")
+    if expected_member_count is not None and (len(by_pid) != expected_member_count or len({member.get("sid") for member in by_pid.values()}) != expected_member_count):
+        raise Stage1S18FormalError("S18_CANDIDATE_PROCESS_TREE_MEMBER_COUNT_INVALID")
+    for pid, member in by_pid.items():
+        if member.get("uid") != launcher_uid or member.get("environment_run_token") != fingerprint.get("environment_run_token") or not isinstance(member.get("start_ticks"), str) or not member["start_ticks"].isdigit() or int(member["start_ticks"]) < int(launcher_start) or not isinstance(depths.get(str(pid)), int) or int(depths[str(pid)]) < 0:
+            raise Stage1S18FormalError("S18_CANDIDATE_PROCESS_TREE_MEMBER_INVALID")
+        current, depth, seen = pid, 0, set()
+        while current != launcher_pid:
+            if current in seen:
+                raise Stage1S18FormalError("S18_CANDIDATE_PROCESS_TREE_ANCESTRY_CYCLE")
+            seen.add(current)
+            parent = by_pid[current].get("ppid")
+            if not isinstance(parent, int) or parent not in by_pid:
+                raise Stage1S18FormalError("S18_CANDIDATE_PROCESS_TREE_ANCESTRY_INVALID")
+            current, depth = parent, depth + 1
+        if depth != depths[str(pid)]:
+            raise Stage1S18FormalError("S18_CANDIDATE_PROCESS_TREE_DEPTH_INVALID")
+
+
+def _validate_process_outcome_contract(outcome: Mapping[str, Any]) -> None:
+    """Directly validate every launcher outcome before and after publication."""
+
+    required = {"schema_version", "label", "command", "rendezvous_id", "rendezvous_endpoint", "rendezvous_handoff", "returncode", "fingerprint", "initial_tree", "known_tree", "termination_audit_ref", "stdout_sha256", "stderr_sha256", "expected_success", "residual_launch_tree", "artifact_hash"}
+    if set(outcome) != required or outcome.get("schema_version") != "stage1-s1-8-process-outcome-v1":
+        raise Stage1S18FormalError("S18_PROCESS_OUTCOME_KEYS_INVALID")
+    command, fingerprint = outcome.get("command"), _mapping(outcome.get("fingerprint"), field="process.fingerprint")
+    endpoint, handoff = outcome.get("rendezvous_endpoint"), outcome.get("rendezvous_handoff")
+    expected_success, returncode = outcome.get("expected_success"), outcome.get("returncode")
+    if not _self_hash(outcome) or not isinstance(command, list) or any(not isinstance(value, str) for value in command) or not isinstance(expected_success, bool) or not isinstance(returncode, int) or (returncode == 0) != expected_success or outcome.get("rendezvous_id") != fingerprint.get("environment_run_token") or outcome.get("residual_launch_tree") != {"session_members": [], "token_members": []}:
+        raise Stage1S18FormalError("S18_PROCESS_OUTCOME_INVALID")
+    distributed = "torch.distributed.run" in command
+    ids = [index for index, value in enumerate(command) if value == "--rdzv-id"]
+    endpoints = [index for index, value in enumerate(command) if value == "--rdzv-endpoint"]
+    # A non-torchrun pre-route scale oracle is one launcher process.  Its
+    # initial snapshot remains permitted to be a transient subset, but its
+    # complete known tree must prove no extra child was launched.
+    expected_member_count: int | None = 1
+    if distributed:
+        nproc_positions = [index for index, value in enumerate(command) if value == "--nproc_per_node"]
+        if len(nproc_positions) != 1 or nproc_positions[0] + 1 >= len(command):
+            raise Stage1S18FormalError("S18_PROCESS_NPROC_OUTCOME_INVALID")
+        try:
+            nproc_per_node = int(command[nproc_positions[0] + 1])
+        except ValueError as error:
+            raise Stage1S18FormalError("S18_PROCESS_NPROC_OUTCOME_INVALID") from error
+        if nproc_per_node not in {1, 2, 4}:
+            raise Stage1S18FormalError("S18_PROCESS_NPROC_OUTCOME_INVALID")
+        expected_member_count = nproc_per_node + 1
+        if not _is_nonzero_loopback_endpoint(endpoint) or handoff != {"reservation_held_to_popen": True, "single_attempt": True, "silent_retry": False} or len(ids) != 1 or ids[0] + 1 >= len(command) or command[ids[0] + 1] != outcome.get("rendezvous_id") or len(endpoints) != 1 or endpoints[0] + 1 >= len(command) or command[endpoints[0] + 1] != endpoint:
+            raise Stage1S18FormalError("S18_PROCESS_RENDEZVOUS_OUTCOME_INVALID")
+    elif endpoint is not None or handoff != {"reservation_held_to_popen": False, "single_attempt": True, "silent_retry": False} or ids or endpoints:
+        raise Stage1S18FormalError("S18_PROCESS_NON_DISTRIBUTED_OUTCOME_INVALID")
+    _validate_recorded_launch_tree(fingerprint=fingerprint, tree=_mapping(outcome.get("initial_tree"), field="process.initial_tree"), expected_member_count=None)
+    _validate_recorded_launch_tree(fingerprint=fingerprint, tree=_mapping(outcome.get("known_tree"), field="process.known_tree"), expected_member_count=expected_member_count)
+
+
 def _candidate_publication_check(
     *,
     repository: Path,
@@ -339,6 +419,10 @@ def _candidate_publication_check(
         if _mapping(report.get("arrays"), field="candidate.worker.arrays") != manifest:
             raise Stage1S18FormalError("S18_CANDIDATE_WORKER_MANIFEST_CROSSREF_INVALID:" + route_key)
         _validate_worker_candidate_contract(route_key, report)
+    from param_importance_nlp.contracts.jsonio import load_canonical_json
+    for name, path in sorted(source_files.items()):
+        if name.endswith(".process.json"):
+            _validate_process_outcome_contract(_mapping(load_canonical_json(path), field="candidate.process." + name))
 
     fixture, ddp, bundle, table, gate, replay_record, validation, index = (
         objects["fixture_manifest"], objects["ddp_report"], objects["array_bundle"],
@@ -378,6 +462,46 @@ def _candidate_publication_check(
         raise Stage1S18FormalError("S18_CANDIDATE_INDEX_ROLE_CROSSREF_INVALID")
     if ddp.get("fixture_hash") != fixture.get("fixture_hash") or table.get("status") != "PASS" or replay_record.get("status") != "PASS":
         raise Stage1S18FormalError("S18_CANDIDATE_FIXTURE_OR_REPLAY_CROSSREF_INVALID")
+    negatives = _mapping(ddp.get("negative_controls"), field="candidate.ddp.negative_controls")
+    if set(negatives) != {"ordinary_sync_negative", "inject_rank_failure"}:
+        raise Stage1S18FormalError("S18_CANDIDATE_NEGATIVE_CONTROL_SET_INVALID")
+    for name, raw in negatives.items():
+        negative = _mapping(raw, field="candidate.ddp.negative." + name)
+        process = _mapping(negative.get("process"), field="candidate.ddp.negative.process." + name)
+        tree = _mapping(process.get("initial_tree"), field="candidate.ddp.negative.initial_tree." + name)
+        known_tree = _mapping(process.get("known_tree"), field="candidate.ddp.negative.known_tree." + name)
+        residual = _mapping(process.get("residual_launch_tree"), field="candidate.ddp.negative.residual_tree." + name)
+        members = tree.get("members")
+        known_members = known_tree.get("members")
+        fingerprint = _mapping(process.get("fingerprint"), field="candidate.ddp.negative.fingerprint." + name)
+        command = process.get("command")
+        initial_pids = tree.get("member_pids")
+        known_pids = known_tree.get("member_pids")
+        initial_depths, known_depths = tree.get("ancestry_depths"), known_tree.get("ancestry_depths")
+        endpoint = process.get("rendezvous_endpoint")
+        if isinstance(command, list):
+            rendezvous_id_positions = [index for index, value in enumerate(command) if value == "--rdzv-id"]
+            endpoint_positions = [index for index, value in enumerate(command) if value == "--rdzv-endpoint"]
+        else:
+            rendezvous_id_positions, endpoint_positions = [], []
+        if (
+            not _is_nonzero_loopback_endpoint(endpoint)
+            or process.get("rendezvous_id") != fingerprint.get("environment_run_token")
+            or process.get("rendezvous_handoff") != {"reservation_held_to_popen": True, "single_attempt": True, "silent_retry": False}
+            or not isinstance(members, list)
+            or not isinstance(known_members, list)
+            or initial_pids != [item.get("pid") for item in members if isinstance(item, Mapping)]
+            or known_pids != [item.get("pid") for item in known_members if isinstance(item, Mapping)]
+            or not isinstance(initial_depths, Mapping) or set(initial_depths) != {str(pid) for pid in initial_pids if isinstance(pid, int)}
+            or not isinstance(known_depths, Mapping) or set(known_depths) != {str(pid) for pid in known_pids if isinstance(pid, int)}
+            or not isinstance(initial_pids, list) or not isinstance(known_pids, list) or not set(initial_pids).issubset(set(known_pids))
+            or len(rendezvous_id_positions) != 1 or rendezvous_id_positions[0] + 1 >= len(command) or command[rendezvous_id_positions[0] + 1] != process.get("rendezvous_id")
+            or len(endpoint_positions) != 1 or endpoint_positions[0] + 1 >= len(command) or command[endpoint_positions[0] + 1] != endpoint
+            or residual != {"session_members": [], "token_members": []}
+        ):
+            raise Stage1S18FormalError("S18_CANDIDATE_NEGATIVE_PROCESS_TREE_INVALID:" + name)
+        _validate_recorded_launch_tree(fingerprint=fingerprint, tree=tree, expected_member_count=None)
+        _validate_process_outcome_contract(process)
     if index.get("implementation_source_sha256") != ddp.get("implementation_source_sha256"):
         raise Stage1S18FormalError("S18_CANDIDATE_SOURCE_MAP_CROSSREF_INVALID")
     source_map = _mapping(index.get("implementation_source_sha256"), field="candidate.source_map")
@@ -970,76 +1094,326 @@ def _parent_fingerprint(pid: int, planned_run_token: str) -> dict[str, Any]:
     return {**identity, "planned_run_token": planned_run_token, "token_inherited_at_exec": False}
 
 
-def _pgid_members(pgid: int) -> list[int]:
+def _session_members(sid: int) -> list[int]:
+    """Enumerate the launch session without retaining process command text."""
+
     members: list[int] = []
     for entry in Path("/proc").iterdir():
         if not entry.name.isdigit():
             continue
         try:
-            if os.getpgid(int(entry.name)) == pgid:
+            if os.getsid(int(entry.name)) == sid:
                 members.append(int(entry.name))
         except ProcessLookupError:
             continue
     return sorted(members)
 
 
-def _audit_exact_process_group(expected: Mapping[str, Any]) -> dict[str, Any]:
-    """Fail closed unless every member is demonstrably this launch tree."""
+def _token_process_ids(run_token: str) -> list[int]:
+    """Find only exact-token processes; all same-session members are audited separately."""
 
-    pgid, token = expected.get("pgid"), expected.get("environment_run_token")
-    if not isinstance(pgid, int) or not isinstance(token, str):
+    result: list[int] = []
+    for entry in Path("/proc").iterdir():
+        if not entry.name.isdigit():
+            continue
+        try:
+            _inherited_run_token(int(entry.name), run_token)
+        except (OSError, ProcessLookupError, UnicodeDecodeError):
+            continue
+        result.append(int(entry.name))
+    return sorted(result)
+
+
+_FINGERPRINT_STABLE_FIELDS = (
+    "pid", "uid", "pgid", "sid", "start_ticks", "exe", "cmdline_sha256", "environment_run_token",
+)
+
+
+def _same_live_fingerprint(expected: Mapping[str, Any], observed: Mapping[str, Any]) -> bool:
+    """Compare fields that cannot legitimately change after a worker execs.
+
+    PPID is deliberately excluded: elastic workers can be re-parented after
+    the torchrun launcher exits.  The initial PPID is retained separately as
+    historical ancestry evidence, while pidfd + start ticks protect signals
+    from PID reuse.
+    """
+
+    return all(expected.get(field) == observed.get(field) for field in _FINGERPRINT_STABLE_FIELDS)
+
+
+def _tree_depths(
+    *, expected: Mapping[str, Any], observed: Mapping[int, Mapping[str, Any]], known_members: Mapping[int, Mapping[str, Any]],
+) -> dict[int, int]:
+    """Prove each token process was launched below the recorded launcher.
+
+    A member's first captured parent is authoritative historical evidence.
+    Thus a worker that has since been re-parented stays attributable, whereas
+    an uncaptured orphan (or a newly injected token process) is rejected.
+    """
+
+    launcher_pid = expected.get("pid")
+    if not isinstance(launcher_pid, int):
         raise Stage1S18ManualInterventionRequired("S18_PROCESS_AUDIT_EXPECTED_INVALID")
-    member_ids = _pgid_members(pgid)
-    observed: list[dict[str, Any]] = []
-    for pid in member_ids:
+    ancestry: dict[int, Mapping[str, Any]] = {int(pid): value for pid, value in known_members.items() if isinstance(pid, int)}
+    ancestry.update({int(pid): value for pid, value in observed.items()})
+    # Preserve first-observed PPID for established workers rather than a
+    # potentially re-parented value from this polling pass.
+    ancestry.update({int(pid): value for pid, value in known_members.items() if isinstance(pid, int)})
+    depths: dict[int, int] = {}
+    for origin in observed:
+        current, depth, seen = origin, 0, set()
+        while current != launcher_pid:
+            if current in seen:
+                raise Stage1S18ManualInterventionRequired("S18_PROCESS_TREE_ANCESTRY_CYCLE")
+            seen.add(current)
+            item = ancestry.get(current)
+            parent = item.get("ppid") if isinstance(item, Mapping) else None
+            if not isinstance(parent, int) or parent not in ancestry:
+                raise Stage1S18ManualInterventionRequired("S18_PROCESS_TREE_PARENT_DRIFT")
+            current, depth = parent, depth + 1
+        depths[origin] = depth
+    return depths
+
+
+def _audit_exact_process_group(expected: Mapping[str, Any], *, known_members: Mapping[int, Mapping[str, Any]] | None = None) -> dict[str, Any]:
+    """Fail closed unless every live token process belongs to this launch tree.
+
+    ``torch.distributed.elastic`` starts workers in *new sessions*.  Therefore
+    SID/PGID equality with the launcher is not an ownership test.  Ownership
+    is the exact inherited token, same UID, post-launch start time, and the
+    launcher-recorded PPID ancestry captured while the launcher is alive.  We
+    nevertheless inspect every live member of every involved SID and reject a
+    session containing an unrelated process.
+    """
+
+    pgid, sid, token = expected.get("pgid"), expected.get("sid"), expected.get("environment_run_token")
+    expected_pid, expected_uid, expected_start = expected.get("pid"), expected.get("uid"), expected.get("start_ticks")
+    if not isinstance(pgid, int) or not isinstance(sid, int) or not isinstance(token, str) or not isinstance(expected_pid, int) or not isinstance(expected_uid, int) or not isinstance(expected_start, str) or not expected_start.isdigit():
+        raise Stage1S18ManualInterventionRequired("S18_PROCESS_AUDIT_EXPECTED_INVALID")
+    previous = dict(known_members or {})
+    token_ids = _token_process_ids(token)
+    if expected_pid not in token_ids:
+        raise ProcessLookupError(expected_pid)
+    observed: dict[int, dict[str, Any]] = {}
+    for pid in token_ids:
         try:
             fingerprint = _fingerprint(pid, token)
         except (OSError, ProcessLookupError):
-            raise Stage1S18ManualInterventionRequired("S18_PROCESS_GROUP_MEMBER_UNVERIFIABLE") from None
-        if fingerprint["uid"] != expected.get("uid") or fingerprint["pgid"] != pgid or fingerprint["sid"] != expected.get("sid"):
-            raise Stage1S18ManualInterventionRequired("S18_PROCESS_GROUP_MEMBER_IDENTITY_DRIFT")
-        observed.append(fingerprint)
-    launcher = next((item for item in observed if item["pid"] == expected.get("pid")), None)
-    if launcher != dict(expected):
+            raise Stage1S18ManualInterventionRequired("S18_PROCESS_TREE_MEMBER_UNVERIFIABLE") from None
+        start_ticks = fingerprint.get("start_ticks")
+        if fingerprint["uid"] != expected_uid or not isinstance(start_ticks, str) or not start_ticks.isdigit() or int(start_ticks) < int(expected_start):
+            raise Stage1S18ManualInterventionRequired("S18_PROCESS_TREE_MEMBER_IDENTITY_DRIFT")
+        earlier = previous.get(pid)
+        if earlier is not None and not _same_live_fingerprint(earlier, fingerprint):
+            raise Stage1S18ManualInterventionRequired("S18_PROCESS_TREE_MEMBER_IDENTITY_DRIFT")
+        observed[pid] = fingerprint
+    launcher = observed.get(expected_pid)
+    if launcher is None or not _same_live_fingerprint(expected, launcher):
         raise Stage1S18ManualInterventionRequired("S18_PROCESS_LAUNCHER_FINGERPRINT_DRIFT")
-    member_set = {item["pid"] for item in observed}
-    if any(item["pid"] != expected["pid"] and item["ppid"] not in member_set for item in observed):
-        raise Stage1S18ManualInterventionRequired("S18_PROCESS_GROUP_TREE_PARENT_DRIFT")
-    return {"pgid": pgid, "members": observed, "member_pids": sorted(member_set)}
+    depths = _tree_depths(expected=expected, observed=observed, known_members=previous)
+    for member_sid in sorted({int(item["sid"]) for item in observed.values()}):
+        for member_pid in _session_members(member_sid):
+            try:
+                session_member = _fingerprint(member_pid, token)
+            except (OSError, ProcessLookupError):
+                raise Stage1S18ManualInterventionRequired("S18_PROCESS_SESSION_TOKEN_MEMBERSHIP_DRIFT") from None
+            if member_pid not in observed or not _same_live_fingerprint(observed[member_pid], session_member):
+                raise Stage1S18ManualInterventionRequired("S18_PROCESS_SESSION_TOKEN_MEMBERSHIP_DRIFT")
+    members = [observed[pid] for pid in sorted(observed)]
+    return {
+        "pgid": pgid, "sid": sid, "members": members, "member_pids": sorted(observed),
+        "ancestry_depths": {str(pid): depths[pid] for pid in sorted(depths)},
+    }
 
 
 def _manual_intervention(work: Path, label: str, expected: Mapping[str, Any], *, reason: str, observed: object) -> None:
     _write(work / f"{label}-manual-intervention.json", _with_hash({"schema_version": "stage1-s1-8-manual-intervention-v1", "status": "BLOCKED", "reason": reason, "expected_fingerprint": dict(expected), "observed": observed, "action": "NO_SIGNAL_NO_LEASE_RELEASE"}))
 
 
-def _terminate_exact(process: subprocess.Popen[str], expected: Mapping[str, Any], work: Path, *, label: str) -> None:
+def _tree_signal_order(members: Sequence[Mapping[str, Any]], ancestry_depths: Mapping[str, Any]) -> list[Mapping[str, Any]]:
+    """Return children before parents, rejecting malformed or cyclic ancestry."""
+
+    by_pid = {member.get("pid"): member for member in members if isinstance(member.get("pid"), int)}
+    if len(by_pid) != len(members) or not by_pid:
+        raise Stage1S18ManualInterventionRequired("S18_PROCESS_TREE_SIGNAL_AUDIT_INVALID")
+    if set(ancestry_depths) != {str(pid) for pid in by_pid} or any(not isinstance(value, int) or value < 0 for value in ancestry_depths.values()):
+        raise Stage1S18ManualInterventionRequired("S18_PROCESS_TREE_SIGNAL_AUDIT_INVALID")
+    return sorted(members, key=lambda member: (-int(ancestry_depths[str(member["pid"])]), int(member["pid"])))
+
+
+def _signal_exact_member(member: Mapping[str, Any], signal_value: int) -> bool:
+    """Signal one freshly re-attested process through a pidfd, never a raw PID.
+
+    ``False`` means it naturally exited between audit and signalling.  A pidfd
+    pins the kernel task identity, while re-reading the exact run token and
+    start identity before and after opening it makes PID reuse fail closed.
+    """
+
+    pid, token = member.get("pid"), member.get("environment_run_token")
+    if not isinstance(pid, int) or not isinstance(token, str):
+        raise Stage1S18ManualInterventionRequired("S18_PROCESS_TREE_SIGNAL_MEMBER_INVALID")
+    if not hasattr(os, "pidfd_open") or not hasattr(signal, "pidfd_send_signal"):
+        raise Stage1S18ManualInterventionRequired("S18_PROCESS_TREE_PIDFD_UNAVAILABLE")
     try:
-        audit = _audit_exact_process_group(expected)
+        if not _same_live_fingerprint(member, _fingerprint(pid, token)):
+            raise Stage1S18ManualInterventionRequired("S18_PROCESS_TREE_SIGNAL_IDENTITY_DRIFT")
+        descriptor = os.pidfd_open(pid, 0)
+    except ProcessLookupError:
+        return False
+    except OSError as error:
+        raise Stage1S18ManualInterventionRequired("S18_PROCESS_TREE_PIDFD_OPEN_FAILED") from error
+    try:
+        try:
+            if not _same_live_fingerprint(member, _fingerprint(pid, token)):
+                raise Stage1S18ManualInterventionRequired("S18_PROCESS_TREE_SIGNAL_IDENTITY_DRIFT")
+            signal.pidfd_send_signal(descriptor, signal_value, None, 0)
+        except ProcessLookupError:
+            return False
+        except OSError as error:
+            raise Stage1S18ManualInterventionRequired("S18_PROCESS_TREE_PIDFD_SIGNAL_FAILED") from error
+    finally:
+        os.close(descriptor)
+    return True
+
+
+def _signal_exact_tree(audit: Mapping[str, Any], signal_value: int) -> list[int]:
+    """Signal only freshly re-attested launch-tree members, child before parent."""
+
+    members, depths = audit.get("members"), audit.get("ancestry_depths")
+    if not isinstance(members, list) or not isinstance(depths, Mapping) or any(not isinstance(member, Mapping) for member in members):
+        raise Stage1S18ManualInterventionRequired("S18_PROCESS_TREE_SIGNAL_AUDIT_INVALID")
+    signalled: list[int] = []
+    for member in _tree_signal_order([dict(member) for member in members], depths):
+        if _signal_exact_member(member, signal_value):
+            signalled.append(int(member["pid"]))
+    return signalled
+
+
+def _residual_launch_tree(expected: Mapping[str, Any], *, known_members: Mapping[int, Mapping[str, Any]] | None = None) -> dict[str, list[int]]:
+    """Return token residuals and every session ever attested for this launch."""
+
+    token = expected.get("environment_run_token")
+    if not isinstance(token, str):
+        return {"session_members": [], "token_members": []}
+    token_members = _token_process_ids(token)
+    session_members: set[int] = set()
+    session_ids: set[int] = set()
+    for pid in token_members:
+        try:
+            session_ids.add(os.getsid(pid))
+        except ProcessLookupError:
+            continue
+    for member in (known_members or {}).values():
+        if isinstance(member, Mapping) and isinstance(member.get("sid"), int):
+            session_ids.add(int(member["sid"]))
+    for member_sid in session_ids:
+        session_members.update(_session_members(member_sid))
+    return {"session_members": sorted(session_members), "token_members": token_members}
+
+
+def _known_launch_tree(expected: Mapping[str, Any], known_members: Mapping[int, Mapping[str, Any]], ancestry_depths: Mapping[int, int]) -> dict[str, Any]:
+    """Serialize the first-seen, token-bound process tree for reproduction."""
+
+    pgid, sid = expected.get("pgid"), expected.get("sid")
+    if not isinstance(pgid, int) or not isinstance(sid, int) or not known_members:
+        raise Stage1S18ManualInterventionRequired("S18_PROCESS_TREE_KNOWN_INVALID")
+    members = [dict(known_members[pid]) for pid in sorted(known_members)]
+    if set(ancestry_depths) != set(known_members):
+        raise Stage1S18ManualInterventionRequired("S18_PROCESS_TREE_KNOWN_ANCESTRY_INVALID")
+    return {
+        "pgid": pgid, "sid": sid, "members": members, "member_pids": sorted(known_members),
+        "ancestry_depths": {str(pid): int(ancestry_depths[pid]) for pid in sorted(ancestry_depths)},
+    }
+
+
+def _terminate_exact(process: subprocess.Popen[str], expected: Mapping[str, Any], work: Path, *, label: str, known_members: Mapping[int, Mapping[str, Any]] | None = None) -> None:
+    try:
+        audit = _audit_exact_process_group(expected, known_members=known_members)
     except Stage1S18ManualInterventionRequired as error:
-        _manual_intervention(work, label, expected, reason=str(error), observed={"pgid_members": _pgid_members(int(expected["pgid"]))})
+        _manual_intervention(work, label, expected, reason=str(error), observed=_residual_launch_tree(expected, known_members=known_members))
         raise
     except ProcessLookupError:
-        survivors = _pgid_members(int(expected["pgid"]))
-        if survivors:
-            _manual_intervention(work, label, expected, reason="S18_LAUNCHER_GONE_PROCESS_GROUP_REMAINS", observed={"pgid_members": survivors})
-            raise Stage1S18ManualInterventionRequired("S18_LAUNCHER_GONE_PROCESS_GROUP_REMAINS")
+        survivors = _residual_launch_tree(expected, known_members=known_members)
+        if survivors["session_members"] or survivors["token_members"]:
+            _manual_intervention(work, label, expected, reason="S18_LAUNCHER_GONE_PROCESS_TREE_REMAINS", observed=survivors)
+            raise Stage1S18ManualInterventionRequired("S18_LAUNCHER_GONE_PROCESS_TREE_REMAINS")
         return
     _write(work / f"{label}-termination-audit.json", _with_hash({"schema_version": "stage1-s1-8-process-tree-audit-v1", "status": "PASS", "phase": "pre_signal", "expected_launcher": dict(expected), "observed_tree": audit}))
-    os.killpg(int(expected["pgid"]), signal.SIGTERM)
+    _signal_exact_tree(audit, signal.SIGTERM)
     try:
         process.wait(timeout=30)
     except subprocess.TimeoutExpired:
         try:
-            audit = _audit_exact_process_group(expected)
+            audit = _audit_exact_process_group(expected, known_members=known_members)
         except Stage1S18ManualInterventionRequired as error:
-            _manual_intervention(work, label, expected, reason=str(error), observed={"pgid_members": _pgid_members(int(expected["pgid"]))})
+            _manual_intervention(work, label, expected, reason=str(error), observed=_residual_launch_tree(expected, known_members=known_members))
             raise
-        os.killpg(int(expected["pgid"]), signal.SIGKILL)
+        _signal_exact_tree(audit, signal.SIGKILL)
         process.wait(timeout=30)
-    residual = _pgid_members(int(expected["pgid"]))
-    if residual:
-        _manual_intervention(work, label, expected, reason="S18_PROCESS_GROUP_RESIDUAL_AFTER_TERMINATION", observed={"pgid_members": residual})
-        raise Stage1S18ManualInterventionRequired("S18_PROCESS_GROUP_RESIDUAL_AFTER_TERMINATION")
+    residual = _residual_launch_tree(expected, known_members=known_members)
+    if residual["session_members"] or residual["token_members"]:
+        _manual_intervention(work, label, expected, reason="S18_PROCESS_TREE_RESIDUAL_AFTER_TERMINATION", observed=residual)
+        raise Stage1S18ManualInterventionRequired("S18_PROCESS_TREE_RESIDUAL_AFTER_TERMINATION")
+
+
+def _reserve_loopback_rendezvous_endpoint() -> tuple[socket.socket, str]:
+    """Reserve one fresh non-zero loopback port for the immediate torchrun exec.
+
+    The reservation socket is held until the Popen boundary, is never reused
+    by this formal attempt, and a collision after handoff is a launch failure
+    rather than a retry on a possibly different endpoint.
+    """
+
+    for _ in range(32):
+        reservation = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            if hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+                reservation.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+            reservation.bind(("127.0.0.1", 0))
+            port = int(reservation.getsockname()[1])
+            if port == 0 or port in _USED_LOOPBACK_RENDEZVOUS_PORTS:
+                reservation.close()
+                continue
+            _USED_LOOPBACK_RENDEZVOUS_PORTS.add(port)
+            return reservation, f"127.0.0.1:{port}"
+        except BaseException:
+            reservation.close()
+            raise
+    raise Stage1S18FormalError("S18_RENDEZVOUS_ENDPOINT_ALLOCATION_EXHAUSTED")
+
+
+def _prepare_rendezvous_command(command: Sequence[str], *, run_token: str | None = None) -> tuple[list[str], socket.socket | None, str | None]:
+    """Replace only the frozen torchrun ``127.0.0.1:0`` placeholder.
+
+    A distributed command must carry the launch token as its rendezvous ID so
+    the process outcome has one immutable identity across torchrun and workers.
+    """
+
+    values = list(command)
+    is_torchrun = "torch.distributed.run" in values
+    endpoint_positions = [index for index, value in enumerate(values) if value == "--rdzv-endpoint"]
+    if not is_torchrun:
+        if endpoint_positions:
+            raise Stage1S18FormalError("S18_NON_TORCHRUN_RENDEZVOUS_ARGUMENT")
+        return values, None, None
+    if len(endpoint_positions) != 1 or endpoint_positions[0] + 1 >= len(values) or values[endpoint_positions[0] + 1] != "127.0.0.1:0":
+        raise Stage1S18FormalError("S18_TORCHRUN_RENDEZVOUS_PLACEHOLDER_INVALID")
+    id_positions = [index for index, value in enumerate(values) if value == "--rdzv-id"]
+    if run_token is None or len(id_positions) != 1 or id_positions[0] + 1 >= len(values) or values[id_positions[0] + 1] != run_token:
+        raise Stage1S18FormalError("S18_TORCHRUN_RENDEZVOUS_ID_INVALID")
+    reservation, endpoint = _reserve_loopback_rendezvous_endpoint()
+    values[endpoint_positions[0] + 1] = endpoint
+    return values, reservation, endpoint
+
+
+def _is_nonzero_loopback_endpoint(value: object) -> bool:
+    if not isinstance(value, str) or not value.startswith("127.0.0.1:"):
+        return False
+    try:
+        port = int(value.rsplit(":", 1)[1])
+    except ValueError:
+        return False
+    return 1 <= port <= 65535
 
 
 def _launch(
@@ -1048,24 +1422,58 @@ def _launch(
 ) -> dict[str, Any]:
     stdout_path, stderr_path = work / f"{label}.stdout.txt", work / f"{label}.stderr.txt"
     env = dict(environment); env["PARAM_IMPORTANCE_S18_RUN_TOKEN"] = run_token
+    actual_command, reservation, rendezvous_endpoint = _prepare_rendezvous_command(command, run_token=run_token)
     with stdout_path.open("w", encoding="utf-8") as stdout, stderr_path.open("w", encoding="utf-8") as stderr:
-        process = subprocess.Popen(list(command), cwd=repository, text=True, stdout=stdout, stderr=stderr, env=env, start_new_session=True)
+        try:
+            if reservation is not None:
+                reservation.close()
+                reservation = None
+            process = subprocess.Popen(actual_command, cwd=repository, text=True, stdout=stdout, stderr=stderr, env=env, start_new_session=True)
+        finally:
+            if reservation is not None:
+                reservation.close()
         fingerprint = _fingerprint(process.pid, run_token)
-        initial_tree = _audit_exact_process_group(fingerprint)
+        known_members: dict[int, Mapping[str, Any]] = {int(fingerprint["pid"]): fingerprint}
+        known_depths: dict[int, int] = {int(fingerprint["pid"]): 0}
+        try:
+            initial_tree = _audit_exact_process_group(fingerprint, known_members=known_members)
+        except Stage1S18ManualInterventionRequired as error:
+            _manual_intervention(work, label, fingerprint, reason=str(error), observed=_residual_launch_tree(fingerprint, known_members=known_members))
+            raise
+        for member in initial_tree["members"]:
+            pid = int(member["pid"])
+            known_members.setdefault(pid, dict(member))
+            known_depths.setdefault(pid, int(initial_tree["ancestry_depths"][str(pid)]))
         _write(work / f"{label}-process-tree-initial.json", _with_hash({"schema_version": "stage1-s1-8-process-tree-audit-v1", "status": "PASS", "phase": "launch", "expected_launcher": fingerprint, "observed_tree": initial_tree}))
-        started = time.monotonic()
+        started, next_heartbeat = time.monotonic(), time.monotonic()
         while process.poll() is None:
-            if time.monotonic() - started > timeout_seconds:
-                _terminate_exact(process, fingerprint, work, label=label)
+            now = time.monotonic()
+            if now - started > timeout_seconds:
+                _terminate_exact(process, fingerprint, work, label=label, known_members=known_members)
                 raise Stage1S18FormalError(f"S18_{label.upper()}_TIMEOUT")
-            lease.heartbeat()
-            time.sleep(2)
+            try:
+                observed_tree = _audit_exact_process_group(fingerprint, known_members=known_members)
+            except Stage1S18ManualInterventionRequired as error:
+                _manual_intervention(work, label, fingerprint, reason=str(error), observed=_residual_launch_tree(fingerprint, known_members=known_members))
+                raise
+            for member in observed_tree["members"]:
+                pid = int(member["pid"])
+                known_members.setdefault(pid, dict(member))
+                known_depths.setdefault(pid, int(observed_tree["ancestry_depths"][str(pid)]))
+            if now >= next_heartbeat:
+                lease.heartbeat()
+                next_heartbeat = now + 2.0
+            # Poll process ownership more frequently than the lease.  This
+            # records elastic workers before a short negative control exits;
+            # heartbeat traffic remains bounded at one update per two seconds.
+            time.sleep(0.2)
         process.wait(timeout=30)
-    residual = _pgid_members(int(fingerprint["pgid"]))
-    if residual:
-        _manual_intervention(work, label, fingerprint, reason=f"S18_{label.upper()}_PROCESS_GROUP_RESIDUAL", observed={"pgid_members": residual})
-        raise Stage1S18ManualInterventionRequired(f"S18_{label.upper()}_PROCESS_GROUP_RESIDUAL")
-    outcome = _with_hash({"schema_version": "stage1-s1-8-process-outcome-v1", "label": label, "command": list(command), "rendezvous_id": run_token, "returncode": process.returncode, "fingerprint": fingerprint, "initial_tree": initial_tree, "termination_audit_ref": f"{label}-termination-audit.json" if (work / f"{label}-termination-audit.json").is_file() else None, "stdout_sha256": _sha(stdout_path), "stderr_sha256": _sha(stderr_path), "expected_success": expected_success, "residual_pgid_members": []})
+    residual = _residual_launch_tree(fingerprint, known_members=known_members)
+    if residual["session_members"] or residual["token_members"]:
+        _manual_intervention(work, label, fingerprint, reason=f"S18_{label.upper()}_PROCESS_TREE_RESIDUAL", observed=residual)
+        raise Stage1S18ManualInterventionRequired(f"S18_{label.upper()}_PROCESS_TREE_RESIDUAL")
+    outcome = _with_hash({"schema_version": "stage1-s1-8-process-outcome-v1", "label": label, "command": actual_command, "rendezvous_id": run_token, "rendezvous_endpoint": rendezvous_endpoint, "rendezvous_handoff": {"reservation_held_to_popen": rendezvous_endpoint is not None, "single_attempt": True, "silent_retry": False}, "returncode": process.returncode, "fingerprint": fingerprint, "initial_tree": initial_tree, "known_tree": _known_launch_tree(fingerprint, known_members, known_depths), "termination_audit_ref": f"{label}-termination-audit.json" if (work / f"{label}-termination-audit.json").is_file() else None, "stdout_sha256": _sha(stdout_path), "stderr_sha256": _sha(stderr_path), "expected_success": expected_success, "residual_launch_tree": {"session_members": [], "token_members": []}})
+    _validate_process_outcome_contract(outcome)
     _write(work / f"{label}.process.json", outcome)
     if (process.returncode == 0) != expected_success:
         raise Stage1S18FormalError(f"S18_{label.upper()}_UNEXPECTED_EXIT")
@@ -1305,6 +1713,8 @@ def _run_route(*, repository: Path, work: Path, plan: Mapping[str, Any], timeout
     command = [sys.executable, "-m", "torch.distributed.run", "--rdzv-id", str(plan["run_token"]), "--rdzv-endpoint", "127.0.0.1:0", "--nproc_per_node", str(ROUTE_WORLD[route]), str(repository / "ops" / "stage1" / "run_s1_8_worker.py"), "--plan", str(plan_path)]
     label = f"{route}-{permutation}-{mode}"
     outcome = _launch(repository=repository, work=work, label=label, command=command, environment=environment, run_token=str(plan["run_token"]), timeout_seconds=timeout_seconds, lease=lease, expected_success=expect_success)
+    if not _is_nonzero_loopback_endpoint(outcome.get("rendezvous_endpoint")):
+        raise Stage1S18FormalError("S18_ROUTE_RENDEZVOUS_ENDPOINT_INVALID")
     report_path = route_work / "route-output" / "route-report.json"
     if not expect_success:
         if report_path.exists() or (route_work / "route-output" / "success.json").exists():
@@ -1326,7 +1736,9 @@ def _scale_oracle(*, repository: Path, work: Path, handoff: Mapping[str, Any], m
     body = dict(plan); body["artifact_hash"] = _canonical(body)
     plan_path = work / "pre-route-scale-plan.json"; write_canonical_json(plan_path, body)
     env = dict(os.environ); offline, _ = _offline_environment(cache_root); env.update(offline); env.update({"CUDA_VISIBLE_DEVICES": uuid, "CUBLAS_WORKSPACE_CONFIG": ":4096:8"})
-    _launch(repository=repository, work=work, label="pre-route-scale", command=[sys.executable, str(repository / "ops" / "stage1" / "run_s1_8_scale_oracle.py"), "--plan", str(plan_path)], environment=env, run_token=run_token, timeout_seconds=timeout_seconds, lease=lease, expected_success=True)
+    scale_process = _launch(repository=repository, work=work, label="pre-route-scale", command=[sys.executable, str(repository / "ops" / "stage1" / "run_s1_8_scale_oracle.py"), "--plan", str(plan_path)], environment=env, run_token=run_token, timeout_seconds=timeout_seconds, lease=lease, expected_success=True)
+    if scale_process.get("rendezvous_endpoint") is not None:
+        raise Stage1S18FormalError("S18_SCALE_NON_DISTRIBUTED_RENDEZVOUS_INVALID")
     report = _mapping(load_canonical_json(work / "pre-route-scale.json"), field="pre_route_scale")
     needed = {"schema_version", "status", "task_id", "execution_commit", "run_token", "fixture_tokens_sha256", "selected_token_sha256", "upstream_token_sha256", "visible_gpu_uuid", "method", "unit_count", "unit_records", "maximum_unit_gradient_abs", "maximum_case", "maximum_microbatch_id", "maximum_parameter", "maximum_abs_data_update", "maximum_data_update_case", "maximum_data_update_parameter", "parameter_registry_hash", "case_pre_parameter_checksums", "case_post_parameter_checksums", "artifact_hash"}
     if set(report) != needed or not _self_hash(report) or report.get("status") != "PASS" or report.get("visible_gpu_uuid") != uuid or report.get("unit_count") != 16 or report.get("method") != "independent_pre_route_single_gpu_autograd_oracle" or not isinstance(report.get("maximum_unit_gradient_abs"), (int, float)) or float(report["maximum_unit_gradient_abs"]) <= 0 or not isinstance(report.get("maximum_abs_data_update"), (int, float)) or float(report["maximum_abs_data_update"]) <= 0:
@@ -1525,7 +1937,7 @@ def execute(*, repository: Path, data_root: Path, s1_7_index_ref: str, gpu_capab
             "s1_7_handoff": handoff["gate_artifact_hash"] == EXPECTED_G1_SINGLE_HASH,
             "consumer_diff": isinstance(_audit_consumer_diff(repository), tuple),
             "approved_four_uuid_topology": capability["artifact_hash"] == EXPECTED_GPU_CAPABILITY_ARTIFACT_HASH and set(approved_gpu_uuids).issubset(set(capability["allowed_gpu_uuids"])) and preflight["requested_uuid_order"] == list(approved_gpu_uuids) == post_gpu["requested_uuid_order"],
-            "nccl_smoke": smoke["returncode"] == 0 and smoke["residual_pgid_members"] == [] and smoke_report.get("status") == "PASS",
+            "nccl_smoke": smoke["returncode"] == 0 and smoke["residual_launch_tree"] == {"session_members": [], "token_members": []} and _is_nonzero_loopback_endpoint(smoke.get("rendezvous_endpoint")) and smoke_report.get("status") == "PASS",
             "pre_route_scale_oracle": scale["case_pre_parameter_checksums"]["weighted"] == scale["case_post_parameter_checksums"]["equal"],
             "real_routes_equal_and_weighted": set(baseline_reports) == set(ROUTE_WORLD) and all(len(report["cases"]) == 2 for report in baseline_reports.values()),
             "rank_partition_and_no_sync": all(all(row["ordinary_ddp_gradient_collectives"] == 0 for row in report["cases"]) for route, report in baseline_reports.items() if route != "A"),
