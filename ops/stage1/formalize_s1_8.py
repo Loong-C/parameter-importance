@@ -925,18 +925,49 @@ def discover_approved_gpus(approved_gpu_uuids: Sequence[str]) -> dict[str, Any]:
     return {"selected": selected, "requested_uuid_order": list(values), "compute_apps": []}
 
 
-def _fingerprint(pid: int, run_token: str) -> dict[str, Any]:
+def _process_identity(pid: int) -> dict[str, Any]:
+    """Read stable process identity without making an inheritance claim."""
+
     stat, cmdline, executable = Path(f"/proc/{pid}/stat"), Path(f"/proc/{pid}/cmdline"), Path(f"/proc/{pid}/exe")
     if not stat.is_file() or not cmdline.is_file() or not executable.exists():
         raise ProcessLookupError(pid)
     parts = stat.read_text(encoding="utf-8").split()
     if len(parts) <= 21:
         raise ProcessLookupError(pid)
-    environment = Path(f"/proc/{pid}/environ").read_bytes().split(b"\0")
+    return {"pid": pid, "ppid": int(parts[3]), "uid": stat.stat().st_uid, "pgid": os.getpgid(pid), "sid": os.getsid(pid), "start_ticks": parts[21], "exe": os.readlink(executable), "cmdline_sha256": hashlib.sha256(cmdline.read_bytes()).hexdigest()}
+
+
+def _inherited_run_token(pid: int, run_token: str) -> str:
+    """Require an exact S1.8 token inherited at child process creation."""
+
+    environment = _process_environment(pid)
     token_values = [item.split(b"=", 1)[1].decode("ascii") for item in environment if item.startswith(b"PARAM_IMPORTANCE_S18_RUN_TOKEN=")]
     if token_values != [run_token]:
         raise ProcessLookupError(pid)
-    return {"pid": pid, "ppid": int(parts[3]), "uid": stat.stat().st_uid, "pgid": os.getpgid(pid), "sid": os.getsid(pid), "start_ticks": parts[21], "exe": os.readlink(executable), "cmdline_sha256": hashlib.sha256(cmdline.read_bytes()).hexdigest(), "environment_run_token": token_values[0]}
+    return token_values[0]
+
+
+def _process_environment(pid: int) -> list[bytes]:
+    """Return raw environment entries for strict spawned-child attestation."""
+
+    return Path(f"/proc/{pid}/environ").read_bytes().split(b"\0")
+
+
+def _fingerprint(pid: int, run_token: str) -> dict[str, Any]:
+    """Fingerprint a spawned launcher/worker that inherited ``run_token``."""
+
+    identity = _process_identity(pid)
+    identity["environment_run_token"] = _inherited_run_token(pid, run_token)
+    return identity
+
+
+def _parent_fingerprint(pid: int, planned_run_token: str) -> dict[str, Any]:
+    """Fingerprint the pre-existing parent without inventing token inheritance."""
+
+    if _require_sha256(planned_run_token, field="parent.planned_run_token") != planned_run_token:
+        raise Stage1S18FormalError("S18_PARENT_RUN_TOKEN_INVALID")
+    identity = _process_identity(pid)
+    return {**identity, "planned_run_token": planned_run_token, "token_inherited_at_exec": False}
 
 
 def _pgid_members(pgid: int) -> list[int]:
@@ -1372,8 +1403,7 @@ def execute(*, repository: Path, data_root: Path, s1_7_index_ref: str, gpu_capab
         phase = "lease_acquire"; lease = ProjectGpuLease(data_root, identity); lease.acquire(); lease.heartbeat()
         post_lease = discover_approved_gpus(approved_gpu_uuids); _write(work / "post-lease-gpu.json", _with_hash({"schema_version": "stage1-s1-8-gpu-preflight-v1", "status": "PASS", "gpu": post_lease}))
         run_token = hashlib.sha256(f"{commit}:{attempt_id}:{time.time_ns()}".encode()).hexdigest()
-        os.environ["PARAM_IMPORTANCE_S18_RUN_TOKEN"] = run_token
-        _write(work / "attempt-start.json", _with_hash({"schema_version": "stage1-s1-8-attempt-start-v1", "status": "STARTED", "run_token": run_token, "parent_fingerprint": _fingerprint(os.getpid(), run_token), "lease": identity.to_dict()}))
+        _write(work / "attempt-start.json", _with_hash({"schema_version": "stage1-s1-8-attempt-start-v1", "status": "STARTED", "run_token": run_token, "parent_fingerprint": _parent_fingerprint(os.getpid(), run_token), "lease": identity.to_dict()}))
         phase = "nccl_smoke"; smoke_env = dict(os.environ); smoke_env.update({"CUDA_VISIBLE_DEVICES": ",".join(approved_gpu_uuids), "CUBLAS_WORKSPACE_CONFIG": ":4096:8"})
         smoke = _launch(repository=repository, work=work, label="nccl-smoke", command=[sys.executable, "-m", "torch.distributed.run", "--rdzv-id", run_token, "--rdzv-endpoint", "127.0.0.1:0", "--nproc_per_node", "4", str(repository / "ops" / "stage1" / "run_s1_8_nccl_smoke.py"), "--report", str(work / "nccl-smoke-report.json")], environment=smoke_env, run_token=run_token, timeout_seconds=min(timeout_seconds, 300), lease=lease, expected_success=True)
         smoke_report = _mapping(load_canonical_json(work / "nccl-smoke-report.json"), field="nccl_smoke")

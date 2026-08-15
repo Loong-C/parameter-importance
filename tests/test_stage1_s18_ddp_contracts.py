@@ -199,6 +199,32 @@ def test_unknown_process_group_member_never_signals_and_persists_manual_marker(t
     assert (tmp_path / "unknown-member-manual-intervention.json").is_file()
 
 
+def test_parent_fingerprint_binds_planned_token_without_claiming_late_environment_inheritance(monkeypatch: pytest.MonkeyPatch) -> None:
+    formalizer = _formalizer(); base = {"pid": 11, "ppid": 1, "uid": 1000, "pgid": 11, "sid": 11, "start_ticks": "99", "exe": "/usr/bin/python", "cmdline_sha256": "a" * 64}
+    monkeypatch.setattr(formalizer, "_process_identity", lambda pid: {**base, "pid": pid})
+    planned = "b" * 64
+    parent = formalizer._parent_fingerprint(11, planned)
+    assert parent == {**base, "planned_run_token": planned, "token_inherited_at_exec": False}
+    assert "environment_run_token" not in parent
+    with pytest.raises(formalizer.Stage1S18FormalError, match="S18_CANDIDATE_SHA256_INVALID:parent.planned_run_token"):
+        formalizer._parent_fingerprint(11, "not-a-token")
+    source = Path("ops/stage1/formalize_s1_8.py").read_text(encoding="utf-8")
+    assert '"parent_fingerprint": _parent_fingerprint(os.getpid(), run_token)' in source
+    assert 'os.environ["PARAM_IMPORTANCE_S18_RUN_TOKEN"] = run_token' not in source
+
+
+def test_child_fingerprint_remains_strict_for_missing_or_wrong_inherited_token(monkeypatch: pytest.MonkeyPatch) -> None:
+    formalizer = _formalizer(); base = {"pid": 12, "ppid": 1, "uid": 1000, "pgid": 12, "sid": 12, "start_ticks": "99", "exe": "/usr/bin/python", "cmdline_sha256": "a" * 64}
+    monkeypatch.setattr(formalizer, "_process_identity", lambda pid: {**base, "pid": pid})
+    token = "b" * 64
+    for environment in ([b"PATH=/usr/bin"], [b"PARAM_IMPORTANCE_S18_RUN_TOKEN=" + (b"c" * 64)]):
+        monkeypatch.setattr(formalizer, "_process_environment", lambda pid, entries=environment: entries)
+        with pytest.raises(ProcessLookupError):
+            formalizer._fingerprint(12, token)
+    monkeypatch.setattr(formalizer, "_process_environment", lambda pid: [b"PARAM_IMPORTANCE_S18_RUN_TOKEN=" + token.encode("ascii")])
+    assert formalizer._fingerprint(12, token) == {**base, "environment_run_token": token}
+
+
 def test_release_failure_is_manual_not_a_close_only_success(tmp_path: Path) -> None:
     formalizer = _formalizer()
     class FailingLease:
