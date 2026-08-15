@@ -156,6 +156,10 @@ class _SessionMemberStatUnavailable(RuntimeError):
     """A session PID vanished before its stat record could be read."""
 
 
+class _LauncherNaturalExitCandidate(RuntimeError):
+    """Only the recorded launcher may be awaiting Popen exit confirmation."""
+
+
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
@@ -1332,6 +1336,7 @@ def _audit_exact_process_group(
         raise Stage1S18ManualInterventionRequired("S18_PROCESS_LAUNCHER_FINGERPRINT_DRIFT")
     depths = _tree_depths(expected=expected, observed=observed, known_members=previous)
     newly_provisional: dict[int, dict[str, Any]] = {}
+    launcher_exit_candidate = False
     for member_sid in sorted({int(item["sid"]) for item in observed.values()}):
         for member_pid in _session_members(member_sid):
             earlier = previous.get(member_pid)
@@ -1376,6 +1381,21 @@ def _audit_exact_process_group(
                     raise Stage1S18ManualInterventionRequired("S18_PROCESS_SESSION_TOKEN_MEMBERSHIP_DRIFT")
                 if session_member is not None and not _same_live_fingerprint(earlier, session_member):
                     raise Stage1S18ManualInterventionRequired("S18_PROCESS_SESSION_TOKEN_MEMBERSHIP_DRIFT")
+                # A successful launcher can exit between the token directory
+                # scan and this direct environment read.  This exception is
+                # deliberately unavailable to workers and to any identity
+                # drift: the caller must still confirm the Popen launcher has
+                # actually exited, then run the usual empty-residual check.
+                if (
+                    member_pid == expected_pid
+                    and session_member is None
+                    and _same_live_fingerprint(expected, earlier)
+                ):
+                    # Finish auditing every other member first.  A launcher
+                    # exit can never excuse a foreign/unknown sibling in its
+                    # session from the normal fail-closed checks.
+                    launcher_exit_candidate = True
+                    continue
                 if not _session_membership_rechecked:
                     # Only a previously attested PID reaches this retry.  The
                     # retry starts from token discovery and redoes
@@ -1395,6 +1415,15 @@ def _audit_exact_process_group(
             _session_membership_rechecked=True,
             _provisional_members={**provisional, **newly_provisional},
         )
+    if launcher_exit_candidate:
+        if not _session_membership_rechecked:
+            time.sleep(SESSION_MEMBER_REVALIDATION_SECONDS)
+            return _audit_exact_process_group(
+                expected,
+                known_members=previous,
+                _session_membership_rechecked=True,
+            )
+        raise _LauncherNaturalExitCandidate("S18_PROCESS_LAUNCHER_NATURAL_EXIT_CANDIDATE")
     members = [observed[pid] for pid in sorted(observed)]
     return {
         "pgid": pgid, "sid": sid, "members": members, "member_pids": sorted(observed),
@@ -1597,6 +1626,12 @@ def _audit_or_confirmed_launcher_exit(process: subprocess.Popen[str], fingerprin
 
     try:
         return _audit_exact_process_group(fingerprint, known_members=known_members)
+    except _LauncherNaturalExitCandidate as audit_error:
+        try:
+            process.wait(timeout=LAUNCHER_EXIT_CONFIRMATION_TIMEOUT_SECONDS)
+        except subprocess.TimeoutExpired:
+            raise Stage1S18ManualInterventionRequired("S18_PROCESS_LAUNCHER_NATURAL_EXIT_UNCONFIRMED") from audit_error
+        return None
     except ProcessLookupError as audit_error:
         # /proc can reap the launcher just before Popen's non-blocking poll
         # observes that exit.  Confirm natural termination with one frozen,
@@ -1630,6 +1665,13 @@ def _launch(
         known_depths: dict[int, int] = {int(fingerprint["pid"]): 0}
         try:
             initial_tree = _audit_exact_process_group(fingerprint, known_members=known_members)
+        except _LauncherNaturalExitCandidate as error:
+            # Without an initial complete token-bound tree there is no safe
+            # ownership basis for treating this as a successful launch exit.
+            # The poll-loop-only confirmation path is intentionally unavailable
+            # until this first audit has been recorded.
+            _manual_intervention(work, label, fingerprint, reason="S18_PROCESS_INITIAL_TREE_LAUNCHER_EXIT_UNCONFIRMED", observed=_residual_launch_tree(fingerprint, known_members=known_members))
+            raise Stage1S18ManualInterventionRequired("S18_PROCESS_INITIAL_TREE_LAUNCHER_EXIT_UNCONFIRMED") from error
         except Stage1S18ManualInterventionRequired as error:
             _manual_intervention(work, label, fingerprint, reason=str(error), observed=_residual_launch_tree(fingerprint, known_members=known_members))
             raise

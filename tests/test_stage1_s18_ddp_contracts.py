@@ -645,6 +645,61 @@ def test_transient_session_member_recovery_requires_fresh_token_and_ancestry_aud
     assert sleeps == [formalizer.SESSION_MEMBER_REVALIDATION_SECONDS]
 
 
+def test_known_launcher_token_loss_is_natural_exit_candidate_only_after_one_retry(monkeypatch: pytest.MonkeyPatch) -> None:
+    formalizer = _formalizer(); token = "b" * 64
+    launcher = {"pid": 100, "ppid": 1, "uid": 7, "pgid": 100, "sid": 100, "start_ticks": "10", "exe": "/usr/bin/python", "cmdline_sha256": "a" * 64, "environment_run_token": token}
+    values: list[object] = [launcher, ProcessLookupError(100), launcher, ProcessLookupError(100)]
+    monkeypatch.setattr(formalizer, "_token_process_ids", lambda _: [100])
+    def fingerprint(_pid: int, _token: str) -> dict[str, object]:
+        value = values.pop(0)
+        if isinstance(value, BaseException):
+            raise value
+        return value
+    monkeypatch.setattr(formalizer, "_fingerprint", fingerprint)
+    monkeypatch.setattr(formalizer, "_session_members", lambda _sid: [100])
+    monkeypatch.setattr(formalizer, "_session_member_stat", lambda _pid: {key: launcher[key] for key in ("pid", "uid", "pgid", "sid", "start_ticks")} | {"state": "S"})
+    sleeps: list[float] = []
+    monkeypatch.setattr(formalizer.time, "sleep", lambda seconds: sleeps.append(seconds))
+    with pytest.raises(formalizer._LauncherNaturalExitCandidate, match="S18_PROCESS_LAUNCHER_NATURAL_EXIT_CANDIDATE"):
+        formalizer._audit_exact_process_group(launcher, known_members={100: launcher})
+    assert values == [] and sleeps == [formalizer.SESSION_MEMBER_REVALIDATION_SECONDS]
+
+
+def test_worker_token_loss_and_live_launcher_identity_drift_remain_manual(monkeypatch: pytest.MonkeyPatch) -> None:
+    formalizer = _formalizer(); token = "b" * 64
+    launcher = {"pid": 100, "ppid": 1, "uid": 7, "pgid": 100, "sid": 100, "start_ticks": "10", "exe": "/usr/bin/python", "cmdline_sha256": "a" * 64, "environment_run_token": token}
+    worker = {**launcher, "pid": 101, "ppid": 100, "pgid": 101, "sid": 201, "start_ticks": "11"}
+    worker_calls = [worker, ProcessLookupError(101), worker, ProcessLookupError(101)]
+    monkeypatch.setattr(formalizer, "_token_process_ids", lambda _: [100, 101])
+    def missing_worker(pid: int, _token: str) -> dict[str, object]:
+        if pid == 100:
+            return launcher
+        value = worker_calls.pop(0)
+        if isinstance(value, BaseException):
+            raise value
+        return value
+    monkeypatch.setattr(formalizer, "_fingerprint", missing_worker)
+    monkeypatch.setattr(formalizer, "_session_members", lambda sid: [100] if sid == 100 else [101])
+    monkeypatch.setattr(formalizer, "_session_member_stat", lambda pid: {key: (launcher if pid == 100 else worker)[key] for key in ("pid", "uid", "pgid", "sid", "start_ticks")} | {"state": "S"})
+    sleeps: list[float] = []
+    monkeypatch.setattr(formalizer.time, "sleep", lambda seconds: sleeps.append(seconds))
+    with pytest.raises(formalizer.Stage1S18ManualInterventionRequired, match="S18_PROCESS_SESSION_TOKEN_MEMBERSHIP_DRIFT"):
+        formalizer._audit_exact_process_group(launcher, known_members={100: launcher, 101: worker})
+    assert worker_calls == [] and sleeps == [formalizer.SESSION_MEMBER_REVALIDATION_SECONDS]
+
+    drifted = {**launcher, "exe": "/usr/bin/python-drift"}
+    launcher_calls = [launcher, drifted]
+    monkeypatch.setattr(formalizer, "_token_process_ids", lambda _: [100])
+    def live_drift(_pid: int, _token: str) -> dict[str, object]:
+        return launcher_calls.pop(0)
+    monkeypatch.setattr(formalizer, "_fingerprint", live_drift)
+    monkeypatch.setattr(formalizer, "_session_members", lambda _sid: [100])
+    monkeypatch.setattr(formalizer, "_session_member_stat", lambda _pid: {key: launcher[key] for key in ("pid", "uid", "pgid", "sid", "start_ticks")} | {"state": "S"})
+    with pytest.raises(formalizer.Stage1S18ManualInterventionRequired, match="S18_PROCESS_SESSION_TOKEN_MEMBERSHIP_DRIFT"):
+        formalizer._audit_exact_process_group(launcher, known_members={100: launcher})
+    assert launcher_calls == [] and sleeps == [formalizer.SESSION_MEMBER_REVALIDATION_SECONDS]
+
+
 def test_launch_audit_allows_only_confirmed_natural_exit_race(monkeypatch: pytest.MonkeyPatch) -> None:
     formalizer = _formalizer()
     fingerprint = {"pid": 100, "ppid": 1, "uid": 7, "pgid": 100, "sid": 100, "start_ticks": "10", "exe": "/usr/bin/python", "cmdline_sha256": "a" * 64, "environment_run_token": "b" * 64}
@@ -661,6 +716,27 @@ def test_launch_audit_allows_only_confirmed_natural_exit_race(monkeypatch: pytes
         raise subprocess.TimeoutExpired(cmd="torchrun", timeout=timeout)
     with pytest.raises(ProcessLookupError):
         formalizer._audit_or_confirmed_launcher_exit(SimpleNamespace(poll=lambda: None, wait=_still_live), fingerprint, {100: fingerprint})
+    monkeypatch.setattr(formalizer, "_audit_exact_process_group", lambda *_args, **_kwargs: (_ for _ in ()).throw(formalizer._LauncherNaturalExitCandidate("candidate")))
+    candidate_waits: list[float] = []
+    assert formalizer._audit_or_confirmed_launcher_exit(SimpleNamespace(wait=lambda *, timeout: candidate_waits.append(timeout) or 0), fingerprint, {100: fingerprint}) is None
+    assert candidate_waits == [formalizer.LAUNCHER_EXIT_CONFIRMATION_TIMEOUT_SECONDS]
+    with pytest.raises(formalizer.Stage1S18ManualInterventionRequired, match="S18_PROCESS_LAUNCHER_NATURAL_EXIT_UNCONFIRMED"):
+        formalizer._audit_or_confirmed_launcher_exit(SimpleNamespace(wait=_still_live), fingerprint, {100: fingerprint})
+
+
+def test_launch_initial_tree_never_accepts_launcher_exit_candidate(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    formalizer = _formalizer(); token = "c" * 64
+    fingerprint = {"pid": 100, "ppid": 1, "uid": 7, "pgid": 100, "sid": 100, "start_ticks": "10", "exe": "/usr/bin/python", "cmdline_sha256": "a" * 64, "environment_run_token": token}
+    process = SimpleNamespace(pid=100, poll=lambda: None, wait=lambda *, timeout: 0, returncode=0)
+    monkeypatch.setattr(formalizer.subprocess, "Popen", lambda *_args, **_kwargs: process)
+    monkeypatch.setattr(formalizer, "_fingerprint", lambda _pid, _token: fingerprint)
+    monkeypatch.setattr(formalizer, "_audit_exact_process_group", lambda *_args, **_kwargs: (_ for _ in ()).throw(formalizer._LauncherNaturalExitCandidate("candidate")))
+    monkeypatch.setattr(formalizer, "_residual_launch_tree", lambda *_args, **_kwargs: {"session_members": [], "token_members": []})
+    with pytest.raises(formalizer.Stage1S18ManualInterventionRequired, match="S18_PROCESS_INITIAL_TREE_LAUNCHER_EXIT_UNCONFIRMED"):
+        formalizer._launch(repository=tmp_path, work=tmp_path, label="initial", command=[sys.executable, "worker.py"], environment={}, run_token=token, timeout_seconds=1, lease=SimpleNamespace(heartbeat=lambda: None), expected_success=True)
+    from param_importance_nlp.contracts.jsonio import load_canonical_json
+    marker = formalizer._mapping(load_canonical_json(tmp_path / "initial-manual-intervention.json"), field="initial.manual")
+    assert marker["reason"] == "S18_PROCESS_INITIAL_TREE_LAUNCHER_EXIT_UNCONFIRMED"
 
 
 @pytest.mark.skipif(os.name != "posix" or not Path("/proc").is_dir() or not hasattr(os, "pidfd_open") or not hasattr(signal, "pidfd_send_signal"), reason="requires Linux /proc and pidfd")
