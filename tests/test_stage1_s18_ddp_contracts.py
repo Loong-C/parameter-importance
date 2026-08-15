@@ -332,6 +332,15 @@ def test_unknown_member_in_worker_session_blocks_without_signal(monkeypatch: pyt
         formalizer._audit_exact_process_group(base, known_members={100: base})
 
 
+def test_launch_audit_allows_only_confirmed_natural_exit_race(monkeypatch: pytest.MonkeyPatch) -> None:
+    formalizer = _formalizer()
+    fingerprint = {"pid": 100, "ppid": 1, "uid": 7, "pgid": 100, "sid": 100, "start_ticks": "10", "exe": "/usr/bin/python", "cmdline_sha256": "a" * 64, "environment_run_token": "b" * 64}
+    monkeypatch.setattr(formalizer, "_audit_exact_process_group", lambda *_args, **_kwargs: (_ for _ in ()).throw(ProcessLookupError(100)))
+    assert formalizer._audit_or_confirmed_launcher_exit(SimpleNamespace(poll=lambda: 0), fingerprint, {100: fingerprint}) is None
+    with pytest.raises(ProcessLookupError):
+        formalizer._audit_or_confirmed_launcher_exit(SimpleNamespace(poll=lambda: None), fingerprint, {100: fingerprint})
+
+
 @pytest.mark.skipif(os.name != "posix" or not Path("/proc").is_dir() or not hasattr(os, "pidfd_open") or not hasattr(signal, "pidfd_send_signal"), reason="requires Linux /proc and pidfd")
 def test_real_linux_elastic_style_child_session_is_audited_and_pidfd_terminated() -> None:
     """Exercise actual /proc ownership, not just a mocked independent SID."""

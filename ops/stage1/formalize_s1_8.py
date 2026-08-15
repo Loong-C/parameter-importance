@@ -1434,6 +1434,21 @@ def _is_nonzero_loopback_endpoint(value: object) -> bool:
     return 1 <= port <= 65535
 
 
+def _audit_or_confirmed_launcher_exit(process: subprocess.Popen[str], fingerprint: Mapping[str, Any], known_members: Mapping[int, Mapping[str, Any]]) -> dict[str, Any] | None:
+    """Audit a live launcher, tolerating only a confirmed natural-exit race."""
+
+    try:
+        return _audit_exact_process_group(fingerprint, known_members=known_members)
+    except ProcessLookupError:
+        # ``poll()`` may have observed the launcher before it exited while
+        # /proc has already reaped it.  This is safe only when the immediate
+        # re-check confirms termination; a still-live launcher remains a
+        # fail-closed process-identity error.
+        if process.poll() is None:
+            raise
+        return None
+
+
 def _launch(
     *, repository: Path, work: Path, label: str, command: Sequence[str], environment: Mapping[str, str],
     run_token: str, timeout_seconds: int, lease: object, expected_success: bool,
@@ -1470,10 +1485,12 @@ def _launch(
                 _terminate_exact(process, fingerprint, work, label=label, known_members=known_members)
                 raise Stage1S18FormalError(f"S18_{label.upper()}_TIMEOUT")
             try:
-                observed_tree = _audit_exact_process_group(fingerprint, known_members=known_members)
+                observed_tree = _audit_or_confirmed_launcher_exit(process, fingerprint, known_members)
             except Stage1S18ManualInterventionRequired as error:
                 _manual_intervention(work, label, fingerprint, reason=str(error), observed=_residual_launch_tree(fingerprint, known_members=known_members))
                 raise
+            if observed_tree is None:
+                break
             for member in observed_tree["members"]:
                 pid = int(member["pid"])
                 known_members.setdefault(pid, dict(member))
