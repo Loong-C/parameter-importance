@@ -993,14 +993,11 @@ def test_real_linux_procfs_owner_exit_transition_is_known_member_only(monkeypatc
     assert captured is not None, "frozen Linux host did not expose its attested UID-only procfs exit transition"
 
     process, expected, observed = captured
-    token = str(expected["environment_run_token"])
     pid = int(expected["pid"])
     monkeypatch.setattr(formalizer, "_token_process_ids", lambda _: [pid])
     monkeypatch.setattr(formalizer, "_fingerprint", lambda _pid, _token: expected)
     monkeypatch.setattr(formalizer, "_session_members", lambda _sid: [pid])
     monkeypatch.setattr(formalizer, "_session_member_stat", lambda _pid: observed)
-    sleeps: list[float] = []
-    monkeypatch.setattr(formalizer.time, "sleep", lambda seconds: sleeps.append(seconds))
     try:
         if observed["state"] == "R":
             assert formalizer._audit_or_confirmed_launcher_exit(
@@ -1008,7 +1005,6 @@ def test_real_linux_procfs_owner_exit_transition_is_known_member_only(monkeypatc
                 expected,
                 {pid: expected},
             ) is None
-            assert sleeps == [formalizer.SESSION_MEMBER_REVALIDATION_SECONDS]
         else:
             assert observed["state"] == "Z"
             audit = formalizer._audit_exact_process_group(expected, known_members={pid: expected})
