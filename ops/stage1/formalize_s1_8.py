@@ -111,6 +111,10 @@ ROUTE_WORLD = {"A": 1, "B": 1, "C": 2, "D": 4}
 PERMUTATIONS = ("rank_swap", "local_reverse")
 _DIGEST = set("0123456789abcdef")
 GPU_UUID_RE = re.compile(r"GPU-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
+PILE_DOWNLOADER_CMDLINE_SIGNATURES = (
+    b"server_xet_download.sh",
+    b"pile-full-download",
+)
 GATE_CHECK_IDS = (
     "s1_7_handoff", "consumer_diff", "approved_four_uuid_topology", "nccl_smoke", "pre_route_scale_oracle",
     "real_routes_equal_and_weighted", "rank_partition_and_no_sync", "manual_collective_contract",
@@ -787,7 +791,8 @@ def _audit_pile_download_activity(handoff: Mapping[str, Any], *, proc_root: Path
                 continue
             try:
                 cmdline = (entry / "cmdline").read_bytes()
-                if b"parameter" not in cmdline.lower() or b"pile" not in cmdline.lower():
+                lowered = cmdline.lower()
+                if not any(signature in lowered for signature in PILE_DOWNLOADER_CMDLINE_SIGNATURES):
                     continue
                 stat = (entry / "stat").read_text(encoding="utf-8").split()
                 records.append({"pid": int(entry.name), "uid": (entry / "stat").stat().st_uid, "pgid": os.getpgid(int(entry.name)), "start_ticks": stat[21], "cmdline_sha256": hashlib.sha256(cmdline).hexdigest(), "role": "project_pile_downloader"})

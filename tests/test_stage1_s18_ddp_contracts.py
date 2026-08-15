@@ -294,7 +294,11 @@ def test_gpu_uuid_runtime_contract_is_canonical_lowercase_and_exact(monkeypatch:
 def test_pile_audit_binds_ready_provenance_and_never_records_command_text(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     formalizer = _formalizer(); handoff = {"pile_provenance": {"logical_asset_id": "pile-selected-prefix", "ready_manifest_sha256": "a" * 64}}
     assert formalizer._audit_pile_download_activity(handoff, proc_root=tmp_path) == {"status": "PASS", "pile_logical_asset_id": "pile-selected-prefix", "pile_ready_manifest_sha256": "a" * 64, "active_count": 0, "process_fingerprints": []}
-    proc = tmp_path / "42"; proc.mkdir(); sensitive = b"parameter pile --token=secret-do-not-persist"; (proc / "cmdline").write_bytes(sensitive); (proc / "stat").write_text(" ".join(["x"] * 22), encoding="utf-8")
+    # Generic project/Pile words can occur in the formalizer's own command
+    # line and must not masquerade as the known background downloader.
+    benign = tmp_path / "41"; benign.mkdir(); (benign / "cmdline").write_bytes(b"parameter-importance dry-check pile provenance")
+    assert formalizer._audit_pile_download_activity(handoff, proc_root=tmp_path)["active_count"] == 0
+    proc = tmp_path / "42"; proc.mkdir(); sensitive = b"bash server_xet_download.sh --token=secret-do-not-persist"; (proc / "cmdline").write_bytes(sensitive); (proc / "stat").write_text(" ".join(["x"] * 22), encoding="utf-8")
     monkeypatch.setattr(formalizer.os, "getpgid", lambda pid: 77, raising=False)
     with pytest.raises(formalizer.Stage1S18FormalError, match="S18_PILE_DOWNLOAD_ACTIVITY_PRESENT") as error:
         formalizer._audit_pile_download_activity(handoff, proc_root=tmp_path)
