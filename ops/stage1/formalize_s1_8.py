@@ -1882,6 +1882,45 @@ def _release_lease_transaction(lease: object, *, outcome: str, work: Path, label
     raise Stage1S18ManualInterventionRequired("S18_LEASE_RELEASE_UNCONFIRMED")
 
 
+def _require_no_current_lease_record(data_root: Path, identity: object) -> Path:
+    """Reject the exact resource-key current record before lease acquisition.
+
+    A current record is operator evidence, even if its owner is no longer
+    alive.  The formalizer must neither overwrite nor remove it while trying
+    to begin a new attempt.
+    """
+
+    resource_key = getattr(identity, "resource_key", None)
+    if not isinstance(resource_key, str) or not re.fullmatch(r"[0-9a-f]{24}", resource_key):
+        raise Stage1S18FormalError("S18_GPU_LEASE_RESOURCE_KEY_INVALID")
+    current = data_root / "operations" / "gpu-leases" / "current" / f"{resource_key}.json"
+    if current.exists() or current.is_symlink():
+        raise Stage1S18FormalError("S18_GPU_LEASE_CURRENT_RECORD_REQUIRES_REVIEW")
+    return current
+
+
+def _finalize_failed_lease(
+    lease: object | None, *, held: bool, release_attempted: bool,
+    error: BaseException, work: Path,
+) -> bool:
+    """Release only an acquired lease; preserve the original acquire failure.
+
+    ``ProjectGpuLease.acquire`` may reject an existing stale record after it
+    has already cleaned up its OS descriptor.  That is not ownership of the
+    record, so calling ``release`` would both mask the original cause and risk
+    acting on somebody else's evidence.  A held non-manual failure still uses
+    the exact release transaction and must read back its history.
+    """
+
+    if lease is None:
+        return False
+    if isinstance(error, Stage1S18ManualInterventionRequired) or release_attempted or not held:
+        lease.close()
+        return False
+    _release_lease_transaction(lease, outcome="FAILED", work=work, label="failure")
+    return True
+
+
 def _route_plan(*, fixture: Mapping[str, Any], execution_commit: str, route: str, visible: Sequence[str], work: Path, data_root: Path, token_sha: str, model_root: str, cache_root: str, run_token: str, permutation: str = "identity", execution_mode: str = "formal") -> dict[str, Any]:
     from param_importance_nlp.stage1_ddp import WORKER_PLAN_SCHEMA, with_artifact_hash
     route_work = work / f"route-{route}-{permutation}-{execution_mode}"
@@ -2004,14 +2043,15 @@ def execute(*, repository: Path, data_root: Path, s1_7_index_ref: str, gpu_capab
     _write(work / "model-qualified-resolution.json", _with_hash({"schema_version": "stage1-s1-8-model-qualified-resolution-v1", "status": "PASS", "model": model_qualification}))
     _, offline_policy = _offline_environment(cache_root)
     _write(work / "offline-policy.json", _with_hash({"schema_version": "stage1-s1-8-offline-policy-v1", "status": "PASS", "policy": offline_policy}))
-    lease: ProjectGpuLease | None = None; release_started = False; release_attempted = False; phase = "preflight"; staging: Path | None = None
+    lease: ProjectGpuLease | None = None; lease_held = False; release_attempted = False; phase = "preflight"; staging: Path | None = None
     try:
         pile_download_audit = _audit_pile_download_activity(handoff)
         nccl_transport = _nccl_transport_protocol()
         _write(work / "nccl-transport-protocol.json", _with_hash({"schema_version": "stage1-s1-8-nccl-transport-binding-v1", "status": "PASS", "protocol": nccl_transport}))
         preflight = discover_approved_gpus(approved_gpu_uuids); _write(work / "preflight.json", _with_hash({"schema_version": "stage1-s1-8-gpu-preflight-v1", "status": "PASS", "gpu": preflight, "capability": capability, "nccl_transport_protocol": nccl_transport, "pile_download_audit": pile_download_audit}))
         identity = GpuLeaseIdentity(run_id=f"stage1-s1-8-{attempt_id}", lease_id=f"s1-8-{attempt_id}", gpu_uuids=tuple(approved_gpu_uuids), owner=lease_owner, config_hash=_canonical({"task_id": TASK_ID, "commit": commit, "attempt_id": attempt_id}), environment_hash=_canonical(preflight))
-        phase = "lease_acquire"; lease = ProjectGpuLease(data_root, identity); lease.acquire(); lease.heartbeat()
+        phase = "lease_preflight"; _require_no_current_lease_record(data_root, identity)
+        phase = "lease_acquire"; lease = ProjectGpuLease(data_root, identity); lease.acquire(); lease_held = True; lease.heartbeat()
         post_lease = discover_approved_gpus(approved_gpu_uuids); _write(work / "post-lease-gpu.json", _with_hash({"schema_version": "stage1-s1-8-gpu-preflight-v1", "status": "PASS", "gpu": post_lease}))
         run_token = hashlib.sha256(f"{commit}:{attempt_id}:{time.time_ns()}".encode()).hexdigest()
         _write(work / "attempt-start.json", _with_hash({"schema_version": "stage1-s1-8-attempt-start-v1", "status": "STARTED", "run_token": run_token, "parent_fingerprint": _parent_fingerprint(os.getpid(), run_token), "lease": identity.to_dict()}))
@@ -2063,7 +2103,7 @@ def execute(*, repository: Path, data_root: Path, s1_7_index_ref: str, gpu_capab
             if marker not in stderr: raise Stage1S18FormalError("S18_NEGATIVE_MARKER_MISSING:" + mode)
             negative[mode] = {"process": outcome, "marker": marker, "route_work": str(route_dir.relative_to(work)), "success_marker_absent": True}
         phase = "post_gpu"; post_gpu = discover_approved_gpus(approved_gpu_uuids); _write(work / "post-worker-gpu.json", _with_hash({"schema_version": "stage1-s1-8-gpu-preflight-v1", "status": "PASS", "gpu": post_gpu}))
-        release_started = True; first_history = _release_lease_transaction(lease, outcome="GPU_PHASE_SUCCESS", work=work, label="first"); release_attempted = True; lease = None; shutil.copy2(first_history, work / "lease-history-first.json")
+        first_history = _release_lease_transaction(lease, outcome="GPU_PHASE_SUCCESS", work=work, label="first"); release_attempted = True; lease_held = False; lease = None; shutil.copy2(first_history, work / "lease-history-first.json")
         post_release = discover_approved_gpus(approved_gpu_uuids); _write(work / "post-release-gpu.json", _with_hash({"schema_version": "stage1-s1-8-gpu-preflight-v1", "status": "PASS", "gpu": post_release}))
         # The exact set must be reacquirable immediately after release; no GPU
         # worker is launched under the second lease.
@@ -2202,16 +2242,9 @@ def execute(*, repository: Path, data_root: Path, s1_7_index_ref: str, gpu_capab
     except BaseException as error:
         if staging is not None and (staging / "success.json").exists(): (staging / "success.json").unlink()
         _write(work / "failed.json", _with_hash({"schema_version": "stage1-s1-8-failure-v1", "status": "FAILED", "phase": phase, "error_type": type(error).__name__, "error": str(error)}))
-        if lease is not None:
-            if isinstance(error, Stage1S18ManualInterventionRequired): lease.close()
-            elif release_attempted:
-                # A completed release has no current record; this only closes
-                # the already-retired descriptor.
-                lease.close()
-            elif not release_started:
-                release_started = True
-                _release_lease_transaction(lease, outcome="FAILED", work=work, label="failure")
-                release_attempted = True
+        if _finalize_failed_lease(lease, held=lease_held, release_attempted=release_attempted, error=error, work=work):
+            release_attempted = True
+            lease_held = False
         raise
 
 

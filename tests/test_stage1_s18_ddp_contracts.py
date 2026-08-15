@@ -823,6 +823,84 @@ def test_release_failure_is_manual_not_a_close_only_success(tmp_path: Path) -> N
     assert (tmp_path / "lease-lease-release-failed.json").is_file()
 
 
+def test_current_resource_key_marker_is_prelease_block_and_is_never_deleted(tmp_path: Path) -> None:
+    formalizer = _formalizer()
+    marker = tmp_path / "operations" / "gpu-leases" / "current" / ("a" * 24 + ".json")
+    marker.parent.mkdir(parents=True); marker.write_text("operator-review", encoding="utf-8")
+    with pytest.raises(formalizer.Stage1S18FormalError, match="S18_GPU_LEASE_CURRENT_RECORD_REQUIRES_REVIEW"):
+        formalizer._require_no_current_lease_record(tmp_path, SimpleNamespace(resource_key="a" * 24))
+    assert marker.read_text(encoding="utf-8") == "operator-review"
+
+
+def test_execute_acquire_failure_preserves_original_error_and_never_releases(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """An acquire rejection is not lease ownership and must not be masked."""
+
+    formalizer = _formalizer(); repository, data_root = tmp_path / "repo", tmp_path / "data"
+    repository.mkdir(); data_root.mkdir()
+    token_file, historical_attestation, historical_replay = tmp_path / "tokens.safetensors", tmp_path / "attestation.json", tmp_path / "replay.json"
+    for path in (token_file, historical_attestation, historical_replay):
+        path.write_bytes(b"test")
+    cache_root = tmp_path / "cache"; cache_root.mkdir()
+    preserved_marker = tmp_path / "foreign-stale-marker.json"; preserved_marker.write_text("leave-for-review", encoding="utf-8")
+    handoff = {
+        "token_file": token_file,
+        "historical_producer_attestation_file": historical_attestation,
+        "historical_producer_attestation_sha256": formalizer._sha(historical_attestation),
+        "historical_g3_replay_file": historical_replay,
+        "historical_g3_replay_sha256": formalizer._sha(historical_replay),
+    }
+    instances: list[object] = []
+
+    class AcquireRejectedLease:
+        def __init__(self, _root: Path, _identity: object) -> None:
+            self.current_path = preserved_marker; self.acquire_calls = 0; self.release_calls = 0; self.close_calls = 0
+            instances.append(self)
+        def acquire(self) -> None:
+            self.acquire_calls += 1
+            raise RuntimeError("GPU_LEASE_STALE_RECORD_REQUIRES_REVIEW")
+        def release(self, *, outcome: str) -> Path:
+            self.release_calls += 1
+            raise AssertionError("unheld lease must never release")
+        def close(self) -> None:
+            self.close_calls += 1
+
+    import param_importance_nlp.runtime.operations as operations
+    monkeypatch.setattr(operations, "ProjectGpuLease", AcquireRejectedLease)
+    monkeypatch.setattr(formalizer, "_git", lambda _repository, *_args: "a" * 40)
+    monkeypatch.setattr(formalizer, "load_s1_7_handoff", lambda **_kwargs: handoff)
+    monkeypatch.setattr(formalizer, "_load_capability", lambda *_args, **_kwargs: {"status": "PASS"})
+    monkeypatch.setattr(formalizer, "_require_prelease_cuda_hidden", lambda: {"cuda_visible_devices": "", "parent_cuda_initialization": False})
+    monkeypatch.setattr(formalizer, "_frozen_model_and_cache_root", lambda *_args: (str(tmp_path), str(cache_root), {"status": "PASS"}))
+    monkeypatch.setattr(formalizer, "_audit_pile_download_activity", lambda _handoff: {"active_count": 0})
+    monkeypatch.setattr(formalizer, "discover_approved_gpus", lambda uuids: {"requested_uuid_order": list(uuids)})
+    uuids = ["GPU-00000000-1111-2222-3333-44444444444" + str(index) for index in range(4)]
+    with pytest.raises(RuntimeError, match="GPU_LEASE_STALE_RECORD_REQUIRES_REVIEW"):
+        formalizer.execute(repository=repository, data_root=data_root, s1_7_index_ref="ignored", gpu_capability_ref="ignored", approved_gpu_uuids=uuids, attempt_id="acquire-failure", lease_owner="test-owner")
+    assert len(instances) == 1
+    lease = instances[0]
+    assert lease.acquire_calls == 1 and lease.release_calls == 0 and lease.close_calls == 1
+    assert preserved_marker.read_text(encoding="utf-8") == "leave-for-review"
+    from param_importance_nlp.contracts.jsonio import load_canonical_json
+    failed = next((data_root / "tmp" / "stage1-s1-8" / "acquire-failure").glob("failed.json"))
+    assert formalizer._mapping(load_canonical_json(failed), field="failure")["error"] == "GPU_LEASE_STALE_RECORD_REQUIRES_REVIEW"
+
+
+def test_held_lease_failure_runs_exact_release_transaction(tmp_path: Path) -> None:
+    formalizer = _formalizer()
+    class HeldLease:
+        def __init__(self) -> None:
+            self.current_path = tmp_path / "held.json"; self.current_path.write_text("held", encoding="utf-8"); self.calls = 0; self.closed = 0
+        def release(self, *, outcome: str) -> Path:
+            self.calls += 1; assert outcome == "FAILED"; self.current_path.unlink()
+            history = tmp_path / "history.json"; history.write_text("released", encoding="utf-8")
+            return history
+        def close(self) -> None:
+            self.closed += 1
+    lease = HeldLease()
+    assert formalizer._finalize_failed_lease(lease, held=True, release_attempted=False, error=RuntimeError("worker-failed"), work=tmp_path) is True
+    assert lease.calls == 1 and lease.closed == 0 and not lease.current_path.exists()
+
+
 def test_immutable_writer_and_schema_set_are_fail_closed(tmp_path: Path) -> None:
     formalizer = _formalizer()
     target = tmp_path / "role.json"; target.write_text("{}", encoding="utf-8")
