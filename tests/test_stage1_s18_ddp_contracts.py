@@ -6,6 +6,7 @@ import math
 import importlib.util
 import copy
 import hashlib
+import inspect
 import os
 from pathlib import Path
 import signal
@@ -330,6 +331,37 @@ def test_session_member_stat_parser_handles_arbitrary_comm_and_rejects_malformed
     for malformed in ("123 worker) S 1 456 789", "124 (worker) S 1 456 789", "123 (worker S 1 456 789", "123 (worker) SS 1 456 789 " + " ".join(["0"] * 16)):
         with pytest.raises(formalizer.Stage1S18ManualInterventionRequired, match="S18_PROCESS_SESSION_MEMBER_STATE_UNVERIFIABLE"):
             formalizer._parse_session_member_stat(malformed, pid=123, uid=7)
+
+
+def test_counting_allreduce_hook_has_exact_runtime_ddp_annotations_and_calls_real_hook() -> None:
+    from torch import distributed as dist
+    from torch.distributed.algorithms.ddp_comm_hooks.default_hooks import allreduce_hook
+    from torch.nn.parallel import DistributedDataParallel
+
+    state = {"calls": 0}
+    bucket, result = object(), object()
+    calls: list[tuple[object, object]] = []
+    hook = ddp._counting_allreduce_hook(
+        dist=dist,
+        allreduce_hook=lambda process_group, received_bucket: calls.append((process_group, received_bucket)) or result,
+    )
+    signature = inspect.signature(hook)
+    assert inspect.signature(allreduce_hook).return_annotation == torch.futures.Future[torch.Tensor]
+    assert hook.__annotations__ == {
+        "bucket": dist.GradBucket,
+        "return": torch.futures.Future[torch.Tensor],
+    }
+    assert signature.parameters["bucket"].annotation is dist.GradBucket
+    assert signature.return_annotation == torch.futures.Future[torch.Tensor]
+
+    class Checker:
+        def _log_and_throw(self, error_type: type[BaseException], message: str) -> None:
+            raise error_type(message)
+
+    DistributedDataParallel._check_comm_hook(Checker(), hook)
+    assert hook(state, bucket) is result
+    assert state == {"calls": 1}
+    assert calls == [(None, bucket)]
 
 
 def test_unknown_member_in_worker_session_blocks_without_signal(monkeypatch: pytest.MonkeyPatch) -> None:

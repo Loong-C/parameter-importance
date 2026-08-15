@@ -640,6 +640,26 @@ def _parameter_registry_hash(module: torch.nn.Module) -> str:
     })
 
 
+def _counting_allreduce_hook(*, dist: Any, allreduce_hook: Any) -> Any:
+    """Build the ordinary-DDP counter hook with DDP-inspectable annotations.
+
+    This module uses postponed annotations, whereas DDP 2.12 compares the
+    annotation *objects* in ``inspect.signature``.  Rewrite the two checked
+    annotations immediately after definition, then retain the default hook's
+    real all-reduce implementation.
+    """
+
+    def hook(state, bucket):
+        state["calls"] += 1
+        return allreduce_hook(None, bucket)
+
+    hook.__annotations__ = {
+        "bucket": dist.GradBucket,
+        "return": torch.futures.Future[torch.Tensor],
+    }
+    return hook
+
+
 def learning_rate_map(
     module: torch.nn.Module, optimizer: torch.optim.Optimizer,
 ) -> dict[str, float]:
@@ -1204,10 +1224,7 @@ def execute_worker(plan_path: str | Path) -> dict[str, object]:
         model = _load_model(plan, device)
         ddp = DistributedDataParallel(model, device_ids=[local_rank], output_device=local_rank, broadcast_buffers=False)
         comm_state = {"calls": 0}
-        def hook(state: dict[str, int], bucket: object) -> object:
-            state["calls"] += 1
-            return allreduce_hook(None, bucket)  # type: ignore[arg-type]
-        ddp.register_comm_hook(comm_state, hook)
+        ddp.register_comm_hook(comm_state, _counting_allreduce_hook(dist=dist, allreduce_hook=allreduce_hook))
         layout = permute_route_layout(build_route_layout(route), permutation=str(plan["permutation"]))
         output_dir = plan_file.parent / str(plan["output_dir"])
         if rank == 0:
