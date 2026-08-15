@@ -267,6 +267,22 @@ def _require_sha256(value: object, *, field: str) -> str:
     return value
 
 
+def _nccl_transport_protocol() -> dict[str, object]:
+    """Bind the Stage 0 G6/G10-qualified P2P-disabled NCCL contract."""
+
+    from param_importance_nlp.stage1_ddp import NCCL_TRANSPORT_PROTOCOL
+    protocol = dict(NCCL_TRANSPORT_PROTOCOL)
+    if protocol != {
+        "schema_version": "stage1-s1-8-nccl-transport-v1",
+        "qualification_basis_gate_ids": ["stage0.G6", "stage0.G10"],
+        "current_cuda_capability_artifact_hash": EXPECTED_GPU_CAPABILITY_ARTIFACT_HASH,
+        "nccl_p2p_disable": "1",
+        "process_group_timeout_seconds": 180,
+    }:
+        raise Stage1S18FormalError("S18_NCCL_TRANSPORT_PROTOCOL_INVALID")
+    return protocol
+
+
 def _validate_worker_candidate_contract(route_key: str, report: Mapping[str, Any]) -> None:
     """Apply route-specific semantics that JSON Schema cannot express alone."""
 
@@ -275,6 +291,8 @@ def _validate_worker_candidate_contract(route_key: str, report: Mapping[str, Any
         raise Stage1S18FormalError("S18_CANDIDATE_WORKER_CASE_CARDINALITY_INVALID:" + route_key)
     if (route_key in ROUTE_WORLD and route_key != route) or (route_key.startswith("D-") and route != "D") or report.get("world_size") != ROUTE_WORLD[route]:
         raise Stage1S18FormalError("S18_CANDIDATE_WORKER_ROUTE_WORLD_INVALID:" + route_key)
+    if report.get("nccl_transport_protocol") != _nccl_transport_protocol():
+        raise Stage1S18FormalError("S18_CANDIDATE_WORKER_NCCL_TRANSPORT_INVALID:" + route_key)
     visible, rank_uuids = report.get("visible_gpu_uuids"), report.get("rank_to_gpu_uuid")
     if not isinstance(visible, list) or not isinstance(rank_uuids, list) or visible != rank_uuids or len(visible) != ROUTE_WORLD[route] or len(set(visible)) != len(visible) or any(not isinstance(value, str) or GPU_UUID_RE.fullmatch(value) is None for value in visible):
         raise Stage1S18FormalError("S18_CANDIDATE_WORKER_UUID_INVALID:" + route_key)
@@ -460,7 +478,7 @@ def _candidate_publication_check(
         raise Stage1S18FormalError("S18_CANDIDATE_VALIDATION_CHECK_STATUS_INVALID")
     if index.get("gate_artifact_hash") != gate.get("artifact_hash") or index.get("validation_ref") != "validation.json" or index.get("validation_sha256") != _canonical_file_sha(validation) or index.get("replay_ref") != "replay-validation.json" or index.get("replay_sha256") != _canonical_file_sha(replay_record):
         raise Stage1S18FormalError("S18_CANDIDATE_INDEX_ROLE_CROSSREF_INVALID")
-    if ddp.get("fixture_hash") != fixture.get("fixture_hash") or table.get("status") != "PASS" or replay_record.get("status") != "PASS":
+    if ddp.get("fixture_hash") != fixture.get("fixture_hash") or table.get("status") != "PASS" or replay_record.get("status") != "PASS" or ddp.get("nccl_transport_protocol") != _nccl_transport_protocol() or index.get("nccl_transport_protocol") != _nccl_transport_protocol():
         raise Stage1S18FormalError("S18_CANDIDATE_FIXTURE_OR_REPLAY_CROSSREF_INVALID")
     negatives = _mapping(ddp.get("negative_controls"), field="candidate.ddp.negative_controls")
     if set(negatives) != {"ordinary_sync_negative", "inject_rank_failure"}:
@@ -1691,7 +1709,7 @@ def _route_plan(*, fixture: Mapping[str, Any], execution_commit: str, route: str
     from param_importance_nlp.stage1_ddp import WORKER_PLAN_SCHEMA, with_artifact_hash
     route_work = work / f"route-{route}-{permutation}-{execution_mode}"
     route_work.mkdir()
-    return with_artifact_hash({"schema_version": WORKER_PLAN_SCHEMA, "task_id": TASK_ID, "execution_commit": execution_commit, "route": route, "fixture": dict(fixture), "fixture_tokens_ref": "../fixture-inputs.safetensors", "fixture_tokens_sha256": token_sha, "data_root": str(data_root), "model_root": model_root, "cache_root": cache_root, "run_token": run_token, "visible_gpu_uuids": list(visible), "output_dir": "route-output", "permutation": permutation, "execution_mode": execution_mode})
+    return with_artifact_hash({"schema_version": WORKER_PLAN_SCHEMA, "task_id": TASK_ID, "execution_commit": execution_commit, "route": route, "fixture": dict(fixture), "fixture_tokens_ref": "../fixture-inputs.safetensors", "fixture_tokens_sha256": token_sha, "data_root": str(data_root), "model_root": model_root, "cache_root": cache_root, "run_token": run_token, "visible_gpu_uuids": list(visible), "nccl_transport_protocol": _nccl_transport_protocol(), "output_dir": "route-output", "permutation": permutation, "execution_mode": execution_mode})
 
 
 def _offline_environment(cache_root: str) -> tuple[dict[str, str], dict[str, object]]:
@@ -1709,7 +1727,9 @@ def _run_route(*, repository: Path, work: Path, plan: Mapping[str, Any], timeout
     route = str(plan["route"]); permutation = str(plan["permutation"]); mode = str(plan["execution_mode"])
     route_work = work / f"route-{route}-{permutation}-{mode}"
     plan_path = route_work / "worker-plan.json"; write_canonical_json(plan_path, dict(plan))
-    environment = dict(os.environ); offline, _ = _offline_environment(str(plan["cache_root"])); environment.update(offline); environment.update({"CUDA_VISIBLE_DEVICES": ",".join(plan["visible_gpu_uuids"]), "CUBLAS_WORKSPACE_CONFIG": ":4096:8"})
+    if plan.get("nccl_transport_protocol") != _nccl_transport_protocol():
+        raise Stage1S18FormalError("S18_ROUTE_NCCL_TRANSPORT_PLAN_INVALID")
+    environment = dict(os.environ); offline, _ = _offline_environment(str(plan["cache_root"])); environment.update(offline); environment.update({"CUDA_VISIBLE_DEVICES": ",".join(plan["visible_gpu_uuids"]), "CUBLAS_WORKSPACE_CONFIG": ":4096:8", "NCCL_P2P_DISABLE": "1"})
     command = [sys.executable, "-m", "torch.distributed.run", "--rdzv-id", str(plan["run_token"]), "--rdzv-endpoint", "127.0.0.1:0", "--nproc_per_node", str(ROUTE_WORLD[route]), str(repository / "ops" / "stage1" / "run_s1_8_worker.py"), "--plan", str(plan_path)]
     label = f"{route}-{permutation}-{mode}"
     outcome = _launch(repository=repository, work=work, label=label, command=command, environment=environment, run_token=str(plan["run_token"]), timeout_seconds=timeout_seconds, lease=lease, expected_success=expect_success)
@@ -1723,7 +1743,7 @@ def _run_route(*, repository: Path, work: Path, plan: Mapping[str, Any], timeout
     if not report_path.is_file():
         raise Stage1S18FormalError("S18_ROUTE_REPORT_MISSING")
     report = _mapping(load_canonical_json(report_path), field=f"route.{route}.report")
-    if not _self_hash(report) or report.get("status") != "PASS" or report.get("execution_mode") != "formal" or report.get("route") != route or report.get("permutation") != permutation:
+    if not _self_hash(report) or report.get("status") != "PASS" or report.get("execution_mode") != "formal" or report.get("route") != route or report.get("permutation") != permutation or report.get("nccl_transport_protocol") != _nccl_transport_protocol():
         raise Stage1S18FormalError("S18_ROUTE_REPORT_INVALID")
     return report, route_work / "route-output", outcome
 
@@ -1760,7 +1780,7 @@ def prelease_dry_chain(*, repository: Path, data_root: Path, s1_7_index_ref: str
     parent_cuda = _require_prelease_cuda_hidden()
     model_root, cache_root, qualification = _frozen_model_and_cache_root(repository, data_root, handoff)
     pile = _audit_pile_download_activity(handoff)
-    return {"status": "PASS", "s1_7_handoff": {key: value for key, value in handoff.items() if key != "token_file"}, "gpu_capability": capability, "parent_cuda": parent_cuda, "model_root": model_root, "cache_root": cache_root, "model_qualification": qualification, "pile_download_audit": pile}
+    return {"status": "PASS", "s1_7_handoff": {key: value for key, value in handoff.items() if key != "token_file"}, "gpu_capability": capability, "nccl_transport_protocol": _nccl_transport_protocol(), "parent_cuda": parent_cuda, "model_root": model_root, "cache_root": cache_root, "model_qualification": qualification, "pile_download_audit": pile}
 
 
 def execute(*, repository: Path, data_root: Path, s1_7_index_ref: str, gpu_capability_ref: str, approved_gpu_uuids: Sequence[str], attempt_id: str, lease_owner: str, timeout_seconds: int = 3600) -> dict[str, str]:
@@ -1810,16 +1830,18 @@ def execute(*, repository: Path, data_root: Path, s1_7_index_ref: str, gpu_capab
     lease: ProjectGpuLease | None = None; release_started = False; release_attempted = False; phase = "preflight"; staging: Path | None = None
     try:
         pile_download_audit = _audit_pile_download_activity(handoff)
-        preflight = discover_approved_gpus(approved_gpu_uuids); _write(work / "preflight.json", _with_hash({"schema_version": "stage1-s1-8-gpu-preflight-v1", "status": "PASS", "gpu": preflight, "capability": capability, "pile_download_audit": pile_download_audit}))
+        nccl_transport = _nccl_transport_protocol()
+        _write(work / "nccl-transport-protocol.json", _with_hash({"schema_version": "stage1-s1-8-nccl-transport-binding-v1", "status": "PASS", "protocol": nccl_transport}))
+        preflight = discover_approved_gpus(approved_gpu_uuids); _write(work / "preflight.json", _with_hash({"schema_version": "stage1-s1-8-gpu-preflight-v1", "status": "PASS", "gpu": preflight, "capability": capability, "nccl_transport_protocol": nccl_transport, "pile_download_audit": pile_download_audit}))
         identity = GpuLeaseIdentity(run_id=f"stage1-s1-8-{attempt_id}", lease_id=f"s1-8-{attempt_id}", gpu_uuids=tuple(approved_gpu_uuids), owner=lease_owner, config_hash=_canonical({"task_id": TASK_ID, "commit": commit, "attempt_id": attempt_id}), environment_hash=_canonical(preflight))
         phase = "lease_acquire"; lease = ProjectGpuLease(data_root, identity); lease.acquire(); lease.heartbeat()
         post_lease = discover_approved_gpus(approved_gpu_uuids); _write(work / "post-lease-gpu.json", _with_hash({"schema_version": "stage1-s1-8-gpu-preflight-v1", "status": "PASS", "gpu": post_lease}))
         run_token = hashlib.sha256(f"{commit}:{attempt_id}:{time.time_ns()}".encode()).hexdigest()
         _write(work / "attempt-start.json", _with_hash({"schema_version": "stage1-s1-8-attempt-start-v1", "status": "STARTED", "run_token": run_token, "parent_fingerprint": _parent_fingerprint(os.getpid(), run_token), "lease": identity.to_dict()}))
-        phase = "nccl_smoke"; smoke_env = dict(os.environ); smoke_env.update({"CUDA_VISIBLE_DEVICES": ",".join(approved_gpu_uuids), "CUBLAS_WORKSPACE_CONFIG": ":4096:8"})
+        phase = "nccl_smoke"; smoke_env = dict(os.environ); smoke_env.update({"CUDA_VISIBLE_DEVICES": ",".join(approved_gpu_uuids), "CUBLAS_WORKSPACE_CONFIG": ":4096:8", "NCCL_P2P_DISABLE": "1"})
         smoke = _launch(repository=repository, work=work, label="nccl-smoke", command=[sys.executable, "-m", "torch.distributed.run", "--rdzv-id", run_token, "--rdzv-endpoint", "127.0.0.1:0", "--nproc_per_node", "4", str(repository / "ops" / "stage1" / "run_s1_8_nccl_smoke.py"), "--report", str(work / "nccl-smoke-report.json")], environment=smoke_env, run_token=run_token, timeout_seconds=min(timeout_seconds, 300), lease=lease, expected_success=True)
         smoke_report = _mapping(load_canonical_json(work / "nccl-smoke-report.json"), field="nccl_smoke")
-        if not _self_hash(smoke_report) or smoke_report.get("backend") != "nccl" or smoke_report.get("world_size") != 4 or smoke_report.get("allocation_probe") != "torch.empty.float32.256" or smoke_report.get("rank_records") != [{"rank": index, "uuid": approved_gpu_uuids[index], "input": index + 1, "output": 10, "cuda_initialized": True, "allocation_bytes": 1024} for index in range(4)]:
+        if not _self_hash(smoke_report) or smoke_report.get("backend") != "nccl" or smoke_report.get("nccl_transport_protocol") != nccl_transport or smoke_report.get("world_size") != 4 or smoke_report.get("allocation_probe") != "torch.empty.float32.256" or smoke_report.get("rank_records") != [{"rank": index, "uuid": approved_gpu_uuids[index], "input": index + 1, "output": 10, "cuda_initialized": True, "allocation_bytes": 1024} for index in range(4)]:
             raise Stage1S18FormalError("S18_NCCL_SMOKE_REPORT_INVALID")
         phase = "pre_route_scale"; scale = _scale_oracle(repository=repository, work=work, handoff=handoff, model_root=model_root, cache_root=cache_root, uuid=approved_gpu_uuids[0], execution_commit=commit, run_token=run_token, timeout_seconds=timeout_seconds, lease=lease)
         fixture = build_fixture(token_sha256=handoff["token_sha256"], upstream_fixture_hash=str(handoff["fixture_hash"]), gradient_design_scale=float(scale["maximum_unit_gradient_abs"]), optimizer_delta_design_scale=float(scale["maximum_abs_data_update"]), pre_route_scale_oracle_hash=str(scale["artifact_hash"]), pre_route_parameter_registry_hash=str(scale["parameter_registry_hash"]), pre_route_case_state_checksums=_mapping(scale["case_pre_parameter_checksums"], field="scale.case_pre_parameter_checksums"))
@@ -1890,13 +1912,13 @@ def execute(*, repository: Path, data_root: Path, s1_7_index_ref: str, gpu_capab
         replay_record = _with_hash(dict(result)); _write(work / "replay-validation.json", replay_record)
         table = _with_hash({"schema_version": "stage1-s1-8-comparison-table-v1", "status": "PASS", "rows": result["comparison_rows"]}); _write(work / "comparison-table.json", table)
         source_hashes = _implementation_source_map(repository)
-        ddp_report = _with_hash({"schema_version": "stage1-s1-8-ddp-report-v1", "status": "PASS", "task_id": TASK_ID, "fixture_hash": fixture["fixture_hash"], "implementation_source_sha256": source_hashes, "baseline_routes": baseline_reports, "permutation_routes": permutation_reports, "negative_controls": negative}); _write(work / "ddp-report.json", ddp_report)
+        ddp_report = _with_hash({"schema_version": "stage1-s1-8-ddp-report-v1", "status": "PASS", "task_id": TASK_ID, "fixture_hash": fixture["fixture_hash"], "nccl_transport_protocol": nccl_transport, "implementation_source_sha256": source_hashes, "baseline_routes": baseline_reports, "permutation_routes": permutation_reports, "negative_controls": negative}); _write(work / "ddp-report.json", ddp_report)
         csv_hashes, svg_hashes = _charts(work, result, ddp_report, baseline_arrays)
         # It is intentionally written only after every worker output, replay,
         # report and chart exists, and excludes itself from the measured scope.
         _write(work / "resource-summary.json", _resource_summary(work, estimated_peak_bytes=estimated_peak_bytes, preflight=preflight, post_gpu=post_gpu))
         role_files = {"fixture_manifest": "fixture-manifest.json", "ddp_report": "ddp-report.json", "array_bundle": "array-bundle.json", "comparison_table": "comparison-table.json", "gate_record": "g1-ddp-record.json"}
-        reproduction = {"fixture_inputs": "fixture-inputs.safetensors", "s1_7_historical_producer_attestation": "s1-7-historical-producer-attestation.json", "s1_7_historical_g3_replay": "s1-7-historical-g3-replay.json", "model_qualified_resolution": "model-qualified-resolution.json", "offline_policy": "offline-policy.json", "pre_route_scale_plan": "pre-route-scale-plan.json", "pre_route_scale": "pre-route-scale.json", "preflight": "preflight.json", "post_lease_gpu": "post-lease-gpu.json", "post_worker_gpu": "post-worker-gpu.json", "post_release_gpu": "post-release-gpu.json", "resource_summary": "resource-summary.json", "nccl_smoke_report": "nccl-smoke-report.json", "nccl_smoke_process": "nccl-smoke.process.json", "nccl_smoke_stdout": "nccl-smoke.stdout.txt", "nccl_smoke_stderr": "nccl-smoke.stderr.txt", "lease_history_first": "lease-history-first.json", "lease_history_reacquire": "lease-history-reacquire.json", "attempt_start": "attempt-start.json"}
+        reproduction = {"fixture_inputs": "fixture-inputs.safetensors", "s1_7_historical_producer_attestation": "s1-7-historical-producer-attestation.json", "s1_7_historical_g3_replay": "s1-7-historical-g3-replay.json", "model_qualified_resolution": "model-qualified-resolution.json", "offline_policy": "offline-policy.json", "nccl_transport_protocol": "nccl-transport-protocol.json", "pre_route_scale_plan": "pre-route-scale-plan.json", "pre_route_scale": "pre-route-scale.json", "preflight": "preflight.json", "post_lease_gpu": "post-lease-gpu.json", "post_worker_gpu": "post-worker-gpu.json", "post_release_gpu": "post-release-gpu.json", "resource_summary": "resource-summary.json", "nccl_smoke_report": "nccl-smoke-report.json", "nccl_smoke_process": "nccl-smoke.process.json", "nccl_smoke_stdout": "nccl-smoke.stdout.txt", "nccl_smoke_stderr": "nccl-smoke.stderr.txt", "lease_history_first": "lease-history-first.json", "lease_history_reacquire": "lease-history-reacquire.json", "attempt_start": "attempt-start.json"}
         reproduction_sources: dict[str, Path] = {published: work / published for published in reproduction.values()}
         for source in sorted(list(work.glob("*.process.json")) + list(work.glob("*.stdout.txt")) + list(work.glob("*.stderr.txt")) + list(work.glob("*-process-tree-initial.json")) + list(work.glob("*-termination-audit.json"))):
             published = "run__root__" + source.name
@@ -1937,7 +1959,7 @@ def execute(*, repository: Path, data_root: Path, s1_7_index_ref: str, gpu_capab
             "s1_7_handoff": handoff["gate_artifact_hash"] == EXPECTED_G1_SINGLE_HASH,
             "consumer_diff": isinstance(_audit_consumer_diff(repository), tuple),
             "approved_four_uuid_topology": capability["artifact_hash"] == EXPECTED_GPU_CAPABILITY_ARTIFACT_HASH and set(approved_gpu_uuids).issubset(set(capability["allowed_gpu_uuids"])) and preflight["requested_uuid_order"] == list(approved_gpu_uuids) == post_gpu["requested_uuid_order"],
-            "nccl_smoke": smoke["returncode"] == 0 and smoke["residual_launch_tree"] == {"session_members": [], "token_members": []} and _is_nonzero_loopback_endpoint(smoke.get("rendezvous_endpoint")) and smoke_report.get("status") == "PASS",
+            "nccl_smoke": smoke["returncode"] == 0 and smoke["residual_launch_tree"] == {"session_members": [], "token_members": []} and _is_nonzero_loopback_endpoint(smoke.get("rendezvous_endpoint")) and smoke_report.get("status") == "PASS" and smoke_report.get("nccl_transport_protocol") == nccl_transport,
             "pre_route_scale_oracle": scale["case_pre_parameter_checksums"]["weighted"] == scale["case_post_parameter_checksums"]["equal"],
             "real_routes_equal_and_weighted": set(baseline_reports) == set(ROUTE_WORLD) and all(len(report["cases"]) == 2 for report in baseline_reports.values()),
             "rank_partition_and_no_sync": all(all(row["ordinary_ddp_gradient_collectives"] == 0 for row in report["cases"]) for route, report in baseline_reports.items() if route != "A"),
@@ -1962,7 +1984,7 @@ def execute(*, repository: Path, data_root: Path, s1_7_index_ref: str, gpu_capab
             gate_value = _with_hash({"schema_version": "stage1-s1-8-gate-record-v1", "status": "PASS", "gate_id": GATE_ID, "task_id": TASK_ID, "requirements": requirements})
             role_hashes = {role: _canonical_file_sha(value) for role, value in {"fixture_manifest": fixture, "ddp_report": ddp_report, "array_bundle": arrays_bundle, "comparison_table": table, "gate_record": gate_value}.items()}
             validation_value = _with_hash({"schema_version": "stage1-s1-8-validation-v1", "status": "PASS", "task_id": TASK_ID, "gate_id": GATE_ID, "producer_commit": commit, "checks": [{"check_id": identifier, "status": "PASS", "detail": identifier.replace("_", " ")} for identifier in GATE_CHECK_IDS], "role_sha256": role_hashes})
-            index_value = _with_hash({"schema_version": "stage1-s1-8-formalization-index-v1", "status": "PASS", "gate_id": GATE_ID, "task_id": TASK_ID, "generator_git_commit": commit, "consumer_git_commit": commit, "gpu_capability": capability, "implementation_source_sha256": source_hashes, "s1_7_handoff": handoff_for_index, "role_refs": role_files, "role_sha256": role_hashes, "reproduction_role_refs": reproduction, "reproduction_role_sha256": reproduction_sha, "gate_artifact_hash": gate_value["artifact_hash"], "validation_ref": "validation.json", "validation_sha256": _canonical_file_sha(validation_value), "replay_ref": "replay-validation.json", "replay_sha256": _canonical_file_sha(replay_record), "next_task_ids": ["stage1.10_checkpoint_resume_and_artifacts"]})
+            index_value = _with_hash({"schema_version": "stage1-s1-8-formalization-index-v1", "status": "PASS", "gate_id": GATE_ID, "task_id": TASK_ID, "generator_git_commit": commit, "consumer_git_commit": commit, "gpu_capability": capability, "nccl_transport_protocol": nccl_transport, "implementation_source_sha256": source_hashes, "s1_7_handoff": handoff_for_index, "role_refs": role_files, "role_sha256": role_hashes, "reproduction_role_refs": reproduction, "reproduction_role_sha256": reproduction_sha, "gate_artifact_hash": gate_value["artifact_hash"], "validation_ref": "validation.json", "validation_sha256": _canonical_file_sha(validation_value), "replay_ref": "replay-validation.json", "replay_sha256": _canonical_file_sha(replay_record), "next_task_ids": ["stage1.10_checkpoint_resume_and_artifacts"]})
             values = {"fixture_manifest": fixture, "ddp_report": ddp_report, "array_bundle": arrays_bundle, "comparison_table": table, "gate_record": gate_value, "replay": replay_record, "validation": validation_value, "index": index_value}
             return values, role_hashes, gate_value, validation_value, index_value
 

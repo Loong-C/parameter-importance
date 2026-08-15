@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 import importlib.util
 import copy
+import hashlib
 import os
 from pathlib import Path
 import signal
@@ -20,6 +21,8 @@ from param_importance_nlp.stage1_ddp import (
     Stage1S18Error,
     build_fixture,
     learning_rate_map,
+    validate_nccl_transport_environment,
+    validate_worker_plan,
     validate_fixture,
 )
 from param_importance_nlp import stage1_ddp_oracle as oracle
@@ -39,7 +42,7 @@ def _worker_report_a(formalizer: object) -> dict[str, object]:
     def case(name: str) -> dict[str, object]:
         return {"case": name, "global_loss_numerator": 1.0, "global_loss_valid_token_count": 8, "global_mean_loss": 0.125, "global_microbatch_count": 8, "global_n1": 8, "global_n2": 8, "global_gradient_norm": 1.0, "clip_factor": 1.0, "rank_records": [{"rank": 0, "local_microbatch_ids": list(range(8)), "local_gradient_checksums": ["c" * 64] * 8, "global_statistic_checksums": {}, "local_loss_numerator": 1.0, "local_effective_tokens": 8}], "global_statistic_checksums": {}, "ordinary_ddp_gradient_collectives": 0, "manual_statistic_collectives": {"backend": "nccl", "operation": "SUM", "tensor_statistics": [], "tensor_all_reduce_count": 0, "scalar_statistics": [], "scalar_all_reduce_count": 0, "total_all_reduce_count": 0}, "post_parameter_checksum": "d" * 64, "pre_parameter_checksum": "e" * 64, "accumulator": None, "array_keys": [f"a-reference/{name}/raw_core/p"]}
     uuid = "GPU-00000000-1111-2222-3333-444444444444"
-    return formalizer._with_hash({"schema_version": "stage1-s1-8-worker-report-v1", "status": "PASS", "task_id": "stage1.08_ddp_and_gradient_accumulation", "execution_commit": "f" * 40, "run_token": "0" * 64, "route": "A", "permutation": "identity", "execution_mode": "formal", "world_size": 1, "backend": "nccl", "visible_gpu_uuids": [uuid], "rank_to_gpu_uuid": [uuid], "parameter_registry_hash": "1" * 64, "fixture_hash": "2" * 64, "route_layout": {"route": "A", "world_size": 1, "rank_microbatch_ids": [list(range(8))]}, "cases": [case("equal"), case("weighted")], "arrays": manifest})
+    return formalizer._with_hash({"schema_version": "stage1-s1-8-worker-report-v1", "status": "PASS", "task_id": "stage1.08_ddp_and_gradient_accumulation", "execution_commit": "f" * 40, "run_token": "0" * 64, "route": "A", "permutation": "identity", "execution_mode": "formal", "world_size": 1, "backend": "nccl", "nccl_transport_protocol": formalizer._nccl_transport_protocol(), "visible_gpu_uuids": [uuid], "rank_to_gpu_uuid": [uuid], "parameter_registry_hash": "1" * 64, "fixture_hash": "2" * 64, "route_layout": {"route": "A", "world_size": 1, "rank_microbatch_ids": [list(range(8))]}, "cases": [case("equal"), case("weighted")], "arrays": manifest})
 
 
 def _fixture() -> dict[str, object]:
@@ -85,6 +88,45 @@ def test_learning_rate_map_uses_parameter_identity_for_nonfirst_multi_parameter_
 
     with pytest.raises(Stage1S18Error, match="S18_OPTIMIZER_PARAMETER_DUPLICATE"):
         learning_rate_map(model, DuplicateOptimizer())  # type: ignore[arg-type]
+
+
+def test_frozen_nccl_transport_requires_p2p_disabled_and_plan_binding(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    assert ddp.NCCL_TRANSPORT_PROTOCOL == {
+        "schema_version": "stage1-s1-8-nccl-transport-v1",
+        "qualification_basis_gate_ids": ["stage0.G6", "stage0.G10"],
+        "current_cuda_capability_artifact_hash": "a536e191cd59318325289d238db727f8939767e384bfccd961ae7ca1c6a11ce4",
+        "nccl_p2p_disable": "1",
+        "process_group_timeout_seconds": 180,
+    }
+    for invalid in (None, "0"):
+        if invalid is None:
+            monkeypatch.delenv("NCCL_P2P_DISABLE", raising=False)
+        else:
+            monkeypatch.setenv("NCCL_P2P_DISABLE", invalid)
+        with pytest.raises(Stage1S18Error, match="S18_NCCL_P2P_ENVIRONMENT_INVALID"):
+            validate_nccl_transport_environment()
+    monkeypatch.setenv("NCCL_P2P_DISABLE", "1")
+    assert validate_nccl_transport_environment() == ddp.NCCL_TRANSPORT_PROTOCOL
+    data_root, model_root, cache_root = tmp_path / "data", tmp_path / "data" / "models" / "model", tmp_path / "data" / "cache"
+    model_root.mkdir(parents=True); cache_root.mkdir()
+    tokens = tmp_path / "fixture-inputs.safetensors"; tokens.write_bytes(b"fixture")
+    plan = ddp.with_artifact_hash({
+        "schema_version": ddp.WORKER_PLAN_SCHEMA, "task_id": ddp.TASK_ID, "execution_commit": "a" * 40,
+        "route": "A", "fixture": _fixture(), "fixture_tokens_ref": "fixture-inputs.safetensors",
+        "fixture_tokens_sha256": hashlib.sha256(b"fixture").hexdigest(), "data_root": str(data_root),
+        "model_root": str(model_root), "cache_root": str(cache_root), "run_token": "b" * 64,
+        "visible_gpu_uuids": ["GPU-00000000-1111-2222-3333-444444444444"],
+        "nccl_transport_protocol": dict(ddp.NCCL_TRANSPORT_PROTOCOL), "output_dir": "route-output",
+        "permutation": "identity", "execution_mode": "formal",
+    })
+    assert validate_worker_plan(plan, path=tmp_path / "worker-plan.json")["nccl_transport_protocol"] == ddp.NCCL_TRANSPORT_PROTOCOL
+    drifted = copy.deepcopy(plan); drifted["nccl_transport_protocol"]["nccl_p2p_disable"] = "0"; drifted["artifact_hash"] = ddp.canonical_json_hash({key: value for key, value in drifted.items() if key != "artifact_hash"})
+    with pytest.raises(Stage1S18Error, match="S18_WORKER_NCCL_TRANSPORT_PROTOCOL_INVALID"):
+        validate_worker_plan(drifted, path=tmp_path / "worker-plan.json")
+    smoke_source = Path("ops/stage1/run_s1_8_nccl_smoke.py").read_text(encoding="utf-8")
+    assert "validate_nccl_transport_environment()" in smoke_source and "timeout=timedelta(seconds=int(NCCL_TRANSPORT_PROTOCOL" in smoke_source
+    formalizer_source = Path("ops/stage1/formalize_s1_8.py").read_text(encoding="utf-8")
+    assert formalizer_source.count('"NCCL_P2P_DISABLE": "1"') == 2
 
 
 def test_rank_local_rng_never_uses_all_visible_cuda_generators(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -189,6 +231,9 @@ def test_worker_and_array_schemas_validate_real_shape_then_reject_deep_unknown_a
     cardinality = copy.deepcopy(report); cardinality["cases"] = cardinality["cases"][:1]
     with pytest.raises(formalizer.Stage1S18FormalError, match="S18_SCHEMA_VALIDATION_FAILED"):
         formalizer._validate_output_schemas(Path("."), {"worker_report": cardinality})
+    transport = copy.deepcopy(report); transport["nccl_transport_protocol"]["nccl_p2p_disable"] = "0"; transport["artifact_hash"] = formalizer._canonical({key: value for key, value in transport.items() if key != "artifact_hash"})
+    with pytest.raises(formalizer.Stage1S18FormalError, match="S18_SCHEMA_VALIDATION_FAILED"):
+        formalizer._validate_output_schemas(Path("."), {"worker_report": transport})
 
 
 def test_unknown_process_group_member_never_signals_and_persists_manual_marker(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -426,7 +471,7 @@ def test_route_specific_candidate_contract_forbids_a_u_and_requires_bcd_accumula
     formalizer = _formalizer()
     uuid = "GPU-00000000-1111-2222-3333-444444444444"
     a_fields = ("mean_gradient", "raw_core", "raw_score", "raw_score_clipped", "data_update", "magnitude")
-    report_a = {"route": "A", "world_size": 1, "visible_gpu_uuids": [uuid], "rank_to_gpu_uuid": [uuid], "route_layout": {"route": "A", "world_size": 1, "rank_microbatch_ids": [list(range(8))]}, "cases": [{"case": case, "array_keys": [f"a-reference/{case}/{field}/p" for field in a_fields], "accumulator": None, "rank_records": [{"rank": 0}]} for case in ("equal", "weighted")]}
+    report_a = {"route": "A", "world_size": 1, "nccl_transport_protocol": formalizer._nccl_transport_protocol(), "visible_gpu_uuids": [uuid], "rank_to_gpu_uuid": [uuid], "route_layout": {"route": "A", "world_size": 1, "rank_microbatch_ids": [list(range(8))]}, "cases": [{"case": case, "array_keys": [f"a-reference/{case}/{field}/p" for field in a_fields], "accumulator": None, "rank_records": [{"rank": 0}]} for case in ("equal", "weighted")]}
     formalizer._validate_worker_candidate_contract("A", report_a)
     bad_a = copy.deepcopy(report_a); bad_a["cases"][0]["array_keys"].append("scores/equal/u_core/p")
     with pytest.raises(formalizer.Stage1S18FormalError, match="S18_CANDIDATE_A_U_OR_ACCUMULATOR_FORBIDDEN"):
@@ -628,7 +673,7 @@ def test_index_schema_strictly_freezes_full_s17_handoff_historical_binding() -> 
     index = formalizer._with_hash({
         "schema_version": "stage1-s1-8-formalization-index-v1", "status": "PASS", "gate_id": "G1-DDP", "task_id": "stage1.08_ddp_and_gradient_accumulation",
         "generator_git_commit": "8" * 40, "consumer_git_commit": "8" * 40,
-        "gpu_capability": {"commit_ref": "commit", "object_ref": "object", "task_id": "stage0.01_baseline_and_safety", "artifact_kind": "capability_cuda", "artifact_hash": formalizer.EXPECTED_GPU_CAPABILITY_ARTIFACT_HASH, "config_hash": "9" * 64, "source_refs": ["source"], "allowed_gpu_uuids": uuids},
+        "gpu_capability": {"commit_ref": "commit", "object_ref": "object", "task_id": "stage0.01_baseline_and_safety", "artifact_kind": "capability_cuda", "artifact_hash": formalizer.EXPECTED_GPU_CAPABILITY_ARTIFACT_HASH, "config_hash": "9" * 64, "source_refs": ["source"], "allowed_gpu_uuids": uuids}, "nccl_transport_protocol": formalizer._nccl_transport_protocol(),
         "implementation_source_sha256": formalizer._implementation_source_map(Path(".")), "s1_7_handoff": handoff,
         "role_refs": {"fixture_manifest": "fixture-manifest.json", "ddp_report": "ddp-report.json", "array_bundle": "array-bundle.json", "comparison_table": "comparison-table.json", "gate_record": "g1-ddp-record.json"},
         "role_sha256": {key: "a" * 64 for key in ("fixture_manifest", "ddp_report", "array_bundle", "comparison_table", "gate_record")},
@@ -643,6 +688,9 @@ def test_index_schema_strictly_freezes_full_s17_handoff_historical_binding() -> 
     missing = copy.deepcopy(index); del missing["s1_7_handoff"]["historical_g3_current_consumer_source_sha256"]; missing["artifact_hash"] = formalizer._canonical({key: value for key, value in missing.items() if key != "artifact_hash"})
     with pytest.raises(formalizer.Stage1S18FormalError, match="S18_SCHEMA_VALIDATION_FAILED:index"):
         formalizer._validate_output_schemas(Path("."), {"index": missing})
+    transport = copy.deepcopy(index); transport["nccl_transport_protocol"]["process_group_timeout_seconds"] = 120; transport["artifact_hash"] = formalizer._canonical({key: value for key, value in transport.items() if key != "artifact_hash"})
+    with pytest.raises(formalizer.Stage1S18FormalError, match="S18_SCHEMA_VALIDATION_FAILED:index"):
+        formalizer._validate_output_schemas(Path("."), {"index": transport})
 
 
 def test_current_critical_sources_are_exactly_zero_drift_from_dcc925_attestation() -> None:

@@ -18,6 +18,7 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from contextlib import nullcontext
 from dataclasses import dataclass
+from datetime import timedelta
 import hashlib
 import math
 import os
@@ -47,6 +48,13 @@ MICROBATCH_COUNT = 8
 T32_DISTRIBUTED_ATOL = 1.0e-7
 T32_DISTRIBUTED_RTOL = 1.0e-4
 T32_DISTRIBUTED_L2_LIMIT = 1.0e-4
+NCCL_TRANSPORT_PROTOCOL = {
+    "schema_version": "stage1-s1-8-nccl-transport-v1",
+    "qualification_basis_gate_ids": ["stage0.G6", "stage0.G10"],
+    "current_cuda_capability_artifact_hash": "a536e191cd59318325289d238db727f8939767e384bfccd961ae7ca1c6a11ce4",
+    "nccl_p2p_disable": "1",
+    "process_group_timeout_seconds": 180,
+}
 
 
 class Stage1S18Error(RuntimeError):
@@ -518,7 +526,7 @@ def validate_worker_plan(value: Mapping[str, object], *, path: Path) -> dict[str
     plan = _mapping(value, field="worker_plan")
     expected = {
         "schema_version", "task_id", "execution_commit", "route", "fixture", "fixture_tokens_ref",
-        "fixture_tokens_sha256", "data_root", "model_root", "cache_root", "run_token", "visible_gpu_uuids",
+        "fixture_tokens_sha256", "data_root", "model_root", "cache_root", "run_token", "visible_gpu_uuids", "nccl_transport_protocol",
         "output_dir", "permutation", "execution_mode", "artifact_hash",
     }
     if set(plan) != expected or plan.get("schema_version") != WORKER_PLAN_SCHEMA or plan.get("task_id") != TASK_ID or not self_hash_matches(plan):
@@ -534,6 +542,8 @@ def validate_worker_plan(value: Mapping[str, object], *, path: Path) -> dict[str
         raise Stage1S18Error("S18_WORKER_RUN_TOKEN_INVALID")
     if plan.get("permutation") not in PERMUTATIONS or plan.get("execution_mode") not in EXECUTION_MODES:
         raise Stage1S18Error("S18_WORKER_EXECUTION_VARIANT_INVALID")
+    if plan.get("nccl_transport_protocol") != NCCL_TRANSPORT_PROTOCOL:
+        raise Stage1S18Error("S18_WORKER_NCCL_TRANSPORT_PROTOCOL_INVALID")
     uuids = plan.get("visible_gpu_uuids")
     if not isinstance(uuids, list) or len(uuids) != ROUTE_WORLD_SIZE[str(plan["route"])] or len(set(uuids)) != len(uuids) or any(not isinstance(item, str) or not item.startswith("GPU-") for item in uuids):
         raise Stage1S18Error("S18_WORKER_UUID_SET_INVALID")
@@ -568,6 +578,14 @@ def seed_rank_local_generators(*, seed: int, local_rank: int) -> dict[str, int]:
     torch.random.default_generator.manual_seed(seed)
     torch.cuda.manual_seed(seed)
     return {"cpu_default_seed": seed, "cuda_current_device_seed": seed, "local_rank": local_rank}
+
+
+def validate_nccl_transport_environment() -> dict[str, object]:
+    """Fail before CUDA/NCCL initialization unless the frozen transport is set."""
+
+    if os.environ.get("NCCL_P2P_DISABLE") != "1":
+        raise Stage1S18Error("S18_NCCL_P2P_ENVIRONMENT_INVALID")
+    return dict(NCCL_TRANSPORT_PROTOCOL)
 
 
 def _load_tokens(path: Path, fixture: Mapping[str, object]) -> dict[int, torch.Tensor]:
@@ -1158,6 +1176,7 @@ def execute_worker(plan_path: str | Path) -> dict[str, object]:
         raise Stage1S18Error("S18_TORCH_DISTRIBUTED_UNAVAILABLE") from error
     if os.environ.get("CUDA_VISIBLE_DEVICES") != ",".join(plan["visible_gpu_uuids"]):
         raise Stage1S18Error("S18_CUDA_VISIBLE_DEVICES_DRIFT")
+    validate_nccl_transport_environment()
     required_environment = ("RANK", "LOCAL_RANK", "WORLD_SIZE")
     if any(name not in os.environ for name in required_environment):
         raise Stage1S18Error("S18_TORCHRUN_ENVIRONMENT_MISSING")
@@ -1168,7 +1187,11 @@ def execute_worker(plan_path: str | Path) -> dict[str, object]:
         raise Stage1S18Error("S18_NCCL_REQUIRES_CUDA")
     torch.cuda.set_device(local_rank)
     device = torch.device("cuda", local_rank)
-    dist.init_process_group("nccl")
+    dist.init_process_group(
+        backend="nccl",
+        init_method="env://",
+        timeout=timedelta(seconds=int(NCCL_TRANSPORT_PROTOCOL["process_group_timeout_seconds"])),
+    )
     try:
         fixture = validate_fixture(_mapping(plan["fixture"], field="plan.fixture"))
         if execution_mode == "inject_rank_failure" and rank == 0:
@@ -1237,6 +1260,7 @@ def execute_worker(plan_path: str | Path) -> dict[str, object]:
             "execution_mode": execution_mode,
             "world_size": world_size,
             "backend": "nccl",
+            "nccl_transport_protocol": dict(NCCL_TRANSPORT_PROTOCOL),
             "visible_gpu_uuids": plan["visible_gpu_uuids"],
             "rank_to_gpu_uuid": list(plan["visible_gpu_uuids"]),
             "parameter_registry_hash": _parameter_registry_hash(ddp),
@@ -1258,8 +1282,8 @@ def execute_worker(plan_path: str | Path) -> dict[str, object]:
 __all__ = [
     "ARRAY_MANIFEST_SCHEMA", "CASES", "EXECUTION_MODES", "FIXTURE_SCHEMA", "MICROBATCH_COUNT", "PERMUTATIONS", "PRE_ROUTE_SCALE_ORACLE_SCHEMA", "ROUTES",
     "RouteLayout", "Stage1S18Error", "TASK_ID", "T32_DISTRIBUTED_ATOL", "T32_DISTRIBUTED_L2_LIMIT",
-    "T32_DISTRIBUTED_RTOL", "WORKER_PLAN_SCHEMA", "WORKER_REPORT_SCHEMA", "build_fixture",
-    "build_route_layout", "execute_worker", "learning_rate_map", "local_sufficient_statistics", "permute_route_layout", "scores_from_global_statistics", "weight_decay_map",
+    "T32_DISTRIBUTED_RTOL", "NCCL_TRANSPORT_PROTOCOL", "WORKER_PLAN_SCHEMA", "WORKER_REPORT_SCHEMA", "build_fixture",
+    "build_route_layout", "execute_worker", "learning_rate_map", "local_sufficient_statistics", "permute_route_layout", "scores_from_global_statistics", "validate_nccl_transport_environment", "weight_decay_map",
     "self_hash_matches", "tensor_map_digest", "validate_fixture", "validate_route_layout", "validate_worker_plan",
     "with_artifact_hash",
 ]
