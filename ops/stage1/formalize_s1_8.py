@@ -312,6 +312,10 @@ def _validate_worker_candidate_contract(route_key: str, report: Mapping[str, Any
     partitions = layout.get("rank_microbatch_ids")
     if layout.get("route") != route or layout.get("world_size") != ROUTE_WORLD[route] or not isinstance(partitions, list) or len(partitions) != ROUTE_WORLD[route] or sorted(item for part in partitions if isinstance(part, list) for item in part) != list(range(8)):
         raise Stage1S18FormalError("S18_CANDIDATE_WORKER_LAYOUT_INVALID:" + route_key)
+    ordinary_collectives = [row.get("ordinary_ddp_gradient_collectives") if isinstance(row, Mapping) else None for row in cases]
+    expected_ordinary_collectives = [1, 2] if route == "A" else [0, 0]
+    if any(type(value) is not int for value in ordinary_collectives) or ordinary_collectives != expected_ordinary_collectives:
+        raise Stage1S18FormalError("S18_CANDIDATE_WORKER_ORDINARY_DDP_COLLECTIVE_CONTRACT_INVALID:" + route_key)
     for ordinal, row_raw in enumerate(cases, start=1):
         row = _mapping(row_raw, field="candidate.worker.case")
         keys, accumulator = row.get("array_keys"), row.get("accumulator")
@@ -2069,7 +2073,7 @@ def execute(*, repository: Path, data_root: Path, s1_7_index_ref: str, gpu_capab
             "nccl_smoke": smoke["returncode"] == 0 and smoke["residual_launch_tree"] == {"session_members": [], "token_members": []} and _is_nonzero_loopback_endpoint(smoke.get("rendezvous_endpoint")) and smoke_report.get("status") == "PASS" and smoke_report.get("nccl_transport_protocol") == nccl_transport,
             "pre_route_scale_oracle": scale["case_pre_parameter_checksums"]["weighted"] == scale["case_post_parameter_checksums"]["equal"],
             "real_routes_equal_and_weighted": set(baseline_reports) == set(ROUTE_WORLD) and all(len(report["cases"]) == 2 for report in baseline_reports.values()),
-            "rank_partition_and_no_sync": all(all(row["ordinary_ddp_gradient_collectives"] == 0 for row in report["cases"]) for route, report in baseline_reports.items() if route != "A"),
+            "rank_partition_and_no_sync": [row["ordinary_ddp_gradient_collectives"] for row in baseline_reports["A"]["cases"]] == [1, 2] and all(all(row["ordinary_ddp_gradient_collectives"] == 0 for row in report["cases"]) for route, report in baseline_reports.items() if route != "A"),
             "manual_collective_contract": result.get("status") == "PASS",
             "independent_fp64_replay": replay_record.get("oracle_reference_dtype") == "torch.float64" and replay_record.get("production_candidate_dtype") == "torch.float32",
             "optimizer_and_accumulator": any("accumulator:cumulative:absolute" in key for key in result["checks"]),

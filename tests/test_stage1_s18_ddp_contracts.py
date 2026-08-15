@@ -41,7 +41,7 @@ def _formalizer() -> object:
 def _worker_report_a(formalizer: object) -> dict[str, object]:
     manifest = formalizer._with_hash({"schema_version": "stage1-s1-8-safetensors-manifest-v1", "file": "route-A.safetensors", "file_sha256": "a" * 64, "file_size_bytes": 4, "tensors": {"a-reference/equal/raw_core/p": {"sha256": "b" * 64, "dtype": "torch.float32", "shape": [1]}}})
     def case(name: str) -> dict[str, object]:
-        return {"case": name, "global_loss_numerator": 1.0, "global_loss_valid_token_count": 8, "global_mean_loss": 0.125, "global_microbatch_count": 8, "global_n1": 8, "global_n2": 8, "global_gradient_norm": 1.0, "clip_factor": 1.0, "rank_records": [{"rank": 0, "local_microbatch_ids": list(range(8)), "local_gradient_checksums": ["c" * 64] * 8, "global_statistic_checksums": {}, "local_loss_numerator": 1.0, "local_effective_tokens": 8}], "global_statistic_checksums": {}, "ordinary_ddp_gradient_collectives": 0, "manual_statistic_collectives": {"backend": "nccl", "operation": "SUM", "tensor_statistics": [], "tensor_all_reduce_count": 0, "scalar_statistics": [], "scalar_all_reduce_count": 0, "total_all_reduce_count": 0}, "post_parameter_checksum": "d" * 64, "pre_parameter_checksum": "e" * 64, "accumulator": None, "array_keys": [f"a-reference/{name}/raw_core/p"]}
+        return {"case": name, "global_loss_numerator": 1.0, "global_loss_valid_token_count": 8, "global_mean_loss": 0.125, "global_microbatch_count": 8, "global_n1": 8, "global_n2": 8, "global_gradient_norm": 1.0, "clip_factor": 1.0, "rank_records": [{"rank": 0, "local_microbatch_ids": list(range(8)), "local_gradient_checksums": ["c" * 64] * 8, "global_statistic_checksums": {}, "local_loss_numerator": 1.0, "local_effective_tokens": 8}], "global_statistic_checksums": {}, "ordinary_ddp_gradient_collectives": 1 if name == "equal" else 2, "manual_statistic_collectives": {"backend": "nccl", "operation": "SUM", "tensor_statistics": [], "tensor_all_reduce_count": 0, "scalar_statistics": [], "scalar_all_reduce_count": 0, "total_all_reduce_count": 0}, "post_parameter_checksum": "d" * 64, "pre_parameter_checksum": "e" * 64, "accumulator": None, "array_keys": [f"a-reference/{name}/raw_core/p"]}
     uuid = "GPU-00000000-1111-2222-3333-444444444444"
     return formalizer._with_hash({"schema_version": "stage1-s1-8-worker-report-v1", "status": "PASS", "task_id": "stage1.08_ddp_and_gradient_accumulation", "execution_commit": "f" * 40, "run_token": "0" * 64, "route": "A", "permutation": "identity", "execution_mode": "formal", "world_size": 1, "backend": "nccl", "nccl_transport_protocol": formalizer._nccl_transport_protocol(), "visible_gpu_uuids": [uuid], "rank_to_gpu_uuid": [uuid], "parameter_registry_hash": "1" * 64, "fixture_hash": "2" * 64, "route_layout": {"route": "A", "world_size": 1, "rank_microbatch_ids": [list(range(8))]}, "cases": [case("equal"), case("weighted")], "arrays": manifest})
 
@@ -235,6 +235,9 @@ def test_worker_and_array_schemas_validate_real_shape_then_reject_deep_unknown_a
     transport = copy.deepcopy(report); transport["nccl_transport_protocol"]["nccl_p2p_disable"] = "0"; transport["artifact_hash"] = formalizer._canonical({key: value for key, value in transport.items() if key != "artifact_hash"})
     with pytest.raises(formalizer.Stage1S18FormalError, match="S18_SCHEMA_VALIDATION_FAILED"):
         formalizer._validate_output_schemas(Path("."), {"worker_report": transport})
+    out_of_range = copy.deepcopy(report); out_of_range["cases"][1]["ordinary_ddp_gradient_collectives"] = 3; out_of_range["artifact_hash"] = formalizer._canonical({key: value for key, value in out_of_range.items() if key != "artifact_hash"})
+    with pytest.raises(formalizer.Stage1S18FormalError, match="S18_SCHEMA_VALIDATION_FAILED"):
+        formalizer._validate_output_schemas(Path("."), {"worker_report": out_of_range})
 
 
 def test_unknown_process_group_member_never_signals_and_persists_manual_marker(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -650,12 +653,18 @@ def test_route_specific_candidate_contract_forbids_a_u_and_requires_bcd_accumula
     formalizer = _formalizer()
     uuid = "GPU-00000000-1111-2222-3333-444444444444"
     a_fields = ("mean_gradient", "raw_core", "raw_score", "raw_score_clipped", "data_update", "magnitude")
-    report_a = {"route": "A", "world_size": 1, "nccl_transport_protocol": formalizer._nccl_transport_protocol(), "visible_gpu_uuids": [uuid], "rank_to_gpu_uuid": [uuid], "route_layout": {"route": "A", "world_size": 1, "rank_microbatch_ids": [list(range(8))]}, "cases": [{"case": case, "array_keys": [f"a-reference/{case}/{field}/p" for field in a_fields], "accumulator": None, "rank_records": [{"rank": 0}]} for case in ("equal", "weighted")]}
+    report_a = {"route": "A", "world_size": 1, "nccl_transport_protocol": formalizer._nccl_transport_protocol(), "visible_gpu_uuids": [uuid], "rank_to_gpu_uuid": [uuid], "route_layout": {"route": "A", "world_size": 1, "rank_microbatch_ids": [list(range(8))]}, "cases": [{"case": case, "ordinary_ddp_gradient_collectives": 1 if case == "equal" else 2, "array_keys": [f"a-reference/{case}/{field}/p" for field in a_fields], "accumulator": None, "rank_records": [{"rank": 0}]} for case in ("equal", "weighted")]}
     formalizer._validate_worker_candidate_contract("A", report_a)
+    for counts in ([0, 1], [1, 1], [1, 3]):
+        drifted_collectives = copy.deepcopy(report_a)
+        for row, value in zip(drifted_collectives["cases"], counts, strict=True):
+            row["ordinary_ddp_gradient_collectives"] = value
+        with pytest.raises(formalizer.Stage1S18FormalError, match="S18_CANDIDATE_WORKER_ORDINARY_DDP_COLLECTIVE_CONTRACT_INVALID"):
+            formalizer._validate_worker_candidate_contract("A", drifted_collectives)
     bad_a = copy.deepcopy(report_a); bad_a["cases"][0]["array_keys"].append("scores/equal/u_core/p")
     with pytest.raises(formalizer.Stage1S18FormalError, match="S18_CANDIDATE_A_U_OR_ACCUMULATOR_FORBIDDEN"):
         formalizer._validate_worker_candidate_contract("A", bad_a)
-    report_b = {**copy.deepcopy(report_a), "route": "B", "route_layout": {"route": "B", "world_size": 1, "rank_microbatch_ids": [list(range(8))]}, "cases": [{"case": "equal", "array_keys": ["scores/equal/u_core/p", "accumulator/equal/cumulative/signed/p"], "accumulator": None, "rank_records": [{"rank": 0}]}, {"case": "weighted", "array_keys": ["scores/weighted/u_core/p", "accumulator/weighted/cumulative/signed/p"], "accumulator": None, "rank_records": [{"rank": 0}]}]}
+    report_b = {**copy.deepcopy(report_a), "route": "B", "route_layout": {"route": "B", "world_size": 1, "rank_microbatch_ids": [list(range(8))]}, "cases": [{"case": "equal", "ordinary_ddp_gradient_collectives": 0, "array_keys": ["scores/equal/u_core/p", "accumulator/equal/cumulative/signed/p"], "accumulator": None, "rank_records": [{"rank": 0}]}, {"case": "weighted", "ordinary_ddp_gradient_collectives": 0, "array_keys": ["scores/weighted/u_core/p", "accumulator/weighted/cumulative/signed/p"], "accumulator": None, "rank_records": [{"rank": 0}]}]}
     with pytest.raises(formalizer.Stage1S18FormalError, match="S18_FORMAL_OBJECT_INVALID"):
         formalizer._validate_worker_candidate_contract("B", report_b)
     report_b["cases"] = [report_b["cases"][0]]
@@ -670,12 +679,33 @@ def test_bcd_shaped_candidate_positive_has_u_stats_and_two_step_accumulator() ->
     cumulative = {name: "b" * 64 for name in ("signed", "positive", "negative_mass", "absolute", "raw", "raw_clipped", "data_movement", "net_data_movement", "total_movement", "total_endpoint_movement", "weight_decay_movement", "net_weight_decay_movement", "actual_update_raw_importance", "magnitude")}
     for ordinal, row in enumerate(report["cases"], start=1):
         case = row["case"]; stats = ("s1", "s2") if case == "equal" else ("g1", "g2")
+        row["ordinary_ddp_gradient_collectives"] = 0
         row["global_statistic_checksums"] = {name: "c" * 64 for name in stats}
         row["array_keys"] = [*(f"stats/{case}/{name}/p" for name in stats), *(f"scores/{case}/{name}/p" for name in ("mean_gradient", "raw_core", "u_core", "raw_score", "u_score", "u_score_clipped")), f"accumulator/{case}/cumulative/signed/p"]
         row["accumulator"] = {"successful_steps": ordinal, "skipped_steps": 0, "signed_identity": True, "absolute_identity": True, "contribution_checksums": contribution, "cumulative_checksums": cumulative}
     report.pop("artifact_hash"); report = formalizer._with_hash(report)
     formalizer._validate_output_schemas(Path("."), {"worker_report": report, "safetensors_manifest": report["arrays"]})
     formalizer._validate_worker_candidate_contract("B", report)
+
+
+def test_bcd_candidate_contract_rejects_any_ordinary_ddp_collective() -> None:
+    formalizer = _formalizer()
+    for route in ("B", "C", "D"):
+        world_size = formalizer.ROUTE_WORLD[route]
+        uuids = [f"GPU-{index:08x}-1111-2222-3333-444444444444" for index in range(world_size)]
+        layout = ddp.build_route_layout(route).to_dict()
+        report = {
+            "route": route, "world_size": world_size,
+            "nccl_transport_protocol": formalizer._nccl_transport_protocol(),
+            "visible_gpu_uuids": uuids, "rank_to_gpu_uuid": uuids,
+            "route_layout": layout,
+            "cases": [
+                {"case": "equal", "ordinary_ddp_gradient_collectives": 1, "array_keys": [], "accumulator": None, "rank_records": [{"rank": index} for index in range(world_size)]},
+                {"case": "weighted", "ordinary_ddp_gradient_collectives": 0, "array_keys": [], "accumulator": None, "rank_records": [{"rank": index} for index in range(world_size)]},
+            ],
+        }
+        with pytest.raises(formalizer.Stage1S18FormalError, match="S18_CANDIDATE_WORKER_ORDINARY_DDP_COLLECTIVE_CONTRACT_INVALID"):
+            formalizer._validate_worker_candidate_contract(route, report)
 
 
 def test_gpu_uuid_runtime_contract_is_canonical_lowercase_and_exact(monkeypatch: pytest.MonkeyPatch) -> None:
