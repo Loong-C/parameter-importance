@@ -23,9 +23,34 @@ from .contracts.jsonio import canonical_json_hash, load_canonical_json, write_ca
 
 
 TASK_ID = "stage1.08_ddp_and_gradient_accumulation"
-PLAN_SCHEMA = "stage1-s1-8-pre-route-scale-plan-v1"
-REPORT_SCHEMA = "stage1-s1-8-pre-route-gradient-scale-oracle-v1"
+PLAN_SCHEMA = "stage1-s1-8-pre-route-scale-plan-v2"
+REPORT_SCHEMA = "stage1-s1-8-pre-route-gradient-scale-oracle-v2"
 MICROBATCH_COUNT = 8
+OPTIMIZER_CONDITIONING = {
+    "schema_version": "stage1-s1-8-optimizer-conditioning-v2",
+    "precision_profile": "T32_DISTRIBUTED",
+    "optimizer_type": "AdamW",
+    "learning_rate": 0.0003,
+    "weight_decay": 0.01,
+    "betas": [0.9, 0.999],
+    "eps": 1.0e-4,
+    "foreach": False,
+    "fused": False,
+    "execution_order": "single_tensor_decoupled_decay_then_adamw_addcdiv_fp32",
+    "selection_method": "r16_route_specific_mean_epsilon_sensitivity",
+    "diagnostic_attempt_id": "formal-20260815-s18-v1-r16",
+    "failed_attempt_artifact_hash": "81674ea39a2b67fcfa4a0294e5d59f75882908cb3f52384a8ae5c85bc7960789",
+    "failed_attempt_phase": "rank_gradient_checksum_cardinality",
+    "r16_optimizer_epsilon": 1.0e-8,
+    "sensitivity_method": "read_only_persisted_route_mean_simulation",
+    "sensitivity_t32_peer_violation_counts": {
+        "1e-8": {"equal": 8, "weighted": 9},
+        "1e-6": {"equal": 6, "weighted": 6},
+        "1e-5": {"equal": 2, "weighted": 0},
+        "1e-4": {"equal": 0, "weighted": 0},
+    },
+    "selected_epsilon_first_t32_zero_violation": 1.0e-4,
+}
 
 
 class Stage1S18ScaleOracleError(RuntimeError):
@@ -36,6 +61,20 @@ def _mapping(value: object, *, field: str) -> dict[str, Any]:
     if not isinstance(value, Mapping):
         raise Stage1S18ScaleOracleError(f"S18_SCALE_{field.upper()}_OBJECT_REQUIRED")
     return dict(value)
+
+
+def _exact_contract_value(value: object, expected: object) -> bool:
+    """Reject jointly rehashed bool/int and nested configuration drift."""
+
+    if isinstance(expected, Mapping):
+        return isinstance(value, Mapping) and set(value) == set(expected) and all(
+            _exact_contract_value(value[key], expected[key]) for key in expected
+        )
+    if isinstance(expected, list):
+        return isinstance(value, list) and len(value) == len(expected) and all(
+            _exact_contract_value(item, reference) for item, reference in zip(value, expected, strict=True)
+        )
+    return type(value) is type(expected) and value == expected
 
 
 def _hash(value: object, *, field: str) -> str:
@@ -56,12 +95,14 @@ def validate_plan(value: Mapping[str, object], *, path: Path) -> dict[str, Any]:
     plan = _mapping(value, field="plan")
     expected = {
         "schema_version", "task_id", "execution_commit", "fixture_tokens_ref", "fixture_tokens_sha256",
-        "selected_token_sha256", "upstream_token_sha256", "cases", "model_root", "output_file", "run_token", "visible_gpu_uuids", "artifact_hash",
+        "selected_token_sha256", "upstream_token_sha256", "cases", "optimizer_conditioning", "model_root", "output_file", "run_token", "visible_gpu_uuids", "artifact_hash",
     }
     declared = plan.pop("artifact_hash", None)
     if set(plan) != expected - {"artifact_hash"} or plan.get("schema_version") != PLAN_SCHEMA or plan.get("task_id") != TASK_ID or declared != canonical_json_hash(plan):
         raise Stage1S18ScaleOracleError("S18_SCALE_PLAN_SCHEMA_INVALID")
     plan["artifact_hash"] = declared
+    if not _exact_contract_value(_mapping(plan.get("optimizer_conditioning"), field="plan.optimizer_conditioning"), OPTIMIZER_CONDITIONING):
+        raise Stage1S18ScaleOracleError("S18_SCALE_PLAN_OPTIMIZER_CONDITIONING_INVALID")
     if not isinstance(plan.get("execution_commit"), str) or len(str(plan["execution_commit"])) != 40:
         raise Stage1S18ScaleOracleError("S18_SCALE_PLAN_COMMIT_INVALID")
     _hash(plan.get("fixture_tokens_sha256"), field="fixture_tokens")
@@ -182,9 +223,14 @@ def execute_scale_oracle(plan_path: str | Path) -> dict[str, object]:
         "shapes": {name: list(parameter.shape) for name, parameter in parameters},
         "dtypes": {name: str(parameter.dtype) for name, parameter in parameters},
     })
+    optimizer_conditioning = _mapping(plan["optimizer_conditioning"], field="plan.optimizer_conditioning")
+    learning_rate = float(optimizer_conditioning["learning_rate"])
+    weight_decay = float(optimizer_conditioning["weight_decay"])
+    betas = tuple(float(value) for value in optimizer_conditioning["betas"])
     optimizer = torch.optim.AdamW(
-        [parameter for _, parameter in parameters], lr=0.0003, weight_decay=0.01,
-        betas=(0.9, 0.999), eps=1e-8, foreach=False, fused=False,
+        [parameter for _, parameter in parameters], lr=learning_rate, weight_decay=weight_decay,
+        betas=betas, eps=float(optimizer_conditioning["eps"]),
+        foreach=bool(optimizer_conditioning["foreach"]), fused=bool(optimizer_conditioning["fused"]),
     )
     records: list[dict[str, object]] = []
     maximum, maximum_case, maximum_microbatch, maximum_parameter = 0.0, "", -1, ""
@@ -231,7 +277,7 @@ def execute_scale_oracle(plan_path: str | Path) -> dict[str, object]:
         for name, parameter in parameters:
             # AdamW's decoupled decay is exactly -eta*lambda*theta_pre; remove
             # it to freeze the data-update design scale independently of U.
-            data_update = (parameter.detach() - pre_parameters[name]) + 0.0003 * 0.01 * pre_parameters[name]
+            data_update = (parameter.detach() - pre_parameters[name]) + learning_rate * weight_decay * pre_parameters[name]
             value = float(data_update.abs().max().item())
             if value > maximum_data_update:
                 maximum_data_update, maximum_data_case, maximum_data_parameter = value, case, name
@@ -244,7 +290,7 @@ def execute_scale_oracle(plan_path: str | Path) -> dict[str, object]:
         "schema_version": REPORT_SCHEMA, "status": "PASS", "task_id": TASK_ID,
         "execution_commit": plan["execution_commit"], "run_token": plan["run_token"],
         "fixture_tokens_sha256": plan["fixture_tokens_sha256"], "selected_token_sha256": plan["selected_token_sha256"], "upstream_token_sha256": plan["upstream_token_sha256"],
-        "visible_gpu_uuid": plan["visible_gpu_uuids"][0], "method": "independent_pre_route_single_gpu_autograd_oracle",
+        "visible_gpu_uuid": plan["visible_gpu_uuids"][0], "method": "independent_pre_route_single_gpu_autograd_oracle", "optimizer_conditioning": plan["optimizer_conditioning"],
         "unit_count": len(records), "unit_records": records, "maximum_unit_gradient_abs": maximum,
         "maximum_case": maximum_case, "maximum_microbatch_id": maximum_microbatch, "maximum_parameter": maximum_parameter,
         "maximum_abs_data_update": maximum_data_update, "maximum_data_update_case": maximum_data_case,
@@ -259,4 +305,4 @@ def execute_scale_oracle(plan_path: str | Path) -> dict[str, object]:
     return result
 
 
-__all__ = ["PLAN_SCHEMA", "REPORT_SCHEMA", "Stage1S18ScaleOracleError", "TASK_ID", "execute_scale_oracle", "validate_plan"]
+__all__ = ["OPTIMIZER_CONDITIONING", "PLAN_SCHEMA", "REPORT_SCHEMA", "Stage1S18ScaleOracleError", "TASK_ID", "execute_scale_oracle", "validate_plan"]

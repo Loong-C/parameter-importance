@@ -140,7 +140,7 @@ IMPLEMENTATION_SOURCE_FILES = (
     "src/param_importance_nlp/core/accumulator.py", "src/param_importance_nlp/core/errors.py", "src/param_importance_nlp/core/tensors.py",
     "src/param_importance_nlp/g3_runtime_assets.py", "src/param_importance_nlp/runtime/operations.py", "src/param_importance_nlp/runtime/task_artifacts.py",
     "configs/stage0/g3-asset-requirements-v1.json", "configs/stage0/g3-asset-layout-v1.json",
-    "schemas/stage1/s1-8-array-bundle-v1.json", "schemas/stage1/s1-8-comparison-table-v1.json", "schemas/stage1/s1-8-ddp-report-v1.json", "schemas/stage1/s1-8-fixture-manifest-v1.json", "schemas/stage1/s1-8-formalization-index-v1.json", "schemas/stage1/s1-8-gate-record-v1.json", "schemas/stage1/s1-8-replay-validation-v1.json", "schemas/stage1/s1-8-safetensors-manifest-v1.json", "schemas/stage1/s1-8-validation-v1.json", "schemas/stage1/s1-8-worker-report-v1.json",
+    "schemas/stage1/s1-8-array-bundle-v1.json", "schemas/stage1/s1-8-comparison-table-v1.json", "schemas/stage1/s1-8-ddp-report-v1.json", "schemas/stage1/s1-8-fixture-manifest-v1.json", "schemas/stage1/s1-8-fixture-manifest-v2.json", "schemas/stage1/s1-8-formalization-index-v1.json", "schemas/stage1/s1-8-gate-record-v1.json", "schemas/stage1/s1-8-replay-validation-v1.json", "schemas/stage1/s1-8-safetensors-manifest-v1.json", "schemas/stage1/s1-8-validation-v1.json", "schemas/stage1/s1-8-worker-report-v1.json",
 )
 
 
@@ -188,6 +188,27 @@ def _mapping(value: object, *, field: str) -> dict[str, Any]:
     return dict(value)
 
 
+def _exact_contract_value(value: object, expected: object) -> bool:
+    """Compare frozen JSON values without accepting ``False == 0``."""
+
+    if isinstance(expected, Mapping):
+        return isinstance(value, Mapping) and set(value) == set(expected) and all(
+            _exact_contract_value(value[key], expected[key]) for key in expected
+        )
+    if isinstance(expected, list):
+        return isinstance(value, list) and len(value) == len(expected) and all(
+            _exact_contract_value(item, reference) for item, reference in zip(value, expected, strict=True)
+        )
+    return type(value) is type(expected) and value == expected
+
+
+def _require_pre_route_scale_conditioning(report: Mapping[str, Any], expected: Mapping[str, Any]) -> None:
+    """Bind the scale report's actual AdamW configuration before fixture use."""
+
+    if not _exact_contract_value(report.get("optimizer_conditioning"), expected):
+        raise Stage1S18FormalError("S18_PRE_ROUTE_SCALE_OPTIMIZER_CONDITIONING_INVALID")
+
+
 def _canonical(value: object) -> str:
     from param_importance_nlp.contracts.jsonio import canonical_json_hash
     return canonical_json_hash(value)
@@ -229,7 +250,7 @@ def _validate_output_schemas(repository: Path, objects: Mapping[str, Mapping[str
             raise Stage1S18FormalError("S18_SCHEMA_REGISTRY_INVALID:" + path.name)
         registry[path.name] = value; registry[str(value["$id"])] = value
     filenames = {
-        "fixture_manifest": "s1-8-fixture-manifest-v1.json", "ddp_report": "s1-8-ddp-report-v1.json",
+        "fixture_manifest": "s1-8-fixture-manifest-v2.json", "ddp_report": "s1-8-ddp-report-v1.json",
         "array_bundle": "s1-8-array-bundle-v1.json", "comparison_table": "s1-8-comparison-table-v1.json",
         "gate_record": "s1-8-gate-record-v1.json", "replay": "s1-8-replay-validation-v1.json",
         "validation": "s1-8-validation-v1.json", "index": "s1-8-formalization-index-v1.json",
@@ -251,7 +272,7 @@ def _schema_prepublication_check(repository: Path, objects: Mapping[str, Mapping
     from param_importance_nlp.contracts.jsonio import loads_strict_json
     expected = {
         "s1-8-array-bundle-v1.json", "s1-8-comparison-table-v1.json", "s1-8-ddp-report-v1.json",
-        "s1-8-fixture-manifest-v1.json", "s1-8-formalization-index-v1.json", "s1-8-gate-record-v1.json",
+        "s1-8-fixture-manifest-v1.json", "s1-8-fixture-manifest-v2.json", "s1-8-formalization-index-v1.json", "s1-8-gate-record-v1.json",
         "s1-8-replay-validation-v1.json", "s1-8-safetensors-manifest-v1.json", "s1-8-validation-v1.json", "s1-8-worker-report-v1.json",
     }
     paths = {path.name: path for path in (repository / "schemas" / "stage1").glob("s1-8-*.json")}
@@ -347,7 +368,7 @@ def _validate_worker_candidate_contract(route_key: str, report: Mapping[str, Any
                 raise Stage1S18FormalError("S18_CANDIDATE_WORKER_LOCAL_GRADIENT_CHECKSUM_INVALID:" + route_key)
         has_u, has_accumulator = any("/u_" in key for key in keys), any(key.startswith("accumulator/") for key in keys)
         if route == "A":
-            if accumulator is not None or has_u or has_accumulator or any(key.startswith(("scores/", "stats/")) for key in keys) or not all(any(key.startswith(f"a-reference/{row['case']}/{field}/") for key in keys) for field in ("mean_gradient", "raw_core", "raw_score", "raw_score_clipped", "data_update", "magnitude")):
+            if accumulator is not None or has_u or has_accumulator or any(key.startswith(("scores/", "stats/")) for key in keys) or not all(any(key.startswith(f"a-reference/{row['case']}/{field}/") for key in keys) for field in ("mean_gradient", "raw_core", "raw_score", "raw_score_clipped", "data_update", "data_movement", "total_update", "total_movement", "weight_decay_update", "weight_decay_movement", "actual_update_raw_importance", "magnitude")):
                 raise Stage1S18FormalError("S18_CANDIDATE_A_U_OR_ACCUMULATOR_FORBIDDEN")
             continue
         summary = _mapping(accumulator, field="candidate.worker.accumulator")
@@ -2135,9 +2156,9 @@ def _run_route(*, repository: Path, work: Path, plan: Mapping[str, Any], timeout
 
 def _scale_oracle(*, repository: Path, work: Path, handoff: Mapping[str, Any], model_root: str, cache_root: str, uuid: str, execution_commit: str, run_token: str, timeout_seconds: int, lease: object) -> Mapping[str, Any]:
     from param_importance_nlp.contracts.jsonio import load_canonical_json, write_canonical_json
-    from param_importance_nlp.stage1_ddp_scale_oracle import PLAN_SCHEMA
+    from param_importance_nlp.stage1_ddp_scale_oracle import OPTIMIZER_CONDITIONING, PLAN_SCHEMA, REPORT_SCHEMA
     selected = {str(index): handoff["token_sha256"][str(index)] for index in range(8)}
-    plan = {"schema_version": PLAN_SCHEMA, "task_id": TASK_ID, "execution_commit": execution_commit, "fixture_tokens_ref": "fixture-inputs.safetensors", "fixture_tokens_sha256": handoff["token_file_sha256"], "selected_token_sha256": selected, "upstream_token_sha256": handoff["token_sha256"], "cases": {"equal": {"label_ignore_suffixes": [0] * 8}, "weighted": {"label_ignore_suffixes": [0, 16, 32, 48, 64, 80, 96, 112]}}, "model_root": model_root, "output_file": "pre-route-scale.json", "run_token": run_token, "visible_gpu_uuids": [uuid]}
+    plan = {"schema_version": PLAN_SCHEMA, "task_id": TASK_ID, "execution_commit": execution_commit, "fixture_tokens_ref": "fixture-inputs.safetensors", "fixture_tokens_sha256": handoff["token_file_sha256"], "selected_token_sha256": selected, "upstream_token_sha256": handoff["token_sha256"], "cases": {"equal": {"label_ignore_suffixes": [0] * 8}, "weighted": {"label_ignore_suffixes": [0, 16, 32, 48, 64, 80, 96, 112]}}, "optimizer_conditioning": OPTIMIZER_CONDITIONING, "model_root": model_root, "output_file": "pre-route-scale.json", "run_token": run_token, "visible_gpu_uuids": [uuid]}
     body = dict(plan); body["artifact_hash"] = _canonical(body)
     plan_path = work / "pre-route-scale-plan.json"; write_canonical_json(plan_path, body)
     env = dict(os.environ); offline, _ = _offline_environment(cache_root); env.update(offline); env.update({"CUDA_VISIBLE_DEVICES": uuid, "CUBLAS_WORKSPACE_CONFIG": ":4096:8"})
@@ -2145,9 +2166,10 @@ def _scale_oracle(*, repository: Path, work: Path, handoff: Mapping[str, Any], m
     if scale_process.get("rendezvous_endpoint") is not None:
         raise Stage1S18FormalError("S18_SCALE_NON_DISTRIBUTED_RENDEZVOUS_INVALID")
     report = _mapping(load_canonical_json(work / "pre-route-scale.json"), field="pre_route_scale")
-    needed = {"schema_version", "status", "task_id", "execution_commit", "run_token", "fixture_tokens_sha256", "selected_token_sha256", "upstream_token_sha256", "visible_gpu_uuid", "method", "unit_count", "unit_records", "maximum_unit_gradient_abs", "maximum_case", "maximum_microbatch_id", "maximum_parameter", "maximum_abs_data_update", "maximum_data_update_case", "maximum_data_update_parameter", "parameter_registry_hash", "case_pre_parameter_checksums", "case_post_parameter_checksums", "artifact_hash"}
-    if set(report) != needed or not _self_hash(report) or report.get("status") != "PASS" or report.get("visible_gpu_uuid") != uuid or report.get("unit_count") != 16 or report.get("method") != "independent_pre_route_single_gpu_autograd_oracle" or not isinstance(report.get("maximum_unit_gradient_abs"), (int, float)) or float(report["maximum_unit_gradient_abs"]) <= 0 or not isinstance(report.get("maximum_abs_data_update"), (int, float)) or float(report["maximum_abs_data_update"]) <= 0:
+    needed = {"schema_version", "status", "task_id", "execution_commit", "run_token", "fixture_tokens_sha256", "selected_token_sha256", "upstream_token_sha256", "visible_gpu_uuid", "method", "optimizer_conditioning", "unit_count", "unit_records", "maximum_unit_gradient_abs", "maximum_case", "maximum_microbatch_id", "maximum_parameter", "maximum_abs_data_update", "maximum_data_update_case", "maximum_data_update_parameter", "parameter_registry_hash", "case_pre_parameter_checksums", "case_post_parameter_checksums", "artifact_hash"}
+    if set(report) != needed or not _self_hash(report) or report.get("schema_version") != REPORT_SCHEMA or report.get("status") != "PASS" or report.get("visible_gpu_uuid") != uuid or report.get("unit_count") != 16 or report.get("method") != "independent_pre_route_single_gpu_autograd_oracle" or not isinstance(report.get("maximum_unit_gradient_abs"), (int, float)) or float(report["maximum_unit_gradient_abs"]) <= 0 or not isinstance(report.get("maximum_abs_data_update"), (int, float)) or float(report["maximum_abs_data_update"]) <= 0:
         raise Stage1S18FormalError("S18_PRE_ROUTE_SCALE_REPORT_INVALID")
+    _require_pre_route_scale_conditioning(report, OPTIMIZER_CONDITIONING)
     pre_checks, post_checks = report.get("case_pre_parameter_checksums"), report.get("case_post_parameter_checksums")
     if not isinstance(pre_checks, Mapping) or not isinstance(post_checks, Mapping) or set(pre_checks) != {"equal", "weighted"} or set(post_checks) != {"equal", "weighted"} or pre_checks.get("weighted") != post_checks.get("equal") or not isinstance(report.get("parameter_registry_hash"), str) or len(str(report["parameter_registry_hash"])) != 64:
         raise Stage1S18FormalError("S18_PRE_ROUTE_SCALE_STATE_SEQUENCE_INVALID")
@@ -2346,7 +2368,14 @@ def execute(*, repository: Path, data_root: Path, s1_7_index_ref: str, gpu_capab
             "consumer_diff": isinstance(_audit_consumer_diff(repository), tuple),
             "approved_four_uuid_topology": capability["artifact_hash"] == EXPECTED_GPU_CAPABILITY_ARTIFACT_HASH and set(approved_gpu_uuids).issubset(set(capability["allowed_gpu_uuids"])) and preflight["requested_uuid_order"] == list(approved_gpu_uuids) == post_gpu["requested_uuid_order"],
             "nccl_smoke": smoke["returncode"] == 0 and smoke["residual_launch_tree"] == {"session_members": [], "token_members": []} and _is_nonzero_loopback_endpoint(smoke.get("rendezvous_endpoint")) and smoke_report.get("status") == "PASS" and smoke_report.get("nccl_transport_protocol") == nccl_transport,
-            "pre_route_scale_oracle": scale["case_pre_parameter_checksums"]["weighted"] == scale["case_post_parameter_checksums"]["equal"],
+            "pre_route_scale_oracle": (
+                scale["case_pre_parameter_checksums"]["weighted"] == scale["case_post_parameter_checksums"]["equal"]
+                and _exact_contract_value(scale.get("optimizer_conditioning"), fixture.get("optimizer_conditioning"))
+                and _exact_contract_value(
+                    {key: fixture.get("optimizer", {}).get(key) for key in ("learning_rate", "weight_decay", "betas", "eps", "foreach", "fused")},
+                    {key: fixture.get("optimizer_conditioning", {}).get(key) for key in ("learning_rate", "weight_decay", "betas", "eps", "foreach", "fused")},
+                )
+            ),
             "real_routes_equal_and_weighted": set(baseline_reports) == set(ROUTE_WORLD) and all(len(report["cases"]) == 2 for report in baseline_reports.values()),
             "rank_partition_and_no_sync": [row["ordinary_ddp_gradient_collectives"] for row in baseline_reports["A"]["cases"]] == [1, 2] and all(all(row["ordinary_ddp_gradient_collectives"] == 0 for row in report["cases"]) for route, report in baseline_reports.items() if route != "A"),
             "manual_collective_contract": result.get("status") == "PASS",

@@ -37,8 +37,9 @@ TASK_ID = "stage1.08_ddp_and_gradient_accumulation"
 WORKER_PLAN_SCHEMA = "stage1-s1-8-worker-plan-v1"
 WORKER_REPORT_SCHEMA = "stage1-s1-8-worker-report-v1"
 ARRAY_MANIFEST_SCHEMA = "stage1-s1-8-safetensors-manifest-v1"
-FIXTURE_SCHEMA = "stage1-s1-8-fixture-manifest-v1"
-PRE_ROUTE_SCALE_ORACLE_SCHEMA = "stage1-s1-8-pre-route-gradient-scale-oracle-v1"
+FIXTURE_SCHEMA = "stage1-s1-8-fixture-manifest-v2"
+PRE_ROUTE_SCALE_ORACLE_SCHEMA = "stage1-s1-8-pre-route-gradient-scale-oracle-v2"
+OPTIMIZER_CONDITIONING_SCHEMA = "stage1-s1-8-optimizer-conditioning-v2"
 ROUTES: tuple[str, ...] = ("A", "B", "C", "D")
 CASES: tuple[str, ...] = ("equal", "weighted")
 ROUTE_WORLD_SIZE = {"A": 1, "B": 1, "C": 2, "D": 4}
@@ -54,6 +55,68 @@ NCCL_TRANSPORT_PROTOCOL = {
     "current_cuda_capability_artifact_hash": "a536e191cd59318325289d238db727f8939767e384bfccd961ae7ca1c6a11ce4",
     "nccl_p2p_disable": "1",
     "process_group_timeout_seconds": 180,
+}
+OPTIMIZER_CONDITIONING = {
+    "schema_version": OPTIMIZER_CONDITIONING_SCHEMA,
+    "precision_profile": "T32_DISTRIBUTED",
+    "optimizer_type": "AdamW",
+    "learning_rate": 0.0003,
+    "weight_decay": 0.01,
+    "betas": [0.9, 0.999],
+    "eps": 1.0e-4,
+    "foreach": False,
+    "fused": False,
+    "execution_order": "single_tensor_decoupled_decay_then_adamw_addcdiv_fp32",
+    "selection_method": "r16_route_specific_mean_epsilon_sensitivity",
+    # r16 itself failed on the now-fixed checksum-cardinality contract.  Its
+    # persisted route means were subsequently read-only replayed below; this
+    # field therefore identifies the diagnostic source without mislabelling
+    # the original failure as a numerical one.
+    "diagnostic_attempt_id": "formal-20260815-s18-v1-r16",
+    "failed_attempt_artifact_hash": "81674ea39a2b67fcfa4a0294e5d59f75882908cb3f52384a8ae5c85bc7960789",
+    "failed_attempt_phase": "rank_gradient_checksum_cardinality",
+    "r16_optimizer_epsilon": 1.0e-8,
+    "sensitivity_method": "read_only_persisted_route_mean_simulation",
+    "sensitivity_t32_peer_violation_counts": {
+        "1e-8": {"equal": 8, "weighted": 9},
+        "1e-6": {"equal": 6, "weighted": 6},
+        "1e-5": {"equal": 2, "weighted": 0},
+        "1e-4": {"equal": 0, "weighted": 0},
+    },
+    "selected_epsilon_first_t32_zero_violation": 1.0e-4,
+}
+FIXTURE_ID = "stage1-s1-8-pythia14m-ddp-conditioned-v2"
+FIXTURE_PRECISION = {
+    "compute": "float32", "statistics": "float32", "replay": "float64",
+    "profile": "T32_DISTRIBUTED", "atol": T32_DISTRIBUTED_ATOL,
+    "rtol": T32_DISTRIBUTED_RTOL, "normalized_l2_limit": T32_DISTRIBUTED_L2_LIMIT,
+}
+FIXTURE_RANDOMNESS = {
+    # Both fields are actually consumed: ``_load_model`` rejects nonzero
+    # configured dropout and ``execute_worker`` seeds the rank-local CPU/CUDA
+    # generators from ``model_seed``.  Do not publish unused RNG metadata as
+    # if it were an observed runtime control.
+    "dropout": "disabled", "model_seed": 1707,
+}
+FIXTURE_OPTIMIZER = {
+    "type": "AdamW", "learning_rate": 0.0003, "weight_decay": 0.01,
+    "betas": [0.9, 0.999], "eps": 1.0e-4, "foreach": False, "fused": False,
+}
+FIXTURE_DDP = {
+    "backend": "nccl", "ordinary_gradient_collectives_during_local_backward": 0,
+    "manual_statistic_collectives": "sum_all_reduce",
+}
+FIXTURE_CASES = {
+    "equal": {
+        "label_ignore_suffixes": [0, 0, 0, 0, 0, 0, 0, 0],
+        "effective_target_tokens": [2048, 2048, 2048, 2048, 2048, 2048, 2048, 2048],
+        "statistics": "equal_s1_s2",
+    },
+    "weighted": {
+        "label_ignore_suffixes": [0, 16, 32, 48, 64, 80, 96, 112],
+        "effective_target_tokens": [2048, 2032, 2016, 2000, 1984, 1968, 1952, 1936],
+        "statistics": "weighted_g1_g2_n1_n2",
+    },
 }
 
 
@@ -115,6 +178,20 @@ def _mapping(value: object, *, field: str) -> dict[str, Any]:
     if not isinstance(value, Mapping):
         raise Stage1S18Error(f"S18_{field.upper()}_OBJECT_REQUIRED")
     return dict(value)
+
+
+def _exact_contract_value(value: object, expected: object) -> bool:
+    """Compare frozen JSON contracts without Python's ``False == 0`` escape."""
+
+    if isinstance(expected, Mapping):
+        if not isinstance(value, Mapping) or set(value) != set(expected):
+            return False
+        return all(_exact_contract_value(value[key], expected[key]) for key in expected)
+    if isinstance(expected, list):
+        return isinstance(value, list) and len(value) == len(expected) and all(
+            _exact_contract_value(item, reference) for item, reference in zip(value, expected, strict=True)
+        )
+    return type(value) is type(expected) and value == expected
 
 
 def with_artifact_hash(value: Mapping[str, object]) -> dict[str, object]:
@@ -228,14 +305,14 @@ def build_fixture(
     ):
         raise Stage1S18Error("S18_PRE_ROUTE_OPTIMIZER_DELTA_SCALE_INVALID")
     layouts = {route: build_route_layout(route).to_dict() for route in ROUTES}
-    equal_weights = [2048] * MICROBATCH_COUNT
-    weighted_weights = [2048, 2032, 2016, 2000, 1984, 1968, 1952, 1936]
+    equal_weights = list(FIXTURE_CASES["equal"]["effective_target_tokens"])
+    weighted_weights = list(FIXTURE_CASES["weighted"]["effective_target_tokens"])
     # ``n_g`` is a frozen *per-microbatch mean-gradient* scale.  Every
     # comparison scale is derived here, before a worker is launched, rather
     # than estimated from a potentially broken worker array.  In particular,
     # S2 and G2 cannot share one made-up ``sufficient_statistic`` scale.
     n_g = float(gradient_design_scale)
-    eta = 0.0003
+    eta = float(FIXTURE_OPTIMIZER["learning_rate"])
     scales = {
         "n_g": n_g,
         "s1": MICROBATCH_COUNT * n_g,
@@ -252,7 +329,7 @@ def build_fixture(
     }
     body: dict[str, object] = {
         "schema_version": FIXTURE_SCHEMA,
-        "fixture_id": "stage1-s1-8-pythia14m-ddp-v1",
+        "fixture_id": FIXTURE_ID,
         "upstream_s1_7_fixture_hash": upstream_fixture_hash,
         "pre_route_gradient_scale": {
             "schema_version": PRE_ROUTE_SCALE_ORACLE_SCHEMA,
@@ -260,6 +337,7 @@ def build_fixture(
             "maximum_unit_gradient_abs": n_g,
             "maximum_abs_data_update": float(optimizer_delta_design_scale),
             "source": "independent_pre_route_single_gpu_autograd_oracle",
+            "optimizer_conditioning": dict(OPTIMIZER_CONDITIONING),
             "parameter_registry_hash": pre_route_parameter_registry_hash,
             "case_pre_parameter_checksums": dict(pre_route_case_state_checksums),
         },
@@ -267,29 +345,17 @@ def build_fixture(
         "token_sha256": {str(index): token_sha256[str(index)] for index in range(MICROBATCH_COUNT)},
         "routes": layouts,
         "cases": {
-            "equal": {
-                "label_ignore_suffixes": [0] * MICROBATCH_COUNT,
-                "effective_target_tokens": equal_weights,
-                "statistics": "equal_s1_s2",
-            },
-            "weighted": {
-                "label_ignore_suffixes": [0, 16, 32, 48, 64, 80, 96, 112],
-                "effective_target_tokens": weighted_weights,
-                "statistics": "weighted_g1_g2_n1_n2",
-            },
+            case: {
+                "label_ignore_suffixes": list(specification["label_ignore_suffixes"]),
+                "effective_target_tokens": list(specification["effective_target_tokens"]),
+                "statistics": specification["statistics"],
+            }
+            for case, specification in FIXTURE_CASES.items()
         },
-        "precision": {
-            "compute": "float32",
-            "statistics": "float32",
-            "replay": "float64",
-            "profile": "T32_DISTRIBUTED",
-            "atol": T32_DISTRIBUTED_ATOL,
-            "rtol": T32_DISTRIBUTED_RTOL,
-            "normalized_l2_limit": T32_DISTRIBUTED_L2_LIMIT,
-        },
+        "precision": dict(FIXTURE_PRECISION),
         "comparison_natural_scales": scales,
         "comparison_natural_scale_rules": {
-        "n_g": "independent_pre_route_oracle_maximum_unit_gradient_abs",
+            "n_g": "independent_pre_route_oracle_maximum_unit_gradient_abs",
             "s1": "M*n_g",
             "s2": "M*n_g^2",
             "g1": "sum(b_m)*n_g",
@@ -300,10 +366,11 @@ def build_fixture(
             "optimizer_delta": "independent_pre_route_adamw_data_update_design_scale",
             "parameter": "frozen_parameter_scale",
         },
-        "randomness": {"dropout": "disabled", "model_seed": 1707, "training_seed": 2707},
-        "optimizer": {"type": "AdamW", "learning_rate": 0.0003, "weight_decay": 0.01, "betas": [0.9, 0.999], "eps": 1e-8, "foreach": False, "fused": False},
+        "randomness": dict(FIXTURE_RANDOMNESS),
+        "optimizer": dict(FIXTURE_OPTIMIZER),
+        "optimizer_conditioning": dict(OPTIMIZER_CONDITIONING),
         "gradient_clip_max_norm": 1.0,
-        "ddp": {"backend": "nccl", "ordinary_gradient_collectives_during_local_backward": 0, "manual_statistic_collectives": "sum_all_reduce"},
+        "ddp": dict(FIXTURE_DDP),
     }
     body["fixture_hash"] = canonical_json_hash(body)
     return body
@@ -313,14 +380,34 @@ def validate_fixture(value: Mapping[str, object]) -> dict[str, Any]:
     fixture = _mapping(value, field="fixture")
     expected = {
         "schema_version", "fixture_id", "upstream_s1_7_fixture_hash", "pre_route_gradient_scale", "record_ids", "token_sha256",
-        "routes", "cases", "precision", "comparison_natural_scales", "comparison_natural_scale_rules", "randomness", "optimizer", "gradient_clip_max_norm", "ddp", "fixture_hash",
+        "routes", "cases", "precision", "comparison_natural_scales", "comparison_natural_scale_rules", "randomness", "optimizer", "optimizer_conditioning", "gradient_clip_max_norm", "ddp", "fixture_hash",
     }
-    if set(fixture) != expected or fixture.get("schema_version") != FIXTURE_SCHEMA:
+    if set(fixture) != expected or fixture.get("schema_version") != FIXTURE_SCHEMA or fixture.get("fixture_id") != FIXTURE_ID:
         raise Stage1S18Error("S18_FIXTURE_SCHEMA_INVALID")
     declared = fixture.pop("fixture_hash")
     if not isinstance(declared, str) or declared != canonical_json_hash(fixture):
         raise Stage1S18Error("S18_FIXTURE_HASH_INVALID")
     fixture["fixture_hash"] = declared
+    _require_hash(fixture.get("upstream_s1_7_fixture_hash"), field="upstream_s1_7_fixture")
+    conditioning = _mapping(fixture.get("optimizer_conditioning"), field="fixture.optimizer_conditioning")
+    if not _exact_contract_value(conditioning, OPTIMIZER_CONDITIONING):
+        raise Stage1S18Error("S18_FIXTURE_OPTIMIZER_CONDITIONING_INVALID")
+    optimizer = _mapping(fixture.get("optimizer"), field="fixture.optimizer")
+    optimizer_conditioning_keys = ("learning_rate", "weight_decay", "betas", "eps", "foreach", "fused")
+    if (
+        not _exact_contract_value(optimizer, FIXTURE_OPTIMIZER)
+        or not _exact_contract_value(
+            {key: optimizer.get(key) for key in optimizer_conditioning_keys},
+            {key: conditioning.get(key) for key in optimizer_conditioning_keys},
+        )
+    ):
+        raise Stage1S18Error("S18_FIXTURE_OPTIMIZER_CONDITIONING_BINDING_INVALID")
+    if not _exact_contract_value(_mapping(fixture.get("precision"), field="fixture.precision"), FIXTURE_PRECISION):
+        raise Stage1S18Error("S18_FIXTURE_PRECISION_CONTRACT_INVALID")
+    if not _exact_contract_value(_mapping(fixture.get("randomness"), field="fixture.randomness"), FIXTURE_RANDOMNESS):
+        raise Stage1S18Error("S18_FIXTURE_RANDOMNESS_CONTRACT_INVALID")
+    if not _exact_contract_value(_mapping(fixture.get("ddp"), field="fixture.ddp"), FIXTURE_DDP):
+        raise Stage1S18Error("S18_FIXTURE_DDP_CONTRACT_INVALID")
     if fixture.get("record_ids") != list(range(MICROBATCH_COUNT)):
         raise Stage1S18Error("S18_FIXTURE_RECORD_IDS_INVALID")
     hashes = _mapping(fixture.get("token_sha256"), field="fixture.token_sha256")
@@ -333,6 +420,8 @@ def validate_fixture(value: Mapping[str, object]) -> dict[str, Any]:
         raise Stage1S18Error("S18_FIXTURE_ROUTE_SET_INVALID")
     for route in ROUTES:
         route_value = _mapping(routes[route], field=f"fixture.routes.{route}")
+        if set(route_value) != {"route", "world_size", "rank_microbatch_ids"} or not _exact_contract_value(route_value, build_route_layout(route).to_dict()):
+            raise Stage1S18Error("S18_FIXTURE_ROUTE_LAYOUT_INVALID")
         raw = route_value.get("rank_microbatch_ids")
         if not isinstance(raw, list) or any(not isinstance(item, list) for item in raw):
             raise Stage1S18Error("S18_FIXTURE_ROUTE_LAYOUT_INVALID")
@@ -343,6 +432,8 @@ def validate_fixture(value: Mapping[str, object]) -> dict[str, Any]:
         raise Stage1S18Error("S18_FIXTURE_CASE_SET_INVALID")
     for case in CASES:
         current = _mapping(cases[case], field=f"fixture.cases.{case}")
+        if not _exact_contract_value(current, FIXTURE_CASES[case]):
+            raise Stage1S18Error("S18_FIXTURE_CASE_STATISTICS_CONTRACT_INVALID")
         suffixes, counts = current.get("label_ignore_suffixes"), current.get("effective_target_tokens")
         if (
             not isinstance(suffixes, list) or not isinstance(counts, list)
@@ -352,12 +443,12 @@ def validate_fixture(value: Mapping[str, object]) -> dict[str, Any]:
             or any(2048 - int(suffix) != int(count) for suffix, count in zip(suffixes, counts, strict=True))
         ):
             raise Stage1S18Error("S18_FIXTURE_CASE_COUNTS_INVALID")
-    if cases["equal"].get("effective_target_tokens") != [2048] * MICROBATCH_COUNT:
+    if not _exact_contract_value(cases["equal"].get("effective_target_tokens"), FIXTURE_CASES["equal"]["effective_target_tokens"]):
         raise Stage1S18Error("S18_EQUAL_CASE_NOT_EQUAL_WEIGHT")
-    if len(set(cases["weighted"]["effective_target_tokens"])) <= 1:
+    if not _exact_contract_value(cases["weighted"], FIXTURE_CASES["weighted"]):
         raise Stage1S18Error("S18_WEIGHTED_CASE_NOT_NONUNIFORM")
     clip = fixture.get("gradient_clip_max_norm")
-    if isinstance(clip, bool) or not isinstance(clip, (int, float)) or not math.isfinite(float(clip)) or float(clip) <= 0:
+    if type(clip) is not float or clip != 1.0:
         raise Stage1S18Error("S18_FIXTURE_CLIP_CONFIGURATION_INVALID")
     scales = _mapping(fixture.get("comparison_natural_scales"), field="fixture.comparison_natural_scales")
     expected_scale_keys = {"n_g", "s1", "s2", "g1", "g2", "mean_gradient", "core", "score", "optimizer_delta", "parameter"}
@@ -377,12 +468,14 @@ def validate_fixture(value: Mapping[str, object]) -> dict[str, Any]:
         raise Stage1S18Error("S18_FIXTURE_NATURAL_SCALE_RULES_INVALID")
     pre_route_scale = _mapping(fixture.get("pre_route_gradient_scale"), field="fixture.pre_route_gradient_scale")
     if (
-        set(pre_route_scale) != {"schema_version", "artifact_hash", "maximum_unit_gradient_abs", "maximum_abs_data_update", "source", "parameter_registry_hash", "case_pre_parameter_checksums"}
+        set(pre_route_scale) != {"schema_version", "artifact_hash", "maximum_unit_gradient_abs", "maximum_abs_data_update", "source", "optimizer_conditioning", "parameter_registry_hash", "case_pre_parameter_checksums"}
         or pre_route_scale.get("schema_version") != PRE_ROUTE_SCALE_ORACLE_SCHEMA
         or pre_route_scale.get("source") != "independent_pre_route_single_gpu_autograd_oracle"
     ):
         raise Stage1S18Error("S18_FIXTURE_PRE_ROUTE_SCALE_SCHEMA_INVALID")
     _require_hash(pre_route_scale.get("artifact_hash"), field="pre_route_scale_oracle")
+    if not _exact_contract_value(_mapping(pre_route_scale.get("optimizer_conditioning"), field="fixture.pre_route_scale.optimizer_conditioning"), conditioning):
+        raise Stage1S18Error("S18_FIXTURE_PRE_ROUTE_OPTIMIZER_CONDITIONING_INVALID")
     _require_hash(pre_route_scale.get("parameter_registry_hash"), field="pre_route_parameter_registry")
     pre_route_case_checksums = _mapping(pre_route_scale.get("case_pre_parameter_checksums"), field="fixture.pre_route_scale.case_pre_parameter_checksums")
     if set(pre_route_case_checksums) != set(CASES):
@@ -1119,7 +1212,9 @@ def _run_case(
             "data_update": data_delta,
             "data_movement": {name: value.abs() for name, value in data_delta.items()},
             "total_update": {name: post_parameters[name] - pre_parameters[name] for name in pre_parameters},
+            "total_movement": {name: (post_parameters[name] - pre_parameters[name]).abs() for name in pre_parameters},
             "weight_decay_update": weight_decay_delta,
+            "weight_decay_movement": {name: value.abs() for name, value in weight_decay_delta.items()},
             "actual_update_raw_importance": {
                 name: -(data_delta[name] * scores["mean"][name]) for name in data_delta
             },
@@ -1344,7 +1439,7 @@ def execute_worker(plan_path: str | Path) -> dict[str, object]:
 
 
 __all__ = [
-    "ARRAY_MANIFEST_SCHEMA", "CASES", "EXECUTION_MODES", "FIXTURE_SCHEMA", "MICROBATCH_COUNT", "PERMUTATIONS", "PRE_ROUTE_SCALE_ORACLE_SCHEMA", "ROUTES",
+    "ARRAY_MANIFEST_SCHEMA", "CASES", "EXECUTION_MODES", "FIXTURE_CASES", "FIXTURE_DDP", "FIXTURE_ID", "FIXTURE_OPTIMIZER", "FIXTURE_PRECISION", "FIXTURE_RANDOMNESS", "FIXTURE_SCHEMA", "MICROBATCH_COUNT", "OPTIMIZER_CONDITIONING", "PERMUTATIONS", "PRE_ROUTE_SCALE_ORACLE_SCHEMA", "ROUTES",
     "RouteLayout", "Stage1S18Error", "TASK_ID", "T32_DISTRIBUTED_ATOL", "T32_DISTRIBUTED_L2_LIMIT",
     "T32_DISTRIBUTED_RTOL", "NCCL_TRANSPORT_PROTOCOL", "WORKER_PLAN_SCHEMA", "WORKER_REPORT_SCHEMA", "build_fixture",
     "build_route_layout", "execute_worker", "learning_rate_map", "local_sufficient_statistics", "permute_route_layout", "scores_from_global_statistics", "validate_nccl_transport_environment", "weight_decay_map",

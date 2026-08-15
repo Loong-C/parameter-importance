@@ -28,6 +28,7 @@ from param_importance_nlp.stage1_ddp import (
 )
 from param_importance_nlp import stage1_ddp_oracle as oracle
 from param_importance_nlp import stage1_ddp as ddp
+from param_importance_nlp import stage1_ddp_scale_oracle as scale_oracle
 
 
 def _formalizer() -> object:
@@ -56,6 +57,41 @@ def _fixture() -> dict[str, object]:
     )
 
 
+def _rehash_fixture(fixture: dict[str, object]) -> dict[str, object]:
+    fixture["fixture_hash"] = ddp.canonical_json_hash(
+        {key: value for key, value in fixture.items() if key != "fixture_hash"}
+    )
+    return fixture
+
+
+def _worker_plan_with_fixture(tmp_path: Path, fixture: dict[str, object]) -> dict[str, object]:
+    data_root = tmp_path / "data"
+    model_root = data_root / "models" / "model"
+    cache_root = data_root / "cache"
+    model_root.mkdir(parents=True)
+    cache_root.mkdir()
+    tokens = tmp_path / "fixture-inputs.safetensors"
+    tokens.write_bytes(b"fixture")
+    return ddp.with_artifact_hash({
+        "schema_version": ddp.WORKER_PLAN_SCHEMA,
+        "task_id": ddp.TASK_ID,
+        "execution_commit": "a" * 40,
+        "route": "A",
+        "fixture": fixture,
+        "fixture_tokens_ref": tokens.name,
+        "fixture_tokens_sha256": hashlib.sha256(b"fixture").hexdigest(),
+        "data_root": str(data_root),
+        "model_root": str(model_root),
+        "cache_root": str(cache_root),
+        "run_token": "b" * 64,
+        "visible_gpu_uuids": ["GPU-00000000-1111-2222-3333-444444444444"],
+        "nccl_transport_protocol": dict(ddp.NCCL_TRANSPORT_PROTOCOL),
+        "output_dir": "route-output",
+        "permutation": "identity",
+        "execution_mode": "formal",
+    })
+
+
 def test_fixture_binds_pre_route_gradient_scale_and_distinct_second_statistics() -> None:
     fixture = _fixture()
     checked = validate_fixture(fixture)
@@ -72,6 +108,198 @@ def test_fixture_rejects_unbound_or_post_hoc_scale_mutation() -> None:
     fixture["comparison_natural_scales"]["g2"] = 1.0
     with pytest.raises(Stage1S18Error, match="S18_FIXTURE_HASH_INVALID"):
         validate_fixture(fixture)
+
+
+def test_conditioned_v2_fixture_rejects_jointly_rehashed_semantic_drift_at_runtime_and_schema(tmp_path: Path) -> None:
+    """A new fixture hash cannot authorize a new numerical experiment."""
+
+    formalizer = _formalizer()
+    mutations: dict[str, tuple[object, str]] = {
+        "fixture_id": ("different", "S18_FIXTURE_SCHEMA_INVALID"),
+        "precision.atol": (2.0e-7, "S18_FIXTURE_PRECISION_CONTRACT_INVALID"),
+        "optimizer.learning_rate": (4.0e-4, "S18_FIXTURE_OPTIMIZER_CONDITIONING_BINDING_INVALID"),
+        "optimizer.betas": ([0.8, 0.999], "S18_FIXTURE_OPTIMIZER_CONDITIONING_BINDING_INVALID"),
+        "optimizer.weight_decay": (0.02, "S18_FIXTURE_OPTIMIZER_CONDITIONING_BINDING_INVALID"),
+        "optimizer.foreach": (0, "S18_FIXTURE_OPTIMIZER_CONDITIONING_BINDING_INVALID"),
+        "optimizer.extra": (True, "S18_FIXTURE_OPTIMIZER_CONDITIONING_BINDING_INVALID"),
+        "optimizer_conditioning.learning_rate": (4.0e-4, "S18_FIXTURE_OPTIMIZER_CONDITIONING_INVALID"),
+        "gradient_clip_max_norm": (0.5, "S18_FIXTURE_CLIP_CONFIGURATION_INVALID"),
+        "randomness.model_seed": (1708, "S18_FIXTURE_RANDOMNESS_CONTRACT_INVALID"),
+        "randomness.dropout": ("enabled", "S18_FIXTURE_RANDOMNESS_CONTRACT_INVALID"),
+        "cases.weighted": ({"label_ignore_suffixes": [0, 15, 32, 48, 64, 80, 96, 112], "effective_target_tokens": [2048, 2033, 2016, 2000, 1984, 1968, 1952, 1936], "statistics": "weighted_g1_g2_n1_n2"}, "S18_FIXTURE_CASE_STATISTICS_CONTRACT_INVALID"),
+        "routes.A.route": ("B", "S18_FIXTURE_ROUTE_LAYOUT_INVALID"),
+        "ddp.backend": ("gloo", "S18_FIXTURE_DDP_CONTRACT_INVALID"),
+        "upstream_s1_7_fixture_hash": ("not-a-sha256", "S18_UPSTREAM_S1_7_FIXTURE_HASH_INVALID"),
+    }
+    for name, (value, marker) in mutations.items():
+        drifted = copy.deepcopy(_fixture())
+        if name == "fixture_id":
+            drifted["fixture_id"] = value
+        elif name == "gradient_clip_max_norm":
+            drifted["gradient_clip_max_norm"] = value
+        elif name == "upstream_s1_7_fixture_hash":
+            drifted["upstream_s1_7_fixture_hash"] = value
+        elif name == "cases.weighted":
+            drifted["cases"]["weighted"] = value  # type: ignore[index]
+        else:
+            location = name.split(".")
+            target: object = drifted
+            for key in location[:-1]:
+                target = target[key]  # type: ignore[index]
+            target[location[-1]] = value  # type: ignore[index]
+        _rehash_fixture(drifted)
+        with pytest.raises(Stage1S18Error, match=marker):
+            validate_fixture(drifted)
+        with pytest.raises(formalizer.Stage1S18FormalError, match="S18_SCHEMA_VALIDATION_FAILED:fixture_manifest"):
+            formalizer._validate_output_schemas(Path("."), {"fixture_manifest": drifted})
+
+    # These use the actual worker-plan validation entrance, rather than only
+    # unit-testing the fixture helper.  Their self hashes are recomputed too.
+    for name in ("precision.atol", "optimizer.learning_rate"):
+        drifted = copy.deepcopy(_fixture())
+        parent, child = name.split(".")
+        drifted[parent][child] = 2.0e-7 if parent == "precision" else 4.0e-4  # type: ignore[index]
+        _rehash_fixture(drifted)
+        plan = _worker_plan_with_fixture(tmp_path / name.replace(".", "-"), drifted)
+        with pytest.raises(Stage1S18Error):
+            validate_worker_plan(plan, path=tmp_path / f"{name}.json")
+
+
+def test_conditioned_fixture_and_scale_plan_reject_r16_epsilon(tmp_path: Path) -> None:
+    fixture = _fixture()
+    assert fixture["schema_version"] == "stage1-s1-8-fixture-manifest-v2"
+    assert fixture["optimizer"]["eps"] == 1.0e-4
+    assert fixture["optimizer_conditioning"] == oracle.OPTIMIZER_CONDITIONING == scale_oracle.OPTIMIZER_CONDITIONING
+    drifted_fixture = copy.deepcopy(fixture)
+    drifted_fixture["optimizer"]["eps"] = 1.0e-8
+    drifted_fixture["optimizer_conditioning"]["eps"] = 1.0e-8
+    drifted_fixture["fixture_hash"] = ddp.canonical_json_hash({key: value for key, value in drifted_fixture.items() if key != "fixture_hash"})
+    with pytest.raises(Stage1S18Error, match="S18_FIXTURE_OPTIMIZER_CONDITIONING"):
+        validate_fixture(drifted_fixture)
+
+    token_path = tmp_path / "fixture-inputs.safetensors"; token_path.write_bytes(b"fixture")
+    selected = {str(index): f"{index:064x}" for index in range(8)}
+    upstream = {str(index): f"{index:064x}" for index in range(16)}
+    plan_body = {
+        "schema_version": scale_oracle.PLAN_SCHEMA, "task_id": scale_oracle.TASK_ID,
+        "execution_commit": "a" * 40, "fixture_tokens_ref": token_path.name,
+        "fixture_tokens_sha256": hashlib.sha256(b"fixture").hexdigest(),
+        "selected_token_sha256": selected, "upstream_token_sha256": upstream,
+        "cases": {"equal": {"label_ignore_suffixes": [0] * 8}, "weighted": {"label_ignore_suffixes": [0, 16, 32, 48, 64, 80, 96, 112]}},
+        "optimizer_conditioning": copy.deepcopy(scale_oracle.OPTIMIZER_CONDITIONING),
+        "model_root": "model", "output_file": "pre-route-scale.json", "run_token": "b" * 64,
+        "visible_gpu_uuids": ["GPU-00000000-1111-2222-3333-444444444444"],
+    }
+    plan = {**plan_body, "artifact_hash": scale_oracle.canonical_json_hash(plan_body)}
+    assert scale_oracle.validate_plan(plan, path=tmp_path / "scale-plan.json")["optimizer_conditioning"] == scale_oracle.OPTIMIZER_CONDITIONING
+    for field, value in (("eps", 1.0e-8), ("learning_rate", 4.0e-4), ("weight_decay", 0.02), ("betas", [0.8, 0.999])):
+        old_plan = copy.deepcopy(plan)
+        old_plan["optimizer_conditioning"][field] = value
+        old_plan["artifact_hash"] = scale_oracle.canonical_json_hash({key: value for key, value in old_plan.items() if key != "artifact_hash"})
+        with pytest.raises(scale_oracle.Stage1S18ScaleOracleError, match="S18_SCALE_PLAN_OPTIMIZER_CONDITIONING_INVALID"):
+            scale_oracle.validate_plan(old_plan, path=tmp_path / "scale-plan.json")
+
+    formalizer = _formalizer()
+    for field, value in (("learning_rate", 4.0e-4), ("weight_decay", 0.02), ("betas", [0.8, 0.999])):
+        report = {"optimizer_conditioning": copy.deepcopy(scale_oracle.OPTIMIZER_CONDITIONING)}
+        report["optimizer_conditioning"][field] = value
+        with pytest.raises(formalizer.Stage1S18FormalError, match="S18_PRE_ROUTE_SCALE_OPTIMIZER_CONDITIONING_INVALID"):
+            formalizer._require_pre_route_scale_conditioning(report, ddp.OPTIMIZER_CONDITIONING)
+
+    drifted_binding = copy.deepcopy(fixture)
+    drifted_binding["optimizer"]["learning_rate"] = 4.0e-4
+    drifted_binding["optimizer_conditioning"]["learning_rate"] = 4.0e-4
+    _rehash_fixture(drifted_binding)
+    with pytest.raises(Stage1S18Error, match="S18_FIXTURE_OPTIMIZER_CONDITIONING"):
+        validate_fixture(drifted_binding)
+
+
+def test_adamw_step_contract_requires_a_cpu_fp32_zero_dim_strided_non_grad_scalar() -> None:
+    valid = {"p": torch.tensor(1.0, dtype=torch.float32)}
+    assert oracle._require_exact_step(valid, expected_step=1, field="test") == 1
+    assert oracle._exact_step_check(valid, expected_step=1)["within_t32_distributed"] is True
+    invalid = {
+        "rank_one": torch.tensor([1.0], dtype=torch.float32),
+        "sparse": torch.sparse_coo_tensor(indices=[[0]], values=[1.0], size=[1]),
+        "requires_grad": torch.tensor(1.0, dtype=torch.float32, requires_grad=True),
+    }
+    for name, value in invalid.items():
+        candidate = {name: value}
+        check = oracle._exact_step_check(candidate, expected_step=1)
+        assert check["within_t32_distributed"] is False
+        with pytest.raises(oracle.Stage1S18OracleError, match=f"S18_ORACLE_ADAMW_PRE_STEP_INVALID:test:{name}"):
+            oracle._require_exact_step(candidate, expected_step=1, field="test")
+
+
+def test_fp32_execution_order_emulator_matches_adamw_one_and_two_steps() -> None:
+    optimizer_config = {"learning_rate": 3.0e-4, "weight_decay": 0.01, "betas": [0.9, 0.999], "eps": 1.0e-4, "foreach": False, "fused": False}
+    pre = {"p": torch.tensor([0.25, -0.5, 1.0e-3], dtype=torch.float32)}
+    mean_steps = (
+        {"p": torch.tensor([1.0e-8, -2.0e-6, 0.125], dtype=torch.float32)},
+        {"p": torch.tensor([-2.0e-8, 1.0e-6, -0.25], dtype=torch.float32)},
+    )
+    expected_avg = {"p": torch.zeros_like(pre["p"])}; expected_sq = {"p": torch.zeros_like(pre["p"])}
+    actual = torch.nn.Parameter(pre["p"].clone())
+    actual_optimizer = torch.optim.AdamW([actual], lr=optimizer_config["learning_rate"], betas=tuple(optimizer_config["betas"]), eps=optimizer_config["eps"], weight_decay=optimizer_config["weight_decay"], foreach=False, fused=False)
+    for previous_step, mean in enumerate(mean_steps):
+        expected_post, expected_avg, expected_sq, expected_step = oracle._adamw_step_fp32_execution(
+            pre={"p": actual.detach().clone()}, mean=mean, clip_factor=0.75,
+            previous_exp_avg=expected_avg, previous_exp_avg_sq=expected_sq,
+            previous_step=previous_step, optimizer=optimizer_config,
+        )
+        if previous_step:
+            state = actual_optimizer.state[actual]
+            state["step"] = torch.tensor(float(previous_step), dtype=torch.float32)
+            state["exp_avg"] = expected_avg_before.clone()
+            state["exp_avg_sq"] = expected_sq_before.clone()
+        actual.grad = (mean["p"] * 0.75).clone()
+        actual_optimizer.step()
+        state = actual_optimizer.state[actual]
+        assert torch.equal(actual.detach(), expected_post["p"])
+        assert torch.equal(state["exp_avg"], expected_avg["p"])
+        assert torch.equal(state["exp_avg_sq"], expected_sq["p"])
+        assert float(state["step"].item()) == float(expected_step)
+        expected_avg_before = expected_avg["p"].clone()
+        expected_sq_before = expected_sq["p"].clone()
+
+
+def test_route_specific_optimizer_mean_cannot_fall_back_to_b_micro_or_a_reference() -> None:
+    a_arrays = {"a-reference/equal/mean_gradient/p": torch.tensor([1.0], dtype=torch.float32)}
+    b_arrays = {"scores/equal/mean_gradient/p": torch.tensor([2.0], dtype=torch.float32)}
+    a_mean, a_kind = oracle._route_optimizer_mean(route="A", case="equal", arrays=a_arrays)
+    b_mean, b_kind = oracle._route_optimizer_mean(route="B", case="equal", arrays=b_arrays)
+    assert float(a_mean["p"].item()) == 1.0 and a_kind.startswith("A_full_batch")
+    assert float(b_mean["p"].item()) == 2.0 and b_kind.startswith("route_fp32")
+    with pytest.raises(oracle.Stage1S18OracleError):
+        oracle._route_optimizer_mean(route="B", case="equal", arrays=a_arrays)
+
+
+def test_fixed_near_zero_sensitivity_fixture_requires_conditioned_epsilon_for_t32_peer() -> None:
+    optimizer = {"learning_rate": 3.0e-4, "weight_decay": 0.01, "betas": [0.9, 0.999], "foreach": False, "fused": False}
+    pre = {"p": torch.tensor([0.25, -0.5], dtype=torch.float32)}
+    zero = {"p": torch.zeros_like(pre["p"])}
+    positive = {"p": torch.tensor([1.0e-8, -1.0e-8], dtype=torch.float32)}
+    negative = {"p": -positive["p"]}
+    def emulate(eps: float, gradient: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+        post, _, _, _ = oracle._adamw_step_fp32_execution(
+            pre=pre, mean=gradient, clip_factor=1.0, previous_exp_avg=zero,
+            previous_exp_avg_sq=zero, previous_step=0, optimizer={**optimizer, "eps": eps},
+        )
+        return post
+    old = oracle.compare_peer_maps(emulate(1.0e-8, positive), emulate(1.0e-8, negative), natural_scale=1.0, atol=ddp.T32_DISTRIBUTED_ATOL, rtol=ddp.T32_DISTRIBUTED_RTOL, normalized_l2_limit=ddp.T32_DISTRIBUTED_L2_LIMIT)
+    conditioned = oracle.compare_peer_maps(emulate(1.0e-4, positive), emulate(1.0e-4, negative), natural_scale=1.0, atol=ddp.T32_DISTRIBUTED_ATOL, rtol=ddp.T32_DISTRIBUTED_RTOL, normalized_l2_limit=ddp.T32_DISTRIBUTED_L2_LIMIT)
+    assert old["within_t32_distributed"] is False
+    assert conditioned["within_t32_distributed"] is True
+
+
+def test_peer_drift_remains_a_t32_gate_failure() -> None:
+    check = oracle.compare_peer_maps(
+        {"p": torch.tensor([1.0], dtype=torch.float32)}, {"p": torch.tensor([1.001], dtype=torch.float32)},
+        natural_scale=1.0, atol=ddp.T32_DISTRIBUTED_ATOL, rtol=ddp.T32_DISTRIBUTED_RTOL,
+        normalized_l2_limit=ddp.T32_DISTRIBUTED_L2_LIMIT,
+    )
+    assert check["reference_kind"] == "production_peer_fp32_promoted_to_fp64_for_metric_only"
+    assert check["within_t32_distributed"] is False
 
 
 def test_learning_rate_map_uses_parameter_identity_for_nonfirst_multi_parameter_group() -> None:
@@ -298,7 +526,7 @@ def test_worker_and_array_schemas_validate_real_shape_then_reject_deep_unknown_a
     scalar_step = copy.deepcopy(report)
     scalar_step["arrays"]["tensors"]["optimizer-state/equal/embed_out.weight::step"] = {"sha256": "d" * 64, "dtype": "torch.float32", "shape": []}
     for row in scalar_step["cases"]:
-        row["array_keys"] = [f"a-reference/{row['case']}/{field}/p" for field in ("mean_gradient", "raw_core", "raw_score", "raw_score_clipped", "data_update", "magnitude")]
+        row["array_keys"] = [f"a-reference/{row['case']}/{field}/p" for field in ("mean_gradient", "raw_core", "raw_score", "raw_score_clipped", "data_update", "data_movement", "total_update", "total_movement", "weight_decay_update", "weight_decay_movement", "actual_update_raw_importance", "magnitude")]
     scalar_step["arrays"] = formalizer._with_hash({key: value for key, value in scalar_step["arrays"].items() if key != "artifact_hash"})
     scalar_step["artifact_hash"] = formalizer._canonical({key: value for key, value in scalar_step.items() if key != "artifact_hash"})
     formalizer._validate_output_schemas(Path("."), {"worker_report": scalar_step, "safetensors_manifest": scalar_step["arrays"]})
@@ -1290,12 +1518,12 @@ def test_implementation_source_map_is_exact_full_production_closure() -> None:
     formalizer = _formalizer()
     sources = formalizer._implementation_source_map(Path("."))
     assert set(sources) == set(formalizer.IMPLEMENTATION_SOURCE_FILES)
-    assert len(sources) == 30
+    assert len(sources) == 31
     assert "src/param_importance_nlp/runtime/optimizer.py" not in sources
     assert "src/param_importance_nlp/contracts/errors.py" in sources
     assert set(name for name in sources if name.startswith("schemas/stage1/s1-8-")) == {
         "schemas/stage1/s1-8-array-bundle-v1.json", "schemas/stage1/s1-8-comparison-table-v1.json",
-        "schemas/stage1/s1-8-ddp-report-v1.json", "schemas/stage1/s1-8-fixture-manifest-v1.json",
+        "schemas/stage1/s1-8-ddp-report-v1.json", "schemas/stage1/s1-8-fixture-manifest-v1.json", "schemas/stage1/s1-8-fixture-manifest-v2.json",
         "schemas/stage1/s1-8-formalization-index-v1.json", "schemas/stage1/s1-8-gate-record-v1.json",
         "schemas/stage1/s1-8-replay-validation-v1.json", "schemas/stage1/s1-8-safetensors-manifest-v1.json",
         "schemas/stage1/s1-8-validation-v1.json", "schemas/stage1/s1-8-worker-report-v1.json",
@@ -1315,7 +1543,7 @@ def test_dirty_worktree_and_nonfrozen_capability_are_prelease_rejections(tmp_pat
 def test_route_specific_candidate_contract_forbids_a_u_and_requires_bcd_accumulator() -> None:
     formalizer = _formalizer()
     uuid = "GPU-00000000-1111-2222-3333-444444444444"
-    a_fields = ("mean_gradient", "raw_core", "raw_score", "raw_score_clipped", "data_update", "magnitude")
+    a_fields = ("mean_gradient", "raw_core", "raw_score", "raw_score_clipped", "data_update", "data_movement", "total_update", "total_movement", "weight_decay_update", "weight_decay_movement", "actual_update_raw_importance", "magnitude")
     report_a = {"route": "A", "world_size": 1, "nccl_transport_protocol": formalizer._nccl_transport_protocol(), "visible_gpu_uuids": [uuid], "rank_to_gpu_uuid": [uuid], "route_layout": {"route": "A", "world_size": 1, "rank_microbatch_ids": [list(range(8))]}, "cases": [{"case": case, "ordinary_ddp_gradient_collectives": 1 if case == "equal" else 2, "array_keys": [f"a-reference/{case}/{field}/p" for field in a_fields], "accumulator": None, "rank_records": [{"rank": 0, "local_microbatch_ids": list(range(8)), "local_gradient_checksums": ["c" * 64]}]} for case in ("equal", "weighted")]}
     formalizer._validate_worker_candidate_contract("A", report_a)
     for gradients in ([], ["c" * 64] * 2, ["G" * 64]):

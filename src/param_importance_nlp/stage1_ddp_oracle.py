@@ -17,8 +17,49 @@ from typing import Any
 import torch
 
 
+OPTIMIZER_CONDITIONING = {
+    "schema_version": "stage1-s1-8-optimizer-conditioning-v2",
+    "precision_profile": "T32_DISTRIBUTED",
+    "optimizer_type": "AdamW",
+    "learning_rate": 0.0003,
+    "weight_decay": 0.01,
+    "betas": [0.9, 0.999],
+    "eps": 1.0e-4,
+    "foreach": False,
+    "fused": False,
+    "execution_order": "single_tensor_decoupled_decay_then_adamw_addcdiv_fp32",
+    "selection_method": "r16_route_specific_mean_epsilon_sensitivity",
+    "diagnostic_attempt_id": "formal-20260815-s18-v1-r16",
+    "failed_attempt_artifact_hash": "81674ea39a2b67fcfa4a0294e5d59f75882908cb3f52384a8ae5c85bc7960789",
+    "failed_attempt_phase": "rank_gradient_checksum_cardinality",
+    "r16_optimizer_epsilon": 1.0e-8,
+    "sensitivity_method": "read_only_persisted_route_mean_simulation",
+    "sensitivity_t32_peer_violation_counts": {
+        "1e-8": {"equal": 8, "weighted": 9},
+        "1e-6": {"equal": 6, "weighted": 6},
+        "1e-5": {"equal": 2, "weighted": 0},
+        "1e-4": {"equal": 0, "weighted": 0},
+    },
+    "selected_epsilon_first_t32_zero_violation": 1.0e-4,
+}
+
+
 class Stage1S18OracleError(RuntimeError):
     """Raised for an incomplete or semantically inconsistent replay input."""
+
+
+def _exact_contract_value(value: object, expected: object) -> bool:
+    """Compare frozen JSON contracts without bool/int equivalence leaks."""
+
+    if isinstance(expected, Mapping):
+        return isinstance(value, Mapping) and set(value) == set(expected) and all(
+            _exact_contract_value(value[key], expected[key]) for key in expected
+        )
+    if isinstance(expected, list):
+        return isinstance(value, list) and len(value) == len(expected) and all(
+            _exact_contract_value(item, reference) for item, reference in zip(value, expected, strict=True)
+        )
+    return type(value) is type(expected) and value == expected
 
 
 def _stable_l2_components(values: Sequence[torch.Tensor]) -> tuple[float, float]:
@@ -223,6 +264,7 @@ def compare_maps(
 def compare_peer_maps(
     candidate: Mapping[str, torch.Tensor], reference: Mapping[str, torch.Tensor], *, natural_scale: float,
     atol: float, rtol: float, normalized_l2_limit: float,
+    reference_kind: str = "production_peer_fp32_promoted_to_fp64_for_metric_only",
 ) -> dict[str, object]:
     """Compare two persisted FP32 route outputs without mislabelling it oracle.
 
@@ -238,7 +280,7 @@ def compare_peer_maps(
         {name: value.to(torch.float64) for name, value in reference.items()},
         natural_scale=natural_scale, atol=atol, rtol=rtol, normalized_l2_limit=normalized_l2_limit,
     )
-    result["reference_kind"] = "production_peer_fp32_promoted_to_fp64_for_metric_only"
+    result["reference_kind"] = reference_kind
     return result
 
 
@@ -305,6 +347,23 @@ def _exact_scalar_check(expected: int, observed: object) -> dict[str, object]:
     return {"expected": expected, "observed": observed, "exact_equality": True, "within_t32_distributed": passed}
 
 
+def _is_exact_adamw_step_scalar(value: object, *, expected_step: int) -> bool:
+    """Accept only the safetensors representation of AdamW's scalar step."""
+
+    return (
+        isinstance(value, torch.Tensor)
+        and value.dtype == torch.float32
+        and value.device.type == "cpu"
+        and value.layout == torch.strided
+        and value.ndim == 0
+        and value.numel() == 1
+        and value.stride() == ()
+        and not value.requires_grad
+        and bool(torch.isfinite(value).all())
+        and float(value.item()) == float(expected_step)
+    )
+
+
 def _exact_step_check(candidate: Mapping[str, torch.Tensor], *, expected_step: int) -> dict[str, object]:
     """AdamW's scalar step is a discrete state value, not a numeric estimate."""
 
@@ -312,12 +371,25 @@ def _exact_step_check(candidate: Mapping[str, torch.Tensor], *, expected_step: i
         raise Stage1S18OracleError("S18_ORACLE_ADAMW_STEP_STATE_EMPTY")
     per_tensor: dict[str, object] = {}
     for name, value in candidate.items():
-        passed = (
-            value.dtype == torch.float32 and value.device.type == "cpu" and value.numel() == 1
-            and bool(torch.isfinite(value).all()) and float(value.item()) == float(expected_step)
-        )
-        per_tensor[name] = {"expected_step": expected_step, "observed": float(value.item()) if value.numel() == 1 else None, "exact_equality": True, "within_t32_distributed": passed}
+        observed = float(value.item()) if isinstance(value, torch.Tensor) and value.numel() == 1 else None
+        per_tensor[name] = {
+            "expected_step": expected_step,
+            "observed": observed,
+            "exact_equality": True,
+            "within_t32_distributed": _is_exact_adamw_step_scalar(value, expected_step=expected_step),
+        }
     return {"max_abs_error": 0.0 if all(bool(item["within_t32_distributed"]) for item in per_tensor.values()) else math.inf, "worst_parameter": "", "worst_index": [], "normalized_l2_error": None, "near_zero_object_count": 0, "violation_count": sum(not bool(item["within_t32_distributed"]) for item in per_tensor.values()), "within_t32_distributed": all(bool(item["within_t32_distributed"]) for item in per_tensor.values()), "per_tensor": per_tensor}
+
+
+def _require_exact_step(candidate: Mapping[str, torch.Tensor], *, expected_step: int, field: str) -> int:
+    """Fail closed before an execution emulator consumes a persisted step."""
+
+    if not candidate:
+        raise Stage1S18OracleError("S18_ORACLE_ADAMW_PRE_STEP_EMPTY:" + field)
+    for name, value in candidate.items():
+        if not _is_exact_adamw_step_scalar(value, expected_step=expected_step):
+            raise Stage1S18OracleError("S18_ORACLE_ADAMW_PRE_STEP_INVALID:" + field + ":" + name)
+    return expected_step
 
 
 def _split_optimizer_state(values: Mapping[str, torch.Tensor]) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor], dict[str, torch.Tensor]]:
@@ -408,12 +480,96 @@ def _adamw_step(
     return output, exp_avg, exp_avg_sq, step
 
 
+def _adamw_step_fp32_execution(
+    *, pre: Mapping[str, torch.Tensor], mean: Mapping[str, torch.Tensor], clip_factor: float,
+    previous_exp_avg: Mapping[str, torch.Tensor], previous_exp_avg_sq: Mapping[str, torch.Tensor],
+    previous_step: int, optimizer: Mapping[str, Any],
+) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor], dict[str, torch.Tensor], int]:
+    """Independently emulate frozen single-tensor FP32 AdamW operation order.
+
+    This intentionally does not call ``torch.optim.AdamW``.  It models the
+    documented ``foreach=False, fused=False`` sequence: FP32 moment updates,
+    decoupled in-place weight decay, then FP32 ``addcdiv``.  The FP64 routine
+    above remains the independent algebraic diagnostic; this routine binds the
+    production execution/decomposition boundary once its route mean has
+    already passed the independent statistic oracle.
+    """
+
+    if set(pre) != set(mean) or set(pre) != set(previous_exp_avg) or set(pre) != set(previous_exp_avg_sq):
+        raise Stage1S18OracleError("S18_ORACLE_ADAMW_EXECUTION_PARAMETER_SET_DRIFT")
+    if optimizer.get("foreach") is not False or optimizer.get("fused") is not False:
+        raise Stage1S18OracleError("S18_ORACLE_ADAMW_EXECUTION_MODE_DRIFT")
+    beta1, beta2 = (float(value) for value in optimizer["betas"])
+    lr, wd, eps = (float(optimizer[key]) for key in ("learning_rate", "weight_decay", "eps"))
+    step = previous_step + 1
+    output: dict[str, torch.Tensor] = {}; exp_avg: dict[str, torch.Tensor] = {}; exp_avg_sq: dict[str, torch.Tensor] = {}
+    for name in sorted(pre):
+        if any(value.dtype != torch.float32 or value.device.type != "cpu" for value in (pre[name], mean[name], previous_exp_avg[name], previous_exp_avg_sq[name])):
+            raise Stage1S18OracleError("S18_ORACLE_ADAMW_EXECUTION_INPUT_INVALID:" + name)
+        gradient = (mean[name] * float(clip_factor)).to(torch.float32)
+        # The frozen single-tensor AdamW kernel updates the first moment via
+        # ``lerp_`` rather than algebraically equivalent mul/add.  Keep that
+        # exact FP32 rounding path in the execution oracle.
+        avg = previous_exp_avg[name].clone().lerp_(gradient, 1.0 - beta1)
+        avg_sq = previous_exp_avg_sq[name].clone().mul_(beta2).addcmul_(gradient, gradient, value=1.0 - beta2)
+        parameter = pre[name].clone().mul_(1.0 - lr * wd)
+        denominator = avg_sq.sqrt().div_(math.sqrt(1.0 - beta2 ** step)).add_(eps)
+        parameter.addcdiv_(avg, denominator, value=-(lr / (1.0 - beta1 ** step)))
+        output[name], exp_avg[name], exp_avg_sq[name] = parameter, avg, avg_sq
+    return output, exp_avg, exp_avg_sq, step
+
+
+def _route_optimizer_mean(*, route: str, case: str, arrays: Mapping[str, torch.Tensor]) -> tuple[dict[str, torch.Tensor], str]:
+    """Return the persisted FP32 optimizer input after independent mean checks.
+
+    It is never used for U/raw/statistic reconstruction; it is only the
+    verified route-local input that production supplied to AdamW.
+    """
+
+    prefix = f"a-reference/{case}/mean_gradient" if route == "A" else f"scores/{case}/mean_gradient"
+    values = collect_route_phase(arrays, prefix=prefix)
+    if any(value.dtype != torch.float32 or value.device.type != "cpu" for value in values.values()):
+        raise Stage1S18OracleError("S18_ORACLE_ROUTE_OPTIMIZER_MEAN_INVALID:" + route)
+    return values, ("A_full_batch_production_mean_after_independent_check" if route == "A" else "route_fp32_sufficient_statistic_mean_after_independent_check")
+
+
 def _add_check(
     checks: dict[str, object], rows: list[dict[str, object]], *, key: str,
     candidate: Mapping[str, torch.Tensor], reference: Mapping[str, torch.Tensor], natural_scale: float,
     precision: Mapping[str, Any],
 ) -> None:
     check = compare_maps(
+        candidate, reference, natural_scale=natural_scale, atol=float(precision["atol"]),
+        rtol=float(precision["rtol"]), normalized_l2_limit=float(precision["normalized_l2_limit"]),
+    )
+    checks[key] = check
+    for name, detail in dict(check["per_tensor"]).items():
+        rows.append({"comparison": key, "parameter": name, **dict(detail)})
+
+
+def _add_execution_check(
+    checks: dict[str, object], rows: list[dict[str, object]], *, key: str,
+    candidate: Mapping[str, torch.Tensor], reference: Mapping[str, torch.Tensor], natural_scale: float,
+    precision: Mapping[str, Any], optimizer_input_kind: str,
+) -> None:
+    check = compare_peer_maps(
+        candidate, reference, natural_scale=natural_scale, atol=float(precision["atol"]),
+        rtol=float(precision["rtol"]), normalized_l2_limit=float(precision["normalized_l2_limit"]),
+        reference_kind="fp32_execution_order_emulator_using_" + optimizer_input_kind,
+    )
+    checks[key] = check
+    for name, detail in dict(check["per_tensor"]).items():
+        rows.append({"comparison": key, "parameter": name, **dict(detail)})
+
+
+def _add_peer_check(
+    checks: dict[str, object], rows: list[dict[str, object]], *, key: str,
+    candidate: Mapping[str, torch.Tensor], reference: Mapping[str, torch.Tensor], natural_scale: float,
+    precision: Mapping[str, Any],
+) -> None:
+    """Compare persisted peer observations, never an optimizer emulator."""
+
+    check = compare_peer_maps(
         candidate, reference, natural_scale=natural_scale, atol=float(precision["atol"]),
         rtol=float(precision["rtol"]), normalized_l2_limit=float(precision["normalized_l2_limit"]),
     )
@@ -452,8 +608,18 @@ def replay(
         raise Stage1S18OracleError("S18_ORACLE_ROUTE_SET_INVALID")
     cases = fixture.get("cases"); precision = fixture.get("precision"); scales = fixture.get("comparison_natural_scales")
     optimizer = fixture.get("optimizer")
-    if not all(isinstance(item, Mapping) for item in (cases, precision, scales, optimizer)):
+    conditioning = fixture.get("optimizer_conditioning")
+    if not all(isinstance(item, Mapping) for item in (cases, precision, scales, optimizer, conditioning)):
         raise Stage1S18OracleError("S18_ORACLE_FIXTURE_CONTRACT_INVALID")
+    optimizer_conditioning_keys = ("learning_rate", "weight_decay", "betas", "eps", "foreach", "fused")
+    if (
+        not _exact_contract_value(conditioning, OPTIMIZER_CONDITIONING)
+        or not _exact_contract_value(
+            {key: optimizer.get(key) for key in optimizer_conditioning_keys},
+            {key: conditioning.get(key) for key in optimizer_conditioning_keys},
+        )
+    ):
+        raise Stage1S18OracleError("S18_ORACLE_OPTIMIZER_CONDITIONING_INVALID")
     required_scales = {"n_g", "s1", "s2", "g1", "g2", "mean_gradient", "core", "score", "optimizer_delta", "parameter"}
     if set(scales) != required_scales:
         raise Stage1S18OracleError("S18_ORACLE_NATURAL_SCALE_SET_INVALID")
@@ -588,11 +754,13 @@ def replay(
                 )
                 checks[f"{route}:equal_to_weighted:optimizer_step_continuity"] = _exact_step_check(weighted_step, expected_step=1)
             pre_fp64 = _phase_reference(collect_route_phase(route_arrays[route], prefix=f"pre/{case}"))
+            route_mean_fp32, route_mean_kind = _route_optimizer_mean(route=route, case=case, arrays=route_arrays[route])
+            route_mean_fp64 = _phase_reference(route_mean_fp32)
             if route != "A":
                 _add_check(checks, rows, key=f"{case}:A:{route}:pre_parameters", candidate=collect_route_phase(route_arrays[route], prefix=f"pre/{case}"), reference=_phase_reference(a_pre), natural_scale=float(scales["parameter"]), precision=precision)
                 state = previous[route]
                 expected_post, exp_avg, exp_avg_sq, step = _adamw_step(
-                    pre=pre_fp64, mean=mean, clip_factor=oracle_clip,
+                    pre=pre_fp64, mean=route_mean_fp64, clip_factor=float(row.get("clip_factor")),
                     previous_exp_avg=state["exp_avg"], previous_exp_avg_sq=state["exp_avg_sq"],
                     previous_step=int(state["step"]), optimizer=optimizer,
                 )
@@ -600,6 +768,29 @@ def replay(
                 observed_avg, observed_avg_sq, observed_step = _split_optimizer_state(collect_route_phase(route_arrays[route], prefix=f"optimizer-state/{case}"))
                 _add_check(checks, rows, key=f"{case}:{route}:optimizer_state:exp_avg", candidate=observed_avg, reference=exp_avg, natural_scale=float(scales["n_g"]), precision=precision)
                 _add_check(checks, rows, key=f"{case}:{route}:optimizer_state:exp_avg_sq", candidate=observed_avg_sq, reference=exp_avg_sq, natural_scale=float(scales["core"]), precision=precision)
+                pre_avg_fp32, pre_sq_fp32, pre_step_fp32 = _split_optimizer_state(collect_route_phase(route_arrays[route], prefix=f"optimizer-state-pre/{case}"))
+                execution_previous_step = _require_exact_step(
+                    pre_step_fp32, expected_step=step - 1,
+                    field=f"{case}:{route}:optimizer-state-pre",
+                )
+                execution_post, execution_avg, execution_sq, execution_step = _adamw_step_fp32_execution(
+                    pre=collect_route_phase(route_arrays[route], prefix=f"pre/{case}"), mean=route_mean_fp32,
+                    clip_factor=float(row.get("clip_factor")), previous_exp_avg=pre_avg_fp32,
+                    previous_exp_avg_sq=pre_sq_fp32, previous_step=execution_previous_step, optimizer=optimizer,
+                )
+                _add_execution_check(checks, rows, key=f"{case}:{route}:execution_fp32:post_parameters", candidate=post_live, reference=execution_post, natural_scale=float(scales["parameter"]), precision=precision, optimizer_input_kind=route_mean_kind)
+                _add_execution_check(checks, rows, key=f"{case}:{route}:execution_fp32:exp_avg", candidate=observed_avg, reference=execution_avg, natural_scale=float(scales["n_g"]), precision=precision, optimizer_input_kind=route_mean_kind)
+                _add_execution_check(checks, rows, key=f"{case}:{route}:execution_fp32:exp_avg_sq", candidate=observed_avg_sq, reference=execution_sq, natural_scale=float(scales["core"]), precision=precision, optimizer_input_kind=route_mean_kind)
+                if execution_step != step:
+                    raise Stage1S18OracleError("S18_ORACLE_ADAMW_EXECUTION_STEP_DRIFT")
+                pre_fp32 = collect_route_phase(route_arrays[route], prefix=f"pre/{case}")
+                execution_decay = {name: (-lr * wd * pre_fp32[name]).to(torch.float32) for name in pre_fp32}
+                execution_total = {name: (execution_post[name] - pre_fp32[name]).to(torch.float32) for name in pre_fp32}
+                execution_data = {name: (execution_total[name] - execution_decay[name]).to(torch.float32) for name in pre_fp32}
+                _add_execution_check(checks, rows, key=f"{case}:{route}:execution_fp32:data_update", candidate=collect_route_phase(route_arrays[route], prefix=f"accumulator/{case}/contribution/data_update"), reference=execution_data, natural_scale=float(scales["optimizer_delta"]), precision=precision, optimizer_input_kind=route_mean_kind)
+                _add_execution_check(checks, rows, key=f"{case}:{route}:execution_fp32:total_update", candidate=collect_route_phase(route_arrays[route], prefix=f"accumulator/{case}/contribution/total_update"), reference=execution_total, natural_scale=float(scales["optimizer_delta"]), precision=precision, optimizer_input_kind=route_mean_kind)
+                _add_execution_check(checks, rows, key=f"{case}:{route}:execution_fp32:weight_decay_update", candidate=collect_route_phase(route_arrays[route], prefix=f"accumulator/{case}/contribution/weight_decay_update"), reference=execution_decay, natural_scale=float(scales["optimizer_delta"]), precision=precision, optimizer_input_kind=route_mean_kind)
+                _add_execution_check(checks, rows, key=f"{case}:{route}:execution_fp32:actual_update_raw_importance", candidate=collect_route_phase(route_arrays[route], prefix=f"accumulator/{case}/contribution/actual_update_raw_importance"), reference={name: -(execution_data[name] * route_mean_fp32[name]) for name in execution_data}, natural_scale=float(scales["score"]), precision=precision, optimizer_input_kind=route_mean_kind)
                 step_check = _exact_step_check(observed_step, expected_step=step)
                 checks[f"{case}:{route}:optimizer_state:step"] = step_check
                 for name, detail in dict(step_check["per_tensor"]).items():
@@ -612,13 +803,13 @@ def replay(
                     "signed": score_views["u_score_clipped"], "raw": score_views["raw_score"],
                     "raw_clipped": score_views["raw_score_clipped"], "data_update": data_update,
                     "total_update": total_update, "weight_decay_update": decay_update,
-                    "actual_update_raw_importance": {name: -(data_update[name] * mean[name]) for name in mean},
+                    "actual_update_raw_importance": {name: -(data_update[name] * route_mean_fp64[name]) for name in route_mean_fp64},
                 }
                 for field, expected in contribution.items():
                     scale = float(scales["score"] if field in {"signed", "raw", "raw_clipped", "actual_update_raw_importance"} else scales["optimizer_delta"])
                     _add_check(checks, rows, key=f"{case}:{route}:accumulator:contribution:{field}", candidate=collect_route_phase(route_arrays[route], prefix=f"accumulator/{case}/contribution/{field}"), reference=expected, natural_scale=scale, precision=precision)
                 state_c = cumulative[route]
-                for name in mean:
+                for name in route_mean_fp64:
                     signed = contribution["signed"][name]
                     state_c["positive"][name] += signed.clamp_min(0)
                     state_c["negative_mass"][name] += (-signed).clamp_min(0)
@@ -628,9 +819,9 @@ def replay(
                         state_c[destination][name] += contribution[source][name].abs() if destination.endswith("movement") else contribution[source][name]
                     state_c["magnitude"][name] = expected_post[name].abs()
                 cumulative_views = {
-                    "signed": {name: state_c["positive"][name] - state_c["negative_mass"][name] for name in mean},
+                    "signed": {name: state_c["positive"][name] - state_c["negative_mass"][name] for name in route_mean_fp64},
                     "positive": state_c["positive"], "negative_mass": state_c["negative_mass"],
-                    "absolute": {name: state_c["positive"][name] + state_c["negative_mass"][name] for name in mean},
+                    "absolute": {name: state_c["positive"][name] + state_c["negative_mass"][name] for name in route_mean_fp64},
                     "raw": state_c["raw"], "raw_clipped": state_c["raw_clipped"],
                     "data_movement": state_c["data_movement"],
                     "net_data_movement": {name: state_c["data_displacement"][name].abs() for name in mean},
@@ -652,11 +843,37 @@ def replay(
                 zero = {name: torch.zeros_like(value) for name, value in pre_fp64.items()} if case == "equal" else a_previous["exp_avg"]
                 zero_sq = {name: torch.zeros_like(value) for name, value in pre_fp64.items()} if case == "equal" else a_previous["exp_avg_sq"]
                 old_step = 0 if case == "equal" else int(a_previous["step"])
-                expected_post, exp_avg, exp_avg_sq, step = _adamw_step(pre=pre_fp64, mean=mean, clip_factor=oracle_clip, previous_exp_avg=zero, previous_exp_avg_sq=zero_sq, previous_step=old_step, optimizer=optimizer)
+                expected_post, exp_avg, exp_avg_sq, step = _adamw_step(pre=pre_fp64, mean=route_mean_fp64, clip_factor=float(row.get("clip_factor")), previous_exp_avg=zero, previous_exp_avg_sq=zero_sq, previous_step=old_step, optimizer=optimizer)
                 _add_check(checks, rows, key=f"{case}:A:post_parameters", candidate=collect_route_phase(route_arrays["A"], prefix=f"post/{case}"), reference=expected_post, natural_scale=float(scales["parameter"]), precision=precision)
                 observed_avg, observed_avg_sq, observed_step = _split_optimizer_state(collect_route_phase(route_arrays["A"], prefix=f"optimizer-state/{case}"))
                 _add_check(checks, rows, key=f"{case}:A:optimizer_state:exp_avg", candidate=observed_avg, reference=exp_avg, natural_scale=float(scales["n_g"]), precision=precision)
                 _add_check(checks, rows, key=f"{case}:A:optimizer_state:exp_avg_sq", candidate=observed_avg_sq, reference=exp_avg_sq, natural_scale=float(scales["core"]), precision=precision)
+                pre_avg_fp32, pre_sq_fp32, pre_step_fp32 = _split_optimizer_state(collect_route_phase(route_arrays["A"], prefix=f"optimizer-state-pre/{case}"))
+                execution_previous_step = _require_exact_step(
+                    pre_step_fp32, expected_step=step - 1,
+                    field=f"{case}:A:optimizer-state-pre",
+                )
+                execution_post, execution_avg, execution_sq, execution_step = _adamw_step_fp32_execution(
+                    pre=collect_route_phase(route_arrays["A"], prefix=f"pre/{case}"), mean=route_mean_fp32,
+                    clip_factor=float(row.get("clip_factor")), previous_exp_avg=pre_avg_fp32,
+                    previous_exp_avg_sq=pre_sq_fp32, previous_step=execution_previous_step, optimizer=optimizer,
+                )
+                _add_execution_check(checks, rows, key=f"{case}:A:execution_fp32:post_parameters", candidate=post_live, reference=execution_post, natural_scale=float(scales["parameter"]), precision=precision, optimizer_input_kind=route_mean_kind)
+                _add_execution_check(checks, rows, key=f"{case}:A:execution_fp32:exp_avg", candidate=observed_avg, reference=execution_avg, natural_scale=float(scales["n_g"]), precision=precision, optimizer_input_kind=route_mean_kind)
+                _add_execution_check(checks, rows, key=f"{case}:A:execution_fp32:exp_avg_sq", candidate=observed_avg_sq, reference=execution_sq, natural_scale=float(scales["core"]), precision=precision, optimizer_input_kind=route_mean_kind)
+                if execution_step != step:
+                    raise Stage1S18OracleError("S18_ORACLE_ADAMW_EXECUTION_STEP_DRIFT")
+                pre_fp32 = collect_route_phase(route_arrays["A"], prefix=f"pre/{case}")
+                execution_decay = {name: (-lr * wd * pre_fp32[name]).to(torch.float32) for name in pre_fp32}
+                execution_total = {name: (execution_post[name] - pre_fp32[name]).to(torch.float32) for name in pre_fp32}
+                execution_data = {name: (execution_total[name] - execution_decay[name]).to(torch.float32) for name in pre_fp32}
+                for field, candidate, reference, scale in (
+                    ("data_update", collect_route_phase(route_arrays["A"], prefix=f"a-reference/{case}/data_update"), execution_data, float(scales["optimizer_delta"])),
+                    ("total_update", collect_route_phase(route_arrays["A"], prefix=f"a-reference/{case}/total_update"), execution_total, float(scales["optimizer_delta"])),
+                    ("weight_decay_update", collect_route_phase(route_arrays["A"], prefix=f"a-reference/{case}/weight_decay_update"), execution_decay, float(scales["optimizer_delta"])),
+                    ("actual_update_raw_importance", collect_route_phase(route_arrays["A"], prefix=f"a-reference/{case}/actual_update_raw_importance"), {name: -(execution_data[name] * route_mean_fp32[name]) for name in execution_data}, float(scales["score"])),
+                ):
+                    _add_execution_check(checks, rows, key=f"{case}:A:execution_fp32:{field}", candidate=candidate, reference=reference, natural_scale=scale, precision=precision, optimizer_input_kind=route_mean_kind)
                 step_check = _exact_step_check(observed_step, expected_step=step)
                 checks[f"{case}:A:optimizer_state:step"] = step_check
                 for name, detail in dict(step_check["per_tensor"]).items():
@@ -666,14 +883,63 @@ def replay(
                 data_update = {name: total_update[name] - decay_update[name] for name in pre_fp64}
                 a_update_views = {
                     "data_update": data_update, "data_movement": {name: value.abs() for name, value in data_update.items()},
-                    "total_update": total_update, "weight_decay_update": decay_update,
-                    "actual_update_raw_importance": {name: -(data_update[name] * mean[name]) for name in mean},
+                    "total_update": total_update, "total_movement": {name: value.abs() for name, value in total_update.items()},
+                    "weight_decay_update": decay_update, "weight_decay_movement": {name: value.abs() for name, value in decay_update.items()},
+                    "actual_update_raw_importance": {name: -(data_update[name] * route_mean_fp64[name]) for name in route_mean_fp64},
                     "magnitude": {name: value.abs() for name, value in expected_post.items()},
                 }
                 for field, expected in a_update_views.items():
                     scale = float(scales["score"] if field == "actual_update_raw_importance" else scales["optimizer_delta"] if field != "magnitude" else scales["parameter"])
                     _add_check(checks, rows, key=f"{case}:A:a_reference:{field}", candidate=collect_route_phase(route_arrays["A"], prefix=f"a-reference/{case}/{field}"), reference=expected, natural_scale=scale, precision=precision)
                 a_previous = {"exp_avg": exp_avg, "exp_avg_sq": exp_avg_sq, "step": step}
+
+        # The conditioned fixture must establish the planned A↔B/C/D update
+        # equivalence explicitly, rather than inferring it only from each
+        # route's separate oracle recurrence.  A remains a non-U route.
+        a_post = collect_route_phase(route_arrays["A"], prefix=f"post/{case}")
+        a_avg, a_sq, a_step = _split_optimizer_state(collect_route_phase(route_arrays["A"], prefix=f"optimizer-state/{case}"))
+        a_updates = {
+            "data_update": collect_route_phase(route_arrays["A"], prefix=f"a-reference/{case}/data_update"),
+            "data_movement": collect_route_phase(route_arrays["A"], prefix=f"a-reference/{case}/data_movement"),
+            "total_update": collect_route_phase(route_arrays["A"], prefix=f"a-reference/{case}/total_update"),
+            "total_movement": collect_route_phase(route_arrays["A"], prefix=f"a-reference/{case}/total_movement"),
+            "weight_decay_update": collect_route_phase(route_arrays["A"], prefix=f"a-reference/{case}/weight_decay_update"),
+            "weight_decay_movement": collect_route_phase(route_arrays["A"], prefix=f"a-reference/{case}/weight_decay_movement"),
+            "actual_update_raw_importance": collect_route_phase(route_arrays["A"], prefix=f"a-reference/{case}/actual_update_raw_importance"),
+            "magnitude": collect_route_phase(route_arrays["A"], prefix=f"a-reference/{case}/magnitude"),
+        }
+        expected_peer_step = 1 if case == "equal" else 2
+        _require_exact_step(
+            a_step,
+            expected_step=expected_peer_step,
+            field=f"{case}:A:optimizer-state-peer",
+        )
+        for route in ("B", "C", "D"):
+            _add_peer_check(checks, rows, key=f"{case}:A:{route}:peer_post_parameters", candidate=collect_route_phase(route_arrays[route], prefix=f"post/{case}"), reference=a_post, natural_scale=float(scales["parameter"]), precision=precision)
+            avg, sq, step_map = _split_optimizer_state(collect_route_phase(route_arrays[route], prefix=f"optimizer-state/{case}"))
+            _add_peer_check(checks, rows, key=f"{case}:A:{route}:peer_exp_avg", candidate=avg, reference=a_avg, natural_scale=float(scales["n_g"]), precision=precision)
+            _add_peer_check(checks, rows, key=f"{case}:A:{route}:peer_exp_avg_sq", candidate=sq, reference=a_sq, natural_scale=float(scales["core"]), precision=precision)
+            _require_exact_step(
+                step_map,
+                expected_step=expected_peer_step,
+                field=f"{case}:{route}:optimizer-state-peer",
+            )
+            if set(step_map) != set(a_step):
+                raise Stage1S18OracleError(f"S18_ORACLE_ADAMW_PEER_STEP_DRIFT:{case}:{route}")
+            step_peer = _exact_step_check(step_map, expected_step=expected_peer_step)
+            checks[f"{case}:A:{route}:peer_step"] = step_peer
+            for name, detail in dict(step_peer["per_tensor"]).items():
+                rows.append({"comparison": f"{case}:A:{route}:peer_step", "parameter": name, **dict(detail)})
+            for field, reference in a_updates.items():
+                if field in {"data_movement", "total_movement", "weight_decay_movement"}:
+                    source = field.removesuffix("_movement") + "_update"
+                    candidate = {name: value.abs() for name, value in collect_route_phase(route_arrays[route], prefix=f"accumulator/{case}/contribution/{source}").items()}
+                elif field == "magnitude":
+                    candidate = collect_route_phase(route_arrays[route], prefix=f"accumulator/{case}/cumulative/magnitude")
+                else:
+                    candidate = collect_route_phase(route_arrays[route], prefix=f"accumulator/{case}/contribution/{field}")
+                scale = float(scales["score"] if field == "actual_update_raw_importance" else scales["parameter"] if field == "magnitude" else scales["optimizer_delta"])
+                _add_peer_check(checks, rows, key=f"{case}:A:{route}:peer_{field}", candidate=candidate, reference=reference, natural_scale=scale, precision=precision)
 
     passed = all(bool(value["within_t32_distributed"]) for value in checks.values()) and all(bool(value["within_t32_distributed"]) for value in scalar_checks.values())
     return {
@@ -685,6 +951,7 @@ def replay(
 
 
 __all__ = [
-    "Stage1S18OracleError", "collect_route_phase", "compare_maps", "compare_peer_maps", "reconstruct_equal",
+    "OPTIMIZER_CONDITIONING", "Stage1S18OracleError", "_adamw_step", "_adamw_step_fp32_execution",
+    "_route_optimizer_mean", "collect_route_phase", "compare_maps", "compare_peer_maps", "reconstruct_equal",
     "reconstruct_weighted", "replay",
 ]

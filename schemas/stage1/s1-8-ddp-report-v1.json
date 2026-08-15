@@ -8,7 +8,7 @@
     "schema_version": {"const": "stage1-s1-8-ddp-report-v1"}, "status": {"const": "PASS"}, "task_id": {"const": "stage1.08_ddp_and_gradient_accumulation"},
     "fixture_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
     "nccl_transport_protocol": {"$ref": "#/$defs/nccl_transport_protocol"},
-    "implementation_source_sha256": {"type": "object", "minProperties": 30, "maxProperties": 30, "propertyNames": {"pattern": "^(ops|src|configs|schemas)/.+$"}, "additionalProperties": {"type": "string", "pattern": "^[0-9a-f]{64}$"}},
+    "implementation_source_sha256": {"type": "object", "minProperties": 31, "maxProperties": 31, "propertyNames": {"pattern": "^(ops|src|configs|schemas)/.+$"}, "additionalProperties": {"type": "string", "pattern": "^[0-9a-f]{64}$"}},
     "baseline_routes": {"type": "object", "additionalProperties": false, "required": ["A", "B", "C", "D"], "properties": {"A": {"$ref": "s1-8-worker-report-v1.json"}, "B": {"$ref": "s1-8-worker-report-v1.json"}, "C": {"$ref": "s1-8-worker-report-v1.json"}, "D": {"$ref": "s1-8-worker-report-v1.json"}}},
     "permutation_routes": {"type": "object", "additionalProperties": false, "required": ["rank_swap", "local_reverse"], "properties": {"rank_swap": {"$ref": "s1-8-worker-report-v1.json"}, "local_reverse": {"$ref": "s1-8-worker-report-v1.json"}}},
     "negative_controls": {"type": "object", "additionalProperties": false, "required": ["ordinary_sync_negative", "inject_rank_failure"], "properties": {"ordinary_sync_negative": {"$ref": "#/$defs/negative"}, "inject_rank_failure": {"$ref": "#/$defs/negative"}}},
