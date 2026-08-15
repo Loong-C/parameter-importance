@@ -1132,6 +1132,12 @@ def _same_session_stat_identity(expected: Mapping[str, Any], observed: Mapping[s
     return all(expected.get(field) == observed.get(field) for field in ("pid", "uid", "pgid", "sid", "start_ticks"))
 
 
+def _same_process_identity(expected: Mapping[str, Any], observed: Mapping[str, Any]) -> bool:
+    """Compare a pre-token provisional identity without claiming token proof."""
+
+    return all(expected.get(field) == observed.get(field) for field in ("pid", "uid", "pgid", "sid", "start_ticks", "exe", "cmdline_sha256"))
+
+
 def _inherited_run_token(pid: int, run_token: str) -> str:
     """Require an exact S1.8 token inherited at child process creation."""
 
@@ -1246,9 +1252,36 @@ def _tree_depths(
     return depths
 
 
+def _provisional_session_member(
+    *, member_pid: int, member_stat: Mapping[str, Any], expected: Mapping[str, Any],
+    observed: Mapping[int, Mapping[str, Any]], known_members: Mapping[int, Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Prove a new session PID is a launcher descendant before one token retry.
+
+    This is deliberately not an ownership attestation: the returned identity
+    is not put into ``known_members`` and is never eligible for signalling.
+    The next audit must discover the same PID through its inherited run token.
+    """
+
+    try:
+        candidate = _process_identity(member_pid)
+    except (OSError, ProcessLookupError):
+        raise Stage1S18ManualInterventionRequired("S18_PROCESS_SESSION_CANDIDATE_UNVERIFIABLE") from None
+    expected_uid, expected_start = expected.get("uid"), expected.get("start_ticks")
+    start = candidate.get("start_ticks")
+    if candidate.get("uid") != expected_uid or not isinstance(expected_start, str) or not expected_start.isdigit() or not isinstance(start, str) or not start.isdigit() or int(start) < int(expected_start) or not _same_session_stat_identity(candidate, member_stat):
+        raise Stage1S18ManualInterventionRequired("S18_PROCESS_SESSION_CANDIDATE_IDENTITY_DRIFT")
+    try:
+        _tree_depths(expected=expected, observed={**observed, member_pid: candidate}, known_members=known_members)
+    except Stage1S18ManualInterventionRequired as error:
+        raise Stage1S18ManualInterventionRequired("S18_PROCESS_SESSION_CANDIDATE_ANCESTRY_DRIFT") from error
+    return candidate
+
+
 def _audit_exact_process_group(
     expected: Mapping[str, Any], *, known_members: Mapping[int, Mapping[str, Any]] | None = None,
     _session_membership_rechecked: bool = False,
+    _provisional_members: Mapping[int, Mapping[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Fail closed unless every live token process belongs to this launch tree.
 
@@ -1259,9 +1292,10 @@ def _audit_exact_process_group(
     nevertheless inspect every live member of every involved SID and reject a
     session containing an unrelated process.  A fully parsed zombie is
     excluded only if it was already fully token-bound and its stat identity
-    exactly matches that first fingerprint.  For a known non-zombie, one
-    recheck may confirm normal exit or complete token/ancestry recovery; a
-    never-known PID, including a zombie, is never promoted or ignored.
+    exactly matches that first fingerprint.  A newly visible direct descendant
+    gets one provisional retry only after stat/UID/ancestry checks; it cannot
+    enter the known tree or be signalled until exact-token discovery on that
+    retry.  A never-token PID, including a zombie, is never promoted.
     """
 
     pgid, sid, token = expected.get("pgid"), expected.get("sid"), expected.get("environment_run_token")
@@ -1269,9 +1303,14 @@ def _audit_exact_process_group(
     if not isinstance(pgid, int) or not isinstance(sid, int) or not isinstance(token, str) or not isinstance(expected_pid, int) or not isinstance(expected_uid, int) or not isinstance(expected_start, str) or not expected_start.isdigit():
         raise Stage1S18ManualInterventionRequired("S18_PROCESS_AUDIT_EXPECTED_INVALID")
     previous = dict(known_members or {})
+    provisional = {int(pid): dict(member) for pid, member in (dict(_provisional_members or {})).items() if isinstance(pid, int) and isinstance(member, Mapping)}
+    if len(provisional) != len(_provisional_members or {}):
+        raise Stage1S18ManualInterventionRequired("S18_PROCESS_SESSION_PROVISIONAL_INVALID")
     token_ids = _token_process_ids(token)
     if expected_pid not in token_ids:
         raise ProcessLookupError(expected_pid)
+    if _session_membership_rechecked and not set(provisional).issubset(token_ids):
+        raise Stage1S18ManualInterventionRequired("S18_PROCESS_SESSION_PROVISIONAL_TOKEN_MISSING")
     observed: dict[int, dict[str, Any]] = {}
     for pid in token_ids:
         try:
@@ -1284,11 +1323,15 @@ def _audit_exact_process_group(
         earlier = previous.get(pid)
         if earlier is not None and not _same_live_fingerprint(earlier, fingerprint):
             raise Stage1S18ManualInterventionRequired("S18_PROCESS_TREE_MEMBER_IDENTITY_DRIFT")
+        provisional_member = provisional.get(pid)
+        if provisional_member is not None and not _same_process_identity(provisional_member, fingerprint):
+            raise Stage1S18ManualInterventionRequired("S18_PROCESS_SESSION_PROVISIONAL_IDENTITY_DRIFT")
         observed[pid] = fingerprint
     launcher = observed.get(expected_pid)
     if launcher is None or not _same_live_fingerprint(expected, launcher):
         raise Stage1S18ManualInterventionRequired("S18_PROCESS_LAUNCHER_FINGERPRINT_DRIFT")
     depths = _tree_depths(expected=expected, observed=observed, known_members=previous)
+    newly_provisional: dict[int, dict[str, Any]] = {}
     for member_sid in sorted({int(item["sid"]) for item in observed.values()}):
         for member_pid in _session_members(member_sid):
             earlier = previous.get(member_pid)
@@ -1313,7 +1356,22 @@ def _audit_exact_process_group(
                 session_member = None
             if session_member is None or member_pid not in observed or not _same_live_fingerprint(observed[member_pid], session_member):
                 if not isinstance(earlier, Mapping):
-                    raise Stage1S18ManualInterventionRequired("S18_PROCESS_SESSION_TOKEN_MEMBERSHIP_DRIFT")
+                    if _session_membership_rechecked:
+                        raise Stage1S18ManualInterventionRequired("S18_PROCESS_SESSION_TOKEN_MEMBERSHIP_DRIFT")
+                    candidate = _provisional_session_member(
+                        member_pid=member_pid,
+                        member_stat=member_stat,
+                        expected=expected,
+                        observed=observed,
+                        known_members=previous,
+                    )
+                    # Audit every newly seen member in this snapshot before
+                    # the single bounded retry.  Otherwise a second worker in
+                    # the same elastic session could evade the provisional
+                    # token-recovery requirement merely because iteration
+                    # reached its sibling first.
+                    newly_provisional[member_pid] = candidate
+                    continue
                 if not _same_session_stat_identity(earlier, member_stat):
                     raise Stage1S18ManualInterventionRequired("S18_PROCESS_SESSION_TOKEN_MEMBERSHIP_DRIFT")
                 if session_member is not None and not _same_live_fingerprint(earlier, session_member):
@@ -1329,6 +1387,14 @@ def _audit_exact_process_group(
                         _session_membership_rechecked=True,
                     )
                 raise Stage1S18ManualInterventionRequired("S18_PROCESS_SESSION_TOKEN_MEMBERSHIP_DRIFT")
+    if newly_provisional:
+        time.sleep(SESSION_MEMBER_REVALIDATION_SECONDS)
+        return _audit_exact_process_group(
+            expected,
+            known_members=previous,
+            _session_membership_rechecked=True,
+            _provisional_members={**provisional, **newly_provisional},
+        )
     members = [observed[pid] for pid in sorted(observed)]
     return {
         "pgid": pgid, "sid": sid, "members": members, "member_pids": sorted(observed),

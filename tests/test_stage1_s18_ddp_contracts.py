@@ -393,11 +393,142 @@ def test_unknown_member_in_worker_session_blocks_without_signal(monkeypatch: pyt
     monkeypatch.setattr(formalizer, "_fingerprint", lambda pid, _: base if pid == 100 else worker if pid == 101 else (_ for _ in ()).throw(ProcessLookupError(pid)))
     monkeypatch.setattr(formalizer, "_session_members", lambda sid: [100] if sid == 100 else [101, 999])
     monkeypatch.setattr(formalizer, "_session_member_stat", lambda pid: {"pid": pid, "uid": 7, "pgid": pid, "sid": 100 if pid == 100 else 201, "start_ticks": "10" if pid == 100 else "11", "state": "S"})
+    outsider = {"pid": 999, "ppid": 77, "uid": 7, "pgid": 999, "sid": 201, "start_ticks": "11", "exe": "/usr/bin/python", "cmdline_sha256": "a" * 64}
+    monkeypatch.setattr(formalizer, "_process_identity", lambda pid: outsider if pid == 999 else (_ for _ in ()).throw(ProcessLookupError(pid)))
     sleeps: list[float] = []
     monkeypatch.setattr(formalizer.time, "sleep", lambda seconds: sleeps.append(seconds))
-    with pytest.raises(formalizer.Stage1S18ManualInterventionRequired, match="S18_PROCESS_SESSION_TOKEN_MEMBERSHIP_DRIFT"):
+    with pytest.raises(formalizer.Stage1S18ManualInterventionRequired, match="S18_PROCESS_SESSION_CANDIDATE_ANCESTRY_DRIFT"):
         formalizer._audit_exact_process_group(base, known_members={100: base})
     assert sleeps == []
+
+
+def test_new_session_member_token_scan_race_requires_exact_token_recovery(monkeypatch: pytest.MonkeyPatch) -> None:
+    formalizer = _formalizer(); token = "b" * 64
+    def member(pid: int, parent: int, pgid: int, sid: int, start: int) -> dict[str, object]:
+        return {"pid": pid, "ppid": parent, "uid": 7, "pgid": pgid, "sid": sid, "start_ticks": str(start), "exe": "/usr/bin/python", "cmdline_sha256": "a" * 64, "environment_run_token": token}
+    launcher, worker, candidate = member(100, 1, 100, 100, 10), member(101, 100, 101, 201, 11), member(102, 100, 102, 201, 12)
+    records = {100: launcher, 101: worker, 102: candidate}
+    token_passes = [[100, 101], [100, 101, 102]]
+    session_passes = {100: [[100], [100]], 201: [[101, 102], [101, 102]]}
+    candidate_calls = [ProcessLookupError(102), candidate, candidate]
+    monkeypatch.setattr(formalizer, "_token_process_ids", lambda _: token_passes.pop(0))
+    def fingerprint(pid: int, _token: str) -> dict[str, object]:
+        if pid == 102:
+            next_value = candidate_calls.pop(0)
+            if isinstance(next_value, BaseException):
+                raise next_value
+            return next_value
+        return records[pid]
+    monkeypatch.setattr(formalizer, "_fingerprint", fingerprint)
+    monkeypatch.setattr(formalizer, "_process_identity", lambda pid: records[pid])
+    monkeypatch.setattr(formalizer, "_session_members", lambda sid: session_passes[sid].pop(0))
+    monkeypatch.setattr(formalizer, "_session_member_stat", lambda pid: {key: records[pid][key] for key in ("pid", "uid", "pgid", "sid", "start_ticks")} | {"state": "S"})
+    sleeps: list[float] = []
+    monkeypatch.setattr(formalizer.time, "sleep", lambda seconds: sleeps.append(seconds))
+    known = {100: launcher}
+    audit = formalizer._audit_exact_process_group(launcher, known_members=known)
+    assert audit["member_pids"] == [100, 101, 102]
+    assert audit["ancestry_depths"] == {"100": 0, "101": 1, "102": 1}
+    assert known == {100: launcher}
+    assert sleeps == [formalizer.SESSION_MEMBER_REVALIDATION_SECONDS]
+
+
+def test_two_new_same_session_members_recover_together_after_one_token_retry(monkeypatch: pytest.MonkeyPatch) -> None:
+    formalizer = _formalizer(); token = "b" * 64
+    def member(pid: int, parent: int, pgid: int, sid: int, start: int) -> dict[str, object]:
+        return {"pid": pid, "ppid": parent, "uid": 7, "pgid": pgid, "sid": sid, "start_ticks": str(start), "exe": "/usr/bin/python", "cmdline_sha256": "a" * 64, "environment_run_token": token}
+    launcher, worker, first, second = member(100, 1, 100, 100, 10), member(101, 100, 101, 201, 11), member(102, 100, 102, 201, 12), member(103, 100, 103, 201, 13)
+    records = {100: launcher, 101: worker, 102: first, 103: second}
+    token_passes = [[100, 101], [100, 101, 102, 103]]
+    session_passes = {100: [[100], [100]], 201: [[101, 102, 103], [101, 102, 103]]}
+    first_calls = [ProcessLookupError(102), first, first]
+    monkeypatch.setattr(formalizer, "_token_process_ids", lambda _: token_passes.pop(0))
+    def fingerprint(pid: int, _token: str) -> dict[str, object]:
+        if pid == 102:
+            result = first_calls.pop(0)
+            if isinstance(result, BaseException):
+                raise result
+            return result
+        return records[pid]
+    monkeypatch.setattr(formalizer, "_fingerprint", fingerprint)
+    monkeypatch.setattr(formalizer, "_process_identity", lambda pid: records[pid])
+    monkeypatch.setattr(formalizer, "_session_members", lambda sid: session_passes[sid].pop(0))
+    monkeypatch.setattr(formalizer, "_session_member_stat", lambda pid: {key: records[pid][key] for key in ("pid", "uid", "pgid", "sid", "start_ticks")} | {"state": "S"})
+    sleeps: list[float] = []
+    monkeypatch.setattr(formalizer.time, "sleep", lambda seconds: sleeps.append(seconds))
+    audit = formalizer._audit_exact_process_group(launcher, known_members={100: launcher})
+    assert audit["member_pids"] == [100, 101, 102, 103]
+    assert audit["ancestry_depths"] == {"100": 0, "101": 1, "102": 1, "103": 1}
+    assert sleeps == [formalizer.SESSION_MEMBER_REVALIDATION_SECONDS]
+
+
+def test_two_new_same_session_members_require_both_to_recover_token(monkeypatch: pytest.MonkeyPatch) -> None:
+    formalizer = _formalizer(); token = "b" * 64
+    def member(pid: int, parent: int, pgid: int, sid: int, start: int) -> dict[str, object]:
+        return {"pid": pid, "ppid": parent, "uid": 7, "pgid": pgid, "sid": sid, "start_ticks": str(start), "exe": "/usr/bin/python", "cmdline_sha256": "a" * 64, "environment_run_token": token}
+    launcher, worker, first, second = member(100, 1, 100, 100, 10), member(101, 100, 101, 201, 11), member(102, 100, 102, 201, 12), member(103, 100, 103, 201, 13)
+    records = {100: launcher, 101: worker, 102: first, 103: second}
+    token_passes = [[100, 101], [100, 101, 102]]
+    session_passes = {100: [[100], [100]], 201: [[101, 102, 103], [101, 102, 103]]}
+    first_calls = [ProcessLookupError(102), first, first]
+    monkeypatch.setattr(formalizer, "_token_process_ids", lambda _: token_passes.pop(0))
+    def fingerprint(pid: int, _token: str) -> dict[str, object]:
+        if pid == 102:
+            result = first_calls.pop(0)
+            if isinstance(result, BaseException):
+                raise result
+            return result
+        if pid == 103:
+            raise ProcessLookupError(pid)
+        return records[pid]
+    monkeypatch.setattr(formalizer, "_fingerprint", fingerprint)
+    monkeypatch.setattr(formalizer, "_process_identity", lambda pid: records[pid])
+    monkeypatch.setattr(formalizer, "_session_members", lambda sid: session_passes[sid].pop(0))
+    monkeypatch.setattr(formalizer, "_session_member_stat", lambda pid: {key: records[pid][key] for key in ("pid", "uid", "pgid", "sid", "start_ticks")} | {"state": "S"})
+    sleeps: list[float] = []
+    monkeypatch.setattr(formalizer.time, "sleep", lambda seconds: sleeps.append(seconds))
+    with pytest.raises(formalizer.Stage1S18ManualInterventionRequired, match="S18_PROCESS_SESSION_PROVISIONAL_TOKEN_MISSING"):
+        formalizer._audit_exact_process_group(launcher, known_members={100: launcher})
+    assert sleeps == [formalizer.SESSION_MEMBER_REVALIDATION_SECONDS]
+
+
+def test_new_session_member_never_token_recovers_is_manual_after_one_retry(monkeypatch: pytest.MonkeyPatch) -> None:
+    formalizer = _formalizer(); token = "b" * 64
+    def member(pid: int, parent: int, pgid: int, sid: int, start: int) -> dict[str, object]:
+        return {"pid": pid, "ppid": parent, "uid": 7, "pgid": pgid, "sid": sid, "start_ticks": str(start), "exe": "/usr/bin/python", "cmdline_sha256": "a" * 64, "environment_run_token": token}
+    launcher, worker, candidate = member(100, 1, 100, 100, 10), member(101, 100, 101, 201, 11), member(102, 100, 102, 201, 12)
+    records = {100: launcher, 101: worker, 102: candidate}
+    token_passes = [[100, 101], [100, 101]]
+    monkeypatch.setattr(formalizer, "_token_process_ids", lambda _: token_passes.pop(0))
+    monkeypatch.setattr(formalizer, "_fingerprint", lambda pid, _: records[pid] if pid != 102 else (_ for _ in ()).throw(ProcessLookupError(pid)))
+    monkeypatch.setattr(formalizer, "_process_identity", lambda pid: records[pid])
+    monkeypatch.setattr(formalizer, "_session_members", lambda sid: [100] if sid == 100 else [101, 102])
+    monkeypatch.setattr(formalizer, "_session_member_stat", lambda pid: {key: records[pid][key] for key in ("pid", "uid", "pgid", "sid", "start_ticks")} | {"state": "S"})
+    sleeps: list[float] = []
+    monkeypatch.setattr(formalizer.time, "sleep", lambda seconds: sleeps.append(seconds))
+    with pytest.raises(formalizer.Stage1S18ManualInterventionRequired, match="S18_PROCESS_SESSION_PROVISIONAL_TOKEN_MISSING"):
+        formalizer._audit_exact_process_group(launcher, known_members={100: launcher})
+    assert sleeps == [formalizer.SESSION_MEMBER_REVALIDATION_SECONDS]
+
+
+def test_new_session_member_provisional_identity_drift_is_manual(monkeypatch: pytest.MonkeyPatch) -> None:
+    formalizer = _formalizer(); token = "b" * 64
+    def member(pid: int, parent: int, pgid: int, sid: int, start: int) -> dict[str, object]:
+        return {"pid": pid, "ppid": parent, "uid": 7, "pgid": pgid, "sid": sid, "start_ticks": str(start), "exe": "/usr/bin/python", "cmdline_sha256": "a" * 64, "environment_run_token": token}
+    launcher, worker, candidate = member(100, 1, 100, 100, 10), member(101, 100, 101, 201, 11), member(102, 100, 102, 201, 12)
+    drifted_candidate = {**candidate, "start_ticks": "13"}
+    records = {100: launcher, 101: worker, 102: candidate}
+    token_passes = [[100, 101], [100, 101, 102]]
+    monkeypatch.setattr(formalizer, "_token_process_ids", lambda _: token_passes.pop(0))
+    monkeypatch.setattr(formalizer, "_fingerprint", lambda pid, _: records[pid] if pid != 102 else drifted_candidate)
+    monkeypatch.setattr(formalizer, "_process_identity", lambda pid: records[pid])
+    monkeypatch.setattr(formalizer, "_session_members", lambda sid: [100] if sid == 100 else [101, 102])
+    monkeypatch.setattr(formalizer, "_session_member_stat", lambda pid: {key: records[pid][key] for key in ("pid", "uid", "pgid", "sid", "start_ticks")} | {"state": "S"})
+    sleeps: list[float] = []
+    monkeypatch.setattr(formalizer.time, "sleep", lambda seconds: sleeps.append(seconds))
+    with pytest.raises(formalizer.Stage1S18ManualInterventionRequired, match="S18_PROCESS_SESSION_PROVISIONAL_IDENTITY_DRIFT"):
+        formalizer._audit_exact_process_group(launcher, known_members={100: launcher})
+    assert sleeps == [formalizer.SESSION_MEMBER_REVALIDATION_SECONDS]
 
 
 def test_known_zombie_session_member_is_excluded_without_promoting_new_pid(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -569,6 +700,65 @@ def test_real_linux_elastic_style_child_session_is_audited_and_pidfd_terminated(
     finally:
         if launcher.poll() is None:
             launcher.kill(); launcher.wait(timeout=5)
+
+
+@pytest.mark.skipif(os.name != "posix" or not Path("/proc").is_dir() or not hasattr(os, "pidfd_open") or not hasattr(signal, "pidfd_send_signal"), reason="requires Linux /proc and pidfd")
+def test_real_linux_same_session_token_scan_race_recovers_child_once(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A genuine inherited-token child must pass the one bounded re-scan.
+
+    The launcher and child share one session so the first deliberately stale
+    token enumeration reproduces the r11 ordering race.  The child is never
+    made known or signallable until the second complete token enumeration.
+    """
+
+    formalizer = _formalizer(); token = "e" * 64; pid_path = tmp_path / "child.pid"
+    child_code = "import time; time.sleep(8)"
+    launcher_code = (
+        "import pathlib,subprocess,sys,time; "
+        f"child=subprocess.Popen([sys.executable, '-c', {child_code!r}]); "
+        f"pathlib.Path({str(pid_path)!r}).write_text(str(child.pid), encoding='ascii'); "
+        "time.sleep(8)"
+    )
+    environment = dict(os.environ); environment["PARAM_IMPORTANCE_S18_RUN_TOKEN"] = token
+    launcher = subprocess.Popen([sys.executable, "-c", launcher_code], env=environment, start_new_session=True)
+    child_pid: int | None = None
+    try:
+        deadline = time.monotonic() + 4.0
+        while time.monotonic() < deadline and not pid_path.is_file():
+            time.sleep(0.01)
+        assert pid_path.is_file()
+        child_pid = int(pid_path.read_text(encoding="ascii"))
+        expected = formalizer._fingerprint(launcher.pid, token)
+        original_token_process_ids = formalizer._token_process_ids
+        token_scans: list[list[int]] = []
+
+        def stale_first_scan(run_token: str) -> list[int]:
+            members = original_token_process_ids(run_token)
+            if not token_scans:
+                members = [pid for pid in members if pid != child_pid]
+            token_scans.append(members)
+            return members
+
+        monkeypatch.setattr(formalizer, "_token_process_ids", stale_first_scan)
+        audit = formalizer._audit_exact_process_group(expected, known_members={launcher.pid: expected})
+        assert token_scans == [[launcher.pid], sorted([launcher.pid, child_pid])]
+        assert audit["member_pids"] == sorted([launcher.pid, child_pid])
+        assert audit["ancestry_depths"] == {str(launcher.pid): 0, str(child_pid): 1}
+        assert len({member["sid"] for member in audit["members"]}) == 1
+        assert len(formalizer._signal_exact_tree(audit, signal.SIGTERM)) == 2
+        launcher.wait(timeout=5)
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline and formalizer._residual_launch_tree(expected, known_members={launcher.pid: expected})["session_members"]:
+            time.sleep(0.05)
+        assert formalizer._residual_launch_tree(expected, known_members={launcher.pid: expected}) == {"session_members": [], "token_members": []}
+    finally:
+        if launcher.poll() is None:
+            launcher.kill(); launcher.wait(timeout=5)
+        if child_pid is not None:
+            try:
+                formalizer._signal_exact_member(formalizer._fingerprint(child_pid, token), signal.SIGKILL)
+            except (OSError, ProcessLookupError, formalizer.Stage1S18ManualInterventionRequired):
+                pass
 
 
 def test_process_outcome_requires_exact_endpoint_handoff_and_independent_worker_tree() -> None:
