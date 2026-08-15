@@ -311,6 +311,7 @@ def test_independent_worker_sessions_are_discovered_by_token_and_historical_ance
     monkeypatch.setattr(formalizer, "_token_process_ids", lambda _: [100, 101, 102])
     monkeypatch.setattr(formalizer, "_fingerprint", fingerprint)
     monkeypatch.setattr(formalizer, "_session_members", lambda sid: {100: [100], 201: [101], 202: [102]}[sid])
+    monkeypatch.setattr(formalizer, "_session_member_stat", lambda pid: {key: fingerprint(pid, token)[key] for key in ("pid", "uid", "pgid", "sid", "start_ticks")} | {"state": "S"})
     audit = formalizer._audit_exact_process_group(expected, known_members={100: expected})
     assert audit["member_pids"] == [100, 101, 102]
     assert audit["ancestry_depths"] == {"100": 0, "101": 1, "102": 2}
@@ -321,6 +322,16 @@ def test_independent_worker_sessions_are_discovered_by_token_and_historical_ance
     assert signalled == [102, 101, 100]
 
 
+def test_session_member_stat_parser_handles_arbitrary_comm_and_rejects_malformed() -> None:
+    formalizer = _formalizer()
+    fields = ["S", "1", "456", "789", *(["0"] * 15), "12345"]
+    parsed = formalizer._parse_session_member_stat("123 (worker ) has spaces) " + " ".join(fields), pid=123, uid=7)
+    assert parsed == {"pid": 123, "uid": 7, "pgid": 456, "sid": 789, "state": "S", "start_ticks": "12345"}
+    for malformed in ("123 worker) S 1 456 789", "124 (worker) S 1 456 789", "123 (worker S 1 456 789", "123 (worker) SS 1 456 789 " + " ".join(["0"] * 16)):
+        with pytest.raises(formalizer.Stage1S18ManualInterventionRequired, match="S18_PROCESS_SESSION_MEMBER_STATE_UNVERIFIABLE"):
+            formalizer._parse_session_member_stat(malformed, pid=123, uid=7)
+
+
 def test_unknown_member_in_worker_session_blocks_without_signal(monkeypatch: pytest.MonkeyPatch) -> None:
     formalizer = _formalizer(); token = "b" * 64
     base = {"pid": 100, "ppid": 1, "uid": 7, "pgid": 100, "sid": 100, "start_ticks": "10", "exe": "/usr/bin/python", "cmdline_sha256": "a" * 64, "environment_run_token": token}
@@ -328,8 +339,126 @@ def test_unknown_member_in_worker_session_blocks_without_signal(monkeypatch: pyt
     monkeypatch.setattr(formalizer, "_token_process_ids", lambda _: [100, 101])
     monkeypatch.setattr(formalizer, "_fingerprint", lambda pid, _: base if pid == 100 else worker if pid == 101 else (_ for _ in ()).throw(ProcessLookupError(pid)))
     monkeypatch.setattr(formalizer, "_session_members", lambda sid: [100] if sid == 100 else [101, 999])
+    monkeypatch.setattr(formalizer, "_session_member_stat", lambda pid: {"pid": pid, "uid": 7, "pgid": pid, "sid": 100 if pid == 100 else 201, "start_ticks": "10" if pid == 100 else "11", "state": "S"})
+    sleeps: list[float] = []
+    monkeypatch.setattr(formalizer.time, "sleep", lambda seconds: sleeps.append(seconds))
     with pytest.raises(formalizer.Stage1S18ManualInterventionRequired, match="S18_PROCESS_SESSION_TOKEN_MEMBERSHIP_DRIFT"):
         formalizer._audit_exact_process_group(base, known_members={100: base})
+    assert sleeps == []
+
+
+def test_known_zombie_session_member_is_excluded_without_promoting_new_pid(monkeypatch: pytest.MonkeyPatch) -> None:
+    formalizer = _formalizer(); token = "b" * 64
+    base = {"pid": 100, "ppid": 1, "uid": 7, "pgid": 100, "sid": 100, "start_ticks": "10", "exe": "/usr/bin/python", "cmdline_sha256": "a" * 64, "environment_run_token": token}
+    worker = {**base, "pid": 101, "ppid": 100, "pgid": 101, "sid": 201, "start_ticks": "11"}
+    exited_worker = {**base, "pid": 102, "ppid": 100, "pgid": 102, "sid": 201, "start_ticks": "12"}
+    monkeypatch.setattr(formalizer, "_token_process_ids", lambda _: [100, 101])
+    monkeypatch.setattr(formalizer, "_fingerprint", lambda pid, _: base if pid == 100 else worker if pid == 101 else (_ for _ in ()).throw(ProcessLookupError(pid)))
+    monkeypatch.setattr(formalizer, "_session_members", lambda sid: [100] if sid == 100 else [101, 102])
+    monkeypatch.setattr(formalizer, "_session_member_stat", lambda pid: {key: (base if pid == 100 else worker if pid == 101 else exited_worker)[key] for key in ("pid", "uid", "pgid", "sid", "start_ticks")} | {"state": "Z" if pid == 102 else "S"})
+    sleeps: list[float] = []
+    monkeypatch.setattr(formalizer.time, "sleep", lambda seconds: sleeps.append(seconds))
+    audit = formalizer._audit_exact_process_group(base, known_members={100: base, 102: exited_worker})
+    assert audit["member_pids"] == [100, 101]
+    assert sleeps == []
+
+
+def test_never_known_zombie_session_member_is_manual_without_retry(monkeypatch: pytest.MonkeyPatch) -> None:
+    formalizer = _formalizer(); token = "b" * 64
+    base = {"pid": 100, "ppid": 1, "uid": 7, "pgid": 100, "sid": 100, "start_ticks": "10", "exe": "/usr/bin/python", "cmdline_sha256": "a" * 64, "environment_run_token": token}
+    worker = {**base, "pid": 101, "ppid": 100, "pgid": 101, "sid": 201, "start_ticks": "11"}
+    monkeypatch.setattr(formalizer, "_token_process_ids", lambda _: [100, 101])
+    monkeypatch.setattr(formalizer, "_fingerprint", lambda pid, _: base if pid == 100 else worker if pid == 101 else (_ for _ in ()).throw(ProcessLookupError(pid)))
+    monkeypatch.setattr(formalizer, "_session_members", lambda sid: [100] if sid == 100 else [101, 999])
+    monkeypatch.setattr(formalizer, "_session_member_stat", lambda pid: {"pid": pid, "uid": 7, "pgid": pid, "sid": 100 if pid == 100 else 201, "start_ticks": "10" if pid == 100 else "11", "state": "Z" if pid == 999 else "S"})
+    sleeps: list[float] = []
+    monkeypatch.setattr(formalizer.time, "sleep", lambda seconds: sleeps.append(seconds))
+    with pytest.raises(formalizer.Stage1S18ManualInterventionRequired, match="S18_PROCESS_SESSION_TOKEN_MEMBERSHIP_DRIFT"):
+        formalizer._audit_exact_process_group(base, known_members={100: base})
+    assert sleeps == []
+
+
+def test_known_session_member_stat_disappearance_retries_a_fresh_audit(monkeypatch: pytest.MonkeyPatch) -> None:
+    formalizer = _formalizer(); token = "b" * 64
+    base = {"pid": 100, "ppid": 1, "uid": 7, "pgid": 100, "sid": 100, "start_ticks": "10", "exe": "/usr/bin/python", "cmdline_sha256": "a" * 64, "environment_run_token": token}
+    worker = {**base, "pid": 101, "ppid": 100, "pgid": 101, "sid": 201, "start_ticks": "11"}
+    exited_worker = {**base, "pid": 102, "ppid": 100, "pgid": 102, "sid": 201, "start_ticks": "12"}
+    records = {100: base, 101: worker, 102: exited_worker}
+    session_passes = {100: [[100], [100]], 201: [[101, 102], [101]]}
+    monkeypatch.setattr(formalizer, "_token_process_ids", lambda _: [100, 101])
+    monkeypatch.setattr(formalizer, "_fingerprint", lambda pid, _: records[pid])
+    monkeypatch.setattr(formalizer, "_session_members", lambda sid: session_passes[sid].pop(0))
+    def stat(pid: int) -> dict[str, object]:
+        if pid == 102:
+            raise formalizer._SessionMemberStatUnavailable(pid)
+        return {key: records[pid][key] for key in ("pid", "uid", "pgid", "sid", "start_ticks")} | {"state": "S"}
+    monkeypatch.setattr(formalizer, "_session_member_stat", stat)
+    sleeps: list[float] = []
+    monkeypatch.setattr(formalizer.time, "sleep", lambda seconds: sleeps.append(seconds))
+    audit = formalizer._audit_exact_process_group(base, known_members={100: base, 102: exited_worker})
+    assert audit["member_pids"] == [100, 101]
+    assert sleeps == [formalizer.SESSION_MEMBER_REVALIDATION_SECONDS]
+
+
+def test_never_known_session_member_stat_disappearance_is_manual_without_retry(monkeypatch: pytest.MonkeyPatch) -> None:
+    formalizer = _formalizer(); token = "b" * 64
+    base = {"pid": 100, "ppid": 1, "uid": 7, "pgid": 100, "sid": 100, "start_ticks": "10", "exe": "/usr/bin/python", "cmdline_sha256": "a" * 64, "environment_run_token": token}
+    worker = {**base, "pid": 101, "ppid": 100, "pgid": 101, "sid": 201, "start_ticks": "11"}
+    records = {100: base, 101: worker}
+    monkeypatch.setattr(formalizer, "_token_process_ids", lambda _: [100, 101])
+    monkeypatch.setattr(formalizer, "_fingerprint", lambda pid, _: records[pid])
+    monkeypatch.setattr(formalizer, "_session_members", lambda sid: [100] if sid == 100 else [101, 999])
+    def stat(pid: int) -> dict[str, object]:
+        if pid == 999:
+            raise formalizer._SessionMemberStatUnavailable(pid)
+        return {key: records[pid][key] for key in ("pid", "uid", "pgid", "sid", "start_ticks")} | {"state": "S"}
+    monkeypatch.setattr(formalizer, "_session_member_stat", stat)
+    sleeps: list[float] = []
+    monkeypatch.setattr(formalizer.time, "sleep", lambda seconds: sleeps.append(seconds))
+    with pytest.raises(formalizer.Stage1S18ManualInterventionRequired, match="S18_PROCESS_SESSION_MEMBER_STATE_UNVERIFIABLE"):
+        formalizer._audit_exact_process_group(base, known_members={100: base})
+    assert sleeps == []
+
+
+def test_known_session_member_stat_disappearance_twice_is_manual(monkeypatch: pytest.MonkeyPatch) -> None:
+    formalizer = _formalizer(); token = "b" * 64
+    base = {"pid": 100, "ppid": 1, "uid": 7, "pgid": 100, "sid": 100, "start_ticks": "10", "exe": "/usr/bin/python", "cmdline_sha256": "a" * 64, "environment_run_token": token}
+    worker = {**base, "pid": 101, "ppid": 100, "pgid": 101, "sid": 201, "start_ticks": "11"}
+    exited_worker = {**base, "pid": 102, "ppid": 100, "pgid": 102, "sid": 201, "start_ticks": "12"}
+    records = {100: base, 101: worker}
+    session_passes = {100: [[100], [100]], 201: [[101, 102], [101, 102]]}
+    monkeypatch.setattr(formalizer, "_token_process_ids", lambda _: [100, 101])
+    monkeypatch.setattr(formalizer, "_fingerprint", lambda pid, _: records[pid])
+    monkeypatch.setattr(formalizer, "_session_members", lambda sid: session_passes[sid].pop(0))
+    def stat(pid: int) -> dict[str, object]:
+        if pid == 102:
+            raise formalizer._SessionMemberStatUnavailable(pid)
+        return {key: records[pid][key] for key in ("pid", "uid", "pgid", "sid", "start_ticks")} | {"state": "S"}
+    monkeypatch.setattr(formalizer, "_session_member_stat", stat)
+    sleeps: list[float] = []
+    monkeypatch.setattr(formalizer.time, "sleep", lambda seconds: sleeps.append(seconds))
+    with pytest.raises(formalizer.Stage1S18ManualInterventionRequired, match="S18_PROCESS_SESSION_MEMBER_STATE_UNVERIFIABLE"):
+        formalizer._audit_exact_process_group(base, known_members={100: base, 102: exited_worker})
+    assert sleeps == [formalizer.SESSION_MEMBER_REVALIDATION_SECONDS]
+
+
+def test_transient_session_member_recovery_requires_fresh_token_and_ancestry_audit(monkeypatch: pytest.MonkeyPatch) -> None:
+    formalizer = _formalizer(); token = "b" * 64
+    def member(pid: int, parent: int, sid: int, start: int) -> dict[str, object]:
+        return {"pid": pid, "ppid": parent, "uid": 7, "pgid": pid, "sid": sid, "start_ticks": str(start), "exe": "/usr/bin/python", "cmdline_sha256": "a" * 64, "environment_run_token": token}
+    launcher, first_worker, recovered_worker = member(100, 1, 100, 10), member(101, 100, 201, 11), member(102, 100, 202, 12)
+    token_passes = [[100, 101], [100, 101, 102]]
+    session_passes = {100: [[100], [100]], 201: [[101, 102], [101]], 202: [[102]]}
+    monkeypatch.setattr(formalizer, "_token_process_ids", lambda _: token_passes.pop(0))
+    monkeypatch.setattr(formalizer, "_fingerprint", lambda pid, _: {100: launcher, 101: first_worker, 102: recovered_worker}[pid])
+    monkeypatch.setattr(formalizer, "_session_members", lambda sid: session_passes[sid].pop(0))
+    monkeypatch.setattr(formalizer, "_session_member_stat", lambda pid: {key: {100: launcher, 101: first_worker, 102: recovered_worker}[pid][key] for key in ("pid", "uid", "pgid", "sid", "start_ticks")} | {"state": "S"})
+    sleeps: list[float] = []
+    monkeypatch.setattr(formalizer.time, "sleep", lambda seconds: sleeps.append(seconds))
+    audit = formalizer._audit_exact_process_group(launcher, known_members={100: launcher, 102: recovered_worker})
+    assert audit["member_pids"] == [100, 101, 102]
+    assert audit["ancestry_depths"] == {"100": 0, "101": 1, "102": 1}
+    assert sleeps == [formalizer.SESSION_MEMBER_REVALIDATION_SECONDS]
 
 
 def test_launch_audit_allows_only_confirmed_natural_exit_race(monkeypatch: pytest.MonkeyPatch) -> None:

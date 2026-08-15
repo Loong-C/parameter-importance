@@ -117,6 +117,10 @@ _USED_LOOPBACK_RENDEZVOUS_PORTS: set[int] = set()
 # exit.  One bounded wait distinguishes that benign reaping race from a live
 # process whose token/identity can no longer be audited.
 LAUNCHER_EXIT_CONFIRMATION_TIMEOUT_SECONDS = 1.0
+# Elastic workers can become zombies while their recently-used session remains
+# enumerable.  Recheck that narrow /proc transition exactly once before
+# treating a session member as foreign process ownership.
+SESSION_MEMBER_REVALIDATION_SECONDS = 0.05
 PILE_DOWNLOADER_CMDLINE_SIGNATURES = (
     b"server_xet_download.sh",
     b"pile-full-download",
@@ -146,6 +150,10 @@ class Stage1S18FormalError(RuntimeError):
 
 class Stage1S18ManualInterventionRequired(Stage1S18FormalError):
     """A process fingerprint drift makes a signal/lease release unsafe."""
+
+
+class _SessionMemberStatUnavailable(RuntimeError):
+    """A session PID vanished before its stat record could be read."""
 
 
 def _now() -> str:
@@ -1083,6 +1091,43 @@ def _process_identity(pid: int) -> dict[str, Any]:
     return {"pid": pid, "ppid": int(parts[3]), "uid": stat.stat().st_uid, "pgid": os.getpgid(pid), "sid": os.getsid(pid), "start_ticks": parts[21], "exe": os.readlink(executable), "cmdline_sha256": hashlib.sha256(cmdline.read_bytes()).hexdigest()}
 
 
+def _parse_session_member_stat(raw: str, *, pid: int, uid: int) -> dict[str, Any]:
+    """Parse `/proc/<pid>/stat` without treating its arbitrary comm as fields."""
+
+    opening, closing = raw.find("("), raw.rfind(")")
+    if opening <= 0 or closing <= opening or raw[:opening].strip() != str(pid):
+        raise Stage1S18ManualInterventionRequired("S18_PROCESS_SESSION_MEMBER_STATE_UNVERIFIABLE")
+    fields = raw[closing + 1:].split()
+    # After the parenthesized comm, indexes 0/2/3/19 are Linux stat fields
+    # 3(state), 5(pgrp), 6(session), and 22(starttime), respectively.
+    if len(fields) <= 19 or len(fields[0]) != 1 or not fields[2].isdigit() or not fields[3].isdigit() or not fields[19].isdigit():
+        raise Stage1S18ManualInterventionRequired("S18_PROCESS_SESSION_MEMBER_STATE_UNVERIFIABLE")
+    return {"pid": pid, "uid": uid, "pgid": int(fields[2]), "sid": int(fields[3]), "state": fields[0], "start_ticks": fields[19]}
+
+
+def _session_member_stat(pid: int) -> dict[str, Any]:
+    """Read the minimum race-safe state needed to classify a session member.
+
+    A SID can retain a zombie after its environment/executable is no longer
+    readable.  Only a fully parsed ``Z`` state is treated as an exited member;
+    malformed records are ownership failures, while an unavailable record is
+    reported distinctly so the caller can re-audit one already-known PID.
+    """
+
+    try:
+        with Path(f"/proc/{pid}/stat").open("r", encoding="utf-8") as handle:
+            raw, uid = handle.read(), os.fstat(handle.fileno()).st_uid
+    except (OSError, UnicodeDecodeError) as error:
+        raise _SessionMemberStatUnavailable(pid) from error
+    return _parse_session_member_stat(raw, pid=pid, uid=uid)
+
+
+def _same_session_stat_identity(expected: Mapping[str, Any], observed: Mapping[str, Any]) -> bool:
+    """Compare stat-only fields that prove a known PID was not reused."""
+
+    return all(expected.get(field) == observed.get(field) for field in ("pid", "uid", "pgid", "sid", "start_ticks"))
+
+
 def _inherited_run_token(pid: int, run_token: str) -> str:
     """Require an exact S1.8 token inherited at child process creation."""
 
@@ -1197,7 +1242,10 @@ def _tree_depths(
     return depths
 
 
-def _audit_exact_process_group(expected: Mapping[str, Any], *, known_members: Mapping[int, Mapping[str, Any]] | None = None) -> dict[str, Any]:
+def _audit_exact_process_group(
+    expected: Mapping[str, Any], *, known_members: Mapping[int, Mapping[str, Any]] | None = None,
+    _session_membership_rechecked: bool = False,
+) -> dict[str, Any]:
     """Fail closed unless every live token process belongs to this launch tree.
 
     ``torch.distributed.elastic`` starts workers in *new sessions*.  Therefore
@@ -1205,7 +1253,11 @@ def _audit_exact_process_group(expected: Mapping[str, Any], *, known_members: Ma
     is the exact inherited token, same UID, post-launch start time, and the
     launcher-recorded PPID ancestry captured while the launcher is alive.  We
     nevertheless inspect every live member of every involved SID and reject a
-    session containing an unrelated process.
+    session containing an unrelated process.  A fully parsed zombie is
+    excluded only if it was already fully token-bound and its stat identity
+    exactly matches that first fingerprint.  For a known non-zombie, one
+    recheck may confirm normal exit or complete token/ancestry recovery; a
+    never-known PID, including a zombie, is never promoted or ignored.
     """
 
     pgid, sid, token = expected.get("pgid"), expected.get("sid"), expected.get("environment_run_token")
@@ -1235,11 +1287,43 @@ def _audit_exact_process_group(expected: Mapping[str, Any], *, known_members: Ma
     depths = _tree_depths(expected=expected, observed=observed, known_members=previous)
     for member_sid in sorted({int(item["sid"]) for item in observed.values()}):
         for member_pid in _session_members(member_sid):
+            earlier = previous.get(member_pid)
+            try:
+                member_stat = _session_member_stat(member_pid)
+            except _SessionMemberStatUnavailable:
+                if isinstance(earlier, Mapping) and not _session_membership_rechecked:
+                    time.sleep(SESSION_MEMBER_REVALIDATION_SECONDS)
+                    return _audit_exact_process_group(
+                        expected,
+                        known_members=previous,
+                        _session_membership_rechecked=True,
+                    )
+                raise Stage1S18ManualInterventionRequired("S18_PROCESS_SESSION_MEMBER_STATE_UNVERIFIABLE") from None
+            if member_stat["state"] == "Z":
+                if not isinstance(earlier, Mapping) or not _same_session_stat_identity(earlier, member_stat):
+                    raise Stage1S18ManualInterventionRequired("S18_PROCESS_SESSION_TOKEN_MEMBERSHIP_DRIFT")
+                continue
             try:
                 session_member = _fingerprint(member_pid, token)
             except (OSError, ProcessLookupError):
-                raise Stage1S18ManualInterventionRequired("S18_PROCESS_SESSION_TOKEN_MEMBERSHIP_DRIFT") from None
-            if member_pid not in observed or not _same_live_fingerprint(observed[member_pid], session_member):
+                session_member = None
+            if session_member is None or member_pid not in observed or not _same_live_fingerprint(observed[member_pid], session_member):
+                if not isinstance(earlier, Mapping):
+                    raise Stage1S18ManualInterventionRequired("S18_PROCESS_SESSION_TOKEN_MEMBERSHIP_DRIFT")
+                if not _same_session_stat_identity(earlier, member_stat):
+                    raise Stage1S18ManualInterventionRequired("S18_PROCESS_SESSION_TOKEN_MEMBERSHIP_DRIFT")
+                if session_member is not None and not _same_live_fingerprint(earlier, session_member):
+                    raise Stage1S18ManualInterventionRequired("S18_PROCESS_SESSION_TOKEN_MEMBERSHIP_DRIFT")
+                if not _session_membership_rechecked:
+                    # Only a previously attested PID reaches this retry.  The
+                    # retry starts from token discovery and redoes
+                    # UID/start/ancestry checks; no session-only PID is added.
+                    time.sleep(SESSION_MEMBER_REVALIDATION_SECONDS)
+                    return _audit_exact_process_group(
+                        expected,
+                        known_members=previous,
+                        _session_membership_rechecked=True,
+                    )
                 raise Stage1S18ManualInterventionRequired("S18_PROCESS_SESSION_TOKEN_MEMBERSHIP_DRIFT")
     members = [observed[pid] for pid in sorted(observed)]
     return {
