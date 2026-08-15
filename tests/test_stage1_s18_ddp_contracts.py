@@ -91,6 +91,53 @@ def test_learning_rate_map_uses_parameter_identity_for_nonfirst_multi_parameter_
         learning_rate_map(model, DuplicateOptimizer())  # type: ignore[arg-type]
 
 
+def test_route_array_serialization_snapshots_validate_cpu_fp32_layout_and_scalar_shape() -> None:
+    scalar = torch.tensor(1.0, dtype=torch.float32)
+    noncontiguous = torch.arange(12, dtype=torch.float32).reshape(3, 4)[:, 1]
+    snapshots = ddp._route_array_serialization_snapshots({"optimizer-state/equal/p::step": scalar, "scores/equal/raw_score/p": noncontiguous})
+    assert tuple(snapshots["optimizer-state/equal/p::step"].shape) == ()
+    assert snapshots["scores/equal/raw_score/p"].is_contiguous()
+    assert torch.equal(snapshots["scores/equal/raw_score/p"], noncontiguous)
+    assert len({tensor.untyped_storage().data_ptr() for tensor in snapshots.values()}) == len(snapshots)
+    invalid_values = (
+        ({"x": torch.tensor([1.0], dtype=torch.float64)}, "S18_ROUTE_ARRAY_DTYPE_INVALID:x"),
+        ({"x": torch.empty(1, device="meta", dtype=torch.float32)}, "S18_ROUTE_ARRAY_DEVICE_INVALID:x"),
+        ({"x": torch.sparse_coo_tensor(indices=[[0]], values=[1.0], size=[1])}, "S18_ROUTE_ARRAY_LAYOUT_INVALID:x"),
+        ({"x": torch.empty(0, dtype=torch.float32)}, "S18_ROUTE_ARRAY_SHAPE_INVALID:x"),
+        ({"x": torch.tensor([float("nan")], dtype=torch.float32)}, "S18_ROUTE_ARRAY_NONFINITE:x"),
+        ({"x": object()}, "S18_ROUTE_ARRAY_TENSOR_INVALID:x"),
+    )
+    for values, marker in invalid_values:
+        with pytest.raises(Stage1S18Error, match=marker):
+            ddp._route_array_serialization_snapshots(values)  # type: ignore[arg-type]
+
+
+def test_route_array_safetensors_roundtrip_preserves_aliased_semantic_keys(tmp_path: Path) -> None:
+    pytest.importorskip("safetensors.torch")
+    from safetensors.torch import load_file
+
+    shared = torch.tensor([0.25, -0.5], dtype=torch.float32)
+    values = {
+        "scores/equal/raw_score/p": shared,
+        "accumulator/equal/contribution/raw/p": shared,
+        "scores/equal/raw_score_clipped/p": shared,
+        "accumulator/equal/contribution/raw_clipped/p": shared,
+        "optimizer-state/equal/p::step": torch.tensor(1.0, dtype=torch.float32),
+    }
+    snapshots = ddp._route_array_serialization_snapshots(values)
+    assert len({tensor.untyped_storage().data_ptr() for tensor in snapshots.values()}) == len(values)
+    path = tmp_path / "route-B.safetensors"
+    manifest = ddp._save_route_arrays(path, values)
+    loaded = load_file(str(path), device="cpu")
+    assert set(loaded) == set(values) == set(manifest["tensors"])
+    assert len({tensor.untyped_storage().data_ptr() for tensor in loaded.values()}) == len(values)
+    for key, source in values.items():
+        assert loaded[key].dtype == torch.float32
+        assert tuple(loaded[key].shape) == tuple(source.shape)
+        assert torch.equal(loaded[key], source)
+        assert manifest["tensors"][key]["sha256"] == hashlib.sha256(ddp._tensor_bytes(source)).hexdigest()
+
+
 def test_frozen_nccl_transport_requires_p2p_disabled_and_plan_binding(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     assert ddp.NCCL_TRANSPORT_PROTOCOL == {
         "schema_version": "stage1-s1-8-nccl-transport-v1",

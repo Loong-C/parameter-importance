@@ -900,7 +900,51 @@ def _all_reduce_float(value: float, *, device: torch.device) -> float:
     return float(item.item())
 
 
+def _route_array_serialization_snapshots(values: Mapping[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    """Freeze each public array key into an independent safetensors value.
+
+    Several report views intentionally have identical mathematical values (for
+    example, public raw score and the matching accumulator contribution).  The
+    evidence still needs both semantic keys, but safetensors rejects shared
+    storage because it cannot reconstruct that alias relation.  The worker's
+    array contract is already CPU FP32 snapshots; this boundary verifies that
+    contract and creates one detached, contiguous allocation per key.
+    """
+
+    if not isinstance(values, Mapping) or not values:
+        raise Stage1S18Error("S18_ROUTE_ARRAY_VALUES_INVALID")
+    keys = list(values)
+    if any(not isinstance(key, str) or not key for key in keys):
+        raise Stage1S18Error("S18_ROUTE_ARRAY_KEY_INVALID")
+    snapshots: dict[str, torch.Tensor] = {}
+    storage_pointers: set[int] = set()
+    for key in sorted(keys):
+        value = values[key]
+        if not isinstance(value, torch.Tensor):
+            raise Stage1S18Error(f"S18_ROUTE_ARRAY_TENSOR_INVALID:{key}")
+        if value.dtype != torch.float32:
+            raise Stage1S18Error(f"S18_ROUTE_ARRAY_DTYPE_INVALID:{key}")
+        if value.device.type != "cpu":
+            raise Stage1S18Error(f"S18_ROUTE_ARRAY_DEVICE_INVALID:{key}")
+        if value.layout != torch.strided:
+            raise Stage1S18Error(f"S18_ROUTE_ARRAY_LAYOUT_INVALID:{key}")
+        if value.ndim > 0 and any(int(size) <= 0 for size in value.shape):
+            raise Stage1S18Error(f"S18_ROUTE_ARRAY_SHAPE_INVALID:{key}")
+        if not bool(torch.isfinite(value).all()):
+            raise Stage1S18Error(f"S18_ROUTE_ARRAY_NONFINITE:{key}")
+        snapshot = value.detach().to(device="cpu", dtype=torch.float32).clone(memory_format=torch.contiguous_format).contiguous()
+        if snapshot.dtype != torch.float32 or snapshot.device.type != "cpu" or snapshot.layout != torch.strided or not snapshot.is_contiguous() or tuple(snapshot.shape) != tuple(value.shape) or not torch.equal(snapshot, value.detach()):
+            raise Stage1S18Error(f"S18_ROUTE_ARRAY_SNAPSHOT_DRIFT:{key}")
+        pointer = snapshot.untyped_storage().data_ptr()
+        if pointer in storage_pointers:
+            raise Stage1S18Error("S18_ROUTE_ARRAY_SNAPSHOT_STORAGE_ALIAS")
+        storage_pointers.add(pointer)
+        snapshots[key] = snapshot
+    return snapshots
+
+
 def _save_route_arrays(path: Path, values: Mapping[str, torch.Tensor]) -> dict[str, object]:
+    serializable = _route_array_serialization_snapshots(values)
     try:
         from safetensors import safe_open
         from safetensors.torch import save_file
@@ -908,13 +952,16 @@ def _save_route_arrays(path: Path, values: Mapping[str, torch.Tensor]) -> dict[s
         raise Stage1S18Error("S18_SAFETENSORS_UNAVAILABLE") from error
     if path.exists():
         raise Stage1S18Error("S18_ROUTE_ARRAY_FILE_COLLISION")
-    save_file(dict(values), str(path), metadata={"schema_version": ARRAY_MANIFEST_SCHEMA})
+    save_file(serializable, str(path), metadata={"schema_version": ARRAY_MANIFEST_SCHEMA})
     tensors: dict[str, object] = {}
     with safe_open(str(path), framework="pt", device="cpu") as handle:
-        if set(handle.keys()) != set(values) or handle.metadata() != {"schema_version": ARRAY_MANIFEST_SCHEMA}:
+        if set(handle.keys()) != set(serializable) or handle.metadata() != {"schema_version": ARRAY_MANIFEST_SCHEMA}:
             raise Stage1S18Error("S18_ROUTE_ARRAY_SAVE_DRIFT")
-        for key in sorted(values):
+        for key in sorted(serializable):
             tensor = handle.get_tensor(key)
+            expected = serializable[key]
+            if tensor.dtype != torch.float32 or tensor.device.type != "cpu" or tensor.layout != torch.strided or not tensor.is_contiguous() or tuple(tensor.shape) != tuple(expected.shape) or not torch.equal(tensor, expected):
+                raise Stage1S18Error(f"S18_ROUTE_ARRAY_SAVE_VALUE_DRIFT:{key}")
             tensors[key] = {"sha256": hashlib.sha256(_tensor_bytes(tensor)).hexdigest(), "dtype": str(tensor.dtype), "shape": list(tensor.shape)}
     return with_artifact_hash({"schema_version": ARRAY_MANIFEST_SCHEMA, "file": path.name, "file_sha256": sha256_file(path), "file_size_bytes": path.stat().st_size, "tensors": tensors})
 
