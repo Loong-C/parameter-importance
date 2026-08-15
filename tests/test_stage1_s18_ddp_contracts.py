@@ -226,6 +226,24 @@ def test_worker_and_array_schemas_validate_real_shape_then_reject_deep_unknown_a
     formalizer = _formalizer()
     report = _worker_report_a(formalizer)
     formalizer._validate_output_schemas(Path("."), {"worker_report": report, "safetensors_manifest": report["arrays"]})
+    scalar_step = copy.deepcopy(report)
+    scalar_step["arrays"]["tensors"]["optimizer-state/equal/embed_out.weight::step"] = {"sha256": "d" * 64, "dtype": "torch.float32", "shape": []}
+    for row in scalar_step["cases"]:
+        row["array_keys"] = [f"a-reference/{row['case']}/{field}/p" for field in ("mean_gradient", "raw_core", "raw_score", "raw_score_clipped", "data_update", "magnitude")]
+    scalar_step["arrays"] = formalizer._with_hash({key: value for key, value in scalar_step["arrays"].items() if key != "artifact_hash"})
+    scalar_step["artifact_hash"] = formalizer._canonical({key: value for key, value in scalar_step.items() if key != "artifact_hash"})
+    formalizer._validate_output_schemas(Path("."), {"worker_report": scalar_step, "safetensors_manifest": scalar_step["arrays"]})
+    formalizer._validate_worker_candidate_contract("A", scalar_step)
+    bad_scalar_shape = copy.deepcopy(scalar_step); bad_scalar_shape["arrays"]["tensors"]["optimizer-state/equal/embed_out.weight::step"]["shape"] = [0]
+    bad_scalar_shape["arrays"] = formalizer._with_hash({key: value for key, value in bad_scalar_shape["arrays"].items() if key != "artifact_hash"})
+    bad_scalar_shape["artifact_hash"] = formalizer._canonical({key: value for key, value in bad_scalar_shape.items() if key != "artifact_hash"})
+    with pytest.raises(formalizer.Stage1S18FormalError, match="S18_SCHEMA_VALIDATION_FAILED"):
+        formalizer._validate_output_schemas(Path("."), {"worker_report": bad_scalar_shape})
+    bad_scalar_descriptor = copy.deepcopy(scalar_step); bad_scalar_descriptor["arrays"]["tensors"]["optimizer-state/equal/embed_out.weight::step"] = {"sha256": "d" * 64, "dtype": "torch.float64", "shape": [], "unexpected": True}
+    bad_scalar_descriptor["arrays"] = formalizer._with_hash({key: value for key, value in bad_scalar_descriptor["arrays"].items() if key != "artifact_hash"})
+    bad_scalar_descriptor["artifact_hash"] = formalizer._canonical({key: value for key, value in bad_scalar_descriptor.items() if key != "artifact_hash"})
+    with pytest.raises(formalizer.Stage1S18FormalError, match="S18_SCHEMA_VALIDATION_FAILED"):
+        formalizer._validate_output_schemas(Path("."), {"worker_report": bad_scalar_descriptor})
     unknown = copy.deepcopy(report); unknown["cases"][0]["rank_records"][0]["intruder"] = 1
     with pytest.raises(formalizer.Stage1S18FormalError, match="S18_SCHEMA_VALIDATION_FAILED"):
         formalizer._validate_output_schemas(Path("."), {"worker_report": unknown})
