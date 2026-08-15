@@ -1,1 +1,119 @@
-{"$id":"stage1-s1-8-formalization-index-v1.json","$schema":"https://json-schema.org/draft/2020-12/schema","type":"object","additionalProperties":false,"required":["schema_version","status","gate_id","task_id","generator_git_commit","consumer_git_commit","gpu_capability","implementation_source_sha256","s1_7_handoff","role_refs","role_sha256","reproduction_role_refs","reproduction_role_sha256","gate_artifact_hash","validation_ref","validation_sha256","replay_ref","replay_sha256","next_task_ids","artifact_hash"],"properties":{"schema_version":{"const":"stage1-s1-8-formalization-index-v1"},"status":{"const":"PASS"},"gate_id":{"const":"G1-DDP"},"task_id":{"const":"stage1.08_ddp_and_gradient_accumulation"},"generator_git_commit":{"type":"string","pattern":"^[0-9a-f]{40}$"},"consumer_git_commit":{"type":"string","pattern":"^[0-9a-f]{40}$"},"gpu_capability":{"type":"object","additionalProperties":false,"required":["commit_ref","object_ref","task_id","artifact_kind","artifact_hash","config_hash","source_refs","allowed_gpu_uuids"],"properties":{"commit_ref":{"type":"string","minLength":1},"object_ref":{"type":"string","minLength":1},"task_id":{"const":"stage0.01_baseline_and_safety"},"artifact_kind":{"const":"capability_cuda"},"artifact_hash":{"const":"a536e191cd59318325289d238db727f8939767e384bfccd961ae7ca1c6a11ce4"},"config_hash":{"type":"string","pattern":"^[0-9a-f]{64}$"},"source_refs":{"type":"array","minItems":1,"items":{"type":"string","minLength":1}},"allowed_gpu_uuids":{"type":"array","minItems":4,"items":{"type":"string","pattern":"^GPU-.+$"},"uniqueItems":true}}},"implementation_source_sha256":{"type":"object","minProperties":30,"maxProperties":30,"propertyNames":{"pattern":"^(ops|src|configs|schemas)/"},"additionalProperties":{"type":"string","pattern":"^[0-9a-f]{64}$"}},"s1_7_handoff":{"type":"object","minProperties":12,"additionalProperties":{"anyOf":[{"type":"string"},{"type":"object","additionalProperties":{"anyOf":[{"type":"string"},{"type":"null"}]}},{"type":"array","items":{"type":"string"}}]}},"role_refs":{"type":"object","additionalProperties":false,"required":["fixture_manifest","ddp_report","array_bundle","comparison_table","gate_record"],"properties":{"fixture_manifest":{"const":"fixture-manifest.json"},"ddp_report":{"const":"ddp-report.json"},"array_bundle":{"const":"array-bundle.json"},"comparison_table":{"const":"comparison-table.json"},"gate_record":{"const":"g1-ddp-record.json"}}},"role_sha256":{"type":"object","additionalProperties":false,"required":["fixture_manifest","ddp_report","array_bundle","comparison_table","gate_record"],"properties":{"fixture_manifest":{"type":"string","pattern":"^[0-9a-f]{64}$"},"ddp_report":{"type":"string","pattern":"^[0-9a-f]{64}$"},"array_bundle":{"type":"string","pattern":"^[0-9a-f]{64}$"},"comparison_table":{"type":"string","pattern":"^[0-9a-f]{64}$"},"gate_record":{"type":"string","pattern":"^[0-9a-f]{64}$"}}},"reproduction_role_refs":{"type":"object","minProperties":18,"propertyNames":{"pattern":"^[a-z0-9_]+$"},"additionalProperties":{"type":"string","minLength":1}},"reproduction_role_sha256":{"type":"object","minProperties":18,"propertyNames":{"pattern":"^[a-z0-9_]+$"},"additionalProperties":{"type":"string","pattern":"^[0-9a-f]{64}$"}},"gate_artifact_hash":{"type":"string","pattern":"^[0-9a-f]{64}$"},"validation_ref":{"const":"validation.json"},"validation_sha256":{"type":"string","pattern":"^[0-9a-f]{64}$"},"replay_ref":{"const":"replay-validation.json"},"replay_sha256":{"type":"string","pattern":"^[0-9a-f]{64}$"},"next_task_ids":{"type":"array","minItems":1,"maxItems":1,"prefixItems":[{"const":"stage1.10_checkpoint_resume_and_artifacts"}]},"artifact_hash":{"type":"string","pattern":"^[0-9a-f]{64}$"}}}
+{
+  "$id": "stage1-s1-8-formalization-index-v1.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "status", "gate_id", "task_id", "generator_git_commit", "consumer_git_commit", "gpu_capability", "implementation_source_sha256", "s1_7_handoff", "role_refs", "role_sha256", "reproduction_role_refs", "reproduction_role_sha256", "gate_artifact_hash", "validation_ref", "validation_sha256", "replay_ref", "replay_sha256", "next_task_ids", "artifact_hash"],
+  "properties": {
+    "schema_version": {"const": "stage1-s1-8-formalization-index-v1"},
+    "status": {"const": "PASS"},
+    "gate_id": {"const": "G1-DDP"},
+    "task_id": {"const": "stage1.08_ddp_and_gradient_accumulation"},
+    "generator_git_commit": {"$ref": "#/$defs/commit"},
+    "consumer_git_commit": {"$ref": "#/$defs/commit"},
+    "gpu_capability": {"$ref": "#/$defs/gpu_capability"},
+    "implementation_source_sha256": {"$ref": "#/$defs/source_map"},
+    "s1_7_handoff": {"$ref": "#/$defs/s1_7_handoff"},
+    "role_refs": {"$ref": "#/$defs/public_role_refs"},
+    "role_sha256": {"$ref": "#/$defs/public_role_hashes"},
+    "reproduction_role_refs": {"type": "object", "minProperties": 20, "propertyNames": {"pattern": "^[a-z0-9_]+$"}, "additionalProperties": {"type": "string", "minLength": 1}},
+    "reproduction_role_sha256": {"type": "object", "minProperties": 20, "propertyNames": {"pattern": "^[a-z0-9_]+$"}, "additionalProperties": {"$ref": "#/$defs/hash"}},
+    "gate_artifact_hash": {"$ref": "#/$defs/hash"},
+    "validation_ref": {"const": "validation.json"},
+    "validation_sha256": {"$ref": "#/$defs/hash"},
+    "replay_ref": {"const": "replay-validation.json"},
+    "replay_sha256": {"$ref": "#/$defs/hash"},
+    "next_task_ids": {"type": "array", "minItems": 1, "maxItems": 1, "prefixItems": [{"const": "stage1.10_checkpoint_resume_and_artifacts"}]},
+    "artifact_hash": {"$ref": "#/$defs/hash"}
+  },
+  "$defs": {
+    "hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "commit": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+    "gpu_uuid": {"type": "string", "pattern": "^GPU-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"},
+    "three_source_hashes": {
+      "type": "object", "additionalProperties": false,
+      "required": ["src/param_importance_nlp/assets.py", "src/param_importance_nlp/contracts/__init__.py", "src/param_importance_nlp/experiments/stage01_task_runners.py"],
+      "properties": {
+        "src/param_importance_nlp/assets.py": {"$ref": "#/$defs/hash"},
+        "src/param_importance_nlp/contracts/__init__.py": {"$ref": "#/$defs/hash"},
+        "src/param_importance_nlp/experiments/stage01_task_runners.py": {"$ref": "#/$defs/hash"}
+      }
+    },
+    "provenance": {
+      "type": "object", "additionalProperties": false,
+      "required": ["schema_version", "logical_asset_id", "asset_id", "manifest_ref", "ready_manifest_sha256", "asset_root_ref", "qualification_ref", "qualification_artifact_hash", "acquisition_ref", "acquisition_sha256", "verification_ref", "verification_sha256", "g3_resolution_ref", "g3_resolution_artifact_hash", "source_git_commit", "storage_kind", "directory_content_sha256"],
+      "properties": {
+        "schema_version": {"const": "qualified-g3-runtime-provenance-v1"},
+        "logical_asset_id": {"type": "string", "minLength": 1},
+        "asset_id": {"$ref": "#/$defs/hash"},
+        "manifest_ref": {"type": "string", "minLength": 1},
+        "ready_manifest_sha256": {"$ref": "#/$defs/hash"},
+        "asset_root_ref": {"type": "string", "minLength": 1},
+        "qualification_ref": {"type": "string", "minLength": 1},
+        "qualification_artifact_hash": {"$ref": "#/$defs/hash"},
+        "acquisition_ref": {"type": "string", "minLength": 1},
+        "acquisition_sha256": {"$ref": "#/$defs/hash"},
+        "verification_ref": {"type": "string", "minLength": 1},
+        "verification_sha256": {"$ref": "#/$defs/hash"},
+        "g3_resolution_ref": {"type": "string", "minLength": 1},
+        "g3_resolution_artifact_hash": {"$ref": "#/$defs/hash"},
+        "source_git_commit": {"$ref": "#/$defs/commit"},
+        "storage_kind": {"type": ["string", "null"]},
+        "directory_content_sha256": {"type": ["string", "null"], "pattern": "^[0-9a-f]{64}$"}
+      }
+    },
+    "token_hashes": {
+      "type": "object", "additionalProperties": false,
+      "required": ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14", "15"],
+      "properties": {
+        "0": {"$ref": "#/$defs/hash"}, "1": {"$ref": "#/$defs/hash"}, "2": {"$ref": "#/$defs/hash"}, "3": {"$ref": "#/$defs/hash"},
+        "4": {"$ref": "#/$defs/hash"}, "5": {"$ref": "#/$defs/hash"}, "6": {"$ref": "#/$defs/hash"}, "7": {"$ref": "#/$defs/hash"},
+        "8": {"$ref": "#/$defs/hash"}, "9": {"$ref": "#/$defs/hash"}, "10": {"$ref": "#/$defs/hash"}, "11": {"$ref": "#/$defs/hash"},
+        "12": {"$ref": "#/$defs/hash"}, "13": {"$ref": "#/$defs/hash"}, "14": {"$ref": "#/$defs/hash"}, "15": {"$ref": "#/$defs/hash"}
+      }
+    },
+    "s1_7_role_refs": {
+      "type": "object", "additionalProperties": false,
+      "required": ["fixture_manifest", "single_gpu_report", "gradient_bundle", "comparison_table", "gate_record"],
+      "properties": {"fixture_manifest": {"const": "fixture-manifest.json"}, "single_gpu_report": {"const": "worker-report.json"}, "gradient_bundle": {"const": "arrays-manifest.json"}, "comparison_table": {"const": "comparison-table.json"}, "gate_record": {"const": "g1-single-record.json"}}
+    },
+    "s1_7_role_hashes": {
+      "type": "object", "additionalProperties": false,
+      "required": ["fixture_manifest", "single_gpu_report", "gradient_bundle", "comparison_table", "gate_record"],
+      "properties": {"fixture_manifest": {"$ref": "#/$defs/hash"}, "single_gpu_report": {"$ref": "#/$defs/hash"}, "gradient_bundle": {"$ref": "#/$defs/hash"}, "comparison_table": {"$ref": "#/$defs/hash"}, "gate_record": {"$ref": "#/$defs/hash"}}
+    },
+    "s1_7_handoff": {
+      "type": "object", "additionalProperties": false,
+      "required": ["index_ref", "index_sha256", "index_artifact_hash", "producer_commit", "gate_artifact_hash", "fixture_hash", "token_file_sha256", "model_resolution_ref", "model_provenance", "pile_provenance", "token_sha256", "role_refs", "role_sha256", "historical_producer_attestation_ref", "historical_producer_attestation_sha256", "historical_g3_replay_ref", "historical_g3_replay_sha256", "historical_g3_attestation_artifact_hash", "historical_g3_historical_producer_commit", "historical_g3_critical_patch_sha256", "historical_g3_historical_source_sha256", "historical_g3_replay_hash", "historical_g3_current_consumer_commit", "historical_g3_current_consumer_source_sha256"],
+      "properties": {
+        "index_ref": {"type": "string", "minLength": 1},
+        "index_sha256": {"const": "4ca26c82d3e6246e0b99c7fc7a35882f712fc1142fa8f3fe9f5191bce64c2a7f"},
+        "index_artifact_hash": {"const": "21b14bdec009bee827dea5d604b363c6ce46ce55c06334d0409a2dc4400292cb"},
+        "producer_commit": {"const": "dcc92506947c3ea30bed75542e006a26d5a2af1b"},
+        "gate_artifact_hash": {"const": "0c8d91dc010533a5c99229fe0c8577e10278f41d0f3fd754d885749c511e7f37"},
+        "fixture_hash": {"$ref": "#/$defs/hash"}, "token_file_sha256": {"$ref": "#/$defs/hash"}, "model_resolution_ref": {"type": "string", "minLength": 1},
+        "model_provenance": {"$ref": "#/$defs/provenance"}, "pile_provenance": {"$ref": "#/$defs/provenance"}, "token_sha256": {"$ref": "#/$defs/token_hashes"},
+        "role_refs": {"$ref": "#/$defs/s1_7_role_refs"}, "role_sha256": {"$ref": "#/$defs/s1_7_role_hashes"},
+        "historical_producer_attestation_ref": {"const": "historical-producer-attestation.json"},
+        "historical_producer_attestation_sha256": {"const": "c28bcf52bd268ce34fe56e509686c6f374bd80a0f1f6d584c6387123479e230a"},
+        "historical_g3_replay_ref": {"const": "historical-g3-replay.json"},
+        "historical_g3_replay_sha256": {"const": "69e74a2adea8cbc4539e85f09cd25f453780fb9f471906b96be3805194c1278b"},
+        "historical_g3_attestation_artifact_hash": {"$ref": "#/$defs/hash"},
+        "historical_g3_historical_producer_commit": {"const": "54b1c7f87eda0533b29622b39cc8a7ec90646d0b"},
+        "historical_g3_critical_patch_sha256": {"const": "308db1c1e38135e5a65d37fa92566ac9cd5136220b4ffbb143a7e2f323d1ee0b"},
+        "historical_g3_historical_source_sha256": {"$ref": "#/$defs/three_source_hashes"},
+        "historical_g3_replay_hash": {"$ref": "#/$defs/hash"},
+        "historical_g3_current_consumer_commit": {"$ref": "#/$defs/commit"},
+        "historical_g3_current_consumer_source_sha256": {"$ref": "#/$defs/three_source_hashes"}
+      }
+    },
+    "gpu_capability": {
+      "type": "object", "additionalProperties": false,
+      "required": ["commit_ref", "object_ref", "task_id", "artifact_kind", "artifact_hash", "config_hash", "source_refs", "allowed_gpu_uuids"],
+      "properties": {"commit_ref": {"type": "string", "minLength": 1}, "object_ref": {"type": "string", "minLength": 1}, "task_id": {"const": "stage0.01_baseline_and_safety"}, "artifact_kind": {"const": "capability_cuda"}, "artifact_hash": {"const": "a536e191cd59318325289d238db727f8939767e384bfccd961ae7ca1c6a11ce4"}, "config_hash": {"$ref": "#/$defs/hash"}, "source_refs": {"type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1}}, "allowed_gpu_uuids": {"type": "array", "minItems": 4, "items": {"$ref": "#/$defs/gpu_uuid"}, "uniqueItems": true}}
+    },
+    "source_map": {"type": "object", "minProperties": 30, "maxProperties": 30, "propertyNames": {"pattern": "^(ops|src|configs|schemas)/.+$"}, "additionalProperties": {"$ref": "#/$defs/hash"}},
+    "public_role_refs": {"type": "object", "additionalProperties": false, "required": ["fixture_manifest", "ddp_report", "array_bundle", "comparison_table", "gate_record"], "properties": {"fixture_manifest": {"const": "fixture-manifest.json"}, "ddp_report": {"const": "ddp-report.json"}, "array_bundle": {"const": "array-bundle.json"}, "comparison_table": {"const": "comparison-table.json"}, "gate_record": {"const": "g1-ddp-record.json"}}},
+    "public_role_hashes": {"type": "object", "additionalProperties": false, "required": ["fixture_manifest", "ddp_report", "array_bundle", "comparison_table", "gate_record"], "properties": {"fixture_manifest": {"$ref": "#/$defs/hash"}, "ddp_report": {"$ref": "#/$defs/hash"}, "array_bundle": {"$ref": "#/$defs/hash"}, "comparison_table": {"$ref": "#/$defs/hash"}, "gate_record": {"$ref": "#/$defs/hash"}}}
+  }
+}

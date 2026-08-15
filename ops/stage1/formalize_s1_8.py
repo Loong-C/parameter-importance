@@ -34,6 +34,54 @@ EXPECTED_S1_7_INDEX_SHA256 = "4ca26c82d3e6246e0b99c7fc7a35882f712fc1142fa8f3fe9f
 EXPECTED_S1_7_ARTIFACT_HASH = "21b14bdec009bee827dea5d604b363c6ce46ce55c06334d0409a2dc4400292cb"
 EXPECTED_G1_SINGLE_HASH = "0c8d91dc010533a5c99229fe0c8577e10278f41d0f3fd754d885749c511e7f37"
 EXPECTED_MODEL_READY_SHA256 = "7d3404906f3dd00c0d0314863f706c5df01f1db1fc0e0b4cf501353b88963d1e"
+HISTORICAL_G3_PRODUCER = "54b1c7f87eda0533b29622b39cc8a7ec90646d0b"
+EXPECTED_HISTORICAL_G3_PATCH_SHA256 = "308db1c1e38135e5a65d37fa92566ac9cd5136220b4ffbb143a7e2f323d1ee0b"
+HISTORICAL_G3_CRITICAL_SOURCE_REFS = (
+    "src/param_importance_nlp/assets.py",
+    "src/param_importance_nlp/contracts/__init__.py",
+    "src/param_importance_nlp/experiments/stage01_task_runners.py",
+)
+HISTORICAL_G3_REPRODUCTION_ROLES = {
+    "historical_producer_attestation": "historical-producer-attestation.json",
+    "historical_g3_replay": "historical-g3-replay.json",
+}
+EXPECTED_S1_7_HISTORICAL_PRODUCER_ATTESTATION_SHA256 = "c28bcf52bd268ce34fe56e509686c6f374bd80a0f1f6d584c6387123479e230a"
+EXPECTED_S1_7_HISTORICAL_G3_REPLAY_SHA256 = "69e74a2adea8cbc4539e85f09cd25f453780fb9f471906b96be3805194c1278b"
+EXPECTED_G3_RESOLUTION_ARTIFACT_HASH = "418e9a60c25edfc275fe459b333bf4893912d03b9331b08dc9afb3e1560ea5cd"
+EXPECTED_G3_RESOLUTION_PAYLOAD_HASH = "a3bc369bcb6f7dd2ba7dbd83a59d518d64d4431e355150c92d8a0cda02cb2a92"
+EXPECTED_MODEL_IDENTITY = {
+    "logical_name": "pythia-14m-step0",
+    "asset_id": "11dd681a22649a451b9be53c255bb4e9f83207c3f22f75f1eec53a33b7776fd2",
+    "revision": "56079904bb80b7f36d3b794089f146e7a4d6efae",
+    "ready_manifest_sha256": EXPECTED_MODEL_READY_SHA256,
+    "parameter_count": 14067712,
+    "config_vocab_size": 50_304,
+}
+EXPECTED_TOKENIZER_IDENTITY = {
+    "logical_name": "pythia-tokenizer",
+    "asset_id": "b5eebc43fe88687e5bf692761f1db25f91e8d6f9a8cceaa2342d2624ac1f652d",
+    "revision": "e361f9afd54b3e7856879eead5326d36ff6f32d7",
+    "ready_manifest_sha256": "ea59f3f8e37321208701326b2ea88b7491450a88eae870775beeff027d102794",
+    "vocab_size": 50_277,
+}
+EXPECTED_PILE_IDENTITY = {
+    "logical_name": "pile-selected-prefix",
+    "asset_id": "dbbfeb12bab4027b386bd97d604d8134699e96f79e309cceacff7999a55b5dad",
+    "revision": "4647773ea142ab1ff5694602fa104bbf49088408",
+    "ready_manifest_sha256": "345cd0f49d35ad9543daa3f95118013c55bdd729ed87fdec3c7a7c93ae449f8b",
+}
+EXPECTED_HISTORICAL_PILE_HASHED_BYTES = 31_757_184_042
+S1_7_INDEX_HANDOFF_KEYS = frozenset({
+    "index_ref", "index_sha256", "index_artifact_hash", "producer_commit",
+    "gate_artifact_hash", "fixture_hash", "token_file_sha256", "model_resolution_ref",
+    "model_provenance", "pile_provenance", "token_sha256", "role_refs", "role_sha256",
+    "historical_producer_attestation_ref", "historical_producer_attestation_sha256",
+    "historical_g3_replay_ref", "historical_g3_replay_sha256",
+    "historical_g3_attestation_artifact_hash", "historical_g3_historical_producer_commit",
+    "historical_g3_critical_patch_sha256", "historical_g3_historical_source_sha256",
+    "historical_g3_replay_hash", "historical_g3_current_consumer_commit",
+    "historical_g3_current_consumer_source_sha256",
+})
 EXPECTED_PILE_LOGICAL_ASSET_ID = "pile-selected-prefix"
 EXPECTED_PILE_READY_SHA256 = "345cd0f49d35ad9543daa3f95118013c55bdd729ed87fdec3c7a7c93ae449f8b"
 EXPECTED_PILE_STORAGE_KIND = "pythia_mmap_shards"
@@ -333,7 +381,23 @@ def _candidate_publication_check(
         raise Stage1S18FormalError("S18_CANDIDATE_SOURCE_MAP_INVALID")
     capability = _mapping(index.get("gpu_capability"), field="candidate.gpu_capability")
     handoff = _mapping(index.get("s1_7_handoff"), field="candidate.s1_7_handoff")
-    if capability.get("artifact_hash") != EXPECTED_GPU_CAPABILITY_ARTIFACT_HASH or handoff.get("producer_commit") != EXPECTED_S1_7_PRODUCER or handoff.get("index_sha256") != EXPECTED_S1_7_INDEX_SHA256 or handoff.get("gate_artifact_hash") != EXPECTED_G1_SINGLE_HASH:
+    if (
+        set(handoff) != S1_7_INDEX_HANDOFF_KEYS
+        or
+        capability.get("artifact_hash") != EXPECTED_GPU_CAPABILITY_ARTIFACT_HASH
+        or handoff.get("producer_commit") != EXPECTED_S1_7_PRODUCER
+        or handoff.get("index_sha256") != EXPECTED_S1_7_INDEX_SHA256
+        or handoff.get("gate_artifact_hash") != EXPECTED_G1_SINGLE_HASH
+        or handoff.get("historical_producer_attestation_ref") != HISTORICAL_G3_REPRODUCTION_ROLES["historical_producer_attestation"]
+        or handoff.get("historical_producer_attestation_sha256") != EXPECTED_S1_7_HISTORICAL_PRODUCER_ATTESTATION_SHA256
+        or handoff.get("historical_g3_replay_ref") != HISTORICAL_G3_REPRODUCTION_ROLES["historical_g3_replay"]
+        or handoff.get("historical_g3_replay_sha256") != EXPECTED_S1_7_HISTORICAL_G3_REPLAY_SHA256
+        or _require_sha256(handoff.get("historical_g3_replay_hash"), field="candidate.historical_g3.replay_hash") != handoff.get("historical_g3_replay_hash")
+        or handoff.get("historical_g3_historical_producer_commit") != HISTORICAL_G3_PRODUCER
+        or handoff.get("historical_g3_critical_patch_sha256") != EXPECTED_HISTORICAL_G3_PATCH_SHA256
+        or set(_mapping(handoff.get("historical_g3_historical_source_sha256"), field="candidate.historical_g3.historical_sources")) != set(HISTORICAL_G3_CRITICAL_SOURCE_REFS)
+        or set(_mapping(handoff.get("historical_g3_current_consumer_source_sha256"), field="candidate.historical_g3.consumer_sources")) != set(HISTORICAL_G3_CRITICAL_SOURCE_REFS)
+    ):
         raise Stage1S18FormalError("S18_CANDIDATE_UPSTREAM_OR_CAPABILITY_DRIFT")
 
     refs, hashes = _mapping(index.get("reproduction_role_refs"), field="candidate.reproduction.refs"), _mapping(index.get("reproduction_role_sha256"), field="candidate.reproduction.hashes")
@@ -394,6 +458,187 @@ def _git(repository: Path, *args: str) -> str:
     if done.returncode:
         raise Stage1S18FormalError(f"S18_FORMAL_GIT_FAILED:{args[0]}")
     return done.stdout.strip()
+
+
+def _git_bytes(repository: Path, *args: str) -> bytes:
+    """Read exact Git bytes; historical patch identity must not be text-normalized."""
+
+    done = subprocess.run(
+        ["git", "-C", str(repository), *args], capture_output=True,
+        timeout=30, check=False,
+    )
+    if done.returncode:
+        raise Stage1S18FormalError(f"S18_FORMAL_GIT_FAILED:{args[0]}")
+    return bytes(done.stdout)
+
+
+def _current_historical_g3_compatibility(
+    repository: Path, attestation: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Prove that today's three G3-critical sources are exactly S1.7-compatible.
+
+    This deliberately does *not* ask the current G3 resolver to reinterpret a
+    historical resolution.  The producer's immutable attestation supplies the
+    only permitted historical patch, while this check makes later source drift
+    fail closed before any CUDA discovery or lease.
+    """
+
+    ancestor = subprocess.run(
+        ["git", "-C", str(repository), "merge-base", "--is-ancestor", HISTORICAL_G3_PRODUCER, "HEAD"],
+        capture_output=True, timeout=30, check=False,
+    )
+    if ancestor.returncode != 0:
+        raise Stage1S18FormalError("S18_HISTORICAL_G3_PRODUCER_NOT_ANCESTOR")
+    changed = tuple(filter(None, _git(
+        repository, "diff", "--name-only", HISTORICAL_G3_PRODUCER, "HEAD", "--",
+        *HISTORICAL_G3_CRITICAL_SOURCE_REFS,
+    ).splitlines()))
+    s1_7_to_current_changed = tuple(filter(None, _git(
+        repository, "diff", "--name-only", EXPECTED_S1_7_PRODUCER, "HEAD", "--",
+        *HISTORICAL_G3_CRITICAL_SOURCE_REFS,
+    ).splitlines()))
+    patch_sha256 = hashlib.sha256(_git_bytes(
+        repository, "diff", "--binary", "--full-index", HISTORICAL_G3_PRODUCER,
+        "HEAD", "--", *HISTORICAL_G3_CRITICAL_SOURCE_REFS,
+    )).hexdigest()
+    source_hashes = {reference: _sha(repository / reference) for reference in HISTORICAL_G3_CRITICAL_SOURCE_REFS}
+    expected_hashes = _mapping(attestation.get("consumer_source_sha256"), field="historical_g3.attestation.consumer_source_sha256")
+    if (
+        changed != HISTORICAL_G3_CRITICAL_SOURCE_REFS
+        or s1_7_to_current_changed != ()
+        or patch_sha256 != EXPECTED_HISTORICAL_G3_PATCH_SHA256
+        or source_hashes != expected_hashes
+    ):
+        raise Stage1S18FormalError("S18_HISTORICAL_G3_CONSUMER_COMPATIBILITY_DRIFT")
+    return {
+        "current_consumer_commit": _git(repository, "rev-parse", "HEAD"),
+        "historical_producer_is_ancestor": True,
+        "critical_source_diff": list(changed),
+        "s1_7_producer_to_current_critical_source_diff": [],
+        "critical_patch_sha256": patch_sha256,
+        "consumer_source_sha256": source_hashes,
+    }
+
+
+def _validate_s1_7_historical_g3_binding(
+    *, repository: Path, handoff: Mapping[str, Any], attestation: Mapping[str, Any], replay: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Strictly replay-bind S1.8 to the published S1.7 historical G3 proof."""
+
+    attestation_expected = {
+        "schema_version", "status", "historical_producer_commit", "consumer_commit",
+        "historical_producer_is_ancestor", "critical_source_diff", "critical_patch_sha256",
+        "historical_source_sha256", "consumer_source_sha256", "artifact_hash",
+    }
+    expected_hash_keys = set(HISTORICAL_G3_CRITICAL_SOURCE_REFS)
+    historical_hashes = _mapping(attestation.get("historical_source_sha256"), field="historical_g3.attestation.historical_source_sha256")
+    consumer_hashes = _mapping(attestation.get("consumer_source_sha256"), field="historical_g3.attestation.consumer_source_sha256")
+    if (
+        set(attestation) != attestation_expected
+        or not _self_hash(attestation)
+        or attestation.get("schema_version") != "stage1-s1-7-historical-producer-attestation-v1"
+        or attestation.get("status") != "PASS"
+        or attestation.get("historical_producer_commit") != HISTORICAL_G3_PRODUCER
+        or attestation.get("consumer_commit") != EXPECTED_S1_7_PRODUCER
+        or attestation.get("historical_producer_is_ancestor") is not True
+        or attestation.get("critical_source_diff") != list(HISTORICAL_G3_CRITICAL_SOURCE_REFS)
+        or attestation.get("critical_patch_sha256") != EXPECTED_HISTORICAL_G3_PATCH_SHA256
+        or set(historical_hashes) != expected_hash_keys
+        or set(consumer_hashes) != expected_hash_keys
+        or any(_require_sha256(value, field="historical_g3.source_hash") != value for value in (*historical_hashes.values(), *consumer_hashes.values()))
+    ):
+        raise Stage1S18FormalError("S18_S17_HISTORICAL_G3_ATTESTATION_INVALID")
+
+    replay_expected = {
+        "schema_version", "status", "model", "tokenizer", "pile", "asset_identity",
+        "resolution_commit_artifact_hash", "resolution_artifact_hash", "fixture_file",
+        "fixture_file_sha256", "token_sha256", "dropout_probabilities", "resolve_hash_seconds",
+        "dataset_rehash_seconds", "qualified_resolution_hashed_bytes", "dataset_rehash_bytes",
+        "pile_hash_passes", "network_policy", "replay_hash",
+    }
+    network = _mapping(replay.get("network_policy"), field="historical_g3.replay.network_policy")
+    identity = _mapping(replay.get("asset_identity"), field="historical_g3.replay.asset_identity")
+    model_identity = _mapping(identity.get("model"), field="historical_g3.replay.asset_identity.model")
+    tokenizer_identity = _mapping(identity.get("tokenizer"), field="historical_g3.replay.asset_identity.tokenizer")
+    pile_identity = _mapping(identity.get("pile"), field="historical_g3.replay.asset_identity.pile")
+    fixture_assets = _mapping(handoff.get("fixture_assets"), field="historical_g3.fixture.assets")
+    tokens = handoff.get("token_sha256")
+    if (
+        set(replay) != replay_expected
+        or replay.get("schema_version") != "stage1-s1-7-historical-g3-replay-v1"
+        or replay.get("status") != "PASS"
+        or replay.get("replay_hash") != _canonical({key: value for key, value in replay.items() if key != "replay_hash"})
+        or replay.get("resolution_commit_artifact_hash") != EXPECTED_G3_RESOLUTION_ARTIFACT_HASH
+        or replay.get("resolution_artifact_hash") != EXPECTED_G3_RESOLUTION_PAYLOAD_HASH
+        or replay.get("fixture_file") != "fixture-inputs.safetensors"
+        or replay.get("fixture_file_sha256") != handoff.get("token_file_sha256")
+        or replay.get("token_sha256") != tokens
+        or replay.get("model") != handoff.get("model_provenance")
+        or replay.get("tokenizer") != fixture_assets.get("tokenizer")
+        or replay.get("pile") != handoff.get("pile_provenance")
+        or {key: model_identity.get(key) for key in EXPECTED_MODEL_IDENTITY} != EXPECTED_MODEL_IDENTITY
+        or {key: tokenizer_identity.get(key) for key in EXPECTED_TOKENIZER_IDENTITY} != EXPECTED_TOKENIZER_IDENTITY
+        or {key: pile_identity.get(key) for key in EXPECTED_PILE_IDENTITY} != EXPECTED_PILE_IDENTITY
+        or not isinstance(model_identity.get("root"), str) or not model_identity["root"]
+        or not isinstance(tokenizer_identity.get("root"), str) or not tokenizer_identity["root"]
+        or replay.get("qualified_resolution_hashed_bytes") != EXPECTED_HISTORICAL_PILE_HASHED_BYTES
+        or replay.get("dataset_rehash_bytes") != EXPECTED_HISTORICAL_PILE_HASHED_BYTES
+        or replay.get("pile_hash_passes") != 2
+        or network != {
+            "hf_hub_offline": True, "transformers_offline": True,
+            "datasets_offline": True, "cuda_visible_devices": True,
+            "cuda_is_available": False,
+            "operations": ["committed-resolution-parse", "qualified-local-manifest-parse", "local-pile-mmap-hash-and-fixture-extraction"],
+            "external_attempts": [],
+        }
+    ):
+        raise Stage1S18FormalError("S18_S17_HISTORICAL_G3_REPLAY_INVALID")
+    compatibility = _current_historical_g3_compatibility(repository, attestation)
+    return {
+        "qualification_method": "s1_7_published_historical_g3_replay_consumer_binding",
+        "historical_producer_attestation": {
+            "ref": handoff["historical_producer_attestation_ref"],
+            "sha256": handoff["historical_producer_attestation_sha256"],
+            "artifact_hash": attestation["artifact_hash"],
+            "historical_producer_commit": HISTORICAL_G3_PRODUCER,
+            "critical_patch_sha256": EXPECTED_HISTORICAL_G3_PATCH_SHA256,
+            "historical_source_sha256": historical_hashes,
+        },
+        "historical_g3_replay": {
+            "ref": handoff["historical_g3_replay_ref"],
+            "sha256": handoff["historical_g3_replay_sha256"],
+            "replay_hash": replay["replay_hash"],
+            "network_policy": network,
+            "model_identity": model_identity,
+            "pile_identity": pile_identity,
+        },
+        "current_consumer_compatibility": compatibility,
+    }
+
+
+def _index_safe_s1_7_handoff(handoff: Mapping[str, Any]) -> dict[str, Any]:
+    """Flatten the immutable historical proof into the strict public index."""
+
+    binding = _mapping(handoff.get("historical_g3_binding"), field="index.historical_g3_binding")
+    attestation = _mapping(binding.get("historical_producer_attestation"), field="index.historical_g3_attestation")
+    replay = _mapping(binding.get("historical_g3_replay"), field="index.historical_g3_replay")
+    compatibility = _mapping(binding.get("current_consumer_compatibility"), field="index.historical_g3_consumer_compatibility")
+    excluded = {
+        "token_file", "fixture_assets", "historical_producer_attestation",
+        "historical_g3_replay", "historical_g3_binding",
+        "historical_producer_attestation_file", "historical_g3_replay_file",
+    }
+    value = {key: item for key, item in handoff.items() if key not in excluded}
+    value.update({
+        "historical_g3_attestation_artifact_hash": attestation["artifact_hash"],
+        "historical_g3_historical_producer_commit": attestation["historical_producer_commit"],
+        "historical_g3_critical_patch_sha256": attestation["critical_patch_sha256"],
+        "historical_g3_historical_source_sha256": attestation["historical_source_sha256"],
+        "historical_g3_replay_hash": replay["replay_hash"],
+        "historical_g3_current_consumer_commit": compatibility["current_consumer_commit"],
+        "historical_g3_current_consumer_source_sha256": compatibility["consumer_source_sha256"],
+    })
+    return value
 
 
 def _audit_consumer_diff(repository: Path) -> tuple[str, ...]:
@@ -460,6 +705,27 @@ def load_s1_7_handoff(*, data_root: Path, index_ref: str, repository: Path) -> d
         raise Stage1S18FormalError("S18_S17_GATE_INVALID")
     reproduce_refs = _mapping(index.get("reproduction_role_refs"), field="s1_7.reproduction_role_refs")
     reproduce_hashes = _mapping(index.get("reproduction_role_sha256"), field="s1_7.reproduction_role_sha256")
+    historical_roles: dict[str, dict[str, Any]] = {}
+    historical_role_files: dict[str, Path] = {}
+    for role, expected_name in HISTORICAL_G3_REPRODUCTION_ROLES.items():
+        reference, digest = reproduce_refs.get(role), reproduce_hashes.get(role)
+        file = _candidate(data_root, index_path, reference, field="s1_7." + role)
+        expected_digest = (
+            EXPECTED_S1_7_HISTORICAL_PRODUCER_ATTESTATION_SHA256
+            if role == "historical_producer_attestation"
+            else EXPECTED_S1_7_HISTORICAL_G3_REPLAY_SHA256
+        )
+        if (
+            reference != expected_name
+            or not isinstance(digest, str)
+            or digest != expected_digest
+            or not file.is_file()
+            or _require_sha256(digest, field="s1_7." + role) != digest
+            or _sha(file) != digest
+        ):
+            raise Stage1S18FormalError("S18_S17_HISTORICAL_G3_ROLE_HASH_INVALID:" + role)
+        historical_roles[role] = _mapping(load_canonical_json(file), field="s1_7." + role)
+        historical_role_files[role] = file
     token_ref, token_hash = reproduce_refs.get("fixture_inputs"), reproduce_hashes.get("fixture_inputs")
     token_file = _candidate(data_root, index_path, token_ref, field="s1_7.fixture_inputs")
     if not isinstance(token_hash, str) or not token_file.is_file() or _sha(token_file) != token_hash:
@@ -482,16 +748,31 @@ def load_s1_7_handoff(*, data_root: Path, index_ref: str, repository: Path) -> d
     tokens = fixture.get("token_sha256")
     if not isinstance(tokens, Mapping) or set(tokens) != {str(index) for index in range(16)}:
         raise Stage1S18FormalError("S18_S17_TOKEN_HASH_SET_INVALID")
-    return {
+    handoff = {
         "index_ref": index_ref, "index_sha256": EXPECTED_S1_7_INDEX_SHA256, "index_artifact_hash": EXPECTED_S1_7_ARTIFACT_HASH,
         "producer_commit": EXPECTED_S1_7_PRODUCER, "gate_artifact_hash": EXPECTED_G1_SINGLE_HASH,
         "fixture_hash": fixture_hash, "token_file": token_file, "token_file_sha256": token_hash,
         "model_resolution_ref": resolution_ref,
         "model_provenance": model_asset,
         "pile_provenance": pile_asset,
+        "fixture_assets": assets,
         "token_sha256": {str(key): str(value) for key, value in tokens.items()},
         "role_refs": {str(key): str(value) for key, value in refs.items()}, "role_sha256": {str(key): str(value) for key, value in hashes.items()},
+        "historical_producer_attestation_ref": str(reproduce_refs["historical_producer_attestation"]),
+        "historical_producer_attestation_sha256": str(reproduce_hashes["historical_producer_attestation"]),
+        "historical_g3_replay_ref": str(reproduce_refs["historical_g3_replay"]),
+        "historical_g3_replay_sha256": str(reproduce_hashes["historical_g3_replay"]),
+        "historical_producer_attestation": historical_roles["historical_producer_attestation"],
+        "historical_g3_replay": historical_roles["historical_g3_replay"],
+        "historical_producer_attestation_file": historical_role_files["historical_producer_attestation"],
+        "historical_g3_replay_file": historical_role_files["historical_g3_replay"],
     }
+    handoff["historical_g3_binding"] = _validate_s1_7_historical_g3_binding(
+        repository=repository, handoff=handoff,
+        attestation=historical_roles["historical_producer_attestation"],
+        replay=historical_roles["historical_g3_replay"],
+    )
+    return handoff
 
 
 def _audit_pile_download_activity(handoff: Mapping[str, Any], *, proc_root: Path | None = None) -> dict[str, Any]:
@@ -517,40 +798,72 @@ def _audit_pile_download_activity(handoff: Mapping[str, Any], *, proc_root: Path
     return {"status": "PASS", "pile_logical_asset_id": pile["logical_asset_id"], "pile_ready_manifest_sha256": pile["ready_manifest_sha256"], "active_count": 0, "process_fingerprints": []}
 
 
-def _frozen_model_and_cache_root(repository: Path, data_root: Path, handoff: Mapping[str, Any]) -> tuple[str, str, dict[str, Any]]:
-    """Freshly re-resolve the S1.7 frozen qualified model, including files."""
+def _require_prelease_cuda_hidden() -> dict[str, object]:
+    """Keep the formalizer parent CPU-only until an owned child is launched."""
 
-    from param_importance_nlp.g3_runtime_assets import FormalG3RuntimeAssets
+    value = os.environ.get("CUDA_VISIBLE_DEVICES", "")
+    if value != "":
+        raise Stage1S18FormalError("S18_PRELEASE_CUDA_VISIBLE_DEVICES_NOT_EMPTY")
+    return {"cuda_visible_devices": "", "parent_cuda_initialization": False}
+
+
+def _frozen_model_and_cache_root(repository: Path, data_root: Path, handoff: Mapping[str, Any]) -> tuple[str, str, dict[str, Any]]:
+    """Recheck current model bytes through S1.7's immutable historical proof.
+
+    The current qualified G3 resolver intentionally rejects a checkout whose
+    historical critical-source patch differs from its own policy.  That policy
+    is left untouched: this consumer first verifies the published S1.7
+    historical producer attestation and then invokes the independently exposed
+    READY/qualification byte verifier only after its current source hash has
+    been proven identical to that attested S1.7 consumer source.
+    """
+
+    from param_importance_nlp.assets import load_manifest, resolve_qualified_asset
+    from param_importance_nlp.contracts.jsonio import load_canonical_json
 
     cache = _path(data_root, "cache", field="controlled_cache_root")
-    resolution_ref = handoff.get("model_resolution_ref")
-    if not isinstance(resolution_ref, str) or not cache.is_dir():
+    provenance = _mapping(handoff.get("model_provenance"), field="frozen_model.provenance")
+    binding = _mapping(handoff.get("historical_g3_binding"), field="frozen_model.historical_g3_binding")
+    replay = _mapping(handoff.get("historical_g3_replay"), field="frozen_model.historical_g3_replay")
+    identity = _mapping(_mapping(replay.get("asset_identity"), field="frozen_model.replay.asset_identity").get("model"), field="frozen_model.replay.model")
+    if (
+        not cache.is_dir()
+        or provenance != replay.get("model")
+        or {key: identity.get(key) for key in EXPECTED_MODEL_IDENTITY} != EXPECTED_MODEL_IDENTITY
+        or binding.get("qualification_method") != "s1_7_published_historical_g3_replay_consumer_binding"
+    ):
         raise Stage1S18FormalError("S18_FROZEN_MODEL_OR_CACHE_INVALID")
     try:
-        assets = FormalG3RuntimeAssets.load(
-            data_root, resolution_ref,
-            requirements_path=repository / "configs" / "stage0" / "g3-asset-requirements-v1.json",
-            layout_path=repository / "configs" / "stage0" / "g3-asset-layout-v1.json",
+        manifest = load_manifest(_path(data_root, provenance.get("manifest_ref"), field="frozen_model.manifest_ref"))
+        qualification = _mapping(load_canonical_json(_path(data_root, provenance.get("qualification_ref"), field="frozen_model.qualification_ref")), field="frozen_model.qualification")
+        requirements = _mapping(load_canonical_json(repository / "configs" / "stage0" / "g3-asset-requirements-v1.json"), field="frozen_model.requirements")
+        resolved = resolve_qualified_asset(
+            manifest,
+            _path(data_root, provenance.get("asset_root_ref"), field="frozen_model.asset_root_ref"),
+            qualification,
+            qualification_ref=str(provenance["qualification_ref"]),
+            requirements_artifact_hash=str(requirements["artifact_hash"]),
         )
-        model = assets.resolve("pythia-14m-step0", expected_kind="model")
     except (OSError, TypeError, ValueError) as error:
         raise Stage1S18FormalError("S18_FROZEN_MODEL_QUALIFIED_RESOLUTION_FAILED") from error
     if (
-        model.ready_manifest_sha256 != EXPECTED_MODEL_READY_SHA256
-        or model.resolved.asset_id != "11dd681a22649a451b9be53c255bb4e9f83207c3f22f75f1eec53a33b7776fd2"
-        or model.resolved.revision != "56079904bb80b7f36d3b794089f146e7a4d6efae"
-        or model.provenance() != handoff.get("model_provenance")
+        _canonical(manifest) != EXPECTED_MODEL_READY_SHA256
+        or resolved.asset_id != EXPECTED_MODEL_IDENTITY["asset_id"]
+        or resolved.revision != EXPECTED_MODEL_IDENTITY["revision"]
+        or str(resolved.root) != identity.get("root")
     ):
         raise Stage1S18FormalError("S18_FROZEN_MODEL_IDENTITY_OR_PROVENANCE_DRIFT")
     summary = {
-        "provenance": model.provenance(),
-        "resolution_ref": resolution_ref,
-        "resolution_artifact_hash": assets.resolution_artifact_hash,
-        "files_checked": len(model.resolved.files),
-        "bytes_checked": sum(item.size_bytes for item in model.resolved.files),
-        "content_hashes": {item.relative_path: item.sha256 for item in model.resolved.files},
+        "provenance": provenance,
+        "resolution_ref": handoff["model_resolution_ref"],
+        "resolution_artifact_hash": EXPECTED_G3_RESOLUTION_PAYLOAD_HASH,
+        "files_checked": len(resolved.files),
+        "bytes_checked": sum(item.size_bytes for item in resolved.files),
+        "content_hashes": {item.relative_path: item.sha256 for item in resolved.files},
+        "historical_g3_binding": binding,
+        "verification_path": "current_assets.resolve_qualified_asset_after_exact_s1_7_historical_consumer_source_binding",
     }
-    return str(model.resolved.root), str(cache), summary
+    return str(resolved.root), str(cache), summary
 
 
 def _run(command: Sequence[str], *, timeout: int = 30) -> str:
@@ -996,9 +1309,10 @@ def prelease_dry_chain(*, repository: Path, data_root: Path, s1_7_index_ref: str
     repository, data_root = repository.resolve(strict=True), data_root.resolve(strict=True)
     handoff = load_s1_7_handoff(data_root=data_root, index_ref=s1_7_index_ref, repository=repository)
     capability = _load_capability(data_root, gpu_capability_ref, approved_gpu_uuids)
+    parent_cuda = _require_prelease_cuda_hidden()
     model_root, cache_root, qualification = _frozen_model_and_cache_root(repository, data_root, handoff)
     pile = _audit_pile_download_activity(handoff)
-    return {"status": "PASS", "s1_7_handoff": {key: value for key, value in handoff.items() if key != "token_file"}, "gpu_capability": capability, "model_root": model_root, "cache_root": cache_root, "model_qualification": qualification, "pile_download_audit": pile}
+    return {"status": "PASS", "s1_7_handoff": {key: value for key, value in handoff.items() if key != "token_file"}, "gpu_capability": capability, "parent_cuda": parent_cuda, "model_root": model_root, "cache_root": cache_root, "model_qualification": qualification, "pile_download_audit": pile}
 
 
 def execute(*, repository: Path, data_root: Path, s1_7_index_ref: str, gpu_capability_ref: str, approved_gpu_uuids: Sequence[str], attempt_id: str, lease_owner: str, timeout_seconds: int = 3600) -> dict[str, str]:
@@ -1014,6 +1328,7 @@ def execute(*, repository: Path, data_root: Path, s1_7_index_ref: str, gpu_capab
     commit = _git(repository, "rev-parse", "HEAD")
     handoff = load_s1_7_handoff(data_root=data_root, index_ref=s1_7_index_ref, repository=repository)
     capability = _load_capability(data_root, gpu_capability_ref, approved_gpu_uuids)
+    _require_prelease_cuda_hidden()
     model_root, cache_root, model_qualification = _frozen_model_and_cache_root(repository, data_root, handoff)
     target = data_root / "evidence" / "stage1" / "s1-8-formal" / commit / attempt_id
     work = data_root / "tmp" / "stage1-s1-8" / attempt_id
@@ -1025,6 +1340,22 @@ def execute(*, repository: Path, data_root: Path, s1_7_index_ref: str, gpu_capab
     if disk.free < estimated_peak_bytes:
         raise Stage1S18FormalError("S18_DISK_CAPACITY_INSUFFICIENT")
     shutil.copy2(handoff["token_file"], work / "fixture-inputs.safetensors")
+    historical_role_copies = {
+        "s1-7-historical-producer-attestation.json": (
+            handoff["historical_producer_attestation_file"],
+            handoff["historical_producer_attestation_sha256"],
+        ),
+        "s1-7-historical-g3-replay.json": (
+            handoff["historical_g3_replay_file"],
+            handoff["historical_g3_replay_sha256"],
+        ),
+    }
+    for published, (source, digest) in historical_role_copies.items():
+        if not isinstance(source, Path) or not source.is_file() or _sha(source) != digest:
+            raise Stage1S18FormalError("S18_S17_HISTORICAL_G3_COPY_SOURCE_DRIFT:" + published)
+        shutil.copy2(source, work / published)
+        if _sha(work / published) != digest:
+            raise Stage1S18FormalError("S18_S17_HISTORICAL_G3_COPY_WRITEBACK_DRIFT:" + published)
     _write(work / "model-qualified-resolution.json", _with_hash({"schema_version": "stage1-s1-8-model-qualified-resolution-v1", "status": "PASS", "model": model_qualification}))
     _, offline_policy = _offline_environment(cache_root)
     _write(work / "offline-policy.json", _with_hash({"schema_version": "stage1-s1-8-offline-policy-v1", "status": "PASS", "policy": offline_policy}))
@@ -1118,7 +1449,7 @@ def execute(*, repository: Path, data_root: Path, s1_7_index_ref: str, gpu_capab
         # report and chart exists, and excludes itself from the measured scope.
         _write(work / "resource-summary.json", _resource_summary(work, estimated_peak_bytes=estimated_peak_bytes, preflight=preflight, post_gpu=post_gpu))
         role_files = {"fixture_manifest": "fixture-manifest.json", "ddp_report": "ddp-report.json", "array_bundle": "array-bundle.json", "comparison_table": "comparison-table.json", "gate_record": "g1-ddp-record.json"}
-        reproduction = {"fixture_inputs": "fixture-inputs.safetensors", "model_qualified_resolution": "model-qualified-resolution.json", "offline_policy": "offline-policy.json", "pre_route_scale_plan": "pre-route-scale-plan.json", "pre_route_scale": "pre-route-scale.json", "preflight": "preflight.json", "post_lease_gpu": "post-lease-gpu.json", "post_worker_gpu": "post-worker-gpu.json", "post_release_gpu": "post-release-gpu.json", "resource_summary": "resource-summary.json", "nccl_smoke_report": "nccl-smoke-report.json", "nccl_smoke_process": "nccl-smoke.process.json", "nccl_smoke_stdout": "nccl-smoke.stdout.txt", "nccl_smoke_stderr": "nccl-smoke.stderr.txt", "lease_history_first": "lease-history-first.json", "lease_history_reacquire": "lease-history-reacquire.json", "attempt_start": "attempt-start.json"}
+        reproduction = {"fixture_inputs": "fixture-inputs.safetensors", "s1_7_historical_producer_attestation": "s1-7-historical-producer-attestation.json", "s1_7_historical_g3_replay": "s1-7-historical-g3-replay.json", "model_qualified_resolution": "model-qualified-resolution.json", "offline_policy": "offline-policy.json", "pre_route_scale_plan": "pre-route-scale-plan.json", "pre_route_scale": "pre-route-scale.json", "preflight": "preflight.json", "post_lease_gpu": "post-lease-gpu.json", "post_worker_gpu": "post-worker-gpu.json", "post_release_gpu": "post-release-gpu.json", "resource_summary": "resource-summary.json", "nccl_smoke_report": "nccl-smoke-report.json", "nccl_smoke_process": "nccl-smoke.process.json", "nccl_smoke_stdout": "nccl-smoke.stdout.txt", "nccl_smoke_stderr": "nccl-smoke.stderr.txt", "lease_history_first": "lease-history-first.json", "lease_history_reacquire": "lease-history-reacquire.json", "attempt_start": "attempt-start.json"}
         reproduction_sources: dict[str, Path] = {published: work / published for published in reproduction.values()}
         for source in sorted(list(work.glob("*.process.json")) + list(work.glob("*.stdout.txt")) + list(work.glob("*.stderr.txt")) + list(work.glob("*-process-tree-initial.json")) + list(work.glob("*-termination-audit.json"))):
             published = "run__root__" + source.name
@@ -1177,7 +1508,7 @@ def execute(*, repository: Path, data_root: Path, s1_7_index_ref: str, gpu_capab
         if set(base_requirements) != set(GATE_CHECK_IDS) - {"schemas_and_atomic_publication"} or not all(base_requirements.values()):
             raise Stage1S18FormalError("S18_GATE_REQUIREMENT_FAILED")
         reproduction_sha = {role: _sha(reproduction_sources[name]) for role, name in reproduction.items()}
-        handoff_for_index = {key: value for key, value in handoff.items() if key != "token_file"}
+        handoff_for_index = _index_safe_s1_7_handoff(handoff)
 
         def build_candidate(schema_result: bool) -> tuple[dict[str, Any], dict[str, str], dict[str, Any], dict[str, Any], dict[str, Any]]:
             requirements = {**base_requirements, "schemas_and_atomic_publication": schema_result}

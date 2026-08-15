@@ -316,3 +316,161 @@ def test_pile_handoff_requires_frozen_ready_identity_and_g3_binding() -> None:
     with_unknown = dict(pile); with_unknown["unknown"] = True
     with pytest.raises(formalizer.Stage1S18FormalError, match="S18_S17_PILE_PROVENANCE_INVALID"):
         formalizer._validate_frozen_pile_provenance(model, with_unknown)
+
+
+def _real_r11_historical_g3_shaped_handoff(formalizer: object) -> tuple[dict[str, object], dict[str, object], dict[str, object]]:
+    """Construct the immutable S1.7 r11 role shape without requiring DATA_ROOT."""
+
+    tokens = {str(index): f"{index:064x}" for index in range(16)}
+    model = {
+        "logical_asset_id": "pythia-14m-step0",
+        "ready_manifest_sha256": formalizer.EXPECTED_MODEL_READY_SHA256,
+        "g3_resolution_ref": formalizer.EXPECTED_PILE_PROVENANCE["g3_resolution_ref"],
+        "g3_resolution_artifact_hash": formalizer.EXPECTED_G3_RESOLUTION_PAYLOAD_HASH,
+    }
+    tokenizer = {"logical_asset_id": "pythia-tokenizer", "ready_manifest_sha256": formalizer.EXPECTED_TOKENIZER_IDENTITY["ready_manifest_sha256"]}
+    historical_hashes = {path: "1" * 64 for path in formalizer.HISTORICAL_G3_CRITICAL_SOURCE_REFS}
+    consumer_hashes = {path: "2" * 64 for path in formalizer.HISTORICAL_G3_CRITICAL_SOURCE_REFS}
+    attestation = formalizer._with_hash({
+        "schema_version": "stage1-s1-7-historical-producer-attestation-v1", "status": "PASS",
+        "historical_producer_commit": formalizer.HISTORICAL_G3_PRODUCER,
+        "consumer_commit": formalizer.EXPECTED_S1_7_PRODUCER,
+        "historical_producer_is_ancestor": True,
+        "critical_source_diff": list(formalizer.HISTORICAL_G3_CRITICAL_SOURCE_REFS),
+        "critical_patch_sha256": formalizer.EXPECTED_HISTORICAL_G3_PATCH_SHA256,
+        "historical_source_sha256": historical_hashes, "consumer_source_sha256": consumer_hashes,
+    })
+    identity = {
+        "model": {**formalizer.EXPECTED_MODEL_IDENTITY, "root": "/home/sophgo13/cjl/storage/parameter-importance/models/pythia-14m-step0"},
+        "tokenizer": {**formalizer.EXPECTED_TOKENIZER_IDENTITY, "root": "/home/sophgo13/cjl/storage/parameter-importance/models/pythia-tokenizer"},
+        "pile": dict(formalizer.EXPECTED_PILE_IDENTITY),
+    }
+    replay = {
+        "schema_version": "stage1-s1-7-historical-g3-replay-v1", "status": "PASS",
+        "model": model, "tokenizer": tokenizer, "pile": dict(formalizer.EXPECTED_PILE_PROVENANCE),
+        "asset_identity": identity,
+        "resolution_commit_artifact_hash": formalizer.EXPECTED_G3_RESOLUTION_ARTIFACT_HASH,
+        "resolution_artifact_hash": formalizer.EXPECTED_G3_RESOLUTION_PAYLOAD_HASH,
+        "fixture_file": "fixture-inputs.safetensors", "fixture_file_sha256": "3" * 64,
+        "token_sha256": tokens, "dropout_probabilities": {"attention_dropout": 0.0, "hidden_dropout": 0.0},
+        "resolve_hash_seconds": 1.0, "dataset_rehash_seconds": 2.0,
+        "qualified_resolution_hashed_bytes": formalizer.EXPECTED_HISTORICAL_PILE_HASHED_BYTES,
+        "dataset_rehash_bytes": formalizer.EXPECTED_HISTORICAL_PILE_HASHED_BYTES,
+        "pile_hash_passes": 2,
+        "network_policy": {
+            "hf_hub_offline": True, "transformers_offline": True, "datasets_offline": True,
+            "cuda_visible_devices": True, "cuda_is_available": False,
+            "operations": ["committed-resolution-parse", "qualified-local-manifest-parse", "local-pile-mmap-hash-and-fixture-extraction"],
+            "external_attempts": [],
+        },
+    }
+    replay["replay_hash"] = formalizer._canonical(replay)
+    handoff = {
+        "model_provenance": model, "pile_provenance": dict(formalizer.EXPECTED_PILE_PROVENANCE),
+        "fixture_assets": {"model": model, "tokenizer": tokenizer, "pile": dict(formalizer.EXPECTED_PILE_PROVENANCE)},
+        "token_sha256": tokens, "token_file_sha256": "3" * 64,
+        "historical_producer_attestation_ref": "historical-producer-attestation.json",
+        "historical_producer_attestation_sha256": formalizer.EXPECTED_S1_7_HISTORICAL_PRODUCER_ATTESTATION_SHA256,
+        "historical_g3_replay_ref": "historical-g3-replay.json",
+        "historical_g3_replay_sha256": formalizer.EXPECTED_S1_7_HISTORICAL_G3_REPLAY_SHA256,
+    }
+    return handoff, attestation, replay
+
+
+def test_historical_s17_g3_replay_binding_is_real_r11_shaped_and_fail_closed(monkeypatch: pytest.MonkeyPatch) -> None:
+    formalizer = _formalizer(); handoff, attestation, replay = _real_r11_historical_g3_shaped_handoff(formalizer)
+    compatibility = {
+        "current_consumer_commit": "b" * 40, "historical_producer_is_ancestor": True,
+        "critical_source_diff": list(formalizer.HISTORICAL_G3_CRITICAL_SOURCE_REFS),
+        "critical_patch_sha256": formalizer.EXPECTED_HISTORICAL_G3_PATCH_SHA256,
+        "consumer_source_sha256": attestation["consumer_source_sha256"],
+    }
+    monkeypatch.setattr(formalizer, "_current_historical_g3_compatibility", lambda repository, observed: compatibility)
+    binding = formalizer._validate_s1_7_historical_g3_binding(repository=Path("."), handoff=handoff, attestation=attestation, replay=replay)
+    assert binding["qualification_method"] == "s1_7_published_historical_g3_replay_consumer_binding"
+    assert binding["historical_g3_replay"]["sha256"] == "69e74a2adea8cbc4539e85f09cd25f453780fb9f471906b96be3805194c1278b"
+    assert binding["historical_producer_attestation"]["sha256"] == "c28bcf52bd268ce34fe56e509686c6f374bd80a0f1f6d584c6387123479e230a"
+    drifted = copy.deepcopy(replay); drifted["network_policy"]["cuda_is_available"] = True; drifted["replay_hash"] = formalizer._canonical({key: value for key, value in drifted.items() if key != "replay_hash"})
+    with pytest.raises(formalizer.Stage1S18FormalError, match="S18_S17_HISTORICAL_G3_REPLAY_INVALID"):
+        formalizer._validate_s1_7_historical_g3_binding(repository=Path("."), handoff=handoff, attestation=attestation, replay=drifted)
+    drifted_attestation = copy.deepcopy(attestation); drifted_attestation["consumer_commit"] = "0" * 40; drifted_attestation["artifact_hash"] = formalizer._canonical({key: value for key, value in drifted_attestation.items() if key != "artifact_hash"})
+    with pytest.raises(formalizer.Stage1S18FormalError, match="S18_S17_HISTORICAL_G3_ATTESTATION_INVALID"):
+        formalizer._validate_s1_7_historical_g3_binding(repository=Path("."), handoff=handoff, attestation=drifted_attestation, replay=replay)
+
+
+def test_index_handoff_flattens_historical_g3_proof_without_losing_immutable_identities() -> None:
+    formalizer = _formalizer(); handoff, attestation, replay = _real_r11_historical_g3_shaped_handoff(formalizer)
+    handoff["token_file"] = Path("fixture-inputs.safetensors"); handoff["historical_producer_attestation"] = attestation; handoff["historical_g3_replay"] = replay
+    handoff["historical_g3_binding"] = {
+        "historical_producer_attestation": {"artifact_hash": attestation["artifact_hash"], "historical_producer_commit": formalizer.HISTORICAL_G3_PRODUCER, "critical_patch_sha256": formalizer.EXPECTED_HISTORICAL_G3_PATCH_SHA256, "historical_source_sha256": attestation["historical_source_sha256"]},
+        "historical_g3_replay": {"replay_hash": replay["replay_hash"]},
+        "current_consumer_compatibility": {"current_consumer_commit": "b" * 40, "consumer_source_sha256": attestation["consumer_source_sha256"]},
+    }
+    published = formalizer._index_safe_s1_7_handoff(handoff)
+    assert "historical_g3_replay" not in published and "historical_g3_binding" not in published
+    assert published["historical_g3_replay_sha256"] == formalizer.EXPECTED_S1_7_HISTORICAL_G3_REPLAY_SHA256
+    assert published["historical_g3_historical_producer_commit"] == formalizer.HISTORICAL_G3_PRODUCER
+
+
+def test_prelease_parent_requires_cuda_hidden(monkeypatch: pytest.MonkeyPatch) -> None:
+    formalizer = _formalizer()
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "")
+    assert formalizer._require_prelease_cuda_hidden() == {"cuda_visible_devices": "", "parent_cuda_initialization": False}
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "GPU-should-not-be-visible")
+    with pytest.raises(formalizer.Stage1S18FormalError, match="S18_PRELEASE_CUDA_VISIBLE_DEVICES_NOT_EMPTY"):
+        formalizer._require_prelease_cuda_hidden()
+
+
+def test_index_schema_strictly_freezes_full_s17_handoff_historical_binding() -> None:
+    formalizer = _formalizer()
+    model = dict(formalizer.EXPECTED_PILE_PROVENANCE)
+    model.update({
+        "logical_asset_id": "pythia-14m-step0", "asset_id": formalizer.EXPECTED_MODEL_IDENTITY["asset_id"],
+        "manifest_ref": "manifests/model/pythia-14m.json", "asset_root_ref": "models/pythia-14m-step0",
+        "ready_manifest_sha256": formalizer.EXPECTED_MODEL_READY_SHA256, "storage_kind": None,
+    })
+    historical_sources = {path: "1" * 64 for path in formalizer.HISTORICAL_G3_CRITICAL_SOURCE_REFS}
+    handoff = {
+        "index_ref": "evidence/stage1/s1-7-formal/dcc/index.json", "index_sha256": formalizer.EXPECTED_S1_7_INDEX_SHA256,
+        "index_artifact_hash": formalizer.EXPECTED_S1_7_ARTIFACT_HASH, "producer_commit": formalizer.EXPECTED_S1_7_PRODUCER,
+        "gate_artifact_hash": formalizer.EXPECTED_G1_SINGLE_HASH, "fixture_hash": "2" * 64,
+        "token_file_sha256": "3" * 64, "model_resolution_ref": model["g3_resolution_ref"],
+        "model_provenance": model, "pile_provenance": dict(formalizer.EXPECTED_PILE_PROVENANCE),
+        "token_sha256": {str(index): f"{index:064x}" for index in range(16)},
+        "role_refs": {"fixture_manifest": "fixture-manifest.json", "single_gpu_report": "worker-report.json", "gradient_bundle": "arrays-manifest.json", "comparison_table": "comparison-table.json", "gate_record": "g1-single-record.json"},
+        "role_sha256": {key: "4" * 64 for key in ("fixture_manifest", "single_gpu_report", "gradient_bundle", "comparison_table", "gate_record")},
+        "historical_producer_attestation_ref": "historical-producer-attestation.json", "historical_producer_attestation_sha256": formalizer.EXPECTED_S1_7_HISTORICAL_PRODUCER_ATTESTATION_SHA256,
+        "historical_g3_replay_ref": "historical-g3-replay.json", "historical_g3_replay_sha256": formalizer.EXPECTED_S1_7_HISTORICAL_G3_REPLAY_SHA256,
+        "historical_g3_attestation_artifact_hash": "5" * 64, "historical_g3_historical_producer_commit": formalizer.HISTORICAL_G3_PRODUCER,
+        "historical_g3_critical_patch_sha256": formalizer.EXPECTED_HISTORICAL_G3_PATCH_SHA256,
+        "historical_g3_historical_source_sha256": historical_sources, "historical_g3_replay_hash": "6" * 64,
+        "historical_g3_current_consumer_commit": "7" * 40, "historical_g3_current_consumer_source_sha256": historical_sources,
+    }
+    uuids = [f"GPU-{index:08x}-1111-2222-3333-444444444444" for index in range(4)]
+    index = formalizer._with_hash({
+        "schema_version": "stage1-s1-8-formalization-index-v1", "status": "PASS", "gate_id": "G1-DDP", "task_id": "stage1.08_ddp_and_gradient_accumulation",
+        "generator_git_commit": "8" * 40, "consumer_git_commit": "8" * 40,
+        "gpu_capability": {"commit_ref": "commit", "object_ref": "object", "task_id": "stage0.01_baseline_and_safety", "artifact_kind": "capability_cuda", "artifact_hash": formalizer.EXPECTED_GPU_CAPABILITY_ARTIFACT_HASH, "config_hash": "9" * 64, "source_refs": ["source"], "allowed_gpu_uuids": uuids},
+        "implementation_source_sha256": formalizer._implementation_source_map(Path(".")), "s1_7_handoff": handoff,
+        "role_refs": {"fixture_manifest": "fixture-manifest.json", "ddp_report": "ddp-report.json", "array_bundle": "array-bundle.json", "comparison_table": "comparison-table.json", "gate_record": "g1-ddp-record.json"},
+        "role_sha256": {key: "a" * 64 for key in ("fixture_manifest", "ddp_report", "array_bundle", "comparison_table", "gate_record")},
+        "reproduction_role_refs": {f"role{index}": f"file{index}" for index in range(20)}, "reproduction_role_sha256": {f"role{index}": "b" * 64 for index in range(20)},
+        "gate_artifact_hash": "c" * 64, "validation_ref": "validation.json", "validation_sha256": "d" * 64, "replay_ref": "replay-validation.json", "replay_sha256": "e" * 64,
+        "next_task_ids": ["stage1.10_checkpoint_resume_and_artifacts"],
+    })
+    formalizer._validate_output_schemas(Path("."), {"index": index})
+    unknown = copy.deepcopy(index); unknown["s1_7_handoff"]["unbound"] = True; unknown["artifact_hash"] = formalizer._canonical({key: value for key, value in unknown.items() if key != "artifact_hash"})
+    with pytest.raises(formalizer.Stage1S18FormalError, match="S18_SCHEMA_VALIDATION_FAILED:index"):
+        formalizer._validate_output_schemas(Path("."), {"index": unknown})
+    missing = copy.deepcopy(index); del missing["s1_7_handoff"]["historical_g3_current_consumer_source_sha256"]; missing["artifact_hash"] = formalizer._canonical({key: value for key, value in missing.items() if key != "artifact_hash"})
+    with pytest.raises(formalizer.Stage1S18FormalError, match="S18_SCHEMA_VALIDATION_FAILED:index"):
+        formalizer._validate_output_schemas(Path("."), {"index": missing})
+
+
+def test_current_critical_sources_are_exactly_zero_drift_from_dcc925_attestation() -> None:
+    formalizer = _formalizer(); repository = Path(".").resolve()
+    attestation = {"consumer_source_sha256": {path: formalizer._sha(repository / path) for path in formalizer.HISTORICAL_G3_CRITICAL_SOURCE_REFS}}
+    audit = formalizer._current_historical_g3_compatibility(repository, attestation)
+    assert audit["s1_7_producer_to_current_critical_source_diff"] == []
+    assert audit["critical_source_diff"] == list(formalizer.HISTORICAL_G3_CRITICAL_SOURCE_REFS)
+    assert audit["critical_patch_sha256"] == formalizer.EXPECTED_HISTORICAL_G3_PATCH_SHA256
