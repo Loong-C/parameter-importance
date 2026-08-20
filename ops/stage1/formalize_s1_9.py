@@ -496,7 +496,12 @@ def _consumer_diff(repository: Path, producer_commit: str, *, validated_producer
     if _COMMIT.fullmatch(producer_commit) is None:
         raise Stage1S19FormalError("S1_9_UPSTREAM_PRODUCER_COMMIT_INVALID")
     changed = [line for line in _git(repository, "diff", "--name-only", f"{producer_commit}..HEAD").splitlines() if line]
-    allowed_exact = {*_S1_9_FROZEN_CONSUMER_FILES, *_S1_10_FROZEN_CONSUMER_FILES, *_S1_10_SHARED_RUNTIME_FILES}
+    allowed_exact = {
+        *_S1_7_AUTHORIZED_SHARED_DEPENDENCIES,
+        *_S1_9_FROZEN_CONSUMER_FILES,
+        *_S1_10_FROZEN_CONSUMER_FILES,
+        *_S1_10_SHARED_RUNTIME_FILES,
+    }
     if validated_producer_source is not None:
         if not isinstance(validated_producer_source, Mapping) or not validated_producer_source or any(not isinstance(path, str) or not path or "\\" in path or path.startswith("/") or ".." in PurePosixPath(path).parts or not isinstance(digest, str) or re.fullmatch(r"[0-9a-f]{64}", digest) is None for path, digest in validated_producer_source.items()):
             raise Stage1S19FormalError("S1_9_UPSTREAM_PRODUCER_SOURCE_CLOSURE_INVALID")
