@@ -605,15 +605,28 @@ def test_s19_s17_handoff_uses_the_real_r11_role_set_and_gate_semantics(monkeypat
     producer = "a" * 40
     gate_hash = ""
     role_names = {"fixture_manifest", "single_gpu_report", "gradient_bundle", "comparison_table", "gate_record"}
+    role_schema_versions = {
+        "fixture_manifest": "stage1-s1-7-fixture-manifest-v1",
+        "single_gpu_report": "stage1-s1-7-single-gpu-report-v1",
+        "gradient_bundle": "stage1-s1-7-safetensors-manifest-v1",
+        "comparison_table": "stage1-s1-7-comparison-table-v1",
+        "gate_record": "stage1-s1-7-gate-record-v1",
+    }
     refs: dict[str, str] = {}; hashes: dict[str, str] = {}
     for role in sorted(role_names):
-        body = {"schema_version": "synthetic", "status": "PASS"}
+        body: dict[str, object] = {"schema_version": role_schema_versions[role]}
+        if role in {"single_gpu_report", "gradient_bundle", "gate_record"}:
+            body["status"] = "PASS"
+        if role == "fixture_manifest":
+            body["fixture_id"] = "stage1-s17-pythia14m-pile16-v1"
+        if role == "comparison_table":
+            body.update({"fixture_hash": "1" * 64, "rows": []})
         if role == "gate_record":
             body.update({"requirements": {"all_required": True}})
-            body["artifact_hash"] = canonical_json_hash(body)
-            gate_hash = str(body["artifact_hash"])
-        else:
-            body["artifact_hash"] = canonical_json_hash(body)
+        hash_field = precision._S1_7_ROLE_SELF_HASH_FIELDS[role]
+        body[hash_field] = canonical_json_hash(body)
+        if role == "gate_record":
+            gate_hash = str(body[hash_field])
         path = bundle / f"{role}.json"; write_canonical_json(path, body)
         refs[role] = f"synthetic/{path.name}"; hashes[role] = hashlib.sha256(path.read_bytes()).hexdigest()
     def auxiliary(name: str, hash_field: str) -> tuple[str, str]:
@@ -634,6 +647,37 @@ def test_s19_s17_handoff_uses_the_real_r11_role_set_and_gate_semantics(monkeypat
     handoff = precision.validate_s1_7_handoff(root, "synthetic/index.json")
     assert set(handoff["s1_7_role_sha256"]) == role_names
     assert frozen_calls == [{"index", *role_names, "replay", "validation"}]
+    assert precision._S1_7_ROLE_SELF_HASH_FIELDS == {"fixture_manifest": "fixture_hash", "single_gpu_report": "artifact_hash", "gradient_bundle": "artifact_hash", "comparison_table": "table_hash", "gate_record": "artifact_hash"}
+
+    def rebind_index(role: str) -> None:
+        hashes[role] = hashlib.sha256((bundle / f"{role}.json").read_bytes()).hexdigest()
+        index_body["role_sha256"] = dict(hashes)
+        index_body.pop("artifact_hash", None)
+        index_body["artifact_hash"] = canonical_json_hash(index_body)
+        write_canonical_json(index_path, index_body)
+        monkeypatch.setattr(precision, "EXPECTED_S1_7_INDEX_SHA256", hashlib.sha256(index_path.read_bytes()).hexdigest())
+        monkeypatch.setattr(precision, "EXPECTED_S1_7_INDEX_ARTIFACT_HASH", index_body["artifact_hash"])
+
+    fixture_path = bundle / "fixture_manifest.json"
+    fixture = json.loads(fixture_path.read_text(encoding="utf-8"))
+    fixture.pop("fixture_hash")
+    fixture["artifact_hash"] = canonical_json_hash(fixture)
+    write_canonical_json(fixture_path, fixture)
+    rebind_index("fixture_manifest")
+    with pytest.raises(Stage1PrecisionError, match="S1_9_S1_7_ROLE_SELF_HASH_INVALID:fixture_manifest"):
+        precision.validate_s1_7_handoff(root, "synthetic/index.json")
+    fixture.pop("artifact_hash")
+    fixture["fixture_hash"] = canonical_json_hash(fixture)
+    write_canonical_json(fixture_path, fixture)
+    rebind_index("fixture_manifest")
+
+    table_path = bundle / "comparison_table.json"
+    table = json.loads(table_path.read_text(encoding="utf-8"))
+    table["table_hash"] = "f" * 64
+    write_canonical_json(table_path, table)
+    rebind_index("comparison_table")
+    with pytest.raises(Stage1PrecisionError, match="S1_9_S1_7_ROLE_SELF_HASH_INVALID:comparison_table"):
+        precision.validate_s1_7_handoff(root, "synthetic/index.json")
 
 
 def test_s19_s17_handoff_frozen_schema_validation_is_fail_closed() -> None:
