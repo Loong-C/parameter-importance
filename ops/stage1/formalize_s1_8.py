@@ -2749,6 +2749,39 @@ def _tensor_max_abs(value: object, *, field: str) -> float:
         raise Stage1S18FormalError("S18_CHART_TENSOR_INVALID:" + field) from error
 
 
+_CHART_NUMERIC_COMPARISON_ROW_FIELDS = frozenset({
+    "comparison", "parameter", "near_zero_branch", "natural_scale", "near_zero_threshold", "absolute_threshold",
+    "max_abs_error", "max_scaled_error", "normalized_l2_error", "candidate_dtype", "reference_dtype", "within_t32_distributed",
+})
+_CHART_STEP_ROW_FIELDS = frozenset({"comparison", "parameter", "expected_step", "observed", "exact_equality", "within_t32_distributed"})
+
+
+def _chart_numeric_comparison_rows(comparisons: Sequence[object]) -> list[Mapping[str, object]]:
+    """Project only schema-defined numeric error rows into error charts.
+
+    Replay comparison rows deliberately also contain exact optimizer-step
+    attestations.  Those rows have no error scalar and remain in the sealed
+    comparison table/Gate, but cannot honestly become heatmap or error-series
+    points.  Partial or unknown row shapes are evidence corruption, not rows
+    to silently omit.
+    """
+
+    projected: list[Mapping[str, object]] = []
+    for index, row in enumerate(comparisons):
+        if not isinstance(row, Mapping):
+            raise Stage1S18FormalError(f"S18_CHART_NUMERIC_INVALID:comparison-row:{index}")
+        fields = frozenset(row)
+        if fields == _CHART_NUMERIC_COMPARISON_ROW_FIELDS:
+            projected.append(row)
+        elif fields == _CHART_STEP_ROW_FIELDS:
+            continue
+        else:
+            raise Stage1S18FormalError(f"S18_CHART_NUMERIC_INVALID:comparison-row:{index}")
+    if not projected:
+        raise Stage1S18FormalError("S18_CHART_NUMERIC_INVALID:heatmap")
+    return projected
+
+
 def _charts(work: Path, replay: Mapping[str, Any], ddp_report: Mapping[str, Any], route_arrays: Mapping[str, Mapping[str, Any]]) -> tuple[dict[str, str], dict[str, str]]:
     """Build five materially different projections; A never participates in U."""
 
@@ -2756,6 +2789,7 @@ def _charts(work: Path, replay: Mapping[str, Any], ddp_report: Mapping[str, Any]
     baseline = ddp_report.get("baseline_routes")
     if not isinstance(comparisons, list) or not comparisons or not isinstance(baseline, Mapping) or set(route_arrays) != set(ROUTE_WORLD):
         raise Stage1S18FormalError("S18_CHART_INPUT_INVALID")
+    numeric_comparisons = _chart_numeric_comparison_rows(comparisons)
     scatter: list[dict[str, object]] = []
     deltas: list[dict[str, object]] = []
     for route, arrays in sorted(route_arrays.items()):
@@ -2773,8 +2807,8 @@ def _charts(work: Path, replay: Mapping[str, Any], ddp_report: Mapping[str, Any]
             delta = _tensor_max_abs(post[parameter] - pre[parameter], field=route + ':' + parameter + ':delta')
             moved = _tensor_max_abs(movement[parameter], field=route + ':' + parameter + ':movement') if route != "A" and parameter in movement else 0.0
             deltas.append({"route": route, "parameter": parameter, "two_step_parameter_delta_max_abs": f"{delta:.17g}", "cumulative_data_movement_max_abs": f"{moved:.17g}"})
-    heatmap = [{"comparison": str(row.get("comparison")), "parameter": str(row.get("parameter")), "max_scaled_error": f"{_finite_chart(row.get('max_scaled_error'), field='heatmap'):.17g}"} for row in comparisons if isinstance(row, Mapping)]
-    series = [{"comparison": str(row.get("comparison")), "parameter": str(row.get("parameter")), "max_abs_error": f"{_finite_chart(row.get('max_abs_error'), field='series.abs'):.17g}", "normalized_l2_error": f"{_finite_chart(row.get('normalized_l2_error'), field='series.l2'):.17g}"} for row in comparisons if isinstance(row, Mapping)]
+    heatmap = [{"comparison": str(row["comparison"]), "parameter": str(row["parameter"]), "max_scaled_error": f"{_finite_chart(row['max_scaled_error'], field='heatmap'):.17g}"} for row in numeric_comparisons]
+    series = [{"comparison": str(row["comparison"]), "parameter": str(row["parameter"]), "max_abs_error": f"{_finite_chart(row['max_abs_error'], field='series.abs'):.17g}", "normalized_l2_error": f"{_finite_chart(row['normalized_l2_error'], field='series.l2'):.17g}"} for row in numeric_comparisons]
     ranks: list[dict[str, object]] = []
     for route in sorted(ROUTE_WORLD):
         report = _mapping(baseline.get(route), field="chart.report." + route)
