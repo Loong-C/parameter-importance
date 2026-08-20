@@ -699,15 +699,27 @@ def test_s19_s18_handoff_requires_pinned_roles_gate_and_replay_validation_closur
     root = tmp_path / "data"; bundle = root / "synthetic"; bundle.mkdir(parents=True)
     producer = "b" * 40
     role_names = {"fixture_manifest", "ddp_report", "array_bundle", "comparison_table", "gate_record"}
+    role_schema_versions = {
+        "fixture_manifest": "stage1-s1-8-fixture-manifest-v3",
+        "ddp_report": "stage1-s1-8-ddp-report-v8",
+        "array_bundle": "stage1-s1-8-array-bundle-v2",
+        "comparison_table": "stage1-s1-8-comparison-table-v2",
+        "gate_record": "stage1-s1-8-gate-record-v1",
+    }
     refs: dict[str, str] = {}; hashes: dict[str, str] = {}
     gate_hash = ""
     for role in sorted(role_names):
-        body = {"schema_version": "synthetic", "status": "PASS"}
+        hash_field, expected_status = precision._S1_8_ROLE_HASH_AND_STATUS[role]
+        body: dict[str, object] = {"schema_version": role_schema_versions[role]}
+        if expected_status is not None:
+            body["status"] = expected_status
+        else:
+            body["fixture_id"] = "stage1-s18-ddp-fixture-v1"
         if role == "gate_record":
             body["requirements"] = {"all_required": True}
-        body["artifact_hash"] = canonical_json_hash(body)
+        body[hash_field] = canonical_json_hash(body)
         if role == "gate_record":
-            gate_hash = str(body["artifact_hash"])
+            gate_hash = str(body[hash_field])
         path = bundle / f"{role}.json"; write_canonical_json(path, body)
         refs[role] = f"synthetic/{path.name}"; hashes[role] = hashlib.sha256(path.read_bytes()).hexdigest()
 
@@ -719,12 +731,49 @@ def test_s19_s18_handoff_requires_pinned_roles_gate_and_replay_validation_closur
     validation_ref, validation_sha = auxiliary("validation", "artifact_hash")
     # Match the real S1.8 replay envelope, which uses ``artifact_hash``.
     replay_ref, replay_sha = auxiliary("replay", "artifact_hash")
-    index = {"schema_version": "stage1-s1-8-formalization-index-v1", "status": "PASS", "gate_id": "G1-DDP", "task_id": "stage1.08_ddp_and_gradient_accumulation", "generator_git_commit": producer, "consumer_git_commit": producer, "role_refs": refs, "role_sha256": hashes, "gate_artifact_hash": gate_hash, "validation_ref": validation_ref, "validation_sha256": validation_sha, "replay_ref": replay_ref, "replay_sha256": replay_sha}
+    index = {"schema_version": "stage1-s1-8-formalization-index-v8", "status": "PASS", "gate_id": "G1-DDP", "task_id": "stage1.08_ddp_and_gradient_accumulation", "generator_git_commit": producer, "consumer_git_commit": producer, "role_refs": refs, "role_sha256": hashes, "gate_artifact_hash": gate_hash, "validation_ref": validation_ref, "validation_sha256": validation_sha, "replay_ref": replay_ref, "replay_sha256": replay_sha}
     index["artifact_hash"] = canonical_json_hash(index)
     index_path = bundle / "index.json"; write_canonical_json(index_path, index)
-    binding = {"index_sha256": hashlib.sha256(index_path.read_bytes()).hexdigest(), "index_artifact_hash": str(index["artifact_hash"]), "gate_artifact_hash": gate_hash, "producer_commit": producer, "schema_version": "stage1-s1-8-formalization-index-v1", "task_id": "stage1.08_ddp_and_gradient_accumulation", "gate_id": "G1-DDP"}
+    binding = {"index_sha256": hashlib.sha256(index_path.read_bytes()).hexdigest(), "index_artifact_hash": str(index["artifact_hash"]), "gate_artifact_hash": gate_hash, "producer_commit": producer, "schema_version": "stage1-s1-8-formalization-index-v8", "task_id": "stage1.08_ddp_and_gradient_accumulation", "gate_id": "G1-DDP"}
     result = precision.validate_s1_8_handoff(root, "synthetic/index.json", expected_binding=binding)
     assert set(result["s1_8_role_sha256"]) == role_names
+    assert precision._S1_8_ROLE_HASH_AND_STATUS == {"fixture_manifest": ("fixture_hash", None), "ddp_report": ("artifact_hash", "PASS"), "array_bundle": ("artifact_hash", "PASS"), "comparison_table": ("artifact_hash", "PASS"), "gate_record": ("artifact_hash", "PASS")}
+
+    def rebind_index(role: str) -> None:
+        hashes[role] = hashlib.sha256((bundle / f"{role}.json").read_bytes()).hexdigest()
+        index["role_sha256"] = dict(hashes)
+        index.pop("artifact_hash", None)
+        index["artifact_hash"] = canonical_json_hash(index)
+        write_canonical_json(index_path, index)
+        binding["index_sha256"] = hashlib.sha256(index_path.read_bytes()).hexdigest()
+        binding["index_artifact_hash"] = str(index["artifact_hash"])
+
+    fixture_path = bundle / "fixture_manifest.json"
+    fixture = json.loads(fixture_path.read_text(encoding="utf-8"))
+    fixture["status"] = "PASS"
+    fixture.pop("fixture_hash")
+    fixture["fixture_hash"] = canonical_json_hash(fixture)
+    write_canonical_json(fixture_path, fixture)
+    rebind_index("fixture_manifest")
+    with pytest.raises(Stage1PrecisionError, match="S1_9_S1_8_ROLE_SEMANTIC_INVALID:fixture_manifest"):
+        precision.validate_s1_8_handoff(root, "synthetic/index.json", expected_binding=binding)
+    fixture.pop("status")
+    fixture.pop("fixture_hash")
+    fixture["fixture_hash"] = canonical_json_hash(fixture)
+    write_canonical_json(fixture_path, fixture)
+    rebind_index("fixture_manifest")
+
+    ddp_path = bundle / "ddp_report.json"
+    ddp = json.loads(ddp_path.read_text(encoding="utf-8"))
+    ddp["artifact_hash"] = "f" * 64
+    write_canonical_json(ddp_path, ddp)
+    rebind_index("ddp_report")
+    with pytest.raises(Stage1PrecisionError, match="S1_9_S1_8_ROLE_SEMANTIC_INVALID:ddp_report"):
+        precision.validate_s1_8_handoff(root, "synthetic/index.json", expected_binding=binding)
+    ddp.pop("artifact_hash")
+    ddp["artifact_hash"] = canonical_json_hash(ddp)
+    write_canonical_json(ddp_path, ddp)
+    rebind_index("ddp_report")
 
     gate = bundle / "gate_record.json"
     altered = json.loads(gate.read_text(encoding="utf-8")); altered["requirements"] = {"all_required": False}; altered.pop("artifact_hash"); altered["artifact_hash"] = canonical_json_hash(altered); write_canonical_json(gate, altered)
