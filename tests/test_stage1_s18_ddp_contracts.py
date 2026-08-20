@@ -1867,15 +1867,15 @@ def test_implementation_source_map_is_exact_full_production_closure() -> None:
     formalizer = _formalizer()
     sources = formalizer._implementation_source_map(Path("."))
     assert set(sources) == set(formalizer.IMPLEMENTATION_SOURCE_FILES)
-    assert len(sources) == 36
+    assert len(sources) == 40
     assert "src/param_importance_nlp/runtime/optimizer.py" not in sources
     assert "src/param_importance_nlp/contracts/errors.py" in sources
     assert set(name for name in sources if name.startswith("schemas/stage1/s1-8-")) == {
         "schemas/stage1/s1-8-array-bundle-v1.json", "schemas/stage1/s1-8-comparison-table-v1.json",
-        "schemas/stage1/s1-8-ddp-report-v1.json", "schemas/stage1/s1-8-ddp-report-v2.json", "schemas/stage1/s1-8-fixture-manifest-v1.json", "schemas/stage1/s1-8-fixture-manifest-v2.json", "schemas/stage1/s1-8-fixture-manifest-v3.json",
-        "schemas/stage1/s1-8-formalization-index-v1.json", "schemas/stage1/s1-8-formalization-index-v2.json", "schemas/stage1/s1-8-gate-record-v1.json",
+        "schemas/stage1/s1-8-ddp-report-v1.json", "schemas/stage1/s1-8-ddp-report-v2.json", "schemas/stage1/s1-8-ddp-report-v3.json", "schemas/stage1/s1-8-fixture-manifest-v1.json", "schemas/stage1/s1-8-fixture-manifest-v2.json", "schemas/stage1/s1-8-fixture-manifest-v3.json",
+        "schemas/stage1/s1-8-formalization-index-v1.json", "schemas/stage1/s1-8-formalization-index-v2.json", "schemas/stage1/s1-8-formalization-index-v3.json", "schemas/stage1/s1-8-gate-record-v1.json", "schemas/stage1/s1-8-gpu-quiescence-v1.json",
         "schemas/stage1/s1-8-replay-validation-v1.json", "schemas/stage1/s1-8-replay-validation-v2.json", "schemas/stage1/s1-8-safetensors-manifest-v1.json",
-        "schemas/stage1/s1-8-validation-v1.json", "schemas/stage1/s1-8-validation-v2.json", "schemas/stage1/s1-8-worker-report-v1.json",
+        "schemas/stage1/s1-8-validation-v1.json", "schemas/stage1/s1-8-validation-v2.json", "schemas/stage1/s1-8-validation-v3.json", "schemas/stage1/s1-8-worker-report-v1.json",
     }
     assert all(len(digest) == 64 and set(digest) <= set("0123456789abcdef") for digest in sources.values())
 
@@ -2022,6 +2022,126 @@ def test_discovery_rejects_any_non_none_recovery_action(monkeypatch: pytest.Monk
         monkeypatch.setattr(formalizer, "_run", lambda command, timeout=30, recovery=recovery: recovery if "gpu_recovery_action" in command[1] else inventory if "--query-gpu=" in command[1] else "")
         with pytest.raises(formalizer.Stage1S18FormalError, match=f"S18_GPU_RECOVERY_ACTION_NOT_NONE:{uuids[1]}:{action}"):
             formalizer.discover_approved_gpus(uuids)
+
+
+def _quiescence_probe(formalizer: object, uuids: list[str], *, memory_used_mib: int = 0, utilization_percent: int = 0, recovery_action: str = "None", apps: list[dict[str, object]] | None = None) -> dict[str, object]:
+    return {
+        "requested_uuid_order": list(uuids),
+        "selected": [
+            {"physical_index": index, "uuid": uuid, "name": "NVIDIA A100-SXM4-80GB", "memory_total_mib": 81920, "memory_used_mib": memory_used_mib, "utilization_percent": utilization_percent, "temperature_c": 40, "compute_capability": "8.0", "recovery_action": recovery_action}
+            for index, uuid in enumerate(uuids)
+        ],
+        "compute_apps": [] if apps is None else apps,
+    }
+
+
+def test_gpu_compute_app_parser_and_quiescence_pid_recovery_are_immediate(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    formalizer = _formalizer(); uuids = [f"GPU-{index:08x}-1111-2222-3333-444444444444" for index in range(4)]
+    assert formalizer._parse_gpu_compute_apps(f"{uuids[0]}, 123, python\n", expected_uuids=uuids) == [{"gpu_uuid": uuids[0], "pid": 123, "process_name": "python"}]
+    for malformed in (f"{uuids[0]}, 0, python", f"{uuids[0]}, 12", "not-a-uuid, 12, python"):
+        with pytest.raises(formalizer.Stage1S18FormalError, match="S18_GPU_COMPUTE_APPS_PARSE_INVALID"):
+            formalizer._parse_gpu_compute_apps(malformed, expected_uuids=uuids)
+
+    app = {"gpu_uuid": uuids[2], "pid": 991, "process_name": "torchrun"}
+    monkeypatch.setattr(formalizer, "_probe_approved_gpus", lambda _uuids: _quiescence_probe(formalizer, uuids, apps=[app]))
+    with pytest.raises(formalizer.Stage1S18FormalError, match=f"S18_GPU_COMPUTE_PROCESS_PRESENT:{uuids[2]}:991"):
+        formalizer.require_gpu_quiescence(uuids, work=tmp_path, phase="post_worker")
+    from param_importance_nlp.contracts.jsonio import load_canonical_json
+    pid_record = load_canonical_json(tmp_path / "post-worker-gpu-quiescence.json")
+    assert pid_record["status"] == "FAILED" and pid_record["samples"][0]["compute_apps"] == [app]
+    assert formalizer._self_hash(pid_record)
+
+    recovery_dir = tmp_path / "recovery"; recovery_dir.mkdir()
+    monkeypatch.setattr(formalizer, "_probe_approved_gpus", lambda _uuids: _quiescence_probe(formalizer, uuids, recovery_action="Reset"))
+    with pytest.raises(formalizer.Stage1S18FormalError, match=f"S18_GPU_RECOVERY_ACTION_NOT_NONE:{uuids[0]}:Reset"):
+        formalizer.require_gpu_quiescence(uuids, work=recovery_dir, phase="post_worker")
+    recovery_record = load_canonical_json(recovery_dir / "post-worker-gpu-quiescence.json")
+    assert recovery_record["status"] == "FAILED" and recovery_record["samples"][0]["selected"][0]["recovery_action"] == "Reset"
+    assert formalizer._self_hash(recovery_record)
+
+
+def test_gpu_quiescence_resets_then_requires_three_exact_idle_and_deadline_retains_samples(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    formalizer = _formalizer(); uuids = [f"GPU-{index:08x}-1111-2222-3333-444444444444" for index in range(4)]
+    now = [0.0]
+    monkeypatch.setattr(formalizer.time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(formalizer.time, "sleep", lambda duration: now.__setitem__(0, now[0] + duration))
+    observations = iter([
+        _quiescence_probe(formalizer, uuids, memory_used_mib=1),
+        _quiescence_probe(formalizer, uuids), _quiescence_probe(formalizer, uuids), _quiescence_probe(formalizer, uuids),
+    ])
+    monkeypatch.setattr(formalizer, "_probe_approved_gpus", lambda _uuids: next(observations))
+    record = formalizer.require_gpu_quiescence(uuids, work=tmp_path, phase="post_release")
+    assert record["status"] == "PASS"
+    assert [sample["consecutive_exact_idle_samples"] for sample in record["samples"]] == [0, 1, 2, 3]
+    assert record["samples"][0]["violations"] == ["S18_GPU_NOT_IDLE_A100:" + uuid for uuid in uuids]
+    formalizer._validate_output_schemas(Path("."), {"gpu_quiescence": record})
+
+    timeout_dir = tmp_path / "timeout"; timeout_dir.mkdir(); now[0] = 0.0
+    monkeypatch.setattr(formalizer, "_probe_approved_gpus", lambda _uuids: _quiescence_probe(formalizer, uuids, utilization_percent=1))
+    with pytest.raises(formalizer.Stage1S18FormalError, match="S18_GPU_QUIESCENCE_TIMEOUT"):
+        formalizer.require_gpu_quiescence(uuids, work=timeout_dir, phase="reacquire_preflight")
+    from param_importance_nlp.contracts.jsonio import load_canonical_json
+    timed_out = load_canonical_json(timeout_dir / "reacquire-preflight-gpu-quiescence.json")
+    assert timed_out["status"] == "FAILED" and len(timed_out["samples"]) >= 2 and timed_out["failure_reason"] == "S18_GPU_QUIESCENCE_TIMEOUT"
+    assert formalizer._self_hash(timed_out)
+
+    # Completion time, not loop entry time, defines the frozen 30.0-second
+    # bound.  A third sample that crosses it cannot convert to a PASS.
+    crossing_dir = tmp_path / "crossing"; crossing_dir.mkdir(); now[0] = 0.0; calls = [0]
+    def cross_deadline(_uuids: list[str]) -> dict[str, object]:
+        calls[0] += 1
+        if calls[0] == 3:
+            now[0] = 30.01
+        return _quiescence_probe(formalizer, uuids)
+    monkeypatch.setattr(formalizer, "_probe_approved_gpus", cross_deadline)
+    with pytest.raises(formalizer.Stage1S18FormalError, match="S18_GPU_QUIESCENCE_TIMEOUT"):
+        formalizer.require_gpu_quiescence(uuids, work=crossing_dir, phase="post_worker")
+    crossed = load_canonical_json(crossing_dir / "post-worker-gpu-quiescence.json")
+    assert crossed["status"] == "FAILED" and crossed["samples"][-1]["consecutive_exact_idle_samples"] == 3
+    assert crossed["samples"][-1]["monotonic_elapsed_seconds"] == 30.01
+
+    # Equality is explicitly admissible: completion exactly at the deadline is
+    # still within the 30.0-second bound if it provides the third sample.
+    equality_dir = tmp_path / "equality"; equality_dir.mkdir(); now[0] = 0.0; calls[0] = 0
+    def at_deadline(_uuids: list[str]) -> dict[str, object]:
+        calls[0] += 1
+        if calls[0] == 3:
+            now[0] = 30.0
+        return _quiescence_probe(formalizer, uuids)
+    monkeypatch.setattr(formalizer, "_probe_approved_gpus", at_deadline)
+    equality = formalizer.require_gpu_quiescence(uuids, work=equality_dir, phase="post_worker")
+    assert equality["status"] == "PASS" and equality["samples"][-1]["monotonic_elapsed_seconds"] == 30.0
+
+
+def test_gpu_quiescence_public_role_hash_and_schema_bindings_fail_closed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    formalizer = _formalizer(); uuids = [f"GPU-{index:08x}-1111-2222-3333-444444444444" for index in range(4)]
+    now = [0.0]
+    monkeypatch.setattr(formalizer.time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(formalizer.time, "sleep", lambda duration: now.__setitem__(0, now[0] + duration))
+    probe = _quiescence_probe(formalizer, uuids)
+    monkeypatch.setattr(formalizer, "_probe_approved_gpus", lambda _uuids: probe)
+    records = {phase: formalizer.require_gpu_quiescence(uuids, work=tmp_path, phase=phase) for phase in formalizer.GPU_QUIESCENCE_ROLES}
+    for phase, filename in formalizer.GPU_QUIESCENCE_ROLES.items():
+        if phase != "reacquire_preflight":
+            snapshot = "post-worker-gpu.json" if phase == "post_worker" else "post-release-gpu.json"
+            formalizer._write(tmp_path / snapshot, formalizer._with_hash({"schema_version": "stage1-s1-8-gpu-preflight-v1", "status": "PASS", "gpu": records[phase]["final_gpu"]}))
+    sources = {filename: tmp_path / filename for filename in formalizer.GPU_QUIESCENCE_ROLES.values()}
+    sources.update({"post-worker-gpu.json": tmp_path / "post-worker-gpu.json", "post-release-gpu.json": tmp_path / "post-release-gpu.json"})
+    bindings = {phase: {"ref": filename, "sha256": formalizer._sha(tmp_path / filename)} for phase, filename in formalizer.GPU_QUIESCENCE_ROLES.items()}
+    index_refs = {phase + "_gpu_quiescence": filename for phase, filename in formalizer.GPU_QUIESCENCE_ROLES.items()}
+    index_hashes = {phase + "_gpu_quiescence": formalizer._sha(tmp_path / filename) for phase, filename in formalizer.GPU_QUIESCENCE_ROLES.items()}
+    ddp, validation, index = {"gpu_quiescence": bindings}, {"gpu_quiescence": bindings}, {"reproduction_role_refs": index_refs, "reproduction_role_sha256": index_hashes}
+    formalizer._validate_gpu_quiescence_publication(repository=Path("."), ddp=ddp, validation=validation, index=index, source_files=sources)
+    wrong_ref = copy.deepcopy(ddp); wrong_ref["gpu_quiescence"]["post_worker"]["ref"] = "wrong.json"
+    with pytest.raises(formalizer.Stage1S18FormalError, match="S18_CANDIDATE_GPU_QUIESCENCE_REFERENCE_INVALID"):
+        formalizer._validate_gpu_quiescence_publication(repository=Path("."), ddp=wrong_ref, validation=validation, index=index, source_files=sources)
+    wrong_hash = copy.deepcopy(validation); wrong_hash["gpu_quiescence"]["post_release"]["sha256"] = "0" * 64
+    with pytest.raises(formalizer.Stage1S18FormalError, match="S18_CANDIDATE_GPU_QUIESCENCE_HASH_DRIFT"):
+        formalizer._validate_gpu_quiescence_publication(repository=Path("."), ddp=ddp, validation=wrong_hash, index=index, source_files=sources)
+    malformed = copy.deepcopy(records["post_worker"]); malformed["unbound"] = True
+    malformed["artifact_hash"] = formalizer._canonical({key: value for key, value in malformed.items() if key != "artifact_hash"})
+    with pytest.raises(formalizer.Stage1S18FormalError, match="S18_SCHEMA_VALIDATION_FAILED:gpu_quiescence"):
+        formalizer._validate_output_schemas(Path("."), {"gpu_quiescence": malformed})
 
 
 def test_pile_audit_binds_ready_provenance_and_never_records_command_text(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -2185,14 +2305,14 @@ def test_index_schema_strictly_freezes_full_s17_handoff_historical_binding() -> 
     }
     uuids = [f"GPU-{index:08x}-1111-2222-3333-444444444444" for index in range(4)]
     index = formalizer._with_hash({
-        "schema_version": "stage1-s1-8-formalization-index-v2", "status": "PASS", "gate_id": "G1-DDP", "task_id": "stage1.08_ddp_and_gradient_accumulation",
+        "schema_version": "stage1-s1-8-formalization-index-v3", "status": "PASS", "gate_id": "G1-DDP", "task_id": "stage1.08_ddp_and_gradient_accumulation",
         "generator_git_commit": "8" * 40, "consumer_git_commit": "8" * 40,
         "fixture_schema_version": "stage1-s1-8-fixture-manifest-v3", "fixture_id": "stage1-s1-8-pythia14m-ddp-conditioned-v3",
         "gpu_capability": {"commit_ref": "commit", "object_ref": "object", "task_id": "stage0.01_baseline_and_safety", "artifact_kind": "capability_cuda", "artifact_hash": formalizer.EXPECTED_GPU_CAPABILITY_ARTIFACT_HASH, "config_hash": "9" * 64, "source_refs": ["source"], "allowed_gpu_uuids": uuids}, "nccl_transport_protocol": formalizer._nccl_transport_protocol(),
         "implementation_source_sha256": formalizer._implementation_source_map(Path(".")), "s1_7_handoff": handoff,
         "role_refs": {"fixture_manifest": "fixture-manifest.json", "ddp_report": "ddp-report.json", "array_bundle": "array-bundle.json", "comparison_table": "comparison-table.json", "gate_record": "g1-ddp-record.json"},
         "role_sha256": {key: "a" * 64 for key in ("fixture_manifest", "ddp_report", "array_bundle", "comparison_table", "gate_record")},
-        "reproduction_role_refs": {f"role{index}": f"file{index}" for index in range(20)}, "reproduction_role_sha256": {f"role{index}": "b" * 64 for index in range(20)},
+        "reproduction_role_refs": {role: published for role, (published, _source) in formalizer._fixed_reproduction_roles().items()}, "reproduction_role_sha256": {role: "b" * 64 for role in formalizer._fixed_reproduction_roles()},
         "gate_artifact_hash": "c" * 64, "validation_ref": "validation.json", "validation_sha256": "d" * 64, "replay_ref": "replay-validation.json", "replay_sha256": "e" * 64,
         "next_task_ids": ["stage1.10_checkpoint_resume_and_artifacts"],
     })
@@ -2206,6 +2326,25 @@ def test_index_schema_strictly_freezes_full_s17_handoff_historical_binding() -> 
     transport = copy.deepcopy(index); transport["nccl_transport_protocol"]["process_group_timeout_seconds"] = 120; transport["artifact_hash"] = formalizer._canonical({key: value for key, value in transport.items() if key != "artifact_hash"})
     with pytest.raises(formalizer.Stage1S18FormalError, match="S18_SCHEMA_VALIDATION_FAILED:index"):
         formalizer._validate_output_schemas(Path("."), {"index": transport})
+    substituted = copy.deepcopy(index); roles = substituted["reproduction_role_refs"]
+    roles["run_root_b91aa61c209eb19f"] = roles["run_root_1f7b55476eefcf3b"]
+    substituted["artifact_hash"] = formalizer._canonical({key: value for key, value in substituted.items() if key != "artifact_hash"})
+    with pytest.raises(formalizer.Stage1S18FormalError, match="S18_SCHEMA_VALIDATION_FAILED:index"):
+        formalizer._validate_output_schemas(Path("."), {"index": substituted})
+    extra_role = copy.deepcopy(index); extra_role["reproduction_role_sha256"]["role0"] = "b" * 64
+    extra_role["artifact_hash"] = formalizer._canonical({key: value for key, value in extra_role.items() if key != "artifact_hash"})
+    with pytest.raises(formalizer.Stage1S18FormalError, match="S18_SCHEMA_VALIDATION_FAILED:index"):
+        formalizer._validate_output_schemas(Path("."), {"index": extra_role})
+    missing_role = copy.deepcopy(index); del missing_role["reproduction_role_sha256"]["fixture_inputs"]
+    missing_role["artifact_hash"] = formalizer._canonical({key: value for key, value in missing_role.items() if key != "artifact_hash"})
+    with pytest.raises(formalizer.Stage1S18FormalError, match="S18_SCHEMA_VALIDATION_FAILED:index"):
+        formalizer._validate_output_schemas(Path("."), {"index": missing_role})
+    source_substitution = copy.deepcopy(index)
+    digest = source_substitution["implementation_source_sha256"].pop("ops/stage1/run_s1_8_worker.py")
+    source_substitution["implementation_source_sha256"]["ops/stage1/not-an-s1-8-source.py"] = digest
+    source_substitution["artifact_hash"] = formalizer._canonical({key: value for key, value in source_substitution.items() if key != "artifact_hash"})
+    with pytest.raises(formalizer.Stage1S18FormalError, match="S18_SCHEMA_VALIDATION_FAILED:index"):
+        formalizer._validate_output_schemas(Path("."), {"index": source_substitution})
 
 
 def test_current_critical_sources_are_exactly_zero_drift_from_dcc925_attestation() -> None:
