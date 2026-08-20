@@ -436,22 +436,36 @@ def _validate_binding(root: Path, binding: DependencyBinding) -> dict[str, objec
             raise Stage1ExitGateError("S1_11_S1_1_SEMANTIC_SOURCE_CLOSURE_INVALID") from error
         formal_records = result.metadata.get("formal_gate_records")
         expected_gate_ids = ("stage1.G1-ENTRY", "stage1.G1-CONTRACT")
-        try:
-            if not isinstance(formal_records, list) or len(formal_records) != len(expected_gate_ids):
-                raise ValueError("formal record count")
-            formal_gates = [GateRecord.from_mapping(_mapping(record, field="s1_1_formal_gate")) for record in formal_records]
-            actual_gate_hashes = {record.gate_id: record.artifact_hash for record in formal_gates}
-        except Exception as error:
-            raise Stage1ExitGateError("S1_11_S1_1_FORMAL_GATE_RECORDS_INVALID") from error
-        if any(record.gate_id != expected or record.status is not GateStatus.PASS for expected, record in zip(expected_gate_ids, formal_gates, strict=True)) or actual_gate_hashes != hashes:
-            raise Stage1ExitGateError("S1_11_S1_1_FORMAL_GATE_RECORDS_INVALID")
+        if formal_records is not None:
+            try:
+                if not isinstance(formal_records, list) or len(formal_records) != len(expected_gate_ids):
+                    raise ValueError("formal record count")
+                formal_gates = [GateRecord.from_mapping(_mapping(record, field="s1_1_formal_gate")) for record in formal_records]
+                actual_gate_hashes = {record.gate_id: record.artifact_hash for record in formal_gates}
+            except Exception as error:
+                raise Stage1ExitGateError("S1_11_S1_1_FORMAL_GATE_RECORDS_INVALID") from error
+            if any(record.gate_id != expected or record.status is not GateStatus.PASS for expected, record in zip(expected_gate_ids, formal_gates, strict=True)) or actual_gate_hashes != hashes:
+                raise Stage1ExitGateError("S1_11_S1_1_FORMAL_GATE_RECORDS_INVALID")
+        elif set(result.metadata) != {"core_evidence_hash", "stage01_specialized"} or result.metadata.get("stage01_specialized") is not True or not isinstance(result.metadata.get("core_evidence_hash"), str):
+            # The released S1.1 producer predates embedded GateRecord objects.
+            # Its index carries the two authoritative per-gate hashes; bind the
+            # legacy task-output object and its core-evidence identity below.
+            raise Stage1ExitGateError("S1_11_S1_1_LEGACY_METADATA_INVALID")
         if not config or not environment or result.result_hash != index.get("result_hash") or result.config_hash != index.get("config_hash") or result.task_id != binding.task_id or result.status.value != "PASS" or result.run_intent != "formal" or result.formal_eligible is not True or dict(result.artifact_refs) != role_refs:
             raise Stage1ExitGateError("S1_11_S1_1_SEMANTIC_SOURCE_CLOSURE_INVALID")
         if binding.gate_role != "gate_record" or not isinstance(role_refs.get("gate_record"), str):
             raise Stage1ExitGateError("S1_11_S1_1_GATE_ROLE_INVALID")
         gate_path = _safe_relative(root, role_refs["gate_record"], field="s1_1_gate_record")
         gate = _mapping(load_canonical_json(gate_path), field="s1_1_gate_record")
-        if gate.get("artifact_hash") and isinstance(gate.get("artifact_hash"), str):
+        if gate.get("schema_version") == "task-output-commit-v1":
+            if set(gate) != {"artifact_hash", "artifact_kind", "config_hash", "formal_eligible", "object_ref", "schema_version", "task_id"} or gate.get("artifact_kind") != "gate_record" or gate.get("formal_eligible") is not True or gate.get("config_hash") != index.get("config_hash") or gate.get("task_id") != binding.task_id:
+                raise Stage1ExitGateError("S1_11_S1_1_LEGACY_GATE_COMMIT_INVALID")
+            object_path = _safe_relative(root, gate.get("object_ref"), field="s1_1_gate_object")
+            gate_object = _mapping(load_canonical_json(object_path), field="s1_1_gate_object")
+            payload = gate_object.get("payload")
+            if not object_path.is_file() or gate_object.get("artifact_hash") != gate.get("artifact_hash") or not isinstance(payload, Mapping) or payload.get("core_evidence_hash") != result.metadata.get("core_evidence_hash") or payload.get("config_hash") != index.get("config_hash") or payload.get("task_id") != binding.task_id or payload.get("scope") != "formal":
+                raise Stage1ExitGateError("S1_11_S1_1_LEGACY_GATE_OBJECT_INVALID")
+        elif gate.get("artifact_hash") and isinstance(gate.get("artifact_hash"), str):
             _self_hash(gate, field="s1_1_gate_record")
         if binding.gate_ref != role_refs["gate_record"] or _hash_file(gate_path) != binding.gate_sha256:
             raise Stage1ExitGateError("S1_11_S1_1_GATE_ROLE_BINDING_MISMATCH")
