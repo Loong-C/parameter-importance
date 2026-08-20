@@ -9,6 +9,7 @@ does not accept a pre-existing lease from a wrapper.
 from __future__ import annotations
 
 import argparse
+import ast
 from datetime import datetime, timezone
 import hashlib
 import importlib.util
@@ -37,6 +38,67 @@ _ATTEMPT = re.compile(r"^[a-z0-9][a-z0-9-]{0,63}$")
 _CHECKPOINT_STORE_REPRODUCTION_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _DETERMINISM_ENV = {"CUBLAS_WORKSPACE_CONFIG": ":4096:8", "PYTHONHASHSEED": "0"}
 _S1_7_AUTHORIZED_SHARED_DEPENDENCIES = {"src/param_importance_nlp/runtime/optimizer.py"}
+# S1.10 was implemented after the immutable S1.8 v3 producer.  These are the
+# complete, reviewed files for that one downstream stage; do not turn this
+# into a directory/prefix exemption.  In particular, an extra sibling under
+# ``schemas/stage1`` or ``ops/stage1`` must still stop upstream reuse.
+_S1_10_FROZEN_CONSUMER_FILES = {
+    "fixtures/stage1/stage1-s110-checkpoint-fixture-v1.json",
+    "ops/stage1/formalize_s1_10.py",
+    "ops/stage1/run_s1_10_resume_worker.py",
+    "schemas/stage1/s1-10-artifact-manifest-v1.json",
+    "schemas/stage1/s1-10-checkpoint-fixture-v1.json",
+    "schemas/stage1/s1-10-comparison-table-v1.json",
+    "schemas/stage1/s1-10-formal-observation-v1.json",
+    "schemas/stage1/s1-10-formalization-index-v1.json",
+    "schemas/stage1/s1-10-gate-record-v1.json",
+    "schemas/stage1/s1-10-oracle-bundle-v1.json",
+    "schemas/stage1/s1-10-replay-validation-v1.json",
+    "schemas/stage1/s1-10-resume-report-v1.json",
+    "schemas/stage1/s1-10-trace-bundle-v1.json",
+    "schemas/stage1/s1-10-validation-v1.json",
+    "src/param_importance_nlp/stage1_checkpoint_oracle.py",
+    "src/param_importance_nlp/stage1_checkpoint_resume.py",
+    "tests/test_runtime_core.py",
+    "tests/test_stage1_s110_checkpoint_resume.py",
+}
+# They are deliberately separate from the frozen consumer-only list.  The
+# source-map/exclusion and CPU replay checks below are mandatory when either
+# implementation changes, so a later S1.10 runtime edit cannot ride this
+# compatibility bridge without being re-examined.
+_S1_10_SHARED_RUNTIME_FILES = {
+    "src/param_importance_nlp/runtime/training.py",
+    "src/param_importance_nlp/runtime/checkpoint_group.py",
+}
+# S1.9's own formalizer/worker/fixture surface is also explicit.  A producer
+# handoff is never permission to accept an arbitrary file merely because its
+# name begins with ``s1-9`` (or, worse, ``s1-8``).  Update this set together
+# with a reviewed consumer compatibility replay and its negative controls.
+_S1_9_FROZEN_CONSUMER_FILES = {
+    "fixtures/stage1/stage1-s19-precision-fixture-v1.json",
+    "ops/stage1/formalize_s1_9.py",
+    "ops/stage1/run_s1_9_ddp_skip_worker.py",
+    "ops/stage1/run_s1_9_single_bf16_worker.py",
+    "schemas/stage1/s1-9-bf16-checkpoint-store-reproduction-v1.json",
+    "schemas/stage1/s1-9-comparison-table-v1.json",
+    "schemas/stage1/s1-9-ddp-skip-worker-v1.json",
+    "schemas/stage1/s1-9-formalization-index-v1.json",
+    "schemas/stage1/s1-9-formalization-index-v5.json",
+    "schemas/stage1/s1-9-gate-record-v1.json",
+    "schemas/stage1/s1-9-gpu-prelease-v3.json",
+    "schemas/stage1/s1-9-gpu-quiescence-v3.json",
+    "schemas/stage1/s1-9-numeric-report-v1.json",
+    "schemas/stage1/s1-9-oracle-bundle-v1.json",
+    "schemas/stage1/s1-9-precision-fixture-v1.json",
+    "schemas/stage1/s1-9-replay-validation-v1.json",
+    "schemas/stage1/s1-9-single-bf16-worker-v1.json",
+    "schemas/stage1/s1-9-trace-bundle-v1.json",
+    "schemas/stage1/s1-9-upstream-compatibility-v4.json",
+    "schemas/stage1/s1-9-validation-v1.json",
+    "src/param_importance_nlp/stage1_precision.py",
+    "src/param_importance_nlp/stage1_precision_oracle.py",
+    "tests/test_stage1_s19_precision.py",
+}
 _ENVIRONMENT_SUMMARY_KEYS = {
     "torch_version", "cuda_runtime_version", "cudnn_version", "nccl_version",
     "deterministic_algorithms", "cudnn_benchmark", "cudnn_deterministic",
@@ -285,13 +347,50 @@ def _source_map(value: Mapping[str, Any], *, field: str) -> dict[str, str]:
     raise Stage1S19FormalError(f"S1_9_UPSTREAM_SOURCE_MAP_MISSING:{field}")
 
 
+def _s1_8_v5_handoff_attestation(data_root: Path, index_ref: str, report: Mapping[str, Any]) -> dict[str, Any]:
+    """Bind S1.8's final v4 index, report, validation, and four phases.
+
+    This is deliberately a separate attestation rather than a path-only
+    assertion.  The S1.8 index pins the report and validation by digest; the
+    validation must carry the same v2 quiescence-role wire as the v4 report.
+    """
+
+    from param_importance_nlp.contracts.jsonio import load_canonical_json
+
+    index_path = _logical(data_root, index_ref, field="s1_8.v4_index")
+    index = _mapping(load_canonical_json(index_path), field="s1_8.v4_index")
+    if index.get("schema_version") != "stage1-s1-8-formalization-index-v5":
+        raise Stage1S19FormalError("S1_9_S1_8_V5_INDEX_REQUIRED")
+    validation_ref, validation_sha = index.get("validation_ref"), index.get("validation_sha256")
+    if not isinstance(validation_ref, str) or not isinstance(validation_sha, str):
+        raise Stage1S19FormalError("S1_9_S1_8_V4_VALIDATION_BINDING_INVALID")
+    validation_path = (index_path.parent / validation_ref).resolve()
+    if not validation_path.is_file() or _sha(validation_path) != validation_sha:
+        raise Stage1S19FormalError("S1_9_S1_8_V4_VALIDATION_HASH_INVALID")
+    validation = _mapping(load_canonical_json(validation_path), field="s1_8.v4_validation")
+    if (
+        report.get("schema_version") != "stage1-s1-8-ddp-report-v5"
+        or validation.get("schema_version") != "stage1-s1-8-validation-v5"
+        or validation.get("gpu_quiescence") != report.get("gpu_quiescence")
+    ):
+        raise Stage1S19FormalError("S1_9_S1_8_V4_QUIESCENCE_WIRE_INVALID")
+    return {
+        "index_schema_version": index["schema_version"],
+        "ddp_report_schema_version": report["schema_version"],
+        "validation_schema_version": validation["schema_version"],
+        "implementation_source_sha256": index.get("implementation_source_sha256"),
+        "reproduction_role_refs": index.get("reproduction_role_refs"),
+        "reproduction_role_sha256": index.get("reproduction_role_sha256"),
+        "gpu_quiescence": report.get("gpu_quiescence"),
+    }
+
+
 def _consumer_diff(repository: Path, producer_commit: str) -> list[str]:
     if _COMMIT.fullmatch(producer_commit) is None:
         raise Stage1S19FormalError("S1_9_UPSTREAM_PRODUCER_COMMIT_INVALID")
     changed = [line for line in _git(repository, "diff", "--name-only", f"{producer_commit}..HEAD").splitlines() if line]
-    allowed_exact = {"src/param_importance_nlp/runtime/optimizer.py", "tests/test_runtime_core.py"}
-    allowed_prefixes = ("worklogs/", "fixtures/stage1/stage1-s18-", "fixtures/stage1/stage1-s19-", "ops/stage1/formalize_s1_8.py", "ops/stage1/run_s1_8_", "ops/stage1/formalize_s1_9.py", "ops/stage1/run_s1_9_", "schemas/stage1/s1-8-", "schemas/stage1/s1-9-", "src/param_importance_nlp/stage1_ddp", "src/param_importance_nlp/stage1_precision", "tests/test_stage1_s18_", "tests/test_stage1_s19_")
-    rejected = [path for path in changed if path not in allowed_exact and not any(path.startswith(prefix) for prefix in allowed_prefixes)]
+    allowed_exact = {"src/param_importance_nlp/runtime/optimizer.py", *_S1_9_FROZEN_CONSUMER_FILES, *_S1_10_FROZEN_CONSUMER_FILES, *_S1_10_SHARED_RUNTIME_FILES}
+    rejected = [path for path in changed if path not in allowed_exact]
     if rejected:
         raise Stage1S19FormalError("S1_9_UPSTREAM_CONSUMER_DIFF_UNAUTHORIZED:" + ",".join(rejected))
     return changed
@@ -384,7 +483,176 @@ def _optimizer_clip_cpu_replay() -> dict[str, Any]:
     }
 
 
-def _upstream_compatibility_attestation(repository: Path, data_root: Path, *, s1_7_ref: str, s1_7: Mapping[str, Any], s1_8_ref: str, s1_8: Mapping[str, Any]) -> dict[str, Any]:
+def _s1_9_checkpoint_resume_cpu_replay(work: Path) -> dict[str, Any]:
+    """Exercise S1.9's real current-source checkpoint boundary on CPU.
+
+    S1.10 changed the transaction/lineage implementation beneath
+    ``TrainingEngine``.  This compact replay is intentionally S1.9-shaped:
+    it writes a real CheckpointStore payload, rejects an omission before the
+    target engine mutates, and compares the next production step after a
+    fresh-engine restore.  It does not claim to reproduce CUDA/BF16 arithmetic.
+    """
+
+    import copy
+    import torch
+    from param_importance_nlp.providers import InMemoryDatasetAdapter, TorchModelAdapter
+    from param_importance_nlp.runtime.checkpoint import CheckpointStore
+    from param_importance_nlp.runtime.training import TrainingEngine, TrainingRunSpec
+    from param_importance_nlp.contracts.jsonio import canonical_json_hash
+    from param_importance_nlp.stage1_precision import _S19FiniteSkipFiniteClassifier, _engine_microbatch, _state_wire
+
+    if work.exists():
+        raise Stage1S19FormalError("S1_9_RUNTIME_COMPATIBILITY_REPLAY_WORK_EXISTS")
+    work.mkdir(parents=True)
+    store = CheckpointStore(work / "authoritative")
+
+    def build(store_override: CheckpointStore) -> TrainingEngine:
+        module = _S19FiniteSkipFiniteClassifier(device=torch.device("cpu"))
+        batches = tuple(
+            (
+                _engine_microbatch(sample_id=f"compat-{index}", micro=0, value=float(index + 1), device=torch.device("cpu")),
+                _engine_microbatch(sample_id=f"compat-{index}", micro=1, value=float(index + 2), device=torch.device("cpu")),
+            )
+            for index in range(3)
+        )
+        optimizer = torch.optim.AdamW(module.parameters(), lr=0.01, weight_decay=0.01, foreach=False, fused=False)
+        return TrainingEngine(
+            spec=TrainingRunSpec("s19-current-source-compat", "local_fixture", max_steps=3, max_attempts=3, importance_enabled=True, estimator_name="u", accumulation_dtype="float32", weights_exogenous=True, common_mean_assumption=True),
+            model=TorchModelAdapter(module, task_type="sequence_classification"),
+            optimizer=optimizer,
+            cursor=InMemoryDatasetAdapter("s19-current-source-compat", batches).cursor(seed=1909),
+            checkpoint_store=store_override,
+        )
+
+    def run_one(engine: TrainingEngine) -> dict[str, Any]:
+        record = engine._run_attempt(engine.cursor.next_microbatches())
+        engine._records.append(record)  # Production run-loop bookkeeping.
+        return record.to_dict()
+
+    def identity(engine: TrainingEngine) -> str:
+        return canonical_json_hash(_state_wire({
+            "state": engine.state.to_dict(),
+            "model": engine.model.module.state_dict(),
+            "optimizer": engine.optimizer.state_dict(),
+            "cursor": dict(engine.cursor.state_dict()),
+            "importance": None if engine.tracker is None else engine.tracker.accumulator.state_dict(),
+            "records": [record.to_dict() for record in engine._records],
+            "checkpoint_ids": list(engine._checkpoint_ids),
+        }))
+
+    source = build(store)
+    run_one(source); run_one(source)
+    checkpoint_id = source.save_checkpoint()
+    payload, commit = store.load(checkpoint_id)
+    if not isinstance(payload, Mapping) or payload.get("schema_version") != "training-checkpoint-state-v2":
+        raise Stage1S19FormalError("S1_9_RUNTIME_COMPATIBILITY_REPLAY_SCHEMA_INVALID")
+    metadata = {
+        "run_spec_hash": source.spec.spec_hash,
+        "registry_hash": source.registry.coordinate_registry_hash,
+        "optimizer_contract_hash": source.registry.optimizer_contract_hash,
+        "runtime_layout_hash": source.registry.runtime_layout_hash,
+        "world_size": 1,
+    }
+    negative_id = "s19-current-source-compat-omission"
+    malformed = copy.deepcopy(dict(payload))
+    state = dict(malformed["training_state"])
+    state["last_checkpoint_id"] = negative_id
+    malformed["training_state"] = state
+    malformed["checkpoint_ids"] = [negative_id]
+    malformed["importance_trajectory_points"] = []
+    malformed.pop("importance")
+    negative_store = CheckpointStore(work / "omission")
+    negative_store.publish(negative_id, malformed, generation=2, metadata=metadata)
+    negative = build(negative_store)
+    negative_before = identity(negative)
+    try:
+        negative.resume_checkpoint(negative_id)
+    except Exception:
+        omission_rejected_before_mutation = identity(negative) == negative_before
+    else:
+        omission_rejected_before_mutation = False
+    restored = build(store)
+    restored_id = restored.resume_checkpoint(checkpoint_id)
+    source_next, restored_next = run_one(source), run_one(restored)
+    passed = (
+        commit.checkpoint_id == checkpoint_id
+        and restored_id == checkpoint_id
+        and omission_rejected_before_mutation
+        and source_next == restored_next
+        and identity(source) == identity(restored)
+    )
+    return {
+        "profile": "s1_9_current_source_training_checkpoint_resume_cpu",
+        "checkpoint_id": checkpoint_id,
+        "checkpoint_schema_version": payload["schema_version"],
+        "omission_rejected_before_mutation": omission_rejected_before_mutation,
+        "fresh_engine_next_step_exact": source_next == restored_next,
+        "fresh_engine_final_state_exact": identity(source) == identity(restored),
+        "passed": passed,
+    }
+
+
+def _nonproducer_runtime_attestation(
+    repository: Path,
+    *,
+    s1_7_producer: str,
+    s1_7_report: Mapping[str, Any],
+    s1_8_sources: Mapping[str, str],
+    changed_paths: Sequence[str],
+    replay_root: Path,
+) -> dict[str, Any]:
+    """Permit only reviewed S1.10 runtime drift outside both producer maps."""
+
+    affected = sorted(set(changed_paths) & _S1_10_SHARED_RUNTIME_FILES)
+    if not affected:
+        return {"affected_paths": [], "s1_8_source_map_excludes_paths": [], "s1_7_oracle_training_import_isolated": True, "checkpoint_group_producer_math_exclusion": "src/param_importance_nlp/runtime/checkpoint_group.py" not in s1_8_sources, "current_source_cpu_replays": {}}
+    included = sorted(set(affected) & set(s1_8_sources))
+    if included:
+        raise Stage1S19FormalError("S1_9_S1_8_NONPRODUCER_RUNTIME_PATH_IN_SOURCE_MAP:" + ",".join(included))
+    if s1_7_report.get("status") != "PASS":
+        raise Stage1S19FormalError("S1_9_S1_7_ORACLE_ROLE_NOT_PASS")
+    source = _git(repository, "show", f"{s1_7_producer}:ops/stage1/formalize_s1_7.py")
+    try:
+        tree = ast.parse(source)
+    except SyntaxError as error:
+        raise Stage1S19FormalError("S1_9_S1_7_ORACLE_RUNTIME_ISOLATION_UNPROVEN") from error
+    oracle = next((node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "_oracle_replay"), None)
+    blocked: tuple[str, ...] | None = None
+    guarded_rejects = False
+    installs_guard = False
+    restores_import = False
+    if isinstance(oracle, ast.FunctionDef):
+        for node in ast.walk(oracle):
+            if isinstance(node, ast.Assign) and any(isinstance(target, ast.Name) and target.id == "blocked" for target in node.targets) and isinstance(node.value, ast.Tuple) and all(isinstance(item, ast.Constant) and isinstance(item.value, str) for item in node.value.elts):
+                blocked = tuple(str(item.value) for item in node.value.elts)
+            if isinstance(node, ast.If) and isinstance(node.test, ast.Call) and isinstance(node.test.func, ast.Attribute) and isinstance(node.test.func.value, ast.Name) and node.test.func.value.id == "name" and node.test.func.attr == "startswith" and len(node.test.args) == 1 and isinstance(node.test.args[0], ast.Name) and node.test.args[0].id == "blocked" and any(isinstance(child, ast.Raise) and isinstance(child.exc, ast.Call) and isinstance(child.exc.func, ast.Name) and child.exc.func.id == "ImportError" for child in node.body):
+                guarded_rejects = True
+            if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Attribute) and isinstance(node.targets[0].value, ast.Name) and node.targets[0].value.id == "builtins" and node.targets[0].attr == "__import__":
+                if isinstance(node.value, ast.Name) and node.value.id == "guarded":
+                    installs_guard = True
+                if isinstance(node.value, ast.Name) and node.value.id == "original":
+                    restores_import = True
+    if blocked != ("param_importance_nlp.core.estimators", "param_importance_nlp.runtime.training", "param_importance_nlp.stage1_single_gpu") or not (guarded_rejects and installs_guard and restores_import):
+        raise Stage1S19FormalError("S1_9_S1_7_ORACLE_RUNTIME_ISOLATION_UNPROVEN")
+    replays: dict[str, Any] = {}
+    if "src/param_importance_nlp/runtime/training.py" in affected:
+        replays["src/param_importance_nlp/runtime/training.py"] = _s1_9_checkpoint_resume_cpu_replay(replay_root / "training-resume")
+    # checkpoint_group.py is excluded from S1.8's explicit source map and
+    # S1.7's independent oracle import boundary.  Its only current consumer
+    # in this diff is the frozen S1.10 worker, so it cannot alter either
+    # producer's formal mathematical output.
+    if any(not value.get("passed") for value in replays.values()):
+        raise Stage1S19FormalError("S1_9_SHARED_RUNTIME_DRIFT_REPLAY_FAILED")
+    return {
+        "affected_paths": affected,
+        "s1_8_source_map_excludes_paths": affected,
+        "s1_7_oracle_training_import_isolated": True,
+        "checkpoint_group_producer_math_exclusion": "src/param_importance_nlp/runtime/checkpoint_group.py" not in s1_8_sources,
+        "current_source_cpu_replays": replays,
+    }
+
+
+def _upstream_compatibility_attestation(repository: Path, data_root: Path, *, s1_7_ref: str, s1_7: Mapping[str, Any], s1_8_ref: str, s1_8: Mapping[str, Any], replay_root: Path | None = None) -> dict[str, Any]:
     """Prove an old formal producer remains consumable at the new consumer.
 
     This does not rerun S1.7 GPU work.  It rejects any producer dependency
@@ -394,10 +662,14 @@ def _upstream_compatibility_attestation(repository: Path, data_root: Path, *, s1
     changed_s17 = _consumer_diff(repository, str(s1_7["s1_7_generator_commit"]))
     changed_s18 = _consumer_diff(repository, str(s1_8["s1_8_generator_commit"]))
     s17_report = _upstream_role(data_root, s1_7_ref, "single_gpu_report")
-    s17_attestation = _s1_7_shared_dependency_attestation(repository, s17_report, producer_commit=str(s1_7["s1_7_generator_commit"]), changed_paths=changed_s17)
+    s17_attestation = _s1_7_shared_dependency_attestation(repository, s17_report, producer_commit=str(s1_7["s1_7_generator_commit"]), changed_paths=[path for path in changed_s17 if path not in _S1_10_SHARED_RUNTIME_FILES])
     affected_s17 = sorted(set(changed_s17) & _S1_7_AUTHORIZED_SHARED_DEPENDENCIES)
     s18_report = _upstream_role(data_root, s1_8_ref, "ddp_report")
     s18_sources = _source_map(s18_report, field="s1_8.ddp_report")
+    s18_v5_handoff = _s1_8_v5_handoff_attestation(data_root, s1_8_ref, s18_report)
+    if replay_root is None:
+        replay_root = data_root / "tmp" / "s1-9-compatibility"
+    nonproducer_runtime = _nonproducer_runtime_attestation(repository, s1_7_producer=str(s1_7["s1_7_generator_commit"]), s1_7_report=s17_report, s1_8_sources=s18_sources, changed_paths=[*changed_s17, *changed_s18], replay_root=replay_root)
     affected_s18 = sorted(set(changed_s18) & set(s18_sources))
     if set(affected_s18) - _S1_7_AUTHORIZED_SHARED_DEPENDENCIES:
         raise Stage1S19FormalError("S1_9_S1_8_DEPENDENCY_DRIFT_REQUIRES_RERUN:" + ",".join(affected_s18))
@@ -411,31 +683,175 @@ def _upstream_compatibility_attestation(repository: Path, data_root: Path, *, s1
     replay = _optimizer_clip_cpu_replay()
     if not replay["passed"]:
         raise Stage1S19FormalError("S1_9_OPTIMIZER_CLIP_COMPATIBILITY_REPLAY_FAILED")
-    return _with_hash({"schema_version": "stage1-s1-9-upstream-compatibility-v1", "status": "PASS", "s1_7_producer": s1_7["s1_7_generator_commit"], "s1_8_producer": s1_8["s1_8_generator_commit"], "consumer_commit": _git(repository, "rev-parse", "HEAD"), "s1_7_to_consumer_changed_paths": changed_s17, "s1_8_to_consumer_changed_paths": changed_s18, "s1_7_source_attestation": s17_attestation, "s1_8_source_dependencies": s18_sources, "s1_7_affected_dependencies": affected_s17, "s1_8_affected_dependencies": affected_s18, "s1_8_authorized_shared_drift": s18_authorized_drift, "authorized_shared_change": "src/param_importance_nlp/runtime/optimizer.py", "current_source_cpu_clip_replay": replay})
+    result = _with_hash({"schema_version": "stage1-s1-9-upstream-compatibility-v4", "status": "PASS", "s1_7_producer": s1_7["s1_7_generator_commit"], "s1_8_producer": s1_8["s1_8_generator_commit"], "consumer_commit": _git(repository, "rev-parse", "HEAD"), "s1_7_to_consumer_changed_paths": changed_s17, "s1_8_to_consumer_changed_paths": changed_s18, "s1_7_source_attestation": s17_attestation, "s1_8_source_dependencies": s18_sources, "s1_8_v5_handoff": s18_v5_handoff, "s1_7_affected_dependencies": affected_s17, "s1_8_affected_dependencies": affected_s18, "s1_8_authorized_shared_drift": s18_authorized_drift, "authorized_shared_change": "src/param_importance_nlp/runtime/optimizer.py", "current_source_cpu_clip_replay": replay, "nonproducer_runtime_attestation": nonproducer_runtime})
+    _validate_s1_9_schemas(repository, {"upstream_compatibility": result})
+    return result
 
 
-def _gpu_preflight(approved: tuple[str, ...], *, minimum_compute_capability: float, max_temperature_c: int) -> dict[str, Any]:
-    query = "index,uuid,name,compute_cap,memory.total,memory.used,utilization.gpu,temperature.gpu"
+_GPU_QUIESCENCE_TIMEOUT_SECONDS = 180.0
+_GPU_QUIESCENCE_POLL_SECONDS = 1.0
+_GPU_QUIESCENCE_CONSECUTIVE_SAMPLES = 3
+_GPU_QUIESCENCE_MAX_TRANSIENT_SAMPLES = 2
+_GPU_QUIESCENCE_MAX_SAMPLES = 9
+_GPU_OPERATIONAL_TIMEOUT_BASIS = {
+    "measurement_method": "frozen_linux_cpu_only_nvidia_smi_management_queries",
+    "combined_inventory_recovery_seconds": 6.166325362000862,
+    "compute_apps_seconds": 6.113894288000665,
+    "two_query_sample_seconds": 12.280219650001527,
+    "maximum_transient_samples": 2,
+    "per_sample_management_budget_seconds": 15.0,
+    "maximum_sample_count": 9,
+    "maximum_cadence_count": 8,
+    "nine_samples_plus_eight_cadences_seconds": 143.0,
+    "fixed_timeout_seconds": 180.0,
+    "fixed_margin_seconds": 37.0,
+    "dynamic_fitting": False,
+}
+
+
+def _gpu_probe_exception_reason(error: BaseException) -> str:
+    if isinstance(error, Stage1S19FormalError):
+        return str(error)
+    if isinstance(error, subprocess.TimeoutExpired):
+        return "S1_9_GPU_PROBE_EXCEPTION:TimeoutExpired"
+    if isinstance(error, FileNotFoundError):
+        return "S1_9_GPU_PROBE_EXCEPTION:FileNotFoundError"
+    if isinstance(error, OSError):
+        return "S1_9_GPU_PROBE_EXCEPTION:OSError"
+    raise Stage1S19FormalError("S1_9_GPU_PROBE_EXCEPTION_CLASS_UNAUTHORIZED") from error
+
+
+def _gpu_prelease_evidence(approved: tuple[str, ...], quiescence: Mapping[str, Any]) -> dict[str, Any]:
+    """Bind bounded prelease health/quiescence before lease construction."""
+
+    return _with_hash({
+        "schema_version": "stage1-s1-9-gpu-prelease-v3",
+        "status": quiescence.get("status"),
+        "approved_gpu_uuids": list(approved),
+        "quiescence": dict(quiescence),
+    })
+
+
+def _gpu_probe_once(approved: tuple[str, ...]) -> dict[str, Any]:
+    """Read selected inventory and Recovery Action atomically in one query.
+
+    Compute applications intentionally remain a second independent command:
+    it is a different nvidia-smi query class, while the inventory/Recovery
+    tuple must never be stitched from separate temporal samples.
+    """
+
+    query = "index,uuid,name,memory.total,memory.used,utilization.gpu,temperature.gpu,compute_cap,gpu_recovery_action"
     rows = _run(["nvidia-smi", f"--query-gpu={query}", "--format=csv,noheader,nounits"]).stdout.splitlines()
     by_uuid: dict[str, dict[str, Any]] = {}
     for line in rows:
         fields = [item.strip() for item in line.split(",")]
-        if len(fields) != 8 or not fields[0].isdigit() or _UUID.fullmatch(fields[1]) is None:
+        if len(fields) != 9 or not fields[0].isdigit() or _UUID.fullmatch(fields[1]) is None or not fields[2] or not fields[7] or not fields[8]:
             raise Stage1S19FormalError("S1_9_GPU_PREFLIGHT_PARSE_INVALID")
         try:
-            row = {"physical_index": int(fields[0]), "uuid": fields[1], "name": fields[2], "compute_capability": float(fields[3]), "memory_total_mib": int(fields[4]), "memory_used_mib": int(fields[5]), "utilization_gpu_percent": int(fields[6]), "temperature_c": int(fields[7])}
+            row = {"physical_index": int(fields[0]), "uuid": fields[1], "name": fields[2], "memory_total_mib": int(fields[3]), "memory_used_mib": int(fields[4]), "utilization_percent": int(fields[5]), "temperature_c": int(fields[6]), "compute_capability": fields[7], "recovery_action": fields[8]}
+            float(row["compute_capability"])
         except ValueError as error:
             raise Stage1S19FormalError("S1_9_GPU_PREFLIGHT_VALUE_INVALID") from error
+        if any(int(row[name]) < 0 for name in ("memory_total_mib", "memory_used_mib", "utilization_percent", "temperature_c")):
+            raise Stage1S19FormalError("S1_9_GPU_PREFLIGHT_VALUE_INVALID")
+        if row["uuid"] in by_uuid:
+            raise Stage1S19FormalError("S1_9_GPU_PREFLIGHT_DUPLICATE_UUID")
         by_uuid[row["uuid"]] = row
     if set(approved) - set(by_uuid):
         raise Stage1S19FormalError("S1_9_APPROVED_GPU_NOT_DISCOVERED")
     processes = _run(["nvidia-smi", "--query-compute-apps=gpu_uuid,pid,process_name", "--format=csv,noheader,nounits"]).stdout.strip()
-    occupied = {line.split(",", 1)[0].strip() for line in processes.splitlines() if line.strip()}
-    selected = [by_uuid[item] for item in approved]
-    healthy = all(row["compute_capability"] >= minimum_compute_capability and row["memory_used_mib"] == 0 and row["utilization_gpu_percent"] == 0 and row["temperature_c"] <= max_temperature_c and row["uuid"] not in occupied for row in selected)
-    if not healthy:
-        raise Stage1S19FormalError("S1_9_GPU_PREFLIGHT_HEALTH_OR_OCCUPANCY_FAILED")
-    return _with_hash({"schema_version": "stage1-s1-9-gpu-preflight-v1", "status": "PASS", "approved_gpu_uuids": list(approved), "minimum_compute_capability": minimum_compute_capability, "max_temperature_c": max_temperature_c, "selected": selected, "compute_process_uuids": sorted(occupied)})
+    compute_apps: list[dict[str, Any]] = []
+    for line in processes.splitlines():
+        if not line.strip():
+            continue
+        fields = [item.strip() for item in line.split(",")]
+        if len(fields) != 3 or _UUID.fullmatch(fields[0]) is None or not fields[1].isdigit() or not fields[2]:
+            raise Stage1S19FormalError("S1_9_GPU_COMPUTE_PROCESS_PARSE_INVALID")
+        compute_apps.append({"gpu_uuid": fields[0], "pid": int(fields[1]), "process_name": fields[2]})
+    return {"selected": [dict(by_uuid[item]) for item in approved], "requested_uuid_order": list(approved), "compute_apps": compute_apps}
+
+
+def _gpu_violations(probe: Mapping[str, Any], *, minimum_compute_capability: float, max_temperature_c: int) -> tuple[list[str], list[str]]:
+    """Return all exact-idle violations and the fail-immediately subset."""
+
+    selected = _mapping(probe, field="gpu.probe").get("selected")
+    apps = probe.get("compute_apps")
+    if not isinstance(selected, list) or not isinstance(apps, list):
+        raise Stage1S19FormalError("S1_9_GPU_PROBE_SHAPE_INVALID")
+    selected_uuids = {row.get("uuid") for row in selected if isinstance(row, Mapping)}
+    violations: list[str] = []
+    hard: list[str] = []
+    for row in selected:
+        if not isinstance(row, Mapping) or not isinstance(row.get("uuid"), str):
+            raise Stage1S19FormalError("S1_9_GPU_PROBE_SHAPE_INVALID")
+        uuid = row["uuid"]
+        if row.get("recovery_action") != "None":
+            hard.append("S1_9_GPU_RECOVERY_ACTION_NOT_NONE:" + uuid + ":" + str(row.get("recovery_action")))
+        if not isinstance(row.get("compute_capability"), str) or float(row["compute_capability"]) < minimum_compute_capability or not isinstance(row.get("temperature_c"), int) or row["temperature_c"] > max_temperature_c:
+            hard.append("S1_9_GPU_PREFLIGHT_HARDWARE_HEALTH_FAILED:" + uuid)
+        if row.get("memory_used_mib") != 0:
+            violations.append("S1_9_GPU_SELECTED_MEMORY_NONZERO:" + uuid)
+        if row.get("utilization_percent") != 0:
+            violations.append("S1_9_GPU_SELECTED_UTILIZATION_NONZERO:" + uuid)
+    for app in apps:
+        if not isinstance(app, Mapping) or not isinstance(app.get("gpu_uuid"), str):
+            raise Stage1S19FormalError("S1_9_GPU_PROBE_SHAPE_INVALID")
+        if app["gpu_uuid"] in selected_uuids:
+            hard.append("S1_9_GPU_COMPUTE_PROCESS_PRESENT:" + app["gpu_uuid"] + ":" + str(app.get("pid")))
+    return [*hard, *violations], hard
+
+
+def _gpu_quiescence(approved: tuple[str, ...], *, phase: str, minimum_compute_capability: float, max_temperature_c: int, timeout_seconds: float = _GPU_QUIESCENCE_TIMEOUT_SECONDS, poll_seconds: float = _GPU_QUIESCENCE_POLL_SECONDS, consecutive_required: int = _GPU_QUIESCENCE_CONSECUTIVE_SAMPLES, max_transient_samples: int = _GPU_QUIESCENCE_MAX_TRANSIENT_SAMPLES) -> dict[str, Any]:
+    """Require fixed 60 s / 1 s / three exact selected-idle samples.
+
+    A completed third probe at the deadline is a timeout, not a PASS.  Any
+    Recovery, health, selected-PID, identity, or parser fault returns a
+    canonical FAIL observation before the caller can acquire or continue a
+    lease.
+    """
+
+    if phase not in {"prelease", "post_worker"} or timeout_seconds != _GPU_QUIESCENCE_TIMEOUT_SECONDS or poll_seconds != _GPU_QUIESCENCE_POLL_SECONDS or consecutive_required != _GPU_QUIESCENCE_CONSECUTIVE_SAMPLES or max_transient_samples != _GPU_QUIESCENCE_MAX_TRANSIENT_SAMPLES:
+        raise Stage1S19FormalError("S1_9_GPU_QUIESCENCE_ARGUMENT_INVALID")
+    started_at, start = _now(), time.monotonic()
+    deadline, consecutive, transients, samples, final_gpu = start + timeout_seconds, 0, 0, [], None
+
+    def result(status: str, reason: str | None) -> dict[str, Any]:
+        return _with_hash({"schema_version": "stage1-s1-9-gpu-quiescence-v3", "status": status, "phase": phase, "approved_gpu_uuids": list(approved), "started_at": started_at, "minimum_compute_capability": minimum_compute_capability, "max_temperature_c": max_temperature_c, "timeout_seconds": timeout_seconds, "sample_interval_seconds": poll_seconds, "required_consecutive_exact_idle_samples": consecutive_required, "max_transient_samples": max_transient_samples, "transient_observation_count": transients, "operational_timeout_basis": dict(_GPU_OPERATIONAL_TIMEOUT_BASIS), "samples": samples, "final_gpu": final_gpu, "failure_reason": reason})
+
+    sample_index = 0
+    while True:
+        try:
+            probe = _gpu_probe_once(approved)
+        except (Stage1S19FormalError, subprocess.TimeoutExpired, FileNotFoundError, OSError) as error:
+            reason = _gpu_probe_exception_reason(error)
+            now = time.monotonic()
+            samples.append({"sample_index": sample_index, "observed_at": _now(), "monotonic_elapsed_seconds": max(0.0, now - start), "requested_uuid_order": list(approved), "probe_error": reason, "exact_selected_idle": False, "consecutive_exact_idle_samples": consecutive, "transient_observation_count": transients})
+            return result("FAILED", reason)
+        now = time.monotonic()
+        final_gpu = probe
+        violations, hard = _gpu_violations(probe, minimum_compute_capability=minimum_compute_capability, max_temperature_c=max_temperature_c)
+        exact_idle = not violations
+        if hard:
+            consecutive = 0
+        elif exact_idle:
+            consecutive += 1
+        else:
+            consecutive = 0; transients += 1
+        samples.append({"sample_index": sample_index, "observed_at": _now(), "monotonic_elapsed_seconds": max(0.0, now - start), "requested_uuid_order": list(approved), "selected": probe["selected"], "compute_apps": probe["compute_apps"], "violations": violations, "exact_selected_idle": exact_idle, "consecutive_exact_idle_samples": consecutive, "transient_observation_count": transients})
+        if hard:
+            return result("FAILED", hard[0])
+        if transients > max_transient_samples:
+            return result("FAILED", "S1_9_GPU_QUIESCENCE_TRANSIENT_LIMIT")
+        # Completion is checked after each whole probe and before accepting a
+        # third sample.  Equality is deliberately failed closed.
+        if now >= deadline:
+            return result("FAILED", "S1_9_GPU_QUIESCENCE_TIMEOUT")
+        if consecutive == consecutive_required:
+            return result("PASS", None)
+        if sample_index + 1 >= _GPU_QUIESCENCE_MAX_SAMPLES:
+            return result("FAILED", "S1_9_GPU_QUIESCENCE_SAMPLE_LIMIT")
+        sample_index += 1
+        time.sleep(min(poll_seconds, max(0.0, deadline - now)))
 
 
 def _proc_record(pid: int, *, run_token: str) -> dict[str, Any]:
@@ -902,6 +1318,46 @@ def _validate_t_amp_table_exact_shapes(table: Mapping[str, Any]) -> None:
         raise Stage1S19FormalError("S1_9_T_AMP_FLAT_PROJECTION_BINDING_INVALID")
 
 
+def _validate_gpu_probe(probe: object, approved: list[str], *, field: str) -> None:
+    snapshot = _exact_keys(_mapping(probe, field=field), {"selected", "requested_uuid_order", "compute_apps"}, field=field)
+    selected, requested, apps = snapshot["selected"], snapshot["requested_uuid_order"], snapshot["compute_apps"]
+    if not isinstance(selected, list) or len(selected) != 4 or not isinstance(requested, list) or requested != approved or not isinstance(apps, list):
+        raise Stage1S19FormalError("S1_9_DEEP_SCHEMA_GPU_PROBE_BINDING_INVALID")
+    observed: list[str] = []
+    for index, row in enumerate(selected):
+        row = _exact_keys(_mapping(row, field=f"{field}.selected[{index}]"), {"physical_index", "uuid", "name", "memory_total_mib", "memory_used_mib", "utilization_percent", "temperature_c", "compute_capability", "recovery_action"}, field=f"{field}.selected[{index}]")
+        if type(row["physical_index"]) is not int or not isinstance(row["uuid"], str) or _UUID.fullmatch(row["uuid"]) is None or not isinstance(row["name"], str) or not row["name"] or any(type(row[name]) is not int or row[name] < 0 for name in ("memory_total_mib", "memory_used_mib", "utilization_percent", "temperature_c")) or not isinstance(row["compute_capability"], str) or not row["compute_capability"] or not isinstance(row["recovery_action"], str) or not row["recovery_action"]:
+            raise Stage1S19FormalError("S1_9_DEEP_SCHEMA_GPU_SELECTED_ROW_INVALID")
+        try:
+            float(row["compute_capability"])
+        except ValueError as error:
+            raise Stage1S19FormalError("S1_9_DEEP_SCHEMA_GPU_SELECTED_CAPABILITY_INVALID") from error
+        observed.append(row["uuid"])
+    if observed != approved:
+        raise Stage1S19FormalError("S1_9_DEEP_SCHEMA_GPU_SELECTED_ORDER_INVALID")
+    for index, app in enumerate(apps):
+        app = _exact_keys(_mapping(app, field=f"{field}.compute_apps[{index}]"), {"gpu_uuid", "pid", "process_name"}, field=f"{field}.compute_apps[{index}]")
+        if not isinstance(app["gpu_uuid"], str) or _UUID.fullmatch(app["gpu_uuid"]) is None or type(app["pid"]) is not int or app["pid"] < 1 or not isinstance(app["process_name"], str) or not app["process_name"]:
+            raise Stage1S19FormalError("S1_9_DEEP_SCHEMA_GPU_COMPUTE_APP_INVALID")
+
+
+def _validate_gpu_sample(value: object, approved: list[str], *, field: str) -> bool:
+    sample = _mapping(value, field=field)
+    base = {"sample_index", "observed_at", "monotonic_elapsed_seconds", "requested_uuid_order", "exact_selected_idle", "consecutive_exact_idle_samples", "transient_observation_count"}
+    if "probe_error" in sample:
+        sample = _exact_keys(sample, {*base, "probe_error"}, field=field)
+        if not isinstance(sample["probe_error"], str) or not sample["probe_error"] or sample["exact_selected_idle"] is not False or sample["consecutive_exact_idle_samples"] != 0:
+            raise Stage1S19FormalError("S1_9_DEEP_SCHEMA_GPU_PROBE_ERROR_SAMPLE_INVALID")
+        return True
+    sample = _exact_keys(sample, {*base, "selected", "compute_apps", "violations"}, field=field)
+    _validate_gpu_probe({"selected": sample["selected"], "requested_uuid_order": sample["requested_uuid_order"], "compute_apps": sample["compute_apps"]}, approved, field=field)
+    if not isinstance(sample["violations"], list) or any(not isinstance(item, str) or not item for item in sample["violations"]) or type(sample["exact_selected_idle"]) is not bool or type(sample["consecutive_exact_idle_samples"]) is not int or sample["consecutive_exact_idle_samples"] < 0:
+        raise Stage1S19FormalError("S1_9_DEEP_SCHEMA_GPU_SAMPLE_INVALID")
+    if sample["exact_selected_idle"] != (not sample["violations"]):
+        raise Stage1S19FormalError("S1_9_DEEP_SCHEMA_GPU_SAMPLE_IDLE_INVALID")
+    return False
+
+
 def _deep_role_contract(role: str, value: Mapping[str, Any]) -> None:
     """Exact key/cardinality policy for roles whose data-dependent maps are
     difficult to spell compactly in JSON Schema's deliberately small runtime
@@ -934,12 +1390,74 @@ def _deep_role_contract(role: str, value: Mapping[str, Any]) -> None:
         if not isinstance(hashes, Mapping) or not hashes or any(not isinstance(ref, str) or not ref.startswith(expected_prefix) or "\\" in ref or ".." in ref for ref in hashes):
             raise Stage1S19FormalError("S1_9_DEEP_SCHEMA_CHECKPOINT_STORE_FILES_INVALID")
         return
+    if role == "upstream_compatibility":
+        compatibility = _exact_keys(value, {"schema_version", "status", "s1_7_producer", "s1_8_producer", "consumer_commit", "s1_7_to_consumer_changed_paths", "s1_8_to_consumer_changed_paths", "s1_7_source_attestation", "s1_8_source_dependencies", "s1_8_v5_handoff", "s1_7_affected_dependencies", "s1_8_affected_dependencies", "s1_8_authorized_shared_drift", "authorized_shared_change", "current_source_cpu_clip_replay", "nonproducer_runtime_attestation", "artifact_hash"}, field="upstream_compatibility")
+        runtime = _exact_keys(_mapping(compatibility["nonproducer_runtime_attestation"], field="upstream_compatibility.nonproducer_runtime_attestation"), {"affected_paths", "s1_8_source_map_excludes_paths", "s1_7_oracle_training_import_isolated", "checkpoint_group_producer_math_exclusion", "current_source_cpu_replays"}, field="upstream_compatibility.nonproducer_runtime_attestation")
+        s18_v5 = _exact_keys(_mapping(compatibility["s1_8_v5_handoff"], field="upstream_compatibility.s1_8_v5_handoff"), {"index_schema_version", "ddp_report_schema_version", "validation_schema_version", "implementation_source_sha256", "reproduction_role_refs", "reproduction_role_sha256", "gpu_quiescence"}, field="upstream_compatibility.s1_8_v5_handoff")
+        if runtime["affected_paths"] != runtime["s1_8_source_map_excludes_paths"] or not isinstance(runtime["current_source_cpu_replays"], Mapping) or s18_v5["implementation_source_sha256"] != compatibility["s1_8_source_dependencies"] or s18_v5["index_schema_version"] != "stage1-s1-8-formalization-index-v5" or s18_v5["ddp_report_schema_version"] != "stage1-s1-8-ddp-report-v5" or s18_v5["validation_schema_version"] != "stage1-s1-8-validation-v5":
+            raise Stage1S19FormalError("S1_9_DEEP_SCHEMA_UPSTREAM_COMPATIBILITY_INVALID")
+        return
+    if role == "gpu_quiescence":
+        quiescence = _exact_keys(value, {"schema_version", "status", "phase", "approved_gpu_uuids", "started_at", "minimum_compute_capability", "max_temperature_c", "timeout_seconds", "sample_interval_seconds", "required_consecutive_exact_idle_samples", "max_transient_samples", "transient_observation_count", "operational_timeout_basis", "samples", "final_gpu", "failure_reason", "artifact_hash"}, field="gpu_quiescence")
+        approved = quiescence["approved_gpu_uuids"]
+        samples = quiescence["samples"]
+        if quiescence["schema_version"] != "stage1-s1-9-gpu-quiescence-v3" or quiescence["status"] not in {"PASS", "FAILED"} or quiescence["phase"] not in {"prelease", "post_worker"} or not isinstance(approved, list) or len(approved) != 4 or len(set(approved)) != 4 or any(not isinstance(uuid, str) or _UUID.fullmatch(uuid) is None for uuid in approved) or not isinstance(samples, list) or not samples or len(samples) > _GPU_QUIESCENCE_MAX_SAMPLES or quiescence["timeout_seconds"] != _GPU_QUIESCENCE_TIMEOUT_SECONDS or quiescence["sample_interval_seconds"] != _GPU_QUIESCENCE_POLL_SECONDS or quiescence["required_consecutive_exact_idle_samples"] != _GPU_QUIESCENCE_CONSECUTIVE_SAMPLES or quiescence["max_transient_samples"] != _GPU_QUIESCENCE_MAX_TRANSIENT_SAMPLES or quiescence["operational_timeout_basis"] != _GPU_OPERATIONAL_TIMEOUT_BASIS or not _self_hash_valid(quiescence):
+            raise Stage1S19FormalError("S1_9_DEEP_SCHEMA_GPU_QUIESCENCE_INVALID")
+        error_sample = False
+        for index, sample in enumerate(samples):
+            error_sample = _validate_gpu_sample(sample, approved, field=f"gpu_quiescence.samples[{index}]") or error_sample
+        if not isinstance(samples[-1], Mapping) or samples[-1].get("transient_observation_count") != quiescence["transient_observation_count"] or quiescence["transient_observation_count"] > _GPU_QUIESCENCE_MAX_TRANSIENT_SAMPLES + 1:
+            raise Stage1S19FormalError("S1_9_DEEP_SCHEMA_GPU_TRANSIENT_COUNT_INVALID")
+        final_gpu = quiescence["final_gpu"]
+        if final_gpu is not None:
+            _validate_gpu_probe(final_gpu, approved, field="gpu_quiescence.final_gpu")
+        if quiescence["status"] == "PASS" and (quiescence["failure_reason"] is not None or len(samples) < 3 or error_sample or final_gpu is None or not isinstance(samples[-1], Mapping) or samples[-1].get("exact_selected_idle") is not True or samples[-1].get("consecutive_exact_idle_samples") != 3):
+            raise Stage1S19FormalError("S1_9_DEEP_SCHEMA_GPU_QUIESCENCE_PASS_INVALID")
+        if quiescence["status"] == "FAILED" and (not isinstance(quiescence["failure_reason"], str) or not quiescence["failure_reason"] or (error_sample and final_gpu is not None)):
+            raise Stage1S19FormalError("S1_9_DEEP_SCHEMA_GPU_QUIESCENCE_FAIL_INVALID")
+        if quiescence["status"] == "FAILED":
+            reason = quiescence["failure_reason"]
+            if error_sample:
+                if not reason.startswith("S1_9_GPU_PROBE_EXCEPTION:"):
+                    raise Stage1S19FormalError("S1_9_DEEP_SCHEMA_GPU_PROBE_ERROR_REASON_INVALID")
+            else:
+                last = _mapping(samples[-1], field="gpu_quiescence.last_sample")
+                selected = last.get("selected")
+                apps = last.get("compute_apps")
+                if not isinstance(selected, list) or not isinstance(apps, list):
+                    raise Stage1S19FormalError("S1_9_DEEP_SCHEMA_GPU_HARD_FAILURE_OBSERVATION_MISSING")
+                if reason.startswith("S1_9_GPU_RECOVERY_ACTION_NOT_NONE:"):
+                    proven = any(isinstance(row, Mapping) and row.get("recovery_action") != "None" for row in selected)
+                elif reason.startswith("S1_9_GPU_PREFLIGHT_HARDWARE_HEALTH_FAILED:"):
+                    proven = any(isinstance(row, Mapping) and (not isinstance(row.get("compute_capability"), str) or float(row["compute_capability"]) < quiescence["minimum_compute_capability"] or row.get("temperature_c") > quiescence["max_temperature_c"]) for row in selected)
+                elif reason.startswith("S1_9_GPU_COMPUTE_PROCESS_PRESENT:"):
+                    proven = any(isinstance(app, Mapping) and app.get("gpu_uuid") in approved for app in apps)
+                elif reason == "S1_9_GPU_QUIESCENCE_TIMEOUT":
+                    proven = True
+                elif reason == "S1_9_GPU_QUIESCENCE_TRANSIENT_LIMIT":
+                    proven = quiescence["transient_observation_count"] == _GPU_QUIESCENCE_MAX_TRANSIENT_SAMPLES + 1
+                elif reason == "S1_9_GPU_QUIESCENCE_SAMPLE_LIMIT":
+                    proven = len(samples) == _GPU_QUIESCENCE_MAX_SAMPLES
+                else:
+                    proven = False
+                if not proven:
+                    raise Stage1S19FormalError("S1_9_DEEP_SCHEMA_GPU_HARD_FAILURE_EVIDENCE_INVALID")
+        return
+    if role == "gpu_prelease":
+        prelease = _exact_keys(value, {"schema_version", "status", "approved_gpu_uuids", "quiescence", "artifact_hash"}, field="gpu_prelease")
+        approved = prelease["approved_gpu_uuids"]
+        if prelease["schema_version"] != "stage1-s1-9-gpu-prelease-v3" or prelease["status"] not in {"PASS", "FAILED"} or not isinstance(approved, list) or len(approved) != 4 or len(set(approved)) != 4 or any(not isinstance(uuid, str) or _UUID.fullmatch(uuid) is None for uuid in approved) or not _self_hash_valid(prelease):
+            raise Stage1S19FormalError("S1_9_DEEP_SCHEMA_GPU_PRELEASE_INVALID")
+        _deep_role_contract("gpu_quiescence", _mapping(prelease["quiescence"], field="gpu_prelease.quiescence"))
+        if prelease["quiescence"].get("phase") != "prelease" or prelease["quiescence"].get("approved_gpu_uuids") != approved or prelease["status"] != prelease["quiescence"].get("status"):
+            raise Stage1S19FormalError("S1_9_DEEP_SCHEMA_GPU_PRELEASE_STATUS_BINDING_INVALID")
+        return
     if role == "index":
         index = _exact_keys(value, {"schema_version", "status", "gate_id", "task_id", "fixture_id", "generator_git_commit", "consumer_git_commit", "git_branch", "checked_at", "s1_7_handoff", "s1_8_handoff", "role_refs", "role_sha256", "reproduction_role_refs", "reproduction_role_sha256", "gate_artifact_hash", "csv_sha256", "svg_sha256", "validation_ref", "validation_sha256", "replay_ref", "replay_sha256", "replay_hash", "next_task_ids", "artifact_hash"}, field="index")
         for map_name in ("role_refs", "role_sha256", "reproduction_role_refs", "reproduction_role_sha256", "csv_sha256", "svg_sha256"):
             if not isinstance(index[map_name], Mapping) or not index[map_name]:
                 raise Stage1S19FormalError(f"S1_9_DEEP_SCHEMA_MAP_INVALID:index.{map_name}")
-        if index["next_task_ids"] != ["stage1.10_checkpoint_resume_and_artifacts"]:
+        if index["schema_version"] != "stage1-s1-9-formalization-index-v5" or index["next_task_ids"] != ["stage1.10_checkpoint_resume_and_artifacts"]:
             raise Stage1S19FormalError("S1_9_DEEP_SCHEMA_NEXT_TASK_INVALID")
 
 
@@ -954,12 +1472,13 @@ def _validate_s1_9_schemas(repository: Path, values: Mapping[str, Mapping[str, A
         raise Stage1S19FormalError("S1_9_SCHEMA_VALIDATOR_LOAD_FAILED")
     module = importlib.util.module_from_spec(spec); spec.loader.exec_module(module)
     registry: dict[str, Mapping[str, Any]] = {}
-    for path in sorted((repository / "schemas" / "stage1").glob("s1-9-*.json")):
+    schema_paths = [*sorted((repository / "schemas" / "stage1").glob("s1-9-*.json")), repository / "schemas" / "stage1" / "s1-8-formalization-index-v1.json", repository / "schemas" / "stage1" / "s1-8-formalization-index-v5.json", repository / "schemas" / "stage1" / "s1-8-ddp-report-v5.json", repository / "schemas" / "stage1" / "s1-8-validation-v5.json", repository / "schemas" / "stage1" / "s1-8-gpu-quiescence-v3.json"]
+    for path in schema_paths:
         loaded = loads_strict_json(path.read_bytes())
         if not isinstance(loaded, Mapping) or not isinstance(loaded.get("$id"), str):
             raise Stage1S19FormalError(f"S1_9_SCHEMA_INVALID:{path.name}")
         registry[path.name] = loaded; registry[str(loaded["$id"])] = loaded
-    files = {"numeric_report": "s1-9-numeric-report-v1.json", "oracle_bundle": "s1-9-oracle-bundle-v1.json", "trace_bundle": "s1-9-trace-bundle-v1.json", "comparison_table": "s1-9-comparison-table-v1.json", "gate_record": "s1-9-gate-record-v1.json", "replay": "s1-9-replay-validation-v1.json", "validation": "s1-9-validation-v1.json", "index": "s1-9-formalization-index-v1.json", "single_worker": "s1-9-single-bf16-worker-v1.json", "ddp_worker": "s1-9-ddp-skip-worker-v1.json", "bf16_checkpoint_store": "s1-9-bf16-checkpoint-store-reproduction-v1.json"}
+    files = {"numeric_report": "s1-9-numeric-report-v1.json", "oracle_bundle": "s1-9-oracle-bundle-v1.json", "trace_bundle": "s1-9-trace-bundle-v1.json", "comparison_table": "s1-9-comparison-table-v1.json", "gate_record": "s1-9-gate-record-v1.json", "replay": "s1-9-replay-validation-v1.json", "validation": "s1-9-validation-v1.json", "index": "s1-9-formalization-index-v5.json", "single_worker": "s1-9-single-bf16-worker-v1.json", "ddp_worker": "s1-9-ddp-skip-worker-v1.json", "bf16_checkpoint_store": "s1-9-bf16-checkpoint-store-reproduction-v1.json", "upstream_compatibility": "s1-9-upstream-compatibility-v4.json", "gpu_quiescence": "s1-9-gpu-quiescence-v3.json", "gpu_prelease": "s1-9-gpu-prelease-v3.json"}
     for role, value in values.items():
         schema = registry.get(files.get(role, ""))
         if schema is None:
@@ -1034,14 +1553,22 @@ def execute(*, repository: str | Path, data_root: str | Path, s1_7_index_ref: st
         fixture = load_stage1_s19_fixture(repository_root)
         upstream_s17 = validate_s1_7_handoff(root, s1_7_index_ref)
         upstream_s18 = validate_s1_8_handoff(root, s1_8_index_ref, expected_binding=s1_8_binding)
-        upstream_compatibility = _upstream_compatibility_attestation(repository_root, root, s1_7_ref=s1_7_index_ref, s1_7=upstream_s17, s1_8_ref=s1_8_index_ref, s1_8=upstream_s18)
+        upstream_compatibility = _upstream_compatibility_attestation(repository_root, root, s1_7_ref=s1_7_index_ref, s1_7=upstream_s17, s1_8_ref=s1_8_index_ref, s1_8=upstream_s18, replay_root=work / "upstream-cpu-replay")
         _write(work / "upstream-compatibility.json", upstream_compatibility)
         capability = _capability(root, gpu_capability_ref, capability_binding, approved_gpu_uuids)
-        preflight = _gpu_preflight(approved_gpu_uuids, minimum_compute_capability=minimum_compute_capability, max_temperature_c=max_temperature_c)
+        # This bounded loop is before the lease constructor.  Both PASS and
+        # every failure variant are schema-checked and durably written.
+        prelease_quiescence = _gpu_quiescence(approved_gpu_uuids, phase="prelease", minimum_compute_capability=minimum_compute_capability, max_temperature_c=max_temperature_c)
+        _validate_s1_9_schemas(repository_root, {"gpu_quiescence": prelease_quiescence})
+        prelease_gpu = _gpu_prelease_evidence(approved_gpu_uuids, prelease_quiescence)
+        _validate_s1_9_schemas(repository_root, {"gpu_prelease": prelease_gpu})
+        _write(work / "prelease-gpu.json", prelease_gpu)
+        if prelease_gpu["status"] != "PASS":
+            raise Stage1S19FormalError("S1_9_GPU_PRELEASE_FAILED:" + str(prelease_quiescence["failure_reason"]))
         resource_budget = _resource_budget(work)
-        _write(work / "preflight.json", _with_hash({"schema_version": "stage1-s1-9-preflight-v1", "status": "PASS", "fixture_hash": fixture["fixture_hash"], "s1_7_handoff": upstream_s17, "s1_8_handoff": upstream_s18, "upstream_compatibility_hash": upstream_compatibility["artifact_hash"], "capability": capability, "gpu": preflight, "resource_budget": resource_budget}))
+        _write(work / "preflight.json", _with_hash({"schema_version": "stage1-s1-9-preflight-v1", "status": "PASS", "fixture_hash": fixture["fixture_hash"], "s1_7_handoff": upstream_s17, "s1_8_handoff": upstream_s18, "upstream_compatibility_hash": upstream_compatibility["artifact_hash"], "capability": capability, "gpu": prelease_quiescence, "resource_budget": resource_budget}))
         config_hash = _canonical({"task_id": TASK_ID, "commit": commit, "s1_7": upstream_s17, "s1_8": upstream_s18, "upstream_compatibility": upstream_compatibility["artifact_hash"], "capability": capability, "approved_gpu_uuids": list(approved_gpu_uuids), "determinism_policy": _DETERMINISM_ENV, "timeout_seconds": timeout_seconds})
-        identity = GpuLeaseIdentity(run_id=f"s19-{attempt_id}", lease_id=f"s19-{attempt_id}", gpu_uuids=approved_gpu_uuids, owner=lease_owner, config_hash=config_hash, environment_hash=str(preflight["artifact_hash"]))
+        identity = GpuLeaseIdentity(run_id=f"s19-{attempt_id}", lease_id=f"s19-{attempt_id}", gpu_uuids=approved_gpu_uuids, owner=lease_owner, config_hash=config_hash, environment_hash=str(prelease_quiescence["artifact_hash"]))
         lease = ProjectGpuLease(root, identity)
         lease.acquire(); lease.heartbeat()
         run_token = hashlib.sha256(_canonical({"execution_commit": commit, "config_hash": config_hash, "approved_gpu_uuids": list(approved_gpu_uuids), "attempt_id": attempt_id}).encode("ascii")).hexdigest()
@@ -1124,8 +1651,13 @@ def execute(*, repository: str | Path, data_root: str | Path, s1_7_index_ref: st
             raise Stage1S19FormalError("S1_9_SCHEMA_NEGATIVE_CONTROL_FAILED")
         if evidence["numeric_report"].get("status") != "PASS" or replay.get("status") != "PASS":
             raise Stage1S19FormalError("S1_9_NUMERIC_OR_REPLAY_NOT_PASS")
-        post_worker = _gpu_preflight(approved_gpu_uuids, minimum_compute_capability=minimum_compute_capability, max_temperature_c=max_temperature_c)
-        _write(work / "post-worker-preflight.json", post_worker)
+        post_worker = _gpu_quiescence(approved_gpu_uuids, phase="post_worker", minimum_compute_capability=minimum_compute_capability, max_temperature_c=max_temperature_c)
+        # Failure is an evidence-bearing, fail-closed outcome too; schema
+        # validate it before making the canonical record durable.
+        _validate_s1_9_schemas(repository_root, {"gpu_quiescence": post_worker})
+        _write(work / "post-worker-quiescence.json", post_worker)
+        if post_worker.get("status") != "PASS":
+            raise Stage1S19FormalError("S1_9_GPU_POST_WORKER_QUIESCENCE_FAILED:" + str(post_worker.get("failure_reason")))
         history = _release_lease_verified(lease, outcome="GPU_PHASE_SUCCESS"); released = True; lease = None
         shutil.copy2(history, work / "lease-history.json")
         role_files = {"numeric_report": "numeric-report.json", "oracle_bundle": "oracle-bundle.json", "trace_bundle": "trace-bundle.json", "comparison_table": "comparison-table.json", "gate_record": "g1-numeric-record.json"}
@@ -1213,7 +1745,7 @@ def execute(*, repository: str | Path, data_root: str | Path, s1_7_index_ref: st
         if staging.exists():
             raise Stage1S19FormalError("S1_9_PUBLISH_STAGING_COLLISION")
         staging.mkdir(parents=True)
-        published = set(role_files.values()) | {"replay-validation.json", "validation.json", "attempt-start.json", "upstream-compatibility.json", "preflight.json", "post-worker-preflight.json", "lease-history.json", "single-bf16.json", "single.stdout.txt", "single.stderr.txt", "single-child-fingerprint.json", "ddp-skip.json", "ddp.stdout.txt", "ddp.stderr.txt", "ddp-child-fingerprint.json"} | set(csv_hashes) | set(svg_hashes)
+        published = set(role_files.values()) | {"replay-validation.json", "validation.json", "attempt-start.json", "upstream-compatibility.json", "prelease-gpu.json", "preflight.json", "post-worker-quiescence.json", "lease-history.json", "single-bf16.json", "single.stdout.txt", "single.stderr.txt", "single-child-fingerprint.json", "ddp-skip.json", "ddp.stdout.txt", "ddp.stderr.txt", "ddp-child-fingerprint.json"} | set(csv_hashes) | set(svg_hashes)
         for name in sorted(published):
             shutil.copy2(work / name, staging / name)
         checkpoint_store_index = _copy_checkpoint_store_reproduction(checkpoint_root, staging / "bf16-resume-store", str(checkpoint_id))
@@ -1221,9 +1753,9 @@ def execute(*, repository: str | Path, data_root: str | Path, s1_7_index_ref: st
         # right: schema-check it before it ever reaches staging.
         _validate_s1_9_schemas(repository_root, {"bf16_checkpoint_store": checkpoint_store_index})
         _write(staging / "bf16-resume-store-index.json", checkpoint_store_index)
-        reproduction = {"attempt_start": "attempt-start.json", "upstream_compatibility": "upstream-compatibility.json", "preflight": "preflight.json", "post_worker_preflight": "post-worker-preflight.json", "lease_history": "lease-history.json", "single_worker": "single-bf16.json", "single_stdout": "single.stdout.txt", "single_stderr": "single.stderr.txt", "single_child_fingerprint": "single-child-fingerprint.json", "bf16_resume_checkpoint_store": "bf16-resume-store-index.json", "ddp_worker": "ddp-skip.json", "ddp_stdout": "ddp.stdout.txt", "ddp_stderr": "ddp.stderr.txt", "ddp_child_fingerprint": "ddp-child-fingerprint.json", **{f"chart_csv_{index}": name for index, name in enumerate(sorted(csv_hashes))}, **{f"chart_svg_{index}": name for index, name in enumerate(sorted(svg_hashes))}}
+        reproduction = {"attempt_start": "attempt-start.json", "upstream_compatibility": "upstream-compatibility.json", "preflight": "preflight.json", "prelease_gpu": "prelease-gpu.json", "post_worker_quiescence": "post-worker-quiescence.json", "lease_history": "lease-history.json", "single_worker": "single-bf16.json", "single_stdout": "single.stdout.txt", "single_stderr": "single.stderr.txt", "single_child_fingerprint": "single-child-fingerprint.json", "bf16_resume_checkpoint_store": "bf16-resume-store-index.json", "ddp_worker": "ddp-skip.json", "ddp_stdout": "ddp.stdout.txt", "ddp_stderr": "ddp.stderr.txt", "ddp_child_fingerprint": "ddp-child-fingerprint.json", **{f"chart_csv_{index}": name for index, name in enumerate(sorted(csv_hashes))}, **{f"chart_svg_{index}": name for index, name in enumerate(sorted(svg_hashes))}}
         reproduction_sha = {role: _sha(staging / filename) for role, filename in reproduction.items()}
-        index = _with_hash({"schema_version": "stage1-s1-9-formalization-index-v1", "status": "PASS", "gate_id": GATE_ID, "task_id": TASK_ID, "fixture_id": FIXTURE_ID, "generator_git_commit": commit, "consumer_git_commit": commit, "git_branch": _git(repository_root, "branch", "--show-current"), "checked_at": _now(), "s1_7_handoff": upstream_s17, "s1_8_handoff": upstream_s18, "role_refs": role_files, "role_sha256": role_sha, "reproduction_role_refs": reproduction, "reproduction_role_sha256": reproduction_sha, "gate_artifact_hash": evidence["gate_record"]["artifact_hash"], "csv_sha256": csv_hashes, "svg_sha256": svg_hashes, "validation_ref": "validation.json", "validation_sha256": _sha(work / "validation.json"), "replay_ref": "replay-validation.json", "replay_sha256": _sha(work / "replay-validation.json"), "replay_hash": replay["replay_hash"], "next_task_ids": ["stage1.10_checkpoint_resume_and_artifacts"]})
+        index = _with_hash({"schema_version": "stage1-s1-9-formalization-index-v5", "status": "PASS", "gate_id": GATE_ID, "task_id": TASK_ID, "fixture_id": FIXTURE_ID, "generator_git_commit": commit, "consumer_git_commit": commit, "git_branch": _git(repository_root, "branch", "--show-current"), "checked_at": _now(), "s1_7_handoff": upstream_s17, "s1_8_handoff": upstream_s18, "role_refs": role_files, "role_sha256": role_sha, "reproduction_role_refs": reproduction, "reproduction_role_sha256": reproduction_sha, "gate_artifact_hash": evidence["gate_record"]["artifact_hash"], "csv_sha256": csv_hashes, "svg_sha256": svg_hashes, "validation_ref": "validation.json", "validation_sha256": _sha(work / "validation.json"), "replay_ref": "replay-validation.json", "replay_sha256": _sha(work / "replay-validation.json"), "replay_hash": replay["replay_hash"], "next_task_ids": ["stage1.10_checkpoint_resume_and_artifacts"]})
         _validate_s1_9_schemas(repository_root, {"index": index})
         _write(staging / "index.json", index)
         _write(staging / "success.json", _with_hash({"schema_version": "stage1-s1-9-attempt-success-v1", "status": "PASS", "completed_at": _now(), "gate_artifact_hash": evidence["gate_record"]["artifact_hash"], "validation_sha256": _sha(work / "validation.json"), "failed_marker_present": False}))
