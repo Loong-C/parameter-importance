@@ -56,6 +56,16 @@ _S1_7_ROLE_SELF_HASH_FIELDS = {
     "comparison_table": "table_hash",
     "gate_record": "artifact_hash",
 }
+# S1.8 V8 has one deliberately non-uniform primary role.  Freeze both the
+# digest field and status-presence rule per exact role, so fixture metadata
+# cannot be treated as a PASS/``artifact_hash`` envelope by accident.
+_S1_8_ROLE_HASH_AND_STATUS = {
+    "fixture_manifest": ("fixture_hash", None),
+    "ddp_report": ("artifact_hash", "PASS"),
+    "array_bundle": ("artifact_hash", "PASS"),
+    "comparison_table": ("artifact_hash", "PASS"),
+    "gate_record": ("artifact_hash", "PASS"),
+}
 
 
 class Stage1PrecisionError(RuntimeError):
@@ -1447,7 +1457,7 @@ def validate_s1_8_handoff(data_root: str | Path, index_ref: str, *, expected_bin
     if supplied != canonical_json_hash(body) or index.get("status") != "PASS" or index.get("schema_version") != expected_binding["schema_version"] or index.get("task_id") != expected_binding["task_id"] or index.get("gate_id") != expected_binding["gate_id"] or index.get("generator_git_commit") != expected_binding["producer_commit"] or index.get("consumer_git_commit") != expected_binding["producer_commit"] or index.get("artifact_hash") != expected_binding["index_artifact_hash"] or index.get("gate_artifact_hash") != expected_binding["gate_artifact_hash"]:
         raise Stage1PrecisionError("S1_9_S1_8_INDEX_SEMANTIC_BINDING_INVALID")
     refs, hashes = index.get("role_refs"), index.get("role_sha256")
-    required_roles = {"fixture_manifest", "ddp_report", "array_bundle", "comparison_table", "gate_record"}
+    required_roles = set(_S1_8_ROLE_HASH_AND_STATUS)
     if not isinstance(refs, Mapping) or not isinstance(hashes, Mapping) or set(refs) != required_roles or set(hashes) != required_roles:
         raise Stage1PrecisionError("S1_9_S1_8_ROLE_SET_INVALID")
     roles: dict[str, Mapping[str, Any]] = {}
@@ -1459,8 +1469,10 @@ def validate_s1_8_handoff(data_root: str | Path, index_ref: str, *, expected_bin
         role_value = load_canonical_json(path)
         if not isinstance(role_value, Mapping):
             raise Stage1PrecisionError(f"S1_9_S1_8_ROLE_NOT_OBJECT:{role}")
-        role_body = dict(role_value); role_hash = role_body.pop("artifact_hash", None)
-        if not isinstance(role_hash, str) or role_hash != canonical_json_hash(role_body) or role_value.get("status") != "PASS":
+        hash_field, expected_status = _S1_8_ROLE_HASH_AND_STATUS[role]
+        role_body = dict(role_value); role_hash = role_body.pop(hash_field, None)
+        status_valid = "status" not in role_value if expected_status is None else role_value.get("status") == expected_status
+        if not isinstance(role_hash, str) or role_hash != canonical_json_hash(role_body) or not status_valid:
             raise Stage1PrecisionError(f"S1_9_S1_8_ROLE_SEMANTIC_INVALID:{role}")
         roles[role] = role_value
     gate = roles["gate_record"]
