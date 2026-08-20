@@ -31,6 +31,7 @@ GATE_ID = "G1-RESUME"
 FIXTURE_ID = "stage1-s110-checkpoint-fixture-v1"
 _COMMIT = re.compile(r"^[0-9a-f]{40}$")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
+_TOKEN = re.compile(r"^[0-9a-f]{64}$")
 _UUID = re.compile(r"^GPU-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
 _ATTEMPT = re.compile(r"^[a-z0-9][a-z0-9-]{0,63}$")
 
