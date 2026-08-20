@@ -124,10 +124,26 @@ TERMINAL_PROCESS_JOIN_TIMEOUT_SECONDS = 30.0
 # GPU contexts can outlive a successfully reaped worker briefly.  The formal
 # contract is therefore not a one-shot observation: it needs three complete,
 # consecutive, exact-idle inventories before a release or reacquire boundary.
-# These values are deliberately frozen rather than derived from an observation.
-GPU_QUIESCENCE_TIMEOUT_SECONDS = 30.0
+# The 60-second operational bound is versioned in gpu-quiescence-v2.  It does
+# not relax any idle predicate: a frozen-server CPU-only management-query
+# measurement observed a 12.280219650001527-second two-query sample, so three
+# samples plus the two fixed one-second cadences require 38.84065895000458s.
+# The fixed 21.15934104999542-second margin is a static operating budget, not
+# dynamically fitted from a formal attempt.
+GPU_QUIESCENCE_TIMEOUT_SECONDS = 60.0
 GPU_QUIESCENCE_SAMPLE_INTERVAL_SECONDS = 1.0
 GPU_QUIESCENCE_REQUIRED_CONSECUTIVE_EXACT_IDLE_SAMPLES = 3
+GPU_QUIESCENCE_SCHEMA_VERSION = "stage1-s1-8-gpu-quiescence-v2"
+GPU_QUIESCENCE_OPERATIONAL_TIMEOUT_BASIS = {
+    "measurement_method": "frozen_linux_cpu_only_nvidia_smi_management_queries",
+    "combined_inventory_recovery_seconds": 6.166325362000862,
+    "compute_apps_seconds": 6.113894288000665,
+    "two_query_sample_seconds": 12.280219650001527,
+    "three_samples_plus_two_cadences_seconds": 38.84065895000458,
+    "fixed_timeout_seconds": 60.0,
+    "fixed_margin_seconds": 21.15934104999542,
+    "dynamic_fitting": False,
+}
 GPU_QUIESCENCE_ROLES = {
     "prelease": "prelease-gpu-quiescence.json",
     "post_worker": "post-worker-gpu-quiescence.json",
@@ -157,14 +173,14 @@ IMPLEMENTATION_SOURCE_FILES = (
     "src/param_importance_nlp/core/accumulator.py", "src/param_importance_nlp/core/errors.py", "src/param_importance_nlp/core/tensors.py",
     "src/param_importance_nlp/g3_runtime_assets.py", "src/param_importance_nlp/runtime/operations.py", "src/param_importance_nlp/runtime/task_artifacts.py",
     "configs/stage0/g3-asset-requirements-v1.json", "configs/stage0/g3-asset-layout-v1.json",
-    "schemas/stage1/s1-8-array-bundle-v1.json", "schemas/stage1/s1-8-comparison-table-v1.json", "schemas/stage1/s1-8-ddp-report-v1.json", "schemas/stage1/s1-8-ddp-report-v2.json", "schemas/stage1/s1-8-ddp-report-v3.json", "schemas/stage1/s1-8-fixture-manifest-v1.json", "schemas/stage1/s1-8-fixture-manifest-v2.json", "schemas/stage1/s1-8-fixture-manifest-v3.json", "schemas/stage1/s1-8-formalization-index-v1.json", "schemas/stage1/s1-8-formalization-index-v2.json", "schemas/stage1/s1-8-formalization-index-v3.json", "schemas/stage1/s1-8-gate-record-v1.json", "schemas/stage1/s1-8-gpu-quiescence-v1.json", "schemas/stage1/s1-8-replay-validation-v1.json", "schemas/stage1/s1-8-replay-validation-v2.json", "schemas/stage1/s1-8-safetensors-manifest-v1.json", "schemas/stage1/s1-8-validation-v1.json", "schemas/stage1/s1-8-validation-v2.json", "schemas/stage1/s1-8-validation-v3.json", "schemas/stage1/s1-8-worker-report-v1.json",
+    "schemas/stage1/s1-8-array-bundle-v1.json", "schemas/stage1/s1-8-comparison-table-v1.json", "schemas/stage1/s1-8-ddp-report-v1.json", "schemas/stage1/s1-8-ddp-report-v2.json", "schemas/stage1/s1-8-ddp-report-v3.json", "schemas/stage1/s1-8-ddp-report-v4.json", "schemas/stage1/s1-8-fixture-manifest-v1.json", "schemas/stage1/s1-8-fixture-manifest-v2.json", "schemas/stage1/s1-8-fixture-manifest-v3.json", "schemas/stage1/s1-8-formalization-index-v1.json", "schemas/stage1/s1-8-formalization-index-v2.json", "schemas/stage1/s1-8-formalization-index-v3.json", "schemas/stage1/s1-8-formalization-index-v4.json", "schemas/stage1/s1-8-gate-record-v1.json", "schemas/stage1/s1-8-gpu-quiescence-v1.json", "schemas/stage1/s1-8-gpu-quiescence-v2.json", "schemas/stage1/s1-8-replay-validation-v1.json", "schemas/stage1/s1-8-replay-validation-v2.json", "schemas/stage1/s1-8-safetensors-manifest-v1.json", "schemas/stage1/s1-8-validation-v1.json", "schemas/stage1/s1-8-validation-v2.json", "schemas/stage1/s1-8-validation-v3.json", "schemas/stage1/s1-8-validation-v4.json", "schemas/stage1/s1-8-worker-report-v1.json",
 )
 
 
 def _fixed_reproduction_roles() -> dict[str, tuple[str, str]]:
     """Return the complete, deterministic publication closure for a PASS run.
 
-    The keys, flattened names, and source-relative paths are part of the v3
+    The keys, flattened names, and source-relative paths are part of the v4
     wire contract.  No glob-discovered file is allowed to add a role merely
     because it happened to exist in an attempt directory.
     """
@@ -353,12 +369,12 @@ def _validate_output_schemas(repository: Path, objects: Mapping[str, Mapping[str
             raise Stage1S18FormalError("S18_SCHEMA_REGISTRY_INVALID:" + path.name)
         registry[path.name] = value; registry[str(value["$id"])] = value
     filenames = {
-        "fixture_manifest": "s1-8-fixture-manifest-v3.json", "ddp_report": "s1-8-ddp-report-v3.json",
+        "fixture_manifest": "s1-8-fixture-manifest-v3.json", "ddp_report": "s1-8-ddp-report-v4.json",
         "array_bundle": "s1-8-array-bundle-v1.json", "comparison_table": "s1-8-comparison-table-v1.json",
         "gate_record": "s1-8-gate-record-v1.json", "replay": "s1-8-replay-validation-v2.json",
-        "validation": "s1-8-validation-v3.json", "index": "s1-8-formalization-index-v3.json",
+        "validation": "s1-8-validation-v4.json", "index": "s1-8-formalization-index-v4.json",
         "worker_report": "s1-8-worker-report-v1.json", "safetensors_manifest": "s1-8-safetensors-manifest-v1.json",
-        "gpu_quiescence": "s1-8-gpu-quiescence-v1.json",
+        "gpu_quiescence": "s1-8-gpu-quiescence-v2.json",
     }
     for role, value in objects.items():
         schema = registry.get(filenames.get(role, ""))
@@ -375,9 +391,9 @@ def _schema_prepublication_check(repository: Path, objects: Mapping[str, Mapping
 
     from param_importance_nlp.contracts.jsonio import loads_strict_json
     expected = {
-        "s1-8-array-bundle-v1.json", "s1-8-comparison-table-v1.json", "s1-8-ddp-report-v1.json", "s1-8-ddp-report-v2.json", "s1-8-ddp-report-v3.json",
-        "s1-8-fixture-manifest-v1.json", "s1-8-fixture-manifest-v2.json", "s1-8-fixture-manifest-v3.json", "s1-8-formalization-index-v1.json", "s1-8-formalization-index-v2.json", "s1-8-formalization-index-v3.json", "s1-8-gate-record-v1.json", "s1-8-gpu-quiescence-v1.json",
-        "s1-8-replay-validation-v1.json", "s1-8-replay-validation-v2.json", "s1-8-safetensors-manifest-v1.json", "s1-8-validation-v1.json", "s1-8-validation-v2.json", "s1-8-validation-v3.json", "s1-8-worker-report-v1.json",
+        "s1-8-array-bundle-v1.json", "s1-8-comparison-table-v1.json", "s1-8-ddp-report-v1.json", "s1-8-ddp-report-v2.json", "s1-8-ddp-report-v3.json", "s1-8-ddp-report-v4.json",
+        "s1-8-fixture-manifest-v1.json", "s1-8-fixture-manifest-v2.json", "s1-8-fixture-manifest-v3.json", "s1-8-formalization-index-v1.json", "s1-8-formalization-index-v2.json", "s1-8-formalization-index-v3.json", "s1-8-formalization-index-v4.json", "s1-8-gate-record-v1.json", "s1-8-gpu-quiescence-v1.json", "s1-8-gpu-quiescence-v2.json",
+        "s1-8-replay-validation-v1.json", "s1-8-replay-validation-v2.json", "s1-8-safetensors-manifest-v1.json", "s1-8-validation-v1.json", "s1-8-validation-v2.json", "s1-8-validation-v3.json", "s1-8-validation-v4.json", "s1-8-worker-report-v1.json",
     }
     paths = {path.name: path for path in (repository / "schemas" / "stage1").glob("s1-8-*.json")}
     if set(paths) != expected:
@@ -1306,40 +1322,48 @@ def _parse_gpu_compute_apps(output: str, *, expected_uuids: Sequence[str]) -> li
     return apps
 
 
-def _probe_approved_gpus(approved_gpu_uuids: Sequence[str]) -> dict[str, Any]:
-    """Perform one complete structured selected-GPU observation.
+def _parse_approved_gpu_inventory(output: str, *, expected_uuids: Sequence[str]) -> list[dict[str, Any]]:
+    """Parse one exact inventory that includes the recovery action per UUID."""
 
-    This intentionally keeps nonzero memory/utilization observable rather than
-    failing here: the quiescence sampler records those transient observations
-    and requires consecutive exact-idle samples.  Identity, recovery, parser,
-    and selected compute-process failures remain immediate and fail closed.
-    """
-
-    values = _approved_gpu_uuid_values(approved_gpu_uuids)
-    output = _run(["nvidia-smi", "--query-gpu=index,uuid,name,memory.total,memory.used,utilization.gpu,temperature.gpu,compute_cap", "--format=csv,noheader,nounits"])
+    values = _approved_gpu_uuid_values(expected_uuids)
     inventory: dict[str, dict[str, Any]] = {}
     for line in output.splitlines():
         fields = [field.strip() for field in line.split(",")]
         if (
-            len(fields) != 8 or not fields[0].isdigit() or GPU_UUID_RE.fullmatch(fields[1]) is None
+            len(fields) != 9 or not fields[0].isdigit() or GPU_UUID_RE.fullmatch(fields[1]) is None
             or not all(field.isdigit() for field in fields[3:7]) or not fields[2] or not fields[7]
-            or fields[1] in inventory
+            or not fields[8] or fields[1] in inventory
         ):
             raise Stage1S18FormalError("S18_GPU_DISCOVERY_PARSE_INVALID")
-        inventory[fields[1]] = {"physical_index": int(fields[0]), "uuid": fields[1], "name": fields[2], "memory_total_mib": int(fields[3]), "memory_used_mib": int(fields[4]), "utilization_percent": int(fields[5]), "temperature_c": int(fields[6]), "compute_capability": fields[7]}
-    recovery_actions = _parse_gpu_recovery_actions(
-        _run(["nvidia-smi", "--query-gpu=uuid,gpu_recovery_action", "--format=csv,noheader,nounits"]),
-        expected_uuids=values,
-    )
+        inventory[fields[1]] = {
+            "physical_index": int(fields[0]), "uuid": fields[1], "name": fields[2],
+            "memory_total_mib": int(fields[3]), "memory_used_mib": int(fields[4]),
+            "utilization_percent": int(fields[5]), "temperature_c": int(fields[6]),
+            "compute_capability": fields[7], "recovery_action": fields[8],
+        }
     selected: list[dict[str, Any]] = []
     for uuid in values:
         row = inventory.get(uuid)
         if row is None:
             raise Stage1S18FormalError("S18_GPU_DISCOVERY_UUID_MISMATCH")
-        # Preserve recovery state in the observation.  The one-shot preflight
-        # and the sampler classify non-None as an immediate failure below; the
-        # sampler must first persist the actual selected inventory.
-        selected.append({**row, "recovery_action": recovery_actions[uuid]})
+        selected.append(row)
+    return selected
+
+
+def _probe_approved_gpus(approved_gpu_uuids: Sequence[str]) -> dict[str, Any]:
+    """Perform one complete structured selected-GPU observation.
+
+    The inventory and Recovery Action are one supported ``nvidia-smi`` query,
+    while compute apps remain an independent exact query.  This only reduces
+    management-process startup; it does not alter the recorded fields or any
+    immediate identity/recovery/PID failure semantics.
+    """
+
+    values = _approved_gpu_uuid_values(approved_gpu_uuids)
+    selected = _parse_approved_gpu_inventory(
+        _run(["nvidia-smi", "--query-gpu=index,uuid,name,memory.total,memory.used,utilization.gpu,temperature.gpu,compute_cap,gpu_recovery_action", "--format=csv,noheader,nounits"]),
+        expected_uuids=values,
+    )
     apps = _parse_gpu_compute_apps(
         _run(["nvidia-smi", "--query-compute-apps=gpu_uuid,pid,process_name", "--format=csv,noheader,nounits"]),
         expected_uuids=values,
@@ -1459,13 +1483,14 @@ def _write_gpu_quiescence_record(
     if phase not in {"prelease", "post_worker", "post_release", "reacquire_preflight"} or status not in {"PASS", "FAILED"}:
         raise Stage1S18FormalError("S18_GPU_QUIESCENCE_RECORD_INVALID")
     value = _with_hash({
-        "schema_version": "stage1-s1-8-gpu-quiescence-v1",
+        "schema_version": GPU_QUIESCENCE_SCHEMA_VERSION,
         "status": status,
         "phase": phase,
         "started_at": started_at,
         "timeout_seconds": GPU_QUIESCENCE_TIMEOUT_SECONDS,
         "sample_interval_seconds": GPU_QUIESCENCE_SAMPLE_INTERVAL_SECONDS,
         "required_consecutive_exact_idle_samples": GPU_QUIESCENCE_REQUIRED_CONSECUTIVE_EXACT_IDLE_SAMPLES,
+        "operational_timeout_basis": GPU_QUIESCENCE_OPERATIONAL_TIMEOUT_BASIS,
         "samples": list(samples),
         "final_gpu": None if final_gpu is None else dict(final_gpu),
         "failure_reason": failure_reason,
@@ -2945,7 +2970,7 @@ def execute(*, repository: Path, data_root: Path, s1_7_index_ref: str, gpu_capab
             phase: {"ref": filename, "sha256": _sha(work / filename)}
             for phase, filename in GPU_QUIESCENCE_ROLES.items()
         }
-        ddp_report = _with_hash({"schema_version": "stage1-s1-8-ddp-report-v3", "status": "PASS", "task_id": TASK_ID, "fixture_hash": fixture["fixture_hash"], "fixture_schema_version": fixture["schema_version"], "fixture_id": fixture["fixture_id"], "nccl_transport_protocol": nccl_transport, "implementation_source_sha256": source_hashes, "baseline_routes": baseline_reports, "permutation_routes": permutation_reports, "negative_controls": negative, "gpu_quiescence": gpu_quiescence_bindings}); _write(work / "ddp-report.json", ddp_report)
+        ddp_report = _with_hash({"schema_version": "stage1-s1-8-ddp-report-v4", "status": "PASS", "task_id": TASK_ID, "fixture_hash": fixture["fixture_hash"], "fixture_schema_version": fixture["schema_version"], "fixture_id": fixture["fixture_id"], "nccl_transport_protocol": nccl_transport, "implementation_source_sha256": source_hashes, "baseline_routes": baseline_reports, "permutation_routes": permutation_reports, "negative_controls": negative, "gpu_quiescence": gpu_quiescence_bindings}); _write(work / "ddp-report.json", ddp_report)
         csv_hashes, svg_hashes = _charts(work, result, ddp_report, baseline_arrays)
         # It is intentionally written only after every worker output, replay,
         # report and chart exists, and excludes itself from the measured scope.
@@ -3022,8 +3047,8 @@ def execute(*, repository: Path, data_root: Path, s1_7_index_ref: str, gpu_capab
             requirements = {**base_requirements, "schemas_and_atomic_publication": schema_result}
             gate_value = _with_hash({"schema_version": "stage1-s1-8-gate-record-v1", "status": "PASS", "gate_id": GATE_ID, "task_id": TASK_ID, "requirements": requirements})
             role_hashes = {role: _canonical_file_sha(value) for role, value in {"fixture_manifest": fixture, "ddp_report": ddp_report, "array_bundle": arrays_bundle, "comparison_table": table, "gate_record": gate_value}.items()}
-            validation_value = _with_hash({"schema_version": "stage1-s1-8-validation-v3", "status": "PASS", "task_id": TASK_ID, "gate_id": GATE_ID, "producer_commit": commit, "fixture_schema_version": fixture["schema_version"], "fixture_id": fixture["fixture_id"], "checks": [{"check_id": identifier, "status": "PASS", "detail": identifier.replace("_", " ")} for identifier in GATE_CHECK_IDS], "role_sha256": role_hashes, "gpu_quiescence": gpu_quiescence_bindings})
-            index_value = _with_hash({"schema_version": "stage1-s1-8-formalization-index-v3", "status": "PASS", "gate_id": GATE_ID, "task_id": TASK_ID, "generator_git_commit": commit, "consumer_git_commit": commit, "fixture_schema_version": fixture["schema_version"], "fixture_id": fixture["fixture_id"], "gpu_capability": capability, "nccl_transport_protocol": nccl_transport, "implementation_source_sha256": source_hashes, "s1_7_handoff": handoff_for_index, "role_refs": role_files, "role_sha256": role_hashes, "reproduction_role_refs": reproduction, "reproduction_role_sha256": reproduction_sha, "gate_artifact_hash": gate_value["artifact_hash"], "validation_ref": "validation.json", "validation_sha256": _canonical_file_sha(validation_value), "replay_ref": "replay-validation.json", "replay_sha256": _canonical_file_sha(replay_record), "next_task_ids": ["stage1.10_checkpoint_resume_and_artifacts"]})
+            validation_value = _with_hash({"schema_version": "stage1-s1-8-validation-v4", "status": "PASS", "task_id": TASK_ID, "gate_id": GATE_ID, "producer_commit": commit, "fixture_schema_version": fixture["schema_version"], "fixture_id": fixture["fixture_id"], "checks": [{"check_id": identifier, "status": "PASS", "detail": identifier.replace("_", " ")} for identifier in GATE_CHECK_IDS], "role_sha256": role_hashes, "gpu_quiescence": gpu_quiescence_bindings})
+            index_value = _with_hash({"schema_version": "stage1-s1-8-formalization-index-v4", "status": "PASS", "gate_id": GATE_ID, "task_id": TASK_ID, "generator_git_commit": commit, "consumer_git_commit": commit, "fixture_schema_version": fixture["schema_version"], "fixture_id": fixture["fixture_id"], "gpu_capability": capability, "nccl_transport_protocol": nccl_transport, "implementation_source_sha256": source_hashes, "s1_7_handoff": handoff_for_index, "role_refs": role_files, "role_sha256": role_hashes, "reproduction_role_refs": reproduction, "reproduction_role_sha256": reproduction_sha, "gate_artifact_hash": gate_value["artifact_hash"], "validation_ref": "validation.json", "validation_sha256": _canonical_file_sha(validation_value), "replay_ref": "replay-validation.json", "replay_sha256": _canonical_file_sha(replay_record), "next_task_ids": ["stage1.10_checkpoint_resume_and_artifacts"]})
             values = {"fixture_manifest": fixture, "ddp_report": ddp_report, "array_bundle": arrays_bundle, "comparison_table": table, "gate_record": gate_value, "replay": replay_record, "validation": validation_value, "index": index_value}
             return values, role_hashes, gate_value, validation_value, index_value
 
