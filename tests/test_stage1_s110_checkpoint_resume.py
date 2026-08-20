@@ -56,7 +56,7 @@ def _schema_handoff(which: str) -> dict[str, object]:
             },
             "validation_sha256": "f" * 64,
             "source_map_sha256": "f" * 64,
-            "source_map_entries": 57,
+            "source_map_entries": 61,
             "reproduction_role_sha256": {
                 "prelease_gpu_quiescence": "f" * 64,
                 "post_worker_gpu_quiescence": "f" * 64,
@@ -65,7 +65,7 @@ def _schema_handoff(which: str) -> dict[str, object]:
             },
             "reproduction_role_set_sha256": "f" * 64,
             "reproduction_role_count": 84,
-            "schema_version": "stage1-s1-8-formalization-index-v7",
+            "schema_version": "stage1-s1-8-formalization-index-v8",
             "task_id": "stage1.08_ddp_and_gradient_accumulation",
             "gate_id": "G1-DDP",
         }
@@ -92,7 +92,7 @@ def _schema_handoff(which: str) -> dict[str, object]:
         },
         "reproduction_role_set_sha256": "6" * 64,
         "reproduction_role_count": 28,
-        "schema_version": "stage1-s1-9-formalization-index-v7",
+        "schema_version": "stage1-s1-9-formalization-index-v8",
         "task_id": "stage1.09_precision_clipping_and_optimizer_boundaries",
         "gate_id": "G1-NUMERIC",
     }
@@ -240,7 +240,7 @@ def _write_handoff_fixture(
         if task_id == "stage1.08_ddp_and_gradient_accumulation"
         else "numeric_report"
     )
-    source_count, reproduction_count = (57, 84) if task_id == "stage1.08_ddp_and_gradient_accumulation" else (34, 28)
+    source_count, reproduction_count = (61, 84) if task_id == "stage1.08_ddp_and_gradient_accumulation" else (34, 28)
     source_map = {f"src/frozen-producer-{index}.py": "b" * 64 for index in range(source_count)}
     gate = {
         "schema_version": "synthetic-gate-v1",
@@ -294,14 +294,14 @@ def _write_handoff_fixture(
         reproduction_refs[f"auxiliary_{index}"] = f"auxiliary-{index}.json"
     schema_versions = (
         {
-            "prelease_gpu_quiescence": "stage1-s1-8-gpu-quiescence-v3",
-            "post_worker_gpu_quiescence": "stage1-s1-8-gpu-quiescence-v3",
-            "post_release_gpu_quiescence": "stage1-s1-8-gpu-quiescence-v3",
-            "reacquire_preflight_gpu_quiescence": "stage1-s1-8-gpu-quiescence-v3",
+            "prelease_gpu_quiescence": "stage1-s1-8-gpu-quiescence-v4",
+            "post_worker_gpu_quiescence": "stage1-s1-8-gpu-quiescence-v4",
+            "post_release_gpu_quiescence": "stage1-s1-8-gpu-quiescence-v4",
+            "reacquire_preflight_gpu_quiescence": "stage1-s1-8-gpu-quiescence-v4",
         }
         if task_id == "stage1.08_ddp_and_gradient_accumulation"
         else {
-            "upstream_compatibility": "stage1-s1-9-upstream-compatibility-v6",
+            "upstream_compatibility": "stage1-s1-9-upstream-compatibility-v7",
             "prelease_gpu": "stage1-s1-9-gpu-prelease-v3",
             "post_worker_quiescence": "stage1-s1-9-gpu-quiescence-v3",
         }
@@ -586,7 +586,7 @@ def test_s110_parameterized_handoff_rejects_missing_or_unpinned_binding(tmp_path
         tmp_path,
         task_id="stage1.08_ddp_and_gradient_accumulation",
         gate_id="G1-DDP",
-        schema_version="stage1-s1-8-formalization-index-v6",
+        schema_version="stage1-s1-8-formalization-index-v7",
     )
     with pytest.raises(Stage1CheckpointError, match="FINAL_SCHEMA_REQUIRED"):
         validate_parameterized_handoff(
@@ -601,8 +601,8 @@ def test_s110_parameterized_handoff_rejects_missing_or_unpinned_binding(tmp_path
 @pytest.mark.parametrize(
     ("task_id", "gate_id", "schema_version"),
     [
-        ("stage1.08_ddp_and_gradient_accumulation", "G1-DDP", "stage1-s1-8-formalization-index-v7"),
-        ("stage1.09_precision_clipping_and_optimizer_boundaries", "G1-NUMERIC", "stage1-s1-9-formalization-index-v7"),
+        ("stage1.08_ddp_and_gradient_accumulation", "G1-DDP", "stage1-s1-8-formalization-index-v8"),
+        ("stage1.09_precision_clipping_and_optimizer_boundaries", "G1-NUMERIC", "stage1-s1-9-formalization-index-v8"),
     ],
 )
 def test_s110_parameterized_handoff_loads_index_siblings_and_rejects_escape(
@@ -663,7 +663,7 @@ def test_s110_final_handoff_rejects_short_or_wrong_versioned_reproduction_closur
         tmp_path,
         task_id="stage1.08_ddp_and_gradient_accumulation",
         gate_id="G1-DDP",
-        schema_version="stage1-s1-8-formalization-index-v7",
+        schema_version="stage1-s1-8-formalization-index-v8",
     )
     index_path = tmp_path / "published" / "index.json"
     index = json.loads(index_path.read_text(encoding="utf-8"))
@@ -687,13 +687,13 @@ def test_s110_final_handoff_rejects_short_or_wrong_versioned_reproduction_closur
         numeric_root,
         task_id="stage1.09_precision_clipping_and_optimizer_boundaries",
         gate_id="G1-NUMERIC",
-        schema_version="stage1-s1-9-formalization-index-v7",
+        schema_version="stage1-s1-9-formalization-index-v8",
     )
     index_path = numeric_root / "published" / "index.json"
     index = json.loads(index_path.read_text(encoding="utf-8"))
     compatibility = numeric_root / "published" / str(index["reproduction_role_refs"]["upstream_compatibility"])
     value = json.loads(compatibility.read_text(encoding="utf-8"))
-    value["schema_version"] = "stage1-s1-9-upstream-compatibility-v5"
+    value["schema_version"] = "stage1-s1-9-upstream-compatibility-v6"
     value["artifact_hash"] = canonical_json_hash({key: item for key, item in value.items() if key != "artifact_hash"})
     write_canonical_json(compatibility, value)
     index["reproduction_role_sha256"]["upstream_compatibility"] = _file_sha256(compatibility)

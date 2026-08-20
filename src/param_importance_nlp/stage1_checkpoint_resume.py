@@ -739,8 +739,8 @@ def validate_parameterized_handoff(data_root: str | Path, index_ref: str, *, exp
     ):
         raise Stage1CheckpointError("S1_10_HANDOFF_BINDING_REQUIRED")
     expected_schema = {
-        "stage1.08_ddp_and_gradient_accumulation": "stage1-s1-8-formalization-index-v7",
-        "stage1.09_precision_clipping_and_optimizer_boundaries": "stage1-s1-9-formalization-index-v7",
+        "stage1.08_ddp_and_gradient_accumulation": "stage1-s1-8-formalization-index-v8",
+        "stage1.09_precision_clipping_and_optimizer_boundaries": "stage1-s1-9-formalization-index-v8",
     }.get(expected_task_id)
     if expected_schema is None or expected_binding["schema_version"] != expected_schema:
         raise Stage1CheckpointError("S1_10_HANDOFF_FINAL_SCHEMA_REQUIRED")
@@ -891,7 +891,7 @@ def validate_parameterized_handoff(data_root: str | Path, index_ref: str, *, exp
     if any(role not in reproduction_refs for role in required_reproduction):
         raise Stage1CheckpointError("S1_10_HANDOFF_REPRODUCTION_ROLE_MISSING")
     expected_source_entries, expected_reproduction_entries = (
-        (57, 84) if expected_task_id == "stage1.08_ddp_and_gradient_accumulation" else (34, 28)
+        (61, 84) if expected_task_id == "stage1.08_ddp_and_gradient_accumulation" else (34, 28)
     )
     if len(report_sources) != expected_source_entries or len(reproduction_hashes) != expected_reproduction_entries:
         raise Stage1CheckpointError("S1_10_HANDOFF_CLOSURE_CARDINALITY_INVALID")
@@ -908,14 +908,14 @@ def validate_parameterized_handoff(data_root: str | Path, index_ref: str, *, exp
             reproduction_values[role] = dict(value)
     expected_artifact_schemas = (
         {
-            "prelease_gpu_quiescence": "stage1-s1-8-gpu-quiescence-v3",
-            "post_worker_gpu_quiescence": "stage1-s1-8-gpu-quiescence-v3",
-            "post_release_gpu_quiescence": "stage1-s1-8-gpu-quiescence-v3",
-            "reacquire_preflight_gpu_quiescence": "stage1-s1-8-gpu-quiescence-v3",
+            "prelease_gpu_quiescence": "stage1-s1-8-gpu-quiescence-v4",
+            "post_worker_gpu_quiescence": "stage1-s1-8-gpu-quiescence-v4",
+            "post_release_gpu_quiescence": "stage1-s1-8-gpu-quiescence-v4",
+            "reacquire_preflight_gpu_quiescence": "stage1-s1-8-gpu-quiescence-v4",
         }
         if expected_task_id == "stage1.08_ddp_and_gradient_accumulation"
         else {
-            "upstream_compatibility": "stage1-s1-9-upstream-compatibility-v6",
+            "upstream_compatibility": "stage1-s1-9-upstream-compatibility-v7",
             "prelease_gpu": "stage1-s1-9-gpu-prelease-v3",
             "post_worker_quiescence": "stage1-s1-9-gpu-quiescence-v3",
         }
