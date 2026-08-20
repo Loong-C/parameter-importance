@@ -509,7 +509,7 @@ def test_s19_new_compatibility_schemas_are_recursively_closed() -> None:
 
     worker_v2 = json.loads((ROOT / "schemas" / "stage1" / "s1-9-single-bf16-worker-v2.json").read_text(encoding="utf-8"))
     validation_v2 = json.loads((ROOT / "schemas" / "stage1" / "s1-9-validation-v2.json").read_text(encoding="utf-8"))
-    assert worker_v2["properties"]["observation"]["properties"]["determinism"]["properties"]["allowed_nondeterministic_kernel_classes"]["items"] == {"type": "string"}
+    assert worker_v2["$defs"]["determinism"]["properties"]["allowed_nondeterministic_kernel_classes"]["items"] == {"type": "string"}
     assert validation_v2["properties"]["regression"]["properties"]["kernel_allowlist"]["items"] == {"type": "string"}
 
 
