@@ -534,9 +534,10 @@ def _top_errors(evidence_root: Path, dependencies: list[Mapping[str, object]]) -
         for row in candidates:
             if not isinstance(row, Mapping):
                 continue
-            error = next((row[key] for key in ("original_unit_max_abs_error", "max_abs_error", "maximum_absolute_error") if isinstance(row.get(key), (int, float)) and not isinstance(row.get(key), bool)), None)
-            parameter = row.get("parameter_name", row.get("parameter", row.get("tensor_name")))
-            coordinate = row.get("coordinate", row.get("worst_coordinate"))
+            actual = row.get("actual") if isinstance(row.get("actual"), Mapping) else {}
+            error = next((source[key] for source in (row, actual) for key in ("original_unit_max_abs_error", "max_abs_error", "max_absolute_error", "maximum_absolute_error", "absolute_error") if isinstance(source.get(key), (int, float)) and not isinstance(source.get(key), bool)), None)
+            parameter = row.get("parameter_name", row.get("parameter", row.get("tensor_name", row.get("object_id", actual.get("object")))))
+            coordinate = row.get("coordinate", row.get("worst_coordinate", row.get("comparison", row.get("comparison_id", row.get("field", actual.get("coordinate"))))))
             if error is not None and isinstance(parameter, str) and isinstance(coordinate, (str, int)):
                 rows.append({"gate_id": binding["gate_id"], "parameter": parameter, "coordinate": str(coordinate), "max_abs_error": float(error)})
     rows.sort(key=lambda row: (-float(row["max_abs_error"]), str(row["gate_id"]), str(row["parameter"]), str(row["coordinate"])))
