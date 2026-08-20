@@ -124,24 +124,32 @@ TERMINAL_PROCESS_JOIN_TIMEOUT_SECONDS = 30.0
 # GPU contexts can outlive a successfully reaped worker briefly.  The formal
 # contract is therefore not a one-shot observation: it needs three complete,
 # consecutive, exact-idle inventories before a release or reacquire boundary.
-# The 60-second operational bound is versioned in gpu-quiescence-v2.  It does
+# The 180-second operational bound is versioned in gpu-quiescence-v3.  It does
 # not relax any idle predicate: a frozen-server CPU-only management-query
-# measurement observed a 12.280219650001527-second two-query sample, so three
-# samples plus the two fixed one-second cadences require 38.84065895000458s.
-# The fixed 21.15934104999542-second margin is a static operating budget, not
-# dynamically fitted from a formal attempt.
-GPU_QUIESCENCE_TIMEOUT_SECONDS = 60.0
+# measurement observed a 12.280219650001527-second two-query sample.  At most
+# two no-PID memory/utilization transients may reset the three-exact-idle
+# counter; the longest permitted sequence before three consecutive exact-idle
+# samples is nine observations.  A pre-registered 15-second management-query
+# budget yields 9 * 15 + 8 * 1 = 143 seconds, with a fixed 37-second margin.
+# This is a static operating budget, not dynamically fitted from a formal
+# attempt.
+GPU_QUIESCENCE_TIMEOUT_SECONDS = 180.0
 GPU_QUIESCENCE_SAMPLE_INTERVAL_SECONDS = 1.0
 GPU_QUIESCENCE_REQUIRED_CONSECUTIVE_EXACT_IDLE_SAMPLES = 3
-GPU_QUIESCENCE_SCHEMA_VERSION = "stage1-s1-8-gpu-quiescence-v2"
+GPU_QUIESCENCE_MAX_TRANSIENT_SAMPLES = 2
+GPU_QUIESCENCE_SCHEMA_VERSION = "stage1-s1-8-gpu-quiescence-v3"
 GPU_QUIESCENCE_OPERATIONAL_TIMEOUT_BASIS = {
     "measurement_method": "frozen_linux_cpu_only_nvidia_smi_management_queries",
     "combined_inventory_recovery_seconds": 6.166325362000862,
     "compute_apps_seconds": 6.113894288000665,
     "two_query_sample_seconds": 12.280219650001527,
-    "three_samples_plus_two_cadences_seconds": 38.84065895000458,
-    "fixed_timeout_seconds": 60.0,
-    "fixed_margin_seconds": 21.15934104999542,
+    "maximum_transient_samples": 2,
+    "per_sample_management_budget_seconds": 15.0,
+    "maximum_sample_count": 9,
+    "maximum_cadence_count": 8,
+    "nine_samples_plus_eight_cadences_seconds": 143.0,
+    "fixed_timeout_seconds": 180.0,
+    "fixed_margin_seconds": 37.0,
     "dynamic_fitting": False,
 }
 GPU_QUIESCENCE_ROLES = {
@@ -173,14 +181,14 @@ IMPLEMENTATION_SOURCE_FILES = (
     "src/param_importance_nlp/core/accumulator.py", "src/param_importance_nlp/core/errors.py", "src/param_importance_nlp/core/tensors.py",
     "src/param_importance_nlp/g3_runtime_assets.py", "src/param_importance_nlp/runtime/operations.py", "src/param_importance_nlp/runtime/task_artifacts.py",
     "configs/stage0/g3-asset-requirements-v1.json", "configs/stage0/g3-asset-layout-v1.json",
-    "schemas/stage1/s1-8-array-bundle-v1.json", "schemas/stage1/s1-8-comparison-table-v1.json", "schemas/stage1/s1-8-ddp-report-v1.json", "schemas/stage1/s1-8-ddp-report-v2.json", "schemas/stage1/s1-8-ddp-report-v3.json", "schemas/stage1/s1-8-ddp-report-v4.json", "schemas/stage1/s1-8-fixture-manifest-v1.json", "schemas/stage1/s1-8-fixture-manifest-v2.json", "schemas/stage1/s1-8-fixture-manifest-v3.json", "schemas/stage1/s1-8-formalization-index-v1.json", "schemas/stage1/s1-8-formalization-index-v2.json", "schemas/stage1/s1-8-formalization-index-v3.json", "schemas/stage1/s1-8-formalization-index-v4.json", "schemas/stage1/s1-8-gate-record-v1.json", "schemas/stage1/s1-8-gpu-quiescence-v1.json", "schemas/stage1/s1-8-gpu-quiescence-v2.json", "schemas/stage1/s1-8-replay-validation-v1.json", "schemas/stage1/s1-8-replay-validation-v2.json", "schemas/stage1/s1-8-safetensors-manifest-v1.json", "schemas/stage1/s1-8-validation-v1.json", "schemas/stage1/s1-8-validation-v2.json", "schemas/stage1/s1-8-validation-v3.json", "schemas/stage1/s1-8-validation-v4.json", "schemas/stage1/s1-8-worker-report-v1.json",
+    "schemas/stage1/s1-8-array-bundle-v1.json", "schemas/stage1/s1-8-comparison-table-v1.json", "schemas/stage1/s1-8-ddp-report-v1.json", "schemas/stage1/s1-8-ddp-report-v2.json", "schemas/stage1/s1-8-ddp-report-v3.json", "schemas/stage1/s1-8-ddp-report-v4.json", "schemas/stage1/s1-8-ddp-report-v5.json", "schemas/stage1/s1-8-fixture-manifest-v1.json", "schemas/stage1/s1-8-fixture-manifest-v2.json", "schemas/stage1/s1-8-fixture-manifest-v3.json", "schemas/stage1/s1-8-formalization-index-v1.json", "schemas/stage1/s1-8-formalization-index-v2.json", "schemas/stage1/s1-8-formalization-index-v3.json", "schemas/stage1/s1-8-formalization-index-v4.json", "schemas/stage1/s1-8-formalization-index-v5.json", "schemas/stage1/s1-8-gate-record-v1.json", "schemas/stage1/s1-8-gpu-quiescence-v1.json", "schemas/stage1/s1-8-gpu-quiescence-v2.json", "schemas/stage1/s1-8-gpu-quiescence-v3.json", "schemas/stage1/s1-8-replay-validation-v1.json", "schemas/stage1/s1-8-replay-validation-v2.json", "schemas/stage1/s1-8-safetensors-manifest-v1.json", "schemas/stage1/s1-8-validation-v1.json", "schemas/stage1/s1-8-validation-v2.json", "schemas/stage1/s1-8-validation-v3.json", "schemas/stage1/s1-8-validation-v4.json", "schemas/stage1/s1-8-validation-v5.json", "schemas/stage1/s1-8-worker-report-v1.json",
 )
 
 
 def _fixed_reproduction_roles() -> dict[str, tuple[str, str]]:
     """Return the complete, deterministic publication closure for a PASS run.
 
-    The keys, flattened names, and source-relative paths are part of the v4
+    The keys, flattened names, and source-relative paths are part of the v5
     wire contract.  No glob-discovered file is allowed to add a role merely
     because it happened to exist in an attempt directory.
     """
@@ -369,12 +377,12 @@ def _validate_output_schemas(repository: Path, objects: Mapping[str, Mapping[str
             raise Stage1S18FormalError("S18_SCHEMA_REGISTRY_INVALID:" + path.name)
         registry[path.name] = value; registry[str(value["$id"])] = value
     filenames = {
-        "fixture_manifest": "s1-8-fixture-manifest-v3.json", "ddp_report": "s1-8-ddp-report-v4.json",
+        "fixture_manifest": "s1-8-fixture-manifest-v3.json", "ddp_report": "s1-8-ddp-report-v5.json",
         "array_bundle": "s1-8-array-bundle-v1.json", "comparison_table": "s1-8-comparison-table-v1.json",
         "gate_record": "s1-8-gate-record-v1.json", "replay": "s1-8-replay-validation-v2.json",
-        "validation": "s1-8-validation-v4.json", "index": "s1-8-formalization-index-v4.json",
+        "validation": "s1-8-validation-v5.json", "index": "s1-8-formalization-index-v5.json",
         "worker_report": "s1-8-worker-report-v1.json", "safetensors_manifest": "s1-8-safetensors-manifest-v1.json",
-        "gpu_quiescence": "s1-8-gpu-quiescence-v2.json",
+        "gpu_quiescence": "s1-8-gpu-quiescence-v3.json",
     }
     for role, value in objects.items():
         schema = registry.get(filenames.get(role, ""))
@@ -391,9 +399,9 @@ def _schema_prepublication_check(repository: Path, objects: Mapping[str, Mapping
 
     from param_importance_nlp.contracts.jsonio import loads_strict_json
     expected = {
-        "s1-8-array-bundle-v1.json", "s1-8-comparison-table-v1.json", "s1-8-ddp-report-v1.json", "s1-8-ddp-report-v2.json", "s1-8-ddp-report-v3.json", "s1-8-ddp-report-v4.json",
-        "s1-8-fixture-manifest-v1.json", "s1-8-fixture-manifest-v2.json", "s1-8-fixture-manifest-v3.json", "s1-8-formalization-index-v1.json", "s1-8-formalization-index-v2.json", "s1-8-formalization-index-v3.json", "s1-8-formalization-index-v4.json", "s1-8-gate-record-v1.json", "s1-8-gpu-quiescence-v1.json", "s1-8-gpu-quiescence-v2.json",
-        "s1-8-replay-validation-v1.json", "s1-8-replay-validation-v2.json", "s1-8-safetensors-manifest-v1.json", "s1-8-validation-v1.json", "s1-8-validation-v2.json", "s1-8-validation-v3.json", "s1-8-validation-v4.json", "s1-8-worker-report-v1.json",
+        "s1-8-array-bundle-v1.json", "s1-8-comparison-table-v1.json", "s1-8-ddp-report-v1.json", "s1-8-ddp-report-v2.json", "s1-8-ddp-report-v3.json", "s1-8-ddp-report-v4.json", "s1-8-ddp-report-v5.json",
+        "s1-8-fixture-manifest-v1.json", "s1-8-fixture-manifest-v2.json", "s1-8-fixture-manifest-v3.json", "s1-8-formalization-index-v1.json", "s1-8-formalization-index-v2.json", "s1-8-formalization-index-v3.json", "s1-8-formalization-index-v4.json", "s1-8-formalization-index-v5.json", "s1-8-gate-record-v1.json", "s1-8-gpu-quiescence-v1.json", "s1-8-gpu-quiescence-v2.json", "s1-8-gpu-quiescence-v3.json",
+        "s1-8-replay-validation-v1.json", "s1-8-replay-validation-v2.json", "s1-8-safetensors-manifest-v1.json", "s1-8-validation-v1.json", "s1-8-validation-v2.json", "s1-8-validation-v3.json", "s1-8-validation-v4.json", "s1-8-validation-v5.json", "s1-8-worker-report-v1.json",
     }
     paths = {path.name: path for path in (repository / "schemas" / "stage1").glob("s1-8-*.json")}
     if set(paths) != expected:
@@ -1440,6 +1448,7 @@ def _gpu_quiescence_sample(
     started_monotonic: float,
     observed_monotonic: float,
     consecutive_exact_idle_samples: int,
+    transient_observation_count: int,
     probe: Mapping[str, Any] | None,
     violations: Sequence[str],
 ) -> dict[str, Any]:
@@ -1467,6 +1476,7 @@ def _gpu_quiescence_sample(
         "violations": list(violations),
         "exact_selected_idle": not violations,
         "consecutive_exact_idle_samples": consecutive_exact_idle_samples,
+        "transient_observation_count": transient_observation_count,
     }
 
 
@@ -1477,6 +1487,7 @@ def _write_gpu_quiescence_record(
     status: str,
     started_at: str,
     samples: Sequence[Mapping[str, Any]],
+    transient_observation_count: int,
     final_gpu: Mapping[str, Any] | None,
     failure_reason: str | None,
 ) -> dict[str, Any]:
@@ -1490,6 +1501,8 @@ def _write_gpu_quiescence_record(
         "timeout_seconds": GPU_QUIESCENCE_TIMEOUT_SECONDS,
         "sample_interval_seconds": GPU_QUIESCENCE_SAMPLE_INTERVAL_SECONDS,
         "required_consecutive_exact_idle_samples": GPU_QUIESCENCE_REQUIRED_CONSECUTIVE_EXACT_IDLE_SAMPLES,
+        "max_transient_samples": GPU_QUIESCENCE_MAX_TRANSIENT_SAMPLES,
+        "transient_observation_count": transient_observation_count,
         "operational_timeout_basis": GPU_QUIESCENCE_OPERATIONAL_TIMEOUT_BASIS,
         "samples": list(samples),
         "final_gpu": None if final_gpu is None else dict(final_gpu),
@@ -1512,6 +1525,7 @@ def require_gpu_quiescence(
     deadline = started_monotonic + GPU_QUIESCENCE_TIMEOUT_SECONDS
     samples: list[dict[str, Any]] = []
     consecutive = 0
+    transient_observation_count = 0
     while True:
         try:
             probe = _probe_approved_gpus(approved_gpu_uuids)
@@ -1520,11 +1534,11 @@ def require_gpu_quiescence(
             # preserve the failed probe attempt and stop immediately.
             sample = _gpu_quiescence_sample(
                 sample_index=len(samples), started_monotonic=started_monotonic, observed_monotonic=time.monotonic(),
-                consecutive_exact_idle_samples=0, probe=None,
+                consecutive_exact_idle_samples=0, transient_observation_count=transient_observation_count, probe=None,
                 violations=[str(error).split(":", 1)[0]],
             )
             samples.append(sample)
-            _write_gpu_quiescence_record(work=work, phase=phase, status="FAILED", started_at=started_at, samples=samples, final_gpu=None, failure_reason=str(error).split(":", 1)[0])
+            _write_gpu_quiescence_record(work=work, phase=phase, status="FAILED", started_at=started_at, samples=samples, transient_observation_count=transient_observation_count, final_gpu=None, failure_reason=str(error).split(":", 1)[0])
             raise
         try:
             immediate = _gpu_quiescence_immediate_violations(probe)
@@ -1532,43 +1546,48 @@ def require_gpu_quiescence(
         except Stage1S18FormalError as error:
             sample = _gpu_quiescence_sample(
                 sample_index=len(samples), started_monotonic=started_monotonic, observed_monotonic=time.monotonic(),
-                consecutive_exact_idle_samples=0, probe=probe,
+                consecutive_exact_idle_samples=0, transient_observation_count=transient_observation_count, probe=probe,
                 violations=[str(error).split(":", 1)[0]],
             )
             samples.append(sample)
-            _write_gpu_quiescence_record(work=work, phase=phase, status="FAILED", started_at=started_at, samples=samples, final_gpu=None, failure_reason=str(error).split(":", 1)[0])
+            _write_gpu_quiescence_record(work=work, phase=phase, status="FAILED", started_at=started_at, samples=samples, transient_observation_count=transient_observation_count, final_gpu=None, failure_reason=str(error).split(":", 1)[0])
             raise
         if immediate:
             sample = _gpu_quiescence_sample(
                 sample_index=len(samples), started_monotonic=started_monotonic, observed_monotonic=time.monotonic(),
-                consecutive_exact_idle_samples=0, probe=probe, violations=immediate,
+                consecutive_exact_idle_samples=0, transient_observation_count=transient_observation_count, probe=probe, violations=immediate,
             )
             samples.append(sample)
-            _write_gpu_quiescence_record(work=work, phase=phase, status="FAILED", started_at=started_at, samples=samples, final_gpu=None, failure_reason=immediate[0])
+            _write_gpu_quiescence_record(work=work, phase=phase, status="FAILED", started_at=started_at, samples=samples, transient_observation_count=transient_observation_count, final_gpu=None, failure_reason=immediate[0])
             raise Stage1S18FormalError(immediate[0])
         if violations:
             consecutive = 0
+            transient_observation_count += 1
         else:
             consecutive += 1
         completed_monotonic = time.monotonic()
         sample = _gpu_quiescence_sample(
             sample_index=len(samples), started_monotonic=started_monotonic, observed_monotonic=completed_monotonic,
-            consecutive_exact_idle_samples=consecutive, probe=probe, violations=violations,
+            consecutive_exact_idle_samples=consecutive, transient_observation_count=transient_observation_count, probe=probe, violations=violations,
         )
         samples.append(sample)
         # A sample is admissible only if its complete nvidia-smi observation
         # finished by the frozen deadline.  Equality is allowed; once the
         # boundary is reached without the third sample, no further sample can
         # be admitted.
+        if transient_observation_count > GPU_QUIESCENCE_MAX_TRANSIENT_SAMPLES:
+            marker = "S18_GPU_QUIESCENCE_TRANSIENT_LIMIT_EXCEEDED"
+            _write_gpu_quiescence_record(work=work, phase=phase, status="FAILED", started_at=started_at, samples=samples, transient_observation_count=transient_observation_count, final_gpu=None, failure_reason=marker)
+            raise Stage1S18FormalError(marker)
         if completed_monotonic > deadline:
             marker = "S18_GPU_QUIESCENCE_TIMEOUT"
-            _write_gpu_quiescence_record(work=work, phase=phase, status="FAILED", started_at=started_at, samples=samples, final_gpu=None, failure_reason=marker)
+            _write_gpu_quiescence_record(work=work, phase=phase, status="FAILED", started_at=started_at, samples=samples, transient_observation_count=transient_observation_count, final_gpu=None, failure_reason=marker)
             raise Stage1S18FormalError(marker)
         if consecutive == GPU_QUIESCENCE_REQUIRED_CONSECUTIVE_EXACT_IDLE_SAMPLES:
-            return _write_gpu_quiescence_record(work=work, phase=phase, status="PASS", started_at=started_at, samples=samples, final_gpu=probe, failure_reason=None)
+            return _write_gpu_quiescence_record(work=work, phase=phase, status="PASS", started_at=started_at, samples=samples, transient_observation_count=transient_observation_count, final_gpu=probe, failure_reason=None)
         if completed_monotonic >= deadline:
             marker = "S18_GPU_QUIESCENCE_TIMEOUT"
-            _write_gpu_quiescence_record(work=work, phase=phase, status="FAILED", started_at=started_at, samples=samples, final_gpu=None, failure_reason=marker)
+            _write_gpu_quiescence_record(work=work, phase=phase, status="FAILED", started_at=started_at, samples=samples, transient_observation_count=transient_observation_count, final_gpu=None, failure_reason=marker)
             raise Stage1S18FormalError(marker)
         time.sleep(min(GPU_QUIESCENCE_SAMPLE_INTERVAL_SECONDS, deadline - completed_monotonic))
 
@@ -2970,7 +2989,7 @@ def execute(*, repository: Path, data_root: Path, s1_7_index_ref: str, gpu_capab
             phase: {"ref": filename, "sha256": _sha(work / filename)}
             for phase, filename in GPU_QUIESCENCE_ROLES.items()
         }
-        ddp_report = _with_hash({"schema_version": "stage1-s1-8-ddp-report-v4", "status": "PASS", "task_id": TASK_ID, "fixture_hash": fixture["fixture_hash"], "fixture_schema_version": fixture["schema_version"], "fixture_id": fixture["fixture_id"], "nccl_transport_protocol": nccl_transport, "implementation_source_sha256": source_hashes, "baseline_routes": baseline_reports, "permutation_routes": permutation_reports, "negative_controls": negative, "gpu_quiescence": gpu_quiescence_bindings}); _write(work / "ddp-report.json", ddp_report)
+        ddp_report = _with_hash({"schema_version": "stage1-s1-8-ddp-report-v5", "status": "PASS", "task_id": TASK_ID, "fixture_hash": fixture["fixture_hash"], "fixture_schema_version": fixture["schema_version"], "fixture_id": fixture["fixture_id"], "nccl_transport_protocol": nccl_transport, "implementation_source_sha256": source_hashes, "baseline_routes": baseline_reports, "permutation_routes": permutation_reports, "negative_controls": negative, "gpu_quiescence": gpu_quiescence_bindings}); _write(work / "ddp-report.json", ddp_report)
         csv_hashes, svg_hashes = _charts(work, result, ddp_report, baseline_arrays)
         # It is intentionally written only after every worker output, replay,
         # report and chart exists, and excludes itself from the measured scope.
@@ -3047,8 +3066,8 @@ def execute(*, repository: Path, data_root: Path, s1_7_index_ref: str, gpu_capab
             requirements = {**base_requirements, "schemas_and_atomic_publication": schema_result}
             gate_value = _with_hash({"schema_version": "stage1-s1-8-gate-record-v1", "status": "PASS", "gate_id": GATE_ID, "task_id": TASK_ID, "requirements": requirements})
             role_hashes = {role: _canonical_file_sha(value) for role, value in {"fixture_manifest": fixture, "ddp_report": ddp_report, "array_bundle": arrays_bundle, "comparison_table": table, "gate_record": gate_value}.items()}
-            validation_value = _with_hash({"schema_version": "stage1-s1-8-validation-v4", "status": "PASS", "task_id": TASK_ID, "gate_id": GATE_ID, "producer_commit": commit, "fixture_schema_version": fixture["schema_version"], "fixture_id": fixture["fixture_id"], "checks": [{"check_id": identifier, "status": "PASS", "detail": identifier.replace("_", " ")} for identifier in GATE_CHECK_IDS], "role_sha256": role_hashes, "gpu_quiescence": gpu_quiescence_bindings})
-            index_value = _with_hash({"schema_version": "stage1-s1-8-formalization-index-v4", "status": "PASS", "gate_id": GATE_ID, "task_id": TASK_ID, "generator_git_commit": commit, "consumer_git_commit": commit, "fixture_schema_version": fixture["schema_version"], "fixture_id": fixture["fixture_id"], "gpu_capability": capability, "nccl_transport_protocol": nccl_transport, "implementation_source_sha256": source_hashes, "s1_7_handoff": handoff_for_index, "role_refs": role_files, "role_sha256": role_hashes, "reproduction_role_refs": reproduction, "reproduction_role_sha256": reproduction_sha, "gate_artifact_hash": gate_value["artifact_hash"], "validation_ref": "validation.json", "validation_sha256": _canonical_file_sha(validation_value), "replay_ref": "replay-validation.json", "replay_sha256": _canonical_file_sha(replay_record), "next_task_ids": ["stage1.10_checkpoint_resume_and_artifacts"]})
+            validation_value = _with_hash({"schema_version": "stage1-s1-8-validation-v5", "status": "PASS", "task_id": TASK_ID, "gate_id": GATE_ID, "producer_commit": commit, "fixture_schema_version": fixture["schema_version"], "fixture_id": fixture["fixture_id"], "checks": [{"check_id": identifier, "status": "PASS", "detail": identifier.replace("_", " ")} for identifier in GATE_CHECK_IDS], "role_sha256": role_hashes, "gpu_quiescence": gpu_quiescence_bindings})
+            index_value = _with_hash({"schema_version": "stage1-s1-8-formalization-index-v5", "status": "PASS", "gate_id": GATE_ID, "task_id": TASK_ID, "generator_git_commit": commit, "consumer_git_commit": commit, "fixture_schema_version": fixture["schema_version"], "fixture_id": fixture["fixture_id"], "gpu_capability": capability, "nccl_transport_protocol": nccl_transport, "implementation_source_sha256": source_hashes, "s1_7_handoff": handoff_for_index, "role_refs": role_files, "role_sha256": role_hashes, "reproduction_role_refs": reproduction, "reproduction_role_sha256": reproduction_sha, "gate_artifact_hash": gate_value["artifact_hash"], "validation_ref": "validation.json", "validation_sha256": _canonical_file_sha(validation_value), "replay_ref": "replay-validation.json", "replay_sha256": _canonical_file_sha(replay_record), "next_task_ids": ["stage1.10_checkpoint_resume_and_artifacts"]})
             values = {"fixture_manifest": fixture, "ddp_report": ddp_report, "array_bundle": arrays_bundle, "comparison_table": table, "gate_record": gate_value, "replay": replay_record, "validation": validation_value, "index": index_value}
             return values, role_hashes, gate_value, validation_value, index_value
 

@@ -1,0 +1,84 @@
+{
+  "$id": "s1-8-validation-v5.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "status",
+    "task_id",
+    "gate_id",
+    "producer_commit",
+    "fixture_schema_version",
+    "fixture_id",
+    "checks",
+    "role_sha256",
+    "gpu_quiescence",
+    "artifact_hash"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "stage1-s1-8-validation-v5"
+    },
+    "status": {
+      "const": "PASS"
+    },
+    "task_id": {
+      "const": "stage1.08_ddp_and_gradient_accumulation"
+    },
+    "gate_id": {
+      "const": "G1-DDP"
+    },
+    "producer_commit": {
+      "$ref": "s1-8-formalization-index-v1.json#/$defs/commit"
+    },
+    "fixture_schema_version": {
+      "const": "stage1-s1-8-fixture-manifest-v3"
+    },
+    "fixture_id": {
+      "const": "stage1-s1-8-pythia14m-ddp-conditioned-v3"
+    },
+    "checks": {
+      "type": "array",
+      "minItems": 18,
+      "maxItems": 18,
+      "items": {
+        "$ref": "s1-8-validation-v1.json#/$defs/check"
+      }
+    },
+    "role_sha256": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "fixture_manifest",
+        "ddp_report",
+        "array_bundle",
+        "comparison_table",
+        "gate_record"
+      ],
+      "properties": {
+        "fixture_manifest": {
+          "$ref": "s1-8-formalization-index-v1.json#/$defs/hash"
+        },
+        "ddp_report": {
+          "$ref": "s1-8-formalization-index-v1.json#/$defs/hash"
+        },
+        "array_bundle": {
+          "$ref": "s1-8-formalization-index-v1.json#/$defs/hash"
+        },
+        "comparison_table": {
+          "$ref": "s1-8-formalization-index-v1.json#/$defs/hash"
+        },
+        "gate_record": {
+          "$ref": "s1-8-formalization-index-v1.json#/$defs/hash"
+        }
+      }
+    },
+    "gpu_quiescence": {
+      "$ref": "s1-8-ddp-report-v5.json#/$defs/quiescence_roles"
+    },
+    "artifact_hash": {
+      "$ref": "s1-8-formalization-index-v1.json#/$defs/hash"
+    }
+  }
+}
