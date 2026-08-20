@@ -11,7 +11,7 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 import hashlib
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 from .contracts.jsonio import canonical_json_hash, load_canonical_json
@@ -41,15 +41,15 @@ _STANDARD_INDEX_WIRES: dict[str, tuple[frozenset[str], dict[str, str]]] = {
     "G1-STEP": (frozenset({"stage1-s1-6-formalization-index-v1"}), {"step_report": "step-report.json", "oracle_bundle": "oracle-bundle.json", "trace_bundle": "trace-bundle.json", "comparison_table": "comparison-table.json", "gate_record": "g1-step-record.json"}),
     "G1-SINGLE": (frozenset({"stage1-s1-7-formalization-index-v1"}), {"fixture_manifest": "fixture-manifest.json", "single_gpu_report": "worker-report.json", "gradient_bundle": "arrays-manifest.json", "comparison_table": "comparison-table.json", "gate_record": "g1-single-record.json"}),
     "G1-DDP": (frozenset({"stage1-s1-8-formalization-index-v1", "stage1-s1-8-formalization-index-v2"}), {"fixture_manifest": "fixture-manifest.json", "ddp_report": "ddp-report.json", "array_bundle": "array-bundle.json", "comparison_table": "comparison-table.json", "gate_record": "g1-ddp-record.json"}),
-    "G1-NUMERIC": (frozenset({"stage1-s1-9-formalization-index-v5"}), {"numeric_report": "numeric-report.json", "oracle_bundle": "oracle-bundle.json", "trace_bundle": "trace-bundle.json", "comparison_table": "comparison-table.json", "gate_record": "g1-numeric-record.json"}),
-    "G1-RESUME": (frozenset({"stage1-s1-10-formalization-index-v1"}), {"resume_report": "resume-report.json", "oracle_bundle": "oracle-bundle.json", "trace_bundle": "trace-bundle.json", "comparison_table": "comparison-table.json", "artifact_manifest": "artifact-manifest.json", "gate_record": "g1-resume-record.json"}),
+    "G1-NUMERIC": (frozenset({"stage1-s1-9-formalization-index-v8"}), {"numeric_report": "numeric-report.json", "oracle_bundle": "oracle-bundle.json", "trace_bundle": "trace-bundle.json", "comparison_table": "comparison-table.json", "gate_record": "g1-numeric-record.json"}),
+    "G1-RESUME": (frozenset({"stage1-s1-10-formalization-index-v2"}), {"resume_report": "resume-report.json", "oracle_bundle": "oracle-bundle.json", "trace_bundle": "trace-bundle.json", "comparison_table": "comparison-table.json", "artifact_manifest": "artifact-manifest.json", "gate_record": "g1-resume-record.json"}),
 }
 
-# S1.9 v5 is the released G1-NUMERIC producer wire.  Its primary evidence
+# S1.9 v8 is the released G1-NUMERIC producer wire.  Its primary evidence
 # roles intentionally keep their v1 filenames, while the immutable
 # reproduction closure adds the final GPU-quiescence and compatibility roles.
 # Do not accept a predecessor merely because those five primary roles match.
-_S1_9_V5_REPRODUCTION_REFS: dict[str, str] = {
+_S1_9_V8_REPRODUCTION_REFS: dict[str, str] = {
     "attempt_start": "attempt-start.json",
     "upstream_compatibility": "upstream-compatibility.json",
     "preflight": "preflight.json",
@@ -78,13 +78,93 @@ _S1_9_V5_REPRODUCTION_REFS: dict[str, str] = {
     "chart_svg_4": "u-single-factor-identity.svg",
     "chart_svg_5": "u-single-factor-ratio-diagnostic.svg",
 }
-_S1_9_V5_INDEX_FIELDS = frozenset({
+_S1_9_V8_HASHED_REPRODUCTION_SCHEMAS: dict[str, tuple[str, str | None]] = {
+    "attempt_start": ("stage1-s1-9-attempt-start-v1", "STARTED"),
+    "preflight": ("stage1-s1-9-preflight-v1", "PASS"),
+    "lease_history": ("runtime.project-gpu-lease-history.v1", None),
+    "single_worker": ("stage1-s1-9-single-bf16-worker-v1", "PASS"),
+    "single_child_fingerprint": ("stage1-s1-9-child-fingerprint-v1", "EXITED"),
+    "bf16_resume_checkpoint_store": ("stage1-s1-9-bf16-checkpoint-store-reproduction-v2", None),
+    "ddp_worker": ("stage1-s1-9-ddp-skip-worker-v1", "PASS"),
+    "ddp_child_fingerprint": ("stage1-s1-9-child-fingerprint-v1", "EXITED"),
+}
+_S1_9_V8_INDEX_FIELDS = frozenset({
     "schema_version", "status", "gate_id", "task_id", "fixture_id",
     "generator_git_commit", "consumer_git_commit", "git_branch", "checked_at",
     "s1_7_handoff", "s1_8_handoff", "role_refs", "role_sha256",
     "reproduction_role_refs", "reproduction_role_sha256", "gate_artifact_hash",
     "csv_sha256", "svg_sha256", "validation_ref", "validation_sha256",
     "replay_ref", "replay_sha256", "replay_hash", "next_task_ids", "artifact_hash",
+})
+_S1_9_SOURCE_PATHS = frozenset({
+    "fixtures/stage1/stage1-s19-precision-fixture-v1.json",
+    "src/param_importance_nlp/stage1_precision.py",
+    "src/param_importance_nlp/stage1_precision_oracle.py",
+    "src/param_importance_nlp/contracts/jsonio.py",
+    "src/param_importance_nlp/contracts/runtime_evidence.py",
+    "src/param_importance_nlp/core/accumulator.py",
+    "src/param_importance_nlp/core/estimators.py",
+    "src/param_importance_nlp/core/registry.py",
+    "src/param_importance_nlp/core/sufficient_statistics.py",
+    "src/param_importance_nlp/core/tensors.py",
+    "src/param_importance_nlp/providers/training.py",
+    "src/param_importance_nlp/runtime/gradients.py",
+    "src/param_importance_nlp/runtime/operations.py",
+    "src/param_importance_nlp/runtime/optimizer.py",
+    "src/param_importance_nlp/runtime/reducers.py",
+    "src/param_importance_nlp/runtime/task_artifacts.py",
+    "src/param_importance_nlp/runtime/training.py",
+    "ops/stage1/formalize_s1_6.py",
+    "ops/stage1/formalize_s1_9.py",
+    "ops/stage1/run_s1_9_single_bf16_worker.py",
+    "ops/stage1/run_s1_9_ddp_skip_worker.py",
+    "tests/test_stage1_s19_precision.py",
+    "schemas/stage1/s1-9-precision-fixture-v1.json",
+    "schemas/stage1/s1-9-numeric-report-v1.json",
+    "schemas/stage1/s1-9-oracle-bundle-v1.json",
+    "schemas/stage1/s1-9-trace-bundle-v1.json",
+    "schemas/stage1/s1-9-comparison-table-v1.json",
+    "schemas/stage1/s1-9-gate-record-v1.json",
+    "schemas/stage1/s1-9-replay-validation-v1.json",
+    "schemas/stage1/s1-9-validation-v1.json",
+    "schemas/stage1/s1-9-formalization-index-v1.json",
+    "schemas/stage1/s1-9-single-bf16-worker-v1.json",
+    "schemas/stage1/s1-9-ddp-skip-worker-v1.json",
+    "schemas/stage1/s1-9-bf16-checkpoint-store-reproduction-v1.json",
+})
+_S1_10_SOURCE_PATHS = frozenset({
+    "fixtures/stage1/stage1-s110-checkpoint-fixture-v1.json",
+    "src/param_importance_nlp/stage1_checkpoint_resume.py",
+    "src/param_importance_nlp/stage1_checkpoint_oracle.py",
+    "src/param_importance_nlp/runtime/checkpoint.py",
+    "src/param_importance_nlp/runtime/checkpoint_group.py",
+    "src/param_importance_nlp/runtime/training.py",
+    "ops/stage1/formalize_s1_10.py",
+    "ops/stage1/run_s1_10_resume_worker.py",
+    "tests/test_stage1_s110_checkpoint_resume.py",
+    "schemas/stage1/s1-10-checkpoint-fixture-v1.json",
+    "schemas/stage1/s1-10-resume-report-v1.json",
+    "schemas/stage1/s1-10-resume-report-v2.json",
+    "schemas/stage1/s1-10-oracle-bundle-v1.json",
+    "schemas/stage1/s1-10-trace-bundle-v1.json",
+    "schemas/stage1/s1-10-comparison-table-v1.json",
+    "schemas/stage1/s1-10-artifact-manifest-v1.json",
+    "schemas/stage1/s1-10-gate-record-v1.json",
+    "schemas/stage1/s1-10-replay-validation-v1.json",
+    "schemas/stage1/s1-10-validation-v1.json",
+    "schemas/stage1/s1-10-validation-v2.json",
+    "schemas/stage1/s1-10-formalization-index-v1.json",
+    "schemas/stage1/s1-10-formalization-index-v2.json",
+    "schemas/stage1/s1-10-formal-observation-v1.json",
+})
+_S1_10_V2_INDEX_FIELDS = frozenset({
+    "schema_version", "status", "gate_id", "task_id", "fixture_id", "generator_git_commit",
+    "consumer_git_commit", "git_branch", "checked_at", "upstream", "role_refs", "role_sha256",
+    "chart_csv_sha256", "chart_svg_sha256", "formal_observation_ref", "formal_observation_sha256",
+    "formal_observation_artifact_hash", "formal_run_token_sha256", "formal_single_report_ref",
+    "formal_single_report_sha256", "formal_four_rank_report_ref", "formal_four_rank_report_sha256",
+    "gate_artifact_hash", "validation_ref", "validation_sha256", "replay_ref", "replay_sha256",
+    "replay_hash", "next_task_ids", "artifact_hash",
 })
 REQUIRED_CHARTS: tuple[str, ...] = (
     "gradient-identity", "u-identity", "weighted-reduction", "ddp-identity", 
@@ -143,6 +223,127 @@ def _self_hash(value: Mapping[str, object], *, field: str) -> None:
     declared = body.pop("artifact_hash", None)
     if not isinstance(declared, str) or declared != canonical_json_hash(body):
         raise Stage1ExitGateError(f"S1_11_{field.upper()}_SELF_HASH_INVALID")
+
+
+def _named_self_hash(value: Mapping[str, object], *, field: str, hash_field: str) -> None:
+    body = dict(value)
+    declared = body.pop(hash_field, None)
+    if not isinstance(declared, str) or declared != canonical_json_hash(body):
+        raise Stage1ExitGateError(f"S1_11_{field.upper()}_SELF_HASH_INVALID")
+
+
+def _source_map(value: object, *, field: str, expected_paths: frozenset[str]) -> dict[str, str]:
+    raw = _mapping(value, field=field)
+    if set(raw) != expected_paths:
+        raise Stage1ExitGateError(f"S1_11_{field.upper()}_KEYSET_INVALID")
+    result: dict[str, str] = {}
+    for reference, digest in raw.items():
+        logical = PurePosixPath(reference)
+        if logical.is_absolute() or any(part in {"", ".", ".."} for part in logical.parts):
+            raise Stage1ExitGateError(f"S1_11_{field.upper()}_REF_INVALID")
+        result[reference] = _hash(digest, field=f"{field}_{reference}")
+    return result
+
+
+def _s1_9_v2_determinism(value: object, *, field: str) -> None:
+    determinism = _mapping(value, field=field)
+    if determinism != {
+        "algorithms_enabled": True,
+        "cudnn_deterministic": True,
+        "cudnn_benchmark": False,
+        "allowed_nondeterministic_kernel_classes": [],
+        "kernel_policy": "empty_pre_registered_allowlist",
+    }:
+        raise Stage1ExitGateError(f"S1_11_{field.upper()}_INVALID")
+
+
+def _validate_s1_9_current_v2_roles(
+    index_dir: Path,
+    reproduction_paths: Mapping[str, Path],
+    validation: Mapping[str, object],
+) -> None:
+    """Validate the final V2 validators behind S1.9's otherwise frozen V1 roles."""
+
+    loaded: dict[str, dict[str, Any]] = {}
+    for role, (schema_version, status) in _S1_9_V8_HASHED_REPRODUCTION_SCHEMAS.items():
+        value = _mapping(load_canonical_json(reproduction_paths[role]), field=f"s1_9.{role}")
+        _self_hash(value, field=f"s1_9.{role}")
+        if value.get("schema_version") != schema_version or (status is not None and value.get("status") != status):
+            raise Stage1ExitGateError("S1_11_S1_9_V8_REPRODUCTION_SCHEMA_INVALID")
+        loaded[role] = value
+
+    single = loaded["single_worker"]
+    if set(single) != {
+        "schema_version", "status", "execution_commit", "run_token",
+        "approved_gpu_uuid", "cuda_visible_devices", "environment_summary",
+        "observation", "artifact_hash",
+    }:
+        raise Stage1ExitGateError("S1_11_S1_9_V8_SINGLE_WORKER_V2_INVALID")
+    observation = _mapping(single.get("observation"), field="s1_9.single_worker_observation")
+    _s1_9_v2_determinism(observation.get("determinism"), field="s1_9_single_worker_v2_determinism")
+
+    if set(validation) != {
+        "schema_version", "status", "gate_id", "task_id", "execution_scope",
+        "fixture_id", "producer_commit", "consumer_commit", "upstream",
+        "regression", "direct_checks", "role_sha256", "csv_sha256",
+        "svg_sha256", "replay_sha256", "replay_hash", "artifact_hash",
+    } or validation.get("schema_version") != "stage1-s1-9-validation-v1":
+        raise Stage1ExitGateError("S1_11_S1_9_V8_VALIDATION_V2_INVALID")
+    regression = _mapping(validation.get("regression"), field="s1_9.validation_regression")
+    if regression.get("kernel_allowlist") != []:
+        raise Stage1ExitGateError("S1_11_S1_9_V8_VALIDATION_V2_INVALID")
+    _s1_9_v2_determinism(regression.get("bf16"), field="s1_9_validation_v2_determinism")
+
+    checkpoint = loaded["bf16_resume_checkpoint_store"]
+    required_checkpoint_fields = {
+        "schema_version", "checkpoint_id", "commit_ref", "commit_sha256",
+        "bundle_manifest_ref", "bundle_manifest_sha256", "bundle_file_hashes",
+        "artifact_hash",
+    }
+    checkpoint_id = checkpoint.get("checkpoint_id")
+    if (
+        set(checkpoint) != required_checkpoint_fields
+        or not isinstance(checkpoint_id, str)
+        or not checkpoint_id
+        or len(checkpoint_id) > 128
+        or checkpoint_id[0] not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+        or any(character not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-" for character in checkpoint_id)
+        or checkpoint.get("commit_ref") != f"commits/{checkpoint_id}.json"
+        or checkpoint.get("bundle_manifest_ref") != f"objects/{checkpoint_id}/manifest.json"
+    ):
+        raise Stage1ExitGateError("S1_11_S1_9_V8_CHECKPOINT_V2_INVALID")
+    store_root = index_dir / "bf16-resume-store"
+    commit_path = _safe_relative(store_root, checkpoint["commit_ref"], field="s1_9_checkpoint_commit")
+    manifest_path = _safe_relative(store_root, checkpoint["bundle_manifest_ref"], field="s1_9_checkpoint_manifest")
+    if (
+        not commit_path.is_file()
+        or _hash_file(commit_path) != _hash(checkpoint.get("commit_sha256"), field="s1_9_checkpoint_commit")
+        or not manifest_path.is_file()
+        or _hash_file(manifest_path) != _hash(checkpoint.get("bundle_manifest_sha256"), field="s1_9_checkpoint_manifest")
+    ):
+        raise Stage1ExitGateError("S1_11_S1_9_V8_CHECKPOINT_FILE_HASH_INVALID")
+    file_rows = checkpoint.get("bundle_file_hashes")
+    if not isinstance(file_rows, list) or not file_rows:
+        raise Stage1ExitGateError("S1_11_S1_9_V8_CHECKPOINT_V2_INVALID")
+    listed: dict[str, str] = {}
+    expected_prefix = f"objects/{checkpoint_id}/"
+    for position, raw in enumerate(file_rows):
+        row = _mapping(raw, field=f"s1_9.checkpoint_file_{position}")
+        ref = row.get("ref")
+        if set(row) != {"ref", "sha256"} or not isinstance(ref, str) or not ref.startswith(expected_prefix) or ref in listed:
+            raise Stage1ExitGateError("S1_11_S1_9_V8_CHECKPOINT_V2_INVALID")
+        path = _safe_relative(store_root, ref, field=f"s1_9_checkpoint_file_{position}")
+        digest = _hash(row.get("sha256"), field=f"s1_9_checkpoint_file_{position}")
+        if not path.is_file() or _hash_file(path) != digest:
+            raise Stage1ExitGateError("S1_11_S1_9_V8_CHECKPOINT_FILE_HASH_INVALID")
+        listed[ref] = digest
+    actual = {
+        path.relative_to(store_root).as_posix(): _hash_file(path)
+        for path in sorted((store_root / "objects" / checkpoint_id).rglob("*"))
+        if path.is_file()
+    }
+    if listed != actual or checkpoint["bundle_manifest_ref"] not in listed:
+        raise Stage1ExitGateError("S1_11_S1_9_V8_CHECKPOINT_FILE_CLOSURE_INVALID")
 
 
 @dataclass(frozen=True, slots=True)
@@ -262,13 +463,24 @@ def _validate_binding(root: Path, binding: DependencyBinding) -> dict[str, objec
     if index.get("gate_id") != binding.gate_id or index.get("task_id") != binding.task_id:
         raise Stage1ExitGateError("S1_11_INDEX_IDENTITY_OR_STATUS_INVALID")
     if binding.gate_id == "G1-NUMERIC" and (
-        set(index) != _S1_9_V5_INDEX_FIELDS
+        set(index) != _S1_9_V8_INDEX_FIELDS
         or index.get("fixture_id") != "stage1-s19-precision-fixture-v1"
         or index.get("validation_ref") != "validation.json"
         or index.get("replay_ref") != "replay-validation.json"
         or index.get("next_task_ids") != ["stage1.10_checkpoint_resume_and_artifacts"]
     ):
-        raise Stage1ExitGateError("S1_11_S1_9_V5_INDEX_SCHEMA_CLOSURE_INVALID")
+        raise Stage1ExitGateError("S1_11_S1_9_V8_INDEX_SCHEMA_CLOSURE_INVALID")
+    if binding.gate_id == "G1-RESUME" and (
+        set(index) != _S1_10_V2_INDEX_FIELDS
+        or index.get("fixture_id") != "stage1-s110-checkpoint-fixture-v1"
+        or index.get("validation_ref") != "validation.json"
+        or index.get("replay_ref") != "replay-validation.json"
+        or index.get("formal_observation_ref") != "formal-observation.json"
+        or index.get("formal_single_report_ref") != "formal-single-report.json"
+        or index.get("formal_four_rank_report_ref") != "formal-four-rank-report.json"
+        or index.get("next_task_ids") != ["stage1.11_reporting_and_exit_gate"]
+    ):
+        raise Stage1ExitGateError("S1_11_S1_10_V2_INDEX_SCHEMA_CLOSURE_INVALID")
     if "consumer_git_commit" in index and _commit(index.get("consumer_git_commit"), field="consumer") != index.get("consumer_git_commit"):
         raise Stage1ExitGateError("S1_11_INDEX_CONSUMER_COMMIT_INVALID")
     # S1.2--S1.4 predate the uniform role_refs wire.  Their named report
@@ -318,6 +530,28 @@ def _validate_binding(root: Path, binding: DependencyBinding) -> dict[str, objec
         role_path = _safe_relative(index_dir, ref, field=f"role_{role}")
         if not role_path.is_file() or _hash_file(role_path) != hashes[role]:
             raise Stage1ExitGateError("S1_11_INDEX_ROLE_FILE_HASH_MISMATCH")
+    role_self_hash_contracts = {
+        "G1-NUMERIC": {
+            "numeric_report": ("report_hash", "stage1-s1-9-numeric-report-v1"),
+            "oracle_bundle": ("oracle_hash", "stage1-s1-9-oracle-bundle-v1"),
+            "trace_bundle": ("trace_hash", "stage1-s1-9-trace-bundle-v1"),
+            "comparison_table": ("table_hash", "stage1-s1-9-comparison-table-v1"),
+            "gate_record": ("artifact_hash", "stage1-s1-9-gate-record-v1"),
+        },
+        "G1-RESUME": {
+            "resume_report": ("report_hash", "stage1-s1-10-resume-report-v2"),
+            "oracle_bundle": ("oracle_hash", "stage1-s1-10-oracle-bundle-v1"),
+            "trace_bundle": ("trace_hash", "stage1-s1-10-trace-bundle-v1"),
+            "comparison_table": ("table_hash", "stage1-s1-10-comparison-table-v1"),
+            "artifact_manifest": ("manifest_hash", "stage1-s1-10-artifact-manifest-v1"),
+            "gate_record": ("artifact_hash", "stage1-s1-10-gate-record-v1"),
+        },
+    }
+    for role, (hash_field, schema_version) in role_self_hash_contracts.get(binding.gate_id, {}).items():
+        role_value = _mapping(load_canonical_json(_safe_relative(index_dir, refs[role], field=f"role_{role}")), field=f"role_{role}")
+        _named_self_hash(role_value, field=f"role_{role}", hash_field=hash_field)
+        if role_value.get("schema_version") != schema_version:
+            raise Stage1ExitGateError("S1_11_INDEX_ROLE_SCHEMA_INVALID")
     validation_ref, validation_sha = index.get("validation_ref"), index.get("validation_sha256")
     validation_path = _safe_relative(index_dir, validation_ref, field="validation")
     if not validation_path.is_file() or _hash_file(validation_path) != _hash(validation_sha, field="validation"):
@@ -350,25 +584,62 @@ def _validate_binding(root: Path, binding: DependencyBinding) -> dict[str, objec
         raise Stage1ExitGateError("S1_11_REPLAY_NOT_PASS")
     if "artifact_hash" in replay:
         _self_hash(replay, field="replay")
+    if binding.gate_id in {"G1-NUMERIC", "G1-RESUME"}:
+        _named_self_hash(replay, field="replay", hash_field="replay_hash")
+        expected_replay_schema = {
+            "G1-NUMERIC": "stage1-s1-9-replay-validation-v1",
+            "G1-RESUME": "stage1-s1-10-replay-validation-v1",
+        }[binding.gate_id]
+        if (
+            replay.get("schema_version") != expected_replay_schema
+            or replay.get("replay_hash") != index.get("replay_hash")
+            or replay.get("source_gate_artifact_hash") != binding.gate_artifact_hash
+        ):
+            raise Stage1ExitGateError("S1_11_REPLAY_SEMANTIC_BINDING_INVALID")
     if binding.gate_id == "G1-NUMERIC":
         reproduction_refs = _mapping(index.get("reproduction_role_refs"), field="s1_9.reproduction_role_refs")
         reproduction_hashes = _mapping(index.get("reproduction_role_sha256"), field="s1_9.reproduction_role_sha256")
-        if reproduction_refs != _S1_9_V5_REPRODUCTION_REFS:
-            raise Stage1ExitGateError("S1_11_S1_9_V5_REPRODUCTION_REF_WIRE_INVALID")
-        if set(reproduction_hashes) != set(_S1_9_V5_REPRODUCTION_REFS):
-            raise Stage1ExitGateError("S1_11_S1_9_V5_REPRODUCTION_HASH_WIRE_INVALID")
+        if reproduction_refs != _S1_9_V8_REPRODUCTION_REFS:
+            raise Stage1ExitGateError("S1_11_S1_9_V8_REPRODUCTION_REF_WIRE_INVALID")
+        if set(reproduction_hashes) != set(_S1_9_V8_REPRODUCTION_REFS):
+            raise Stage1ExitGateError("S1_11_S1_9_V8_REPRODUCTION_HASH_WIRE_INVALID")
         reproduction_paths: dict[str, Path] = {}
         for role, ref in reproduction_refs.items():
             role_path = _safe_relative(index_dir, ref, field=f"s1_9_reproduction_{role}")
             digest = _hash(reproduction_hashes[role], field=f"s1_9_reproduction_{role}")
             if not role_path.is_file() or _hash_file(role_path) != digest:
-                raise Stage1ExitGateError("S1_11_S1_9_V5_REPRODUCTION_FILE_HASH_MISMATCH")
+                raise Stage1ExitGateError("S1_11_S1_9_V8_REPRODUCTION_FILE_HASH_MISMATCH")
             reproduction_paths[role] = role_path
+        _validate_s1_9_current_v2_roles(index_dir, reproduction_paths, validation)
+        numeric_report = _mapping(load_canonical_json(_safe_relative(index_dir, refs["numeric_report"], field="s1_9_numeric_report")), field="s1_9.numeric_report")
+        _named_self_hash(numeric_report, field="s1_9.numeric_report", hash_field="report_hash")
+        if numeric_report.get("schema_version") != "stage1-s1-9-numeric-report-v1" or numeric_report.get("status") != "PASS":
+            raise Stage1ExitGateError("S1_11_S1_9_V8_NUMERIC_REPORT_INVALID")
+        _source_map(numeric_report.get("implementation_source_sha256"), field="s1_9_source", expected_paths=_S1_9_SOURCE_PATHS)
         compatibility = _mapping(load_canonical_json(reproduction_paths["upstream_compatibility"]), field="s1_9.upstream_compatibility")
         _self_hash(compatibility, field="s1_9.upstream_compatibility")
-        handoff = _mapping(compatibility.get("s1_8_v5_handoff"), field="s1_9.upstream_compatibility_handoff")
-        if compatibility.get("schema_version") != "stage1-s1-9-upstream-compatibility-v4" or compatibility.get("status") != "PASS" or handoff.get("index_schema_version") != "stage1-s1-8-formalization-index-v5":
-            raise Stage1ExitGateError("S1_11_S1_9_V5_UPSTREAM_SOURCE_CLOSURE_INVALID")
+        handoff = _mapping(compatibility.get("s1_8_v8_handoff"), field="s1_9.upstream_compatibility_handoff")
+        s1_8_sources = _mapping(compatibility.get("s1_8_source_dependencies"), field="s1_9.s1_8_source_dependencies")
+        handoff_sources = _mapping(handoff.get("implementation_source_sha256"), field="s1_9.s1_8_handoff_sources")
+        handoff_reproduction_refs = _mapping(handoff.get("reproduction_role_refs"), field="s1_9.s1_8_reproduction_refs")
+        handoff_reproduction_hashes = _mapping(handoff.get("reproduction_role_sha256"), field="s1_9.s1_8_reproduction_hashes")
+        if (
+            compatibility.get("schema_version") != "stage1-s1-9-upstream-compatibility-v7"
+            or compatibility.get("status") != "PASS"
+            or handoff.get("index_schema_version") != "stage1-s1-8-formalization-index-v8"
+            or handoff.get("ddp_report_schema_version") != "stage1-s1-8-ddp-report-v8"
+            or handoff.get("validation_schema_version") != "stage1-s1-8-validation-v8"
+            or handoff.get("replay_schema_version") != "stage1-s1-8-replay-validation-v3"
+            or handoff.get("comparison_table_schema_version") != "stage1-s1-8-comparison-table-v2"
+            or handoff.get("array_bundle_schema_version") != "stage1-s1-8-array-bundle-v2"
+            or s1_8_sources != handoff_sources
+            or len(s1_8_sources) != 61
+            or any(_hash(value, field="s1_8_source") != value for value in s1_8_sources.values())
+            or set(handoff_reproduction_refs) != set(handoff_reproduction_hashes)
+            or len(handoff_reproduction_refs) != 84
+            or any(_hash(value, field="s1_8_reproduction") != value for value in handoff_reproduction_hashes.values())
+        ):
+            raise Stage1ExitGateError("S1_11_S1_9_V8_UPSTREAM_SOURCE_CLOSURE_INVALID")
         prelease = _mapping(load_canonical_json(reproduction_paths["prelease_gpu"]), field="s1_9.prelease_gpu")
         _self_hash(prelease, field="s1_9.prelease_gpu")
         prelease_quiescence = _mapping(prelease.get("quiescence"), field="s1_9.prelease_quiescence")
@@ -385,7 +656,63 @@ def _validate_binding(root: Path, binding: DependencyBinding) -> dict[str, objec
             or post_worker.get("status") != "PASS"
             or post_worker.get("phase") != "post_worker"
         ):
-            raise Stage1ExitGateError("S1_11_S1_9_V5_GPU_SOURCE_CLOSURE_INVALID")
+            raise Stage1ExitGateError("S1_11_S1_9_V8_GPU_SOURCE_CLOSURE_INVALID")
+    if binding.gate_id == "G1-RESUME":
+        resume_report_path = _safe_relative(index_dir, refs["resume_report"], field="s1_10_resume_report")
+        resume_report = _mapping(load_canonical_json(resume_report_path), field="s1_10.resume_report")
+        _named_self_hash(resume_report, field="s1_10.resume_report", hash_field="report_hash")
+        if resume_report.get("schema_version") != "stage1-s1-10-resume-report-v2" or resume_report.get("status") != "PASS":
+            raise Stage1ExitGateError("S1_11_S1_10_V2_RESUME_REPORT_INVALID")
+        _source_map(resume_report.get("implementation_source_sha256"), field="s1_10_source", expected_paths=_S1_10_SOURCE_PATHS)
+        upstream = _mapping(index.get("upstream"), field="s1_10.index_upstream")
+        if set(upstream) != {"s1_8", "s1_9"} or resume_report.get("upstream") != upstream or validation.get("upstream") != upstream or validation.get("schema_version") != "stage1-s1-10-validation-v2":
+            raise Stage1ExitGateError("S1_11_S1_10_V2_UPSTREAM_BINDING_INVALID")
+        expected_upstream = {
+            "s1_8": ("stage1-s1-8-formalization-index-v8", "stage1.08_ddp_and_gradient_accumulation", "G1-DDP", 61, 84, {"prelease_gpu_quiescence", "post_worker_gpu_quiescence", "post_release_gpu_quiescence", "reacquire_preflight_gpu_quiescence"}),
+            "s1_9": ("stage1-s1-9-formalization-index-v8", "stage1.09_precision_clipping_and_optimizer_boundaries", "G1-NUMERIC", 34, 27, {"upstream_compatibility", "prelease_gpu", "post_worker_quiescence"}),
+        }
+        upstream_fields = {"index_ref", "index_sha256", "index_artifact_hash", "producer_commit", "gate_artifact_hash", "role_sha256", "validation_sha256", "source_map_sha256", "source_map_entries", "reproduction_role_sha256", "reproduction_role_set_sha256", "reproduction_role_count", "schema_version", "task_id", "gate_id"}
+        for name, (schema, task, gate_id, sources, reproduction_count, required_reproduction) in expected_upstream.items():
+            row = _mapping(upstream[name], field=f"s1_10.upstream_{name}")
+            role_hashes = _mapping(row.get("role_sha256"), field=f"s1_10.upstream_{name}_roles")
+            reproduction_hashes = _mapping(row.get("reproduction_role_sha256"), field=f"s1_10.upstream_{name}_reproduction")
+            if (
+                set(row) != upstream_fields or row.get("schema_version") != schema or row.get("task_id") != task
+                or row.get("gate_id") != gate_id or row.get("source_map_entries") != sources
+                or row.get("reproduction_role_count") != reproduction_count or set(reproduction_hashes) != required_reproduction
+                or "gate_record" not in role_hashes or any(_hash(value, field=f"s1_10_{name}_role") != value for value in role_hashes.values())
+                or any(_hash(value, field=f"s1_10_{name}_reproduction") != value for value in reproduction_hashes.values())
+            ):
+                raise Stage1ExitGateError("S1_11_S1_10_V2_UPSTREAM_CLOSURE_INVALID")
+        formal_observation_path = _safe_relative(index_dir, index.get("formal_observation_ref"), field="s1_10_formal_observation")
+        if not formal_observation_path.is_file() or _hash_file(formal_observation_path) != _hash(index.get("formal_observation_sha256"), field="s1_10_formal_observation"):
+            raise Stage1ExitGateError("S1_11_S1_10_V2_FORMAL_OBSERVATION_HASH_INVALID")
+        formal_observation = _mapping(load_canonical_json(formal_observation_path), field="s1_10.formal_observation")
+        _self_hash(formal_observation, field="s1_10.formal_observation")
+        if formal_observation.get("schema_version") != "stage1-s1-10-formal-observation-v1" or formal_observation.get("status") != "PASS" or formal_observation.get("artifact_hash") != index.get("formal_observation_artifact_hash") or formal_observation.get("run_token_sha256") != index.get("formal_run_token_sha256"):
+            raise Stage1ExitGateError("S1_11_S1_10_V2_FORMAL_OBSERVATION_INVALID")
+        for role, reference_field, digest_field in (
+            ("single", "formal_single_report_ref", "formal_single_report_sha256"),
+            ("four_rank", "formal_four_rank_report_ref", "formal_four_rank_report_sha256"),
+        ):
+            worker_path = _safe_relative(index_dir, index.get(reference_field), field=f"s1_10_{role}_report")
+            if not worker_path.is_file() or _hash_file(worker_path) != _hash(index.get(digest_field), field=f"s1_10_{role}_report"):
+                raise Stage1ExitGateError("S1_11_S1_10_V2_WORKER_REPORT_HASH_INVALID")
+            worker = _mapping(load_canonical_json(worker_path), field=f"s1_10.{role}_report")
+            _self_hash(worker, field=f"s1_10.{role}_report")
+            if worker.get("schema_version") != "stage1-s1-10-formal-worker-report-v1" or worker.get("status") != "PASS":
+                raise Stage1ExitGateError("S1_11_S1_10_V2_WORKER_REPORT_INVALID")
+        for field, expected_files in (
+            ("chart_csv_sha256", {"resume-errors.csv", "state-timeline.csv"}),
+            ("chart_svg_sha256", {"resume-errors.svg", "state-timeline.svg"}),
+        ):
+            chart_hashes = _mapping(index.get(field), field=f"s1_10.{field}")
+            if set(chart_hashes) != expected_files:
+                raise Stage1ExitGateError("S1_11_S1_10_V2_CHART_WIRE_INVALID")
+            for filename, digest in chart_hashes.items():
+                chart_path = _safe_relative(index_dir, filename, field="s1_10_chart")
+                if not chart_path.is_file() or _hash_file(chart_path) != _hash(digest, field="s1_10_chart"):
+                    raise Stage1ExitGateError("S1_11_S1_10_V2_CHART_HASH_INVALID")
     return {"binding": binding.to_dict(), "index_artifact_hash": index["artifact_hash"], "gate_requirements": sorted(requirements)}
 
 

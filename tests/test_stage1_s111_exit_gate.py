@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import importlib.util
+import json
 import subprocess
 from pathlib import Path
 
@@ -52,14 +53,14 @@ def _publish_dependency(root: Path, ordinal: int, gate_id: str, task_id: str) ->
         "G1-STEP": ("stage1-s1-6-formalization-index-v1", {"step_report": "step-report.json", "oracle_bundle": "oracle-bundle.json", "trace_bundle": "trace-bundle.json", "comparison_table": "comparison-table.json", "gate_record": "g1-step-record.json"}),
         "G1-SINGLE": ("stage1-s1-7-formalization-index-v1", {"fixture_manifest": "fixture-manifest.json", "single_gpu_report": "worker-report.json", "gradient_bundle": "arrays-manifest.json", "comparison_table": "comparison-table.json", "gate_record": "g1-single-record.json"}),
         "G1-DDP": ("stage1-s1-8-formalization-index-v2", {"fixture_manifest": "fixture-manifest.json", "ddp_report": "ddp-report.json", "array_bundle": "array-bundle.json", "comparison_table": "comparison-table.json", "gate_record": "g1-ddp-record.json"}),
-        "G1-NUMERIC": ("stage1-s1-9-formalization-index-v5", {"numeric_report": "numeric-report.json", "oracle_bundle": "oracle-bundle.json", "trace_bundle": "trace-bundle.json", "comparison_table": "comparison-table.json", "gate_record": "g1-numeric-record.json"}),
-        "G1-RESUME": ("stage1-s1-10-formalization-index-v1", {"resume_report": "resume-report.json", "oracle_bundle": "oracle-bundle.json", "trace_bundle": "trace-bundle.json", "comparison_table": "comparison-table.json", "artifact_manifest": "artifact-manifest.json", "gate_record": "g1-resume-record.json"}),
+        "G1-NUMERIC": ("stage1-s1-9-formalization-index-v8", {"numeric_report": "numeric-report.json", "oracle_bundle": "oracle-bundle.json", "trace_bundle": "trace-bundle.json", "comparison_table": "comparison-table.json", "gate_record": "g1-numeric-record.json"}),
+        "G1-RESUME": ("stage1-s1-10-formalization-index-v2", {"resume_report": "resume-report.json", "oracle_bundle": "oracle-bundle.json", "trace_bundle": "trace-bundle.json", "comparison_table": "comparison-table.json", "artifact_manifest": "artifact-manifest.json", "gate_record": "g1-resume-record.json"}),
     }
     schema_version, role_files = index_wires[gate_id]
     role_name = role_files["gate_record"] if "gate_record" in role_files else role_files["named"]
     replay_name = "replay-validation.json"
     gate = _with_hash({
-        "schema_version": "synthetic-gate-record-v1", "status": "PASS", "gate_id": gate_id,
+        "schema_version": {"G1-NUMERIC": "stage1-s1-9-gate-record-v1", "G1-RESUME": "stage1-s1-10-gate-record-v1"}.get(gate_id, "synthetic-gate-record-v1"), "status": "PASS", "gate_id": gate_id,
         "task_id": task_id, "requirements": {"independent_measurement": True, "negative_control": True},
     })
     replay = _with_hash({"schema_version": "synthetic-replay-v1", "status": "PASS", "task_id": task_id})
@@ -67,7 +68,35 @@ def _publish_dependency(root: Path, ordinal: int, gate_id: str, task_id: str) ->
     write_canonical_json(published / role_name, gate)
     for role, filename in role_files.items():
         if filename != role_name:
-            write_canonical_json(published / filename, _with_hash({"schema_version": "synthetic-bound-role-v1", "status": "PASS", "role": role}))
+            if gate_id == "G1-NUMERIC" and role == "numeric_report":
+                schema = json.loads(Path("schemas/stage1/s1-9-numeric-report-v1.json").read_text(encoding="utf-8"))
+                sources = {name: "a" * 64 for name in schema["$defs"]["implementation_source_sha256"]["required"]}
+                body = {"schema_version": "stage1-s1-9-numeric-report-v1", "status": "PASS", "implementation_source_sha256": sources}
+                write_canonical_json(published / filename, {**body, "report_hash": canonical_json_hash(body)})
+            elif gate_id == "G1-RESUME" and role == "resume_report":
+                schema = json.loads(Path("schemas/stage1/s1-10-resume-report-v2.json").read_text(encoding="utf-8"))
+                sources = {name: "b" * 64 for name in schema["$defs"]["source_map"]["required"]}
+                body = {"schema_version": "stage1-s1-10-resume-report-v2", "status": "PASS", "implementation_source_sha256": sources, "upstream": {}}
+                write_canonical_json(published / filename, {**body, "report_hash": canonical_json_hash(body)})
+            elif gate_id in {"G1-NUMERIC", "G1-RESUME"}:
+                contracts = {
+                    "G1-NUMERIC": {"oracle_bundle": ("oracle_hash", "stage1-s1-9-oracle-bundle-v1"), "trace_bundle": ("trace_hash", "stage1-s1-9-trace-bundle-v1"), "comparison_table": ("table_hash", "stage1-s1-9-comparison-table-v1")},
+                    "G1-RESUME": {"oracle_bundle": ("oracle_hash", "stage1-s1-10-oracle-bundle-v1"), "trace_bundle": ("trace_hash", "stage1-s1-10-trace-bundle-v1"), "comparison_table": ("table_hash", "stage1-s1-10-comparison-table-v1"), "artifact_manifest": ("manifest_hash", "stage1-s1-10-artifact-manifest-v1")},
+                }
+                hash_field, role_schema_version = contracts[gate_id][role]
+                body = {"schema_version": role_schema_version, "role": role}
+                write_canonical_json(published / filename, {**body, hash_field: canonical_json_hash(body)})
+            else:
+                write_canonical_json(published / filename, _with_hash({"schema_version": "synthetic-bound-role-v1", "status": "PASS", "role": role}))
+    if gate_id in {"G1-NUMERIC", "G1-RESUME"}:
+        replay_body = {
+            "schema_version": {
+                "G1-NUMERIC": "stage1-s1-9-replay-validation-v1",
+                "G1-RESUME": "stage1-s1-10-replay-validation-v1",
+            }[gate_id],
+            "status": "PASS", "source_gate_artifact_hash": gate["artifact_hash"],
+        }
+        replay = {**replay_body, "replay_hash": canonical_json_hash(replay_body)}
     write_canonical_json(published / replay_name, replay)
     write_canonical_json(published / "validation.json", validation)
     role_sha = {role: _sha(published / filename) for role, filename in role_files.items()}
@@ -87,6 +116,11 @@ def _publish_dependency(root: Path, ordinal: int, gate_id: str, task_id: str) ->
     elif gate_id == "G1-GRAD":
         index_body.update({"gate_record_ref": role_name, "gate_record_sha256": role_sha["named"]})
     elif gate_id == "G1-NUMERIC":
+        determinism = {
+            "algorithms_enabled": True, "cudnn_deterministic": True,
+            "cudnn_benchmark": False, "allowed_nondeterministic_kernel_classes": [],
+            "kernel_policy": "empty_pre_registered_allowlist",
+        }
         reproduction_refs = {
             "attempt_start": "attempt-start.json", "upstream_compatibility": "upstream-compatibility.json",
             "preflight": "preflight.json", "prelease_gpu": "prelease-gpu.json",
@@ -102,16 +136,67 @@ def _publish_dependency(root: Path, ordinal: int, gate_id: str, task_id: str) ->
         for name in reproduction_refs.values():
             path = published / name
             if name == "upstream-compatibility.json":
-                write_canonical_json(path, _with_hash({"schema_version": "stage1-s1-9-upstream-compatibility-v4", "status": "PASS", "s1_8_v5_handoff": {"index_schema_version": "stage1-s1-8-formalization-index-v5"}}))
+                s1_8_sources = {f"src/s1-8-frozen-{index}.py": "c" * 64 for index in range(61)}
+                s1_8_reproduction = {f"role_{index}": f"role-{index}.json" for index in range(84)}
+                handoff = {"index_schema_version": "stage1-s1-8-formalization-index-v8", "ddp_report_schema_version": "stage1-s1-8-ddp-report-v8", "validation_schema_version": "stage1-s1-8-validation-v8", "implementation_source_sha256": s1_8_sources, "reproduction_role_refs": s1_8_reproduction, "reproduction_role_sha256": {role: "d" * 64 for role in s1_8_reproduction}, "replay_schema_version": "stage1-s1-8-replay-validation-v3", "comparison_table_schema_version": "stage1-s1-8-comparison-table-v2", "array_bundle_schema_version": "stage1-s1-8-array-bundle-v2"}
+                write_canonical_json(path, _with_hash({"schema_version": "stage1-s1-9-upstream-compatibility-v7", "status": "PASS", "s1_8_source_dependencies": s1_8_sources, "s1_8_v8_handoff": handoff}))
             elif name == "prelease-gpu.json":
                 quiescence = _with_hash({"schema_version": "stage1-s1-9-gpu-quiescence-v3", "status": "PASS", "phase": "prelease"})
                 write_canonical_json(path, _with_hash({"schema_version": "stage1-s1-9-gpu-prelease-v3", "status": "PASS", "quiescence": quiescence}))
             elif name == "post-worker-quiescence.json":
                 write_canonical_json(path, _with_hash({"schema_version": "stage1-s1-9-gpu-quiescence-v3", "status": "PASS", "phase": "post_worker"}))
+            elif name == "attempt-start.json":
+                write_canonical_json(path, _with_hash({"schema_version": "stage1-s1-9-attempt-start-v1", "status": "STARTED"}))
+            elif name == "preflight.json":
+                write_canonical_json(path, _with_hash({"schema_version": "stage1-s1-9-preflight-v1", "status": "PASS"}))
+            elif name == "lease-history.json":
+                write_canonical_json(path, _with_hash({"schema_version": "runtime.project-gpu-lease-history.v1", "lease": {}}))
+            elif name == "single-bf16.json":
+                write_canonical_json(path, _with_hash({
+                    "schema_version": "stage1-s1-9-single-bf16-worker-v1", "status": "PASS",
+                    "execution_commit": "1" * 40, "run_token": "run-token",
+                    "approved_gpu_uuid": "GPU-00000000-0000-0000-0000-000000000000",
+                    "cuda_visible_devices": "GPU-00000000-0000-0000-0000-000000000000",
+                    "environment_summary": {}, "observation": {"determinism": determinism},
+                }))
+            elif name in {"single-child-fingerprint.json", "ddp-child-fingerprint.json"}:
+                write_canonical_json(path, _with_hash({"schema_version": "stage1-s1-9-child-fingerprint-v1", "status": "EXITED"}))
+            elif name == "bf16-resume-store-index.json":
+                checkpoint_id = "authoritative"
+                store = published / "bf16-resume-store"
+                commit = store / "commits" / f"{checkpoint_id}.json"
+                manifest = store / "objects" / checkpoint_id / "manifest.json"
+                tensor = store / "objects" / checkpoint_id / "tensors" / "parameter.safetensors"
+                commit.parent.mkdir(parents=True); tensor.parent.mkdir(parents=True)
+                write_canonical_json(commit, {"checkpoint_id": checkpoint_id})
+                write_canonical_json(manifest, {"checkpoint_id": checkpoint_id, "files": ["tensors/parameter.safetensors"]})
+                tensor.write_bytes(b"frozen-tensor-bytes")
+                rows = [
+                    {"ref": item.relative_to(store).as_posix(), "sha256": _sha(item)}
+                    for item in sorted((store / "objects" / checkpoint_id).rglob("*")) if item.is_file()
+                ]
+                write_canonical_json(path, _with_hash({
+                    "schema_version": "stage1-s1-9-bf16-checkpoint-store-reproduction-v2",
+                    "checkpoint_id": checkpoint_id, "commit_ref": f"commits/{checkpoint_id}.json",
+                    "commit_sha256": _sha(commit), "bundle_manifest_ref": f"objects/{checkpoint_id}/manifest.json",
+                    "bundle_manifest_sha256": _sha(manifest), "bundle_file_hashes": rows,
+                }))
+            elif name == "ddp-skip.json":
+                write_canonical_json(path, _with_hash({"schema_version": "stage1-s1-9-ddp-skip-worker-v1", "status": "PASS"}))
             elif name.endswith(".json"):
                 write_canonical_json(path, _with_hash({"schema_version": "synthetic-s1-9-reproduction-v1", "status": "PASS", "role": name}))
             else:
                 path.write_text(name + "\n", encoding="utf-8", newline="\n")
+        validation = _with_hash({
+            "schema_version": "stage1-s1-9-validation-v1", "status": "PASS",
+            "gate_id": "G1-NUMERIC", "task_id": task_id, "execution_scope": "formal",
+            "fixture_id": "stage1-s19-precision-fixture-v1", "producer_commit": "1" * 40,
+            "consumer_commit": "1" * 40, "upstream": {},
+            "regression": {"bf16": determinism, "kernel_allowlist": []}, "direct_checks": {},
+            "role_sha256": role_sha, "csv_sha256": {}, "svg_sha256": {},
+            "replay_sha256": _sha(published / replay_name), "replay_hash": replay["replay_hash"],
+        })
+        write_canonical_json(published / "validation.json", validation)
         index_body.update({
             "reproduction_role_refs": reproduction_refs,
             "reproduction_role_sha256": {role: _sha(published / name) for role, name in reproduction_refs.items()},
@@ -119,9 +204,51 @@ def _publish_dependency(root: Path, ordinal: int, gate_id: str, task_id: str) ->
             "checked_at": "2026-08-20T00:00:00+00:00", "s1_7_handoff": {}, "s1_8_handoff": {},
             "csv_sha256": {name: _sha(published / name) for name in ("bf16-fp32-heatmap.csv", "clip-norm-factor.csv", "skip-zero-difference.csv", "t-amp-scale.csv", "u-single-factor-identity.csv", "u-single-factor-ratio-diagnostic.csv")},
             "svg_sha256": {name: _sha(published / name) for name in ("bf16-fp32-heatmap.svg", "clip-norm-factor.svg", "skip-zero-difference.svg", "t-amp-scale.svg", "u-single-factor-identity.svg", "u-single-factor-ratio-diagnostic.svg")},
-            "replay_hash": replay["artifact_hash"],
+            "replay_hash": replay["replay_hash"],
+            "validation_sha256": _sha(published / "validation.json"),
             "next_task_ids": ["stage1.10_checkpoint_resume_and_artifacts"],
         })
+    elif gate_id == "G1-RESUME":
+        def upstream_row(*, schema: str, task: str, gate: str, sources: int, reproduction: int, required: tuple[str, ...], roles: tuple[str, ...]) -> dict[str, object]:
+            return {
+                "index_ref": f"{task}/index.json", "index_sha256": "1" * 64,
+                "index_artifact_hash": "2" * 64, "producer_commit": "3" * 40,
+                "gate_artifact_hash": "4" * 64, "role_sha256": {role: "5" * 64 for role in roles},
+                "validation_sha256": "6" * 64, "source_map_sha256": "7" * 64,
+                "source_map_entries": sources, "reproduction_role_sha256": {role: "8" * 64 for role in required},
+                "reproduction_role_set_sha256": "9" * 64, "reproduction_role_count": reproduction,
+                "schema_version": schema, "task_id": task, "gate_id": gate,
+            }
+
+        upstream = {
+            "s1_8": upstream_row(schema="stage1-s1-8-formalization-index-v8", task="stage1.08_ddp_and_gradient_accumulation", gate="G1-DDP", sources=61, reproduction=84, required=("prelease_gpu_quiescence", "post_worker_gpu_quiescence", "post_release_gpu_quiescence", "reacquire_preflight_gpu_quiescence"), roles=("fixture_manifest", "ddp_report", "array_bundle", "comparison_table", "gate_record")),
+            "s1_9": upstream_row(schema="stage1-s1-9-formalization-index-v8", task="stage1.09_precision_clipping_and_optimizer_boundaries", gate="G1-NUMERIC", sources=34, reproduction=27, required=("upstream_compatibility", "prelease_gpu", "post_worker_quiescence"), roles=("numeric_report", "oracle_bundle", "trace_bundle", "comparison_table", "gate_record")),
+        }
+        report_path = published / role_files["resume_report"]
+        report = json.loads(report_path.read_text(encoding="utf-8")); report["upstream"] = upstream; report.pop("report_hash"); report["report_hash"] = canonical_json_hash(report)
+        write_canonical_json(report_path, report)
+        role_sha["resume_report"] = _sha(report_path)
+        validation = _with_hash({"schema_version": "stage1-s1-10-validation-v2", "status": "PASS", "upstream": upstream})
+        write_canonical_json(published / "validation.json", validation)
+        index_body["validation_sha256"] = _sha(published / "validation.json")
+        observation = _with_hash({"schema_version": "stage1-s1-10-formal-observation-v1", "status": "PASS", "run_token_sha256": "a" * 64})
+        write_canonical_json(published / "formal-observation.json", observation)
+        for filename in ("formal-single-report.json", "formal-four-rank-report.json"):
+            write_canonical_json(published / filename, _with_hash({"schema_version": "stage1-s1-10-formal-worker-report-v1", "status": "PASS"}))
+        for filename in ("resume-errors.csv", "state-timeline.csv", "resume-errors.svg", "state-timeline.svg"):
+            (published / filename).write_text(filename + "\n", encoding="utf-8", newline="\n")
+        index_body.update({
+            "fixture_id": "stage1-s110-checkpoint-fixture-v1", "git_branch": "fixture", "checked_at": "2026-08-20T00:00:00+00:00", "upstream": upstream,
+            "chart_csv_sha256": {name: _sha(published / name) for name in ("resume-errors.csv", "state-timeline.csv")},
+            "chart_svg_sha256": {name: _sha(published / name) for name in ("resume-errors.svg", "state-timeline.svg")},
+            "formal_observation_ref": "formal-observation.json", "formal_observation_sha256": _sha(published / "formal-observation.json"),
+            "formal_observation_artifact_hash": observation["artifact_hash"], "formal_run_token_sha256": observation["run_token_sha256"],
+            "formal_single_report_ref": "formal-single-report.json", "formal_single_report_sha256": _sha(published / "formal-single-report.json"),
+            "formal_four_rank_report_ref": "formal-four-rank-report.json", "formal_four_rank_report_sha256": _sha(published / "formal-four-rank-report.json"),
+            "replay_hash": replay["replay_hash"],
+            "next_task_ids": ["stage1.11_reporting_and_exit_gate"],
+        })
+        index_body["role_sha256"] = role_sha
     index = _with_hash(index_body)
     write_canonical_json(published / "index.json", index)
     return {
@@ -275,7 +402,7 @@ def test_s111_missing_future_s19_or_s110_index_fails_closed(tmp_path: Path) -> N
         build_exit_gate_summary(tmp_path, broken, unresolved_failures=[], charts=charts)
 
 
-def test_s111_requires_final_s19_v5_reproduction_and_source_closure(tmp_path: Path) -> None:
+def test_s111_requires_final_s19_v8_reproduction_and_source_closure(tmp_path: Path) -> None:
     dependencies, charts = _inputs(tmp_path)
     binding = dependencies[9]
     index_path = tmp_path / binding["index_ref"]
@@ -291,9 +418,9 @@ def test_s111_requires_final_s19_v5_reproduction_and_source_closure(tmp_path: Pa
         return {**binding, "index_sha256": _sha(index_path), "index_artifact_hash": updated["artifact_hash"]}
 
     legacy = dict(index)
-    legacy["schema_version"] = "stage1-s1-9-formalization-index-v1"
+    legacy["schema_version"] = "stage1-s1-9-formalization-index-v7"
     legacy_binding = resign(legacy)
-    legacy_binding["index_schema_version"] = "stage1-s1-9-formalization-index-v1"
+    legacy_binding["index_schema_version"] = "stage1-s1-9-formalization-index-v7"
     with pytest.raises(Stage1ExitGateError, match="UNSUPPORTED_INDEX_WIRE_VERSION"):
         build_exit_gate_summary(tmp_path, [*dependencies[:9], legacy_binding, *dependencies[10:]], unresolved_failures=[], charts=charts)
 
@@ -302,32 +429,110 @@ def test_s111_requires_final_s19_v5_reproduction_and_source_closure(tmp_path: Pa
     refs = dict(missing["reproduction_role_refs"])
     refs.pop("prelease_gpu")
     missing["reproduction_role_refs"] = refs
-    with pytest.raises(Stage1ExitGateError, match="S1_9_V5_REPRODUCTION_REF_WIRE_INVALID"):
+    with pytest.raises(Stage1ExitGateError, match="S1_9_V8_REPRODUCTION_REF_WIRE_INVALID"):
         build_exit_gate_summary(tmp_path, [*dependencies[:9], resign(missing), *dependencies[10:]], unresolved_failures=[], charts=charts)
 
     write_canonical_json(index_path, index)
     missing_schema_field = dict(index)
     missing_schema_field.pop("fixture_id")
-    with pytest.raises(Stage1ExitGateError, match="S1_9_V5_INDEX_SCHEMA_CLOSURE_INVALID"):
+    with pytest.raises(Stage1ExitGateError, match="S1_9_V8_INDEX_SCHEMA_CLOSURE_INVALID"):
         build_exit_gate_summary(tmp_path, [*dependencies[:9], resign(missing_schema_field), *dependencies[10:]], unresolved_failures=[], charts=charts)
 
     write_canonical_json(index_path, index)
     source = tmp_path / binding["index_ref"].replace("index.json", "upstream-compatibility.json")
     source.write_text('{"schema_version":"tampered"}\n', encoding="utf-8", newline="\n")
-    with pytest.raises(Stage1ExitGateError, match="S1_9_V5_REPRODUCTION_FILE_HASH_MISMATCH"):
+    with pytest.raises(Stage1ExitGateError, match="S1_9_V8_REPRODUCTION_FILE_HASH_MISMATCH"):
         build_exit_gate_summary(tmp_path, dependencies, unresolved_failures=[], charts=charts)
 
     write_canonical_json(index_path, index)
     write_canonical_json(source, _with_hash({
-        "schema_version": "stage1-s1-9-upstream-compatibility-v4", "status": "PASS",
-        "s1_8_v5_handoff": {"index_schema_version": "stage1-s1-8-formalization-index-v4"},
+        "schema_version": "stage1-s1-9-upstream-compatibility-v7", "status": "PASS",
+        "s1_8_source_dependencies": {}, "s1_8_v8_handoff": {"index_schema_version": "stage1-s1-8-formalization-index-v7", "implementation_source_sha256": {}, "reproduction_role_refs": {}, "reproduction_role_sha256": {}},
     }))
     invalid_source = dict(index)
     invalid_source["reproduction_role_sha256"] = dict(index["reproduction_role_sha256"])
     invalid_source["reproduction_role_sha256"]["upstream_compatibility"] = _sha(source)
     invalid_source_binding = resign(invalid_source)
-    with pytest.raises(Stage1ExitGateError, match="S1_9_V5_UPSTREAM_SOURCE_CLOSURE_INVALID"):
+    with pytest.raises(Stage1ExitGateError, match="S1_9_V8_UPSTREAM_SOURCE_CLOSURE_INVALID"):
         build_exit_gate_summary(tmp_path, [*dependencies[:9], invalid_source_binding, *dependencies[10:]], unresolved_failures=[], charts=charts)
+
+
+def test_s111_requires_final_s110_v2_source_and_formal_role_closure(tmp_path: Path) -> None:
+    from param_importance_nlp.contracts.jsonio import load_canonical_json
+
+    dependencies, charts = _inputs(tmp_path)
+    binding = dependencies[10]
+    index_path = tmp_path / binding["index_ref"]
+    index = load_canonical_json(index_path); assert isinstance(index, dict)
+
+    def resign(body: dict[str, object]) -> dict[str, object]:
+        unsigned = {key: value for key, value in body.items() if key != "artifact_hash"}
+        updated = _with_hash(unsigned); write_canonical_json(index_path, updated)
+        return {**binding, "index_sha256": _sha(index_path), "index_artifact_hash": updated["artifact_hash"]}
+
+    legacy = dict(index); legacy["schema_version"] = "stage1-s1-10-formalization-index-v1"
+    legacy_binding = resign(legacy); legacy_binding["index_schema_version"] = "stage1-s1-10-formalization-index-v1"
+    with pytest.raises(Stage1ExitGateError, match="UNSUPPORTED_INDEX_WIRE_VERSION"):
+        build_exit_gate_summary(tmp_path, [*dependencies[:10], legacy_binding], unresolved_failures=[], charts=charts)
+
+    write_canonical_json(index_path, index)
+    report_path = index_path.parent / "resume-report.json"
+    report = load_canonical_json(report_path); assert isinstance(report, dict)
+    sources = dict(report["implementation_source_sha256"]); sources["unreviewed/source.py"] = sources.pop(next(iter(sources)))
+    report["implementation_source_sha256"] = sources; report.pop("report_hash"); report["report_hash"] = canonical_json_hash(report)
+    write_canonical_json(report_path, report)
+    altered = dict(index); altered["role_sha256"] = dict(index["role_sha256"]); altered["role_sha256"]["resume_report"] = _sha(report_path)
+    with pytest.raises(Stage1ExitGateError, match="S1_10_SOURCE_KEYSET_INVALID"):
+        build_exit_gate_summary(tmp_path, [*dependencies[:10], resign(altered)], unresolved_failures=[], charts=charts)
+
+    worker_root = tmp_path / "worker-tamper"; worker_root.mkdir()
+    worker_dependencies, worker_charts = _inputs(worker_root)
+    worker_binding = worker_dependencies[10]
+    worker_index_path = worker_root / worker_binding["index_ref"]
+    worker_index = load_canonical_json(worker_index_path); assert isinstance(worker_index, dict)
+    worker_path = worker_index_path.parent / "formal-four-rank-report.json"
+    worker_path.write_text('{"status":"PASS"}\n', encoding="utf-8", newline="\n")
+    with pytest.raises(Stage1ExitGateError, match="S1_10_V2_WORKER_REPORT_HASH_INVALID"):
+        build_exit_gate_summary(worker_root, worker_dependencies, unresolved_failures=[], charts=worker_charts)
+
+
+def test_s111_rejects_s19_legacy_checkpoint_and_non_v2_determinism(tmp_path: Path) -> None:
+    from param_importance_nlp.contracts.jsonio import load_canonical_json
+
+    checkpoint_root = tmp_path / "legacy-checkpoint"; checkpoint_root.mkdir()
+    dependencies, charts = _inputs(checkpoint_root)
+    binding = dependencies[9]
+    index_path = checkpoint_root / binding["index_ref"]
+    index = load_canonical_json(index_path); assert isinstance(index, dict)
+    checkpoint_path = index_path.parent / "bf16-resume-store-index.json"
+    checkpoint = load_canonical_json(checkpoint_path); assert isinstance(checkpoint, dict)
+    checkpoint["schema_version"] = "stage1-s1-9-bf16-checkpoint-store-reproduction-v1"
+    checkpoint.pop("artifact_hash"); checkpoint["artifact_hash"] = canonical_json_hash(checkpoint)
+    write_canonical_json(checkpoint_path, checkpoint)
+    index["reproduction_role_sha256"] = dict(index["reproduction_role_sha256"])
+    index["reproduction_role_sha256"]["bf16_resume_checkpoint_store"] = _sha(checkpoint_path)
+    index.pop("artifact_hash"); index["artifact_hash"] = canonical_json_hash(index)
+    write_canonical_json(index_path, index)
+    broken_binding = {**binding, "index_sha256": _sha(index_path), "index_artifact_hash": index["artifact_hash"]}
+    with pytest.raises(Stage1ExitGateError, match="S1_9_V8_REPRODUCTION_SCHEMA_INVALID"):
+        build_exit_gate_summary(checkpoint_root, [*dependencies[:9], broken_binding, *dependencies[10:]], unresolved_failures=[], charts=charts)
+
+    validation_root = tmp_path / "legacy-determinism"; validation_root.mkdir()
+    dependencies, charts = _inputs(validation_root)
+    binding = dependencies[9]
+    index_path = validation_root / binding["index_ref"]
+    index = load_canonical_json(index_path); assert isinstance(index, dict)
+    validation_path = index_path.parent / "validation.json"
+    validation = load_canonical_json(validation_path); assert isinstance(validation, dict)
+    validation["regression"]["bf16"]["allowed_nondeterministic_kernel_classes"] = ["legacy-kernel"]
+    validation.pop("artifact_hash"); validation["artifact_hash"] = canonical_json_hash(validation)
+    write_canonical_json(validation_path, validation)
+    index["validation_sha256"] = _sha(validation_path)
+    index.pop("artifact_hash"); index["artifact_hash"] = canonical_json_hash(index)
+    write_canonical_json(index_path, index)
+    broken_binding = {**binding, "index_sha256": _sha(index_path), "index_artifact_hash": index["artifact_hash"]}
+    with pytest.raises(Stage1ExitGateError, match="S1_9_VALIDATION_V2_DETERMINISM_INVALID"):
+        build_exit_gate_summary(validation_root, [*dependencies[:9], broken_binding, *dependencies[10:]], unresolved_failures=[], charts=charts)
 
 
 def test_s111_rejects_self_consistent_text_without_bound_role_hash(tmp_path: Path) -> None:
