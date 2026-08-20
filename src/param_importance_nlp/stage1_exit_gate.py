@@ -287,7 +287,7 @@ def _validate_s1_9_current_v2_roles(
         "fixture_id", "producer_commit", "consumer_commit", "upstream",
         "regression", "direct_checks", "role_sha256", "csv_sha256",
         "svg_sha256", "replay_sha256", "replay_hash", "artifact_hash",
-    } or validation.get("schema_version") != "stage1-s1-9-validation-v1":
+    } or validation.get("schema_version") != "stage1-s1-9-validation-v2":
         raise Stage1ExitGateError("S1_11_S1_9_V8_VALIDATION_V2_INVALID")
     regression = _mapping(validation.get("regression"), field="s1_9.validation_regression")
     if regression.get("kernel_allowlist") != []:

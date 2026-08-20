@@ -188,7 +188,7 @@ def _publish_dependency(root: Path, ordinal: int, gate_id: str, task_id: str) ->
             else:
                 path.write_text(name + "\n", encoding="utf-8", newline="\n")
         validation = _with_hash({
-            "schema_version": "stage1-s1-9-validation-v1", "status": "PASS",
+            "schema_version": "stage1-s1-9-validation-v2", "status": "PASS",
             "gate_id": "G1-NUMERIC", "task_id": task_id, "execution_scope": "formal",
             "fixture_id": "stage1-s19-precision-fixture-v1", "producer_commit": "1" * 40,
             "consumer_commit": "1" * 40, "upstream": {},
