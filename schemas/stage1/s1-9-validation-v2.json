@@ -1,26 +1,36 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://parameter-importance.local/schemas/stage1/s1-9-validation-v2.json",
-  "allOf": [
-    {"$ref": "s1-9-validation-v1.json"}
-  ],
+  "type": "object",
+  "required": ["schema_version", "status", "gate_id", "task_id", "execution_scope", "fixture_id", "producer_commit", "consumer_commit", "upstream", "regression", "direct_checks", "role_sha256", "csv_sha256", "svg_sha256", "replay_sha256", "replay_hash", "artifact_hash"],
+  "additionalProperties": false,
   "properties": {
-    "regression": {
-      "properties": {
-        "bf16": {
-          "type": "object",
-          "additionalProperties": false,
-          "required": ["algorithms_enabled", "cudnn_deterministic", "cudnn_benchmark", "allowed_nondeterministic_kernel_classes", "kernel_policy"],
-          "properties": {
-            "algorithms_enabled": {"const": true},
-            "cudnn_deterministic": {"const": true},
-            "cudnn_benchmark": {"const": false},
-            "allowed_nondeterministic_kernel_classes": {"type": "array", "maxItems": 0, "items": {"type": "string"}},
-            "kernel_policy": {"const": "empty_pre_registered_allowlist"}
-          }
-        },
-        "kernel_allowlist": {"type": "array", "maxItems": 0, "items": {"type": "string"}}
-      }
-    }
+    "schema_version": {"const": "stage1-s1-9-validation-v1"}, "status": {"const": "PASS"}, "gate_id": {"const": "G1-NUMERIC"}, "task_id": {"const": "stage1.09_precision_clipping_and_optimizer_boundaries"}, "execution_scope": {"const": "formal_server_gpu_single_and_ddp_skip"}, "fixture_id": {"const": "stage1-s19-precision-fixture-v1"}, "producer_commit": {"$ref": "#/$defs/commit"}, "consumer_commit": {"$ref": "#/$defs/commit"},
+    "upstream": {"type": "object", "required": ["s1_7", "s1_8"], "additionalProperties": false, "properties": {"s1_7": {"$ref": "s1-9-numeric-report-v1.json#/$defs/s1_7_handoff"}, "s1_8": {"$ref": "s1-9-numeric-report-v1.json#/$defs/s1_8_handoff"}}},
+    "regression": {"type": "object", "required": ["bf16", "ddp_world_size", "kernel_allowlist", "environment"], "additionalProperties": false, "properties": {"bf16": {"$ref": "s1-9-single-bf16-worker-v2.json#/$defs/determinism"}, "ddp_world_size": {"const": 4}, "kernel_allowlist": {"type": "array", "maxItems": 0, "items": {"type": "string"}}, "environment": {"type": "object", "required": ["single", "ddp_rank0", "ddp_all_ranks"], "additionalProperties": false, "properties": {"single": {"$ref": "s1-9-single-bf16-worker-v2.json#/$defs/environment_summary"}, "ddp_rank0": {"allOf": [{"$ref": "s1-9-ddp-skip-worker-v1.json#/$defs/environment_summary"}, {"properties": {"local_rank": {"const": 0}}}]}, "ddp_all_ranks": {"type": "array", "minItems": 4, "maxItems": 4, "items": {"$ref": "s1-9-ddp-skip-worker-v1.json#/$defs/environment_summary"}}}}}},
+    "direct_checks": {"type": "array", "minItems": 18, "maxItems": 18, "prefixItems": [{"$ref": "#/$defs/check_fp32_statistics_containers"}, {"$ref": "#/$defs/check_mixed_magnitude"}, {"$ref": "#/$defs/check_autocast_scale"}, {"$ref": "#/$defs/check_unscale_negative"}, {"$ref": "#/$defs/check_scaler_skip"}, {"$ref": "#/$defs/check_clip_oracle"}, {"$ref": "#/$defs/check_u_factor"}, {"$ref": "#/$defs/check_microbatch_negative"}, {"$ref": "#/$defs/check_raw_preserved"}, {"$ref": "#/$defs/check_adamw"}, {"$ref": "#/$defs/check_determinism"}, {"$ref": "#/$defs/check_bf16"}, {"$ref": "#/$defs/check_ddp"}, {"$ref": "#/$defs/check_bf16_self_hash"}, {"$ref": "#/$defs/check_checkpoint"}, {"$ref": "#/$defs/check_ddp_self_hash"}, {"$ref": "#/$defs/check_post_worker"}, {"$ref": "#/$defs/check_schema_controls"}], "items": {"$ref": "#/$defs/pass_check"}},
+    "role_sha256": {"$ref": "s1-9-formalization-index-v1.json#/$defs/role_hashes"}, "csv_sha256": {"$ref": "s1-9-formalization-index-v1.json#/$defs/csv_hashes"}, "svg_sha256": {"$ref": "s1-9-formalization-index-v1.json#/$defs/svg_hashes"}, "replay_sha256": {"$ref": "#/$defs/hash"}, "replay_hash": {"$ref": "#/$defs/hash"}, "artifact_hash": {"$ref": "#/$defs/hash"}
+  },
+  "$defs": {
+    "hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"}, "commit": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+    "pass_check": {"type": "object", "required": ["check_id", "status", "detail"], "additionalProperties": false, "properties": {"check_id": {"type": "string", "minLength": 1}, "status": {"const": "PASS"}, "detail": {"type": "string", "minLength": 1}}},
+    "check_fp32_statistics_containers": {"allOf": [{"$ref": "#/$defs/pass_check"}, {"properties": {"check_id": {"const": "fp32_statistics_containers"}}}]},
+    "check_mixed_magnitude": {"allOf": [{"$ref": "#/$defs/pass_check"}, {"properties": {"check_id": {"const": "mixed_magnitude_fp64_norm_and_nonfinite_preflight"}}}]},
+    "check_autocast_scale": {"allOf": [{"$ref": "#/$defs/pass_check"}, {"properties": {"check_id": {"const": "same_autocast_scale_unscale_equivalence"}}}]},
+    "check_unscale_negative": {"allOf": [{"$ref": "#/$defs/pass_check"}, {"properties": {"check_id": {"const": "unscale_negative_first_and_second_order_detected"}}}]},
+    "check_scaler_skip": {"allOf": [{"$ref": "#/$defs/pass_check"}, {"properties": {"check_id": {"const": "single_scaler_transition_and_skip"}}}]},
+    "check_clip_oracle": {"allOf": [{"$ref": "#/$defs/pass_check"}, {"properties": {"check_id": {"const": "clip_factor_matches_analytic_oracle"}}}]},
+    "check_u_factor": {"allOf": [{"$ref": "#/$defs/pass_check"}, {"properties": {"check_id": {"const": "u_clipped_uses_one_factor"}}}]},
+    "check_microbatch_negative": {"allOf": [{"$ref": "#/$defs/pass_check"}, {"properties": {"check_id": {"const": "per_microbatch_clip_negative_control_detected"}}}]},
+    "check_raw_preserved": {"allOf": [{"$ref": "#/$defs/pass_check"}, {"properties": {"check_id": {"const": "raw_unclipped_field_preserved"}}}]},
+    "check_adamw": {"allOf": [{"$ref": "#/$defs/pass_check"}, {"properties": {"check_id": {"const": "adamw_moment_and_decay_boundary"}}}]},
+    "check_determinism": {"allOf": [{"$ref": "#/$defs/pass_check"}, {"properties": {"check_id": {"const": "repeated_short_run_bitwise_deterministic"}}}]},
+    "check_bf16": {"allOf": [{"$ref": "#/$defs/pass_check"}, {"properties": {"check_id": {"const": "bf16_cuda_smoke"}}}]},
+    "check_ddp": {"allOf": [{"$ref": "#/$defs/pass_check"}, {"properties": {"check_id": {"const": "ddp_global_nonfinite_skip"}}}]},
+    "check_bf16_self_hash": {"allOf": [{"$ref": "#/$defs/pass_check"}, {"properties": {"check_id": {"const": "bf16_worker_self_hash"}}}]},
+    "check_checkpoint": {"allOf": [{"$ref": "#/$defs/pass_check"}, {"properties": {"check_id": {"const": "bf16_checkpoint_binding_and_tamper_negative_control"}}}]},
+    "check_ddp_self_hash": {"allOf": [{"$ref": "#/$defs/pass_check"}, {"properties": {"check_id": {"const": "ddp_worker_self_hash_and_all_direct_checks"}}}]},
+    "check_post_worker": {"allOf": [{"$ref": "#/$defs/pass_check"}, {"properties": {"check_id": {"const": "post_worker_gpu_preflight_clean"}}}]},
+    "check_schema_controls": {"allOf": [{"$ref": "#/$defs/pass_check"}, {"properties": {"check_id": {"const": "strict_schema_missing_and_unknown_negative_controls"}}}]}
   }
 }
