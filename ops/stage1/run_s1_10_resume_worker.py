@@ -318,6 +318,15 @@ def _event_pointer(root: Path, store: Any, checkpoint_id: str, event_path: Path)
     return {"event_ref": event_path.relative_to(root).as_posix(), "event_sha256": _file_sha(event_path), "checkpoint_event_sequence": int(state["training_state"]["event_sequence"]) - 1}
 
 
+def _broadcast_group_output(dist: Any, *, rank: int, output: Mapping[str, Any]) -> dict[str, Any]:
+    slot: list[Any] = [dict(output) if rank == 0 else None]
+    dist.broadcast_object_list(slot, src=0)
+    if not isinstance(slot[0], Mapping):
+        raise RuntimeError("S1_10_GROUP_BROADCAST_OUTPUT_INVALID")
+    dist.barrier()
+    return dict(slot[0])
+
+
 def _group_publish(torch: Any, *, root: Path, rank: int, world_size: int, label: str, checkpoint_root: Path, checkpoint_id: str, event_path: Path, parent: str | None, generation: int, config_hash: str, environment_hash: str) -> dict[str, Any]:
     from param_importance_nlp.runtime import CheckpointStore
     from param_importance_nlp.runtime.checkpoint_group import CheckpointGroupStore
@@ -344,8 +353,7 @@ def _group_publish(torch: Any, *, root: Path, rank: int, world_size: int, label:
             "broadcast_commit_sha256": reloaded.commit_sha256,
             "reload_commit_sha256": reloaded.commit_sha256,
         }
-    gathered_output: list[Any] = [None]; dist.broadcast_object_list(gathered_output, src=0); dist.barrier()
-    return dict(gathered_output[0])
+    return _broadcast_group_output(dist, rank=rank, output=output)
 
 
 def _run(args: argparse.Namespace, *, approved: tuple[str, ...], torch: Any) -> dict[str, Any]:

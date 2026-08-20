@@ -912,6 +912,34 @@ def test_s110_resume_loads_source_before_isolating_output_store() -> None:
     ]
 
 
+def test_s110_group_broadcast_seeds_rank_zero_output() -> None:
+    worker_spec = importlib.util.spec_from_file_location(
+        "s110_worker_group_broadcast_test",
+        ROOT / "ops" / "stage1" / "run_s1_10_resume_worker.py",
+    )
+    assert worker_spec is not None and worker_spec.loader is not None
+    worker = importlib.util.module_from_spec(worker_spec)
+    worker_spec.loader.exec_module(worker)
+
+    class FakeDist:
+        observed: object = None
+        barriers = 0
+
+        def broadcast_object_list(self, slot: list[object], *, src: int) -> None:
+            assert src == 0
+            self.observed = slot[0]
+
+        def barrier(self) -> None:
+            self.barriers += 1
+
+    dist = FakeDist()
+    assert worker._broadcast_group_output(dist, rank=0, output={"commit_sha256": "a" * 64}) == {
+        "commit_sha256": "a" * 64
+    }
+    assert dist.observed == {"commit_sha256": "a" * 64}
+    assert dist.barriers == 1
+
+
 def test_s110_source_process_identity_rejects_live_source_and_accepts_pid_reuse(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
