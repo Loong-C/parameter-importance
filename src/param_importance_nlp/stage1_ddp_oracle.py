@@ -962,7 +962,7 @@ def replay(
 
     passed = all(bool(value["within_t32_distributed"]) for value in checks.values()) and all(bool(value["within_t32_distributed"]) for value in scalar_checks.values())
     return {
-        "schema_version": "stage1-s1-8-replay-validation-v2", "status": "PASS" if passed else "FAIL",
+        "schema_version": "stage1-s1-8-replay-validation-v3", "status": "PASS" if passed else "FAIL",
         "fixture_schema_version": fixture["schema_version"], "fixture_id": fixture["fixture_id"],
         "oracle_import_isolated": True, "oracle_reference_dtype": "torch.float64",
         "production_candidate_dtype": "torch.float32", "checks": checks, "scalar_checks": scalar_checks,
