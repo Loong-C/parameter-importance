@@ -583,7 +583,9 @@ def test_rank_contract_route_a_requires_one_full_batch_gradient_checksum() -> No
 
 def test_formal_chart_exports_have_five_csv_data_projections_and_no_a_u_reference(tmp_path: Path) -> None:
     formalizer = _formalizer()
-    replay = {"comparison_rows": [{"comparison": "equal:A:a_reference:raw_core", "parameter": "p", "max_abs_error": 0.0, "max_scaled_error": 0.25, "normalized_l2_error": 0.1, "candidate_dtype": "torch.float32", "reference_dtype": "torch.float64", "within_t32_distributed": True}]}
+    numeric = {"comparison": "equal:A:a_reference:raw_core", "parameter": "p", "near_zero_branch": False, "natural_scale": 1.0, "near_zero_threshold": 0.0, "absolute_threshold": 0.0, "max_abs_error": 0.0, "max_scaled_error": 0.25, "normalized_l2_error": 0.1, "candidate_dtype": "torch.float32", "reference_dtype": "torch.float64", "within_t32_distributed": True}
+    step = {"comparison": "equal:A:optimizer_state:step", "parameter": "p", "expected_step": 1, "observed": 1.0, "exact_equality": True, "within_t32_distributed": True}
+    replay = {"comparison_rows": [numeric, step]}
     arrays = {}
     for route in ("A", "B", "C", "D"):
         prefix = "a-reference/equal" if route == "A" else "scores/equal"
@@ -597,6 +599,19 @@ def test_formal_chart_exports_have_five_csv_data_projections_and_no_a_u_referenc
         text = (tmp_path / svg).read_text(encoding="utf-8")
         assert "data-source=" in text and "data-value=" in text
         assert "A U" not in text
+    assert len((tmp_path / "error-heatmap.csv").read_text(encoding="utf-8").splitlines()) == 2
+    assert len((tmp_path / "error-series.csv").read_text(encoding="utf-8").splitlines()) == 2
+
+
+def test_chart_numeric_projection_excludes_only_complete_step_rows_and_rejects_partial_rows() -> None:
+    formalizer = _formalizer()
+    numeric = {"comparison": "equal:B:raw", "parameter": "p", "near_zero_branch": False, "natural_scale": 1.0, "near_zero_threshold": 0.0, "absolute_threshold": 0.0, "max_abs_error": 0.0, "max_scaled_error": 0.25, "normalized_l2_error": 0.1, "candidate_dtype": "torch.float32", "reference_dtype": "torch.float64", "within_t32_distributed": True}
+    step = {"comparison": "equal:B:optimizer_state:step", "parameter": "p", "expected_step": 1, "observed": 1.0, "exact_equality": True, "within_t32_distributed": True}
+    assert formalizer._chart_numeric_comparison_rows([numeric, step]) == [numeric]
+    partial = dict(numeric); del partial["max_scaled_error"]
+    for rows, marker in (([partial], "comparison-row:0"), ([{**step, "unexpected": 1}], "comparison-row:0"), ([step], "heatmap")):
+        with pytest.raises(formalizer.Stage1S18FormalError, match="S18_CHART_NUMERIC_INVALID:" + marker):
+            formalizer._chart_numeric_comparison_rows(rows)
 
 
 def test_strict_fixture_and_gate_schemas_reject_nested_unknown_missing_and_cardinality() -> None:
