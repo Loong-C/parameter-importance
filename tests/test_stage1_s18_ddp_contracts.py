@@ -12,6 +12,7 @@ from pathlib import Path
 import signal
 import subprocess
 import sys
+import threading
 import time
 from types import SimpleNamespace
 
@@ -1299,6 +1300,71 @@ def test_launch_audit_natural_exit_requires_attestation_expected_pid_and_no_resi
         formalizer._audit_or_confirmed_launcher_exit(exited, fingerprint, {100: fingerprint})
 
 
+def test_token_missing_owner_exit_uses_terminal_join_only_for_exact_attested_state(monkeypatch: pytest.MonkeyPatch) -> None:
+    formalizer = _formalizer()
+    launcher = {"pid": 100, "ppid": 1, "uid": 7, "pgid": 100, "sid": 100, "start_ticks": "10", "exe": "/usr/bin/python", "cmdline_sha256": "a" * 64, "environment_run_token": "b" * 64}
+    owner_exit = {key: launcher[key] for key in ("pid", "pgid", "sid", "start_ticks")} | {"uid": 0, "state": "R"}
+    monkeypatch.setattr(formalizer, "_token_process_ids", lambda _: [])
+    monkeypatch.setattr(formalizer, "_session_members", lambda _sid: [100])
+    monkeypatch.setattr(formalizer, "_session_member_stat", lambda _pid: owner_exit)
+    monkeypatch.setattr(formalizer, "_residual_launch_tree", lambda *_args, **_kwargs: {"session_members": [], "token_members": []})
+    waits: list[float] = []
+    def delayed_owner_exit(*, timeout: float) -> int:
+        waits.append(timeout)
+        if len(waits) < 3:
+            raise subprocess.TimeoutExpired(cmd="torchrun", timeout=timeout)
+        return 0
+    assert formalizer._audit_or_confirmed_launcher_exit(
+        SimpleNamespace(wait=delayed_owner_exit), launcher, {100: launcher},
+    ) is None
+    assert formalizer.TERMINAL_PROCESS_JOIN_TIMEOUT_SECONDS == 30.0
+    assert waits == [formalizer.LAUNCHER_EXIT_CONFIRMATION_TIMEOUT_SECONDS] * 3
+
+    never_wait = SimpleNamespace(wait=lambda *, timeout: pytest.fail(f"unexpected wait {timeout}"))
+    live_stat = {key: launcher[key] for key in ("pid", "uid", "pgid", "sid", "start_ticks")} | {"state": "S"}
+    monkeypatch.setattr(formalizer, "_session_member_stat", lambda _pid: live_stat)
+    with pytest.raises(formalizer.Stage1S18ManualInterventionRequired, match="S18_PROCESS_LAUNCHER_TOKEN_MISSING_LIVE_OR_IDENTITY_DRIFT"):
+        formalizer._audit_or_confirmed_launcher_exit(never_wait, launcher, {100: launcher})
+
+    monkeypatch.setattr(formalizer, "_session_member_stat", lambda _pid: owner_exit)
+    monkeypatch.setattr(formalizer, "_session_members", lambda _sid: [100, 101])
+    with pytest.raises(formalizer.Stage1S18ManualInterventionRequired, match="S18_PROCESS_LAUNCHER_OWNER_EXIT_SESSION_MEMBERS"):
+        formalizer._audit_or_confirmed_launcher_exit(never_wait, launcher, {100: launcher})
+    monkeypatch.setattr(formalizer, "_session_members", lambda _sid: [100])
+    with pytest.raises(formalizer.Stage1S18ManualInterventionRequired, match="S18_PROCESS_LAUNCHER_EXIT_UNATTESTED"):
+        formalizer._audit_or_confirmed_launcher_exit(never_wait, launcher, {})
+
+    drifted_owner_exit = {**owner_exit, "start_ticks": "11"}
+    monkeypatch.setattr(formalizer, "_session_member_stat", lambda _pid: drifted_owner_exit)
+    with pytest.raises(formalizer.Stage1S18ManualInterventionRequired, match="S18_PROCESS_LAUNCHER_TOKEN_MISSING_LIVE_OR_IDENTITY_DRIFT"):
+        formalizer._audit_or_confirmed_launcher_exit(never_wait, launcher, {100: launcher})
+
+    monkeypatch.setattr(formalizer, "_session_member_stat", lambda _pid: owner_exit)
+    monkeypatch.setattr(formalizer, "_residual_launch_tree", lambda *_args, **_kwargs: {"session_members": [100], "token_members": []})
+    with pytest.raises(formalizer.Stage1S18ManualInterventionRequired, match="S18_PROCESS_LAUNCHER_EXIT_RESIDUAL"):
+        formalizer._audit_or_confirmed_launcher_exit(
+            SimpleNamespace(wait=lambda *, timeout: 0), launcher, {100: launcher},
+        )
+
+
+def test_token_missing_owner_exit_revalidates_each_incomplete_wait(monkeypatch: pytest.MonkeyPatch) -> None:
+    formalizer = _formalizer()
+    launcher = {"pid": 100, "ppid": 1, "uid": 7, "pgid": 100, "sid": 100, "start_ticks": "10", "exe": "/usr/bin/python", "cmdline_sha256": "a" * 64, "environment_run_token": "b" * 64}
+    owner_exit = {key: launcher[key] for key in ("pid", "pgid", "sid", "start_ticks")} | {"uid": 0, "state": "R"}
+    recovered_live = {key: launcher[key] for key in ("pid", "uid", "pgid", "sid", "start_ticks")} | {"state": "S"}
+    states = [owner_exit, owner_exit, recovered_live]
+    monkeypatch.setattr(formalizer, "_token_process_ids", lambda _: [])
+    monkeypatch.setattr(formalizer, "_session_members", lambda _sid: [100])
+    monkeypatch.setattr(formalizer, "_session_member_stat", lambda _pid: states.pop(0))
+    with pytest.raises(formalizer.Stage1S18ManualInterventionRequired, match="S18_PROCESS_LAUNCHER_TOKEN_MISSING_LIVE_OR_IDENTITY_DRIFT"):
+        formalizer._audit_or_confirmed_launcher_exit(
+            SimpleNamespace(wait=lambda *, timeout: (_ for _ in ()).throw(subprocess.TimeoutExpired(cmd="torchrun", timeout=timeout))),
+            launcher,
+            {100: launcher},
+        )
+    assert states == []
+
+
 @pytest.mark.skipif(os.name != "posix" or not Path("/proc").is_dir(), reason="requires Linux /proc")
 def test_real_linux_short_launcher_exit_is_confirmed_only_after_attestation() -> None:
     """A real, reaped launcher exercises the raw ProcessLookup race closure."""
@@ -1327,6 +1393,68 @@ def test_real_linux_short_launcher_exit_is_confirmed_only_after_attestation() ->
             {int(fingerprint["pid"]): fingerprint},
         ) is None
     finally:
+        if process.poll() is None:
+            process.kill()
+        process.wait(timeout=2)
+
+
+@pytest.mark.skipif(os.name != "posix" or not Path("/proc").is_dir(), reason="requires Linux /proc")
+def test_real_linux_owner_exit_candidate_joins_teardown_longer_than_one_second(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Use a real pipe-blocked launcher to prove the owner path exceeds 1s.
+
+    The frozen UID-only owner transition is supplied as the observed procfs
+    state, while ``Popen.wait`` and the >1s teardown are real: the child cannot
+    exit until the timer releases its stdin pipe.  No mocked sleep can make the
+    terminal-join path pass.
+    """
+
+    formalizer = _formalizer()
+    token = hashlib.sha256(b"s18-owner-exit-terminal-join").hexdigest()
+    environment = dict(os.environ); environment["PARAM_IMPORTANCE_S18_RUN_TOKEN"] = token
+    process = subprocess.Popen(
+        [sys.executable, "-c", "import sys; sys.stdin.buffer.read(1)"],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        env=environment,
+        start_new_session=True,
+    )
+    timer: threading.Timer | None = None
+    try:
+        fingerprint = formalizer._fingerprint(process.pid, token)
+        pid = int(fingerprint["pid"])
+        owner_exit = {key: fingerprint[key] for key in ("pid", "pgid", "sid", "start_ticks")} | {"uid": 0, "state": "R"}
+        real_token_process_ids = formalizer._token_process_ids
+        real_session_members = formalizer._session_members
+        monkeypatch.setattr(formalizer, "_token_process_ids", lambda _: [])
+        monkeypatch.setattr(formalizer, "_session_members", lambda _sid: [pid])
+        monkeypatch.setattr(formalizer, "_session_member_stat", lambda _pid: owner_exit)
+        real_wait = process.wait
+        def wait_then_restore_real_procfs(*, timeout: float | None = None) -> int:
+            returncode = real_wait(timeout=timeout)
+            monkeypatch.setattr(formalizer, "_token_process_ids", real_token_process_ids)
+            monkeypatch.setattr(formalizer, "_session_members", real_session_members)
+            return returncode
+        monkeypatch.setattr(process, "wait", wait_then_restore_real_procfs)
+        assert process.stdin is not None
+        def release_pipe() -> None:
+            try:
+                process.stdin.write(b"x"); process.stdin.flush(); process.stdin.close()
+            except (BrokenPipeError, ValueError):
+                pass
+        timer = threading.Timer(formalizer.LAUNCHER_EXIT_CONFIRMATION_TIMEOUT_SECONDS + 0.25, release_pipe)
+        started = time.monotonic(); timer.start()
+        assert formalizer._audit_or_confirmed_launcher_exit(
+            process,
+            fingerprint,
+            {pid: fingerprint},
+        ) is None
+        assert time.monotonic() - started > formalizer.LAUNCHER_EXIT_CONFIRMATION_TIMEOUT_SECONDS
+    finally:
+        if timer is not None:
+            timer.cancel()
+        if process.stdin is not None and not process.stdin.closed:
+            process.stdin.close()
         if process.poll() is None:
             process.kill()
         process.wait(timeout=2)

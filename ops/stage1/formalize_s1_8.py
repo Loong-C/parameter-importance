@@ -117,6 +117,10 @@ _USED_LOOPBACK_RENDEZVOUS_PORTS: set[int] = set()
 # exit.  One bounded wait distinguishes that benign reaping race from a live
 # process whose token/identity can no longer be audited.
 LAUNCHER_EXIT_CONFIRMATION_TIMEOUT_SECONDS = 1.0
+# This is the already-established post-poll terminal join bound.  It is not a
+# broader token-loss grace: only a separately re-attested Linux owner-exit
+# candidate may use it, revalidating at the one-second confirmation cadence.
+TERMINAL_PROCESS_JOIN_TIMEOUT_SECONDS = 30.0
 # Elastic workers can become zombies while their recently-used session remains
 # enumerable.  Recheck that narrow /proc transition exactly once before
 # treating a session member as foreign process ownership.
@@ -158,6 +162,10 @@ class _SessionMemberStatUnavailable(RuntimeError):
 
 class _LauncherNaturalExitCandidate(RuntimeError):
     """Only the recorded launcher may be awaiting Popen exit confirmation."""
+
+
+class _LauncherOwnerExitCandidate(_LauncherNaturalExitCandidate):
+    """An exact, attested Linux procfs owner-exit transition needs terminal join."""
 
 
 def _now() -> str:
@@ -1420,6 +1428,64 @@ def _provisional_session_member(
     return candidate
 
 
+def _require_exact_attested_launcher(
+    fingerprint: Mapping[str, Any], known_members: Mapping[int, Mapping[str, Any]],
+) -> Mapping[str, Any]:
+    """Require the originally recorded launcher identity, including its token."""
+
+    expected_pid = fingerprint.get("pid")
+    attested = known_members.get(expected_pid) if isinstance(expected_pid, int) else None
+    if not isinstance(expected_pid, int) or not isinstance(attested, Mapping) or dict(attested) != dict(fingerprint):
+        raise Stage1S18ManualInterventionRequired("S18_PROCESS_LAUNCHER_EXIT_UNATTESTED")
+    return attested
+
+
+def _token_missing_launcher_owner_exit_candidate(
+    expected: Mapping[str, Any], *, known_members: Mapping[int, Mapping[str, Any]], token_ids: Sequence[int],
+) -> _LauncherOwnerExitCandidate | None:
+    """Classify only the frozen-host's exact owner-exit state after token loss.
+
+    A missing launcher token ordinarily means that live ownership can no
+    longer be proven.  The lone exception is the frozen Linux observation
+    where an already-attested launcher keeps its PID/PGID/SID/start ticks but
+    procfs changes only its stat inode UID to zero while it is exiting.  No
+    other token or same-session process may coexist with that exception.
+    """
+
+    expected_pid, expected_sid = expected.get("pid"), expected.get("sid")
+    if not isinstance(expected_pid, int) or not isinstance(expected_sid, int):
+        raise Stage1S18ManualInterventionRequired("S18_PROCESS_AUDIT_EXPECTED_INVALID")
+    if token_ids:
+        raise Stage1S18ManualInterventionRequired("S18_PROCESS_LAUNCHER_OWNER_EXIT_TOKEN_MEMBERS_PRESENT")
+    attested = _require_exact_attested_launcher(expected, known_members)
+    try:
+        session_members = _session_members(expected_sid)
+    except OSError:
+        # The expected PID may have been reaped between the token and session
+        # scans; retain the existing one-second Popen confirmation path.
+        return None
+    if expected_pid not in session_members:
+        return None
+    if session_members != [expected_pid]:
+        raise Stage1S18ManualInterventionRequired("S18_PROCESS_LAUNCHER_OWNER_EXIT_SESSION_MEMBERS")
+    try:
+        member_stat = _session_member_stat(expected_pid)
+    except _SessionMemberStatUnavailable:
+        raise Stage1S18ManualInterventionRequired("S18_PROCESS_LAUNCHER_OWNER_EXIT_STATE_UNVERIFIABLE") from None
+    if not _is_known_procfs_owner_exit_transition(
+        expected=expected,
+        earlier=attested,
+        member_stat=member_stat,
+    ):
+        raise Stage1S18ManualInterventionRequired(
+            "S18_PROCESS_LAUNCHER_TOKEN_MISSING_LIVE_OR_IDENTITY_DRIFT"
+        )
+    return _LauncherOwnerExitCandidate(
+        "S18_PROCESS_LAUNCHER_PROCFS_OWNER_EXIT_TOKEN_MISSING:"
+        f"pid={expected_pid}:state={member_stat['state']}:fields=uid"
+    )
+
+
 def _audit_exact_process_group(
     expected: Mapping[str, Any], *, known_members: Mapping[int, Mapping[str, Any]] | None = None,
     _session_membership_rechecked: bool = False,
@@ -1451,6 +1517,13 @@ def _audit_exact_process_group(
         raise Stage1S18ManualInterventionRequired("S18_PROCESS_SESSION_PROVISIONAL_INVALID")
     token_ids = _token_process_ids(token)
     if expected_pid not in token_ids:
+        owner_exit_candidate = _token_missing_launcher_owner_exit_candidate(
+            expected,
+            known_members=previous,
+            token_ids=token_ids,
+        )
+        if owner_exit_candidate is not None:
+            raise owner_exit_candidate
         raise ProcessLookupError(expected_pid)
     if _session_membership_rechecked and not set(provisional).issubset(token_ids):
         raise Stage1S18ManualInterventionRequired("S18_PROCESS_SESSION_PROVISIONAL_TOKEN_MISSING")
@@ -1828,10 +1901,7 @@ def _confirm_attested_launcher_exit(
     session member survived the launcher.
     """
 
-    expected_pid = fingerprint.get("pid")
-    attested = known_members.get(expected_pid) if isinstance(expected_pid, int) else None
-    if not isinstance(expected_pid, int) or not isinstance(attested, Mapping) or dict(attested) != dict(fingerprint):
-        raise Stage1S18ManualInterventionRequired("S18_PROCESS_LAUNCHER_EXIT_UNATTESTED")
+    _require_exact_attested_launcher(fingerprint, known_members)
     try:
         returncode = process.wait(timeout=LAUNCHER_EXIT_CONFIRMATION_TIMEOUT_SECONDS)
     except subprocess.TimeoutExpired as error:
@@ -1851,11 +1921,72 @@ def _confirm_attested_launcher_exit(
         raise Stage1S18ManualInterventionRequired("S18_PROCESS_LAUNCHER_EXIT_RESIDUAL")
 
 
+def _confirm_attested_launcher_owner_exit(
+    process: subprocess.Popen[str],
+    fingerprint: Mapping[str, Any],
+    known_members: Mapping[int, Mapping[str, Any]],
+    *,
+    reason: str,
+) -> None:
+    """Join only a revalidated frozen-host owner-exit transition.
+
+    This reuses the normal post-poll terminal join bound, but never turns it
+    into a general token-loss timeout.  Each one-second incomplete wait must
+    still show the same exact UID-only R/Z procfs transition; normal live
+    token-loss, a sibling, or every identity drift remains Manual.
+    """
+
+    _require_exact_attested_launcher(fingerprint, known_members)
+    run_token = fingerprint.get("environment_run_token")
+    if not isinstance(run_token, str):
+        raise Stage1S18ManualInterventionRequired("S18_PROCESS_AUDIT_EXPECTED_INVALID")
+    deadline = time.monotonic() + TERMINAL_PROCESS_JOIN_TIMEOUT_SECONDS
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise Stage1S18ManualInterventionRequired(
+                "S18_PROCESS_LAUNCHER_OWNER_EXIT_UNCONFIRMED:" + reason
+            )
+        try:
+            returncode = process.wait(timeout=min(LAUNCHER_EXIT_CONFIRMATION_TIMEOUT_SECONDS, remaining))
+        except subprocess.TimeoutExpired:
+            candidate = _token_missing_launcher_owner_exit_candidate(
+                fingerprint,
+                known_members=known_members,
+                token_ids=_token_process_ids(run_token),
+            )
+            if candidate is None:
+                raise Stage1S18ManualInterventionRequired(
+                    "S18_PROCESS_LAUNCHER_OWNER_EXIT_REVALIDATION_DISAPPEARED:" + reason
+                )
+            continue
+        except OSError as error:
+            raise Stage1S18ManualInterventionRequired(
+                "S18_PROCESS_LAUNCHER_OWNER_EXIT_WAIT_FAILED:" + reason
+            ) from error
+        if not isinstance(returncode, int):
+            raise Stage1S18ManualInterventionRequired(
+                "S18_PROCESS_LAUNCHER_OWNER_EXIT_UNCONFIRMED:" + reason
+            )
+        residual = _residual_launch_tree(fingerprint, known_members=known_members)
+        if residual["session_members"] or residual["token_members"]:
+            raise Stage1S18ManualInterventionRequired("S18_PROCESS_LAUNCHER_EXIT_RESIDUAL")
+        return
+
+
 def _audit_or_confirmed_launcher_exit(process: subprocess.Popen[str], fingerprint: Mapping[str, Any], known_members: Mapping[int, Mapping[str, Any]]) -> dict[str, Any] | None:
     """Audit a live launcher, tolerating only a confirmed natural-exit race."""
 
     try:
         return _audit_exact_process_group(fingerprint, known_members=known_members)
+    except _LauncherOwnerExitCandidate as audit_error:
+        _confirm_attested_launcher_owner_exit(
+            process,
+            fingerprint,
+            known_members,
+            reason=str(audit_error),
+        )
+        return None
     except _LauncherNaturalExitCandidate as audit_error:
         _confirm_attested_launcher_exit(
             process,
@@ -1941,7 +2072,7 @@ def _launch(
             # records elastic workers before a short negative control exits;
             # heartbeat traffic remains bounded at one update per two seconds.
             time.sleep(0.2)
-        process.wait(timeout=30)
+        process.wait(timeout=TERMINAL_PROCESS_JOIN_TIMEOUT_SECONDS)
     residual = _residual_launch_tree(fingerprint, known_members=known_members)
     if residual["session_members"] or residual["token_members"]:
         _manual_intervention(work, label, fingerprint, reason=f"S18_{label.upper()}_PROCESS_TREE_RESIDUAL", observed=residual)
