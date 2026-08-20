@@ -46,6 +46,16 @@ EXPECTED_S1_7_PRODUCER = "dcc92506947c3ea30bed75542e006a26d5a2af1b"
 EXPECTED_S1_7_INDEX_SHA256 = "4ca26c82d3e6246e0b99c7fc7a35882f712fc1142fa8f3fe9f5191bce64c2a7f"
 EXPECTED_S1_7_INDEX_ARTIFACT_HASH = "21b14bdec009bee827dea5d604b363c6ce46ce55c06334d0409a2dc4400292cb"
 EXPECTED_S1_7_GATE_HASH = "0c8d91dc010533a5c99229fe0c8577e10278f41d0f3fd754d885749c511e7f37"
+# r11's five immutable primary roles predate a uniform self-hash envelope.
+# This map is deliberately exhaustive: no role may select an arbitrary hash
+# field, and index/file SHA-256 binding remains a separate mandatory check.
+_S1_7_ROLE_SELF_HASH_FIELDS = {
+    "fixture_manifest": "fixture_hash",
+    "single_gpu_report": "artifact_hash",
+    "gradient_bundle": "artifact_hash",
+    "comparison_table": "table_hash",
+    "gate_record": "artifact_hash",
+}
 
 
 class Stage1PrecisionError(RuntimeError):
@@ -1375,7 +1385,7 @@ def validate_s1_7_handoff(data_root: str | Path, index_ref: str) -> dict[str, An
     if supplied != canonical_json_hash(body) or index.get("schema_version") != "stage1-s1-7-formalization-index-v1" or index.get("status") != "PASS" or index.get("gate_id") != "G1-SINGLE" or index.get("task_id") != "stage1.07_single_gpu_pythia14m" or index.get("generator_git_commit") != EXPECTED_S1_7_PRODUCER or index.get("consumer_git_commit") != EXPECTED_S1_7_PRODUCER or index.get("artifact_hash") != EXPECTED_S1_7_INDEX_ARTIFACT_HASH or index.get("gate_artifact_hash") != EXPECTED_S1_7_GATE_HASH or set(index.get("next_task_ids", [])) != expected_next:
         raise Stage1PrecisionError("S1_9_S1_7_INDEX_SEMANTIC_BINDING_INVALID")
     refs, hashes = index.get("role_refs"), index.get("role_sha256")
-    required = {"fixture_manifest", "single_gpu_report", "gradient_bundle", "comparison_table", "gate_record"}
+    required = set(_S1_7_ROLE_SELF_HASH_FIELDS)
     if not isinstance(refs, Mapping) or not isinstance(hashes, Mapping) or set(refs) != required or set(hashes) != required:
         raise Stage1PrecisionError("S1_9_S1_7_ROLE_SET_INVALID")
     roles: dict[str, Mapping[str, Any]] = {}
@@ -1388,7 +1398,8 @@ def validate_s1_7_handoff(data_root: str | Path, index_ref: str) -> dict[str, An
         role_value = load_canonical_json(path)
         if not isinstance(role_value, Mapping):
             raise Stage1PrecisionError(f"S1_9_S1_7_ROLE_NOT_OBJECT:{role}")
-        role_body = dict(role_value); role_hash = role_body.pop("artifact_hash", None)
+        hash_field = _S1_7_ROLE_SELF_HASH_FIELDS[role]
+        role_body = dict(role_value); role_hash = role_body.pop(hash_field, None)
         if not isinstance(role_hash, str) or role_hash != canonical_json_hash(role_body):
             raise Stage1PrecisionError(f"S1_9_S1_7_ROLE_SELF_HASH_INVALID:{role}")
         roles[role] = role_value
