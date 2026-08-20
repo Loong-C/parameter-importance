@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib.util
 import hashlib
 import json
+import subprocess
 from copy import deepcopy
 from pathlib import Path
 
@@ -477,12 +478,13 @@ def test_s19_formal_schema_validator_accepts_real_roles_and_rejects_nested_drift
             formal._validate_s1_9_schemas(ROOT, {"trace_bundle": nested})
 
 
-def test_s19_schemas_prohibit_untyped_deep_object_maps() -> None:
-    """S1.9 role schemas cannot hide semantic fields behind permissive maps."""
+def test_s19_new_compatibility_schemas_are_recursively_closed() -> None:
+    """Every new S1.9 compatibility schema is closed through nested arrays."""
 
     def walk(value: object) -> list[dict[str, object]]:
         if isinstance(value, dict):
-            found = [value]
+            schema_keys = {"type", "$ref", "const", "enum", "allOf", "anyOf", "properties", "items", "prefixItems", "additionalProperties", "required"}
+            found = [value] if set(value) & schema_keys else []
             for child in value.values():
                 found.extend(walk(child))
             return found
@@ -490,23 +492,21 @@ def test_s19_schemas_prohibit_untyped_deep_object_maps() -> None:
             return [item for child in value for item in walk(child)]
         return []
 
-    for path in sorted((ROOT / "schemas" / "stage1").glob("s1-9-*.json")):
+    names = ("s1-9-upstream-compatibility-v4.json", "s1-9-gpu-quiescence-v3.json", "s1-9-gpu-prelease-v3.json", "s1-9-formalization-index-v5.json")
+    for name in names:
+        path = ROOT / "schemas" / "stage1" / name
         for schema in walk(json.loads(path.read_text(encoding="utf-8"))):
+            assert schema != {}, path.name
             if "$ref" in schema:
                 continue
             kind = schema.get("type")
             is_object = kind == "object" or isinstance(kind, list) and "object" in kind
             if is_object:
                 additional = schema.get("additionalProperties")
-                # Dynamic maps are allowed only when both key and value are
-                # typed.  This is needed for the immutable checkpoint bundle
-                # file-hash inventory, whose tensor filenames are content
-                # addressed rather than a hidden free-form object.
-                if isinstance(additional, dict):
-                    assert isinstance(schema.get("propertyNames"), dict), path.name
-                    assert "$ref" in additional or additional.get("type") is not None, path.name
-                else:
-                    assert additional is False, path.name
+                assert additional is False, path.name
+            is_array = kind == "array" or isinstance(kind, list) and "array" in kind
+            if is_array:
+                assert isinstance(schema.get("items"), dict) or isinstance(schema.get("prefixItems"), list), path.name
 
 
 def test_s19_runtime_validator_rejects_jointly_rehashed_nested_schema_drift() -> None:
@@ -538,13 +538,14 @@ def test_s19_gate_replay_and_validation_schema_sets_are_exact() -> None:
     visible = ",".join(GPU_UUIDS)
     validation = {"schema_version": "stage1-s1-9-validation-v1", "status": "PASS", "gate_id": "G1-NUMERIC", "task_id": precision.TASK_ID, "execution_scope": "formal_server_gpu_single_and_ddp_skip", "fixture_id": precision_oracle.FIXTURE_ID, "producer_commit": commit, "consumer_commit": commit, "upstream": {"s1_7": s17, "s1_8": s18}, "regression": {"bf16": {"algorithms_enabled": True, "cudnn_deterministic": True, "cudnn_benchmark": False, "allowed_nondeterministic_kernel_classes": [], "kernel_policy": "empty_pre_registered_allowlist"}, "ddp_world_size": 4, "kernel_allowlist": [], "environment": {"single": _environment_summary(visible=GPU_UUIDS[0], rank=0, uuid=GPU_UUIDS[0]), "ddp_rank0": _environment_summary(visible=visible, rank=0, uuid=GPU_UUIDS[0]), "ddp_all_ranks": [_environment_summary(visible=visible, rank=rank, uuid=uuid) for rank, uuid in enumerate(GPU_UUIDS)]}}, "direct_checks": [{"check_id": check_id, "status": "PASS", "detail": "checked"} for check_id in (*precision.REQUIREMENT_KEYS, *formal_checks)], "role_sha256": {name: digest for name in ("numeric_report", "oracle_bundle", "trace_bundle", "comparison_table", "gate_record")}, "csv_sha256": {name: digest for name in ("bf16-fp32-heatmap.csv", "clip-norm-factor.csv", "skip-zero-difference.csv", "t-amp-scale.csv", "u-single-factor-identity.csv", "u-single-factor-ratio-diagnostic.csv")}, "svg_sha256": {name: digest for name in ("bf16-fp32-heatmap.svg", "clip-norm-factor.svg", "skip-zero-difference.svg", "t-amp-scale.svg", "u-single-factor-identity.svg", "u-single-factor-ratio-diagnostic.svg")}, "replay_sha256": digest, "replay_hash": digest, "artifact_hash": digest}
     formal._validate_s1_9_schemas(ROOT, {"validation": validation})
-    index_schema = json.loads((ROOT / "schemas" / "stage1" / "s1-9-formalization-index-v1.json").read_text(encoding="utf-8"))
+    index_schema = json.loads((ROOT / "schemas" / "stage1" / "s1-9-formalization-index-v5.json").read_text(encoding="utf-8"))
     reproduction = {
         name: definition["const"]
         for name, definition in index_schema["$defs"]["reproduction_refs"]["properties"].items()
     }
+    assert reproduction["prelease_gpu"] == "prelease-gpu.json"
     index = {
-        "schema_version": "stage1-s1-9-formalization-index-v1", "status": "PASS",
+        "schema_version": "stage1-s1-9-formalization-index-v5", "status": "PASS",
         "gate_id": "G1-NUMERIC", "task_id": precision.TASK_ID,
         "fixture_id": precision_oracle.FIXTURE_ID, "generator_git_commit": commit,
         "consumer_git_commit": commit, "git_branch": "main",
@@ -563,6 +564,14 @@ def test_s19_gate_replay_and_validation_schema_sets_are_exact() -> None:
     }
     index["artifact_hash"] = canonical_json_hash(index)
     formal._validate_s1_9_schemas(ROOT, {"index": index})
+    same_count_key = json.loads(json.dumps(index)); refs = same_count_key["reproduction_role_refs"]; refs["unreviewed"] = refs.pop("preflight"); same_count_key.pop("artifact_hash"); same_count_key["artifact_hash"] = canonical_json_hash(same_count_key)
+    with pytest.raises(formal.Stage1S19FormalError, match="SCHEMA_VALIDATION_FAILED:index"):
+        formal._validate_s1_9_schemas(ROOT, {"index": same_count_key})
+    missing_prelease = json.loads(json.dumps(index)); missing_prelease["reproduction_role_refs"].pop("prelease_gpu"); missing_prelease.pop("artifact_hash"); missing_prelease["artifact_hash"] = canonical_json_hash(missing_prelease)
+    extra_prelease = json.loads(json.dumps(index)); extra_prelease["reproduction_role_sha256"]["unreviewed"] = digest; extra_prelease.pop("artifact_hash"); extra_prelease["artifact_hash"] = canonical_json_hash(extra_prelease)
+    for mutated in (missing_prelease, extra_prelease):
+        with pytest.raises(formal.Stage1S19FormalError, match="SCHEMA_VALIDATION_FAILED:index"):
+            formal._validate_s1_9_schemas(ROOT, {"index": mutated})
     validation_bad_id = dict(validation); validation_bad_id["direct_checks"] = list(validation["direct_checks"]); validation_bad_id["direct_checks"][0] = {**validation_bad_id["direct_checks"][0], "check_id": "drift"}
     validation_missing = dict(validation); validation_missing["role_sha256"] = dict(validation["role_sha256"]); validation_missing["role_sha256"].pop("gate_record")
     validation_cardinality = dict(validation); validation_cardinality["direct_checks"] = list(validation["direct_checks"][:-1])
@@ -713,6 +722,8 @@ def test_s19_s18_source_map_intersection_is_empty_or_revalidated_for_the_one_sha
         "ddp_report": {"source_map": {"src/param_importance_nlp/runtime/training.py": "b" * 64}},
     }
     monkeypatch.setattr(formal, "_upstream_role", lambda _root, _ref, role: roles[role])
+    monkeypatch.setattr(formal, "_s1_8_v5_handoff_attestation", lambda *_args: {"index_schema_version": "stage1-s1-8-formalization-index-v5", "ddp_report_schema_version": "stage1-s1-8-ddp-report-v5", "validation_schema_version": "stage1-s1-8-validation-v5", "implementation_source_sha256": roles["ddp_report"]["source_map"], "reproduction_role_refs": {name: "x" for name in ()}, "reproduction_role_sha256": {}, "gpu_quiescence": {}})
+    monkeypatch.setattr(formal, "_validate_s1_9_schemas", lambda *_args: None)
     monkeypatch.setattr(formal, "_consumer_diff", lambda _repository, _producer: [path])
     monkeypatch.setattr(formal, "_git", lambda *_args: "c" * 40)
     empty = formal._upstream_compatibility_attestation(ROOT, tmp_path, s1_7_ref="s17/index.json", s1_7=s17, s1_8_ref="s18/index.json", s1_8=s18)
@@ -732,6 +743,291 @@ def test_s19_current_source_clip_compatibility_replay_covers_order_and_none() ->
     assert replay["empty"] == [0.0, 1.0]
     assert replay["none_only"] == [0.0, 1.0]
     assert replay["observed_norm"] == pytest.approx(replay["reverse_observed_norm"], abs=1e-15, rel=0.0)
+
+
+def test_s19_s110_compatibility_paths_are_exact_and_reject_extra_siblings(monkeypatch: pytest.MonkeyPatch) -> None:
+    formal = _module(ROOT / "ops" / "stage1" / "formalize_s1_9.py", "s19_s110_exact_paths")
+    approved = [
+        "ops/stage1/formalize_s1_10.py",
+        "schemas/stage1/s1-10-validation-v1.json",
+        "src/param_importance_nlp/runtime/training.py",
+        "src/param_importance_nlp/runtime/checkpoint_group.py",
+        "tests/test_stage1_s110_checkpoint_resume.py",
+    ]
+    monkeypatch.setattr(formal, "_git", lambda *_args: "\n".join(approved))
+    assert formal._consumer_diff(ROOT, "0" * 40) == approved
+    monkeypatch.setattr(formal, "_git", lambda *_args: "\n".join([*approved, "schemas/stage1/s1-10-unreviewed-v1.json"]))
+    with pytest.raises(formal.Stage1S19FormalError, match="S1_9_UPSTREAM_CONSUMER_DIFF_UNAUTHORIZED:schemas/stage1/s1-10-unreviewed-v1.json"):
+        formal._consumer_diff(ROOT, "0" * 40)
+
+
+def test_s19_consumer_paths_are_exact_and_reject_s18_or_s19_prefix_siblings(monkeypatch: pytest.MonkeyPatch) -> None:
+    formal = _module(ROOT / "ops" / "stage1" / "formalize_s1_9.py", "s19_exact_consumer_paths")
+    approved = sorted(formal._S1_9_FROZEN_CONSUMER_FILES)
+    monkeypatch.setattr(formal, "_git", lambda *_args: "\n".join(approved))
+    assert formal._consumer_diff(ROOT, "0" * 40) == approved
+    for extra in (
+        "schemas/stage1/s1-9-unreviewed-v1.json",
+        "ops/stage1/formalize_s1_8.py",
+        "fixtures/stage1/stage1-s18-unreviewed.json",
+    ):
+        monkeypatch.setattr(formal, "_git", lambda *_args, _extra=extra: "\n".join([*approved, _extra]))
+        with pytest.raises(formal.Stage1S19FormalError, match="S1_9_UPSTREAM_CONSUMER_DIFF_UNAUTHORIZED:" + extra):
+            formal._consumer_diff(ROOT, "0" * 40)
+
+
+def test_s19_clean_producer_diff_accepts_only_s110_and_s19_then_rejects_s111(tmp_path: Path) -> None:
+    """Exercise the actual git diff path, not only a mocked name list."""
+
+    formal = _module(ROOT / "ops" / "stage1" / "formalize_s1_9.py", "s19_clean_consumer_diff")
+    repository = tmp_path / "clean-consumer"; repository.mkdir()
+    def git(*args: str) -> str:
+        return subprocess.run(["git", "-C", str(repository), *args], check=True, text=True, capture_output=True).stdout.strip()
+    git("init"); git("config", "user.email", "s19-test@example.invalid"); git("config", "user.name", "S19 test")
+    git("commit", "--allow-empty", "-m", "producer")
+    producer = git("rev-parse", "HEAD")
+    reviewed = {
+        "src/param_importance_nlp/runtime/optimizer.py",
+        *formal._S1_9_FROZEN_CONSUMER_FILES,
+        *formal._S1_10_FROZEN_CONSUMER_FILES,
+        *formal._S1_10_SHARED_RUNTIME_FILES,
+    }
+    for relative in reviewed:
+        path = repository / relative; path.parent.mkdir(parents=True, exist_ok=True); path.write_text("reviewed\n", encoding="utf-8")
+    git("add", "."); git("commit", "-m", "s110-and-s19-only")
+    assert set(formal._consumer_diff(repository, producer)) == reviewed
+    drift = repository / "schemas/stage1/s1-11-formalization-index-v1.json"; drift.parent.mkdir(parents=True, exist_ok=True); drift.write_text("unreviewed\n", encoding="utf-8")
+    git("add", "."); git("commit", "-m", "s111-must-not-pass")
+    with pytest.raises(formal.Stage1S19FormalError, match="S1_9_UPSTREAM_CONSUMER_DIFF_UNAUTHORIZED:schemas/stage1/s1-11-formalization-index-v1.json"):
+        formal._consumer_diff(repository, producer)
+
+
+def test_s19_upstream_v3_freezes_s18_v4_source_and_reproduction_closure() -> None:
+    formal = _module(ROOT / "ops" / "stage1" / "formalize_s1_9.py", "s19_upstream_v4_closure")
+    digest, commit = "a" * 64, "b" * 40
+    v4 = json.loads((ROOT / "schemas" / "stage1" / "s1-8-formalization-index-v5.json").read_text(encoding="utf-8"))
+    ddp_v4 = json.loads((ROOT / "schemas" / "stage1" / "s1-8-ddp-report-v5.json").read_text(encoding="utf-8"))
+    source_map = {name: digest for name in v4["$defs"]["source_map"]["required"]}
+    reproduction = {name: item["const"] for name, item in v4["$defs"]["reproduction_role_refs"]["properties"].items()}
+    quiescence = {
+        role: {"ref": ddp_v4["$defs"][f"{role}_binding"]["properties"]["ref"]["const"], "sha256": digest}
+        for role in ("prelease", "post_worker", "post_release", "reacquire_preflight")
+    }
+    assert len(source_map) == 48
+    assert len(reproduction) == 84
+    result = {
+        "schema_version": "stage1-s1-9-upstream-compatibility-v4", "status": "PASS", "s1_7_producer": commit, "s1_8_producer": commit, "consumer_commit": commit,
+        "s1_7_to_consumer_changed_paths": ["src/param_importance_nlp/runtime/optimizer.py"], "s1_8_to_consumer_changed_paths": ["src/param_importance_nlp/runtime/checkpoint_group.py", "src/param_importance_nlp/runtime/training.py"],
+        "s1_7_source_attestation": {"source_map_mode": "r11_no_per_file_source_map_global_diff_allowlist", "report_source_git_commit": commit, "authorized_shared_dependencies": ["src/param_importance_nlp/runtime/optimizer.py"], "authorized_shared_dependency_hashes": {"src/param_importance_nlp/runtime/optimizer.py": {"producer_sha256": digest, "consumer_sha256": digest, "changed": True}}},
+        "s1_8_source_dependencies": source_map,
+        "s1_8_v5_handoff": {"index_schema_version": "stage1-s1-8-formalization-index-v5", "ddp_report_schema_version": "stage1-s1-8-ddp-report-v5", "validation_schema_version": "stage1-s1-8-validation-v5", "implementation_source_sha256": source_map, "reproduction_role_refs": reproduction, "reproduction_role_sha256": {name: digest for name in reproduction}, "gpu_quiescence": quiescence},
+        "s1_7_affected_dependencies": ["src/param_importance_nlp/runtime/optimizer.py"], "s1_8_affected_dependencies": [], "s1_8_authorized_shared_drift": {}, "authorized_shared_change": "src/param_importance_nlp/runtime/optimizer.py",
+        "current_source_cpu_clip_replay": formal._optimizer_clip_cpu_replay(),
+        "nonproducer_runtime_attestation": {"affected_paths": ["src/param_importance_nlp/runtime/checkpoint_group.py", "src/param_importance_nlp/runtime/training.py"], "s1_8_source_map_excludes_paths": ["src/param_importance_nlp/runtime/checkpoint_group.py", "src/param_importance_nlp/runtime/training.py"], "s1_7_oracle_training_import_isolated": True, "checkpoint_group_producer_math_exclusion": True, "current_source_cpu_replays": {"src/param_importance_nlp/runtime/training.py": {"profile": "s1_9_current_source_training_checkpoint_resume_cpu", "checkpoint_id": "synthetic", "checkpoint_schema_version": "training-checkpoint-state-v2", "omission_rejected_before_mutation": True, "fresh_engine_next_step_exact": True, "fresh_engine_final_state_exact": True, "passed": True}}},
+    }
+    result["artifact_hash"] = canonical_json_hash(result)
+    formal._validate_s1_9_schemas(ROOT, {"upstream_compatibility": result})
+    for mutate in (
+        lambda item: item["s1_8_source_dependencies"].__setitem__("unreviewed.py", item["s1_8_source_dependencies"].pop(next(iter(item["s1_8_source_dependencies"]))),),
+        lambda item: item["s1_8_v5_handoff"]["reproduction_role_refs"].__setitem__("unreviewed", item["s1_8_v5_handoff"]["reproduction_role_refs"].pop("prelease_gpu_quiescence")),
+    ):
+        altered = json.loads(json.dumps(result)); mutate(altered); altered.pop("artifact_hash"); altered["artifact_hash"] = canonical_json_hash(altered)
+        with pytest.raises(formal.Stage1S19FormalError, match="SCHEMA_VALIDATION_FAILED:upstream_compatibility"):
+            formal._validate_s1_9_schemas(ROOT, {"upstream_compatibility": altered})
+    old_wire = json.loads(json.dumps(result)); old_wire["schema_version"] = "stage1-s1-9-upstream-compatibility-v3"; old_wire["s1_8_v5_handoff"]["index_schema_version"] = "stage1-s1-8-formalization-index-v4"; old_wire.pop("artifact_hash"); old_wire["artifact_hash"] = canonical_json_hash(old_wire)
+    with pytest.raises(formal.Stage1S19FormalError, match="SCHEMA_VALIDATION_FAILED:upstream_compatibility"):
+        formal._validate_s1_9_schemas(ROOT, {"upstream_compatibility": old_wire})
+
+
+def test_s19_s18_v3_handoff_is_rejected_before_consumption(tmp_path: Path) -> None:
+    formal = _module(ROOT / "ops" / "stage1" / "formalize_s1_9.py", "s19_reject_s18_v3")
+    index = tmp_path / "s18" / "index.json"; index.parent.mkdir()
+    write_canonical_json(index, {"schema_version": "stage1-s1-8-formalization-index-v3"})
+    with pytest.raises(formal.Stage1S19FormalError, match="S1_9_S1_8_V5_INDEX_REQUIRED"):
+        formal._s1_8_v5_handoff_attestation(tmp_path, "s18/index.json", {})
+
+
+def test_s19_shared_runtime_drift_fails_closed_without_current_source_replay(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    formal = _module(ROOT / "ops" / "stage1" / "formalize_s1_9.py", "s19_runtime_drift_replay")
+    monkeypatch.setattr(formal, "_git", lambda *_args: 'import builtins\ndef _oracle_replay(arrays):\n    blocked = ("param_importance_nlp.core.estimators", "param_importance_nlp.runtime.training", "param_importance_nlp.stage1_single_gpu")\n    original = builtins.__import__\n    def guarded(name):\n        if name.startswith(blocked):\n            raise ImportError("isolated")\n        return original(name)\n    try:\n        builtins.__import__ = guarded\n    finally:\n        builtins.__import__ = original\n')
+    monkeypatch.setattr(formal, "_s1_9_checkpoint_resume_cpu_replay", lambda _path: {"passed": False})
+    with pytest.raises(formal.Stage1S19FormalError, match="S1_9_SHARED_RUNTIME_DRIFT_REPLAY_FAILED"):
+        formal._nonproducer_runtime_attestation(
+            ROOT,
+            s1_7_producer="0" * 40,
+            s1_7_report={"status": "PASS"},
+            s1_8_sources={},
+            changed_paths=["src/param_importance_nlp/runtime/training.py"],
+            replay_root=tmp_path / "replay",
+        )
+
+
+def test_s19_s17_oracle_isolation_requires_ast_guard_not_comment_or_name(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    formal = _module(ROOT / "ops" / "stage1" / "formalize_s1_9.py", "s19_oracle_ast_isolation")
+    monkeypatch.setattr(
+        formal,
+        "_git",
+        lambda *_args: '# param_importance_nlp.runtime.training is supposedly isolated\n'
+        'def _oracle_replay(arrays):\n'
+        '    note = "param_importance_nlp.runtime.training"\n'
+        '    return arrays\n',
+    )
+    with pytest.raises(formal.Stage1S19FormalError, match="S1_9_S1_7_ORACLE_RUNTIME_ISOLATION_UNPROVEN"):
+        formal._nonproducer_runtime_attestation(
+            ROOT,
+            s1_7_producer="0" * 40,
+            s1_7_report={"status": "PASS"},
+            s1_8_sources={},
+            changed_paths=["src/param_importance_nlp/runtime/training.py"],
+            replay_root=tmp_path / "replay",
+        )
+
+
+def test_s19_current_source_training_checkpoint_resume_compatibility_replay(tmp_path: Path) -> None:
+    formal = _module(ROOT / "ops" / "stage1" / "formalize_s1_9.py", "s19_runtime_resume_replay")
+    replay = formal._s1_9_checkpoint_resume_cpu_replay(tmp_path / "replay")
+    assert replay["passed"] is True
+    assert replay["omission_rejected_before_mutation"] is True
+    assert replay["fresh_engine_next_step_exact"] is True
+
+
+def test_s19_gpu_probe_combines_inventory_recovery_and_ignores_unselected_processes(
+    monkeypatch: pytest.MonkeyPatch
+) -> None:
+    formal = _module(ROOT / "ops" / "stage1" / "formalize_s1_9.py", "s19_gpu_recovery")
+    inventory = "\n".join(f"{index}, {uuid}, NVIDIA A100, 81920, 0, 0, 40, 8.0, None" for index, uuid in enumerate(GPU_UUIDS))
+    unselected = "GPU-ffffffff-1111-2222-3333-444444444444, 999, unrelated"
+    calls: list[list[str]] = []
+    def runner(command, **_kwargs):
+        calls.append(command)
+        text = inventory if "--query-gpu=" in command[1] else unselected
+        return subprocess.CompletedProcess(command, 0, stdout=text)
+    monkeypatch.setattr(formal, "_run", runner)
+    observed = formal._gpu_probe_once(GPU_UUIDS)
+    assert len(calls) == 2
+    assert "gpu_recovery_action" in calls[0][1]
+    assert [row["recovery_action"] for row in observed["selected"]] == ["None"] * 4
+    assert observed["compute_apps"] == [{"gpu_uuid": "GPU-ffffffff-1111-2222-3333-444444444444", "pid": 999, "process_name": "unrelated"}]
+    violations, hard = formal._gpu_violations(observed, minimum_compute_capability=8.0, max_temperature_c=85)
+    assert not violations and not hard
+    reset = inventory.replace(f"{GPU_UUIDS[1]}, NVIDIA A100, 81920, 0, 0, 40, 8.0, None", f"{GPU_UUIDS[1]}, NVIDIA A100, 81920, 0, 0, 40, 8.0, Reset")
+    monkeypatch.setattr(formal, "_run", lambda command, **_kwargs: subprocess.CompletedProcess(command, 0, stdout=reset if "--query-gpu=" in command[1] else ""))
+    failed = formal._gpu_probe_once(GPU_UUIDS)
+    _, hard = formal._gpu_violations(failed, minimum_compute_capability=8.0, max_temperature_c=85)
+    assert hard[0].startswith("S1_9_GPU_RECOVERY_ACTION_NOT_NONE")
+    assert [row["uuid"] for row in failed["selected"]] == list(GPU_UUIDS)
+
+
+def test_s19_execute_persists_strict_prelease_gpu_failure_before_any_lease(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    formal = _module(ROOT / "ops" / "stage1" / "formalize_s1_9.py", "s19_execute_prelease_failure")
+    import param_importance_nlp.runtime.operations as operations
+
+    digest, commit = "a" * 64, "b" * 40
+    selected = [{"physical_index": index, "uuid": uuid, "name": "NVIDIA A100", "memory_total_mib": 81920, "memory_used_mib": 0, "utilization_percent": 0, "temperature_c": 40, "compute_capability": "8.0", "recovery_action": "None"} for index, uuid in enumerate(GPU_UUIDS)]
+    def quiescence(*, reason: str, probe_error: bool = False) -> dict[str, object]:
+        sample = {"sample_index": 0, "observed_at": "2026-08-20T00:00:00+00:00", "monotonic_elapsed_seconds": 0.1, "requested_uuid_order": list(GPU_UUIDS), "probe_error": reason, "exact_selected_idle": False, "consecutive_exact_idle_samples": 0, "transient_observation_count": 0} if probe_error else {"sample_index": 0, "observed_at": "2026-08-20T00:00:00+00:00", "monotonic_elapsed_seconds": 0.1, "requested_uuid_order": list(GPU_UUIDS), "selected": selected, "compute_apps": [{"gpu_uuid": GPU_UUIDS[0], "pid": 73, "process_name": "python"}], "violations": [reason], "exact_selected_idle": False, "consecutive_exact_idle_samples": 0, "transient_observation_count": 0}
+        return formal._with_hash({"schema_version": "stage1-s1-9-gpu-quiescence-v3", "status": "FAILED", "phase": "prelease", "approved_gpu_uuids": list(GPU_UUIDS), "started_at": "2026-08-20T00:00:00+00:00", "minimum_compute_capability": 8.0, "max_temperature_c": 85, "timeout_seconds": 180.0, "sample_interval_seconds": 1.0, "required_consecutive_exact_idle_samples": 3, "max_transient_samples": 2, "transient_observation_count": 0, "operational_timeout_basis": dict(formal._GPU_OPERATIONAL_TIMEOUT_BASIS), "samples": [sample], "final_gpu": None if probe_error else {"selected": selected, "requested_uuid_order": list(GPU_UUIDS), "compute_apps": sample["compute_apps"]}, "failure_reason": reason})
+    calls = {"lease_constructor": 0}
+
+    class ForbiddenLease:
+        def __init__(self, *_args, **_kwargs) -> None:
+            calls["lease_constructor"] += 1
+            raise AssertionError("prelease failure must precede lease construction")
+
+    monkeypatch.setattr(precision, "load_stage1_s19_fixture", lambda _repo: {"fixture_hash": digest})
+    monkeypatch.setattr(precision, "validate_s1_7_handoff", lambda *_args: {"s1_7_generator_commit": commit})
+    monkeypatch.setattr(precision, "validate_s1_8_handoff", lambda *_args, **_kwargs: {"s1_8_generator_commit": commit})
+    monkeypatch.setattr(formal, "_upstream_compatibility_attestation", lambda *_args, **_kwargs: {"artifact_hash": digest})
+    monkeypatch.setattr(formal, "_capability", lambda *_args, **_kwargs: {"artifact_hash": digest})
+    monkeypatch.setattr(formal, "_git", lambda _repo, *args: commit if args == ("rev-parse", "HEAD") else "")
+    monkeypatch.setattr(operations, "ProjectGpuLease", ForbiddenLease)
+
+    def run_failure(attempt_id: str, record: object) -> Path:
+        monkeypatch.setattr(formal, "_gpu_quiescence", lambda *_args, **_kwargs: record)
+        with pytest.raises(formal.Stage1S19FormalError, match="S1_9_GPU_PRELEASE_FAILED"):
+            formal.execute(repository=ROOT, data_root=tmp_path, s1_7_index_ref="s1-7/index.json", s1_8_index_ref="s1-8/index.json", s1_8_binding={"index_sha256": digest, "index_artifact_hash": digest, "gate_artifact_hash": digest, "producer_commit": commit, "schema_version": "stage1-s1-8-formalization-index-v5", "task_id": "stage1.08_ddp_and_gradient_accumulation", "gate_id": "G1-DDP"}, gpu_capability_ref="capability.json", capability_binding={"task_id": "x", "artifact_kind": "x", "artifact_hash": digest, "config_hash": digest}, approved_gpu_uuids=GPU_UUIDS, attempt_id=attempt_id, lease_owner="test")
+        return tmp_path / "tmp" / "stage1-s1-9" / commit / attempt_id / "prelease-gpu.json"
+
+    hard_path = run_failure("prelease-hard", quiescence(reason="S1_9_GPU_COMPUTE_PROCESS_PRESENT:" + GPU_UUIDS[0] + ":73"))
+    hard_evidence = json.loads(hard_path.read_text(encoding="utf-8"))
+    assert hard_evidence["status"] == "FAILED"
+    assert hard_evidence["quiescence"]["samples"][0]["selected"] == selected
+    assert hard_evidence["quiescence"]["samples"][0]["compute_apps"][0]["pid"] == 73
+    formal._validate_s1_9_schemas(ROOT, {"gpu_prelease": hard_evidence})
+    timeout_path = run_failure("prelease-timeout", quiescence(reason="S1_9_GPU_PROBE_EXCEPTION:TimeoutExpired", probe_error=True))
+    timeout_evidence = json.loads(timeout_path.read_text(encoding="utf-8"))
+    assert timeout_evidence["quiescence"]["samples"][0]["probe_error"] == "S1_9_GPU_PROBE_EXCEPTION:TimeoutExpired"
+    formal._validate_s1_9_schemas(ROOT, {"gpu_prelease": timeout_evidence})
+    assert calls["lease_constructor"] == 0
+
+
+def test_s19_gpu_quiescence_requires_three_exact_idle_samples_and_records_hard_failure(
+    monkeypatch: pytest.MonkeyPatch
+) -> None:
+    formal = _module(ROOT / "ops" / "stage1" / "formalize_s1_9.py", "s19_gpu_quiescence")
+    def probe(*, busy: bool = False, selected_pid: bool = False) -> dict[str, object]:
+        return {"selected": [{"physical_index": index, "uuid": uuid, "name": "NVIDIA A100", "memory_total_mib": 81920, "memory_used_mib": 1 if busy and index == 0 else 0, "utilization_percent": 0, "temperature_c": 40, "compute_capability": "8.0", "recovery_action": "None"} for index, uuid in enumerate(GPU_UUIDS)], "requested_uuid_order": list(GPU_UUIDS), "compute_apps": [{"gpu_uuid": GPU_UUIDS[0], "pid": 17, "process_name": "python"}] if selected_pid else []}
+
+    busy, idle = probe(busy=True), probe()
+    observations = iter((busy, idle, idle, idle))
+    monkeypatch.setattr(formal, "_gpu_probe_once", lambda *_args, **_kwargs: next(observations))
+    monkeypatch.setattr(formal.time, "sleep", lambda _seconds: None)
+    quiescence = formal._gpu_quiescence(GPU_UUIDS, phase="post_worker", minimum_compute_capability=8.0, max_temperature_c=85)
+    assert quiescence["status"] == "PASS"
+    assert quiescence["timeout_seconds"] == 180.0
+    assert quiescence["samples"][-1]["consecutive_exact_idle_samples"] == 3
+    formal._validate_s1_9_schemas(ROOT, {"gpu_quiescence": quiescence})
+    late_observations = iter((idle, idle, idle))
+    clock = iter((0.0, 0.1, 1.1, 180.0))
+    real_monotonic = formal.time.monotonic
+    monkeypatch.setattr(formal, "_gpu_probe_once", lambda *_args, **_kwargs: next(late_observations))
+    monkeypatch.setattr(formal.time, "monotonic", lambda: next(clock))
+    late = formal._gpu_quiescence(GPU_UUIDS, phase="post_worker", minimum_compute_capability=8.0, max_temperature_c=85)
+    assert late["status"] == "FAILED"
+    assert late["failure_reason"] == "S1_9_GPU_QUIESCENCE_TIMEOUT"
+    assert len(late["samples"]) == 3
+    monkeypatch.setattr(formal.time, "monotonic", real_monotonic)
+    monkeypatch.setattr(formal, "_gpu_probe_once", lambda *_args, **_kwargs: probe(selected_pid=True))
+    failed = formal._gpu_quiescence(GPU_UUIDS, phase="post_worker", minimum_compute_capability=8.0, max_temperature_c=85)
+    assert failed["status"] == "FAILED"
+    assert failed["failure_reason"].startswith("S1_9_GPU_COMPUTE_PROCESS_PRESENT")
+    assert failed["samples"][-1]["compute_apps"][0]["pid"] == 17
+    formal._validate_s1_9_schemas(ROOT, {"gpu_quiescence": failed})
+    transient_observations = iter((busy, busy, busy))
+    monkeypatch.setattr(formal, "_gpu_probe_once", lambda *_args, **_kwargs: next(transient_observations))
+    transient_limit = formal._gpu_quiescence(GPU_UUIDS, phase="post_worker", minimum_compute_capability=8.0, max_temperature_c=85)
+    assert transient_limit["status"] == "FAILED"
+    assert transient_limit["failure_reason"] == "S1_9_GPU_QUIESCENCE_TRANSIENT_LIMIT"
+    assert transient_limit["transient_observation_count"] == 3
+    assert len(transient_limit["samples"]) == 3
+    formal._validate_s1_9_schemas(ROOT, {"gpu_quiescence": transient_limit})
+    unproven_hard = json.loads(json.dumps(failed)); unproven_hard["samples"][-1]["compute_apps"] = [{"gpu_uuid": "GPU-ffffffff-1111-2222-3333-444444444444", "pid": 17, "process_name": "python"}]; unproven_hard.pop("artifact_hash"); unproven_hard["artifact_hash"] = canonical_json_hash(unproven_hard)
+    with pytest.raises(formal.Stage1S19FormalError, match="SCHEMA_VALIDATION_FAILED:gpu_quiescence"):
+        formal._validate_s1_9_schemas(ROOT, {"gpu_quiescence": unproven_hard})
+
+    for mutate in (
+        lambda item: item["samples"][0]["selected"][0].__setitem__("unexpected", True),
+        lambda item: item["samples"][0]["selected"][0].pop("recovery_action"),
+    ):
+        nested = json.loads(json.dumps(quiescence))
+        mutate(nested)
+        nested.pop("artifact_hash"); nested = formal._with_hash(nested)
+        with pytest.raises(formal.Stage1S19FormalError, match="SCHEMA_VALIDATION_FAILED:gpu_quiescence"):
+            formal._validate_s1_9_schemas(ROOT, {"gpu_quiescence": nested})
+
+    for error, reason in ((subprocess.TimeoutExpired(["nvidia-smi"], 1), "S1_9_GPU_PROBE_EXCEPTION:TimeoutExpired"), (OSError("nvidia-smi unavailable"), "S1_9_GPU_PROBE_EXCEPTION:OSError")):
+        monkeypatch.setattr(formal, "_gpu_probe_once", lambda *_args, _error=error, **_kwargs: (_ for _ in ()).throw(_error))
+        probe_error = formal._gpu_quiescence(GPU_UUIDS, phase="post_worker", minimum_compute_capability=8.0, max_temperature_c=85)
+        assert probe_error["status"] == "FAILED"
+        assert probe_error["failure_reason"] == reason
+        assert probe_error["samples"][-1]["probe_error"] == reason
+        formal._validate_s1_9_schemas(ROOT, {"gpu_quiescence": probe_error})
 
 
 def test_s19_offline_replay_rejects_jointly_rehashed_report_and_gate() -> None:
