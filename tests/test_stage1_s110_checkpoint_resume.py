@@ -814,6 +814,79 @@ def test_s110_formal_observation_requires_bound_pass_reports(tmp_path: Path) -> 
         formalizer._formal_observation(ROOT, tmp_path, "formal-observation.json", expected_commit="0" * 40)
 
 
+def test_s110_formal_observation_report_refs_are_bundle_relative_or_data_root_relative(tmp_path: Path) -> None:
+    published = tmp_path / "published"
+    published.mkdir()
+    run_token_sha256 = "f" * 64
+    for name, mode, world_size in (
+        ("single-report.json", "single", 1),
+        ("four-rank-report.json", "four-rank", 4),
+    ):
+        write_canonical_json(
+            published / name,
+            {
+                "schema_version": "synthetic-worker-v1",
+                "status": "PASS",
+                "task_id": TASK_ID,
+                "gate_id": "G1-RESUME",
+                "fixture_id": "stage1-s110-checkpoint-fixture-v1",
+                "execution_commit": "0" * 40,
+                "run_token_sha256": run_token_sha256,
+                "mode": mode,
+                "phase": "resume",
+                "world_size": world_size,
+            },
+        )
+    observation = {
+        "schema_version": "stage1-s1-10-formal-observation-v1",
+        "status": "PASS",
+        "task_id": TASK_ID,
+        "gate_id": "G1-RESUME",
+        "fixture_id": "stage1-s110-checkpoint-fixture-v1",
+        "execution_commit": "0" * 40,
+        "run_token_sha256": run_token_sha256,
+        "single_process_resume": True,
+        "four_rank_resume": True,
+        "run_owned_resources_released": True,
+        "single_cases": ["pre_skip", "post_skip"],
+        "four_rank_cases": ["pre_skip", "post_skip"],
+        "single_report_ref": "single-report.json",
+        "single_report_sha256": _file_sha256(published / "single-report.json"),
+        "four_rank_report_ref": "four-rank-report.json",
+        "four_rank_report_sha256": _file_sha256(published / "four-rank-report.json"),
+    }
+    formalizer_spec = importlib.util.spec_from_file_location(
+        "s110_formal_observation_report_ref_test", ROOT / "ops" / "stage1" / "formalize_s1_10.py"
+    )
+    assert formalizer_spec is not None and formalizer_spec.loader is not None
+    formalizer = importlib.util.module_from_spec(formalizer_spec)
+    formalizer_spec.loader.exec_module(formalizer)
+
+    observation["artifact_hash"] = canonical_json_hash(observation)
+    write_canonical_json(published / "formal-observation.json", observation)
+    assert formalizer._formal_observation(
+        ROOT, tmp_path, "published/formal-observation.json", expected_commit="0" * 40
+    )["status"] == "PASS"
+
+    observation["single_report_ref"] = "published/single-report.json"
+    observation["four_rank_report_ref"] = "published/four-rank-report.json"
+    observation["artifact_hash"] = canonical_json_hash(
+        {key: value for key, value in observation.items() if key != "artifact_hash"}
+    )
+    write_canonical_json(published / "formal-observation.json", observation)
+    assert formalizer._formal_observation(
+        ROOT, tmp_path, "published/formal-observation.json", expected_commit="0" * 40
+    )["status"] == "PASS"
+
+    observation["single_report_ref"] = "../outside.json"
+    observation["artifact_hash"] = canonical_json_hash(
+        {key: value for key, value in observation.items() if key != "artifact_hash"}
+    )
+    write_canonical_json(published / "formal-observation.json", observation)
+    with pytest.raises(formalizer.Stage1S110FormalError, match="REFERENCE_ESCAPE:single_report"):
+        formalizer._formal_observation(ROOT, tmp_path, "published/formal-observation.json", expected_commit="0" * 40)
+
+
 def test_training_resume_rejects_bad_checkpoint_before_mutating_active_engine(tmp_path: Path) -> None:
     state, metadata = _published_state(CheckpointStore(tmp_path / "source"))
     malformed = deepcopy(state)

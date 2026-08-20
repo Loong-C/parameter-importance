@@ -263,8 +263,18 @@ def _formal_observation(repository: Path, root: Path, reference: str, *, expecte
     ):
         report_ref = value.get(f"{prefix}_report_ref")
         report_sha = value.get(f"{prefix}_report_sha256")
-        report_path = _logical(root, report_ref, field=f"{prefix}_report")
-        if not report_path.is_file() or not isinstance(report_sha, str) or _sha(report_path) != report_sha:
+        report_path = _formal_observation_report_path(
+            root,
+            observation_path=path,
+            reference=report_ref,
+            field=f"{prefix}_report",
+        )
+        if (
+            not report_path.is_file()
+            or not isinstance(report_sha, str)
+            or _SHA256.fullmatch(report_sha) is None
+            or _sha(report_path) != report_sha
+        ):
             raise Stage1S110FormalError(f"S1_10_FORMAL_OBSERVATION_REPORT_HASH_INVALID:{prefix}")
         report = load_canonical_json(report_path)
         if (
@@ -281,6 +291,44 @@ def _formal_observation(repository: Path, root: Path, reference: str, *, expecte
         ):
             raise Stage1S110FormalError(f"S1_10_FORMAL_OBSERVATION_REPORT_NOT_PASS:{prefix}")
     return dict(value)
+
+
+def _formal_observation_report_path(
+    root: Path,
+    *,
+    observation_path: Path,
+    reference: object,
+    field: str,
+) -> Path:
+    """Resolve a report beside its observation or from the published data root.
+
+    Observations are published as a bundle, so a bare report reference means a
+    sibling of the observation.  A fully logical DATA_ROOT reference remains
+    valid for consumers that deliberately record that form.  Both candidates
+    must remain inside DATA_ROOT; an ambiguous reference is rejected rather
+    than silently selecting whichever duplicate happens to be found first.
+    """
+
+    if not isinstance(reference, str) or not reference or "\\" in reference:
+        raise Stage1S110FormalError(f"S1_10_REFERENCE_INVALID:{field}")
+    logical = PurePosixPath(reference)
+    if logical.is_absolute() or any(part in {"", ".", ".."} for part in logical.parts):
+        raise Stage1S110FormalError(f"S1_10_REFERENCE_ESCAPE:{field}")
+    root_path = root.resolve()
+    candidates: list[Path] = []
+    for base in (observation_path.parent, root_path):
+        candidate = base.joinpath(*logical.parts).resolve()
+        try:
+            candidate.relative_to(root_path)
+        except ValueError as error:
+            raise Stage1S110FormalError(f"S1_10_REFERENCE_ESCAPE:{field}") from error
+        if candidate not in candidates:
+            candidates.append(candidate)
+    existing = [candidate for candidate in candidates if candidate.is_file()]
+    if len(existing) != 1:
+        code = "AMBIGUOUS" if len(existing) > 1 else "MISSING"
+        raise Stage1S110FormalError(f"S1_10_FORMAL_OBSERVATION_REPORT_{code}:{field}")
+    return existing[0]
 
 
 def _schema_validate(repository: Path, objects: Mapping[str, Mapping[str, Any]]) -> None:
