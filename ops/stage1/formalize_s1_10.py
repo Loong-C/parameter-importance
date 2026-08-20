@@ -295,22 +295,22 @@ def _schema_validate(repository: Path, objects: Mapping[str, Mapping[str, Any]])
     spec.loader.exec_module(module)
     names = {
         "checkpoint_fixture": "s1-10-checkpoint-fixture-v1.json",
-        "resume_report": "s1-10-resume-report-v1.json",
+        "resume_report": "s1-10-resume-report-v2.json",
         "oracle_bundle": "s1-10-oracle-bundle-v1.json",
         "trace_bundle": "s1-10-trace-bundle-v1.json",
         "comparison_table": "s1-10-comparison-table-v1.json",
         "artifact_manifest": "s1-10-artifact-manifest-v1.json",
         "gate_record": "s1-10-gate-record-v1.json",
         "replay": "s1-10-replay-validation-v1.json",
-        "validation": "s1-10-validation-v1.json",
-        "index": "s1-10-formalization-index-v1.json",
+        "validation": "s1-10-validation-v2.json",
+        "index": "s1-10-formalization-index-v2.json",
         "formal_observation": "s1-10-formal-observation-v1.json",
     }
     schema_paths = {
         path.name: path
         for path in sorted((repository / "schemas" / "stage1").glob("s1-10-*.json"))
     }
-    if set(schema_paths) != set(names.values()):
+    if not set(names.values()).issubset(schema_paths):
         raise Stage1S110FormalError("S1_10_SCHEMA_REGISTRY_SET_INVALID")
     registry: dict[str, Mapping[str, Any]] = {}
     for path in schema_paths.values():
@@ -501,9 +501,9 @@ def execute(*, repository: str | Path, data_root: str | Path, s1_8_index_ref: st
         csv_hashes, svg_hashes = _charts(work, reloaded["comparison_table"], reloaded["trace_bundle"])
         role_sha = {role: _sha(work / name) for role, name in files.items()}
         direct = {"all_requirements_true": True, "formal_observation_hash_valid": True, "parameterized_s1_8_handoff": True, "parameterized_s1_9_handoff": True, "replay_matches": replay == replay_stage1_s110_evidence(reloaded, source_root=repository_root, scratch_root=work / "replay-verify")}
-        validation = _with_hash({"schema_version": "stage1-s1-10-validation-v1", "status": "PASS", "gate_id": GATE_ID, "task_id": TASK_ID, "execution_scope": "formal_server_single_and_four_rank_resume", "fixture_id": FIXTURE_ID, "producer_commit": commit, "consumer_commit": commit, "upstream": upstream, "direct_checks": direct, "role_sha256": role_sha, "replay_sha256": _sha(work / "replay-validation.json"), "replay_hash": replay["replay_hash"]})
+        validation = _with_hash({"schema_version": "stage1-s1-10-validation-v2", "status": "PASS", "gate_id": GATE_ID, "task_id": TASK_ID, "execution_scope": "formal_server_single_and_four_rank_resume", "fixture_id": FIXTURE_ID, "producer_commit": commit, "consumer_commit": commit, "upstream": upstream, "direct_checks": direct, "role_sha256": role_sha, "replay_sha256": _sha(work / "replay-validation.json"), "replay_hash": replay["replay_hash"]})
         _write(work / "validation.json", validation)
-        index = _with_hash({"schema_version": "stage1-s1-10-formalization-index-v1", "status": "PASS", "gate_id": GATE_ID, "task_id": TASK_ID, "fixture_id": FIXTURE_ID, "generator_git_commit": commit, "consumer_git_commit": commit, "git_branch": _git(repository_root, "branch", "--show-current"), "checked_at": _now(), "upstream": upstream, "role_refs": files, "role_sha256": role_sha, "chart_csv_sha256": csv_hashes, "chart_svg_sha256": svg_hashes, "formal_observation_ref": "formal-observation.json", "formal_observation_sha256": _sha(formal_inputs["formal-observation.json"]), "formal_observation_artifact_hash": observation["artifact_hash"], "formal_run_token_sha256": observation["run_token_sha256"], "formal_single_report_ref": "formal-single-report.json", "formal_single_report_sha256": _sha(formal_inputs["formal-single-report.json"]), "formal_four_rank_report_ref": "formal-four-rank-report.json", "formal_four_rank_report_sha256": _sha(formal_inputs["formal-four-rank-report.json"]), "gate_artifact_hash": evidence["gate_record"]["artifact_hash"], "validation_ref": "validation.json", "validation_sha256": _sha(work / "validation.json"), "replay_ref": "replay-validation.json", "replay_sha256": _sha(work / "replay-validation.json"), "replay_hash": replay["replay_hash"], "next_task_ids": ["stage1.11_reporting_and_exit_gate"]})
+        index = _with_hash({"schema_version": "stage1-s1-10-formalization-index-v2", "status": "PASS", "gate_id": GATE_ID, "task_id": TASK_ID, "fixture_id": FIXTURE_ID, "generator_git_commit": commit, "consumer_git_commit": commit, "git_branch": _git(repository_root, "branch", "--show-current"), "checked_at": _now(), "upstream": upstream, "role_refs": files, "role_sha256": role_sha, "chart_csv_sha256": csv_hashes, "chart_svg_sha256": svg_hashes, "formal_observation_ref": "formal-observation.json", "formal_observation_sha256": _sha(formal_inputs["formal-observation.json"]), "formal_observation_artifact_hash": observation["artifact_hash"], "formal_run_token_sha256": observation["run_token_sha256"], "formal_single_report_ref": "formal-single-report.json", "formal_single_report_sha256": _sha(formal_inputs["formal-single-report.json"]), "formal_four_rank_report_ref": "formal-four-rank-report.json", "formal_four_rank_report_sha256": _sha(formal_inputs["formal-four-rank-report.json"]), "gate_artifact_hash": evidence["gate_record"]["artifact_hash"], "validation_ref": "validation.json", "validation_sha256": _sha(work / "validation.json"), "replay_ref": "replay-validation.json", "replay_sha256": _sha(work / "replay-validation.json"), "replay_hash": replay["replay_hash"], "next_task_ids": ["stage1.11_reporting_and_exit_gate"]})
         _schema_validate(repository_root, {"index": index, "validation": validation, "replay": replay})
         _write(work / "index.json", index)
         staging = work.parent / f".{attempt_id}.publishing"

@@ -40,7 +40,6 @@ ROOT = Path(__file__).resolve().parents[1]
 def _schema_handoff(which: str) -> dict[str, object]:
     """A complete frozen S1.8/S1.9 handoff shape for schema-only roles."""
 
-    schema = json.loads((ROOT / "schemas" / "stage1" / "s1-10-resume-report-v1.json").read_text(encoding="utf-8"))
     if which == "s1_8":
         return {
             "index_ref": "published/s1-8-index.json",
@@ -55,10 +54,18 @@ def _schema_handoff(which: str) -> dict[str, object]:
                 "comparison_table": "d" * 64,
                 "gate_record": "e" * 64,
             },
-            "implementation_source_sha256": {
-                key: "f" * 64 for key in schema["$defs"]["s1_8_source_map"]["required"]
+            "validation_sha256": "f" * 64,
+            "source_map_sha256": "f" * 64,
+            "source_map_entries": 53,
+            "reproduction_role_sha256": {
+                "prelease_gpu_quiescence": "f" * 64,
+                "post_worker_gpu_quiescence": "f" * 64,
+                "post_release_gpu_quiescence": "f" * 64,
+                "reacquire_preflight_gpu_quiescence": "f" * 64,
             },
-            "schema_version": "stage1-s1-8-formalization-index-v2",
+            "reproduction_role_set_sha256": "f" * 64,
+            "reproduction_role_count": 84,
+            "schema_version": "stage1-s1-8-formalization-index-v6",
             "task_id": "stage1.08_ddp_and_gradient_accumulation",
             "gate_id": "G1-DDP",
         }
@@ -75,10 +82,17 @@ def _schema_handoff(which: str) -> dict[str, object]:
             "comparison_table": "4" * 64,
             "gate_record": "5" * 64,
         },
-        "implementation_source_sha256": {
-            key: "6" * 64 for key in schema["$defs"]["s1_9_source_map"]["required"]
+        "validation_sha256": "6" * 64,
+        "source_map_sha256": "6" * 64,
+        "source_map_entries": 34,
+        "reproduction_role_sha256": {
+            "upstream_compatibility": "6" * 64,
+            "prelease_gpu": "6" * 64,
+            "post_worker_quiescence": "6" * 64,
         },
-        "schema_version": "stage1-s1-9-formalization-index-v1",
+        "reproduction_role_set_sha256": "6" * 64,
+        "reproduction_role_count": 28,
+        "schema_version": "stage1-s1-9-formalization-index-v6",
         "task_id": "stage1.09_precision_clipping_and_optimizer_boundaries",
         "gate_id": "G1-NUMERIC",
     }
@@ -226,7 +240,8 @@ def _write_handoff_fixture(
         if task_id == "stage1.08_ddp_and_gradient_accumulation"
         else "numeric_report"
     )
-    source_map = {"src/frozen-producer.py": "b" * 64}
+    source_count, reproduction_count = (53, 84) if task_id == "stage1.08_ddp_and_gradient_accumulation" else (34, 28)
+    source_map = {f"src/frozen-producer-{index}.py": "b" * 64 for index in range(source_count)}
     gate = {
         "schema_version": "synthetic-gate-v1",
         "status": "PASS",
@@ -269,6 +284,33 @@ def _write_handoff_fixture(
     validation["role_sha256"] = role_sha256
     validation["artifact_hash"] = canonical_json_hash(validation)
     write_canonical_json(publication / "validation.json", validation)
+    required_reproduction = (
+        ("prelease_gpu_quiescence", "post_worker_gpu_quiescence", "post_release_gpu_quiescence", "reacquire_preflight_gpu_quiescence")
+        if task_id == "stage1.08_ddp_and_gradient_accumulation"
+        else ("upstream_compatibility", "prelease_gpu", "post_worker_quiescence")
+    )
+    reproduction_refs = {role: f"{role}.json" for role in required_reproduction}
+    for index in range(reproduction_count - len(reproduction_refs)):
+        reproduction_refs[f"auxiliary_{index}"] = f"auxiliary-{index}.json"
+    schema_versions = (
+        {
+            "prelease_gpu_quiescence": "stage1-s1-8-gpu-quiescence-v3",
+            "post_worker_gpu_quiescence": "stage1-s1-8-gpu-quiescence-v3",
+            "post_release_gpu_quiescence": "stage1-s1-8-gpu-quiescence-v3",
+            "reacquire_preflight_gpu_quiescence": "stage1-s1-8-gpu-quiescence-v3",
+        }
+        if task_id == "stage1.08_ddp_and_gradient_accumulation"
+        else {
+            "upstream_compatibility": "stage1-s1-9-upstream-compatibility-v5",
+            "prelease_gpu": "stage1-s1-9-gpu-prelease-v3",
+            "post_worker_quiescence": "stage1-s1-9-gpu-quiescence-v3",
+        }
+    )
+    for role_name, filename in reproduction_refs.items():
+        value = {"schema_version": schema_versions.get(role_name, "synthetic-reproduction-v1"), "status": "PASS"}
+        value["artifact_hash"] = canonical_json_hash(value)
+        write_canonical_json(publication / filename, value)
+    reproduction_sha256 = {name: _file_sha256(publication / ref) for name, ref in reproduction_refs.items()}
     index = {
         "schema_version": schema_version,
         "status": "PASS",
@@ -279,6 +321,8 @@ def _write_handoff_fixture(
         "next_task_ids": [TASK_ID],
         "role_refs": role_refs,
         "role_sha256": role_sha256,
+        "reproduction_role_refs": reproduction_refs,
+        "reproduction_role_sha256": reproduction_sha256,
         "gate_artifact_hash": gate["artifact_hash"],
         "validation_ref": "validation.json",
         "validation_sha256": _file_sha256(publication / "validation.json"),
@@ -333,7 +377,7 @@ def test_s110_fixture_oracle_evidence_and_independent_replay(tmp_path: Path) -> 
         "gate_record": "6" * 64,
     }
     formal_validation = {
-        "schema_version": "stage1-s1-10-validation-v1", "status": "PASS",
+        "schema_version": "stage1-s1-10-validation-v2", "status": "PASS",
         "gate_id": "G1-RESUME", "task_id": TASK_ID,
         "execution_scope": "formal_server_single_and_four_rank_resume",
         "fixture_id": "stage1-s110-checkpoint-fixture-v1",
@@ -351,7 +395,7 @@ def test_s110_fixture_oracle_evidence_and_independent_replay(tmp_path: Path) -> 
     formal_validation["artifact_hash"] = canonical_json_hash(formal_validation)
     formal_upstream = upstream
     formal_index = {
-        "schema_version": "stage1-s1-10-formalization-index-v1", "status": "PASS",
+        "schema_version": "stage1-s1-10-formalization-index-v2", "status": "PASS",
         "gate_id": "G1-RESUME", "task_id": TASK_ID,
         "fixture_id": "stage1-s110-checkpoint-fixture-v1",
         "generator_git_commit": "0" * 40, "consumer_git_commit": "0" * 40,
@@ -418,11 +462,16 @@ def test_s110_schema_closure_and_nested_negative_contracts(tmp_path: Path) -> No
     formalizer_spec.loader.exec_module(formalizer)
     formalizer._schema_validate(ROOT, evidence)
     resume_schema = json.loads(
-        (ROOT / "schemas" / "stage1" / "s1-10-resume-report-v1.json").read_text(encoding="utf-8")
+        (ROOT / "schemas" / "stage1" / "s1-10-resume-report-v2.json").read_text(encoding="utf-8")
     )
     assert set(evidence["resume_report"]["implementation_source_sha256"]) == set(
         resume_schema["$defs"]["source_map"]["required"]
     )
+    assert {
+        "schemas/stage1/s1-10-resume-report-v2.json",
+        "schemas/stage1/s1-10-validation-v2.json",
+        "schemas/stage1/s1-10-formalization-index-v2.json",
+    } <= set(evidence["resume_report"]["implementation_source_sha256"])
 
     mutations: list[tuple[str, object]] = []
     extra = deepcopy(evidence["trace_bundle"])
@@ -533,13 +582,27 @@ def test_s110_parameterized_handoff_rejects_missing_or_unpinned_binding(tmp_path
             expected_task_id="stage1.08_ddp_and_gradient_accumulation",
             expected_gate_id="G1-DDP",
         )
+    reference, stale_binding = _write_handoff_fixture(
+        tmp_path,
+        task_id="stage1.08_ddp_and_gradient_accumulation",
+        gate_id="G1-DDP",
+        schema_version="stage1-s1-8-formalization-index-v5",
+    )
+    with pytest.raises(Stage1CheckpointError, match="FINAL_SCHEMA_REQUIRED"):
+        validate_parameterized_handoff(
+            tmp_path,
+            reference,
+            expected_binding=stale_binding,
+            expected_task_id="stage1.08_ddp_and_gradient_accumulation",
+            expected_gate_id="G1-DDP",
+        )
 
 
 @pytest.mark.parametrize(
     ("task_id", "gate_id", "schema_version"),
     [
-        ("stage1.08_ddp_and_gradient_accumulation", "G1-DDP", "stage1-s1-8-formalization-index-v1"),
-        ("stage1.09_precision_clipping_and_optimizer_boundaries", "G1-NUMERIC", "stage1-s1-9-formalization-index-v1"),
+        ("stage1.08_ddp_and_gradient_accumulation", "G1-DDP", "stage1-s1-8-formalization-index-v6"),
+        ("stage1.09_precision_clipping_and_optimizer_boundaries", "G1-NUMERIC", "stage1-s1-9-formalization-index-v6"),
     ],
 )
 def test_s110_parameterized_handoff_loads_index_siblings_and_rejects_escape(
@@ -592,6 +655,57 @@ def test_s110_parameterized_handoff_loads_index_siblings_and_rejects_escape(
             expected_binding=binding,
             expected_task_id=task_id,
             expected_gate_id=gate_id,
+        )
+
+
+def test_s110_final_handoff_rejects_short_or_wrong_versioned_reproduction_closure(tmp_path: Path) -> None:
+    reference, binding = _write_handoff_fixture(
+        tmp_path,
+        task_id="stage1.08_ddp_and_gradient_accumulation",
+        gate_id="G1-DDP",
+        schema_version="stage1-s1-8-formalization-index-v6",
+    )
+    index_path = tmp_path / "published" / "index.json"
+    index = json.loads(index_path.read_text(encoding="utf-8"))
+    dropped = next(name for name in index["reproduction_role_refs"] if name.startswith("auxiliary_"))
+    del index["reproduction_role_refs"][dropped]
+    del index["reproduction_role_sha256"][dropped]
+    index["artifact_hash"] = canonical_json_hash({key: value for key, value in index.items() if key != "artifact_hash"})
+    write_canonical_json(index_path, index)
+    binding = dict(binding)
+    binding["index_sha256"] = _file_sha256(index_path)
+    binding["index_artifact_hash"] = str(index["artifact_hash"])
+    with pytest.raises(Stage1CheckpointError, match="CLOSURE_CARDINALITY_INVALID"):
+        validate_parameterized_handoff(
+            tmp_path, reference, expected_binding=binding,
+            expected_task_id="stage1.08_ddp_and_gradient_accumulation", expected_gate_id="G1-DDP",
+        )
+
+    numeric_root = tmp_path / "numeric"
+    numeric_root.mkdir()
+    reference, binding = _write_handoff_fixture(
+        numeric_root,
+        task_id="stage1.09_precision_clipping_and_optimizer_boundaries",
+        gate_id="G1-NUMERIC",
+        schema_version="stage1-s1-9-formalization-index-v6",
+    )
+    index_path = numeric_root / "published" / "index.json"
+    index = json.loads(index_path.read_text(encoding="utf-8"))
+    compatibility = numeric_root / "published" / str(index["reproduction_role_refs"]["upstream_compatibility"])
+    value = json.loads(compatibility.read_text(encoding="utf-8"))
+    value["schema_version"] = "stage1-s1-9-upstream-compatibility-v4"
+    value["artifact_hash"] = canonical_json_hash({key: item for key, item in value.items() if key != "artifact_hash"})
+    write_canonical_json(compatibility, value)
+    index["reproduction_role_sha256"]["upstream_compatibility"] = _file_sha256(compatibility)
+    index["artifact_hash"] = canonical_json_hash({key: item for key, item in index.items() if key != "artifact_hash"})
+    write_canonical_json(index_path, index)
+    binding = dict(binding)
+    binding["index_sha256"] = _file_sha256(index_path)
+    binding["index_artifact_hash"] = str(index["artifact_hash"])
+    with pytest.raises(Stage1CheckpointError, match="REPRODUCTION_SCHEMA_INVALID"):
+        validate_parameterized_handoff(
+            numeric_root, reference, expected_binding=binding,
+            expected_task_id="stage1.09_precision_clipping_and_optimizer_boundaries", expected_gate_id="G1-NUMERIC",
         )
 
 

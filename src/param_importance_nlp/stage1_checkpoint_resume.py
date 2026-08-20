@@ -31,7 +31,7 @@ GATE_ID = "G1-RESUME"
 FIXTURE_ID = "stage1-s110-checkpoint-fixture-v1"
 FIXTURE_SCHEMA = "stage1-s1-10-checkpoint-fixture-v1"
 CHECKPOINT_SCHEMA = "stage1-s1-10-checkpoint-state-v1"
-REPORT_SCHEMA = "stage1-s1-10-resume-report-v1"
+REPORT_SCHEMA = "stage1-s1-10-resume-report-v2"
 TRACE_SCHEMA = "stage1-s1-10-trace-bundle-v1"
 TABLE_SCHEMA = "stage1-s1-10-comparison-table-v1"
 MANIFEST_SCHEMA = "stage1-s1-10-artifact-manifest-v1"
@@ -562,6 +562,7 @@ def _source_hashes(source_root: Path) -> dict[str, str]:
         "tests/test_stage1_s110_checkpoint_resume.py",
         "schemas/stage1/s1-10-checkpoint-fixture-v1.json",
         "schemas/stage1/s1-10-resume-report-v1.json",
+        "schemas/stage1/s1-10-resume-report-v2.json",
         "schemas/stage1/s1-10-oracle-bundle-v1.json",
         "schemas/stage1/s1-10-trace-bundle-v1.json",
         "schemas/stage1/s1-10-comparison-table-v1.json",
@@ -569,7 +570,9 @@ def _source_hashes(source_root: Path) -> dict[str, str]:
         "schemas/stage1/s1-10-gate-record-v1.json",
         "schemas/stage1/s1-10-replay-validation-v1.json",
         "schemas/stage1/s1-10-validation-v1.json",
+        "schemas/stage1/s1-10-validation-v2.json",
         "schemas/stage1/s1-10-formalization-index-v1.json",
+        "schemas/stage1/s1-10-formalization-index-v2.json",
         "schemas/stage1/s1-10-formal-observation-v1.json",
     )
     result: dict[str, str] = {}
@@ -735,6 +738,12 @@ def validate_parameterized_handoff(data_root: str | Path, index_ref: str, *, exp
         or expected_binding.get("task_id") != expected_task_id or expected_binding.get("gate_id") != expected_gate_id
     ):
         raise Stage1CheckpointError("S1_10_HANDOFF_BINDING_REQUIRED")
+    expected_schema = {
+        "stage1.08_ddp_and_gradient_accumulation": "stage1-s1-8-formalization-index-v6",
+        "stage1.09_precision_clipping_and_optimizer_boundaries": "stage1-s1-9-formalization-index-v6",
+    }.get(expected_task_id)
+    if expected_schema is None or expected_binding["schema_version"] != expected_schema:
+        raise Stage1CheckpointError("S1_10_HANDOFF_FINAL_SCHEMA_REQUIRED")
     root = Path(data_root).resolve(strict=True)
     index_path = _safe_reference(root, index_ref, field="index")
     if not index_path.is_file() or _sha256_file(index_path) != expected_binding["index_sha256"]:
@@ -861,7 +870,75 @@ def validate_parameterized_handoff(data_root: str | Path, index_ref: str, *, exp
         raise Stage1CheckpointError("S1_10_HANDOFF_REPLAY_SELF_HASH_INVALID")
     if expected_task_id == "stage1.09_precision_clipping_and_optimizer_boundaries" and replay.get("source_gate_artifact_hash") != expected_binding["gate_artifact_hash"]:
         raise Stage1CheckpointError("S1_10_HANDOFF_REPLAY_GATE_BINDING_INVALID")
-    return {"index_ref": index_ref, "index_sha256": expected_binding["index_sha256"], "index_artifact_hash": expected_binding["index_artifact_hash"], "producer_commit": expected_binding["producer_commit"], "gate_artifact_hash": expected_binding["gate_artifact_hash"], "role_sha256": role_hashes, "implementation_source_sha256": report_sources, "schema_version": expected_binding["schema_version"], "task_id": expected_task_id, "gate_id": expected_gate_id}
+
+    # Final upstream publications also carry non-public, safety-relevant
+    # reproduction members.  Bind the complete map and then inspect the
+    # specific quiescence/prelease/compatibility artifacts that make a later
+    # resume run safe to start.  These are not optional diagnostics.
+    reproduction_refs, reproduction_hashes = index.get("reproduction_role_refs"), index.get("reproduction_role_sha256")
+    if (
+        not isinstance(reproduction_refs, Mapping)
+        or not isinstance(reproduction_hashes, Mapping)
+        or not reproduction_refs
+        or set(reproduction_refs) != set(reproduction_hashes)
+    ):
+        raise Stage1CheckpointError("S1_10_HANDOFF_REPRODUCTION_CLOSURE_INVALID")
+    required_reproduction = (
+        ("prelease_gpu_quiescence", "post_worker_gpu_quiescence", "post_release_gpu_quiescence", "reacquire_preflight_gpu_quiescence")
+        if expected_task_id == "stage1.08_ddp_and_gradient_accumulation"
+        else ("upstream_compatibility", "prelease_gpu", "post_worker_quiescence")
+    )
+    if any(role not in reproduction_refs for role in required_reproduction):
+        raise Stage1CheckpointError("S1_10_HANDOFF_REPRODUCTION_ROLE_MISSING")
+    expected_source_entries, expected_reproduction_entries = (
+        (53, 84) if expected_task_id == "stage1.08_ddp_and_gradient_accumulation" else (34, 28)
+    )
+    if len(report_sources) != expected_source_entries or len(reproduction_hashes) != expected_reproduction_entries:
+        raise Stage1CheckpointError("S1_10_HANDOFF_CLOSURE_CARDINALITY_INVALID")
+    reproduction_values: dict[str, dict[str, Any]] = {}
+    for role in sorted(reproduction_refs):
+        path = _safe_index_member(root, index_path, reproduction_refs[role], field=f"reproduction.{role}")
+        digest = reproduction_hashes[role]
+        if not path.is_file() or not isinstance(digest, str) or _SHA256.fullmatch(digest) is None or _sha256_file(path) != digest:
+            raise Stage1CheckpointError(f"S1_10_HANDOFF_REPRODUCTION_HASH_INVALID:{role}")
+        if role in required_reproduction:
+            value = load_canonical_json(path)
+            if not isinstance(value, Mapping) or value.get("status") != "PASS" or not _self_hash(value, field="artifact_hash"):
+                raise Stage1CheckpointError(f"S1_10_HANDOFF_REPRODUCTION_NOT_PASS:{role}")
+            reproduction_values[role] = dict(value)
+    expected_artifact_schemas = (
+        {
+            "prelease_gpu_quiescence": "stage1-s1-8-gpu-quiescence-v3",
+            "post_worker_gpu_quiescence": "stage1-s1-8-gpu-quiescence-v3",
+            "post_release_gpu_quiescence": "stage1-s1-8-gpu-quiescence-v3",
+            "reacquire_preflight_gpu_quiescence": "stage1-s1-8-gpu-quiescence-v3",
+        }
+        if expected_task_id == "stage1.08_ddp_and_gradient_accumulation"
+        else {
+            "upstream_compatibility": "stage1-s1-9-upstream-compatibility-v5",
+            "prelease_gpu": "stage1-s1-9-gpu-prelease-v3",
+            "post_worker_quiescence": "stage1-s1-9-gpu-quiescence-v3",
+        }
+    )
+    if any(reproduction_values[role].get("schema_version") != schema for role, schema in expected_artifact_schemas.items()):
+        raise Stage1CheckpointError("S1_10_HANDOFF_REPRODUCTION_SCHEMA_INVALID")
+    return {
+        "index_ref": index_ref,
+        "index_sha256": expected_binding["index_sha256"],
+        "index_artifact_hash": expected_binding["index_artifact_hash"],
+        "producer_commit": expected_binding["producer_commit"],
+        "gate_artifact_hash": expected_binding["gate_artifact_hash"],
+        "role_sha256": role_hashes,
+        "validation_sha256": str(index["validation_sha256"]),
+        "source_map_sha256": canonical_json_hash(report_sources),
+        "source_map_entries": len(report_sources),
+        "reproduction_role_sha256": {str(role): str(reproduction_hashes[role]) for role in sorted(required_reproduction)},
+        "reproduction_role_set_sha256": canonical_json_hash(dict(reproduction_hashes)),
+        "reproduction_role_count": len(reproduction_hashes),
+        "schema_version": expected_binding["schema_version"],
+        "task_id": expected_task_id,
+        "gate_id": expected_gate_id,
+    }
 
 
 __all__ = [
