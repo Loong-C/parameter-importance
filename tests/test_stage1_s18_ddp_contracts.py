@@ -1589,6 +1589,48 @@ def test_execute_acquire_failure_preserves_original_error_and_never_releases(tmp
     assert formalizer._mapping(load_canonical_json(failed), field="failure")["error"] == "GPU_LEASE_STALE_RECORD_REQUIRES_REVIEW"
 
 
+def test_recovery_action_preflight_fails_before_lease_acquire(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A Reset recommendation is hardware state, not a launch-time soft failure."""
+
+    formalizer = _formalizer(); repository, data_root = tmp_path / "repo", tmp_path / "data"
+    repository.mkdir(); data_root.mkdir()
+    token_file, attestation, replay = (tmp_path / "tokens.safetensors", tmp_path / "attestation.json", tmp_path / "replay.json")
+    for path in (token_file, attestation, replay):
+        path.write_bytes(b"test")
+    cache_root = tmp_path / "cache"; cache_root.mkdir()
+    handoff = {
+        "token_file": token_file, "historical_producer_attestation_file": attestation,
+        "historical_producer_attestation_sha256": formalizer._sha(attestation),
+        "historical_g3_replay_file": replay, "historical_g3_replay_sha256": formalizer._sha(replay),
+    }
+    constructed: list[object] = []
+    class LeaseMustNotConstruct:
+        def __init__(self, *_args: object) -> None:
+            constructed.append(self)
+            raise AssertionError("recovery preflight must precede lease construction")
+    import param_importance_nlp.runtime.operations as operations
+    monkeypatch.setattr(operations, "ProjectGpuLease", LeaseMustNotConstruct)
+    monkeypatch.setattr(formalizer, "_git", lambda _repository, *_args: "a" * 40)
+    monkeypatch.setattr(formalizer, "load_s1_7_handoff", lambda **_kwargs: handoff)
+    monkeypatch.setattr(formalizer, "_load_capability", lambda *_args, **_kwargs: {"status": "PASS"})
+    monkeypatch.setattr(formalizer, "_require_prelease_cuda_hidden", lambda: {"cuda_visible_devices": "", "parent_cuda_initialization": False})
+    monkeypatch.setattr(formalizer, "_frozen_model_and_cache_root", lambda *_args: (str(tmp_path), str(cache_root), {"status": "PASS"}))
+    monkeypatch.setattr(formalizer, "_audit_pile_download_activity", lambda _handoff: {"active_count": 0})
+    bad_uuid = "GPU-00000000-1111-2222-3333-444444444441"
+    monkeypatch.setattr(formalizer, "discover_approved_gpus", lambda _uuids: (_ for _ in ()).throw(formalizer.Stage1S18FormalError("S18_GPU_RECOVERY_ACTION_NOT_NONE:" + bad_uuid + ":Reset")))
+    uuids = ["GPU-00000000-1111-2222-3333-44444444444" + str(index) for index in range(4)]
+    with pytest.raises(formalizer.Stage1S18FormalError, match="S18_GPU_RECOVERY_ACTION_NOT_NONE"):
+        formalizer.execute(repository=repository, data_root=data_root, s1_7_index_ref="ignored", gpu_capability_ref="ignored", approved_gpu_uuids=uuids, attempt_id="recovery-action-preflight", lease_owner="test-owner")
+    assert constructed == []
+    from param_importance_nlp.contracts.jsonio import load_canonical_json
+    failed = next((data_root / "tmp" / "stage1-s1-8" / "recovery-action-preflight").glob("failed.json"))
+    assert formalizer._mapping(load_canonical_json(failed), field="failure") == {
+        "schema_version": "stage1-s1-8-failure-v1", "status": "FAILED", "phase": "preflight",
+        "error_type": "Stage1S18FormalError", "error": "S18_GPU_RECOVERY_ACTION_NOT_NONE:" + bad_uuid + ":Reset",
+        "artifact_hash": formalizer._mapping(load_canonical_json(failed), field="failure")["artifact_hash"],
+    }
+
+
 def test_held_lease_failure_runs_exact_release_transaction(tmp_path: Path) -> None:
     formalizer = _formalizer()
     class HeldLease:
@@ -1738,11 +1780,40 @@ def test_gpu_uuid_runtime_contract_is_canonical_lowercase_and_exact(monkeypatch:
     formalizer = _formalizer()
     uuids = [f"GPU-{index:08x}-1111-2222-3333-444444444444" for index in range(4)]
     inventory = "\n".join(f"{index}, {uuid}, NVIDIA A100-SXM4-80GB, 81920, 0, 0, 40, 8.0" for index, uuid in enumerate(uuids))
-    monkeypatch.setattr(formalizer, "_run", lambda command, timeout=30: inventory if "--query-gpu=" in command[1] else "")
-    assert formalizer.discover_approved_gpus(uuids)["requested_uuid_order"] == uuids
+    recovery = "\n".join(f"{uuid}, None" for uuid in uuids)
+    monkeypatch.setattr(formalizer, "_run", lambda command, timeout=30: recovery if "gpu_recovery_action" in command[1] else inventory if "--query-gpu=" in command[1] else "")
+    discovered = formalizer.discover_approved_gpus(uuids)
+    assert discovered["requested_uuid_order"] == uuids
+    assert [row["recovery_action"] for row in discovered["selected"]] == ["None"] * 4
     for invalid in (uuids[:3] + ["GPU-ABCDEF12-1111-2222-3333-444444444444"], uuids[:3] + ["GPU-1"], uuids[:3] + [uuids[3] + "x"]):
         with pytest.raises(formalizer.Stage1S18FormalError, match="S18_APPROVED_GPU_UUID_SET_INVALID"):
             formalizer.discover_approved_gpus(invalid)
+
+
+def test_gpu_recovery_action_query_rejects_reset_empty_unknown_and_uuid_mismatch() -> None:
+    formalizer = _formalizer()
+    uuids = [f"GPU-{index:08x}-1111-2222-3333-444444444444" for index in range(4)]
+    good = "\n".join(f"{uuid}, None" for uuid in uuids)
+    assert formalizer._parse_gpu_recovery_actions(good, expected_uuids=uuids) == {uuid: "None" for uuid in uuids}
+    reset = good.replace(f"{uuids[1]}, None", f"{uuids[1]}, Reset")
+    assert formalizer._parse_gpu_recovery_actions(reset, expected_uuids=uuids)[uuids[1]] == "Reset"
+    for output, marker in (
+        (good.replace(f"{uuids[1]}, None", f"{uuids[1]}, "), "S18_GPU_RECOVERY_ACTION_PARSE_INVALID"),
+        (good.replace(uuids[1], "GPU-ffffffff-1111-2222-3333-444444444444"), "S18_GPU_RECOVERY_ACTION_UUID_MISMATCH"),
+    ):
+        with pytest.raises(formalizer.Stage1S18FormalError, match=marker):
+            formalizer._parse_gpu_recovery_actions(output, expected_uuids=uuids)
+
+
+def test_discovery_rejects_any_non_none_recovery_action(monkeypatch: pytest.MonkeyPatch) -> None:
+    formalizer = _formalizer()
+    uuids = [f"GPU-{index:08x}-1111-2222-3333-444444444444" for index in range(4)]
+    inventory = "\n".join(f"{index}, {uuid}, NVIDIA A100-SXM4-80GB, 81920, 0, 0, 40, 8.0" for index, uuid in enumerate(uuids))
+    for action in ("Reset", "Unknown"):
+        recovery = "\n".join(f"{uuid}, {action if uuid == uuids[1] else 'None'}" for uuid in uuids)
+        monkeypatch.setattr(formalizer, "_run", lambda command, timeout=30, recovery=recovery: recovery if "gpu_recovery_action" in command[1] else inventory if "--query-gpu=" in command[1] else "")
+        with pytest.raises(formalizer.Stage1S18FormalError, match=f"S18_GPU_RECOVERY_ACTION_NOT_NONE:{uuids[1]}:{action}"):
+            formalizer.discover_approved_gpus(uuids)
 
 
 def test_pile_audit_binds_ready_provenance_and_never_records_command_text(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

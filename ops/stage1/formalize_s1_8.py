@@ -1128,17 +1128,45 @@ def discover_approved_gpus(approved_gpu_uuids: Sequence[str]) -> dict[str, Any]:
         if len(fields) != 8 or not fields[0].isdigit() or GPU_UUID_RE.fullmatch(fields[1]) is None:
             raise Stage1S18FormalError("S18_GPU_DISCOVERY_PARSE_INVALID")
         inventory[fields[1]] = {"physical_index": int(fields[0]), "uuid": fields[1], "name": fields[2], "memory_total_mib": int(fields[3]), "memory_used_mib": int(fields[4]), "utilization_percent": int(fields[5]), "temperature_c": int(fields[6]), "compute_capability": fields[7]}
+    recovery_actions = _parse_gpu_recovery_actions(
+        _run(["nvidia-smi", "--query-gpu=uuid,gpu_recovery_action", "--format=csv,noheader,nounits"]),
+        expected_uuids=values,
+    )
     selected = []
     for uuid in values:
         row = inventory.get(uuid)
         if row is None or not str(row["name"]).startswith("NVIDIA A100") or int(row["memory_total_mib"]) < 70000 or int(row["memory_used_mib"]) != 0 or int(row["utilization_percent"]) != 0 or int(row["temperature_c"]) >= 85 or str(row["compute_capability"]) != "8.0":
             raise Stage1S18FormalError("S18_GPU_NOT_IDLE_A100:" + uuid)
-        selected.append(row)
+        action = recovery_actions[uuid]
+        if action != "None":
+            raise Stage1S18FormalError("S18_GPU_RECOVERY_ACTION_NOT_NONE:" + uuid + ":" + action)
+        selected.append({**row, "recovery_action": action})
     processes = _run(["nvidia-smi", "--query-compute-apps=gpu_uuid,pid", "--format=csv,noheader,nounits"])
     occupied = [line for line in processes.splitlines() if any(uuid in line for uuid in values)]
     if occupied:
         raise Stage1S18FormalError("S18_GPU_COMPUTE_PROCESS_PRESENT")
     return {"selected": selected, "requested_uuid_order": list(values), "compute_apps": []}
+
+
+def _parse_gpu_recovery_actions(output: str, *, expected_uuids: Sequence[str]) -> dict[str, str]:
+    """Parse the structured ``nvidia-smi`` recovery-action query exactly."""
+
+    expected = tuple(expected_uuids)
+    if not expected or len(expected) != len(set(expected)) or any(GPU_UUID_RE.fullmatch(value) is None for value in expected):
+        raise Stage1S18FormalError("S18_GPU_RECOVERY_ACTION_EXPECTED_UUIDS_INVALID")
+    values: dict[str, str] = {}
+    for line in output.splitlines():
+        fields = [field.strip() for field in line.split(",")]
+        if len(fields) != 2 or GPU_UUID_RE.fullmatch(fields[0]) is None or not fields[1]:
+            raise Stage1S18FormalError("S18_GPU_RECOVERY_ACTION_PARSE_INVALID")
+        uuid, action = fields
+        if uuid in values:
+            raise Stage1S18FormalError("S18_GPU_RECOVERY_ACTION_UUID_DUPLICATE:" + uuid)
+        values[uuid] = action
+    selected = {uuid: values[uuid] for uuid in expected if uuid in values}
+    if set(selected) != set(expected):
+        raise Stage1S18FormalError("S18_GPU_RECOVERY_ACTION_UUID_MISMATCH")
+    return selected
 
 
 def _process_identity(pid: int) -> dict[str, Any]:
