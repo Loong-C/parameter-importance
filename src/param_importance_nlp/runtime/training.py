@@ -19,6 +19,7 @@ checkpoint 保存 model/buffer、optimizer、scheduler、scaler、RNG、cursor�
 from __future__ import annotations
 
 from contextlib import nullcontext
+from copy import deepcopy
 from dataclasses import dataclass, field, replace
 import hashlib
 import json
@@ -1380,9 +1381,13 @@ class TrainingEngine:
             "training_state": self.state.to_dict(),
         }
 
-    def _checkpoint_state(self) -> dict[str, object]:
+    def _checkpoint_state(
+        self,
+        *,
+        checkpoint_ids: Sequence[str] | None = None,
+    ) -> dict[str, object]:
         return {
-            "schema_version": "training-checkpoint-state-v1",
+            "schema_version": "training-checkpoint-state-v2",
             "run_spec_hash": self.spec.spec_hash,
             "registry_hash": self.registry.coordinate_registry_hash,
             "optimizer_contract_hash": self.registry.optimizer_contract_hash,
@@ -1399,16 +1404,319 @@ class TrainingEngine:
             "importance_trajectory_points": [
                 point.to_dict() for point in self._importance_points
             ],
+            # The checkpoint's own ID is included before publication, so a
+            # fresh process restores the complete immutable lineage rather
+            # than inferring it from a directory scan.
+            "checkpoint_ids": list(self._checkpoint_ids if checkpoint_ids is None else checkpoint_ids),
         }
+
+    def _validate_checkpoint_payload_for_install(
+        self,
+        raw: Mapping[str, object],
+    ) -> tuple[
+        TrainingState,
+        Mapping[str, object],
+        Mapping[str, object],
+        list[TrainingStepRecord],
+        list[ImportanceTrajectoryPoint],
+        list[str],
+    ]:
+        """Validate every recoverable state component before mutating the engine.
+
+        ``CheckpointStore`` has already verified the committed object's byte
+        identity.  This second, in-memory check owns the compatibility boundary
+        between a valid object and this particular live engine.  In particular,
+        a malformed scheduler/scaler/accumulator must not be discovered after
+        model or optimizer installation has already altered the caller's state.
+        """
+
+        expected_fields = {
+            "schema_version",
+            "run_spec_hash",
+            "registry_hash",
+            "optimizer_contract_hash",
+            "runtime_layout_hash",
+            "training_state",
+            "model",
+            "optimizer",
+            "scheduler",
+            "scaler",
+            "rng",
+            "cursor",
+            "importance",
+            "records",
+            "importance_trajectory_points",
+            "checkpoint_ids",
+        }
+        # v1 intentionally has no implicit migration path: it cannot provide
+        # the complete checkpoint lineage required for transactional resume.
+        if set(raw) != expected_fields or raw.get("schema_version") != "training-checkpoint-state-v2":
+            raise ValueError("TRAINING_CHECKPOINT_STATE_INVALID")
+        if raw.get("run_spec_hash") != self.spec.spec_hash:
+            raise ValueError("TRAINING_CHECKPOINT_SPEC_HASH_MISMATCH")
+        if raw.get("registry_hash") != self.registry.coordinate_registry_hash:
+            raise ValueError("TRAINING_CHECKPOINT_REGISTRY_HASH_MISMATCH")
+        if raw.get("optimizer_contract_hash") != self.registry.optimizer_contract_hash:
+            raise ValueError("TRAINING_CHECKPOINT_OPTIMIZER_CONTRACT_MISMATCH")
+        if raw.get("runtime_layout_hash") != self.registry.runtime_layout_hash:
+            raise ValueError("TRAINING_CHECKPOINT_RUNTIME_LAYOUT_MISMATCH")
+
+        state_value = raw.get("training_state")
+        if not isinstance(state_value, Mapping):
+            raise TypeError("TRAINING_CHECKPOINT_CONTROL_STATE_INVALID")
+        staged_state = TrainingState.from_mapping(state_value)
+
+        model_state = raw.get("model")
+        if not isinstance(model_state, Mapping):
+            raise TypeError("TRAINING_CHECKPOINT_MODEL_STATE_INVALID")
+        current_model_state = self.model.module.state_dict()
+        if set(model_state) != set(current_model_state):
+            raise ValueError("TRAINING_CHECKPOINT_MODEL_KEYSET_MISMATCH")
+        for name, expected_value in current_model_state.items():
+            candidate = model_state.get(name)
+            if (
+                not isinstance(candidate, torch.Tensor)
+                or not isinstance(expected_value, torch.Tensor)
+                or candidate.shape != expected_value.shape
+                or candidate.dtype != expected_value.dtype
+                or candidate.layout != expected_value.layout
+            ):
+                raise ValueError(f"TRAINING_CHECKPOINT_MODEL_TENSOR_MISMATCH:{name}")
+
+        optimizer_state = raw.get("optimizer")
+        if not isinstance(optimizer_state, Mapping):
+            raise TypeError("TRAINING_CHECKPOINT_OPTIMIZER_STATE_INVALID")
+        cursor_value = raw.get("cursor")
+        rng_value = raw.get("rng")
+        if not isinstance(cursor_value, Mapping) or not isinstance(rng_value, Mapping):
+            raise TypeError("TRAINING_CHECKPOINT_CURSOR_OR_RNG_INVALID")
+        if set(rng_value) != {"python", "numpy", "torch_cpu", "torch_cuda"}:
+            raise ValueError("TRAINING_CHECKPOINT_RNG_FIELDS_MISMATCH")
+        cpu_rng = rng_value.get("torch_cpu")
+        cuda_rng = rng_value.get("torch_cuda")
+        if (
+            not isinstance(cpu_rng, torch.Tensor)
+            or cpu_rng.dtype != torch.uint8
+            or not isinstance(cuda_rng, tuple)
+            or not all(isinstance(item, torch.Tensor) and item.dtype == torch.uint8 for item in cuda_rng)
+        ):
+            raise TypeError("TRAINING_CHECKPOINT_RNG_STATE_INVALID")
+        # Validate Python/NumPy/Torch CPU states without perturbing the active
+        # process streams.  CUDA compatibility is checked below before the
+        # transaction starts, so a bad payload cannot initialise a device.
+        random.Random().setstate(rng_value["python"])  # type: ignore[arg-type]
+        probe_numpy = np.random.RandomState()
+        probe_numpy.set_state(rng_value["numpy"])  # type: ignore[arg-type]
+        probe_torch = torch.Generator(device="cpu")
+        probe_torch.set_state(cpu_rng.detach().cpu())
+        # A CUDA checkpoint is only compatible with an already-initialised
+        # CUDA training runtime owning exactly the saved device generators.
+        # Do this before model/optimizer installation: resume must never
+        # initialise a device as a side effect of discovering an incompatible
+        # checkpoint, and rank/device-count drift is not a recoverable mode.
+        if cuda_rng:
+            if not torch.cuda.is_available():
+                raise RuntimeError("TRAINING_CHECKPOINT_REQUIRES_CUDA_RNG")
+            if not torch.cuda.is_initialized():
+                raise RuntimeError("TRAINING_CHECKPOINT_CUDA_RUNTIME_NOT_INITIALIZED")
+            if len(cuda_rng) != torch.cuda.device_count():
+                raise ValueError("TRAINING_CUDA_RNG_DEVICE_COUNT_MISMATCH")
+        elif torch.cuda.is_initialized() and torch.cuda.device_count() != 0:
+            raise ValueError("TRAINING_CHECKPOINT_CUDA_RNG_MISSING")
+
+        scheduler_state = raw.get("scheduler")
+        if self.scheduler is None:
+            if scheduler_state is not None:
+                raise ValueError("TRAINING_CHECKPOINT_SCHEDULER_MISMATCH")
+        elif not isinstance(scheduler_state, Mapping):
+            raise TypeError("TRAINING_CHECKPOINT_SCHEDULER_STATE_INVALID")
+        scaler_state = raw.get("scaler")
+        if self.scaler is None:
+            if scaler_state is not None:
+                raise ValueError("TRAINING_CHECKPOINT_SCALER_MISMATCH")
+        elif not isinstance(scaler_state, Mapping):
+            raise TypeError("TRAINING_CHECKPOINT_SCALER_STATE_INVALID")
+
+        raw_records = raw.get("records")
+        if not isinstance(raw_records, list) or not all(
+            isinstance(item, Mapping) for item in raw_records
+        ):
+            raise TypeError("TRAINING_CHECKPOINT_RECORDS_INVALID")
+        staged_records = [TrainingStepRecord.from_mapping(item) for item in raw_records]
+        raw_points = raw.get("importance_trajectory_points")
+        if not isinstance(raw_points, list) or not all(
+            isinstance(item, Mapping) for item in raw_points
+        ):
+            raise TypeError("TRAINING_CHECKPOINT_TRAJECTORY_POINTS_INVALID")
+        staged_points = [ImportanceTrajectoryPoint.from_mapping(item) for item in raw_points]
+
+        raw_checkpoint_ids = raw.get("checkpoint_ids")
+        if (
+            not isinstance(raw_checkpoint_ids, list)
+            or not raw_checkpoint_ids
+            or not all(isinstance(item, str) and item for item in raw_checkpoint_ids)
+            or len(set(raw_checkpoint_ids)) != len(raw_checkpoint_ids)
+            or staged_state.last_checkpoint_id != raw_checkpoint_ids[-1]
+        ):
+            raise ValueError("TRAINING_CHECKPOINT_LINEAGE_INVALID")
+        staged_checkpoint_ids = list(raw_checkpoint_ids)
+
+        if (
+            len(staged_records) != staged_state.attempt_index
+            or any(record.attempt_index != index for index, record in enumerate(staged_records, start=1))
+            or (staged_records and staged_records[-1].global_step != staged_state.global_step)
+            or (not staged_records and staged_state.attempt_index != 0)
+        ):
+            raise ValueError("TRAINING_CHECKPOINT_RECORD_LINEAGE_INVALID")
+        if (
+            any(point.checkpoint_id not in staged_checkpoint_ids for point in staged_points)
+            or any(
+                later.global_step <= earlier.global_step
+                for earlier, later in zip(staged_points, staged_points[1:], strict=False)
+            )
+        ):
+            raise ValueError("TRAINING_CHECKPOINT_TRAJECTORY_LINEAGE_INVALID")
+
+        importance = raw.get("importance")
+        if self.tracker is None:
+            if importance is not None:
+                raise ValueError("TRAINING_CHECKPOINT_IMPORTANCE_MISMATCH")
+        elif not isinstance(importance, Mapping):
+            raise TypeError("TRAINING_CHECKPOINT_IMPORTANCE_STATE_INVALID")
+        return (
+            staged_state,
+            cursor_value,
+            rng_value,
+            staged_records,
+            staged_points,
+            staged_checkpoint_ids,
+        )
+
+    def _capture_resume_install_snapshot(self) -> dict[str, object]:
+        """Capture the complete mutable engine state before a resume install."""
+
+        return {
+            "model": deepcopy(self.model.module.state_dict()),
+            "model_modes": {
+                name: module.training
+                for name, module in self.model.module.named_modules()
+            },
+            "parameter_gradients": {
+                name: None if parameter.grad is None else parameter.grad.detach().clone()
+                for name, parameter in self.model.module.named_parameters(remove_duplicate=True)
+            },
+            "optimizer": deepcopy(self.optimizer.state_dict()),
+            "scheduler": None if self.scheduler is None else deepcopy(self.scheduler.state_dict()),
+            "scaler": None if self.scaler is None else deepcopy(self.scaler.state_dict()),
+            "cursor": deepcopy(dict(self.cursor.state_dict())),
+            "importance": (
+                None
+                if self.tracker is None
+                else deepcopy(self.tracker.accumulator.state_dict())
+            ),
+            "rng": _capture_rng_state(),
+            "state": self.state,
+            "records": list(self._records),
+            "points": list(self._importance_points),
+            "checkpoint_ids": list(self._checkpoint_ids),
+            "boundary_trace": deepcopy(self._boundary_trace),
+        }
+
+    def _validate_checkpoint_ids_against_committed_lineage(
+        self,
+        checkpoint_ids: Sequence[str],
+        *,
+        target_checkpoint_id: str,
+    ) -> None:
+        """Prove payload lineage against immutable commits, never payload alone.
+
+        ``checkpoint_ids`` is a convenience projection saved in the tensor
+        object.  It cannot itself authorise a recovery path: an otherwise
+        hash-valid object can be published by a buggy producer with a missing,
+        reordered, or invented ancestor.  Re-open every committed ancestor
+        before any engine mutation and require the exact root-to-target list.
+        """
+
+        if self.checkpoint_store is None:
+            raise RuntimeError("TRAINING_CHECKPOINT_STORE_NOT_CONFIGURED")
+        chain: list[str] = []
+        current: str | None = target_checkpoint_id
+        seen: set[str] = set()
+        while current is not None:
+            if current in seen:
+                raise ValueError("TRAINING_CHECKPOINT_COMMITTED_LINEAGE_CYCLE")
+            seen.add(current)
+            # ``load`` verifies object bytes, metadata-independent commit
+            # structure, tombstone status, and all parents before we consume
+            # the private parent pointer for this exact reconstruction.
+            self.checkpoint_store.load(current)
+            commit_value = self.checkpoint_store._read_commit(current)  # noqa: SLF001 - recovery authority API lacks lineage projection
+            chain.append(current)
+            parent = commit_value.get("parent_checkpoint_id")
+            if parent is not None and not isinstance(parent, str):
+                raise ValueError("TRAINING_CHECKPOINT_COMMITTED_PARENT_INVALID")
+            current = parent
+        chain.reverse()
+        if list(checkpoint_ids) != chain:
+            raise ValueError("TRAINING_CHECKPOINT_PAYLOAD_LINEAGE_MISMATCH")
+
+    def _restore_resume_install_snapshot(self, snapshot: Mapping[str, object]) -> None:
+        """Restore a failed resume attempt, including all mutable aliases."""
+
+        self.model.module.load_state_dict(snapshot["model"], strict=True)  # type: ignore[arg-type]
+        model_modes = snapshot["model_modes"]
+        parameter_gradients = snapshot["parameter_gradients"]
+        if not isinstance(model_modes, Mapping) or not isinstance(parameter_gradients, Mapping):
+            raise TypeError("TRAINING_CHECKPOINT_ROLLBACK_MODEL_SNAPSHOT_INVALID")
+        modules = dict(self.model.module.named_modules())
+        parameters = dict(self.model.module.named_parameters(remove_duplicate=True))
+        if set(model_modes) != set(modules) or set(parameter_gradients) != set(parameters):
+            raise ValueError("TRAINING_CHECKPOINT_ROLLBACK_MODEL_ALIAS_MISMATCH")
+        for name, module in modules.items():
+            mode = model_modes[name]
+            if type(mode) is not bool:
+                raise TypeError("TRAINING_CHECKPOINT_ROLLBACK_MODEL_MODE_INVALID")
+            module.training = mode
+        for name, parameter in parameters.items():
+            gradient = parameter_gradients[name]
+            if gradient is None:
+                parameter.grad = None
+            elif (
+                not isinstance(gradient, torch.Tensor)
+                or gradient.shape != parameter.shape
+                or gradient.dtype != parameter.dtype
+                or gradient.layout != parameter.layout
+            ):
+                raise ValueError("TRAINING_CHECKPOINT_ROLLBACK_GRADIENT_INVALID")
+            else:
+                parameter.grad = gradient.detach().to(device=parameter.device).clone()
+        self.optimizer.load_state_dict(snapshot["optimizer"])  # type: ignore[arg-type]
+        if self.scheduler is not None:
+            self.scheduler.load_state_dict(snapshot["scheduler"])  # type: ignore[arg-type]
+        if self.scaler is not None:
+            self.scaler.load_state_dict(snapshot["scaler"])  # type: ignore[arg-type]
+        self.cursor.load_state_dict(snapshot["cursor"])  # type: ignore[arg-type]
+        if self.tracker is not None:
+            self.tracker.accumulator.load_state_dict(snapshot["importance"])  # type: ignore[arg-type]
+        _restore_rng_state(snapshot["rng"])  # type: ignore[arg-type]
+        self.state = snapshot["state"]  # type: ignore[assignment]
+        self._records = list(snapshot["records"])  # type: ignore[arg-type]
+        self._importance_points = list(snapshot["points"])  # type: ignore[arg-type]
+        self._checkpoint_ids = list(snapshot["checkpoint_ids"])  # type: ignore[arg-type]
+        self._boundary_trace = deepcopy(snapshot["boundary_trace"])  # type: ignore[arg-type]
+        # ``optimizer.load_state_dict`` may replace param-group dictionaries.
+        # Always rebuild the bridge rather than reusing a stale alias.
+        self.bridge = OptimizerBridge(self.named_parameters, self.optimizer)
 
     def save_checkpoint(self) -> str:
         if self.checkpoint_store is None:
             raise RuntimeError("TRAINING_CHECKPOINT_STORE_NOT_CONFIGURED")
-        checkpoint_id = f"{self.spec.run_id}-step-{self.state.global_step:08d}"
+        checkpoint_id = self._checkpoint_id_for_state()
         metadata = {
             "run_spec_hash": self.spec.spec_hash,
             "registry_hash": self.registry.coordinate_registry_hash,
             "optimizer_contract_hash": self.registry.optimizer_contract_hash,
+            "runtime_layout_hash": self.registry.runtime_layout_hash,
             "world_size": self.reducer.capabilities.world_size,  # type: ignore[attr-defined]
         }
         previous_state = self.state
@@ -1422,7 +1730,17 @@ class TrainingEngine:
             checkpoint_id,
         )
         point: ImportanceTrajectoryPoint | None = None
-        if self.tracker is not None:
+        # A skipped attempt has no new successful-step trajectory coordinate,
+        # but it still receives a complete checkpoint below.  Never emit two
+        # points at one global step merely to make the skip durable.
+        if (
+            self.tracker is not None
+            and self.state.global_step > 0
+            and (
+                not self._importance_points
+                or self._importance_points[-1].global_step != self.state.global_step
+            )
+        ):
             point = ImportanceTrajectoryPoint(
                 self.state.global_step,
                 checkpoint_id,
@@ -1432,8 +1750,12 @@ class TrainingEngine:
         try:
             commit = self.checkpoint_store.publish(
                 checkpoint_id,
-                self._checkpoint_state(),
-                generation=self.state.global_step,
+                self._checkpoint_state(
+                    checkpoint_ids=[*self._checkpoint_ids, checkpoint_id]
+                ),
+                # ``global_step`` does not advance on SKIPPED.  The complete
+                # attempt sequence is the monotonic publication generation.
+                generation=self.state.attempt_index,
                 metadata=metadata,
                 parent_checkpoint_id=previous_state.last_checkpoint_id,
             )
@@ -1480,6 +1802,19 @@ class TrainingEngine:
             )
         return checkpoint_id
 
+    def _checkpoint_id_for_state(self) -> str:
+        """Return the immutable checkpoint identity for this complete attempt.
+
+        Preserve the long-standing ``run-step`` spelling when there have been
+        no skips.  Once an attempt count diverges from successful steps, add a
+        suffix so a post-skip checkpoint cannot collide with the last success.
+        """
+
+        base = f"{self.spec.run_id}-step-{self.state.global_step:08d}"
+        if self.state.attempt_index == self.state.global_step:
+            return base
+        return f"{base}-attempt-{self.state.attempt_index:08d}"
+
     def resume_checkpoint(self, checkpoint_id: str) -> str:
         """从显式指定的权威 checkpoint commit 恢复。
 
@@ -1510,6 +1845,7 @@ class TrainingEngine:
             "run_spec_hash": self.spec.spec_hash,
             "registry_hash": self.registry.coordinate_registry_hash,
             "optimizer_contract_hash": self.registry.optimizer_contract_hash,
+            "runtime_layout_hash": self.registry.runtime_layout_hash,
             "world_size": self.reducer.capabilities.world_size,  # type: ignore[attr-defined]
         }
         if checkpoint_id is None:
@@ -1519,65 +1855,47 @@ class TrainingEngine:
                 checkpoint_id,
                 expected_metadata=expected,
             )
-        if not isinstance(raw, Mapping) or raw.get("schema_version") != "training-checkpoint-state-v1":
+        if not isinstance(raw, Mapping):
             raise ValueError("TRAINING_CHECKPOINT_STATE_INVALID")
-        if raw.get("run_spec_hash") != self.spec.spec_hash:
-            raise ValueError("TRAINING_CHECKPOINT_SPEC_HASH_MISMATCH")
-        state_value = raw.get("training_state")
-        if not isinstance(state_value, Mapping):
-            raise TypeError("TRAINING_CHECKPOINT_CONTROL_STATE_INVALID")
-        staged_state = TrainingState.from_mapping(state_value)
-        cursor_value = raw.get("cursor")
-        rng_value = raw.get("rng")
-        if not isinstance(cursor_value, Mapping) or not isinstance(rng_value, Mapping):
-            raise TypeError("TRAINING_CHECKPOINT_CURSOR_OR_RNG_INVALID")
-        self.model.module.load_state_dict(raw["model"], strict=True)  # type: ignore[arg-type]
-        self.optimizer.load_state_dict(raw["optimizer"])  # type: ignore[arg-type]
-        if self.scheduler is None:
-            if raw.get("scheduler") is not None:
-                raise ValueError("TRAINING_CHECKPOINT_SCHEDULER_MISMATCH")
-        else:
-            self.scheduler.load_state_dict(raw["scheduler"])  # type: ignore[attr-defined]
-        if self.scaler is None:
-            if raw.get("scaler") is not None:
-                raise ValueError("TRAINING_CHECKPOINT_SCALER_MISMATCH")
-        else:
-            self.scaler.load_state_dict(raw["scaler"])  # type: ignore[attr-defined]
-        self.cursor.load_state_dict(cursor_value)
-        raw_records = raw.get("records", [])
-        if not isinstance(raw_records, list) or not all(
-            isinstance(item, Mapping) for item in raw_records
-        ):
-            raise TypeError("TRAINING_CHECKPOINT_RECORDS_INVALID")
-        staged_records = [TrainingStepRecord.from_mapping(item) for item in raw_records]
-        raw_points = raw.get("importance_trajectory_points", [])
-        if not isinstance(raw_points, list) or not all(
-            isinstance(item, Mapping) for item in raw_points
-        ):
-            raise TypeError("TRAINING_CHECKPOINT_TRAJECTORY_POINTS_INVALID")
-        staged_points = [ImportanceTrajectoryPoint.from_mapping(item) for item in raw_points]
-        if self.tracker is None:
-            if raw.get("importance") is not None:
-                raise ValueError("TRAINING_CHECKPOINT_IMPORTANCE_MISMATCH")
-        else:
-            importance = raw.get("importance")
-            if not isinstance(importance, Mapping):
-                raise TypeError("TRAINING_CHECKPOINT_IMPORTANCE_STATE_INVALID")
-            self.tracker.accumulator.load_state_dict(importance)
-        _restore_rng_state(rng_value)
-        # optimizer.load_state_dict 允许替换 param-group 字典，因此恢复后重新绑定
-        # bridge，避免继续读取恢复前的学习率或静态 options 引用。
-        self.bridge = OptimizerBridge(self.named_parameters, self.optimizer)
-        self.state = TrainingState(
-            staged_state.global_step,
-            staged_state.attempt_index,
-            staged_state.skipped_steps,
-            staged_state.event_sequence,
-            commit.checkpoint_id,
+        (
+            staged_state,
+            cursor_value,
+            rng_value,
+            staged_records,
+            staged_points,
+            staged_checkpoint_ids,
+        ) = self._validate_checkpoint_payload_for_install(raw)
+        if staged_state.last_checkpoint_id != commit.checkpoint_id:
+            raise ValueError("TRAINING_CHECKPOINT_COMMIT_LINEAGE_MISMATCH")
+        self._validate_checkpoint_ids_against_committed_lineage(
+            staged_checkpoint_ids,
+            target_checkpoint_id=commit.checkpoint_id,
         )
-        self._records = staged_records
-        self._importance_points = staged_points
-        self._checkpoint_ids.append(commit.checkpoint_id)
+        snapshot = self._capture_resume_install_snapshot()
+        try:
+            self.model.module.load_state_dict(raw["model"], strict=True)  # type: ignore[arg-type]
+            self.optimizer.load_state_dict(raw["optimizer"])  # type: ignore[arg-type]
+            if self.scheduler is not None:
+                self.scheduler.load_state_dict(raw["scheduler"])  # type: ignore[attr-defined]
+            if self.scaler is not None:
+                self.scaler.load_state_dict(raw["scaler"])  # type: ignore[attr-defined]
+            self.cursor.load_state_dict(cursor_value)
+            if self.tracker is not None:
+                self.tracker.accumulator.load_state_dict(raw["importance"])  # type: ignore[arg-type]
+            _restore_rng_state(rng_value)
+            # optimizer.load_state_dict 允许替换 param-group 字典，因此恢复后重新绑定
+            # bridge，避免继续读取恢复前的学习率或静态 options 引用。
+            self.bridge = OptimizerBridge(self.named_parameters, self.optimizer)
+            self.state = staged_state
+            self._records = staged_records
+            self._importance_points = staged_points
+            self._checkpoint_ids = staged_checkpoint_ids
+        except Exception:
+            try:
+                self._restore_resume_install_snapshot(snapshot)
+            except Exception as rollback_error:
+                raise RuntimeError("TRAINING_CHECKPOINT_INSTALL_ROLLBACK_FAILED") from rollback_error
+            raise
         return commit.checkpoint_id
 
     def _run_attempt(self, microbatches: Sequence[TrainingMicrobatch]) -> TrainingStepRecord:
@@ -1897,8 +2215,10 @@ class TrainingEngine:
             record = self._run_attempt(microbatches)
             self._records.append(record)
             if (
-                record.status == "COMMITTED"
-                and self.spec.should_checkpoint(self.state.global_step)
+                (
+                    record.status == "SKIPPED"
+                    or self.spec.should_checkpoint(self.state.global_step)
+                )
                 and self.checkpoint_store is not None
             ):
                 self.save_checkpoint()
@@ -1928,9 +2248,8 @@ class TrainingEngine:
             status = "DATA_EXHAUSTED" if exhausted else "MAX_ATTEMPTS_REACHED"
         if (
             self.checkpoint_store is not None
-            and self.state.global_step > 0
             and self.state.last_checkpoint_id
-            != f"{self.spec.run_id}-step-{self.state.global_step:08d}"
+            != self._checkpoint_id_for_state()
         ):
             self.save_checkpoint()
         self._emit(EventType.RUN_LIFECYCLE, {"status": status}, critical=True)
