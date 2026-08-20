@@ -187,7 +187,7 @@ IMPLEMENTATION_SOURCE_FILES = (
     "src/param_importance_nlp/core/accumulator.py", "src/param_importance_nlp/core/errors.py", "src/param_importance_nlp/core/tensors.py",
     "src/param_importance_nlp/g3_runtime_assets.py", "src/param_importance_nlp/runtime/operations.py", "src/param_importance_nlp/runtime/task_artifacts.py",
     "configs/stage0/g3-asset-requirements-v1.json", "configs/stage0/g3-asset-layout-v1.json",
-    "schemas/stage1/s1-8-array-bundle-v1.json", "schemas/stage1/s1-8-comparison-table-v1.json", "schemas/stage1/s1-8-comparison-table-v2.json", "schemas/stage1/s1-8-ddp-report-v1.json", "schemas/stage1/s1-8-ddp-report-v2.json", "schemas/stage1/s1-8-ddp-report-v3.json", "schemas/stage1/s1-8-ddp-report-v4.json", "schemas/stage1/s1-8-ddp-report-v5.json", "schemas/stage1/s1-8-ddp-report-v6.json", "schemas/stage1/s1-8-fixture-manifest-v1.json", "schemas/stage1/s1-8-fixture-manifest-v2.json", "schemas/stage1/s1-8-fixture-manifest-v3.json", "schemas/stage1/s1-8-formalization-index-v1.json", "schemas/stage1/s1-8-formalization-index-v2.json", "schemas/stage1/s1-8-formalization-index-v3.json", "schemas/stage1/s1-8-formalization-index-v4.json", "schemas/stage1/s1-8-formalization-index-v5.json", "schemas/stage1/s1-8-formalization-index-v6.json", "schemas/stage1/s1-8-gate-record-v1.json", "schemas/stage1/s1-8-gpu-quiescence-v1.json", "schemas/stage1/s1-8-gpu-quiescence-v2.json", "schemas/stage1/s1-8-gpu-quiescence-v3.json", "schemas/stage1/s1-8-replay-validation-v1.json", "schemas/stage1/s1-8-replay-validation-v2.json", "schemas/stage1/s1-8-replay-validation-v3.json", "schemas/stage1/s1-8-safetensors-manifest-v1.json", "schemas/stage1/s1-8-validation-v1.json", "schemas/stage1/s1-8-validation-v2.json", "schemas/stage1/s1-8-validation-v3.json", "schemas/stage1/s1-8-validation-v4.json", "schemas/stage1/s1-8-validation-v5.json", "schemas/stage1/s1-8-validation-v6.json", "schemas/stage1/s1-8-worker-report-v1.json",
+    "schemas/stage1/s1-8-array-bundle-v1.json", "schemas/stage1/s1-8-array-bundle-v2.json", "schemas/stage1/s1-8-comparison-table-v1.json", "schemas/stage1/s1-8-comparison-table-v2.json", "schemas/stage1/s1-8-ddp-report-v1.json", "schemas/stage1/s1-8-ddp-report-v2.json", "schemas/stage1/s1-8-ddp-report-v3.json", "schemas/stage1/s1-8-ddp-report-v4.json", "schemas/stage1/s1-8-ddp-report-v5.json", "schemas/stage1/s1-8-ddp-report-v6.json", "schemas/stage1/s1-8-ddp-report-v7.json", "schemas/stage1/s1-8-fixture-manifest-v1.json", "schemas/stage1/s1-8-fixture-manifest-v2.json", "schemas/stage1/s1-8-fixture-manifest-v3.json", "schemas/stage1/s1-8-formalization-index-v1.json", "schemas/stage1/s1-8-formalization-index-v2.json", "schemas/stage1/s1-8-formalization-index-v3.json", "schemas/stage1/s1-8-formalization-index-v4.json", "schemas/stage1/s1-8-formalization-index-v5.json", "schemas/stage1/s1-8-formalization-index-v6.json", "schemas/stage1/s1-8-formalization-index-v7.json", "schemas/stage1/s1-8-gate-record-v1.json", "schemas/stage1/s1-8-gpu-quiescence-v1.json", "schemas/stage1/s1-8-gpu-quiescence-v2.json", "schemas/stage1/s1-8-gpu-quiescence-v3.json", "schemas/stage1/s1-8-replay-validation-v1.json", "schemas/stage1/s1-8-replay-validation-v2.json", "schemas/stage1/s1-8-replay-validation-v3.json", "schemas/stage1/s1-8-safetensors-manifest-v1.json", "schemas/stage1/s1-8-validation-v1.json", "schemas/stage1/s1-8-validation-v2.json", "schemas/stage1/s1-8-validation-v3.json", "schemas/stage1/s1-8-validation-v4.json", "schemas/stage1/s1-8-validation-v5.json", "schemas/stage1/s1-8-validation-v6.json", "schemas/stage1/s1-8-validation-v7.json", "schemas/stage1/s1-8-worker-report-v1.json",
 )
 
 
@@ -369,6 +369,13 @@ def _self_hash(value: Mapping[str, Any]) -> bool:
     return isinstance(declared, str) and declared == _canonical(body)
 
 
+def _fixture_self_hash(value: Mapping[str, Any]) -> bool:
+    """Validate the fixture's deliberately distinct ``fixture_hash`` wire."""
+
+    body = dict(value); declared = body.pop("fixture_hash", None)
+    return isinstance(declared, str) and declared == _canonical(body)
+
+
 def _write(path: Path, value: Mapping[str, Any]) -> None:
     from param_importance_nlp.contracts.jsonio import write_canonical_json
     if path.exists():
@@ -392,10 +399,10 @@ def _validate_output_schemas(repository: Path, objects: Mapping[str, Mapping[str
             raise Stage1S18FormalError("S18_SCHEMA_REGISTRY_INVALID:" + path.name)
         registry[path.name] = value; registry[str(value["$id"])] = value
     filenames = {
-        "fixture_manifest": "s1-8-fixture-manifest-v3.json", "ddp_report": "s1-8-ddp-report-v6.json",
-        "array_bundle": "s1-8-array-bundle-v1.json", "comparison_table": "s1-8-comparison-table-v2.json",
+        "fixture_manifest": "s1-8-fixture-manifest-v3.json", "ddp_report": "s1-8-ddp-report-v7.json",
+        "array_bundle": "s1-8-array-bundle-v2.json", "comparison_table": "s1-8-comparison-table-v2.json",
         "gate_record": "s1-8-gate-record-v1.json", "replay": "s1-8-replay-validation-v3.json",
-        "validation": "s1-8-validation-v6.json", "index": "s1-8-formalization-index-v6.json",
+        "validation": "s1-8-validation-v7.json", "index": "s1-8-formalization-index-v7.json",
         "worker_report": "s1-8-worker-report-v1.json", "safetensors_manifest": "s1-8-safetensors-manifest-v1.json",
         "gpu_quiescence": "s1-8-gpu-quiescence-v3.json",
     }
@@ -414,9 +421,9 @@ def _schema_prepublication_check(repository: Path, objects: Mapping[str, Mapping
 
     from param_importance_nlp.contracts.jsonio import loads_strict_json
     expected = {
-        "s1-8-array-bundle-v1.json", "s1-8-comparison-table-v1.json", "s1-8-comparison-table-v2.json", "s1-8-ddp-report-v1.json", "s1-8-ddp-report-v2.json", "s1-8-ddp-report-v3.json", "s1-8-ddp-report-v4.json", "s1-8-ddp-report-v5.json", "s1-8-ddp-report-v6.json",
-        "s1-8-fixture-manifest-v1.json", "s1-8-fixture-manifest-v2.json", "s1-8-fixture-manifest-v3.json", "s1-8-formalization-index-v1.json", "s1-8-formalization-index-v2.json", "s1-8-formalization-index-v3.json", "s1-8-formalization-index-v4.json", "s1-8-formalization-index-v5.json", "s1-8-formalization-index-v6.json", "s1-8-gate-record-v1.json", "s1-8-gpu-quiescence-v1.json", "s1-8-gpu-quiescence-v2.json", "s1-8-gpu-quiescence-v3.json",
-        "s1-8-replay-validation-v1.json", "s1-8-replay-validation-v2.json", "s1-8-replay-validation-v3.json", "s1-8-safetensors-manifest-v1.json", "s1-8-validation-v1.json", "s1-8-validation-v2.json", "s1-8-validation-v3.json", "s1-8-validation-v4.json", "s1-8-validation-v5.json", "s1-8-validation-v6.json", "s1-8-worker-report-v1.json",
+        "s1-8-array-bundle-v1.json", "s1-8-array-bundle-v2.json", "s1-8-comparison-table-v1.json", "s1-8-comparison-table-v2.json", "s1-8-ddp-report-v1.json", "s1-8-ddp-report-v2.json", "s1-8-ddp-report-v3.json", "s1-8-ddp-report-v4.json", "s1-8-ddp-report-v5.json", "s1-8-ddp-report-v6.json", "s1-8-ddp-report-v7.json",
+        "s1-8-fixture-manifest-v1.json", "s1-8-fixture-manifest-v2.json", "s1-8-fixture-manifest-v3.json", "s1-8-formalization-index-v1.json", "s1-8-formalization-index-v2.json", "s1-8-formalization-index-v3.json", "s1-8-formalization-index-v4.json", "s1-8-formalization-index-v5.json", "s1-8-formalization-index-v6.json", "s1-8-formalization-index-v7.json", "s1-8-gate-record-v1.json", "s1-8-gpu-quiescence-v1.json", "s1-8-gpu-quiescence-v2.json", "s1-8-gpu-quiescence-v3.json",
+        "s1-8-replay-validation-v1.json", "s1-8-replay-validation-v2.json", "s1-8-replay-validation-v3.json", "s1-8-safetensors-manifest-v1.json", "s1-8-validation-v1.json", "s1-8-validation-v2.json", "s1-8-validation-v3.json", "s1-8-validation-v4.json", "s1-8-validation-v5.json", "s1-8-validation-v6.json", "s1-8-validation-v7.json", "s1-8-worker-report-v1.json",
     }
     paths = {path.name: path for path in (repository / "schemas" / "stage1").glob("s1-8-*.json")}
     if set(paths) != expected:
@@ -715,7 +722,7 @@ def _candidate_publication_check(
         objects["comparison_table"], objects["gate_record"], objects["replay"],
         objects["validation"], objects["index"],
     )
-    if any(not _self_hash(value) for value in objects.values()):
+    if not _fixture_self_hash(fixture) or any(not _self_hash(value) for role, value in objects.items() if role != "fixture_manifest"):
         raise Stage1S18FormalError("S18_CANDIDATE_SELF_HASH_INVALID")
     role_names = {
         "fixture_manifest": "fixture-manifest.json", "ddp_report": "ddp-report.json",
@@ -3129,7 +3136,7 @@ def execute(*, repository: Path, data_root: Path, s1_7_index_ref: str, gpu_capab
             phase: {"ref": filename, "sha256": _sha(work / filename)}
             for phase, filename in GPU_QUIESCENCE_ROLES.items()
         }
-        ddp_report = _with_hash({"schema_version": "stage1-s1-8-ddp-report-v6", "status": "PASS", "task_id": TASK_ID, "fixture_hash": fixture["fixture_hash"], "fixture_schema_version": fixture["schema_version"], "fixture_id": fixture["fixture_id"], "nccl_transport_protocol": nccl_transport, "implementation_source_sha256": source_hashes, "baseline_routes": baseline_reports, "permutation_routes": permutation_reports, "negative_controls": negative, "gpu_quiescence": gpu_quiescence_bindings}); _write(work / "ddp-report.json", ddp_report)
+        ddp_report = _with_hash({"schema_version": "stage1-s1-8-ddp-report-v7", "status": "PASS", "task_id": TASK_ID, "fixture_hash": fixture["fixture_hash"], "fixture_schema_version": fixture["schema_version"], "fixture_id": fixture["fixture_id"], "nccl_transport_protocol": nccl_transport, "implementation_source_sha256": source_hashes, "baseline_routes": baseline_reports, "permutation_routes": permutation_reports, "negative_controls": negative, "gpu_quiescence": gpu_quiescence_bindings}); _write(work / "ddp-report.json", ddp_report)
         csv_hashes, svg_hashes = _charts(work, result, ddp_report, baseline_arrays)
         # It is intentionally written only after every worker output, replay,
         # report and chart exists, and excludes itself from the measured scope.
@@ -3165,7 +3172,7 @@ def execute(*, repository: Path, data_root: Path, s1_7_index_ref: str, gpu_capab
             if reproduction_sources.get(report_published) != report_source:
                 raise Stage1S18FormalError("S18_ARRAY_MANIFEST_PUBLISHED_REF_MISSING:" + route_key)
             array_descriptors[route_key] = {"artifact_ref": published, "manifest_ref": report_published, "file_sha256": manifest["file_sha256"], "file_size_bytes": manifest["file_size_bytes"], "manifest_hash": manifest["artifact_hash"]}
-        arrays_bundle = _with_hash({"schema_version": "stage1-s1-8-array-bundle-v1", "status": "PASS", "route_artifacts": array_descriptors})
+        arrays_bundle = _with_hash({"schema_version": "stage1-s1-8-array-bundle-v2", "status": "PASS", "route_artifacts": array_descriptors})
         _write(work / "array-bundle.json", arrays_bundle)
         all_worker_reports = {**baseline_reports, **{f"D-{permutation}": report for permutation, report in permutation_reports.items()}}
         base_requirements = {
@@ -3206,8 +3213,8 @@ def execute(*, repository: Path, data_root: Path, s1_7_index_ref: str, gpu_capab
             requirements = {**base_requirements, "schemas_and_atomic_publication": schema_result}
             gate_value = _with_hash({"schema_version": "stage1-s1-8-gate-record-v1", "status": "PASS", "gate_id": GATE_ID, "task_id": TASK_ID, "requirements": requirements})
             role_hashes = {role: _canonical_file_sha(value) for role, value in {"fixture_manifest": fixture, "ddp_report": ddp_report, "array_bundle": arrays_bundle, "comparison_table": table, "gate_record": gate_value}.items()}
-            validation_value = _with_hash({"schema_version": "stage1-s1-8-validation-v6", "status": "PASS", "task_id": TASK_ID, "gate_id": GATE_ID, "producer_commit": commit, "fixture_schema_version": fixture["schema_version"], "fixture_id": fixture["fixture_id"], "checks": [{"check_id": identifier, "status": "PASS", "detail": identifier.replace("_", " ")} for identifier in GATE_CHECK_IDS], "role_sha256": role_hashes, "gpu_quiescence": gpu_quiescence_bindings})
-            index_value = _with_hash({"schema_version": "stage1-s1-8-formalization-index-v6", "status": "PASS", "gate_id": GATE_ID, "task_id": TASK_ID, "generator_git_commit": commit, "consumer_git_commit": commit, "fixture_schema_version": fixture["schema_version"], "fixture_id": fixture["fixture_id"], "gpu_capability": capability, "nccl_transport_protocol": nccl_transport, "implementation_source_sha256": source_hashes, "s1_7_handoff": handoff_for_index, "role_refs": role_files, "role_sha256": role_hashes, "reproduction_role_refs": reproduction, "reproduction_role_sha256": reproduction_sha, "gate_artifact_hash": gate_value["artifact_hash"], "validation_ref": "validation.json", "validation_sha256": _canonical_file_sha(validation_value), "replay_ref": "replay-validation.json", "replay_sha256": _canonical_file_sha(replay_record), "next_task_ids": ["stage1.10_checkpoint_resume_and_artifacts"]})
+            validation_value = _with_hash({"schema_version": "stage1-s1-8-validation-v7", "status": "PASS", "task_id": TASK_ID, "gate_id": GATE_ID, "producer_commit": commit, "fixture_schema_version": fixture["schema_version"], "fixture_id": fixture["fixture_id"], "checks": [{"check_id": identifier, "status": "PASS", "detail": identifier.replace("_", " ")} for identifier in GATE_CHECK_IDS], "role_sha256": role_hashes, "gpu_quiescence": gpu_quiescence_bindings})
+            index_value = _with_hash({"schema_version": "stage1-s1-8-formalization-index-v7", "status": "PASS", "gate_id": GATE_ID, "task_id": TASK_ID, "generator_git_commit": commit, "consumer_git_commit": commit, "fixture_schema_version": fixture["schema_version"], "fixture_id": fixture["fixture_id"], "gpu_capability": capability, "nccl_transport_protocol": nccl_transport, "implementation_source_sha256": source_hashes, "s1_7_handoff": handoff_for_index, "role_refs": role_files, "role_sha256": role_hashes, "reproduction_role_refs": reproduction, "reproduction_role_sha256": reproduction_sha, "gate_artifact_hash": gate_value["artifact_hash"], "validation_ref": "validation.json", "validation_sha256": _canonical_file_sha(validation_value), "replay_ref": "replay-validation.json", "replay_sha256": _canonical_file_sha(replay_record), "next_task_ids": ["stage1.10_checkpoint_resume_and_artifacts"]})
             values = {"fixture_manifest": fixture, "ddp_report": ddp_report, "array_bundle": arrays_bundle, "comparison_table": table, "gate_record": gate_value, "replay": replay_record, "validation": validation_value, "index": index_value}
             return values, role_hashes, gate_value, validation_value, index_value
 
