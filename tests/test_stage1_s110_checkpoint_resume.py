@@ -861,8 +861,29 @@ def test_s110_resume_loads_source_before_isolating_output_store() -> None:
     worker = importlib.util.module_from_spec(worker_spec)
     worker_spec.loader.exec_module(worker)
 
+    class Commit:
+        def __init__(self, *, parent: str | None, generation: int) -> None:
+            self.parent_checkpoint_id = parent
+            self.generation = generation
+            self.metadata = {"source": True}
+
+    class SourceStore:
+        def load(self, checkpoint_id: str) -> tuple[dict[str, str], Commit]:
+            if checkpoint_id == "source-parent":
+                return {"checkpoint_id": checkpoint_id}, Commit(parent=None, generation=1)
+            return {"checkpoint_id": checkpoint_id}, Commit(parent="source-parent", generation=2)
+
+    class OutputStore:
+        published: list[tuple[object, ...]] = []
+
+        def publish(self, checkpoint_id: str, state: object, **kwargs: object) -> None:
+            self.published.append((checkpoint_id, state, kwargs))
+
+    source_store = SourceStore()
+    output_store = OutputStore()
+
     class FakeEngine:
-        checkpoint_store = "source-store"
+        checkpoint_store = source_store
         events: list[object] = []
 
         def resume_checkpoint(self, checkpoint_id: str) -> None:
@@ -872,10 +893,22 @@ def test_s110_resume_loads_source_before_isolating_output_store() -> None:
             self.events.append(("run", self.checkpoint_store))
 
     engine = FakeEngine()
-    worker._resume_and_run(engine, "source-checkpoint", output_store="isolated-output-store")
+    worker._resume_and_run(engine, "source-checkpoint", output_store=output_store)
+    assert output_store.published == [
+        (
+            "source-parent",
+            {"checkpoint_id": "source-parent"},
+            {"generation": 1, "metadata": {"source": True}, "parent_checkpoint_id": None},
+        ),
+        (
+            "source-checkpoint",
+            {"checkpoint_id": "source-checkpoint"},
+            {"generation": 2, "metadata": {"source": True}, "parent_checkpoint_id": "source-parent"},
+        )
+    ]
     assert engine.events == [
-        ("resume", "source-checkpoint", "source-store"),
-        ("run", "isolated-output-store"),
+        ("resume", "source-checkpoint", source_store),
+        ("run", output_store),
     ]
 
 

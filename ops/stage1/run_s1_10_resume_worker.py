@@ -94,9 +94,26 @@ def _source_process_exited(source_pid: object, source_identity: object) -> bool:
     return True
 
 
-def _resume_and_run(engine: Any, checkpoint_id: str, *, output_store: Any) -> None:
-    """Load from the immutable source store, then isolate resumed writes."""
+def _copy_checkpoint_lineage(source_store: Any, output_store: Any, checkpoint_id: str) -> None:
+    state, commit = source_store.load(checkpoint_id)
+    if commit.parent_checkpoint_id is not None:
+        _copy_checkpoint_lineage(source_store, output_store, commit.parent_checkpoint_id)
+    output_store.publish(
+        checkpoint_id,
+        state,
+        generation=commit.generation,
+        metadata=commit.metadata,
+        parent_checkpoint_id=commit.parent_checkpoint_id,
+    )
 
+
+def _resume_and_run(engine: Any, checkpoint_id: str, *, output_store: Any) -> None:
+    """Load from immutable source, clone only its lineage, then isolate writes."""
+
+    source_store = engine.checkpoint_store
+    if source_store is None:
+        raise RuntimeError("S1_10_RESUME_SOURCE_STORE_MISSING")
+    _copy_checkpoint_lineage(source_store, output_store, checkpoint_id)
     engine.resume_checkpoint(checkpoint_id)
     engine.checkpoint_store = output_store
     engine.run()
