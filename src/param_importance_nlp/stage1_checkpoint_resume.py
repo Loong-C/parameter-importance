@@ -632,7 +632,7 @@ def build_stage1_s110_evidence(
         "s1_8_and_s1_9_formal_handoffs_are_parameter_pinned": isinstance(upstream_evidence, Mapping) and set(upstream_evidence) == {"s1_8", "s1_9"},
         "four_rank_resume_observation_required_for_formal_gate": formal_valid,
     }
-    if tuple(requirements) != REQUIREMENT_KEYS:
+    if set(requirements) != set(REQUIREMENT_KEYS):
         raise Stage1CheckpointError("S1_10_REQUIREMENT_KEYSET_DRIFT")
     status = "PASS" if all(requirements.values()) else "NOT_RUN" if not formal_valid else "FAIL"
     trace = _with_hash({"schema_version": TRACE_SCHEMA, "fixture_id": FIXTURE_ID, "fixture_hash": fixture["fixture_hash"], "continuous": continuous, "resume_cases": cases, "corruption_rejections": corruption, "formal_observation": observation}, field="trace_hash")
@@ -661,7 +661,7 @@ def validate_stage1_s110_evidence(evidence: Mapping[str, Any], *, source_root: s
     if report.get("gate_id") != GATE_ID or report.get("task_id") != TASK_ID or gate.get("requirements") != report.get("requirements"):
         raise Stage1CheckpointError("S1_10_REPORT_GATE_BINDING_INVALID")
     requirements = report.get("requirements")
-    if not isinstance(requirements, Mapping) or tuple(requirements) != REQUIREMENT_KEYS or any(type(value) is not bool for value in requirements.values()):
+    if not isinstance(requirements, Mapping) or set(requirements) != set(REQUIREMENT_KEYS) or any(type(value) is not bool for value in requirements.values()):
         raise Stage1CheckpointError("S1_10_REQUIREMENTS_INVALID")
     if (report.get("status") == "PASS" or gate.get("status") == "PASS") and not all(requirements.values()):
         raise Stage1CheckpointError("S1_10_PASS_WITH_FALSE_REQUIREMENT")

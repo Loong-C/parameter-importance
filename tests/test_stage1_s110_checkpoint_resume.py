@@ -15,7 +15,7 @@ import pytest
 import torch
 
 from param_importance_nlp.core.losses import LossBatch
-from param_importance_nlp.contracts.jsonio import canonical_json_hash, write_canonical_json
+from param_importance_nlp.contracts.jsonio import canonical_json_hash, load_canonical_json, write_canonical_json
 from param_importance_nlp.providers import DeterministicBatchCursor, TorchModelAdapter, TrainingMicrobatch
 from param_importance_nlp.runtime import CheckpointStore, JsonlEventSink
 from param_importance_nlp.runtime.checkpoint_group import GROUP_COMMIT_SCHEMA, GROUP_COMMIT_SCHEMA_V2, CheckpointGroupStore
@@ -398,6 +398,15 @@ def test_s110_fixture_oracle_evidence_and_independent_replay(tmp_path: Path) -> 
     replay = replay_stage1_s110_evidence(evidence, source_root=ROOT, scratch_root=tmp_path / "replay")
     assert replay["status"] == "PASS"
     assert replay["source_gate_artifact_hash"] == hashes["gate_artifact_hash"]
+    persisted: dict[str, object] = {}
+    for role, value in evidence.items():
+        role_path = tmp_path / f"{role}.json"
+        write_canonical_json(role_path, value)
+        persisted[role] = load_canonical_json(role_path)
+    validate_stage1_s110_evidence(persisted, source_root=ROOT)
+    assert replay_stage1_s110_evidence(
+        persisted, source_root=ROOT, scratch_root=tmp_path / "persisted-replay"
+    )["status"] == "PASS"
     formalizer_spec = importlib.util.spec_from_file_location(
         "s110_formalizer_schema_test", ROOT / "ops" / "stage1" / "formalize_s1_10.py"
     )
