@@ -21,6 +21,7 @@ from .checkpoint import CheckpointStore
 
 
 GROUP_COMMIT_SCHEMA = "runtime.checkpoint-group-commit.v1"
+GROUP_COMMIT_SCHEMA_V2 = "runtime.checkpoint-group-commit.v2"
 GROUP_LATEST_SCHEMA = "runtime.checkpoint-group-latest.v1"
 GROUP_EVENT_SCHEMA = "runtime.checkpoint-group-event.v1"
 GROUP_LINEAGE_SCHEMA = "runtime.checkpoint-group-lineage.v1"
@@ -106,6 +107,10 @@ class CheckpointGroupCommit:
     commit_sha256: str
     rank_checkpoints: tuple[Mapping[str, Any], ...]
     metadata: Mapping[str, Any]
+    schema_version: str = GROUP_COMMIT_SCHEMA
+    global_step: int | None = None
+    successful_optimizer_step: int | None = None
+    skip_count: int | None = None
 
 
 class CheckpointGroupStore:
@@ -145,8 +150,8 @@ class CheckpointGroupStore:
         return path
 
     @staticmethod
-    def _validate_training_state(state: Any, *, expected_step: int) -> Mapping[str, Any]:
-        required = {
+    def _validate_training_state(state: Any, *, expected_generation: int) -> Mapping[str, Any]:
+        v1_required = {
             "schema_version",
             "run_spec_hash",
             "registry_hash",
@@ -163,18 +168,81 @@ class CheckpointGroupStore:
             "records",
             "importance_trajectory_points",
         }
-        if not isinstance(state, Mapping) or set(state) != required:
+        v2_required = v1_required | {"checkpoint_ids"}
+        if not isinstance(state, Mapping):
             raise ValueError("CHECKPOINT_GROUP_TRAINING_STATE_FIELDS_INVALID")
-        if state.get("schema_version") != "training-checkpoint-state-v1":
+        version = state.get("schema_version")
+        if version == "training-checkpoint-state-v1":
+            if set(state) != v1_required:
+                raise ValueError("CHECKPOINT_GROUP_TRAINING_STATE_FIELDS_INVALID")
+        elif version == "training-checkpoint-state-v2":
+            if set(state) != v2_required:
+                raise ValueError("CHECKPOINT_GROUP_TRAINING_STATE_FIELDS_INVALID")
+        else:
             raise ValueError("CHECKPOINT_GROUP_TRAINING_STATE_VERSION_INVALID")
         control = state.get("training_state")
-        if not isinstance(control, Mapping) or control.get("global_step") != expected_step:
+        if not isinstance(control, Mapping):
             raise ValueError("CHECKPOINT_GROUP_STEP_BOUNDARY_MISMATCH")
+        if version == "training-checkpoint-state-v1" and control.get("global_step") != expected_generation:
+            raise ValueError("CHECKPOINT_GROUP_STEP_BOUNDARY_MISMATCH")
+        if version == "training-checkpoint-state-v2":
+            global_step, attempt_index, skipped_steps = (
+                control.get("global_step"),
+                control.get("attempt_index"),
+                control.get("skipped_steps"),
+            )
+            if (
+                any(isinstance(item, bool) or not isinstance(item, int) or item < 0 for item in (global_step, attempt_index, skipped_steps))
+                or global_step + skipped_steps != attempt_index
+                or attempt_index != expected_generation
+            ):
+                raise ValueError("CHECKPOINT_GROUP_ATTEMPT_BOUNDARY_MISMATCH")
+            checkpoint_ids = state.get("checkpoint_ids")
+            if (
+                not isinstance(checkpoint_ids, list)
+                or not checkpoint_ids
+                or not all(isinstance(item, str) and item for item in checkpoint_ids)
+                or len(set(checkpoint_ids)) != len(checkpoint_ids)
+                or control.get("last_checkpoint_id") != checkpoint_ids[-1]
+            ):
+                raise ValueError("CHECKPOINT_GROUP_V2_LINEAGE_INVALID")
         if not isinstance(state.get("rng"), Mapping) or not isinstance(state.get("cursor"), Mapping):
             raise ValueError("CHECKPOINT_GROUP_RNG_OR_CURSOR_MISSING")
         if not isinstance(state.get("records"), list):
             raise ValueError("CHECKPOINT_GROUP_RECORDS_INVALID")
         return state
+
+    @staticmethod
+    def _validate_rank_payload_lineage(
+        store: CheckpointStore,
+        state: Mapping[str, Any],
+        *,
+        checkpoint_id: str,
+    ) -> None:
+        """Bind v2's convenience ID list to the immutable rank commit chain."""
+
+        if state.get("schema_version") != "training-checkpoint-state-v2":
+            return
+        declared = state.get("checkpoint_ids")
+        if not isinstance(declared, list):  # guarded above; retain local proof.
+            raise ValueError("CHECKPOINT_GROUP_V2_LINEAGE_INVALID")
+        chain: list[str] = []
+        current: str | None = checkpoint_id
+        seen: set[str] = set()
+        while current is not None:
+            if current in seen:
+                raise ValueError("CHECKPOINT_GROUP_RANK_LINEAGE_CYCLE")
+            seen.add(current)
+            store.load(current)
+            commit = store._read_commit(current)  # noqa: SLF001 - exact committed-parent reconstruction
+            chain.append(current)
+            parent = commit.get("parent_checkpoint_id")
+            if parent is not None and not isinstance(parent, str):
+                raise ValueError("CHECKPOINT_GROUP_RANK_PARENT_INVALID")
+            current = parent
+        chain.reverse()
+        if declared != chain:
+            raise ValueError("CHECKPOINT_GROUP_V2_PAYLOAD_LINEAGE_MISMATCH")
 
     def _rank_binding(
         self,
@@ -192,7 +260,13 @@ class CheckpointGroupStore:
         checkpoint_id = self._validate_id(raw.get("checkpoint_id"), field="rank_checkpoint_id")
         store = CheckpointStore(store_path)
         state, commit = store.load(checkpoint_id, expected_metadata={"world_size": world_size})
-        state = self._validate_training_state(state, expected_step=generation)
+        state = self._validate_training_state(state, expected_generation=generation)
+        self._validate_rank_payload_lineage(store, state, checkpoint_id=checkpoint_id)
+        if (
+            state.get("schema_version") == "training-checkpoint-state-v2"
+            and state["training_state"].get("last_checkpoint_id") != checkpoint_id  # type: ignore[index]
+        ):
+            raise ValueError("CHECKPOINT_GROUP_V2_CURRENT_COMMIT_LINEAGE_MISMATCH")
         commit_path = store.commits / f"{checkpoint_id}.json"
         event = raw.get("event_pointer")
         if not isinstance(event, Mapping) or set(event) != {
@@ -277,6 +351,7 @@ class CheckpointGroupStore:
         metadata: Mapping[str, Any],
         parent_checkpoint_id: str | None = None,
         derive_views: bool = True,
+        commit_schema_version: str = GROUP_COMMIT_SCHEMA,
     ) -> CheckpointGroupCommit:
         checkpoint_id = self._validate_id(checkpoint_id, field="checkpoint_id")
         if isinstance(generation, bool) or not isinstance(generation, int) or generation < 0:
@@ -287,6 +362,8 @@ class CheckpointGroupStore:
             raise ValueError("CHECKPOINT_GROUP_WORLD_SIZE_INVALID")
         if len(rank_checkpoints) != world_size:
             raise ValueError("CHECKPOINT_GROUP_RANK_COUNT_INVALID")
+        if commit_schema_version not in {GROUP_COMMIT_SCHEMA, GROUP_COMMIT_SCHEMA_V2}:
+            raise ValueError("CHECKPOINT_GROUP_COMMIT_SCHEMA_VERSION_INVALID")
         if parent_checkpoint_id is not None:
             parent_checkpoint_id = self._validate_id(parent_checkpoint_id, field="parent")
             parent = self._read_and_validate(parent_checkpoint_id)
@@ -298,11 +375,35 @@ class CheckpointGroupStore:
         if commit_path.exists():
             raise FileExistsError(f"CHECKPOINT_GROUP_COMMIT_EXISTS:{checkpoint_id}")
         bindings: list[dict[str, Any]] = []
+        states: list[Mapping[str, Any]] = []
         for rank, raw in enumerate(rank_checkpoints):
-            binding, _ = self._rank_binding(
+            binding, state = self._rank_binding(
                 raw, rank=rank, world_size=world_size, generation=generation
             )
             bindings.append(binding)
+            states.append(state)
+        versions = {state.get("schema_version") for state in states}
+        if versions not in ({"training-checkpoint-state-v1"}, {"training-checkpoint-state-v2"}):
+            raise ValueError("CHECKPOINT_GROUP_TRAINING_STATE_VERSION_DRIFT")
+        legacy_equivalent_v2 = (
+            versions == {"training-checkpoint-state-v2"}
+            and all(
+                isinstance(state.get("training_state"), Mapping)
+                and state["training_state"].get("skipped_steps") == 0
+                and state["training_state"].get("global_step") == generation
+                and state["training_state"].get("attempt_index") == generation
+                for state in states
+            )
+        )
+        compatible = (
+            versions == {"training-checkpoint-state-v2"}
+            if commit_schema_version == GROUP_COMMIT_SCHEMA_V2
+            else versions == {"training-checkpoint-state-v1"} or legacy_equivalent_v2
+        )
+        if not compatible:
+            raise ValueError(
+                "CHECKPOINT_GROUP_COMMIT_AND_TRAINING_STATE_VERSION_MISMATCH"
+            )
         for field in (
             "model_sha256",
             "optimizer_sha256",
@@ -313,8 +414,37 @@ class CheckpointGroupStore:
             if len({binding[field] for binding in bindings}) != 1:
                 raise ValueError(f"CHECKPOINT_GROUP_SHARED_STATE_DRIFT:{field}")
         normalized_metadata = self._validate_metadata(metadata)
-        value = {
-            "schema_version": GROUP_COMMIT_SCHEMA,
+        controls = [state["training_state"] for state in states]
+        if not all(isinstance(control, Mapping) for control in controls):
+            raise ValueError("CHECKPOINT_GROUP_CONTROL_STATE_INVALID")
+        version = next(iter(versions))
+        if parent_checkpoint_id is not None:
+            parent = self._read_and_validate(parent_checkpoint_id)
+            expected_parent_schema = commit_schema_version
+            if parent.get("schema_version") != expected_parent_schema:
+                raise ValueError("CHECKPOINT_GROUP_PARENT_VERSION_MISMATCH")
+            if commit_schema_version == GROUP_COMMIT_SCHEMA_V2:
+                parent_bindings = parent.get("rank_checkpoints")
+                if not isinstance(parent_bindings, list) or len(parent_bindings) != world_size:
+                    raise ValueError("CHECKPOINT_GROUP_PARENT_RANK_BINDINGS_INVALID")
+                for rank, (state, parent_binding) in enumerate(
+                    zip(states, parent_bindings, strict=True)
+                ):
+                    ids = state.get("checkpoint_ids")
+                    parent_rank_id = (
+                        parent_binding.get("checkpoint_id")
+                        if isinstance(parent_binding, Mapping)
+                        else None
+                    )
+                    if (
+                        not isinstance(ids, list)
+                        or len(ids) < 2
+                        or ids[-2] != parent_rank_id
+                        or bindings[rank]["checkpoint_id"] != ids[-1]
+                    ):
+                        raise ValueError("CHECKPOINT_GROUP_V2_PARENT_RANK_LINEAGE_MISMATCH")
+        value: dict[str, Any] = {
+            "schema_version": commit_schema_version,
             "checkpoint_id": checkpoint_id,
             "generation": generation,
             "run_id": run_id,
@@ -335,6 +465,37 @@ class CheckpointGroupStore:
             },
             "metadata": normalized_metadata,
         }
+        if commit_schema_version == GROUP_COMMIT_SCHEMA_V2:
+            first = controls[0]
+            assert isinstance(first, Mapping)
+            attempt_index = first.get("attempt_index")
+            global_step = first.get("global_step")
+            skipped_steps = first.get("skipped_steps")
+            if (
+                attempt_index != generation
+                or any(
+                    control.get("attempt_index") != attempt_index
+                    or control.get("global_step") != global_step
+                    or control.get("skipped_steps") != skipped_steps
+                    for control in controls[1:]
+                )
+            ):
+                raise ValueError("CHECKPOINT_GROUP_V2_CONTROL_STATE_DRIFT")
+            value.update(
+                {
+                    "schema_version": GROUP_COMMIT_SCHEMA_V2,
+                    # ``generation`` is the complete attempt boundary; it is
+                    # intentionally distinct from the successful-step cursor
+                    # so a SKIPPED attempt gets its own immutable group commit.
+                    "attempt_index": attempt_index,
+                    "global_step": global_step,
+                    "successful_optimizer_step": global_step,
+                    "skip_count": skipped_steps,
+                    "next_attempt_index": generation + 1,
+                    "last_completed_step": global_step,
+                    "next_step": global_step + 1,
+                }
+            )
         value["commit_sha256"] = stable_json_hash(value)
         atomic_write_json(commit_path, value)
         # Every rank object was fully loaded above.  Re-open the small atomic
@@ -357,12 +518,21 @@ class CheckpointGroupStore:
 
     def _read_and_validate(self, checkpoint_id: str) -> dict[str, Any]:
         value = self._read(checkpoint_id)
-        expected = {
+        v1_expected = {
             "schema_version", "checkpoint_id", "generation", "run_id", "world_size",
             "parent_checkpoint_id", "last_completed_step", "next_step", "rank_checkpoints",
             "shared_state_sha256", "metadata", "commit_sha256",
         }
-        if set(value) != expected or value.get("schema_version") != GROUP_COMMIT_SCHEMA:
+        v2_expected = v1_expected | {
+            "attempt_index", "global_step", "successful_optimizer_step", "skip_count",
+            "next_attempt_index",
+        }
+        version = value.get("schema_version")
+        if (
+            (version == GROUP_COMMIT_SCHEMA and set(value) != v1_expected)
+            or (version == GROUP_COMMIT_SCHEMA_V2 and set(value) != v2_expected)
+            or version not in {GROUP_COMMIT_SCHEMA, GROUP_COMMIT_SCHEMA_V2}
+        ):
             raise ValueError("CHECKPOINT_GROUP_COMMIT_FIELDS_OR_VERSION_INVALID")
         declared = value.pop("commit_sha256")
         if declared != stable_json_hash(value):
@@ -375,13 +545,34 @@ class CheckpointGroupStore:
         if (
             isinstance(generation, bool) or not isinstance(generation, int) or generation < 0
             or isinstance(world_size, bool) or not isinstance(world_size, int) or world_size < 1
-            or value.get("last_completed_step") != generation
-            or value.get("next_step") != generation + 1
         ):
             raise ValueError("CHECKPOINT_GROUP_COMMIT_NUMERIC_FIELDS_INVALID")
+        if version == GROUP_COMMIT_SCHEMA:
+            if (
+                value.get("last_completed_step") != generation
+                or value.get("next_step") != generation + 1
+            ):
+                raise ValueError("CHECKPOINT_GROUP_COMMIT_NUMERIC_FIELDS_INVALID")
+        else:
+            attempt_index = value.get("attempt_index")
+            global_step = value.get("global_step")
+            successful_step = value.get("successful_optimizer_step")
+            skip_count = value.get("skip_count")
+            next_attempt = value.get("next_attempt_index")
+            if (
+                any(isinstance(item, bool) or not isinstance(item, int) or item < 0 for item in (attempt_index, global_step, successful_step, skip_count, next_attempt))
+                or attempt_index != generation
+                or global_step != successful_step
+                or global_step + skip_count != attempt_index
+                or next_attempt != attempt_index + 1
+                or value.get("last_completed_step") != global_step
+                or value.get("next_step") != global_step + 1
+            ):
+                raise ValueError("CHECKPOINT_GROUP_V2_ATTEMPT_METADATA_INVALID")
         if not isinstance(value.get("run_id"), str) or not value["run_id"]:
             raise ValueError("CHECKPOINT_GROUP_COMMIT_RUN_ID_INVALID")
         parent_id = value.get("parent_checkpoint_id")
+        parent: dict[str, Any] | None = None
         if parent_id is not None:
             parent_id = self._validate_id(parent_id, field="parent")
             parent = self._read_and_validate(parent_id)
@@ -389,17 +580,19 @@ class CheckpointGroupStore:
                 parent["run_id"] != value["run_id"]
                 or parent["world_size"] != world_size
                 or int(parent["generation"]) >= generation
+                or parent.get("schema_version") != version
             ):
                 raise ValueError("CHECKPOINT_GROUP_PARENT_LINEAGE_INVALID")
         raw_bindings = value.get("rank_checkpoints")
         if not isinstance(raw_bindings, list) or len(raw_bindings) != world_size:
             raise ValueError("CHECKPOINT_GROUP_RANK_BINDINGS_INVALID")
         verified_bindings: list[dict[str, Any]] = []
+        verified_states: list[Any] = []
         for rank, binding in enumerate(raw_bindings):
             if not isinstance(binding, Mapping):
                 raise ValueError("CHECKPOINT_GROUP_RANK_BINDING_INVALID")
             store_ref = binding.get("checkpoint_store_ref")
-            reconstructed, _ = self._rank_binding(
+            reconstructed, state = self._rank_binding(
                 {
                     "rank": rank,
                     "checkpoint_store_ref": store_ref,
@@ -412,7 +605,47 @@ class CheckpointGroupStore:
             )
             if reconstructed != dict(binding):
                 raise ValueError("CHECKPOINT_GROUP_RANK_BINDING_DRIFT")
+            if version == GROUP_COMMIT_SCHEMA_V2:
+                control = state.get("training_state")
+                if (
+                    state.get("schema_version") != "training-checkpoint-state-v2"
+                    or not isinstance(control, Mapping)
+                    or control.get("attempt_index") != generation
+                    or control.get("global_step") != value.get("global_step")
+                    or control.get("skipped_steps") != value.get("skip_count")
+                ):
+                    raise ValueError("CHECKPOINT_GROUP_V2_RANK_CONTROL_DRIFT")
             verified_bindings.append(reconstructed)
+            verified_states.append(state)
+        if version == GROUP_COMMIT_SCHEMA:
+            # A v1 group commit may bridge the v2 rank payload only when its
+            # attempt and successful-step cursors are indistinguishable from
+            # legacy semantics.  A skipped attempt must remain explicitly v2;
+            # otherwise v1's generation-based fields would erase it.
+            for state in verified_states:
+                control = state["training_state"]
+                if state.get("schema_version") == "training-checkpoint-state-v2":
+                    if (
+                        control.get("attempt_index") != generation
+                        or control.get("global_step") != generation
+                        or control.get("skipped_steps") != 0
+                    ):
+                        raise ValueError("CHECKPOINT_GROUP_V1_V2_BRIDGE_NOT_EQUIVALENT")
+        if version == GROUP_COMMIT_SCHEMA_V2 and parent is not None:
+            parent_bindings = parent["rank_checkpoints"]
+            for rank, (state, binding, parent_binding) in enumerate(
+                zip(verified_states, verified_bindings, parent_bindings, strict=True)
+            ):
+                checkpoint_ids = state.get("checkpoint_ids") if isinstance(state, Mapping) else None
+                if (
+                    not isinstance(checkpoint_ids, list)
+                    or len(checkpoint_ids) < 2
+                    or checkpoint_ids[-1] != binding["checkpoint_id"]
+                    or checkpoint_ids[-2] != parent_binding["checkpoint_id"]
+                ):
+                    raise ValueError(
+                        "CHECKPOINT_GROUP_V2_PARENT_RANK_LINEAGE_MISMATCH"
+                    )
         shared = value.get("shared_state_sha256")
         fields = (
             "model_sha256",
@@ -441,6 +674,22 @@ class CheckpointGroupStore:
             commit_sha256=str(value["commit_sha256"]),
             rank_checkpoints=tuple(dict(item) for item in value["rank_checkpoints"]),
             metadata=dict(value["metadata"]),
+            schema_version=str(value["schema_version"]),
+            global_step=(
+                int(value["global_step"])
+                if value.get("schema_version") == GROUP_COMMIT_SCHEMA_V2
+                else None
+            ),
+            successful_optimizer_step=(
+                int(value["successful_optimizer_step"])
+                if value.get("schema_version") == GROUP_COMMIT_SCHEMA_V2
+                else None
+            ),
+            skip_count=(
+                int(value["skip_count"])
+                if value.get("schema_version") == GROUP_COMMIT_SCHEMA_V2
+                else None
+            ),
         )
 
     def load(
@@ -600,6 +849,7 @@ __all__ = [
     "CheckpointGroupCommit",
     "CheckpointGroupStore",
     "GROUP_COMMIT_SCHEMA",
+    "GROUP_COMMIT_SCHEMA_V2",
     "GROUP_EVENT_SCHEMA",
     "GROUP_LATEST_SCHEMA",
     "GROUP_LINEAGE_SCHEMA",
