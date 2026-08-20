@@ -940,6 +940,24 @@ def test_s110_group_broadcast_seeds_rank_zero_output() -> None:
     assert dist.barriers == 1
 
 
+def test_s110_group_event_snapshots_are_boundary_immutable(tmp_path: Path) -> None:
+    worker_spec = importlib.util.spec_from_file_location(
+        "s110_worker_event_snapshot_test",
+        ROOT / "ops" / "stage1" / "run_s1_10_resume_worker.py",
+    )
+    assert worker_spec is not None and worker_spec.loader is not None
+    worker = importlib.util.module_from_spec(worker_spec)
+    worker_spec.loader.exec_module(worker)
+    event_path = tmp_path / "live.jsonl"
+    event_path.write_bytes(b'{"boundary":"pre"}\n')
+    snapshot = worker._immutable_event_snapshot(tmp_path, event_path, label="pre", rank=0)
+    original = snapshot.read_bytes()
+    event_path.write_bytes(original + b'{"boundary":"post"}\n')
+    assert snapshot.read_bytes() == original
+    with pytest.raises(RuntimeError, match="S1_10_EVENT_SNAPSHOT_EXISTS"):
+        worker._immutable_event_snapshot(tmp_path, event_path, label="pre", rank=0)
+
+
 def test_s110_source_process_identity_rejects_live_source_and_accepts_pid_reuse(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

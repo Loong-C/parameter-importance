@@ -318,6 +318,17 @@ def _event_pointer(root: Path, store: Any, checkpoint_id: str, event_path: Path)
     return {"event_ref": event_path.relative_to(root).as_posix(), "event_sha256": _file_sha(event_path), "checkpoint_event_sequence": int(state["training_state"]["event_sequence"]) - 1}
 
 
+def _immutable_event_snapshot(root: Path, event_path: Path, *, label: str, rank: int) -> Path:
+    snapshot = root / "event-snapshots" / f"{label}-rank-{rank:04d}.jsonl"
+    snapshot.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with snapshot.open("xb") as stream:
+            stream.write(event_path.read_bytes())
+    except FileExistsError as error:
+        raise RuntimeError(f"S1_10_EVENT_SNAPSHOT_EXISTS:{snapshot.name}") from error
+    return snapshot
+
+
 def _broadcast_group_output(dist: Any, *, rank: int, output: Mapping[str, Any]) -> dict[str, Any]:
     slot: list[Any] = [dict(output) if rank == 0 else None]
     dist.broadcast_object_list(slot, src=0)
@@ -331,7 +342,8 @@ def _group_publish(torch: Any, *, root: Path, rank: int, world_size: int, label:
     from param_importance_nlp.runtime import CheckpointStore
     from param_importance_nlp.runtime.checkpoint_group import CheckpointGroupStore
     import torch.distributed as dist
-    local = {"rank": rank, "checkpoint_store_ref": checkpoint_root.relative_to(root).as_posix(), "checkpoint_id": checkpoint_id, "event_pointer": _event_pointer(root, CheckpointStore(checkpoint_root), checkpoint_id, event_path)}
+    event_snapshot = _immutable_event_snapshot(root, event_path, label=label, rank=rank)
+    local = {"rank": rank, "checkpoint_store_ref": checkpoint_root.relative_to(root).as_posix(), "checkpoint_id": checkpoint_id, "event_pointer": _event_pointer(root, CheckpointStore(checkpoint_root), checkpoint_id, event_snapshot)}
     gathered: list[Any] = [None] * world_size; dist.all_gather_object(gathered, local); dist.barrier()
     output: dict[str, Any] = {}
     if rank == 0:
