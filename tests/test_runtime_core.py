@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -626,6 +627,64 @@ def test_local_reducer_and_global_clip_are_explicit() -> None:
         compute_global_clip_factor({"x": tensor}, float("inf"))
     with pytest.raises(ValueError, match="CLIP_EPS"):
         compute_global_clip_factor({"x": tensor}, 1.0, eps=0.0)
+
+
+def test_global_clip_is_fp64_and_device_independent_when_cuda_is_available() -> None:
+    cpu = torch.tensor([3.0, 4.0], dtype=torch.float32)
+    cpu_norm, cpu_factor = compute_global_clip_factor({"x": cpu}, 2.5)
+    assert cpu_norm == pytest.approx(5.0)
+    assert cpu_factor == pytest.approx(0.5)
+    # Hardware coverage is an explicit opt-in: the formal S1.9 worker owns
+    # CUDA isolation/lease policy, while the ordinary CPU suite must never
+    # initialise a visible accelerator merely to discover it exists.
+    if os.environ.get("S1_9_ENABLE_LOCAL_CUDA_CONTRACT_TESTS") != "1":
+        pytest.skip("S1.9 CUDA clip contract is exercised only in an isolated formal worker")
+    if not torch.cuda.is_available():
+        pytest.skip("local CUDA unavailable")
+    cuda = cpu.to("cuda")
+    cuda_norm, cuda_factor = compute_global_clip_factor({"x": cuda}, 2.5)
+    # This explicitly covers the historical CPU-accumulator/CUDA-scalar
+    # mismatch and pins the public result rather than the implementation.
+    assert cuda_norm == pytest.approx(cpu_norm)
+    assert cuda_factor == pytest.approx(cpu_factor)
+
+
+def test_global_clip_mixed_device_and_iteration_order_contract() -> None:
+    """The authorised FP64 merge is independent of map ordering/device.
+
+    In particular, this catches the old CPU accumulator + CUDA scalar add:
+    a real caller may construct its parameter mapping from heterogeneous
+    sources, so the result must not depend on which tensor happens to arrive
+    first.
+    """
+
+    cpu_first = {
+        "large_cpu": torch.tensor([3.0, -4.0], dtype=torch.float32),
+        "small_cpu": torch.tensor([12.0, 5.0], dtype=torch.float32),
+        "absent": None,
+    }
+    cpu_last = {name: cpu_first[name] for name in reversed(tuple(cpu_first))}
+    expected_norm = (25.0 + 169.0) ** 0.5
+    forward = compute_global_clip_factor(cpu_first, 2.5)
+    backward = compute_global_clip_factor(cpu_last, 2.5)
+    assert forward[0] == pytest.approx(expected_norm, abs=1e-15, rel=0.0)
+    assert forward[1] == pytest.approx(2.5 / (expected_norm + 1e-12), abs=1e-15, rel=0.0)
+    assert backward == pytest.approx(forward, abs=1e-15, rel=0.0)
+    assert compute_global_clip_factor({}, 2.5) == (0.0, 1.0)
+    assert compute_global_clip_factor({"absent": None}, None) == (0.0, 1.0)
+
+    if os.environ.get("S1_9_ENABLE_LOCAL_CUDA_CONTRACT_TESTS") != "1":
+        pytest.skip("S1.9 CUDA clip contract is exercised only in an isolated formal worker")
+    if not torch.cuda.is_available():
+        pytest.skip("local CUDA unavailable")
+    mixed_first = {
+        "cuda": torch.tensor([12.0, 5.0], dtype=torch.float32, device="cuda"),
+        "cpu": torch.tensor([3.0, -4.0], dtype=torch.float32),
+        "absent": None,
+    }
+    mixed_last = {name: mixed_first[name] for name in reversed(tuple(mixed_first))}
+    assert compute_global_clip_factor(mixed_first, 2.5) == pytest.approx(forward, abs=1e-15, rel=0.0)
+    assert compute_global_clip_factor(mixed_last, 2.5) == pytest.approx(forward, abs=1e-15, rel=0.0)
 
 
 def test_optimizer_bridge_sgd_momentum_and_adamw_decomposition() -> None:

@@ -1,0 +1,57 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://parameter-importance.local/schemas/stage1/s1-9-comparison-table-v1.json",
+  "type": "object",
+  "required": ["schema_version", "fixture_id", "profile", "rows", "comparison_objects", "table_hash"],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {"const": "stage1-s1-9-comparison-table-v1"},
+    "fixture_id": {"const": "stage1-s19-precision-fixture-v1"},
+    "profile": {"const": "T_AMP_SCALE"},
+    "rows": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/table_row"}},
+    "comparison_objects": {"type": "array", "minItems": 14, "items": {"$ref": "#/$defs/comparison_object"}},
+    "table_hash": {"$ref": "#/$defs/hash"}
+  },
+  "$defs": {
+    "hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "scale_row": {
+      "oneOf": [
+        {"$ref": "#/$defs/normalized_scale_row"},
+        {"$ref": "#/$defs/near_zero_absolute_scale_row"}
+      ]
+    },
+    "normalized_scale_row": {
+      "type": "object",
+      "required": ["object", "coordinate", "profile", "oracle_hash", "n_q", "n_q_rule", "branch", "oracle_norm_inf", "original_unit_max_abs_error", "scaled_max_abs_error", "scaled_threshold", "normalized_l2_error", "normalized_l2_limit", "nonfinite_count", "passed"],
+      "additionalProperties": false,
+      "properties": {
+        "object": {"type": "string", "minLength": 1}, "coordinate": {"type": "string", "minLength": 1}, "profile": {"const": "T_AMP_SCALE"}, "oracle_hash": {"$ref": "#/$defs/hash"},
+        "n_q": {"type": "number", "exclusiveMinimum": 0}, "n_q_rule": {"type": "string", "minLength": 1}, "branch": {"const": "normalized"},
+        "oracle_norm_inf": {"type": "number", "exclusiveMinimum": 0}, "original_unit_max_abs_error": {"type": "number", "minimum": 0}, "scaled_max_abs_error": {"type": "number", "minimum": 0}, "scaled_threshold": {"type": "number", "exclusiveMinimum": 0}, "normalized_l2_error": {"type": "number", "minimum": 0}, "normalized_l2_limit": {"const": 0.0005}, "nonfinite_count": {"const": 0}, "passed": {"const": true}
+      }
+    },
+    "near_zero_absolute_scale_row": {
+      "type": "object",
+      "required": ["object", "coordinate", "profile", "oracle_hash", "n_q", "n_q_rule", "branch", "near_zero_threshold", "absolute_threshold", "original_unit_max_abs_error", "scaled_max_abs_error", "normalized_l2_error", "nonfinite_count", "passed"],
+      "additionalProperties": false,
+      "properties": {
+        "object": {"type": "string", "minLength": 1}, "coordinate": {"type": "string", "minLength": 1}, "profile": {"const": "T_AMP_SCALE"}, "oracle_hash": {"$ref": "#/$defs/hash"},
+        "n_q": {"type": "number", "exclusiveMinimum": 0}, "n_q_rule": {"type": "string", "minLength": 1}, "branch": {"const": "near_zero_absolute"},
+        "near_zero_threshold": {"type": "number", "exclusiveMinimum": 0}, "absolute_threshold": {"type": "number", "exclusiveMinimum": 0}, "original_unit_max_abs_error": {"type": "number", "minimum": 0}, "scaled_max_abs_error": {"const": null}, "normalized_l2_error": {"const": null}, "nonfinite_count": {"const": 0}, "passed": {"const": true}
+      }
+    },
+    "table_row": {
+      "type": "object", "required": ["section", "case_id", "field", "actual", "reference", "passed"], "additionalProperties": false,
+      "properties": {
+        "section": {"type": "string", "minLength": 1}, "case_id": {"type": "string", "minLength": 1}, "field": {"type": "string", "minLength": 1},
+        "actual": {"$ref": "#/$defs/scale_row"},
+        "reference": {"type": "object", "required": ["profile", "oracle_hash"], "additionalProperties": false, "properties": {"profile": {"const": "T_AMP_SCALE"}, "oracle_hash": {"$ref": "#/$defs/hash"}}},
+        "passed": {"const": true}
+      }
+    },
+    "comparison_object": {
+      "type": "object", "required": ["object", "profile", "oracle_hash", "rows", "passed"], "additionalProperties": false,
+      "properties": {"object": {"type": "string", "minLength": 1}, "profile": {"const": "T_AMP_SCALE"}, "oracle_hash": {"$ref": "#/$defs/hash"}, "rows": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/scale_row"}}, "passed": {"const": true}}
+    }
+  }
+}

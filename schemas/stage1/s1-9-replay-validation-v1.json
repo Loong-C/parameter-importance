@@ -1,0 +1,8 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://parameter-importance.local/schemas/stage1/s1-9-replay-validation-v1.json",
+  "type": "object",
+  "required": ["schema_version", "status", "source_report_hash", "source_oracle_hash", "source_trace_hash", "source_table_hash", "source_gate_artifact_hash", "replayed_roles", "replay_hash"],
+  "additionalProperties": false,
+  "properties": {"schema_version": {"const": "stage1-s1-9-replay-validation-v1"}, "status": {"const": "PASS"}, "source_report_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"}, "source_oracle_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"}, "source_trace_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"}, "source_table_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"}, "source_gate_artifact_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"}, "replayed_roles": {"const": ["oracle_bundle", "trace_bundle", "comparison_table"]}, "replay_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"}}
+}
