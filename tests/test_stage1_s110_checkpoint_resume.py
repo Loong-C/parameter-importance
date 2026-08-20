@@ -989,9 +989,19 @@ def test_s110_worker_snapshot_comparison_is_closed_over_required_observations(mu
         "cursor": {"index": 6}, "next_cursor": {"index": 6}, "sample_multiset": ["sample-a"],
         "rng_sha256": "b", "next_rng_state_sha256": "b", "per_rank_cuda_rng_state_hex": ["00"],
         "optimizer_sha256": "c", "scheduler_sha256": "d", "scaler_sha256": "e", "importance_sha256": "f",
-        "records_sha256": "g", "object_digests": {"importance_accumulator": "f"}, "checkpoint_ids": ["c"],
+        "records_sha256": "g", "object_digests": {
+            "parameters": "p", "buffers": "b", "optimizer": "c", "scheduler": "d",
+            "scaler": "e", "importance_accumulator": "f", "records": "g",
+            "importance_points": "checkpoint-specific",
+        }, "checkpoint_ids": ["c"],
         "bridge_optimizer_alias": True,
     }
+    assert worker._assert_trajectory(snapshot, snapshot, label="pre_skip") is True
+    checkpoint_variant = deepcopy(snapshot)
+    checkpoint_variant["object_digests"]["importance_points"] = "different-checkpoint-cadence"
+    checkpoint_variant["training_state"]["event_sequence"] = 12
+    checkpoint_variant["training_state"]["last_checkpoint_id"] = "resumed-output"
+    assert worker._assert_trajectory(snapshot, checkpoint_variant, label="post_skip") is True
     altered = deepcopy(snapshot)
     if mutation == "missing":
         altered.pop("sample_multiset")

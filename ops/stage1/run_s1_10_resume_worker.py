@@ -196,6 +196,12 @@ def _snapshot(
         for microbatch in attempt
         for sample_id in microbatch.sample_ids
     )
+    records = [row.to_dict() for row in engine._records]
+    semantic_records = [
+        {key: value for key, value in row.items() if key != "attempt_commit_state_hash"}
+        for row in records
+    ]
+    semantic_records_sha256 = checkpoint_state_sha256(semantic_records)
     object_digests = {
         "parameters": checkpoint_state_sha256(state["parameters"]),
         "buffers": checkpoint_state_sha256(state["buffers"]),
@@ -203,7 +209,7 @@ def _snapshot(
         "scheduler": checkpoint_state_sha256(state["scheduler"]),
         "scaler": checkpoint_state_sha256(state["scaler"]),
         "importance_accumulator": checkpoint_state_sha256(complete["importance"]),
-        "records": checkpoint_state_sha256(complete["records"]),
+        "records": semantic_records_sha256,
         "importance_points": checkpoint_state_sha256(complete["points"]),
     }
     return {
@@ -219,7 +225,7 @@ def _snapshot(
         "scheduler_sha256": object_digests["scheduler"],
         "scaler_sha256": object_digests["scaler"],
         "importance_sha256": object_digests["importance_accumulator"],
-        "records_sha256": object_digests["records"],
+        "records_sha256": semantic_records_sha256,
         "object_digests": object_digests,
         "checkpoint_ids": complete["checkpoint_ids"],
         "bridge_optimizer_alias": complete["bridge_optimizer_alias"],
@@ -235,8 +241,14 @@ def _assert_trajectory(reference: Mapping[str, Any], resumed: Mapping[str, Any],
     }
     if set(reference) != expected_snapshot_fields or set(resumed) != expected_snapshot_fields:
         return False
-    keys = ("rng_sha256", "next_rng_state_sha256", "per_rank_cuda_rng_state_hex", "optimizer_sha256", "scheduler_sha256", "scaler_sha256", "importance_sha256", "records_sha256", "cursor", "next_cursor", "sample_multiset", "object_digests", "bridge_optimizer_alias")
+    keys = ("rng_sha256", "next_rng_state_sha256", "per_rank_cuda_rng_state_hex", "optimizer_sha256", "scheduler_sha256", "scaler_sha256", "importance_sha256", "records_sha256", "cursor", "next_cursor", "sample_multiset", "bridge_optimizer_alias")
     if any(reference.get(key) != resumed.get(key) for key in keys):
+        return False
+    object_keys = {"parameters", "buffers", "optimizer", "scheduler", "scaler", "importance_accumulator", "records", "importance_points"}
+    reference_objects, resumed_objects = reference.get("object_digests"), resumed.get("object_digests")
+    if not isinstance(reference_objects, Mapping) or not isinstance(resumed_objects, Mapping) or set(reference_objects) != object_keys or set(resumed_objects) != object_keys:
+        return False
+    if any(reference_objects[key] != resumed_objects[key] for key in object_keys - {"importance_points"}):
         return False
     state, expected_state = resumed.get("training_state"), reference.get("training_state")
     if not isinstance(state, Mapping) or not isinstance(expected_state, Mapping) or int(state.get("attempt_index", -1)) < 6:
