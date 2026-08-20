@@ -46,6 +46,41 @@ _S1_8_ARRAY_BUNDLE_V2_ROUTE_REFS = {
     "D-rank_swap": {"artifact_ref": "run__route-D-rank_swap-formal__route-output__route-D.safetensors", "manifest_ref": "run__route-D-rank_swap-formal__route-output__route-report.json"},
     "D-local_reverse": {"artifact_ref": "run__route-D-local_reverse-formal__route-output__route-D.safetensors", "manifest_ref": "run__route-D-local_reverse-formal__route-output__route-report.json"},
 }
+# This is the complete S1.9 V8 production reproduction closure.  It is
+# intentionally a concrete map, rather than a count plus an ``auxiliary``
+# allowance: every entry names a file emitted and read back by this producer.
+# Downstream consumers must bind this exact 27-role set; a synthetic 28th role
+# has no S1.9 production meaning.
+_S1_9_REPRODUCTION_ROLE_REFS = {
+    "attempt_start": "attempt-start.json",
+    "upstream_compatibility": "upstream-compatibility.json",
+    "preflight": "preflight.json",
+    "prelease_gpu": "prelease-gpu.json",
+    "post_worker_quiescence": "post-worker-quiescence.json",
+    "lease_history": "lease-history.json",
+    "single_worker": "single-bf16.json",
+    "single_stdout": "single.stdout.txt",
+    "single_stderr": "single.stderr.txt",
+    "single_child_fingerprint": "single-child-fingerprint.json",
+    "bf16_resume_checkpoint_store": "bf16-resume-store-index.json",
+    "ddp_worker": "ddp-skip.json",
+    "ddp_stdout": "ddp.stdout.txt",
+    "ddp_stderr": "ddp.stderr.txt",
+    "ddp_child_fingerprint": "ddp-child-fingerprint.json",
+    "chart_csv_0": "bf16-fp32-heatmap.csv",
+    "chart_csv_1": "clip-norm-factor.csv",
+    "chart_csv_2": "skip-zero-difference.csv",
+    "chart_csv_3": "t-amp-scale.csv",
+    "chart_csv_4": "u-single-factor-identity.csv",
+    "chart_csv_5": "u-single-factor-ratio-diagnostic.csv",
+    "chart_svg_0": "bf16-fp32-heatmap.svg",
+    "chart_svg_1": "clip-norm-factor.svg",
+    "chart_svg_2": "skip-zero-difference.svg",
+    "chart_svg_3": "t-amp-scale.svg",
+    "chart_svg_4": "u-single-factor-identity.svg",
+    "chart_svg_5": "u-single-factor-ratio-diagnostic.svg",
+}
+_S1_9_REPRODUCTION_ROLE_COUNT = 27
 # S1.10 was implemented after the immutable S1.8 v3 producer.  These are the
 # complete, reviewed files for that one downstream stage; do not turn this
 # into a directory/prefix exemption.  In particular, an extra sibling under
@@ -88,6 +123,7 @@ _S1_9_FROZEN_CONSUMER_FILES = {
     "ops/stage1/run_s1_9_ddp_skip_worker.py",
     "ops/stage1/run_s1_9_single_bf16_worker.py",
     "schemas/stage1/s1-9-bf16-checkpoint-store-reproduction-v1.json",
+    "schemas/stage1/s1-9-bf16-checkpoint-store-reproduction-v2.json",
     "schemas/stage1/s1-9-comparison-table-v1.json",
     "schemas/stage1/s1-9-ddp-skip-worker-v1.json",
     "schemas/stage1/s1-9-formalization-index-v1.json",
@@ -102,11 +138,13 @@ _S1_9_FROZEN_CONSUMER_FILES = {
     "schemas/stage1/s1-9-precision-fixture-v1.json",
     "schemas/stage1/s1-9-replay-validation-v1.json",
     "schemas/stage1/s1-9-single-bf16-worker-v1.json",
+    "schemas/stage1/s1-9-single-bf16-worker-v2.json",
     "schemas/stage1/s1-9-trace-bundle-v1.json",
     "schemas/stage1/s1-9-upstream-compatibility-v5.json",
     "schemas/stage1/s1-9-upstream-compatibility-v6.json",
     "schemas/stage1/s1-9-upstream-compatibility-v7.json",
     "schemas/stage1/s1-9-validation-v1.json",
+    "schemas/stage1/s1-9-validation-v2.json",
     "src/param_importance_nlp/stage1_precision.py",
     "src/param_importance_nlp/stage1_precision_oracle.py",
     "tests/test_stage1_s19_precision.py",
@@ -1242,21 +1280,21 @@ def _checkpoint_store_reproduction_index(store_root: Path, checkpoint_id: str) -
     manifest_path = object_root / "manifest.json"
     if not commit_path.is_file() or not manifest_path.is_file():
         raise Stage1S19FormalError("S1_9_CHECKPOINT_STORE_REPRODUCTION_SOURCE_MISSING")
-    bundle_files = {
-        path.relative_to(store_root).as_posix(): _sha(path)
+    bundle_files = [
+        {"ref": path.relative_to(store_root).as_posix(), "sha256": _sha(path)}
         for path in sorted(object_root.rglob("*"))
         if path.is_file()
-    }
-    if "objects/" + checkpoint_id + "/manifest.json" not in bundle_files:
+    ]
+    if f"objects/{checkpoint_id}/manifest.json" not in {item["ref"] for item in bundle_files}:
         raise Stage1S19FormalError("S1_9_CHECKPOINT_STORE_MANIFEST_NOT_LISTED")
     return _with_hash({
-        "schema_version": "stage1-s1-9-bf16-checkpoint-store-reproduction-v1",
+        "schema_version": "stage1-s1-9-bf16-checkpoint-store-reproduction-v2",
         "checkpoint_id": checkpoint_id,
         "commit_ref": f"commits/{checkpoint_id}.json",
         "commit_sha256": _sha(commit_path),
         "bundle_manifest_ref": f"objects/{checkpoint_id}/manifest.json",
         "bundle_manifest_sha256": commit.manifest_sha256,
-        "bundle_files_sha256": bundle_files,
+        "bundle_file_hashes": bundle_files,
     })
 
 
@@ -1294,8 +1332,8 @@ def _verify_checkpoint_store_reproduction(store_root: Path, index: Mapping[str, 
         supplied = body.pop("artifact_hash")
         if supplied != _with_hash(body).get("artifact_hash"):
             return False
-        required = {"schema_version", "checkpoint_id", "commit_ref", "commit_sha256", "bundle_manifest_ref", "bundle_manifest_sha256", "bundle_files_sha256", "artifact_hash"}
-        if set(index) != required or index.get("schema_version") != "stage1-s1-9-bf16-checkpoint-store-reproduction-v1":
+        required = {"schema_version", "checkpoint_id", "commit_ref", "commit_sha256", "bundle_manifest_ref", "bundle_manifest_sha256", "bundle_file_hashes", "artifact_hash"}
+        if set(index) != required or index.get("schema_version") != "stage1-s1-9-bf16-checkpoint-store-reproduction-v2":
             return False
         checkpoint_id = _safe_checkpoint_store_reproduction_id(index.get("checkpoint_id"))
         store = CheckpointStore(store_root)
@@ -1304,15 +1342,20 @@ def _verify_checkpoint_store_reproduction(store_root: Path, index: Mapping[str, 
             return False
         if index.get("commit_sha256") != _sha(store.commits / f"{checkpoint_id}.json") or index.get("bundle_manifest_sha256") != commit.manifest_sha256:
             return False
-        files = index.get("bundle_files_sha256")
-        if not isinstance(files, Mapping) or not files:
+        files = index.get("bundle_file_hashes")
+        if not isinstance(files, list) or not files:
             return False
         actual = {
             path.relative_to(store_root).as_posix(): _sha(path)
             for path in sorted((store.objects / checkpoint_id).rglob("*"))
             if path.is_file()
         }
-        return dict(files) == actual
+        listed: dict[str, str] = {}
+        for entry in files:
+            if not isinstance(entry, Mapping) or set(entry) != {"ref", "sha256"} or not isinstance(entry.get("ref"), str) or not isinstance(entry.get("sha256"), str) or entry["ref"] in listed:
+                return False
+            listed[entry["ref"]] = entry["sha256"]
+        return listed == actual
     except Exception:
         return False
 
@@ -1435,13 +1478,13 @@ def _deep_role_contract(role: str, value: Mapping[str, Any]) -> None:
         _validate_t_amp_table_exact_shapes(value)
         return
     if role == "bf16_checkpoint_store":
-        checkpoint = _exact_keys(value, {"schema_version", "checkpoint_id", "commit_ref", "commit_sha256", "bundle_manifest_ref", "bundle_manifest_sha256", "bundle_files_sha256", "artifact_hash"}, field="bf16_checkpoint_store")
+        checkpoint = _exact_keys(value, {"schema_version", "checkpoint_id", "commit_ref", "commit_sha256", "bundle_manifest_ref", "bundle_manifest_sha256", "bundle_file_hashes", "artifact_hash"}, field="bf16_checkpoint_store")
         checkpoint_id = _safe_checkpoint_store_reproduction_id(checkpoint["checkpoint_id"])
         if checkpoint["commit_ref"] != f"commits/{checkpoint_id}.json" or checkpoint["bundle_manifest_ref"] != f"objects/{checkpoint_id}/manifest.json":
             raise Stage1S19FormalError("S1_9_DEEP_SCHEMA_CHECKPOINT_STORE_REF_INVALID")
-        hashes = checkpoint["bundle_files_sha256"]
+        hashes = checkpoint["bundle_file_hashes"]
         expected_prefix = f"objects/{checkpoint_id}/"
-        if not isinstance(hashes, Mapping) or not hashes or any(not isinstance(ref, str) or not ref.startswith(expected_prefix) or "\\" in ref or ".." in ref for ref in hashes):
+        if not isinstance(hashes, list) or not hashes or any(not isinstance(entry, Mapping) or set(entry) != {"ref", "sha256"} or not isinstance(entry.get("ref"), str) or not entry["ref"].startswith(expected_prefix) or "\\" in entry["ref"] or ".." in entry["ref"] or not isinstance(entry.get("sha256"), str) or re.fullmatch(r"[0-9a-f]{64}", entry["sha256"]) is None for entry in hashes) or len({entry["ref"] for entry in hashes if isinstance(entry, Mapping) and isinstance(entry.get("ref"), str)}) != len(hashes):
             raise Stage1S19FormalError("S1_9_DEEP_SCHEMA_CHECKPOINT_STORE_FILES_INVALID")
         return
     if role == "upstream_compatibility":
@@ -1513,6 +1556,8 @@ def _deep_role_contract(role: str, value: Mapping[str, Any]) -> None:
                 raise Stage1S19FormalError(f"S1_9_DEEP_SCHEMA_MAP_INVALID:index.{map_name}")
         if index["schema_version"] != "stage1-s1-9-formalization-index-v8" or index["next_task_ids"] != ["stage1.10_checkpoint_resume_and_artifacts"]:
             raise Stage1S19FormalError("S1_9_DEEP_SCHEMA_NEXT_TASK_INVALID")
+        if dict(index["reproduction_role_refs"]) != _S1_9_REPRODUCTION_ROLE_REFS or set(index["reproduction_role_sha256"]) != set(_S1_9_REPRODUCTION_ROLE_REFS) or len(index["reproduction_role_refs"]) != _S1_9_REPRODUCTION_ROLE_COUNT:
+            raise Stage1S19FormalError("S1_9_DEEP_SCHEMA_REPRODUCTION_ROLE_CLOSURE_INVALID")
 
 
 def _validate_s1_9_schemas(repository: Path, values: Mapping[str, Mapping[str, Any]]) -> None:
@@ -1532,7 +1577,7 @@ def _validate_s1_9_schemas(repository: Path, values: Mapping[str, Mapping[str, A
         if not isinstance(loaded, Mapping) or not isinstance(loaded.get("$id"), str):
             raise Stage1S19FormalError(f"S1_9_SCHEMA_INVALID:{path.name}")
         registry[path.name] = loaded; registry[str(loaded["$id"])] = loaded
-    files = {"numeric_report": "s1-9-numeric-report-v1.json", "oracle_bundle": "s1-9-oracle-bundle-v1.json", "trace_bundle": "s1-9-trace-bundle-v1.json", "comparison_table": "s1-9-comparison-table-v1.json", "gate_record": "s1-9-gate-record-v1.json", "replay": "s1-9-replay-validation-v1.json", "validation": "s1-9-validation-v1.json", "index": "s1-9-formalization-index-v8.json", "single_worker": "s1-9-single-bf16-worker-v1.json", "ddp_worker": "s1-9-ddp-skip-worker-v1.json", "bf16_checkpoint_store": "s1-9-bf16-checkpoint-store-reproduction-v1.json", "upstream_compatibility": "s1-9-upstream-compatibility-v7.json", "gpu_quiescence": "s1-9-gpu-quiescence-v3.json", "gpu_prelease": "s1-9-gpu-prelease-v3.json"}
+    files = {"numeric_report": "s1-9-numeric-report-v1.json", "oracle_bundle": "s1-9-oracle-bundle-v1.json", "trace_bundle": "s1-9-trace-bundle-v1.json", "comparison_table": "s1-9-comparison-table-v1.json", "gate_record": "s1-9-gate-record-v1.json", "replay": "s1-9-replay-validation-v1.json", "validation": "s1-9-validation-v2.json", "index": "s1-9-formalization-index-v8.json", "single_worker": "s1-9-single-bf16-worker-v2.json", "ddp_worker": "s1-9-ddp-skip-worker-v1.json", "bf16_checkpoint_store": "s1-9-bf16-checkpoint-store-reproduction-v2.json", "upstream_compatibility": "s1-9-upstream-compatibility-v7.json", "gpu_quiescence": "s1-9-gpu-quiescence-v3.json", "gpu_prelease": "s1-9-gpu-prelease-v3.json"}
     for role, value in values.items():
         schema = registry.get(files.get(role, ""))
         if schema is None:
@@ -1807,7 +1852,9 @@ def execute(*, repository: str | Path, data_root: str | Path, s1_7_index_ref: st
         # right: schema-check it before it ever reaches staging.
         _validate_s1_9_schemas(repository_root, {"bf16_checkpoint_store": checkpoint_store_index})
         _write(staging / "bf16-resume-store-index.json", checkpoint_store_index)
-        reproduction = {"attempt_start": "attempt-start.json", "upstream_compatibility": "upstream-compatibility.json", "preflight": "preflight.json", "prelease_gpu": "prelease-gpu.json", "post_worker_quiescence": "post-worker-quiescence.json", "lease_history": "lease-history.json", "single_worker": "single-bf16.json", "single_stdout": "single.stdout.txt", "single_stderr": "single.stderr.txt", "single_child_fingerprint": "single-child-fingerprint.json", "bf16_resume_checkpoint_store": "bf16-resume-store-index.json", "ddp_worker": "ddp-skip.json", "ddp_stdout": "ddp.stdout.txt", "ddp_stderr": "ddp.stderr.txt", "ddp_child_fingerprint": "ddp-child-fingerprint.json", **{f"chart_csv_{index}": name for index, name in enumerate(sorted(csv_hashes))}, **{f"chart_svg_{index}": name for index, name in enumerate(sorted(svg_hashes))}}
+        reproduction = dict(_S1_9_REPRODUCTION_ROLE_REFS)
+        if len(reproduction) != _S1_9_REPRODUCTION_ROLE_COUNT or set(csv_hashes) != {filename for role, filename in reproduction.items() if role.startswith("chart_csv_")} or set(svg_hashes) != {filename for role, filename in reproduction.items() if role.startswith("chart_svg_")}:
+            raise Stage1S19FormalError("S1_9_REPRODUCTION_ROLE_CLOSURE_INVALID")
         reproduction_sha = {role: _sha(staging / filename) for role, filename in reproduction.items()}
         index = _with_hash({"schema_version": "stage1-s1-9-formalization-index-v8", "status": "PASS", "gate_id": GATE_ID, "task_id": TASK_ID, "fixture_id": FIXTURE_ID, "generator_git_commit": commit, "consumer_git_commit": commit, "git_branch": _git(repository_root, "branch", "--show-current"), "checked_at": _now(), "s1_7_handoff": upstream_s17, "s1_8_handoff": upstream_s18, "role_refs": role_files, "role_sha256": role_sha, "reproduction_role_refs": reproduction, "reproduction_role_sha256": reproduction_sha, "gate_artifact_hash": evidence["gate_record"]["artifact_hash"], "csv_sha256": csv_hashes, "svg_sha256": svg_hashes, "validation_ref": "validation.json", "validation_sha256": _sha(work / "validation.json"), "replay_ref": "replay-validation.json", "replay_sha256": _sha(work / "replay-validation.json"), "replay_hash": replay["replay_hash"], "next_task_ids": ["stage1.10_checkpoint_resume_and_artifacts"]})
         _validate_s1_9_schemas(repository_root, {"index": index})

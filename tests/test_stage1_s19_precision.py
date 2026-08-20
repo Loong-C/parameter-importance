@@ -268,13 +268,12 @@ def test_s19_checkpoint_store_reproduction_schema_rejects_deep_drift_and_path_es
     index = formal._copy_checkpoint_store_reproduction(source.root, target, "authoritative")
 
     deep_extra = json.loads(json.dumps(index))
-    first_ref = next(iter(deep_extra["bundle_files_sha256"]))
-    deep_extra["bundle_files_sha256"][first_ref] = {"sha256": "0" * 64}
+    deep_extra["bundle_file_hashes"][0]["unexpected"] = True
     missing = dict(index); missing.pop("bundle_manifest_sha256")
     escaped = json.loads(json.dumps(index))
-    escaped["bundle_files_sha256"]["objects/authoritative/tensors/../escape"] = "0" * 64
+    escaped["bundle_file_hashes"].append({"ref": "objects/authoritative/tensors/../escape", "sha256": "0" * 64})
     hash_map_drift = json.loads(json.dumps(index))
-    hash_map_drift["bundle_files_sha256"][first_ref] = "f" * 64
+    hash_map_drift["bundle_file_hashes"][0]["sha256"] = "f" * 64
     for mutated in (deep_extra, missing, escaped):
         with pytest.raises(formal.Stage1S19FormalError, match="SCHEMA_VALIDATION_FAILED:bf16_checkpoint_store"):
             formal._validate_s1_9_schemas(ROOT, {"bf16_checkpoint_store": mutated})
@@ -492,7 +491,7 @@ def test_s19_new_compatibility_schemas_are_recursively_closed() -> None:
             return [item for child in value for item in walk(child)]
         return []
 
-    names = ("s1-9-upstream-compatibility-v5.json", "s1-9-upstream-compatibility-v6.json", "s1-9-upstream-compatibility-v7.json", "s1-9-gpu-quiescence-v3.json", "s1-9-gpu-prelease-v3.json", "s1-9-formalization-index-v6.json", "s1-9-formalization-index-v7.json", "s1-9-formalization-index-v8.json")
+    names = ("s1-9-upstream-compatibility-v5.json", "s1-9-upstream-compatibility-v6.json", "s1-9-upstream-compatibility-v7.json", "s1-9-gpu-quiescence-v3.json", "s1-9-gpu-prelease-v3.json", "s1-9-formalization-index-v6.json", "s1-9-formalization-index-v7.json", "s1-9-formalization-index-v8.json", "s1-9-single-bf16-worker-v2.json", "s1-9-validation-v2.json", "s1-9-bf16-checkpoint-store-reproduction-v2.json")
     for name in names:
         path = ROOT / "schemas" / "stage1" / name
         for schema in walk(json.loads(path.read_text(encoding="utf-8"))):
@@ -507,6 +506,11 @@ def test_s19_new_compatibility_schemas_are_recursively_closed() -> None:
             is_array = kind == "array" or isinstance(kind, list) and "array" in kind
             if is_array:
                 assert isinstance(schema.get("items"), dict) or isinstance(schema.get("prefixItems"), list), path.name
+
+    worker_v2 = json.loads((ROOT / "schemas" / "stage1" / "s1-9-single-bf16-worker-v2.json").read_text(encoding="utf-8"))
+    validation_v2 = json.loads((ROOT / "schemas" / "stage1" / "s1-9-validation-v2.json").read_text(encoding="utf-8"))
+    assert worker_v2["properties"]["observation"]["properties"]["determinism"]["properties"]["allowed_nondeterministic_kernel_classes"]["items"] == {"type": "string"}
+    assert validation_v2["properties"]["regression"]["properties"]["kernel_allowlist"]["items"] == {"type": "string"}
 
 
 def test_s19_runtime_validator_rejects_jointly_rehashed_nested_schema_drift() -> None:
@@ -540,13 +544,14 @@ def test_s19_gate_replay_and_validation_schema_sets_are_exact() -> None:
     formal._validate_s1_9_schemas(ROOT, {"validation": validation})
     index_schema = json.loads((ROOT / "schemas" / "stage1" / "s1-9-formalization-index-v8.json").read_text(encoding="utf-8"))
     v7_index_schema = json.loads((ROOT / "schemas" / "stage1" / "s1-9-formalization-index-v7.json").read_text(encoding="utf-8"))
-    frozen_index_schema = json.loads((ROOT / "schemas" / "stage1" / "s1-9-formalization-index-v6.json").read_text(encoding="utf-8"))
-    assert index_schema["properties"]["reproduction_role_refs"]["$ref"] == "s1-9-formalization-index-v7.json#/properties/reproduction_role_refs"
+    assert index_schema["properties"]["reproduction_role_refs"]["$ref"] == "#/$defs/reproduction_refs"
     assert v7_index_schema["properties"]["reproduction_role_refs"]["$ref"] == "s1-9-formalization-index-v6.json#/properties/reproduction_role_refs"
     reproduction = {
         name: definition["const"]
-        for name, definition in frozen_index_schema["$defs"]["reproduction_refs"]["properties"].items()
+        for name, definition in index_schema["$defs"]["reproduction_refs"]["properties"].items()
     }
+    assert len(reproduction) == formal._S1_9_REPRODUCTION_ROLE_COUNT == 27
+    assert reproduction == formal._S1_9_REPRODUCTION_ROLE_REFS
     assert reproduction["prelease_gpu"] == "prelease-gpu.json"
     index = {
         "schema_version": "stage1-s1-9-formalization-index-v8", "status": "PASS",

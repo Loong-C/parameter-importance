@@ -1,0 +1,25 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://parameter-importance.local/schemas/stage1/s1-9-single-bf16-worker-v2.json",
+  "allOf": [
+    {"$ref": "s1-9-single-bf16-worker-v1.json"}
+  ],
+  "properties": {
+    "observation": {
+      "properties": {
+        "determinism": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["algorithms_enabled", "cudnn_deterministic", "cudnn_benchmark", "allowed_nondeterministic_kernel_classes", "kernel_policy"],
+          "properties": {
+            "algorithms_enabled": {"const": true},
+            "cudnn_deterministic": {"const": true},
+            "cudnn_benchmark": {"const": false},
+            "allowed_nondeterministic_kernel_classes": {"type": "array", "maxItems": 0, "items": {"type": "string"}},
+            "kernel_policy": {"const": "empty_pre_registered_allowlist"}
+          }
+        }
+      }
+    }
+  }
+}

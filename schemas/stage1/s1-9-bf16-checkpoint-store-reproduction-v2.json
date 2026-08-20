@@ -1,0 +1,33 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://parameter-importance.local/schemas/stage1/s1-9-bf16-checkpoint-store-reproduction-v2.json",
+  "type": "object",
+  "required": ["schema_version", "checkpoint_id", "commit_ref", "commit_sha256", "bundle_manifest_ref", "bundle_manifest_sha256", "bundle_file_hashes", "artifact_hash"],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {"const": "stage1-s1-9-bf16-checkpoint-store-reproduction-v2"},
+    "checkpoint_id": {"$ref": "#/$defs/checkpoint_id"},
+    "commit_ref": {"type": "string", "pattern": "^commits/[A-Za-z0-9][A-Za-z0-9._-]{0,127}\\.json$"},
+    "commit_sha256": {"$ref": "#/$defs/hash"},
+    "bundle_manifest_ref": {"type": "string", "pattern": "^objects/[A-Za-z0-9][A-Za-z0-9._-]{0,127}/manifest\\.json$"},
+    "bundle_manifest_sha256": {"$ref": "#/$defs/hash"},
+    "bundle_file_hashes": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["ref", "sha256"],
+        "properties": {
+          "ref": {"type": "string", "pattern": "^objects/[A-Za-z0-9][A-Za-z0-9._-]{0,127}/(?:manifest\\.json|tensors/[A-Za-z0-9][A-Za-z0-9._-]{0,255})$"},
+          "sha256": {"$ref": "#/$defs/hash"}
+        }
+      }
+    },
+    "artifact_hash": {"$ref": "#/$defs/hash"}
+  },
+  "$defs": {
+    "checkpoint_id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"},
+    "hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+  }
+}
