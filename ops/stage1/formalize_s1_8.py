@@ -162,6 +162,12 @@ GPU_QUIESCENCE_ROLES = {
 # enumerable.  Recheck that narrow /proc transition exactly once before
 # treating a session member as foreign process ownership.
 SESSION_MEMBER_REVALIDATION_SECONDS = 0.05
+# A launcher is first visible to its Popen parent while Linux may still expose
+# an empty argv during exec.  Reuse the existing one-second launcher-confirm
+# window and the existing bounded /proc revalidation cadence; this is not a
+# new grace for later process-tree ownership audits.
+INITIAL_LAUNCHER_ATTESTATION_TIMEOUT_SECONDS = LAUNCHER_EXIT_CONFIRMATION_TIMEOUT_SECONDS
+INITIAL_LAUNCHER_ATTESTATION_POLL_SECONDS = SESSION_MEMBER_REVALIDATION_SECONDS
 PILE_DOWNLOADER_CMDLINE_SIGNATURES = (
     b"server_xet_download.sh",
     b"pile-full-download",
@@ -259,6 +265,15 @@ class Stage1S18FormalError(RuntimeError):
 
 class Stage1S18ManualInterventionRequired(Stage1S18FormalError):
     """A process fingerprint drift makes a signal/lease release unsafe."""
+
+
+class _InitialLauncherAttestationFailure(Stage1S18ManualInterventionRequired):
+    """Initial Popen identity never reached two stable, nonempty argv reads."""
+
+    def __init__(self, reason: str, *, expected: Mapping[str, Any], observed: Mapping[str, Any] | None) -> None:
+        super().__init__(reason)
+        self.expected = dict(expected)
+        self.observed = None if observed is None else dict(observed)
 
 
 class _SessionMemberStatUnavailable(RuntimeError):
@@ -1748,6 +1763,71 @@ def _fingerprint(pid: int, run_token: str) -> dict[str, Any]:
     return identity
 
 
+_EMPTY_CMDLINE_SHA256 = hashlib.sha256(b"").hexdigest()
+_INITIAL_LAUNCHER_ATTESTATION_IDENTITY_FIELDS = (
+    "pid", "uid", "pgid", "sid", "start_ticks", "exe", "environment_run_token",
+)
+
+
+def _attest_initial_launcher(pid: int, run_token: str) -> dict[str, Any]:
+    """Return only a Popen PID with two stable, nonempty argv fingerprints.
+
+    This closes the narrow fork/exec observation race before the initial tree
+    exists.  It never turns an empty command line into an accepted identity:
+    all retries retain the Popen PID and the first observed UID, PGID, SID,
+    start ticks, executable, and inherited exact token.  Any loss or drift is
+    manual; later process-group audit and signal rules remain unchanged.
+    """
+
+    deadline = time.monotonic() + INITIAL_LAUNCHER_ATTESTATION_TIMEOUT_SECONDS
+    anchor: dict[str, Any] | None = None
+    stable_nonempty: dict[str, Any] | None = None
+    last: dict[str, Any] | None = None
+    while True:
+        try:
+            observed = _fingerprint(pid, run_token)
+        except (OSError, ProcessLookupError):
+            raise _InitialLauncherAttestationFailure(
+                "S18_PROCESS_INITIAL_LAUNCHER_ATTESTATION_UNVERIFIABLE",
+                expected=anchor or {"pid": pid},
+                observed=last,
+            ) from None
+        if observed.get("pid") != pid:
+            raise _InitialLauncherAttestationFailure(
+                "S18_PROCESS_INITIAL_LAUNCHER_POPEN_PID_DRIFT",
+                expected=anchor or {"pid": pid},
+                observed=observed,
+            )
+        if anchor is None:
+            anchor = dict(observed)
+        elif any(anchor.get(field) != observed.get(field) for field in _INITIAL_LAUNCHER_ATTESTATION_IDENTITY_FIELDS):
+            raise _InitialLauncherAttestationFailure(
+                "S18_PROCESS_INITIAL_LAUNCHER_IDENTITY_DRIFT",
+                expected=anchor,
+                observed=observed,
+            )
+        last = dict(observed)
+        completed_monotonic = time.monotonic()
+        if observed.get("cmdline_sha256") != _EMPTY_CMDLINE_SHA256:
+            if stable_nonempty is not None:
+                if not _same_live_fingerprint(stable_nonempty, observed):
+                    raise _InitialLauncherAttestationFailure(
+                        "S18_PROCESS_INITIAL_LAUNCHER_CMDLINE_STABILITY_DRIFT",
+                        expected=stable_nonempty,
+                        observed=observed,
+                    )
+                if completed_monotonic <= deadline:
+                    return dict(observed)
+            stable_nonempty = dict(observed)
+        if completed_monotonic >= deadline:
+            raise _InitialLauncherAttestationFailure(
+                "S18_PROCESS_INITIAL_LAUNCHER_ATTESTATION_EMPTY_CMDLINE_TIMEOUT",
+                expected=anchor,
+                observed=last,
+            )
+        time.sleep(min(INITIAL_LAUNCHER_ATTESTATION_POLL_SECONDS, deadline - completed_monotonic))
+
+
 def _parent_fingerprint(pid: int, planned_run_token: str) -> dict[str, Any]:
     """Fingerprint the pre-existing parent without inventing token inheritance."""
 
@@ -2464,7 +2544,17 @@ def _launch(
         finally:
             if reservation is not None:
                 reservation.close()
-        fingerprint = _fingerprint(process.pid, run_token)
+        try:
+            fingerprint = _attest_initial_launcher(process.pid, run_token)
+        except _InitialLauncherAttestationFailure as error:
+            _manual_intervention(
+                work,
+                label,
+                error.expected,
+                reason=str(error),
+                observed={"initial_launcher_attestation": error.observed},
+            )
+            raise
         known_members: dict[int, Mapping[str, Any]] = {int(fingerprint["pid"]): fingerprint}
         known_depths: dict[int, int] = {int(fingerprint["pid"]): 0}
         try:
