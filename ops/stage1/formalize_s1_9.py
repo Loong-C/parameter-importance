@@ -38,6 +38,11 @@ _ATTEMPT = re.compile(r"^[a-z0-9][a-z0-9-]{0,63}$")
 _CHECKPOINT_STORE_REPRODUCTION_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _DETERMINISM_ENV = {"CUBLAS_WORKSPACE_CONFIG": ":4096:8", "PYTHONHASHSEED": "0"}
 _S1_7_AUTHORIZED_SHARED_DEPENDENCIES = {"src/param_importance_nlp/runtime/optimizer.py"}
+_S1_7_REVIEWED_PRODUCER_PATHS = {
+    ".gitignore",
+    "tests/test_stage1_s18_ddp_contracts.py",
+    "worklogs/2026-08-15-s1.7-single-gpu-pythia14m.md",
+}
 _S1_8_ARRAY_BUNDLE_V2_ROUTE_REFS = {
     "A": {"artifact_ref": "run__route-A-identity-formal__route-output__route-A.safetensors", "manifest_ref": "run__route-A-identity-formal__route-output__route-report.json"},
     "B": {"artifact_ref": "run__route-B-identity-formal__route-output__route-B.safetensors", "manifest_ref": "run__route-B-identity-formal__route-output__route-report.json"},
@@ -127,6 +132,7 @@ _S1_9_FROZEN_CONSUMER_FILES = {
     "schemas/stage1/s1-9-comparison-table-v1.json",
     "schemas/stage1/s1-9-ddp-skip-worker-v1.json",
     "schemas/stage1/s1-9-formalization-index-v1.json",
+    "schemas/stage1/s1-9-formalization-index-v5.json",
     "schemas/stage1/s1-9-formalization-index-v6.json",
     "schemas/stage1/s1-9-formalization-index-v7.json",
     "schemas/stage1/s1-9-formalization-index-v8.json",
@@ -143,6 +149,7 @@ _S1_9_FROZEN_CONSUMER_FILES = {
     "schemas/stage1/s1-9-upstream-compatibility-v5.json",
     "schemas/stage1/s1-9-upstream-compatibility-v6.json",
     "schemas/stage1/s1-9-upstream-compatibility-v7.json",
+    "schemas/stage1/s1-9-upstream-compatibility-v4.json",
     "schemas/stage1/s1-9-validation-v1.json",
     "schemas/stage1/s1-9-validation-v2.json",
     "src/param_importance_nlp/stage1_precision.py",
@@ -477,11 +484,25 @@ def _s1_8_v8_handoff_attestation(data_root: Path, index_ref: str, report: Mappin
     }
 
 
-def _consumer_diff(repository: Path, producer_commit: str) -> list[str]:
+def _consumer_diff(repository: Path, producer_commit: str, *, validated_producer_source: Mapping[str, str] | None = None) -> list[str]:
+    """Reject every unreviewed producer-to-consumer path.
+
+    S1.8-to-S1.9 accepts only frozen S1.9/S1.10 consumer files.  The older
+    S1.7 diff additionally permits the exact, schema-validated S1.8 index
+    source-map keys and three reviewed producer/metadata files; it is never a
+    prefix or family exemption.
+    """
+
     if _COMMIT.fullmatch(producer_commit) is None:
         raise Stage1S19FormalError("S1_9_UPSTREAM_PRODUCER_COMMIT_INVALID")
     changed = [line for line in _git(repository, "diff", "--name-only", f"{producer_commit}..HEAD").splitlines() if line]
-    allowed_exact = {"src/param_importance_nlp/runtime/optimizer.py", *_S1_9_FROZEN_CONSUMER_FILES, *_S1_10_FROZEN_CONSUMER_FILES, *_S1_10_SHARED_RUNTIME_FILES}
+    allowed_exact = {*_S1_9_FROZEN_CONSUMER_FILES, *_S1_10_FROZEN_CONSUMER_FILES, *_S1_10_SHARED_RUNTIME_FILES}
+    if validated_producer_source is not None:
+        if not isinstance(validated_producer_source, Mapping) or not validated_producer_source or any(not isinstance(path, str) or not path or "\\" in path or path.startswith("/") or ".." in PurePosixPath(path).parts or not isinstance(digest, str) or re.fullmatch(r"[0-9a-f]{64}", digest) is None for path, digest in validated_producer_source.items()):
+            raise Stage1S19FormalError("S1_9_UPSTREAM_PRODUCER_SOURCE_CLOSURE_INVALID")
+        allowed_exact.update(validated_producer_source)
+        allowed_exact.update(_S1_7_REVIEWED_PRODUCER_PATHS)
+        allowed_exact.update(_S1_7_AUTHORIZED_SHARED_DEPENDENCIES)
     rejected = [path for path in changed if path not in allowed_exact]
     if rejected:
         raise Stage1S19FormalError("S1_9_UPSTREAM_CONSUMER_DIFF_UNAUTHORIZED:" + ",".join(rejected))
@@ -751,14 +772,22 @@ def _upstream_compatibility_attestation(repository: Path, data_root: Path, *, s1
     drift other than the explicitly reviewed, CPU-replayed clipping helper.
     """
 
-    changed_s17 = _consumer_diff(repository, str(s1_7["s1_7_generator_commit"]))
-    changed_s18 = _consumer_diff(repository, str(s1_8["s1_8_generator_commit"]))
     s17_report = _upstream_role(data_root, s1_7_ref, "single_gpu_report")
-    s17_attestation = _s1_7_shared_dependency_attestation(repository, s17_report, producer_commit=str(s1_7["s1_7_generator_commit"]), changed_paths=[path for path in changed_s17 if path not in _S1_10_SHARED_RUNTIME_FILES])
-    affected_s17 = sorted(set(changed_s17) & _S1_7_AUTHORIZED_SHARED_DEPENDENCIES)
     s18_report = _upstream_role(data_root, s1_8_ref, "ddp_report")
     s18_sources = _source_map(s18_report, field="s1_8.ddp_report")
     s18_v8_handoff = _s1_8_v8_handoff_attestation(data_root, s1_8_ref, s18_report)
+    s18_index_sources = _source_map(s18_v8_handoff, field="s1_8.v8_index")
+    if s18_index_sources != s18_sources:
+        raise Stage1S19FormalError("S1_9_S1_8_INDEX_REPORT_SOURCE_MAP_MISMATCH")
+    changed_s17 = _consumer_diff(repository, str(s1_7["s1_7_generator_commit"]), validated_producer_source=s18_index_sources)
+    changed_s18 = _consumer_diff(repository, str(s1_8["s1_8_generator_commit"]))
+    s17_attestation_changed = [
+        path for path in changed_s17
+        if path not in _S1_10_SHARED_RUNTIME_FILES
+        and (path not in s18_index_sources or path in _S1_7_AUTHORIZED_SHARED_DEPENDENCIES)
+    ]
+    s17_attestation = _s1_7_shared_dependency_attestation(repository, s17_report, producer_commit=str(s1_7["s1_7_generator_commit"]), changed_paths=s17_attestation_changed)
+    affected_s17 = sorted(set(s17_attestation_changed) & _S1_7_AUTHORIZED_SHARED_DEPENDENCIES)
     if replay_root is None:
         replay_root = data_root / "tmp" / "s1-9-compatibility"
     nonproducer_runtime = _nonproducer_runtime_attestation(repository, s1_7_producer=str(s1_7["s1_7_generator_commit"]), s1_7_report=s17_report, s1_8_sources=s18_sources, changed_paths=[*changed_s17, *changed_s18], replay_root=replay_root)

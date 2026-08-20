@@ -892,7 +892,6 @@ def test_s19_clean_producer_diff_accepts_only_s110_and_s19_then_rejects_s111(tmp
     git("commit", "--allow-empty", "-m", "producer")
     producer = git("rev-parse", "HEAD")
     reviewed = {
-        "src/param_importance_nlp/runtime/optimizer.py",
         *formal._S1_9_FROZEN_CONSUMER_FILES,
         *formal._S1_10_FROZEN_CONSUMER_FILES,
         *formal._S1_10_SHARED_RUNTIME_FILES,
@@ -905,6 +904,38 @@ def test_s19_clean_producer_diff_accepts_only_s110_and_s19_then_rejects_s111(tmp
     git("add", "."); git("commit", "-m", "s111-must-not-pass")
     with pytest.raises(formal.Stage1S19FormalError, match="S1_9_UPSTREAM_CONSUMER_DIFF_UNAUTHORIZED:schemas/stage1/s1-11-formalization-index-v1.json"):
         formal._consumer_diff(repository, producer)
+
+
+def test_s19_s17_parameterized_diff_accepts_only_exact_s18_source_closure_and_reviewed_metadata(tmp_path: Path) -> None:
+    formal = _module(ROOT / "ops" / "stage1" / "formalize_s1_9.py", "s19_s17_parameterized_diff")
+    repository = tmp_path / "s17-to-current"; repository.mkdir()
+
+    def git(*args: str) -> str:
+        return subprocess.run(["git", "-C", str(repository), *args], check=True, text=True, capture_output=True).stdout.strip()
+
+    git("init"); git("config", "user.email", "s19-test@example.invalid"); git("config", "user.name", "S19 test")
+    git("commit", "--allow-empty", "-m", "s17-r11")
+    producer = git("rev-parse", "HEAD")
+    source_closure = {
+        "ops/stage1/formalize_s1_8.py": "a" * 64,
+        "schemas/stage1/s1-8-formalization-index-v8.json": "b" * 64,
+    }
+    reviewed = {
+        *source_closure,
+        *formal._S1_7_REVIEWED_PRODUCER_PATHS,
+        *formal._S1_7_AUTHORIZED_SHARED_DEPENDENCIES,
+        *formal._S1_9_FROZEN_CONSUMER_FILES,
+        *formal._S1_10_FROZEN_CONSUMER_FILES,
+        *formal._S1_10_SHARED_RUNTIME_FILES,
+    }
+    for relative in reviewed:
+        path = repository / relative; path.parent.mkdir(parents=True, exist_ok=True); path.write_text("reviewed\n", encoding="utf-8")
+    git("add", "."); git("commit", "-m", "exact-s18-closure-and-consumer")
+    assert set(formal._consumer_diff(repository, producer, validated_producer_source=source_closure)) == reviewed
+    sibling = repository / "schemas/stage1/s1-8-unreviewed-v8.json"; sibling.parent.mkdir(parents=True, exist_ok=True); sibling.write_text("unreviewed\n", encoding="utf-8")
+    git("add", "."); git("commit", "-m", "extra-s18-sibling")
+    with pytest.raises(formal.Stage1S19FormalError, match="S1_9_UPSTREAM_CONSUMER_DIFF_UNAUTHORIZED:schemas/stage1/s1-8-unreviewed-v8.json"):
+        formal._consumer_diff(repository, producer, validated_producer_source=source_closure)
 
 
 def test_s19_upstream_v7_freezes_s18_v8_source_array_and_reproduction_closure() -> None:
