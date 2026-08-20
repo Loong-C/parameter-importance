@@ -612,6 +612,27 @@ def test_s111_chart_renderer_requires_real_numeric_csv_and_reads_back(tmp_path: 
         )
 
 
+def test_s111_chart_projects_only_index_bound_json_measurements(tmp_path: Path) -> None:
+    formalizer = _formalizer()
+    role = tmp_path / "comparison-table.json"
+    write_canonical_json(role, {"rows": [
+        {"max_abs_error": 1.0e-8, "absolute_threshold": 1.0e-7},
+        {"max_abs_error": 2.0e-8, "absolute_threshold": 1.0e-7},
+    ]})
+    projection = tmp_path / "projection.csv"
+    formalizer._project_role_rows(role, projection, ("max_abs_error", "absolute_threshold"))
+    record = formalizer._render_chart(
+        projection, chart_id="ddp-identity", x_column="max_abs_error", y_column="absolute_threshold",
+        output_csv=tmp_path / "ddp.csv", output_svg=tmp_path / "ddp.svg",
+        source_identity_sha256=_sha(role),
+    )
+    assert record["source_csv_sha256"] == _sha(role)
+    broken = tmp_path / "broken-table.json"
+    write_canonical_json(broken, {"rows": [{"max_abs_error": 1.0e-8}]})
+    with pytest.raises(formalizer.Stage1S111FormalError, match="CHART_ROLE_ROW_INVALID"):
+        formalizer._project_role_rows(broken, projection, ("max_abs_error", "absolute_threshold"))
+
+
 def test_s111_chart_geometry_is_typed_and_rejects_wrong_columns_nan_and_duplicate_keys(tmp_path: Path) -> None:
     formalizer = _formalizer()
     cases = (

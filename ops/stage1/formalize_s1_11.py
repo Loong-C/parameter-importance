@@ -383,7 +383,7 @@ def _verify_chart_geometry(
             raise Stage1S111FormalError("S1_11_CHART_READBACK_INVALID")
 
 
-def _render_chart(source: Path, *, chart_id: str, x_column: str, y_column: str, output_csv: Path, output_svg: Path, value_column: str | None = None, error_column: str | None = None) -> dict[str, object]:
+def _render_chart(source: Path, *, chart_id: str, x_column: str, y_column: str, output_csv: Path, output_svg: Path, value_column: str | None = None, error_column: str | None = None, source_identity_sha256: str | None = None) -> dict[str, object]:
     """Render the plan-mandated geometry from a typed, finite CSV source."""
 
     kind = "scatter" if chart_id in _SCATTERS else "heatmap" if chart_id in _HEATMAPS else "error" if chart_id in _ERROR_BARS else "line"
@@ -450,7 +450,23 @@ def _render_chart(source: Path, *, chart_id: str, x_column: str, y_column: str, 
         if reader.fieldnames != expected_header or len(rows) != len(points):
             raise Stage1S111FormalError("S1_11_CHART_READBACK_INVALID")
     _verify_chart_geometry(output_svg.read_text(encoding="utf-8"), chart_id=chart_id, kind=kind, points=points, coordinates=coordinates, heat_cells=heat_cells)
-    return {"chart_id": chart_id, "source_csv_sha256": _sha(source), "row_count": len(points), "csv_ref": output_csv.name, "csv_sha256": _sha(output_csv), "svg_ref": output_svg.name, "svg_sha256": _sha(output_svg)}
+    return {"chart_id": chart_id, "source_csv_sha256": source_identity_sha256 or _sha(source), "row_count": len(points), "csv_ref": output_csv.name, "csv_sha256": _sha(output_csv), "svg_ref": output_svg.name, "svg_sha256": _sha(output_svg)}
+
+
+def _project_role_rows(source: Path, destination: Path, columns: tuple[str, ...]) -> None:
+    """Project an index-bound JSON table to CSV without inventing measurements."""
+
+    value = _object(source, field="chart_role_source")
+    rows = value.get("rows")
+    if not isinstance(rows, list) or not rows:
+        raise Stage1S111FormalError("S1_11_CHART_ROLE_ROWS_INVALID")
+    with destination.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.writer(handle, lineterminator="\n")
+        writer.writerow(columns)
+        for ordinal, row in enumerate(rows):
+            if not isinstance(row, Mapping) or any(column not in row for column in columns):
+                raise Stage1S111FormalError(f"S1_11_CHART_ROLE_ROW_INVALID:{ordinal}")
+            writer.writerow([row[column] for column in columns])
 
 
 def _build_charts(evidence_root: Path, work: Path, dependencies: list[Mapping[str, object]], specs: object) -> list[dict[str, object]]:
@@ -467,12 +483,25 @@ def _build_charts(evidence_root: Path, work: Path, dependencies: list[Mapping[st
         index = _object(_relative(evidence_root, binding["index_ref"], field="chart_index"), field="chart_index")
         hashes = index.get("chart_csv_sha256", index.get("csv_sha256"))
         source_ref, source_sha = item["source_csv_ref"], item["source_csv_sha256"]
-        if not isinstance(hashes, Mapping) or Path(str(source_ref)).name not in hashes or hashes[Path(str(source_ref)).name] != source_sha:
+        role_refs, role_hashes = index.get("role_refs"), index.get("role_sha256")
+        csv_bound = isinstance(hashes, Mapping) and Path(str(source_ref)).name in hashes and hashes[Path(str(source_ref)).name] == source_sha
+        matching_roles = [] if not isinstance(role_refs, Mapping) or not isinstance(role_hashes, Mapping) else [
+            role for role, ref in role_refs.items() if ref == source_ref and role_hashes.get(role) == source_sha
+        ]
+        role_bound = len(matching_roles) == 1
+        if not csv_bound and not role_bound:
             raise Stage1S111FormalError("S1_11_CHART_SOURCE_INDEX_BINDING_INVALID")
         source = _relative(_relative(evidence_root, binding["index_ref"], field="chart_index").parent, source_ref, field="chart_source")
         if not source.is_file() or _sha(source) != source_sha:
             raise Stage1S111FormalError("S1_11_CHART_SOURCE_HASH_MISMATCH")
-        result.append(_render_chart(source, chart_id=expected, x_column=str(item["x_column"]), y_column=str(item["y_column"]), value_column=None if item["value_column"] is None else str(item["value_column"]), error_column=None if item["error_column"] is None else str(item["error_column"]), output_csv=work / f"{expected}.csv", output_svg=work / f"{expected}.svg"))
+        render_source = source
+        if role_bound:
+            columns = tuple(dict.fromkeys(str(value) for value in (item["x_column"], item["y_column"], item["value_column"], item["error_column"]) if value is not None))
+            render_source = work / f".{expected}.source.csv"
+            _project_role_rows(source, render_source, columns)
+        result.append(_render_chart(render_source, chart_id=expected, x_column=str(item["x_column"]), y_column=str(item["y_column"]), value_column=None if item["value_column"] is None else str(item["value_column"]), error_column=None if item["error_column"] is None else str(item["error_column"]), output_csv=work / f"{expected}.csv", output_svg=work / f"{expected}.svg", source_identity_sha256=str(source_sha)))
+        if role_bound:
+            render_source.unlink()
     return result
 
 
