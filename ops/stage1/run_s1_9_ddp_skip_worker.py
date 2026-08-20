@@ -128,6 +128,24 @@ def _production_tracker(model: DistributedDataParallel, optimizer: _CountingAdam
     return OnlineImportanceTracker(registry, spec)
 
 
+def _learning_rates_by_group(registry: ParameterRegistry) -> dict[str, float]:
+    """Return the estimator's public optimizer-group learning-rate wire."""
+
+    learning_rates: dict[str, float] = {}
+    for record in registry.eligible_records:
+        if record.group_id is None or record.learning_rate is None:
+            raise RuntimeError("S1_9_DDP_TRACKER_LEARNING_RATES_INVALID")
+        observed = float(record.learning_rate)
+        previous = learning_rates.get(record.group_id)
+        if previous is not None and previous != observed:
+            raise RuntimeError("S1_9_DDP_TRACKER_LEARNING_RATES_INVALID")
+        learning_rates[record.group_id] = observed
+    expected_groups = {record.group_id for record in registry.eligible_records}
+    if None in expected_groups or set(learning_rates) != expected_groups:
+        raise RuntimeError("S1_9_DDP_TRACKER_LEARNING_RATES_INVALID")
+    return learning_rates
+
+
 def _tracker_views(tracker: OnlineImportanceTracker) -> dict[str, Any]:
     accumulator = tracker.accumulator
     return _wire({
@@ -143,6 +161,10 @@ def _tracker_views(tracker: OnlineImportanceTracker) -> dict[str, Any]:
         "actual_update_raw_importance": accumulator.actual_update_raw_importance,
         "magnitude": accumulator.magnitude,
     })
+
+
+def _without_skipped_steps(state: Mapping[str, Any]) -> dict[str, Any]:
+    return {key: value for key, value in state.items() if key != "skipped_steps"}
 
 
 def _state(model: DistributedDataParallel, optimizer: _CountingAdamW, scheduler: Any, scaler: _CountingGradScaler, tracker: OnlineImportanceTracker, *, cursor: int, attempt: int, skipped: int) -> dict[str, Any]:
@@ -164,9 +186,7 @@ def _run_sequence(*, rank: int, model: DistributedDataParallel, attempts_spec: t
     tracker = _production_tracker(model, optimizer)
     optimizer_bridge = OptimizerBridge(dict(model.module.named_parameters()), optimizer)
     reducer = TorchDistributedReducer(integer_device=device)
-    learning_rates = {record.canonical_name: float(record.learning_rate) for record in tracker.registry.eligible_records if record.learning_rate is not None}
-    if set(learning_rates) != set(tracker.registry.eligible_names):
-        raise RuntimeError("S1_9_DDP_TRACKER_LEARNING_RATES_INVALID")
+    learning_rates = _learning_rates_by_group(tracker.registry)
     cursor = attempt = skipped = successful = 0
     attempts: list[dict[str, Any]] = []
     for sequence, (frozen_sample_value, inject_here) in enumerate(attempts_spec):
@@ -302,7 +322,7 @@ def main(argv: list[str] | None = None) -> int:
                 for item in skip_rows
             )
             expected_cursor = all(int(item["post_fetch_state"]["cursor"]) == int(item["pre_fetch_state"]["cursor"]) + 1 and item["post_fetch_state"]["cursor"] == item["post_state"]["cursor"] for item in skip_rows)
-            next_finite_parity = all(observed_item["final_state"]["parameters"] == reference_item["final_state"]["parameters"] and observed_item["final_state"]["optimizer"] == reference_item["final_state"]["optimizer"] and observed_item["final_state"]["scheduler"] == reference_item["final_state"]["scheduler"] and {key: value for key, value in observed_item["final_state"]["importance_accumulator"].items() if key != "skipped_steps"} == reference_item["final_state"]["importance_accumulator"] and observed_item["final_state"]["importance_views"] == reference_item["final_state"]["importance_views"] for observed_item, reference_item in zip(gathered_observed, gathered_reference, strict=True))
+            next_finite_parity = all(observed_item["final_state"]["parameters"] == reference_item["final_state"]["parameters"] and observed_item["final_state"]["optimizer"] == reference_item["final_state"]["optimizer"] and observed_item["final_state"]["scheduler"] == reference_item["final_state"]["scheduler"] and _without_skipped_steps(observed_item["final_state"]["importance_accumulator"]) == _without_skipped_steps(reference_item["final_state"]["importance_accumulator"]) and observed_item["final_state"]["importance_views"] == reference_item["final_state"]["importance_views"] for observed_item, reference_item in zip(gathered_observed, gathered_reference, strict=True))
             counters = all(item["scaler_calls"] == {"unscale": 3, "step": 3, "update": 3} and item["actual_optimizer_step_calls"] == 2 and item["successful"] == 2 and item["skipped"] == 1 for item in gathered_observed)
             rank_parity = len({_canonical(item["final_state"]).hex() for item in gathered_observed}) == 1
             progression = all(item["attempts"][1]["pre_fetch_state"]["rng_cpu"] == item["attempts"][1]["post_fetch_state"]["rng_cpu"] == item["attempts"][1]["post_state"]["rng_cpu"] and item["attempts"][1]["pre_fetch_state"]["rng_cuda_local"] == item["attempts"][1]["post_fetch_state"]["rng_cuda_local"] == item["attempts"][1]["post_state"]["rng_cuda_local"] and int(item["attempts"][1]["post_state"]["attempt"]) == int(item["attempts"][1]["pre_fetch_state"]["attempt"]) + 1 and int(item["attempts"][1]["post_state"]["skipped"]) == int(item["attempts"][1]["pre_fetch_state"]["skipped"]) + 1 for item in gathered_observed)

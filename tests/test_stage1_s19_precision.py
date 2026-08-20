@@ -361,6 +361,20 @@ def test_s19_ddp_worker_proves_gradscaler_ordering_negative_control() -> None:
     assert worker._cpu_gradscaler_ordering_negative_control() is True
 
 
+def test_s19_ddp_worker_uses_optimizer_group_learning_rate_wire() -> None:
+    worker = _module(ROOT / "ops" / "stage1" / "run_s1_9_ddp_skip_worker.py", "s19_ddp_lr_worker")
+    model = torch.nn.Linear(1, 1, bias=False)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=0.05, weight_decay=0.1, foreach=False, fused=False)
+    registry = worker.ParameterRegistry.from_model(model, optimizer)
+    assert worker._learning_rates_by_group(registry) == {"group_0000": 0.05}
+
+
+def test_s19_ddp_reference_parity_excludes_skip_counter_on_both_sides() -> None:
+    worker = _module(ROOT / "ops" / "stage1" / "run_s1_9_ddp_skip_worker.py", "s19_ddp_skip_counter_worker")
+    assert worker._without_skipped_steps({"value": 3, "skipped_steps": 1}) == {"value": 3}
+    assert worker._without_skipped_steps({"value": 3, "skipped_steps": 0}) == {"value": 3}
+
+
 def test_s19_formal_helpers_reject_bad_explicit_uuid_sets() -> None:
     formal = _module(ROOT / "ops" / "stage1" / "formalize_s1_9.py", "s19_formalizer")
     with pytest.raises(formal.Stage1S19FormalError, match="S1_9_APPROVED_UUIDS_INVALID"):
@@ -509,8 +523,12 @@ def test_s19_new_compatibility_schemas_are_recursively_closed() -> None:
 
     worker_v2 = json.loads((ROOT / "schemas" / "stage1" / "s1-9-single-bf16-worker-v2.json").read_text(encoding="utf-8"))
     validation_v2 = json.loads((ROOT / "schemas" / "stage1" / "s1-9-validation-v2.json").read_text(encoding="utf-8"))
+    ddp_v1 = json.loads((ROOT / "schemas" / "stage1" / "s1-9-ddp-skip-worker-v1.json").read_text(encoding="utf-8"))
     assert worker_v2["$defs"]["determinism"]["properties"]["allowed_nondeterministic_kernel_classes"]["items"] == {"type": "string"}
     assert validation_v2["properties"]["regression"]["properties"]["kernel_allowlist"]["items"] == {"type": "string"}
+    optimizer_group = ddp_v1["$defs"]["optimizer"]["properties"]["param_groups"]["items"]
+    assert "initial_lr" in optimizer_group["required"]
+    assert optimizer_group["properties"]["initial_lr"] == {"type": "number"}
 
 
 def test_s19_runtime_validator_rejects_jointly_rehashed_nested_schema_drift() -> None:
@@ -540,7 +558,7 @@ def test_s19_gate_replay_and_validation_schema_sets_are_exact() -> None:
     s18 = {"s1_8_index_ref": "s1-8/index.json", "s1_8_index_sha256": digest, "s1_8_index_artifact_hash": digest, "s1_8_generator_commit": commit, "s1_8_gate_artifact_hash": digest, "s1_8_role_sha256": {name: digest for name in ("fixture_manifest", "ddp_report", "array_bundle", "comparison_table", "gate_record")}}
     formal_checks = ("bf16_worker_self_hash", "bf16_checkpoint_binding_and_tamper_negative_control", "ddp_worker_self_hash_and_all_direct_checks", "post_worker_gpu_preflight_clean", "strict_schema_missing_and_unknown_negative_controls")
     visible = ",".join(GPU_UUIDS)
-    validation = {"schema_version": "stage1-s1-9-validation-v1", "status": "PASS", "gate_id": "G1-NUMERIC", "task_id": precision.TASK_ID, "execution_scope": "formal_server_gpu_single_and_ddp_skip", "fixture_id": precision_oracle.FIXTURE_ID, "producer_commit": commit, "consumer_commit": commit, "upstream": {"s1_7": s17, "s1_8": s18}, "regression": {"bf16": {"algorithms_enabled": True, "cudnn_deterministic": True, "cudnn_benchmark": False, "allowed_nondeterministic_kernel_classes": [], "kernel_policy": "empty_pre_registered_allowlist"}, "ddp_world_size": 4, "kernel_allowlist": [], "environment": {"single": _environment_summary(visible=GPU_UUIDS[0], rank=0, uuid=GPU_UUIDS[0]), "ddp_rank0": _environment_summary(visible=visible, rank=0, uuid=GPU_UUIDS[0]), "ddp_all_ranks": [_environment_summary(visible=visible, rank=rank, uuid=uuid) for rank, uuid in enumerate(GPU_UUIDS)]}}, "direct_checks": [{"check_id": check_id, "status": "PASS", "detail": "checked"} for check_id in (*precision.REQUIREMENT_KEYS, *formal_checks)], "role_sha256": {name: digest for name in ("numeric_report", "oracle_bundle", "trace_bundle", "comparison_table", "gate_record")}, "csv_sha256": {name: digest for name in ("bf16-fp32-heatmap.csv", "clip-norm-factor.csv", "skip-zero-difference.csv", "t-amp-scale.csv", "u-single-factor-identity.csv", "u-single-factor-ratio-diagnostic.csv")}, "svg_sha256": {name: digest for name in ("bf16-fp32-heatmap.svg", "clip-norm-factor.svg", "skip-zero-difference.svg", "t-amp-scale.svg", "u-single-factor-identity.svg", "u-single-factor-ratio-diagnostic.svg")}, "replay_sha256": digest, "replay_hash": digest, "artifact_hash": digest}
+    validation = {"schema_version": "stage1-s1-9-validation-v2", "status": "PASS", "gate_id": "G1-NUMERIC", "task_id": precision.TASK_ID, "execution_scope": "formal_server_gpu_single_and_ddp_skip", "fixture_id": precision_oracle.FIXTURE_ID, "producer_commit": commit, "consumer_commit": commit, "upstream": {"s1_7": s17, "s1_8": s18}, "regression": {"bf16": {"algorithms_enabled": True, "cudnn_deterministic": True, "cudnn_benchmark": False, "allowed_nondeterministic_kernel_classes": [], "kernel_policy": "empty_pre_registered_allowlist"}, "ddp_world_size": 4, "kernel_allowlist": [], "environment": {"single": _environment_summary(visible=GPU_UUIDS[0], rank=0, uuid=GPU_UUIDS[0]), "ddp_rank0": _environment_summary(visible=visible, rank=0, uuid=GPU_UUIDS[0]), "ddp_all_ranks": [_environment_summary(visible=visible, rank=rank, uuid=uuid) for rank, uuid in enumerate(GPU_UUIDS)]}}, "direct_checks": [{"check_id": check_id, "status": "PASS", "detail": "checked"} for check_id in (*precision.REQUIREMENT_KEYS, *formal_checks)], "role_sha256": {name: digest for name in ("numeric_report", "oracle_bundle", "trace_bundle", "comparison_table", "gate_record")}, "csv_sha256": {name: digest for name in ("bf16-fp32-heatmap.csv", "clip-norm-factor.csv", "skip-zero-difference.csv", "t-amp-scale.csv", "u-single-factor-identity.csv", "u-single-factor-ratio-diagnostic.csv")}, "svg_sha256": {name: digest for name in ("bf16-fp32-heatmap.svg", "clip-norm-factor.svg", "skip-zero-difference.svg", "t-amp-scale.svg", "u-single-factor-identity.svg", "u-single-factor-ratio-diagnostic.svg")}, "replay_sha256": digest, "replay_hash": digest, "artifact_hash": digest}
     formal._validate_s1_9_schemas(ROOT, {"validation": validation})
     index_schema = json.loads((ROOT / "schemas" / "stage1" / "s1-9-formalization-index-v8.json").read_text(encoding="utf-8"))
     v7_index_schema = json.loads((ROOT / "schemas" / "stage1" / "s1-9-formalization-index-v7.json").read_text(encoding="utf-8"))
