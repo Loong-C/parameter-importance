@@ -326,6 +326,17 @@ def test_s111_rehearsal_is_not_run_but_offline_replays_immutable_roles(tmp_path:
     assert summary["status"] == "NOT_RUN"
     assert summary["exit_verdict"] == "BLOCKED_FORMAL_OBSERVATION_MISSING"
     assert len(summary["dependency_audits"]) == 11
+    schema_summary = {
+        **summary,
+        "charts": [
+            {**chart, "source_csv_sha256": chart["csv_sha256"], "row_count": 2}
+            for chart in summary["charts"]
+        ],
+    }
+    schema_summary["artifact_hash"] = canonical_json_hash(
+        {key: value for key, value in schema_summary.items() if key != "artifact_hash"}
+    )
+    _formalizer()._schema_validate(Path.cwd(), {"gate_summary": schema_summary})
     assert replay_exit_gate_summary(tmp_path, summary)["status"] == "PASS"
 
 
