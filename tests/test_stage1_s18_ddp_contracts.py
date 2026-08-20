@@ -695,6 +695,78 @@ def test_child_fingerprint_remains_strict_for_missing_or_wrong_inherited_token(m
     assert formalizer._fingerprint(12, token) == {**base, "environment_run_token": token}
 
 
+def test_initial_launcher_attestation_retries_empty_argv_but_rejects_timeout_and_identity_drift(monkeypatch: pytest.MonkeyPatch) -> None:
+    formalizer = _formalizer(); token = "b" * 64
+    stable = {"pid": 12, "ppid": 1, "uid": 1000, "pgid": 12, "sid": 12, "start_ticks": "99", "exe": "/usr/bin/python", "cmdline_sha256": "a" * 64, "environment_run_token": token}
+    empty = {**stable, "cmdline_sha256": formalizer._EMPTY_CMDLINE_SHA256}
+    now = [0.0]
+    monkeypatch.setattr(formalizer.time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(formalizer.time, "sleep", lambda seconds: now.__setitem__(0, now[0] + seconds))
+    observations = iter([empty, stable, stable])
+    monkeypatch.setattr(formalizer, "_fingerprint", lambda _pid, _token: next(observations))
+    assert formalizer._attest_initial_launcher(12, token) == stable
+
+    monkeypatch.setattr(formalizer, "_fingerprint", lambda _pid, _token: empty)
+    now[0] = 0.0
+    with pytest.raises(formalizer._InitialLauncherAttestationFailure, match="S18_PROCESS_INITIAL_LAUNCHER_ATTESTATION_EMPTY_CMDLINE_TIMEOUT") as timed_out:
+        formalizer._attest_initial_launcher(12, token)
+    assert timed_out.value.expected["cmdline_sha256"] == formalizer._EMPTY_CMDLINE_SHA256
+
+    for changed in ({**empty, "uid": 1001}, {**empty, "environment_run_token": "c" * 64}, {**empty, "pid": 13}):
+        now[0] = 0.0
+        observations = iter([empty, changed])
+        monkeypatch.setattr(formalizer, "_fingerprint", lambda _pid, _token, observations=observations: next(observations))
+        with pytest.raises(formalizer._InitialLauncherAttestationFailure, match="S18_PROCESS_INITIAL_LAUNCHER_(IDENTITY|POPEN_PID)_DRIFT"):
+            formalizer._attest_initial_launcher(12, token)
+
+
+@pytest.mark.skipif(os.name != "posix" or not Path("/proc").is_dir(), reason="requires Linux /proc")
+def test_real_posix_popen_initial_attestation_recovers_empty_to_stable_argv(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A real Popen child deterministically models its one empty-argv read."""
+
+    formalizer = _formalizer(); token = hashlib.sha256(b"s18-initial-exec-start-race").hexdigest()
+    environment = dict(os.environ); environment["PARAM_IMPORTANCE_S18_RUN_TOKEN"] = token
+    process = subprocess.Popen(
+        [sys.executable, "-c", "import sys; sys.stdin.buffer.read(1)"],
+        stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        env=environment, start_new_session=True,
+    )
+    try:
+        real_fingerprint, calls = formalizer._fingerprint, [0]
+        def empty_then_stable(pid: int, run_token: str) -> dict[str, object]:
+            calls[0] += 1
+            observed = real_fingerprint(pid, run_token)
+            return {**observed, "cmdline_sha256": formalizer._EMPTY_CMDLINE_SHA256} if calls[0] == 1 else observed
+        monkeypatch.setattr(formalizer, "_fingerprint", empty_then_stable)
+        attested = formalizer._attest_initial_launcher(process.pid, token)
+        assert attested["pid"] == process.pid and attested["cmdline_sha256"] != formalizer._EMPTY_CMDLINE_SHA256
+        assert calls[0] == 3
+    finally:
+        if process.stdin is not None and not process.stdin.closed:
+            process.stdin.close()
+        if process.poll() is None:
+            process.terminate()
+        process.wait(timeout=2)
+
+
+def test_launch_persists_manual_marker_when_initial_launcher_argv_never_stabilizes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    formalizer = _formalizer(); token = "c" * 64
+    empty = {"pid": 100, "ppid": 1, "uid": 7, "pgid": 100, "sid": 100, "start_ticks": "10", "exe": "/usr/bin/python", "cmdline_sha256": formalizer._EMPTY_CMDLINE_SHA256, "environment_run_token": token}
+    process = SimpleNamespace(pid=100, poll=lambda: None, wait=lambda *, timeout: 0, returncode=0)
+    now = [0.0]
+    monkeypatch.setattr(formalizer.subprocess, "Popen", lambda *_args, **_kwargs: process)
+    monkeypatch.setattr(formalizer, "_fingerprint", lambda _pid, _token: empty)
+    monkeypatch.setattr(formalizer.time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(formalizer.time, "sleep", lambda seconds: now.__setitem__(0, now[0] + seconds))
+    monkeypatch.setattr(formalizer, "_audit_exact_process_group", lambda *_args, **_kwargs: pytest.fail("initial tree must not run"))
+    with pytest.raises(formalizer._InitialLauncherAttestationFailure, match="S18_PROCESS_INITIAL_LAUNCHER_ATTESTATION_EMPTY_CMDLINE_TIMEOUT"):
+        formalizer._launch(repository=tmp_path, work=tmp_path, label="empty-launcher", command=[sys.executable, "worker.py"], environment={}, run_token=token, timeout_seconds=1, lease=SimpleNamespace(heartbeat=lambda: None), expected_success=True)
+    from param_importance_nlp.contracts.jsonio import load_canonical_json
+    marker = formalizer._mapping(load_canonical_json(tmp_path / "empty-launcher-manual-intervention.json"), field="empty-launcher.manual")
+    assert marker["reason"] == "S18_PROCESS_INITIAL_LAUNCHER_ATTESTATION_EMPTY_CMDLINE_TIMEOUT"
+    assert marker["action"] == "NO_SIGNAL_NO_LEASE_RELEASE"
+
+
 def test_torchrun_endpoint_is_nonzero_loopback_and_never_reused() -> None:
     formalizer = _formalizer()
     command = [
