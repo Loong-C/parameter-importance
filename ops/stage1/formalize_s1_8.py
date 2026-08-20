@@ -1811,28 +1811,73 @@ def _is_nonzero_loopback_endpoint(value: object) -> bool:
     return 1 <= port <= 65535
 
 
+def _confirm_attested_launcher_exit(
+    process: subprocess.Popen[str],
+    fingerprint: Mapping[str, Any],
+    known_members: Mapping[int, Mapping[str, Any]],
+    *,
+    reason: str,
+) -> None:
+    """Confirm an already-attested launcher exit without weakening ownership.
+
+    The poll loop may sample ``/proc`` after a short-lived launcher has gone
+    away but before its ``Popen`` object has been observed as exited.  That is
+    acceptable only after the exact launcher identity (including its inherited
+    run token) was recorded in the initial tree.  A bounded ``wait`` freezes
+    that decision, then an immediate residual scan proves that no token or
+    session member survived the launcher.
+    """
+
+    expected_pid = fingerprint.get("pid")
+    attested = known_members.get(expected_pid) if isinstance(expected_pid, int) else None
+    if not isinstance(expected_pid, int) or not isinstance(attested, Mapping) or dict(attested) != dict(fingerprint):
+        raise Stage1S18ManualInterventionRequired("S18_PROCESS_LAUNCHER_EXIT_UNATTESTED")
+    try:
+        returncode = process.wait(timeout=LAUNCHER_EXIT_CONFIRMATION_TIMEOUT_SECONDS)
+    except subprocess.TimeoutExpired as error:
+        raise Stage1S18ManualInterventionRequired(
+            "S18_PROCESS_LAUNCHER_NATURAL_EXIT_UNCONFIRMED:" + reason
+        ) from error
+    except OSError as error:
+        raise Stage1S18ManualInterventionRequired(
+            "S18_PROCESS_LAUNCHER_NATURAL_EXIT_WAIT_FAILED:" + reason
+        ) from error
+    if not isinstance(returncode, int):
+        raise Stage1S18ManualInterventionRequired(
+            "S18_PROCESS_LAUNCHER_NATURAL_EXIT_UNCONFIRMED:" + reason
+        )
+    residual = _residual_launch_tree(fingerprint, known_members=known_members)
+    if residual["session_members"] or residual["token_members"]:
+        raise Stage1S18ManualInterventionRequired("S18_PROCESS_LAUNCHER_EXIT_RESIDUAL")
+
+
 def _audit_or_confirmed_launcher_exit(process: subprocess.Popen[str], fingerprint: Mapping[str, Any], known_members: Mapping[int, Mapping[str, Any]]) -> dict[str, Any] | None:
     """Audit a live launcher, tolerating only a confirmed natural-exit race."""
 
     try:
         return _audit_exact_process_group(fingerprint, known_members=known_members)
     except _LauncherNaturalExitCandidate as audit_error:
-        try:
-            process.wait(timeout=LAUNCHER_EXIT_CONFIRMATION_TIMEOUT_SECONDS)
-        except subprocess.TimeoutExpired:
-            raise Stage1S18ManualInterventionRequired(
-                "S18_PROCESS_LAUNCHER_NATURAL_EXIT_UNCONFIRMED:" + str(audit_error)
-            ) from audit_error
+        _confirm_attested_launcher_exit(
+            process,
+            fingerprint,
+            known_members,
+            reason=str(audit_error),
+        )
         return None
     except ProcessLookupError as audit_error:
-        # /proc can reap the launcher just before Popen's non-blocking poll
-        # observes that exit.  Confirm natural termination with one frozen,
-        # bounded wait; accepting a timeout would turn a live identity drift
-        # into a cleanup bypass, so preserve the original audit failure.
-        try:
-            process.wait(timeout=LAUNCHER_EXIT_CONFIRMATION_TIMEOUT_SECONDS)
-        except subprocess.TimeoutExpired:
-            raise audit_error from None
+        # `_audit_exact_process_group` raises ProcessLookupError(expected_pid)
+        # only when the previously observed expected launcher vanished from the
+        # token scan.  Do not reinterpret any other lookup failure as exit.
+        if audit_error.args != (fingerprint.get("pid"),):
+            raise Stage1S18ManualInterventionRequired(
+                "S18_PROCESS_LAUNCHER_EXIT_AUDIT_TARGET_INVALID"
+            ) from audit_error
+        _confirm_attested_launcher_exit(
+            process,
+            fingerprint,
+            known_members,
+            reason="S18_PROCESS_LAUNCHER_TOKEN_OWNER_MISSING",
+        )
         return None
 
 

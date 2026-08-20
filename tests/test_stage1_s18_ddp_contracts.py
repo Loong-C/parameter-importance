@@ -1253,6 +1253,7 @@ def test_launch_audit_allows_only_confirmed_natural_exit_race(monkeypatch: pytes
     formalizer = _formalizer()
     fingerprint = {"pid": 100, "ppid": 1, "uid": 7, "pgid": 100, "sid": 100, "start_ticks": "10", "exe": "/usr/bin/python", "cmdline_sha256": "a" * 64, "environment_run_token": "b" * 64}
     monkeypatch.setattr(formalizer, "_audit_exact_process_group", lambda *_args, **_kwargs: (_ for _ in ()).throw(ProcessLookupError(100)))
+    monkeypatch.setattr(formalizer, "_residual_launch_tree", lambda *_args, **_kwargs: {"session_members": [], "token_members": []})
     immediate_waits: list[float] = []
     immediate_exit = SimpleNamespace(poll=lambda: 0, wait=lambda *, timeout: immediate_waits.append(timeout) or 0)
     assert formalizer._audit_or_confirmed_launcher_exit(immediate_exit, fingerprint, {100: fingerprint}) is None
@@ -1263,7 +1264,7 @@ def test_launch_audit_allows_only_confirmed_natural_exit_race(monkeypatch: pytes
     assert delayed_waits == [formalizer.LAUNCHER_EXIT_CONFIRMATION_TIMEOUT_SECONDS]
     def _still_live(*, timeout: float) -> int:
         raise subprocess.TimeoutExpired(cmd="torchrun", timeout=timeout)
-    with pytest.raises(ProcessLookupError):
+    with pytest.raises(formalizer.Stage1S18ManualInterventionRequired, match="S18_PROCESS_LAUNCHER_NATURAL_EXIT_UNCONFIRMED"):
         formalizer._audit_or_confirmed_launcher_exit(SimpleNamespace(poll=lambda: None, wait=_still_live), fingerprint, {100: fingerprint})
     monkeypatch.setattr(formalizer, "_audit_exact_process_group", lambda *_args, **_kwargs: (_ for _ in ()).throw(formalizer._LauncherNaturalExitCandidate("candidate")))
     candidate_waits: list[float] = []
@@ -1271,6 +1272,64 @@ def test_launch_audit_allows_only_confirmed_natural_exit_race(monkeypatch: pytes
     assert candidate_waits == [formalizer.LAUNCHER_EXIT_CONFIRMATION_TIMEOUT_SECONDS]
     with pytest.raises(formalizer.Stage1S18ManualInterventionRequired, match="S18_PROCESS_LAUNCHER_NATURAL_EXIT_UNCONFIRMED"):
         formalizer._audit_or_confirmed_launcher_exit(SimpleNamespace(wait=_still_live), fingerprint, {100: fingerprint})
+
+
+def test_launch_audit_natural_exit_requires_attestation_expected_pid_and_no_residual(monkeypatch: pytest.MonkeyPatch) -> None:
+    formalizer = _formalizer()
+    fingerprint = {"pid": 100, "ppid": 1, "uid": 7, "pgid": 100, "sid": 100, "start_ticks": "10", "exe": "/usr/bin/python", "cmdline_sha256": "a" * 64, "environment_run_token": "b" * 64}
+    exited = SimpleNamespace(wait=lambda *, timeout: 0)
+
+    monkeypatch.setattr(formalizer, "_audit_exact_process_group", lambda *_args, **_kwargs: (_ for _ in ()).throw(ProcessLookupError(101)))
+    monkeypatch.setattr(formalizer, "_residual_launch_tree", lambda *_args, **_kwargs: {"session_members": [], "token_members": []})
+    with pytest.raises(formalizer.Stage1S18ManualInterventionRequired, match="S18_PROCESS_LAUNCHER_EXIT_AUDIT_TARGET_INVALID"):
+        formalizer._audit_or_confirmed_launcher_exit(exited, fingerprint, {100: fingerprint})
+
+    monkeypatch.setattr(formalizer, "_audit_exact_process_group", lambda *_args, **_kwargs: (_ for _ in ()).throw(ProcessLookupError(100)))
+    with pytest.raises(formalizer.Stage1S18ManualInterventionRequired, match="S18_PROCESS_LAUNCHER_EXIT_UNATTESTED"):
+        formalizer._audit_or_confirmed_launcher_exit(exited, fingerprint, {})
+    with pytest.raises(formalizer.Stage1S18ManualInterventionRequired, match="S18_PROCESS_LAUNCHER_EXIT_UNATTESTED"):
+        formalizer._audit_or_confirmed_launcher_exit(
+            exited,
+            fingerprint,
+            {100: {**fingerprint, "environment_run_token": "c" * 64}},
+        )
+
+    monkeypatch.setattr(formalizer, "_residual_launch_tree", lambda *_args, **_kwargs: {"session_members": [101], "token_members": []})
+    with pytest.raises(formalizer.Stage1S18ManualInterventionRequired, match="S18_PROCESS_LAUNCHER_EXIT_RESIDUAL"):
+        formalizer._audit_or_confirmed_launcher_exit(exited, fingerprint, {100: fingerprint})
+
+
+@pytest.mark.skipif(os.name != "posix" or not Path("/proc").is_dir(), reason="requires Linux /proc")
+def test_real_linux_short_launcher_exit_is_confirmed_only_after_attestation() -> None:
+    """A real, reaped launcher exercises the raw ProcessLookup race closure."""
+
+    formalizer = _formalizer()
+    token = hashlib.sha256(b"s18-confirmed-short-launcher-exit").hexdigest()
+    environment = dict(os.environ); environment["PARAM_IMPORTANCE_S18_RUN_TOKEN"] = token
+    process = subprocess.Popen(
+        [sys.executable, "-c", "import sys; sys.stdin.buffer.read(1)"],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        env=environment,
+        start_new_session=True,
+    )
+    try:
+        fingerprint = formalizer._fingerprint(process.pid, token)
+        assert process.stdin is not None
+        process.stdin.write(b"x"); process.stdin.flush(); process.stdin.close()
+        assert process.wait(timeout=2) == 0
+        # The process has been reaped, so `_audit_exact_process_group` reaches
+        # its expected-PID ProcessLookupError branch without a mock.
+        assert formalizer._audit_or_confirmed_launcher_exit(
+            process,
+            fingerprint,
+            {int(fingerprint["pid"]): fingerprint},
+        ) is None
+    finally:
+        if process.poll() is None:
+            process.kill()
+        process.wait(timeout=2)
 
 
 def test_launch_initial_tree_never_accepts_launcher_exit_candidate(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
