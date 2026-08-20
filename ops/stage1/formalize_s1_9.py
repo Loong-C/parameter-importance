@@ -786,11 +786,11 @@ def _upstream_compatibility_attestation(repository: Path, data_root: Path, *, s1
         raise Stage1S19FormalError("S1_9_S1_8_INDEX_REPORT_SOURCE_MAP_MISMATCH")
     changed_s17 = _consumer_diff(repository, str(s1_7["s1_7_generator_commit"]), validated_producer_source=s18_index_sources)
     changed_s18 = _consumer_diff(repository, str(s1_8["s1_8_generator_commit"]))
-    s17_attestation_changed = [
-        path for path in changed_s17
-        if path not in _S1_10_SHARED_RUNTIME_FILES
-        and (path not in s18_index_sources or path in _S1_7_AUTHORIZED_SHARED_DEPENDENCIES)
-    ]
+    # The global diff above has already constrained every producer and
+    # consumer path.  Only the one file shared with S1.7's runtime belongs in
+    # its dependency replay; later S1.9/S1.10 consumer modules are not S1.7
+    # producer dependencies.
+    s17_attestation_changed = sorted(set(changed_s17) & _S1_7_AUTHORIZED_SHARED_DEPENDENCIES)
     s17_attestation = _s1_7_shared_dependency_attestation(repository, s17_report, producer_commit=str(s1_7["s1_7_generator_commit"]), changed_paths=s17_attestation_changed)
     affected_s17 = sorted(set(s17_attestation_changed) & _S1_7_AUTHORIZED_SHARED_DEPENDENCIES)
     if replay_root is None:
