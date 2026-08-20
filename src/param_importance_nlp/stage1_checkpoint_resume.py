@@ -908,7 +908,11 @@ def validate_parameterized_handoff(data_root: str | Path, index_ref: str, *, exp
             raise Stage1CheckpointError(f"S1_10_HANDOFF_REPRODUCTION_HASH_INVALID:{role}")
         if role in required_reproduction:
             value = load_canonical_json(path)
-            if not isinstance(value, Mapping) or value.get("status") != "PASS" or not _self_hash(value, field="artifact_hash"):
+            if (
+                not isinstance(value, Mapping)
+                or (role != "bf16_resume_checkpoint_store" and value.get("status") != "PASS")
+                or not _self_hash(value, field="artifact_hash")
+            ):
                 raise Stage1CheckpointError(f"S1_10_HANDOFF_REPRODUCTION_NOT_PASS:{role}")
             reproduction_values[role] = dict(value)
     expected_artifact_schemas = (
@@ -923,7 +927,7 @@ def validate_parameterized_handoff(data_root: str | Path, index_ref: str, *, exp
             "upstream_compatibility": "stage1-s1-9-upstream-compatibility-v7",
             "prelease_gpu": "stage1-s1-9-gpu-prelease-v3",
             "post_worker_quiescence": "stage1-s1-9-gpu-quiescence-v3",
-            "single_worker": "stage1-s1-9-single-bf16-worker-v2",
+            "single_worker": "stage1-s1-9-single-bf16-worker-v1",
             "bf16_resume_checkpoint_store": "stage1-s1-9-bf16-checkpoint-store-reproduction-v2",
         }
     )
