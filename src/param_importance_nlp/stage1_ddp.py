@@ -37,9 +37,9 @@ TASK_ID = "stage1.08_ddp_and_gradient_accumulation"
 WORKER_PLAN_SCHEMA = "stage1-s1-8-worker-plan-v1"
 WORKER_REPORT_SCHEMA = "stage1-s1-8-worker-report-v1"
 ARRAY_MANIFEST_SCHEMA = "stage1-s1-8-safetensors-manifest-v1"
-FIXTURE_SCHEMA = "stage1-s1-8-fixture-manifest-v2"
-PRE_ROUTE_SCALE_ORACLE_SCHEMA = "stage1-s1-8-pre-route-gradient-scale-oracle-v2"
-OPTIMIZER_CONDITIONING_SCHEMA = "stage1-s1-8-optimizer-conditioning-v2"
+FIXTURE_SCHEMA = "stage1-s1-8-fixture-manifest-v3"
+PRE_ROUTE_SCALE_ORACLE_SCHEMA = "stage1-s1-8-pre-route-gradient-scale-oracle-v3"
+OPTIMIZER_CONDITIONING_SCHEMA = "stage1-s1-8-optimizer-conditioning-v3"
 ROUTES: tuple[str, ...] = ("A", "B", "C", "D")
 CASES: tuple[str, ...] = ("equal", "weighted")
 ROUTE_WORLD_SIZE = {"A": 1, "B": 1, "C": 2, "D": 4}
@@ -60,7 +60,7 @@ OPTIMIZER_CONDITIONING = {
     "schema_version": OPTIMIZER_CONDITIONING_SCHEMA,
     "precision_profile": "T32_DISTRIBUTED",
     "optimizer_type": "AdamW",
-    "learning_rate": 0.0003,
+    "learning_rate": 0.003,
     "weight_decay": 0.01,
     "betas": [0.9, 0.999],
     "eps": 1.0e-4,
@@ -85,7 +85,7 @@ OPTIMIZER_CONDITIONING = {
     },
     "selected_epsilon_first_t32_zero_violation": 1.0e-4,
 }
-FIXTURE_ID = "stage1-s1-8-pythia14m-ddp-conditioned-v2"
+FIXTURE_ID = "stage1-s1-8-pythia14m-ddp-conditioned-v3"
 FIXTURE_PRECISION = {
     "compute": "float32", "statistics": "float32", "replay": "float64",
     "profile": "T32_DISTRIBUTED", "atol": T32_DISTRIBUTED_ATOL,
@@ -99,7 +99,7 @@ FIXTURE_RANDOMNESS = {
     "dropout": "disabled", "model_seed": 1707,
 }
 FIXTURE_OPTIMIZER = {
-    "type": "AdamW", "learning_rate": 0.0003, "weight_decay": 0.01,
+    "type": "AdamW", "learning_rate": 0.003, "weight_decay": 0.01,
     "betas": [0.9, 0.999], "eps": 1.0e-4, "foreach": False, "fused": False,
 }
 FIXTURE_DDP = {

@@ -1,0 +1,606 @@
+{
+    "$id":  "stage1-s1-8-fixture-manifest-v3.json",
+    "$schema":  "https://json-schema.org/draft/2020-12/schema",
+    "type":  "object",
+    "additionalProperties":  false,
+    "required":  [
+                     "schema_version",
+                     "fixture_id",
+                     "upstream_s1_7_fixture_hash",
+                     "pre_route_gradient_scale",
+                     "record_ids",
+                     "token_sha256",
+                     "routes",
+                     "cases",
+                     "precision",
+                     "comparison_natural_scales",
+                     "comparison_natural_scale_rules",
+                     "randomness",
+                     "optimizer",
+                     "optimizer_conditioning",
+                     "gradient_clip_max_norm",
+                     "ddp",
+                     "fixture_hash"
+                 ],
+    "properties":  {
+                       "schema_version":  {
+                                              "const":  "stage1-s1-8-fixture-manifest-v3"
+                                          },
+                       "fixture_id":  {
+                                          "const":  "stage1-s1-8-pythia14m-ddp-conditioned-v3"
+                                      },
+                       "upstream_s1_7_fixture_hash":  {
+                                                          "$ref":  "#/$defs/hash"
+                                                      },
+                       "pre_route_gradient_scale":  {
+                                                        "$ref":  "#/$defs/pre_route_scale"
+                                                    },
+                       "record_ids":  {
+                                          "type":  "array",
+                                          "const": [0,1,2,3,4,5,6,7]
+                                      },
+                       "token_sha256":  {
+                                            "type":  "object",
+                                            "additionalProperties":  {
+                                                                         "$ref":  "#/$defs/hash"
+                                                                     },
+                                            "propertyNames":  {
+                                                                  "pattern":  "^[0-7]$"
+                                                              },
+                                            "minProperties":  8,
+                                            "maxProperties":  8
+                                        },
+                       "routes":  {
+                                      "type":  "object",
+                                      "additionalProperties":  false,
+                                      "required":  [
+                                                       "A",
+                                                       "B",
+                                                       "C",
+                                                       "D"
+                                                   ],
+                                      "properties":  {
+                                                        "A":  { "$ref": "#/$defs/route_a" },
+                                                        "B":  { "$ref": "#/$defs/route_b" },
+                                                        "C":  { "$ref": "#/$defs/route_c" },
+                                                        "D":  { "$ref": "#/$defs/route_d" }
+                                                     }
+                                  },
+                       "cases":  {
+                                     "type":  "object",
+                                     "additionalProperties":  false,
+                                     "required":  [
+                                                      "equal",
+                                                      "weighted"
+                                                  ],
+                                     "properties":  {
+                                                        "equal":  { "$ref": "#/$defs/equal_case" },
+                                                        "weighted":  { "$ref": "#/$defs/weighted_case" }
+                                                    }
+                                 },
+                       "precision":  {
+                                         "type":  "object",
+                                         "additionalProperties":  false,
+                                         "required":  [
+                                                          "compute",
+                                                          "statistics",
+                                                          "replay",
+                                                          "profile",
+                                                          "atol",
+                                                          "rtol",
+                                                          "normalized_l2_limit"
+                                                      ],
+                                         "properties":  {
+                                                            "compute":  {
+                                                                            "const":  "float32"
+                                                                        },
+                                                            "statistics":  {
+                                                                               "const":  "float32"
+                                                                           },
+                                                            "replay":  {
+                                                                           "const":  "float64"
+                                                                       },
+                                                            "profile":  {
+                                                                            "const":  "T32_DISTRIBUTED"
+                                                                        },
+                                                            "atol":  { "const": 1e-7 },
+                                                            "rtol":  { "const": 1e-4 },
+                                                            "normalized_l2_limit":  { "const": 1e-4 }
+                                                        }
+                                     },
+                       "comparison_natural_scales":  {
+                                                         "$ref":  "#/$defs/scales"
+                                                     },
+                       "comparison_natural_scale_rules":  {
+                                                              "$ref":  "#/$defs/scale_rules"
+                                                          },
+                       "randomness":  {
+                                          "type":  "object",
+                                          "additionalProperties":  false,
+                                          "required":  [
+                                                           "dropout", "model_seed"
+                                                       ],
+                                          "properties":  {
+                                                             "dropout":  {
+                                                                             "const":  "disabled"
+                                                                         },
+                                                             "model_seed": { "type": "integer", "const": 1707 }
+                                                         }
+                                      },
+                       "optimizer":  {
+                                         "$ref":  "#/$defs/optimizer"
+                                     },
+                       "optimizer_conditioning":  {
+                                                      "$ref":  "#/$defs/conditioning"
+                                                  },
+                       "gradient_clip_max_norm":  { "type": "number", "const": 1.0 },
+                       "ddp":  {
+                                   "type":  "object",
+                                   "additionalProperties":  false,
+                                   "required":  [
+                                                    "backend",
+                                                    "ordinary_gradient_collectives_during_local_backward",
+                                                    "manual_statistic_collectives"
+                                                ],
+                                   "properties":  {
+                                                      "backend":  {
+                                                                      "const":  "nccl"
+                                                                  },
+                       "ordinary_gradient_collectives_during_local_backward":  {
+                                                                                   "type": "integer", "const":  0
+                                                                                                              },
+                                                      "manual_statistic_collectives":  {
+                                                                                           "const":  "sum_all_reduce"
+                                                                                       }
+                                                  }
+                               },
+                       "fixture_hash":  {
+                                            "$ref":  "#/$defs/hash"
+                                        }
+                   },
+    "$defs":  {
+                  "hash":  {
+                               "type":  "string",
+                               "pattern":  "^[0-9a-f]{64}$"
+                           },
+                  "conditioning":  {
+                                       "type":  "object",
+                                       "additionalProperties":  false,
+                                       "required":  [
+                                                        "schema_version",
+                                                        "precision_profile",
+                                                        "optimizer_type",
+                                                        "learning_rate",
+                                                        "weight_decay",
+                                                        "betas",
+                                                        "eps",
+                                                        "foreach",
+                                                        "fused",
+                                                        "execution_order",
+                                                        "selection_method",
+                                                        "diagnostic_attempt_id",
+                                                        "failed_attempt_artifact_hash",
+                                                        "failed_attempt_phase",
+                                                        "r16_optimizer_epsilon",
+                                                        "sensitivity_method",
+                                                        "sensitivity_t32_peer_violation_counts",
+                                                        "selected_epsilon_first_t32_zero_violation"
+                                                    ],
+                                       "properties":  {
+                                                          "schema_version":  {
+                                                                                 "const":  "stage1-s1-8-optimizer-conditioning-v3"
+                                                                             },
+                                                          "precision_profile":  {
+                                                                                    "const":  "T32_DISTRIBUTED"
+                                                                                },
+                                                          "optimizer_type":  {
+                                                                                 "const":  "AdamW"
+                                                                             },
+                                                          "learning_rate":  {
+                                                                                 "type": "number", "const": 0.003
+                                                                             },
+                                                          "weight_decay":  {
+                                                                                "type": "number", "const": 0.01
+                                                                            },
+                                                          "betas":  {
+                                                                        "type": "array", "const": [0.9, 0.999]
+                                                                    },
+                                                          "eps":  {
+                                                                      "type": "number", "const":  0.0001
+                                                                  },
+                                                          "foreach":  {
+                                                                          "type": "boolean", "const":  false
+                                                                      },
+                                                          "fused":  {
+                                                                        "type": "boolean", "const":  false
+                                                                    },
+                                                          "execution_order":  {
+                                                                                  "const":  "single_tensor_decoupled_decay_then_adamw_addcdiv_fp32"
+                                                                              },
+                                                          "selection_method":  {
+                                                                                   "const":  "r16_route_specific_mean_epsilon_sensitivity"
+                                                                               },
+                                                          "diagnostic_attempt_id":  {
+                                                                                        "const":  "formal-20260815-s18-v1-r16"
+                                                                                    },
+                                                          "failed_attempt_artifact_hash":  {
+                                                                                               "const":  "81674ea39a2b67fcfa4a0294e5d59f75882908cb3f52384a8ae5c85bc7960789"
+                                                                                           },
+                                                          "failed_attempt_phase":  {
+                                                                                       "const":  "rank_gradient_checksum_cardinality"
+                                                                                   },
+                                                          "r16_optimizer_epsilon":  {
+                                                                                        "const":  1E-08
+                                                                                    },
+                                                          "sensitivity_method":  {
+                                                                                     "const":  "read_only_persisted_route_mean_simulation"
+                                                                                 },
+                                                          "sensitivity_t32_peer_violation_counts":  {
+                                                                                                        "type":  "object",
+                                                                                                        "additionalProperties":  false,
+                                                                                                        "required":  [
+                                                                                                                         "1e-8",
+                                                                                                                         "1e-6",
+                                                                                                                         "1e-5",
+                                                                                                                         "1e-4"
+                                                                                                                     ],
+                                                                                                        "properties":  {
+                                                                                                                           "1e-8":  {
+                                                                                                                                        "$ref":  "#/$defs/case_counts_8_9"
+                                                                                                                                    },
+                                                                                                                           "1e-6":  {
+                                                                                                                                        "$ref":  "#/$defs/case_counts_6_6"
+                                                                                                                                    },
+                                                                                                                           "1e-5":  {
+                                                                                                                                        "$ref":  "#/$defs/case_counts_2_0"
+                                                                                                                                    },
+                                                                                                                           "1e-4":  {
+                                                                                                                                        "$ref":  "#/$defs/case_counts_0_0"
+                                                                                                                                    }
+                                                                                                                       }
+                                                                                                    },
+                                                          "selected_epsilon_first_t32_zero_violation":  {
+                                                                                                            "const":  0.0001
+                                                                                                        }
+                                                      }
+                                   },
+                  "case_counts_8_9":  {
+                                          "type":  "object",
+                                          "additionalProperties":  false,
+                                          "required":  [
+                                                           "equal",
+                                                           "weighted"
+                                                       ],
+                                          "properties":  {
+                                                             "equal":  {
+                                                                           "const":  8
+                                                                       },
+                                                             "weighted":  {
+                                                                              "const":  9
+                                                                          }
+                                                         }
+                                      },
+                  "case_counts_6_6":  {
+                                          "type":  "object",
+                                          "additionalProperties":  false,
+                                          "required":  [
+                                                           "equal",
+                                                           "weighted"
+                                                       ],
+                                          "properties":  {
+                                                             "equal":  {
+                                                                           "const":  6
+                                                                       },
+                                                             "weighted":  {
+                                                                              "const":  6
+                                                                          }
+                                                         }
+                                      },
+                  "case_counts_2_0":  {
+                                          "type":  "object",
+                                          "additionalProperties":  false,
+                                          "required":  [
+                                                           "equal",
+                                                           "weighted"
+                                                       ],
+                                          "properties":  {
+                                                             "equal":  {
+                                                                           "const":  2
+                                                                       },
+                                                             "weighted":  {
+                                                                              "const":  0
+                                                                          }
+                                                         }
+                                      },
+                  "case_counts_0_0":  {
+                                          "type":  "object",
+                                          "additionalProperties":  false,
+                                          "required":  [
+                                                           "equal",
+                                                           "weighted"
+                                                       ],
+                                          "properties":  {
+                                                             "equal":  {
+                                                                           "const":  0
+                                                                       },
+                                                             "weighted":  {
+                                                                              "const":  0
+                                                                          }
+                                                         }
+                                      },
+                  "pre_route_scale":  {
+                                          "type":  "object",
+                                          "additionalProperties":  false,
+                                          "required":  [
+                                                           "schema_version",
+                                                           "artifact_hash",
+                                                           "maximum_unit_gradient_abs",
+                                                           "maximum_abs_data_update",
+                                                           "source",
+                                                           "optimizer_conditioning",
+                                                           "parameter_registry_hash",
+                                                           "case_pre_parameter_checksums"
+                                                       ],
+                                          "properties":  {
+                                                             "schema_version":  {
+                                                                                    "const":  "stage1-s1-8-pre-route-gradient-scale-oracle-v3"
+                                                                                },
+                                                             "artifact_hash":  {
+                                                                                   "$ref":  "#/$defs/hash"
+                                                                               },
+                                                             "maximum_unit_gradient_abs":  {
+                                                                                               "type":  "number",
+                                                                                               "exclusiveMinimum":  0
+                                                                                           },
+                                                             "maximum_abs_data_update":  {
+                                                                                             "type":  "number",
+                                                                                             "exclusiveMinimum":  0
+                                                                                         },
+                                                             "source":  {
+                                                                            "const":  "independent_pre_route_single_gpu_autograd_oracle"
+                                                                        },
+                                                             "optimizer_conditioning":  {
+                                                                                            "$ref":  "#/$defs/conditioning"
+                                                                                        },
+                                                             "parameter_registry_hash":  {
+                                                                                             "$ref":  "#/$defs/hash"
+                                                                                         },
+                                                             "case_pre_parameter_checksums":  {
+                                                                                                  "type":  "object",
+                                                                                                  "additionalProperties":  false,
+                                                                                                  "required":  [
+                                                                                                                   "equal",
+                                                                                                                   "weighted"
+                                                                                                               ],
+                                                                                                  "properties":  {
+                                                                                                                     "equal":  {
+                                                                                                                                   "$ref":  "#/$defs/hash"
+                                                                                                                               },
+                                                                                                                     "weighted":  {
+                                                                                                                                      "$ref":  "#/$defs/hash"
+                                                                                                                                  }
+                                                                                                                 }
+                                                                                              }
+                                                         }
+                                      },
+                  "route_layout":  {
+                                       "type":  "object",
+                                       "additionalProperties":  false,
+                                       "required":  [
+                                                        "route",
+                                                        "world_size",
+                                                        "rank_microbatch_ids"
+                                                    ],
+                                       "properties":  {
+                                                          "route":  {
+                                                                        "enum":  [
+                                                                                     "A",
+                                                                                     "B",
+                                                                                     "C",
+                                                                                     "D"
+                                                                                 ]
+                                                                    },
+                                                          "world_size":  {
+                                                                             "type":  "integer",
+                                                                             "minimum":  1,
+                                                                             "maximum":  4
+                                                                         },
+                                                          "rank_microbatch_ids":  {
+                                                                                      "type":  "array",
+                                                                                      "minItems":  1,
+                                                                                      "maxItems":  4,
+                                                                                      "items":  {
+                                                                                                    "type":  "array",
+                                                                                                    "minItems":  1,
+                                                                                                    "maxItems":  8,
+                                                                                                    "uniqueItems":  true,
+                                                                                                    "items":  {
+                                                                                                                  "type":  "integer",
+                                                                                                                  "minimum":  0,
+                                                                                                                  "maximum":  7
+                                                                                                              }
+                                                                                                }
+                                                                                  }
+                                                      }
+                                   },
+                  "route_a": { "allOf": [{ "$ref": "#/$defs/route_layout" }, { "properties": { "route": { "const": "A" }, "world_size": { "const": 1 }, "rank_microbatch_ids": { "const": [[0,1,2,3,4,5,6,7]] } } }] },
+                  "route_b": { "allOf": [{ "$ref": "#/$defs/route_layout" }, { "properties": { "route": { "const": "B" }, "world_size": { "const": 1 }, "rank_microbatch_ids": { "const": [[0,1,2,3,4,5,6,7]] } } }] },
+                  "route_c": { "allOf": [{ "$ref": "#/$defs/route_layout" }, { "properties": { "route": { "const": "C" }, "world_size": { "const": 2 }, "rank_microbatch_ids": { "const": [[0,1,2,3],[4,5,6,7]] } } }] },
+                  "route_d": { "allOf": [{ "$ref": "#/$defs/route_layout" }, { "properties": { "route": { "const": "D" }, "world_size": { "const": 4 }, "rank_microbatch_ids": { "const": [[0,1],[2,3],[4,5],[6,7]] } } }] },
+                  "case":  {
+                               "type":  "object",
+                               "additionalProperties":  false,
+                               "required":  [
+                                                "label_ignore_suffixes",
+                                                "effective_target_tokens",
+                                                "statistics"
+                                            ],
+                               "properties":  {
+                                                  "label_ignore_suffixes":  {
+                                                                                "type":  "array",
+                                                                                "minItems":  8,
+                                                                                "maxItems":  8,
+                                                                                "items":  {
+                                                                                              "type":  "integer",
+                                                                                              "minimum":  0,
+                                                                                              "maximum":  2047
+                                                                                          }
+                                                                            },
+                                                  "effective_target_tokens":  {
+                                                                                  "type":  "array",
+                                                                                  "minItems":  8,
+                                                                                  "maxItems":  8,
+                                                                                  "items":  {
+                                                                                                "type":  "integer",
+                                                                                                "minimum":  1,
+                                                                                                "maximum":  2048
+                                                                                            }
+                                                                              },
+                                                  "statistics":  {
+                                                                     "enum":  [
+                                                                                  "equal_s1_s2",
+                                                                                  "weighted_g1_g2_n1_n2"
+                                                                              ]
+                                                                 }
+                                              }
+                           },
+                  "equal_case": { "allOf": [{ "$ref": "#/$defs/case" }, { "properties": { "label_ignore_suffixes": { "const": [0,0,0,0,0,0,0,0] }, "effective_target_tokens": { "const": [2048,2048,2048,2048,2048,2048,2048,2048] }, "statistics": { "const": "equal_s1_s2" } } }] },
+                  "weighted_case": { "allOf": [{ "$ref": "#/$defs/case" }, { "properties": { "label_ignore_suffixes": { "const": [0,16,32,48,64,80,96,112] }, "effective_target_tokens": { "const": [2048,2032,2016,2000,1984,1968,1952,1936] }, "statistics": { "const": "weighted_g1_g2_n1_n2" } } }] },
+                  "scales":  {
+                                 "type":  "object",
+                                 "additionalProperties":  false,
+                                 "required":  [
+                                                  "n_g",
+                                                  "s1",
+                                                  "s2",
+                                                  "g1",
+                                                  "g2",
+                                                  "mean_gradient",
+                                                  "core",
+                                                  "score",
+                                                  "optimizer_delta",
+                                                  "parameter"
+                                              ],
+                                 "properties":  {
+                                                    "n_g":  {
+                                                                "type":  "number",
+                                                                "exclusiveMinimum":  0
+                                                            },
+                                                    "s1":  {
+                                                               "type":  "number",
+                                                               "exclusiveMinimum":  0
+                                                           },
+                                                    "s2":  {
+                                                               "type":  "number",
+                                                               "exclusiveMinimum":  0
+                                                           },
+                                                    "g1":  {
+                                                               "type":  "number",
+                                                               "exclusiveMinimum":  0
+                                                           },
+                                                    "g2":  {
+                                                               "type":  "number",
+                                                               "exclusiveMinimum":  0
+                                                           },
+                                                    "mean_gradient":  {
+                                                                          "type":  "number",
+                                                                          "exclusiveMinimum":  0
+                                                                      },
+                                                    "core":  {
+                                                                 "type":  "number",
+                                                                 "exclusiveMinimum":  0
+                                                             },
+                                                    "score":  {
+                                                                  "type":  "number",
+                                                                  "exclusiveMinimum":  0
+                                                              },
+                                                    "optimizer_delta":  {
+                                                                            "type":  "number",
+                                                                            "exclusiveMinimum":  0
+                                                                        },
+                                                    "parameter":  {
+                                                                      "type":  "number",
+                                                                      "exclusiveMinimum":  0
+                                                                  }
+                                                }
+                             },
+                  "scale_rules":  {
+                                      "type":  "object",
+                                      "additionalProperties":  false,
+                                      "required":  [
+                                                       "n_g",
+                                                       "s1",
+                                                       "s2",
+                                                       "g1",
+                                                       "g2",
+                                                       "mean_gradient",
+                                                       "core",
+                                                       "score",
+                                                       "optimizer_delta",
+                                                       "parameter"
+                                                   ],
+                                      "properties":  {
+                                                         "n_g":  {
+                                                                     "const":  "independent_pre_route_oracle_maximum_unit_gradient_abs"
+                                                                 },
+                                                         "s1":  {
+                                                                    "const":  "M*n_g"
+                                                                },
+                                                         "s2":  {
+                                                                    "const":  "M*n_g^2"
+                                                                },
+                                                         "g1":  {
+                                                                    "const":  "sum(b_m)*n_g"
+                                                                },
+                                                         "g2":  {
+                                                                    "const":  "sum(b_m^2)*n_g^2"
+                                                                },
+                                                         "mean_gradient":  {
+                                                                               "const":  "n_g"
+                                                                           },
+                                                         "core":  {
+                                                                      "const":  "n_g^2"
+                                                                  },
+                                                         "score":  {
+                                                                       "const":  "eta*n_g^2"
+                                                                   },
+                                                         "optimizer_delta":  {
+                                                                                 "const":  "independent_pre_route_adamw_data_update_design_scale"
+                                                                             },
+                                                         "parameter":  {
+                                                                           "const":  "frozen_parameter_scale"
+                                                                       }
+                                                     }
+                                  },
+                  "optimizer":  {
+                                    "type":  "object",
+                                    "additionalProperties":  false,
+                                    "required":  [
+                                                     "type",
+                                                     "learning_rate",
+                                                     "weight_decay",
+                                                     "betas",
+                                                     "eps",
+                                                     "foreach",
+                                                     "fused"
+                                                 ],
+                                    "properties":  {
+                                                       "type":  {
+                                                                    "const":  "AdamW"
+                                                                },
+                                                       "learning_rate": { "type": "number", "const": 0.003 },
+                                                       "weight_decay": { "type": "number", "const": 0.01 },
+                                                       "betas": { "type": "array", "const": [0.9, 0.999] },
+                                                       "eps":  {
+                                                                   "type": "number", "const":  0.0001
+                                                               },
+                                                       "foreach":  {
+                                                                       "type": "boolean", "const":  false
+                                                                   },
+                                                       "fused":  {
+                                                                     "type": "boolean", "const":  false
+                                                                 }
+                                                   }
+                                }
+              }
+}

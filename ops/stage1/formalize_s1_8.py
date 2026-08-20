@@ -140,7 +140,7 @@ IMPLEMENTATION_SOURCE_FILES = (
     "src/param_importance_nlp/core/accumulator.py", "src/param_importance_nlp/core/errors.py", "src/param_importance_nlp/core/tensors.py",
     "src/param_importance_nlp/g3_runtime_assets.py", "src/param_importance_nlp/runtime/operations.py", "src/param_importance_nlp/runtime/task_artifacts.py",
     "configs/stage0/g3-asset-requirements-v1.json", "configs/stage0/g3-asset-layout-v1.json",
-    "schemas/stage1/s1-8-array-bundle-v1.json", "schemas/stage1/s1-8-comparison-table-v1.json", "schemas/stage1/s1-8-ddp-report-v1.json", "schemas/stage1/s1-8-fixture-manifest-v1.json", "schemas/stage1/s1-8-fixture-manifest-v2.json", "schemas/stage1/s1-8-formalization-index-v1.json", "schemas/stage1/s1-8-gate-record-v1.json", "schemas/stage1/s1-8-replay-validation-v1.json", "schemas/stage1/s1-8-safetensors-manifest-v1.json", "schemas/stage1/s1-8-validation-v1.json", "schemas/stage1/s1-8-worker-report-v1.json",
+    "schemas/stage1/s1-8-array-bundle-v1.json", "schemas/stage1/s1-8-comparison-table-v1.json", "schemas/stage1/s1-8-ddp-report-v1.json", "schemas/stage1/s1-8-ddp-report-v2.json", "schemas/stage1/s1-8-fixture-manifest-v1.json", "schemas/stage1/s1-8-fixture-manifest-v2.json", "schemas/stage1/s1-8-fixture-manifest-v3.json", "schemas/stage1/s1-8-formalization-index-v1.json", "schemas/stage1/s1-8-formalization-index-v2.json", "schemas/stage1/s1-8-gate-record-v1.json", "schemas/stage1/s1-8-replay-validation-v1.json", "schemas/stage1/s1-8-replay-validation-v2.json", "schemas/stage1/s1-8-safetensors-manifest-v1.json", "schemas/stage1/s1-8-validation-v1.json", "schemas/stage1/s1-8-validation-v2.json", "schemas/stage1/s1-8-worker-report-v1.json",
 )
 
 
@@ -250,10 +250,10 @@ def _validate_output_schemas(repository: Path, objects: Mapping[str, Mapping[str
             raise Stage1S18FormalError("S18_SCHEMA_REGISTRY_INVALID:" + path.name)
         registry[path.name] = value; registry[str(value["$id"])] = value
     filenames = {
-        "fixture_manifest": "s1-8-fixture-manifest-v2.json", "ddp_report": "s1-8-ddp-report-v1.json",
+        "fixture_manifest": "s1-8-fixture-manifest-v3.json", "ddp_report": "s1-8-ddp-report-v2.json",
         "array_bundle": "s1-8-array-bundle-v1.json", "comparison_table": "s1-8-comparison-table-v1.json",
-        "gate_record": "s1-8-gate-record-v1.json", "replay": "s1-8-replay-validation-v1.json",
-        "validation": "s1-8-validation-v1.json", "index": "s1-8-formalization-index-v1.json",
+        "gate_record": "s1-8-gate-record-v1.json", "replay": "s1-8-replay-validation-v2.json",
+        "validation": "s1-8-validation-v2.json", "index": "s1-8-formalization-index-v2.json",
         "worker_report": "s1-8-worker-report-v1.json", "safetensors_manifest": "s1-8-safetensors-manifest-v1.json",
     }
     for role, value in objects.items():
@@ -271,9 +271,9 @@ def _schema_prepublication_check(repository: Path, objects: Mapping[str, Mapping
 
     from param_importance_nlp.contracts.jsonio import loads_strict_json
     expected = {
-        "s1-8-array-bundle-v1.json", "s1-8-comparison-table-v1.json", "s1-8-ddp-report-v1.json",
-        "s1-8-fixture-manifest-v1.json", "s1-8-fixture-manifest-v2.json", "s1-8-formalization-index-v1.json", "s1-8-gate-record-v1.json",
-        "s1-8-replay-validation-v1.json", "s1-8-safetensors-manifest-v1.json", "s1-8-validation-v1.json", "s1-8-worker-report-v1.json",
+        "s1-8-array-bundle-v1.json", "s1-8-comparison-table-v1.json", "s1-8-ddp-report-v1.json", "s1-8-ddp-report-v2.json",
+        "s1-8-fixture-manifest-v1.json", "s1-8-fixture-manifest-v2.json", "s1-8-fixture-manifest-v3.json", "s1-8-formalization-index-v1.json", "s1-8-formalization-index-v2.json", "s1-8-gate-record-v1.json",
+        "s1-8-replay-validation-v1.json", "s1-8-replay-validation-v2.json", "s1-8-safetensors-manifest-v1.json", "s1-8-validation-v1.json", "s1-8-validation-v2.json", "s1-8-worker-report-v1.json",
     }
     paths = {path.name: path for path in (repository / "schemas" / "stage1").glob("s1-8-*.json")}
     if set(paths) != expected:
@@ -289,6 +289,15 @@ def _schema_prepublication_check(repository: Path, objects: Mapping[str, Mapping
     for name, path in paths.items(): strict(loads_strict_json(path.read_bytes()), location=name)
     _validate_output_schemas(repository, objects)
     return True
+
+
+def _require_baseline_replay(*, replay_fn: Any, route_arrays: Mapping[str, Mapping[str, Any]], fixture: Mapping[str, Any], route_reports: Mapping[str, Mapping[str, Any]]) -> dict[str, Any]:
+    """Fail before any permutation when the canonical A/B/C/D baseline drifts."""
+
+    result = replay_fn(route_arrays=route_arrays, fixture=fixture, route_reports=route_reports)
+    if result.get("status") != "PASS":
+        raise Stage1S18FormalError("S18_BASELINE_REPLAY_FAILED")
+    return result
 
 
 def _canonical_file_sha(value: Mapping[str, Any]) -> str:
@@ -536,7 +545,13 @@ def _candidate_publication_check(
         raise Stage1S18FormalError("S18_CANDIDATE_VALIDATION_CHECK_STATUS_INVALID")
     if index.get("gate_artifact_hash") != gate.get("artifact_hash") or index.get("validation_ref") != "validation.json" or index.get("validation_sha256") != _canonical_file_sha(validation) or index.get("replay_ref") != "replay-validation.json" or index.get("replay_sha256") != _canonical_file_sha(replay_record):
         raise Stage1S18FormalError("S18_CANDIDATE_INDEX_ROLE_CROSSREF_INVALID")
-    if ddp.get("fixture_hash") != fixture.get("fixture_hash") or table.get("status") != "PASS" or replay_record.get("status") != "PASS" or ddp.get("nccl_transport_protocol") != _nccl_transport_protocol() or index.get("nccl_transport_protocol") != _nccl_transport_protocol():
+    fixture_binding = {"fixture_schema_version": fixture.get("schema_version"), "fixture_id": fixture.get("fixture_id")}
+    if (
+        ddp.get("fixture_hash") != fixture.get("fixture_hash")
+        or any({key: value.get(key) for key in fixture_binding} != fixture_binding for value in (ddp, replay_record, validation, index))
+        or table.get("status") != "PASS" or replay_record.get("status") != "PASS"
+        or ddp.get("nccl_transport_protocol") != _nccl_transport_protocol() or index.get("nccl_transport_protocol") != _nccl_transport_protocol()
+    ):
         raise Stage1S18FormalError("S18_CANDIDATE_FIXTURE_OR_REPLAY_CROSSREF_INVALID")
     negatives = _mapping(ddp.get("negative_controls"), field="candidate.ddp.negative_controls")
     if set(negatives) != {"ordinary_sync_negative", "inject_rank_failure"}:
@@ -2265,6 +2280,7 @@ def execute(*, repository: Path, data_root: Path, s1_7_index_ref: str, gpu_capab
             arrays, manifest = _load_arrays(route_dir, report)
             _validate_output_schemas(repository, {"worker_report": report, "safetensors_manifest": manifest})
             baseline_reports[route] = report; baseline_arrays[route] = arrays; manifests[route] = manifest
+        phase = "baseline_offline_replay"; result = _require_baseline_replay(replay_fn=replay, route_arrays=baseline_arrays, fixture=fixture, route_reports=baseline_reports)
         permutation_reports: dict[str, Mapping[str, Any]] = {}
         for permutation in PERMUTATIONS:
             phase = f"D_{permutation}"; plan = _route_plan(fixture=fixture, execution_commit=commit, route="D", visible=approved_gpu_uuids, work=work, data_root=data_root, token_sha=str(handoff["token_file_sha256"]), model_root=model_root, cache_root=cache_root, run_token=run_token, permutation=permutation)
@@ -2315,12 +2331,10 @@ def execute(*, repository: Path, data_root: Path, s1_7_index_ref: str, gpu_capab
                 second.close()
             raise
         shutil.copy2(second_history, work / "lease-history-reacquire.json")
-        phase = "offline_replay"; result = replay(route_arrays=baseline_arrays, fixture=fixture, route_reports=baseline_reports)
-        if result.get("status") != "PASS": raise Stage1S18FormalError("S18_FP64_REPLAY_FAILED")
         replay_record = _with_hash(dict(result)); _write(work / "replay-validation.json", replay_record)
         table = _with_hash({"schema_version": "stage1-s1-8-comparison-table-v1", "status": "PASS", "rows": result["comparison_rows"]}); _write(work / "comparison-table.json", table)
         source_hashes = _implementation_source_map(repository)
-        ddp_report = _with_hash({"schema_version": "stage1-s1-8-ddp-report-v1", "status": "PASS", "task_id": TASK_ID, "fixture_hash": fixture["fixture_hash"], "nccl_transport_protocol": nccl_transport, "implementation_source_sha256": source_hashes, "baseline_routes": baseline_reports, "permutation_routes": permutation_reports, "negative_controls": negative}); _write(work / "ddp-report.json", ddp_report)
+        ddp_report = _with_hash({"schema_version": "stage1-s1-8-ddp-report-v2", "status": "PASS", "task_id": TASK_ID, "fixture_hash": fixture["fixture_hash"], "fixture_schema_version": fixture["schema_version"], "fixture_id": fixture["fixture_id"], "nccl_transport_protocol": nccl_transport, "implementation_source_sha256": source_hashes, "baseline_routes": baseline_reports, "permutation_routes": permutation_reports, "negative_controls": negative}); _write(work / "ddp-report.json", ddp_report)
         csv_hashes, svg_hashes = _charts(work, result, ddp_report, baseline_arrays)
         # It is intentionally written only after every worker output, replay,
         # report and chart exists, and excludes itself from the measured scope.
@@ -2398,8 +2412,8 @@ def execute(*, repository: Path, data_root: Path, s1_7_index_ref: str, gpu_capab
             requirements = {**base_requirements, "schemas_and_atomic_publication": schema_result}
             gate_value = _with_hash({"schema_version": "stage1-s1-8-gate-record-v1", "status": "PASS", "gate_id": GATE_ID, "task_id": TASK_ID, "requirements": requirements})
             role_hashes = {role: _canonical_file_sha(value) for role, value in {"fixture_manifest": fixture, "ddp_report": ddp_report, "array_bundle": arrays_bundle, "comparison_table": table, "gate_record": gate_value}.items()}
-            validation_value = _with_hash({"schema_version": "stage1-s1-8-validation-v1", "status": "PASS", "task_id": TASK_ID, "gate_id": GATE_ID, "producer_commit": commit, "checks": [{"check_id": identifier, "status": "PASS", "detail": identifier.replace("_", " ")} for identifier in GATE_CHECK_IDS], "role_sha256": role_hashes})
-            index_value = _with_hash({"schema_version": "stage1-s1-8-formalization-index-v1", "status": "PASS", "gate_id": GATE_ID, "task_id": TASK_ID, "generator_git_commit": commit, "consumer_git_commit": commit, "gpu_capability": capability, "nccl_transport_protocol": nccl_transport, "implementation_source_sha256": source_hashes, "s1_7_handoff": handoff_for_index, "role_refs": role_files, "role_sha256": role_hashes, "reproduction_role_refs": reproduction, "reproduction_role_sha256": reproduction_sha, "gate_artifact_hash": gate_value["artifact_hash"], "validation_ref": "validation.json", "validation_sha256": _canonical_file_sha(validation_value), "replay_ref": "replay-validation.json", "replay_sha256": _canonical_file_sha(replay_record), "next_task_ids": ["stage1.10_checkpoint_resume_and_artifacts"]})
+            validation_value = _with_hash({"schema_version": "stage1-s1-8-validation-v2", "status": "PASS", "task_id": TASK_ID, "gate_id": GATE_ID, "producer_commit": commit, "fixture_schema_version": fixture["schema_version"], "fixture_id": fixture["fixture_id"], "checks": [{"check_id": identifier, "status": "PASS", "detail": identifier.replace("_", " ")} for identifier in GATE_CHECK_IDS], "role_sha256": role_hashes})
+            index_value = _with_hash({"schema_version": "stage1-s1-8-formalization-index-v2", "status": "PASS", "gate_id": GATE_ID, "task_id": TASK_ID, "generator_git_commit": commit, "consumer_git_commit": commit, "fixture_schema_version": fixture["schema_version"], "fixture_id": fixture["fixture_id"], "gpu_capability": capability, "nccl_transport_protocol": nccl_transport, "implementation_source_sha256": source_hashes, "s1_7_handoff": handoff_for_index, "role_refs": role_files, "role_sha256": role_hashes, "reproduction_role_refs": reproduction, "reproduction_role_sha256": reproduction_sha, "gate_artifact_hash": gate_value["artifact_hash"], "validation_ref": "validation.json", "validation_sha256": _canonical_file_sha(validation_value), "replay_ref": "replay-validation.json", "replay_sha256": _canonical_file_sha(replay_record), "next_task_ids": ["stage1.10_checkpoint_resume_and_artifacts"]})
             values = {"fixture_manifest": fixture, "ddp_report": ddp_report, "array_bundle": arrays_bundle, "comparison_table": table, "gate_record": gate_value, "replay": replay_record, "validation": validation_value, "index": index_value}
             return values, role_hashes, gate_value, validation_value, index_value
 

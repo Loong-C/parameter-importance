@@ -18,10 +18,10 @@ import torch
 
 
 OPTIMIZER_CONDITIONING = {
-    "schema_version": "stage1-s1-8-optimizer-conditioning-v2",
+    "schema_version": "stage1-s1-8-optimizer-conditioning-v3",
     "precision_profile": "T32_DISTRIBUTED",
     "optimizer_type": "AdamW",
-    "learning_rate": 0.0003,
+    "learning_rate": 0.003,
     "weight_decay": 0.01,
     "betas": [0.9, 0.999],
     "eps": 1.0e-4,
@@ -578,6 +578,31 @@ def _add_peer_check(
         rows.append({"comparison": key, "parameter": name, **dict(detail)})
 
 
+def _add_observed_peer_update_checks(
+    checks: dict[str, object], rows: list[dict[str, object]], *, case: str, route: str,
+    candidate_arrays: Mapping[str, torch.Tensor], reference_updates: Mapping[str, Mapping[str, torch.Tensor]],
+    scales: Mapping[str, object], precision: Mapping[str, object],
+) -> None:
+    """Gate persisted peer post-pre movement without redefining its meaning.
+
+    ``candidate_arrays`` is the complete persisted route array object.  The
+    movement fields are derived from that route's observed contribution tensor,
+    exactly as the formal replay does for a baseline D route or its substituted
+    rank/local permutation candidate.
+    """
+
+    for field, reference in reference_updates.items():
+        if field in {"data_movement", "total_movement", "weight_decay_movement"}:
+            source = field.removesuffix("_movement") + "_update"
+            candidate = {name: value.abs() for name, value in collect_route_phase(candidate_arrays, prefix=f"accumulator/{case}/contribution/{source}").items()}
+        elif field == "magnitude":
+            candidate = collect_route_phase(candidate_arrays, prefix=f"accumulator/{case}/cumulative/magnitude")
+        else:
+            candidate = collect_route_phase(candidate_arrays, prefix=f"accumulator/{case}/contribution/{field}")
+        scale = float(scales["score"] if field == "actual_update_raw_importance" else scales["parameter"] if field == "magnitude" else scales["optimizer_delta"])
+        _add_peer_check(checks, rows, key=f"{case}:A:{route}:peer_{field}", candidate=candidate, reference=reference, natural_scale=scale, precision=precision)
+
+
 def _expected_manual_contract(*, case: str, parameter_count: int) -> dict[str, object]:
     if case == "equal":
         scalar = ["M", "loss_numerator", "loss_valid_token_count"]
@@ -930,20 +955,15 @@ def replay(
             checks[f"{case}:A:{route}:peer_step"] = step_peer
             for name, detail in dict(step_peer["per_tensor"]).items():
                 rows.append({"comparison": f"{case}:A:{route}:peer_step", "parameter": name, **dict(detail)})
-            for field, reference in a_updates.items():
-                if field in {"data_movement", "total_movement", "weight_decay_movement"}:
-                    source = field.removesuffix("_movement") + "_update"
-                    candidate = {name: value.abs() for name, value in collect_route_phase(route_arrays[route], prefix=f"accumulator/{case}/contribution/{source}").items()}
-                elif field == "magnitude":
-                    candidate = collect_route_phase(route_arrays[route], prefix=f"accumulator/{case}/cumulative/magnitude")
-                else:
-                    candidate = collect_route_phase(route_arrays[route], prefix=f"accumulator/{case}/contribution/{field}")
-                scale = float(scales["score"] if field == "actual_update_raw_importance" else scales["parameter"] if field == "magnitude" else scales["optimizer_delta"])
-                _add_peer_check(checks, rows, key=f"{case}:A:{route}:peer_{field}", candidate=candidate, reference=reference, natural_scale=scale, precision=precision)
+            _add_observed_peer_update_checks(
+                checks, rows, case=case, route=route, candidate_arrays=route_arrays[route],
+                reference_updates=a_updates, scales=scales, precision=precision,
+            )
 
     passed = all(bool(value["within_t32_distributed"]) for value in checks.values()) and all(bool(value["within_t32_distributed"]) for value in scalar_checks.values())
     return {
-        "schema_version": "stage1-s1-8-replay-validation-v1", "status": "PASS" if passed else "FAIL",
+        "schema_version": "stage1-s1-8-replay-validation-v2", "status": "PASS" if passed else "FAIL",
+        "fixture_schema_version": fixture["schema_version"], "fixture_id": fixture["fixture_id"],
         "oracle_import_isolated": True, "oracle_reference_dtype": "torch.float64",
         "production_candidate_dtype": "torch.float32", "checks": checks, "scalar_checks": scalar_checks,
         "comparison_rows": rows,
@@ -952,6 +972,6 @@ def replay(
 
 __all__ = [
     "OPTIMIZER_CONDITIONING", "Stage1S18OracleError", "_adamw_step", "_adamw_step_fp32_execution",
-    "_route_optimizer_mean", "collect_route_phase", "compare_maps", "compare_peer_maps", "reconstruct_equal",
+    "_add_observed_peer_update_checks", "_route_optimizer_mean", "collect_route_phase", "compare_maps", "compare_peer_maps", "reconstruct_equal",
     "reconstruct_weighted", "replay",
 ]

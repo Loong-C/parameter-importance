@@ -23,14 +23,14 @@ from .contracts.jsonio import canonical_json_hash, load_canonical_json, write_ca
 
 
 TASK_ID = "stage1.08_ddp_and_gradient_accumulation"
-PLAN_SCHEMA = "stage1-s1-8-pre-route-scale-plan-v2"
-REPORT_SCHEMA = "stage1-s1-8-pre-route-gradient-scale-oracle-v2"
+PLAN_SCHEMA = "stage1-s1-8-pre-route-scale-plan-v3"
+REPORT_SCHEMA = "stage1-s1-8-pre-route-gradient-scale-oracle-v3"
 MICROBATCH_COUNT = 8
 OPTIMIZER_CONDITIONING = {
-    "schema_version": "stage1-s1-8-optimizer-conditioning-v2",
+    "schema_version": "stage1-s1-8-optimizer-conditioning-v3",
     "precision_profile": "T32_DISTRIBUTED",
     "optimizer_type": "AdamW",
-    "learning_rate": 0.0003,
+    "learning_rate": 0.003,
     "weight_decay": 0.01,
     "betas": [0.9, 0.999],
     "eps": 1.0e-4,

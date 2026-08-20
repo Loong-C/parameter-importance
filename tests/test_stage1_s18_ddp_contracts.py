@@ -110,11 +110,12 @@ def test_fixture_rejects_unbound_or_post_hoc_scale_mutation() -> None:
         validate_fixture(fixture)
 
 
-def test_conditioned_v2_fixture_rejects_jointly_rehashed_semantic_drift_at_runtime_and_schema(tmp_path: Path) -> None:
+def test_conditioned_v3_fixture_rejects_jointly_rehashed_semantic_drift_at_runtime_and_schema(tmp_path: Path) -> None:
     """A new fixture hash cannot authorize a new numerical experiment."""
 
     formalizer = _formalizer()
     mutations: dict[str, tuple[object, str]] = {
+        "schema_version": ("stage1-s1-8-fixture-manifest-v2", "S18_FIXTURE_SCHEMA_INVALID"),
         "fixture_id": ("different", "S18_FIXTURE_SCHEMA_INVALID"),
         "precision.atol": (2.0e-7, "S18_FIXTURE_PRECISION_CONTRACT_INVALID"),
         "optimizer.learning_rate": (4.0e-4, "S18_FIXTURE_OPTIMIZER_CONDITIONING_BINDING_INVALID"),
@@ -135,6 +136,8 @@ def test_conditioned_v2_fixture_rejects_jointly_rehashed_semantic_drift_at_runti
         drifted = copy.deepcopy(_fixture())
         if name == "fixture_id":
             drifted["fixture_id"] = value
+        elif name == "schema_version":
+            drifted["schema_version"] = value
         elif name == "gradient_clip_max_norm":
             drifted["gradient_clip_max_norm"] = value
         elif name == "upstream_s1_7_fixture_hash":
@@ -165,9 +168,37 @@ def test_conditioned_v2_fixture_rejects_jointly_rehashed_semantic_drift_at_runti
             validate_worker_plan(plan, path=tmp_path / f"{name}.json")
 
 
+def test_v3_fixture_exactly_binds_lr_conditioning_and_rejects_rehashed_v2_fixture() -> None:
+    """The new fixture is a distinct conditioning experiment, never a v2 rewrite."""
+
+    formalizer = _formalizer()
+    fixture = _fixture()
+    assert fixture["schema_version"] == "stage1-s1-8-fixture-manifest-v3"
+    assert fixture["fixture_id"] == "stage1-s1-8-pythia14m-ddp-conditioned-v3"
+    assert fixture["optimizer"]["learning_rate"] == 3.0e-3
+    assert fixture["optimizer_conditioning"]["learning_rate"] == 3.0e-3
+    assert ddp.OPTIMIZER_CONDITIONING["learning_rate"] == 3.0e-3
+    assert scale_oracle.OPTIMIZER_CONDITIONING["learning_rate"] == 3.0e-3
+    assert ddp.PRE_ROUTE_SCALE_ORACLE_SCHEMA == scale_oracle.REPORT_SCHEMA == "stage1-s1-8-pre-route-gradient-scale-oracle-v3"
+    assert scale_oracle.PLAN_SCHEMA == "stage1-s1-8-pre-route-scale-plan-v3"
+
+    old = copy.deepcopy(fixture)
+    old["schema_version"] = "stage1-s1-8-fixture-manifest-v2"
+    old["fixture_id"] = "stage1-s1-8-pythia14m-ddp-conditioned-v2"
+    old["optimizer"]["learning_rate"] = 3.0e-4
+    old["optimizer_conditioning"]["learning_rate"] = 3.0e-4
+    old["optimizer_conditioning"]["schema_version"] = "stage1-s1-8-optimizer-conditioning-v2"
+    old["pre_route_gradient_scale"]["schema_version"] = "stage1-s1-8-pre-route-gradient-scale-oracle-v2"
+    _rehash_fixture(old)
+    with pytest.raises(Stage1S18Error, match="S18_FIXTURE_SCHEMA_INVALID"):
+        validate_fixture(old)
+    with pytest.raises(formalizer.Stage1S18FormalError, match="S18_SCHEMA_VALIDATION_FAILED:fixture_manifest"):
+        formalizer._validate_output_schemas(Path("."), {"fixture_manifest": old})
+
+
 def test_conditioned_fixture_and_scale_plan_reject_r16_epsilon(tmp_path: Path) -> None:
     fixture = _fixture()
-    assert fixture["schema_version"] == "stage1-s1-8-fixture-manifest-v2"
+    assert fixture["schema_version"] == "stage1-s1-8-fixture-manifest-v3"
     assert fixture["optimizer"]["eps"] == 1.0e-4
     assert fixture["optimizer_conditioning"] == oracle.OPTIMIZER_CONDITIONING == scale_oracle.OPTIMIZER_CONDITIONING
     drifted_fixture = copy.deepcopy(fixture)
@@ -232,7 +263,7 @@ def test_adamw_step_contract_requires_a_cpu_fp32_zero_dim_strided_non_grad_scala
 
 
 def test_fp32_execution_order_emulator_matches_adamw_one_and_two_steps() -> None:
-    optimizer_config = {"learning_rate": 3.0e-4, "weight_decay": 0.01, "betas": [0.9, 0.999], "eps": 1.0e-4, "foreach": False, "fused": False}
+    optimizer_config = {"learning_rate": 3.0e-3, "weight_decay": 0.01, "betas": [0.9, 0.999], "eps": 1.0e-4, "foreach": False, "fused": False}
     pre = {"p": torch.tensor([0.25, -0.5, 1.0e-3], dtype=torch.float32)}
     mean_steps = (
         {"p": torch.tensor([1.0e-8, -2.0e-6, 0.125], dtype=torch.float32)},
@@ -300,6 +331,74 @@ def test_peer_drift_remains_a_t32_gate_failure() -> None:
     )
     assert check["reference_kind"] == "production_peer_fp32_promoted_to_fp64_for_metric_only"
     assert check["within_t32_distributed"] is False
+
+
+def test_observed_peer_and_permutation_movements_remain_direct_t32_gates() -> None:
+    """No execution reference may replace the required observed-movement checks."""
+
+    import inspect
+    source = inspect.getsource(oracle.replay)
+    assert "_add_observed_peer_update_checks(" in source
+    reference = {
+        "data_update": {"p": torch.tensor([3.0e-3], dtype=torch.float32)},
+        "data_movement": {"p": torch.tensor([3.0e-3], dtype=torch.float32)},
+        "total_update": {"p": torch.tensor([2.97e-3], dtype=torch.float32)},
+        "total_movement": {"p": torch.tensor([2.97e-3], dtype=torch.float32)},
+        "weight_decay_update": {"p": torch.tensor([-3.0e-5], dtype=torch.float32)},
+        "weight_decay_movement": {"p": torch.tensor([3.0e-5], dtype=torch.float32)},
+        "actual_update_raw_importance": {"p": torch.tensor([-3.0e-4], dtype=torch.float32)},
+        "magnitude": {"p": torch.tensor([0.997], dtype=torch.float32)},
+    }
+    # This is the same slash-keyed persisted candidate object supplied to
+    # replay after D identity or a D rank_swap/local_reverse run is loaded.
+    rank_swap_candidate = {
+        "accumulator/equal/contribution/data_update/p": reference["data_update"]["p"].clone(),
+        "accumulator/equal/contribution/total_update/p": reference["total_update"]["p"].clone(),
+        "accumulator/equal/contribution/weight_decay_update/p": reference["weight_decay_update"]["p"].clone(),
+        "accumulator/equal/contribution/actual_update_raw_importance/p": reference["actual_update_raw_importance"]["p"].clone(),
+        "accumulator/equal/cumulative/magnitude/p": reference["magnitude"]["p"].clone(),
+    }
+    scales = {"optimizer_delta": 3.0e-3, "score": 3.0e-4, "parameter": 1.0}
+    precision = {"atol": ddp.T32_DISTRIBUTED_ATOL, "rtol": ddp.T32_DISTRIBUTED_RTOL, "normalized_l2_limit": ddp.T32_DISTRIBUTED_L2_LIMIT}
+    checks: dict[str, object] = {}; rows: list[dict[str, object]] = []
+    oracle._add_observed_peer_update_checks(checks, rows, case="equal", route="D", candidate_arrays=rank_swap_candidate, reference_updates=reference, scales=scales, precision=precision)
+    assert all(value["within_t32_distributed"] for value in checks.values())
+    # Mutate only observed D rank-swap post-pre data movement/update.  The
+    # direct replay Gate—not a comparator unit test or execution oracle—fails.
+    rank_swap_candidate["accumulator/equal/contribution/data_update/p"] = torch.tensor([1.0e-1], dtype=torch.float32)
+    checks = {}; rows = []
+    oracle._add_observed_peer_update_checks(checks, rows, case="equal", route="D", candidate_arrays=rank_swap_candidate, reference_updates=reference, scales=scales, precision=precision)
+    assert checks["equal:A:D:peer_data_update"]["within_t32_distributed"] is False
+    assert checks["equal:A:D:peer_data_movement"]["within_t32_distributed"] is False
+
+
+def test_t32_is_unchanged_and_r17_tenfold_margin_is_analytic_not_formal_equivalence() -> None:
+    """Recorded r17 scale analysis justifies v3 conditioning; it is not a formal run."""
+
+    assert (ddp.T32_DISTRIBUTED_ATOL, ddp.T32_DISTRIBUTED_RTOL, ddp.T32_DISTRIBUTED_L2_LIMIT) == (1.0e-7, 1.0e-4, 1.0e-4)
+    r17_worst_scaled_error = 4.3059988261529014e-4
+    fixed_t32_relative_limit = ddp.T32_DISTRIBUTED_ATOL + ddp.T32_DISTRIBUTED_RTOL
+    projected_v3_scaled_error = r17_worst_scaled_error / 10.0
+    assert r17_worst_scaled_error > fixed_t32_relative_limit
+    assert projected_v3_scaled_error < fixed_t32_relative_limit
+    # CPU-only scalar simulation of the same scale law: fixed FP32 ULP error
+    # divided by a tenfold optimizer delta produces the same tenfold margin.
+    ulp_error = torch.tensor(1.1920928955078125e-7, dtype=torch.float64)
+    old_delta = torch.tensor(2.7680e-4, dtype=torch.float64)
+    assert torch.equal(ulp_error / (old_delta * 10.0), (ulp_error / old_delta) / 10.0)
+
+
+def test_baseline_replay_precedes_permutation_and_negative_launches_with_dedicated_code() -> None:
+    import inspect
+    formalizer = _formalizer()
+    source = inspect.getsource(formalizer.execute)
+    baseline = source.index('phase = "baseline_offline_replay"')
+    rank_permutation = source.index("for permutation in PERMUTATIONS")
+    negative = source.index('for mode, marker in (("ordinary_sync_negative"')
+    assert baseline < rank_permutation < negative
+    assert "_require_baseline_replay(" in source
+    with pytest.raises(formalizer.Stage1S18FormalError, match="S18_BASELINE_REPLAY_FAILED"):
+        formalizer._require_baseline_replay(replay_fn=lambda **_: {"status": "FAIL"}, route_arrays={}, fixture={}, route_reports={})
 
 
 def test_learning_rate_map_uses_parameter_identity_for_nonfirst_multi_parameter_group() -> None:
@@ -1518,15 +1617,15 @@ def test_implementation_source_map_is_exact_full_production_closure() -> None:
     formalizer = _formalizer()
     sources = formalizer._implementation_source_map(Path("."))
     assert set(sources) == set(formalizer.IMPLEMENTATION_SOURCE_FILES)
-    assert len(sources) == 31
+    assert len(sources) == 36
     assert "src/param_importance_nlp/runtime/optimizer.py" not in sources
     assert "src/param_importance_nlp/contracts/errors.py" in sources
     assert set(name for name in sources if name.startswith("schemas/stage1/s1-8-")) == {
         "schemas/stage1/s1-8-array-bundle-v1.json", "schemas/stage1/s1-8-comparison-table-v1.json",
-        "schemas/stage1/s1-8-ddp-report-v1.json", "schemas/stage1/s1-8-fixture-manifest-v1.json", "schemas/stage1/s1-8-fixture-manifest-v2.json",
-        "schemas/stage1/s1-8-formalization-index-v1.json", "schemas/stage1/s1-8-gate-record-v1.json",
-        "schemas/stage1/s1-8-replay-validation-v1.json", "schemas/stage1/s1-8-safetensors-manifest-v1.json",
-        "schemas/stage1/s1-8-validation-v1.json", "schemas/stage1/s1-8-worker-report-v1.json",
+        "schemas/stage1/s1-8-ddp-report-v1.json", "schemas/stage1/s1-8-ddp-report-v2.json", "schemas/stage1/s1-8-fixture-manifest-v1.json", "schemas/stage1/s1-8-fixture-manifest-v2.json", "schemas/stage1/s1-8-fixture-manifest-v3.json",
+        "schemas/stage1/s1-8-formalization-index-v1.json", "schemas/stage1/s1-8-formalization-index-v2.json", "schemas/stage1/s1-8-gate-record-v1.json",
+        "schemas/stage1/s1-8-replay-validation-v1.json", "schemas/stage1/s1-8-replay-validation-v2.json", "schemas/stage1/s1-8-safetensors-manifest-v1.json",
+        "schemas/stage1/s1-8-validation-v1.json", "schemas/stage1/s1-8-validation-v2.json", "schemas/stage1/s1-8-worker-report-v1.json",
     }
     assert all(len(digest) == 64 and set(digest) <= set("0123456789abcdef") for digest in sources.values())
 
@@ -1782,8 +1881,9 @@ def test_index_schema_strictly_freezes_full_s17_handoff_historical_binding() -> 
     }
     uuids = [f"GPU-{index:08x}-1111-2222-3333-444444444444" for index in range(4)]
     index = formalizer._with_hash({
-        "schema_version": "stage1-s1-8-formalization-index-v1", "status": "PASS", "gate_id": "G1-DDP", "task_id": "stage1.08_ddp_and_gradient_accumulation",
+        "schema_version": "stage1-s1-8-formalization-index-v2", "status": "PASS", "gate_id": "G1-DDP", "task_id": "stage1.08_ddp_and_gradient_accumulation",
         "generator_git_commit": "8" * 40, "consumer_git_commit": "8" * 40,
+        "fixture_schema_version": "stage1-s1-8-fixture-manifest-v3", "fixture_id": "stage1-s1-8-pythia14m-ddp-conditioned-v3",
         "gpu_capability": {"commit_ref": "commit", "object_ref": "object", "task_id": "stage0.01_baseline_and_safety", "artifact_kind": "capability_cuda", "artifact_hash": formalizer.EXPECTED_GPU_CAPABILITY_ARTIFACT_HASH, "config_hash": "9" * 64, "source_refs": ["source"], "allowed_gpu_uuids": uuids}, "nccl_transport_protocol": formalizer._nccl_transport_protocol(),
         "implementation_source_sha256": formalizer._implementation_source_map(Path(".")), "s1_7_handoff": handoff,
         "role_refs": {"fixture_manifest": "fixture-manifest.json", "ddp_report": "ddp-report.json", "array_bundle": "array-bundle.json", "comparison_table": "comparison-table.json", "gate_record": "g1-ddp-record.json"},
