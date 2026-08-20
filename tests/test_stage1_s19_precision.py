@@ -369,6 +369,12 @@ def test_s19_ddp_worker_uses_optimizer_group_learning_rate_wire() -> None:
     assert worker._learning_rates_by_group(registry) == {"group_0000": 0.05}
 
 
+def test_s19_ddp_reference_parity_excludes_skip_counter_on_both_sides() -> None:
+    worker = _module(ROOT / "ops" / "stage1" / "run_s1_9_ddp_skip_worker.py", "s19_ddp_skip_counter_worker")
+    assert worker._without_skipped_steps({"value": 3, "skipped_steps": 1}) == {"value": 3}
+    assert worker._without_skipped_steps({"value": 3, "skipped_steps": 0}) == {"value": 3}
+
+
 def test_s19_formal_helpers_reject_bad_explicit_uuid_sets() -> None:
     formal = _module(ROOT / "ops" / "stage1" / "formalize_s1_9.py", "s19_formalizer")
     with pytest.raises(formal.Stage1S19FormalError, match="S1_9_APPROVED_UUIDS_INVALID"):

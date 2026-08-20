@@ -163,6 +163,10 @@ def _tracker_views(tracker: OnlineImportanceTracker) -> dict[str, Any]:
     })
 
 
+def _without_skipped_steps(state: Mapping[str, Any]) -> dict[str, Any]:
+    return {key: value for key, value in state.items() if key != "skipped_steps"}
+
+
 def _state(model: DistributedDataParallel, optimizer: _CountingAdamW, scheduler: Any, scaler: _CountingGradScaler, tracker: OnlineImportanceTracker, *, cursor: int, attempt: int, skipped: int) -> dict[str, Any]:
     return _wire({
         "parameters": {name: parameter.detach().clone() for name, parameter in model.module.named_parameters()},
@@ -318,7 +322,7 @@ def main(argv: list[str] | None = None) -> int:
                 for item in skip_rows
             )
             expected_cursor = all(int(item["post_fetch_state"]["cursor"]) == int(item["pre_fetch_state"]["cursor"]) + 1 and item["post_fetch_state"]["cursor"] == item["post_state"]["cursor"] for item in skip_rows)
-            next_finite_parity = all(observed_item["final_state"]["parameters"] == reference_item["final_state"]["parameters"] and observed_item["final_state"]["optimizer"] == reference_item["final_state"]["optimizer"] and observed_item["final_state"]["scheduler"] == reference_item["final_state"]["scheduler"] and {key: value for key, value in observed_item["final_state"]["importance_accumulator"].items() if key != "skipped_steps"} == reference_item["final_state"]["importance_accumulator"] and observed_item["final_state"]["importance_views"] == reference_item["final_state"]["importance_views"] for observed_item, reference_item in zip(gathered_observed, gathered_reference, strict=True))
+            next_finite_parity = all(observed_item["final_state"]["parameters"] == reference_item["final_state"]["parameters"] and observed_item["final_state"]["optimizer"] == reference_item["final_state"]["optimizer"] and observed_item["final_state"]["scheduler"] == reference_item["final_state"]["scheduler"] and _without_skipped_steps(observed_item["final_state"]["importance_accumulator"]) == _without_skipped_steps(reference_item["final_state"]["importance_accumulator"]) and observed_item["final_state"]["importance_views"] == reference_item["final_state"]["importance_views"] for observed_item, reference_item in zip(gathered_observed, gathered_reference, strict=True))
             counters = all(item["scaler_calls"] == {"unscale": 3, "step": 3, "update": 3} and item["actual_optimizer_step_calls"] == 2 and item["successful"] == 2 and item["skipped"] == 1 for item in gathered_observed)
             rank_parity = len({_canonical(item["final_state"]).hex() for item in gathered_observed}) == 1
             progression = all(item["attempts"][1]["pre_fetch_state"]["rng_cpu"] == item["attempts"][1]["post_fetch_state"]["rng_cpu"] == item["attempts"][1]["post_state"]["rng_cpu"] and item["attempts"][1]["pre_fetch_state"]["rng_cuda_local"] == item["attempts"][1]["post_fetch_state"]["rng_cuda_local"] == item["attempts"][1]["post_state"]["rng_cuda_local"] and int(item["attempts"][1]["post_state"]["attempt"]) == int(item["attempts"][1]["pre_fetch_state"]["attempt"]) + 1 and int(item["attempts"][1]["post_state"]["skipped"]) == int(item["attempts"][1]["pre_fetch_state"]["skipped"]) + 1 for item in gathered_observed)
