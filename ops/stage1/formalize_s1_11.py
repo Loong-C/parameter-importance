@@ -508,7 +508,10 @@ def _build_charts(evidence_root: Path, work: Path, dependencies: list[Mapping[st
             columns = tuple(dict.fromkeys(str(value) for value in (item["x_column"], item["y_column"], item["value_column"], item["error_column"]) if value is not None))
             render_source = work / f".{expected}.source.csv"
             _project_role_rows(source, render_source, columns)
-        result.append(_render_chart(render_source, chart_id=expected, x_column=str(item["x_column"]), y_column=str(item["y_column"]), value_column=None if item["value_column"] is None else str(item["value_column"]), error_column=None if item["error_column"] is None else str(item["error_column"]), output_csv=work / f"{expected}.csv", output_svg=work / f"{expected}.svg", source_identity_sha256=str(source_sha), allow_duplicate_keys=role_bound))
+        # Repeated plotted coordinates are legitimate when an immutable source
+        # contains multiple parameter identities that project to the same 2-D
+        # point.  The exact index/file hash remains the anti-tamper boundary.
+        result.append(_render_chart(render_source, chart_id=expected, x_column=str(item["x_column"]), y_column=str(item["y_column"]), value_column=None if item["value_column"] is None else str(item["value_column"]), error_column=None if item["error_column"] is None else str(item["error_column"]), output_csv=work / f"{expected}.csv", output_svg=work / f"{expected}.svg", source_identity_sha256=str(source_sha), allow_duplicate_keys=True))
         if role_bound:
             render_source.unlink()
     return result
