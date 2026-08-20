@@ -129,6 +129,7 @@ GPU_QUIESCENCE_TIMEOUT_SECONDS = 30.0
 GPU_QUIESCENCE_SAMPLE_INTERVAL_SECONDS = 1.0
 GPU_QUIESCENCE_REQUIRED_CONSECUTIVE_EXACT_IDLE_SAMPLES = 3
 GPU_QUIESCENCE_ROLES = {
+    "prelease": "prelease-gpu-quiescence.json",
     "post_worker": "post-worker-gpu-quiescence.json",
     "post_release": "post-release-gpu-quiescence.json",
     "reacquire_preflight": "reacquire-preflight-gpu-quiescence.json",
@@ -178,6 +179,7 @@ def _fixed_reproduction_roles() -> dict[str, tuple[str, str]]:
         "pre_route_scale_plan": ("pre-route-scale-plan.json", "pre-route-scale-plan.json"),
         "pre_route_scale": ("pre-route-scale.json", "pre-route-scale.json"),
         "preflight": ("preflight.json", "preflight.json"),
+        "prelease_gpu_quiescence": ("prelease-gpu-quiescence.json", "prelease-gpu-quiescence.json"),
         "post_lease_gpu": ("post-lease-gpu.json", "post-lease-gpu.json"),
         "post_worker_gpu": ("post-worker-gpu.json", "post-worker-gpu.json"),
         "post_release_gpu": ("post-release-gpu.json", "post-release-gpu.json"),
@@ -222,7 +224,7 @@ def _fixed_reproduction_roles() -> dict[str, tuple[str, str]]:
         ):
             role = "run_" + hashlib.sha256(source_relative.encode("utf-8")).hexdigest()[:16]
             roles[role] = ("run__" + source_relative.replace("/", "__"), source_relative)
-    if len(roles) != 83 or len({reference for reference, _ in roles.values()}) != len(roles):
+    if len(roles) != 84 or len({reference for reference, _ in roles.values()}) != len(roles):
         raise Stage1S18FormalError("S18_REPRODUCTION_ROLE_CLOSURE_INVALID")
     return roles
 
@@ -267,6 +269,20 @@ def _implementation_source_map(repository: Path) -> dict[str, str]:
             raise Stage1S18FormalError("S18_IMPLEMENTATION_SOURCE_MISSING:" + reference)
         result[reference] = _sha(file)
     return result
+
+
+def _validate_implementation_source_map(repository: Path, source_map: Mapping[str, Any]) -> None:
+    """Require candidate source hashes to bind to the current source bytes."""
+
+    observed = _mapping(source_map, field="candidate.source_map")
+    expected = _implementation_source_map(repository)
+    if set(observed) != set(IMPLEMENTATION_SOURCE_FILES) or any(
+        _require_sha256(value, field="source_map." + key) != value
+        for key, value in observed.items()
+    ):
+        raise Stage1S18FormalError("S18_CANDIDATE_SOURCE_MAP_INVALID")
+    if observed != expected:
+        raise Stage1S18FormalError("S18_CANDIDATE_SOURCE_MAP_BYTE_DRIFT")
 
 
 def _mapping(value: object, *, field: str) -> dict[str, Any]:
@@ -603,6 +619,7 @@ def _validate_gpu_quiescence_publication(
         if not _self_hash(record) or record.get("status") != "PASS" or record.get("phase") != phase:
             raise Stage1S18FormalError("S18_CANDIDATE_GPU_QUIESCENCE_RECORD_INVALID:" + phase)
         snapshot_name = {
+            "prelease": "preflight.json",
             "post_worker": "post-worker-gpu.json",
             "post_release": "post-release-gpu.json",
             "reacquire_preflight": None,
@@ -740,9 +757,7 @@ def _candidate_publication_check(
         _validate_process_outcome_contract(process)
     if index.get("implementation_source_sha256") != ddp.get("implementation_source_sha256"):
         raise Stage1S18FormalError("S18_CANDIDATE_SOURCE_MAP_CROSSREF_INVALID")
-    source_map = _mapping(index.get("implementation_source_sha256"), field="candidate.source_map")
-    if set(source_map) != set(IMPLEMENTATION_SOURCE_FILES) or any(_require_sha256(value, field="source_map." + key) != value for key, value in source_map.items()):
-        raise Stage1S18FormalError("S18_CANDIDATE_SOURCE_MAP_INVALID")
+    _validate_implementation_source_map(repository, index.get("implementation_source_sha256"))
     capability = _mapping(index.get("gpu_capability"), field="candidate.gpu_capability")
     handoff = _mapping(index.get("s1_7_handoff"), field="candidate.s1_7_handoff")
     if (
@@ -1441,7 +1456,7 @@ def _write_gpu_quiescence_record(
     final_gpu: Mapping[str, Any] | None,
     failure_reason: str | None,
 ) -> dict[str, Any]:
-    if phase not in {"post_worker", "post_release", "reacquire_preflight"} or status not in {"PASS", "FAILED"}:
+    if phase not in {"prelease", "post_worker", "post_release", "reacquire_preflight"} or status not in {"PASS", "FAILED"}:
         raise Stage1S18FormalError("S18_GPU_QUIESCENCE_RECORD_INVALID")
     value = _with_hash({
         "schema_version": "stage1-s1-8-gpu-quiescence-v1",
@@ -2836,7 +2851,9 @@ def execute(*, repository: Path, data_root: Path, s1_7_index_ref: str, gpu_capab
         pile_download_audit = _audit_pile_download_activity(handoff)
         nccl_transport = _nccl_transport_protocol()
         _write(work / "nccl-transport-protocol.json", _with_hash({"schema_version": "stage1-s1-8-nccl-transport-binding-v1", "status": "PASS", "protocol": nccl_transport}))
-        preflight = discover_approved_gpus(approved_gpu_uuids); _write(work / "preflight.json", _with_hash({"schema_version": "stage1-s1-8-gpu-preflight-v1", "status": "PASS", "gpu": preflight, "capability": capability, "nccl_transport_protocol": nccl_transport, "pile_download_audit": pile_download_audit}))
+        prelease_quiescence = require_gpu_quiescence(approved_gpu_uuids, work=work, phase="prelease")
+        preflight = _mapping(prelease_quiescence.get("final_gpu"), field="prelease_quiescence.final_gpu")
+        _write(work / "preflight.json", _with_hash({"schema_version": "stage1-s1-8-gpu-preflight-v1", "status": "PASS", "gpu": preflight, "capability": capability, "nccl_transport_protocol": nccl_transport, "pile_download_audit": pile_download_audit}))
         identity = GpuLeaseIdentity(run_id=f"stage1-s1-8-{attempt_id}", lease_id=f"s1-8-{attempt_id}", gpu_uuids=tuple(approved_gpu_uuids), owner=lease_owner, config_hash=_canonical({"task_id": TASK_ID, "commit": commit, "attempt_id": attempt_id}), environment_hash=_canonical(preflight))
         phase = "lease_preflight"; _require_no_current_lease_record(data_root, identity)
         phase = "lease_acquire"; lease = ProjectGpuLease(data_root, identity); lease.acquire(); lease_held = True; lease.heartbeat()
@@ -2991,7 +3008,7 @@ def execute(*, repository: Path, data_root: Path, s1_7_index_ref: str, gpu_capab
             "array_manifest": all(_self_hash(value) for value in manifests.values()),
             "lease_release_reacquire": (
                 (work / "lease-history-first.json").is_file() and (work / "lease-history-reacquire.json").is_file()
-                and all(record.get("status") == "PASS" and _self_hash(record) for record in (post_worker_quiescence, post_release_quiescence, reacquire_quiescence))
+                and all(record.get("status") == "PASS" and _self_hash(record) for record in (prelease_quiescence, post_worker_quiescence, post_release_quiescence, reacquire_quiescence))
             ),
             "resource_summary": _self_hash(_mapping(load_canonical_json(work / "resource-summary.json"), field="resource_summary")),
             "charts_no_a_u_reference": all("A U" not in (work / name).read_text(encoding="utf-8") for name in svg_hashes),

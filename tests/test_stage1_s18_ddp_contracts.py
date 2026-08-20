@@ -1784,7 +1784,7 @@ def test_execute_acquire_failure_preserves_original_error_and_never_releases(tmp
     monkeypatch.setattr(formalizer, "_require_prelease_cuda_hidden", lambda: {"cuda_visible_devices": "", "parent_cuda_initialization": False})
     monkeypatch.setattr(formalizer, "_frozen_model_and_cache_root", lambda *_args: (str(tmp_path), str(cache_root), {"status": "PASS"}))
     monkeypatch.setattr(formalizer, "_audit_pile_download_activity", lambda _handoff: {"active_count": 0})
-    monkeypatch.setattr(formalizer, "discover_approved_gpus", lambda uuids: {"requested_uuid_order": list(uuids)})
+    monkeypatch.setattr(formalizer, "require_gpu_quiescence", lambda uuids, *, work, phase: {"final_gpu": {"requested_uuid_order": list(uuids), "selected": [], "compute_apps": []}})
     uuids = ["GPU-00000000-1111-2222-3333-44444444444" + str(index) for index in range(4)]
     with pytest.raises(RuntimeError, match="GPU_LEASE_STALE_RECORD_REQUIRES_REVIEW"):
         formalizer.execute(repository=repository, data_root=data_root, s1_7_index_ref="ignored", gpu_capability_ref="ignored", approved_gpu_uuids=uuids, attempt_id="acquire-failure", lease_owner="test-owner")
@@ -1825,7 +1825,7 @@ def test_recovery_action_preflight_fails_before_lease_acquire(tmp_path: Path, mo
     monkeypatch.setattr(formalizer, "_frozen_model_and_cache_root", lambda *_args: (str(tmp_path), str(cache_root), {"status": "PASS"}))
     monkeypatch.setattr(formalizer, "_audit_pile_download_activity", lambda _handoff: {"active_count": 0})
     bad_uuid = "GPU-00000000-1111-2222-3333-444444444441"
-    monkeypatch.setattr(formalizer, "discover_approved_gpus", lambda _uuids: (_ for _ in ()).throw(formalizer.Stage1S18FormalError("S18_GPU_RECOVERY_ACTION_NOT_NONE:" + bad_uuid + ":Reset")))
+    monkeypatch.setattr(formalizer, "require_gpu_quiescence", lambda _uuids, *, work, phase: (_ for _ in ()).throw(formalizer.Stage1S18FormalError("S18_GPU_RECOVERY_ACTION_NOT_NONE:" + bad_uuid + ":Reset")))
     uuids = ["GPU-00000000-1111-2222-3333-44444444444" + str(index) for index in range(4)]
     with pytest.raises(formalizer.Stage1S18FormalError, match="S18_GPU_RECOVERY_ACTION_NOT_NONE"):
         formalizer.execute(repository=repository, data_root=data_root, s1_7_index_ref="ignored", gpu_capability_ref="ignored", approved_gpu_uuids=uuids, attempt_id="recovery-action-preflight", lease_owner="test-owner")
@@ -1878,6 +1878,18 @@ def test_implementation_source_map_is_exact_full_production_closure() -> None:
         "schemas/stage1/s1-8-validation-v1.json", "schemas/stage1/s1-8-validation-v2.json", "schemas/stage1/s1-8-validation-v3.json", "schemas/stage1/s1-8-worker-report-v1.json",
     }
     assert all(len(digest) == 64 and set(digest) <= set("0123456789abcdef") for digest in sources.values())
+
+
+def test_implementation_source_map_rejects_schema_byte_drift() -> None:
+    formalizer = _formalizer()
+    repository = Path(".").resolve()
+    source_map = formalizer._implementation_source_map(repository)
+    formalizer._validate_implementation_source_map(repository, source_map)
+    drifted = dict(source_map)
+    source = "schemas/stage1/s1-8-formalization-index-v3.json"
+    drifted[source] = "0" * 64 if source_map[source] != "0" * 64 else "1" * 64
+    with pytest.raises(formalizer.Stage1S18FormalError, match="S18_CANDIDATE_SOURCE_MAP_BYTE_DRIFT"):
+        formalizer._validate_implementation_source_map(repository, drifted)
 
 
 def test_dirty_worktree_and_nonfrozen_capability_are_prelease_rejections(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -2123,10 +2135,10 @@ def test_gpu_quiescence_public_role_hash_and_schema_bindings_fail_closed(tmp_pat
     records = {phase: formalizer.require_gpu_quiescence(uuids, work=tmp_path, phase=phase) for phase in formalizer.GPU_QUIESCENCE_ROLES}
     for phase, filename in formalizer.GPU_QUIESCENCE_ROLES.items():
         if phase != "reacquire_preflight":
-            snapshot = "post-worker-gpu.json" if phase == "post_worker" else "post-release-gpu.json"
+            snapshot = {"prelease": "preflight.json", "post_worker": "post-worker-gpu.json", "post_release": "post-release-gpu.json"}[phase]
             formalizer._write(tmp_path / snapshot, formalizer._with_hash({"schema_version": "stage1-s1-8-gpu-preflight-v1", "status": "PASS", "gpu": records[phase]["final_gpu"]}))
     sources = {filename: tmp_path / filename for filename in formalizer.GPU_QUIESCENCE_ROLES.values()}
-    sources.update({"post-worker-gpu.json": tmp_path / "post-worker-gpu.json", "post-release-gpu.json": tmp_path / "post-release-gpu.json"})
+    sources.update({"preflight.json": tmp_path / "preflight.json", "post-worker-gpu.json": tmp_path / "post-worker-gpu.json", "post-release-gpu.json": tmp_path / "post-release-gpu.json"})
     bindings = {phase: {"ref": filename, "sha256": formalizer._sha(tmp_path / filename)} for phase, filename in formalizer.GPU_QUIESCENCE_ROLES.items()}
     index_refs = {phase + "_gpu_quiescence": filename for phase, filename in formalizer.GPU_QUIESCENCE_ROLES.items()}
     index_hashes = {phase + "_gpu_quiescence": formalizer._sha(tmp_path / filename) for phase, filename in formalizer.GPU_QUIESCENCE_ROLES.items()}
