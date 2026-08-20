@@ -862,6 +862,11 @@ def validate_parameterized_handoff(data_root: str | Path, index_ref: str, *, exp
         or validation.get("role_sha256") != role_hashes
     ):
         raise Stage1CheckpointError("S1_10_HANDOFF_VALIDATION_SEMANTIC_INVALID")
+    if (
+        expected_task_id == "stage1.09_precision_clipping_and_optimizer_boundaries"
+        and validation.get("schema_version") != "stage1-s1-9-validation-v2"
+    ):
+        raise Stage1CheckpointError("S1_10_HANDOFF_VALIDATION_SCHEMA_INVALID")
     replay = auxiliaries["replay"]
     replay_hash_field = "artifact_hash" if expected_task_id == "stage1.08_ddp_and_gradient_accumulation" else "replay_hash"
     replay_body = dict(replay)
@@ -886,7 +891,7 @@ def validate_parameterized_handoff(data_root: str | Path, index_ref: str, *, exp
     required_reproduction = (
         ("prelease_gpu_quiescence", "post_worker_gpu_quiescence", "post_release_gpu_quiescence", "reacquire_preflight_gpu_quiescence")
         if expected_task_id == "stage1.08_ddp_and_gradient_accumulation"
-        else ("upstream_compatibility", "prelease_gpu", "post_worker_quiescence")
+        else ("upstream_compatibility", "prelease_gpu", "post_worker_quiescence", "single_worker", "bf16_resume_checkpoint_store")
     )
     if any(role not in reproduction_refs for role in required_reproduction):
         raise Stage1CheckpointError("S1_10_HANDOFF_REPRODUCTION_ROLE_MISSING")
@@ -918,6 +923,8 @@ def validate_parameterized_handoff(data_root: str | Path, index_ref: str, *, exp
             "upstream_compatibility": "stage1-s1-9-upstream-compatibility-v7",
             "prelease_gpu": "stage1-s1-9-gpu-prelease-v3",
             "post_worker_quiescence": "stage1-s1-9-gpu-quiescence-v3",
+            "single_worker": "stage1-s1-9-single-bf16-worker-v2",
+            "bf16_resume_checkpoint_store": "stage1-s1-9-bf16-checkpoint-store-reproduction-v2",
         }
     )
     if any(reproduction_values[role].get("schema_version") != schema for role, schema in expected_artifact_schemas.items()):

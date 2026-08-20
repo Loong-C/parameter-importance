@@ -85,11 +85,13 @@ def _schema_handoff(which: str) -> dict[str, object]:
         "validation_sha256": "6" * 64,
         "source_map_sha256": "6" * 64,
         "source_map_entries": 34,
-        "reproduction_role_sha256": {
-            "upstream_compatibility": "6" * 64,
-            "prelease_gpu": "6" * 64,
-            "post_worker_quiescence": "6" * 64,
-        },
+            "reproduction_role_sha256": {
+                "upstream_compatibility": "6" * 64,
+                "prelease_gpu": "6" * 64,
+                "post_worker_quiescence": "6" * 64,
+                "single_worker": "6" * 64,
+                "bf16_resume_checkpoint_store": "6" * 64,
+            },
         "reproduction_role_set_sha256": "6" * 64,
         "reproduction_role_count": 27,
         "schema_version": "stage1-s1-9-formalization-index-v8",
@@ -267,7 +269,11 @@ def _write_handoff_fixture(
     # Validation binds the actual immutable sibling identities rather than a
     # generic placeholder.  This mirrors the S1.8/S1.9 handoff contract.
     validation = {
-        "schema_version": "synthetic-validation-v1",
+        "schema_version": (
+            "synthetic-validation-v1"
+            if task_id == "stage1.08_ddp_and_gradient_accumulation"
+            else "stage1-s1-9-validation-v2"
+        ),
         "status": "PASS",
         "task_id": task_id,
         "gate_id": gate_id,
@@ -325,6 +331,8 @@ def _write_handoff_fixture(
             "upstream_compatibility": "stage1-s1-9-upstream-compatibility-v7",
             "prelease_gpu": "stage1-s1-9-gpu-prelease-v3",
             "post_worker_quiescence": "stage1-s1-9-gpu-quiescence-v3",
+            "single_worker": "stage1-s1-9-single-bf16-worker-v2",
+            "bf16_resume_checkpoint_store": "stage1-s1-9-bf16-checkpoint-store-reproduction-v2",
         }
     )
     for role_name, filename in reproduction_refs.items():
