@@ -1819,6 +1819,10 @@ def _attest_initial_launcher(pid: int, run_token: str) -> dict[str, Any]:
                 if completed_monotonic <= deadline:
                     return dict(observed)
             stable_nonempty = dict(observed)
+        else:
+            # Stability must be consecutive.  An intervening fork/exec empty
+            # argv observation invalidates the earlier non-empty candidate.
+            stable_nonempty = None
         if completed_monotonic >= deadline:
             raise _InitialLauncherAttestationFailure(
                 "S18_PROCESS_INITIAL_LAUNCHER_ATTESTATION_EMPTY_CMDLINE_TIMEOUT",
