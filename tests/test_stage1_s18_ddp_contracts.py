@@ -658,6 +658,9 @@ def test_replay_v3_and_comparison_table_v2_bind_near_zero_l2_nulls_fail_closed()
 def test_strict_fixture_and_gate_schemas_reject_nested_unknown_missing_and_cardinality() -> None:
     formalizer = _formalizer()
     fixture = _fixture()
+    assert formalizer._fixture_self_hash(fixture)
+    drifted_hash = copy.deepcopy(fixture); drifted_hash["gradient_clip_max_norm"] = 2.0
+    assert not formalizer._fixture_self_hash(drifted_hash)
     formalizer._validate_output_schemas(Path("."), {"fixture_manifest": fixture})
     unknown = copy.deepcopy(fixture); unknown["precision"]["surprise"] = 1  # type: ignore[index]
     with pytest.raises(formalizer.Stage1S18FormalError, match="S18_SCHEMA_VALIDATION_FAILED"):
@@ -674,6 +677,33 @@ def test_strict_fixture_and_gate_schemas_reject_nested_unknown_missing_and_cardi
     gate_missing = copy.deepcopy(gate); del gate_missing["requirements"]["nccl_smoke"]  # type: ignore[index]
     with pytest.raises(formalizer.Stage1S18FormalError, match="S18_SCHEMA_VALIDATION_FAILED"):
         formalizer._validate_output_schemas(Path("."), {"gate_record": gate_missing})
+
+
+def test_array_bundle_v2_exactly_binds_all_r15_route_refs_and_rejects_substitution() -> None:
+    formalizer = _formalizer()
+    locations = {
+        "A": ("run__route-A-identity-formal__route-output__route-A.safetensors", "run__route-A-identity-formal__route-output__route-report.json"),
+        "B": ("run__route-B-identity-formal__route-output__route-B.safetensors", "run__route-B-identity-formal__route-output__route-report.json"),
+        "C": ("run__route-C-identity-formal__route-output__route-C.safetensors", "run__route-C-identity-formal__route-output__route-report.json"),
+        "D": ("run__route-D-identity-formal__route-output__route-D.safetensors", "run__route-D-identity-formal__route-output__route-report.json"),
+        "D-rank_swap": ("run__route-D-rank_swap-formal__route-output__route-D.safetensors", "run__route-D-rank_swap-formal__route-output__route-report.json"),
+        "D-local_reverse": ("run__route-D-local_reverse-formal__route-output__route-D.safetensors", "run__route-D-local_reverse-formal__route-output__route-report.json"),
+    }
+    routes = {route: {"artifact_ref": artifact, "manifest_ref": manifest, "file_sha256": "a" * 64, "file_size_bytes": 1, "manifest_hash": "b" * 64} for route, (artifact, manifest) in locations.items()}
+    bundle = formalizer._with_hash({"schema_version": "stage1-s1-8-array-bundle-v2", "status": "PASS", "route_artifacts": routes})
+    formalizer._validate_output_schemas(Path("."), {"array_bundle": bundle})
+    for mutate in (
+        lambda value: value["route_artifacts"]["D-local_reverse"].__setitem__("artifact_ref", value["route_artifacts"]["D-rank_swap"]["artifact_ref"]),
+        lambda value: value["route_artifacts"]["D-rank_swap"].__setitem__("manifest_ref", "run__route-D-rank-swap-formal__route-output__route-report.json"),
+        lambda value: value["route_artifacts"].pop("A"),
+        lambda value: value["route_artifacts"].__setitem__("unexpected", dict(value["route_artifacts"]["A"])),
+    ):
+        bad = copy.deepcopy(bundle); bad.pop("artifact_hash"); mutate(bad); bad = formalizer._with_hash(bad)
+        with pytest.raises(formalizer.Stage1S18FormalError, match="S18_SCHEMA_VALIDATION_FAILED:array_bundle"):
+            formalizer._validate_output_schemas(Path("."), {"array_bundle": bad})
+    legacy = formalizer._with_hash({"schema_version": "stage1-s1-8-array-bundle-v1", "status": "PASS", "route_artifacts": routes})
+    with pytest.raises(formalizer.Stage1S18FormalError, match="S18_SCHEMA_VALIDATION_FAILED:array_bundle"):
+        formalizer._validate_output_schemas(Path("."), {"array_bundle": legacy})
 
 
 def test_worker_and_array_schemas_validate_real_shape_then_reject_deep_unknown_and_case_cardinality() -> None:
@@ -2008,15 +2038,15 @@ def test_implementation_source_map_is_exact_full_production_closure() -> None:
     formalizer = _formalizer()
     sources = formalizer._implementation_source_map(Path("."))
     assert set(sources) == set(formalizer.IMPLEMENTATION_SOURCE_FILES)
-    assert len(sources) == 53
+    assert len(sources) == 57
     assert "src/param_importance_nlp/runtime/optimizer.py" not in sources
     assert "src/param_importance_nlp/contracts/errors.py" in sources
     assert set(name for name in sources if name.startswith("schemas/stage1/s1-8-")) == {
-        "schemas/stage1/s1-8-array-bundle-v1.json", "schemas/stage1/s1-8-comparison-table-v1.json", "schemas/stage1/s1-8-comparison-table-v2.json",
-        "schemas/stage1/s1-8-ddp-report-v1.json", "schemas/stage1/s1-8-ddp-report-v2.json", "schemas/stage1/s1-8-ddp-report-v3.json", "schemas/stage1/s1-8-ddp-report-v4.json", "schemas/stage1/s1-8-ddp-report-v5.json", "schemas/stage1/s1-8-ddp-report-v6.json", "schemas/stage1/s1-8-fixture-manifest-v1.json", "schemas/stage1/s1-8-fixture-manifest-v2.json", "schemas/stage1/s1-8-fixture-manifest-v3.json",
-        "schemas/stage1/s1-8-formalization-index-v1.json", "schemas/stage1/s1-8-formalization-index-v2.json", "schemas/stage1/s1-8-formalization-index-v3.json", "schemas/stage1/s1-8-formalization-index-v4.json", "schemas/stage1/s1-8-formalization-index-v5.json", "schemas/stage1/s1-8-formalization-index-v6.json", "schemas/stage1/s1-8-gate-record-v1.json", "schemas/stage1/s1-8-gpu-quiescence-v1.json", "schemas/stage1/s1-8-gpu-quiescence-v2.json", "schemas/stage1/s1-8-gpu-quiescence-v3.json",
+        "schemas/stage1/s1-8-array-bundle-v1.json", "schemas/stage1/s1-8-array-bundle-v2.json", "schemas/stage1/s1-8-comparison-table-v1.json", "schemas/stage1/s1-8-comparison-table-v2.json",
+        "schemas/stage1/s1-8-ddp-report-v1.json", "schemas/stage1/s1-8-ddp-report-v2.json", "schemas/stage1/s1-8-ddp-report-v3.json", "schemas/stage1/s1-8-ddp-report-v4.json", "schemas/stage1/s1-8-ddp-report-v5.json", "schemas/stage1/s1-8-ddp-report-v6.json", "schemas/stage1/s1-8-ddp-report-v7.json", "schemas/stage1/s1-8-fixture-manifest-v1.json", "schemas/stage1/s1-8-fixture-manifest-v2.json", "schemas/stage1/s1-8-fixture-manifest-v3.json",
+        "schemas/stage1/s1-8-formalization-index-v1.json", "schemas/stage1/s1-8-formalization-index-v2.json", "schemas/stage1/s1-8-formalization-index-v3.json", "schemas/stage1/s1-8-formalization-index-v4.json", "schemas/stage1/s1-8-formalization-index-v5.json", "schemas/stage1/s1-8-formalization-index-v6.json", "schemas/stage1/s1-8-formalization-index-v7.json", "schemas/stage1/s1-8-gate-record-v1.json", "schemas/stage1/s1-8-gpu-quiescence-v1.json", "schemas/stage1/s1-8-gpu-quiescence-v2.json", "schemas/stage1/s1-8-gpu-quiescence-v3.json",
         "schemas/stage1/s1-8-replay-validation-v1.json", "schemas/stage1/s1-8-replay-validation-v2.json", "schemas/stage1/s1-8-replay-validation-v3.json", "schemas/stage1/s1-8-safetensors-manifest-v1.json",
-        "schemas/stage1/s1-8-validation-v1.json", "schemas/stage1/s1-8-validation-v2.json", "schemas/stage1/s1-8-validation-v3.json", "schemas/stage1/s1-8-validation-v4.json", "schemas/stage1/s1-8-validation-v5.json", "schemas/stage1/s1-8-validation-v6.json", "schemas/stage1/s1-8-worker-report-v1.json",
+        "schemas/stage1/s1-8-validation-v1.json", "schemas/stage1/s1-8-validation-v2.json", "schemas/stage1/s1-8-validation-v3.json", "schemas/stage1/s1-8-validation-v4.json", "schemas/stage1/s1-8-validation-v5.json", "schemas/stage1/s1-8-validation-v6.json", "schemas/stage1/s1-8-validation-v7.json", "schemas/stage1/s1-8-worker-report-v1.json",
     }
     assert all(len(digest) == 64 and set(digest) <= set("0123456789abcdef") for digest in sources.values())
 
@@ -2027,7 +2057,7 @@ def test_implementation_source_map_rejects_schema_byte_drift() -> None:
     source_map = formalizer._implementation_source_map(repository)
     formalizer._validate_implementation_source_map(repository, source_map)
     drifted = dict(source_map)
-    source = "schemas/stage1/s1-8-formalization-index-v6.json"
+    source = "schemas/stage1/s1-8-formalization-index-v7.json"
     drifted[source] = "0" * 64 if source_map[source] != "0" * 64 else "1" * 64
     with pytest.raises(formalizer.Stage1S18FormalError, match="S18_CANDIDATE_SOURCE_MAP_BYTE_DRIFT"):
         formalizer._validate_implementation_source_map(repository, drifted)
@@ -2588,7 +2618,7 @@ def test_index_schema_strictly_freezes_full_s17_handoff_historical_binding() -> 
     }
     uuids = [f"GPU-{index:08x}-1111-2222-3333-444444444444" for index in range(4)]
     index = formalizer._with_hash({
-        "schema_version": "stage1-s1-8-formalization-index-v6", "status": "PASS", "gate_id": "G1-DDP", "task_id": "stage1.08_ddp_and_gradient_accumulation",
+        "schema_version": "stage1-s1-8-formalization-index-v7", "status": "PASS", "gate_id": "G1-DDP", "task_id": "stage1.08_ddp_and_gradient_accumulation",
         "generator_git_commit": "8" * 40, "consumer_git_commit": "8" * 40,
         "fixture_schema_version": "stage1-s1-8-fixture-manifest-v3", "fixture_id": "stage1-s1-8-pythia14m-ddp-conditioned-v3",
         "gpu_capability": {"commit_ref": "commit", "object_ref": "object", "task_id": "stage0.01_baseline_and_safety", "artifact_kind": "capability_cuda", "artifact_hash": formalizer.EXPECTED_GPU_CAPABILITY_ARTIFACT_HASH, "config_hash": "9" * 64, "source_refs": ["source"], "allowed_gpu_uuids": uuids}, "nccl_transport_protocol": formalizer._nccl_transport_protocol(),
@@ -2600,7 +2630,7 @@ def test_index_schema_strictly_freezes_full_s17_handoff_historical_binding() -> 
         "next_task_ids": ["stage1.10_checkpoint_resume_and_artifacts"],
     })
     formalizer._validate_output_schemas(Path("."), {"index": index})
-    for legacy_version in range(1, 6):
+    for legacy_version in range(1, 7):
         legacy = copy.deepcopy(index); legacy["schema_version"] = f"stage1-s1-8-formalization-index-v{legacy_version}"
         legacy["artifact_hash"] = formalizer._canonical({key: value for key, value in legacy.items() if key != "artifact_hash"})
         with pytest.raises(formalizer.Stage1S18FormalError, match="S18_SCHEMA_VALIDATION_FAILED:index"):

@@ -1,0 +1,77 @@
+{
+  "$id": "stage1-s1-8-array-bundle-v2.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "status", "route_artifacts", "artifact_hash"],
+  "properties": {
+    "schema_version": {"const": "stage1-s1-8-array-bundle-v2"},
+    "status": {"const": "PASS"},
+    "route_artifacts": {"$ref": "#/$defs/routes"},
+    "artifact_hash": {"$ref": "s1-8-formalization-index-v1.json#/$defs/hash"}
+  },
+  "$defs": {
+    "hash": {"$ref": "s1-8-formalization-index-v1.json#/$defs/hash"},
+    "descriptor": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["artifact_ref", "manifest_ref", "file_sha256", "file_size_bytes", "manifest_hash"],
+      "properties": {
+        "artifact_ref": {"type": "string", "minLength": 1},
+        "manifest_ref": {"type": "string", "minLength": 1},
+        "file_sha256": {"$ref": "#/$defs/hash"},
+        "file_size_bytes": {"type": "integer", "exclusiveMinimum": 0},
+        "manifest_hash": {"$ref": "#/$defs/hash"}
+      }
+    },
+    "routes": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["A", "B", "C", "D", "D-rank_swap", "D-local_reverse"],
+      "properties": {
+        "A": {"$ref": "#/$defs/a"},
+        "B": {"$ref": "#/$defs/b"},
+        "C": {"$ref": "#/$defs/c"},
+        "D": {"$ref": "#/$defs/d"},
+        "D-rank_swap": {"$ref": "#/$defs/d_rank_swap"},
+        "D-local_reverse": {"$ref": "#/$defs/d_local_reverse"}
+      }
+    },
+    "a": {
+      "allOf": [
+        {"$ref": "#/$defs/descriptor"},
+        {"properties": {"artifact_ref": {"const": "run__route-A-identity-formal__route-output__route-A.safetensors"}, "manifest_ref": {"const": "run__route-A-identity-formal__route-output__route-report.json"}}}
+      ]
+    },
+    "b": {
+      "allOf": [
+        {"$ref": "#/$defs/descriptor"},
+        {"properties": {"artifact_ref": {"const": "run__route-B-identity-formal__route-output__route-B.safetensors"}, "manifest_ref": {"const": "run__route-B-identity-formal__route-output__route-report.json"}}}
+      ]
+    },
+    "c": {
+      "allOf": [
+        {"$ref": "#/$defs/descriptor"},
+        {"properties": {"artifact_ref": {"const": "run__route-C-identity-formal__route-output__route-C.safetensors"}, "manifest_ref": {"const": "run__route-C-identity-formal__route-output__route-report.json"}}}
+      ]
+    },
+    "d": {
+      "allOf": [
+        {"$ref": "#/$defs/descriptor"},
+        {"properties": {"artifact_ref": {"const": "run__route-D-identity-formal__route-output__route-D.safetensors"}, "manifest_ref": {"const": "run__route-D-identity-formal__route-output__route-report.json"}}}
+      ]
+    },
+    "d_rank_swap": {
+      "allOf": [
+        {"$ref": "#/$defs/descriptor"},
+        {"properties": {"artifact_ref": {"const": "run__route-D-rank_swap-formal__route-output__route-D.safetensors"}, "manifest_ref": {"const": "run__route-D-rank_swap-formal__route-output__route-report.json"}}}
+      ]
+    },
+    "d_local_reverse": {
+      "allOf": [
+        {"$ref": "#/$defs/descriptor"},
+        {"properties": {"artifact_ref": {"const": "run__route-D-local_reverse-formal__route-output__route-D.safetensors"}, "manifest_ref": {"const": "run__route-D-local_reverse-formal__route-output__route-report.json"}}}
+      ]
+    }
+  }
+}
