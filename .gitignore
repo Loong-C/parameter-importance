@@ -3,6 +3,7 @@ __pycache__/
 .pytest_cache/
 .pytest-tmp-*/
 .codex-tmp/
+.agent-temp/
 .codex-stage0-*/
 ops/monitor/runtime/
 Agent/
