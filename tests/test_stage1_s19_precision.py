@@ -800,7 +800,7 @@ def test_s19_s17_r11_no_source_map_uses_frozen_global_diff_allowlist() -> None:
     producer = precision.EXPECTED_S1_7_PRODUCER
     attestation = formal._s1_7_shared_dependency_attestation(
         ROOT,
-        {"source_git_commit": producer},
+        {"execution_commit": producer},
         producer_commit=producer,
         changed_paths=["worklogs/2026-08-15-stage1-s17.md", "src/param_importance_nlp/runtime/optimizer.py"],
     )
@@ -809,7 +809,7 @@ def test_s19_s17_r11_no_source_map_uses_frozen_global_diff_allowlist() -> None:
     with pytest.raises(formal.Stage1S19FormalError, match="S1_9_S1_7_SHARED_DEPENDENCY_DRIFT_REQUIRES_RERUN"):
         formal._s1_7_shared_dependency_attestation(
             ROOT,
-            {"source_git_commit": producer},
+            {"execution_commit": producer},
             producer_commit=producer,
             changed_paths=["src/param_importance_nlp/runtime/training.py"],
         )
@@ -823,13 +823,13 @@ def test_s19_s18_source_map_intersection_is_empty_or_revalidated_for_the_one_sha
     s17 = {"s1_7_generator_commit": producer}
     s18 = {"s1_8_generator_commit": producer}
     roles = {
-        "single_gpu_report": {"source_git_commit": producer},
+        "single_gpu_report": {"execution_commit": producer},
         "ddp_report": {"source_map": {"src/param_importance_nlp/runtime/training.py": "b" * 64}},
     }
     monkeypatch.setattr(formal, "_upstream_role", lambda _root, _ref, role: roles[role])
     monkeypatch.setattr(formal, "_s1_8_v8_handoff_attestation", lambda *_args: {"index_schema_version": "stage1-s1-8-formalization-index-v8", "ddp_report_schema_version": "stage1-s1-8-ddp-report-v8", "validation_schema_version": "stage1-s1-8-validation-v8", "implementation_source_sha256": roles["ddp_report"]["source_map"], "reproduction_role_refs": {name: "x" for name in ()}, "reproduction_role_sha256": {}, "gpu_quiescence": {}, "replay_schema_version": "stage1-s1-8-replay-validation-v3", "comparison_table_schema_version": "stage1-s1-8-comparison-table-v2", "array_bundle_schema_version": "stage1-s1-8-array-bundle-v2", "array_bundle_route_refs": formal._S1_8_ARRAY_BUNDLE_V2_ROUTE_REFS})
     monkeypatch.setattr(formal, "_validate_s1_9_schemas", lambda *_args: None)
-    monkeypatch.setattr(formal, "_consumer_diff", lambda _repository, _producer: [path])
+    monkeypatch.setattr(formal, "_consumer_diff", lambda _repository, _producer, **_kwargs: [path])
     monkeypatch.setattr(formal, "_git", lambda *_args: "c" * 40)
     empty = formal._upstream_compatibility_attestation(ROOT, tmp_path, s1_7_ref="s17/index.json", s1_7=s17, s1_8_ref="s18/index.json", s1_8=s18)
     assert empty["s1_8_affected_dependencies"] == []

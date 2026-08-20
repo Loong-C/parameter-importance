@@ -534,7 +534,7 @@ def _s1_7_shared_dependency_attestation(repository: Path, report: Mapping[str, A
     only this named, reviewed helper may be a shared runtime drift.
     """
 
-    if report.get("source_git_commit") != producer_commit:
+    if report.get("execution_commit") != producer_commit:
         raise Stage1S19FormalError("S1_9_S1_7_REPORT_PROVENANCE_COMMIT_INVALID")
     unauthorised_shared = set(changed_paths) & {
         path for path in changed_paths
