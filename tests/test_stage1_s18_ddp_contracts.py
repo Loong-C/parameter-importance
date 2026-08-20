@@ -1639,6 +1639,31 @@ def test_dirty_worktree_and_nonfrozen_capability_are_prelease_rejections(tmp_pat
         formalizer._load_capability(tmp_path, "evidence/not-the-frozen-capability.json", ["GPU-a", "GPU-b", "GPU-c", "GPU-d"])
 
 
+def test_consumer_diff_allows_only_the_frozen_temp_ignore_rule(monkeypatch: pytest.MonkeyPatch) -> None:
+    formalizer = _formalizer()
+
+    def accepted(_repository: Path, *args: str) -> str:
+        if args == ("status", "--porcelain=v1"):
+            return ""
+        if args[:2] == ("diff", "--name-only"):
+            return ".gitignore\nops/stage1/formalize_s1_8.py"
+        raise AssertionError(args)
+
+    monkeypatch.setattr(formalizer, "_git", accepted)
+    assert formalizer._audit_consumer_diff(Path(".")) == (".gitignore", "ops/stage1/formalize_s1_8.py")
+
+    def rejected(_repository: Path, *args: str) -> str:
+        if args == ("status", "--porcelain=v1"):
+            return ""
+        if args[:2] == ("diff", "--name-only"):
+            return ".gitignore\nREADME.md"
+        raise AssertionError(args)
+
+    monkeypatch.setattr(formalizer, "_git", rejected)
+    with pytest.raises(formalizer.Stage1S18FormalError, match=r"S18_S17_CONSUMER_DIFF_UNAUTHORIZED:README\.md"):
+        formalizer._audit_consumer_diff(Path("."))
+
+
 def test_route_specific_candidate_contract_forbids_a_u_and_requires_bcd_accumulator() -> None:
     formalizer = _formalizer()
     uuid = "GPU-00000000-1111-2222-3333-444444444444"

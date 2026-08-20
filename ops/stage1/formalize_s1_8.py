@@ -867,6 +867,7 @@ def _audit_consumer_diff(repository: Path) -> tuple[str, ...]:
         raise Stage1S18FormalError("S18_FORMAL_WORKTREE_NOT_CLEAN")
     changed = tuple(filter(None, _git(repository, "diff", "--name-only", EXPECTED_S1_7_PRODUCER, "HEAD").splitlines()))
     allowed = (
+        ".gitignore",
         "worklogs/2026-08-15-s1.7-single-gpu-pythia14m.md",
         "ops/stage1/formalize_s1_8.py", "ops/stage1/run_s1_8_worker.py", "ops/stage1/run_s1_8_scale_oracle.py", "ops/stage1/run_s1_8_nccl_smoke.py",
     )
