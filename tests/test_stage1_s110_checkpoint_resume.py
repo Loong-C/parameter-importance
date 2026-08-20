@@ -331,12 +331,14 @@ def _write_handoff_fixture(
             "upstream_compatibility": "stage1-s1-9-upstream-compatibility-v7",
             "prelease_gpu": "stage1-s1-9-gpu-prelease-v3",
             "post_worker_quiescence": "stage1-s1-9-gpu-quiescence-v3",
-            "single_worker": "stage1-s1-9-single-bf16-worker-v2",
+            "single_worker": "stage1-s1-9-single-bf16-worker-v1",
             "bf16_resume_checkpoint_store": "stage1-s1-9-bf16-checkpoint-store-reproduction-v2",
         }
     )
     for role_name, filename in reproduction_refs.items():
-        value = {"schema_version": schema_versions.get(role_name, "synthetic-reproduction-v1"), "status": "PASS"}
+        value = {"schema_version": schema_versions.get(role_name, "synthetic-reproduction-v1")}
+        if role_name != "bf16_resume_checkpoint_store":
+            value["status"] = "PASS"
         value["artifact_hash"] = canonical_json_hash(value)
         write_canonical_json(publication / filename, value)
     reproduction_sha256 = {name: _file_sha256(publication / ref) for name, ref in reproduction_refs.items()}
