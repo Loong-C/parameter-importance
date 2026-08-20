@@ -128,7 +128,7 @@ _S1_9_SOURCE_PATHS = frozenset({
     "schemas/stage1/s1-9-replay-validation-v1.json",
     "schemas/stage1/s1-9-validation-v1.json",
     "schemas/stage1/s1-9-formalization-index-v1.json",
-    "schemas/stage1/s1-9-single-bf16-worker-v1.json",
+    "schemas/stage1/s1-9-single-bf16-worker-v2.json",
     "schemas/stage1/s1-9-ddp-skip-worker-v1.json",
     "schemas/stage1/s1-9-bf16-checkpoint-store-reproduction-v1.json",
 })
