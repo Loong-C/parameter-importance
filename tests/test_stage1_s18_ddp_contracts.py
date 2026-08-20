@@ -706,6 +706,18 @@ def test_initial_launcher_attestation_retries_empty_argv_but_rejects_timeout_and
     monkeypatch.setattr(formalizer, "_fingerprint", lambda _pid, _token: next(observations))
     assert formalizer._attest_initial_launcher(12, token) == stable
 
+    # Non-empty observations separated by the fork/exec empty window are not
+    # consecutive; a fourth stable read is required before attestation.
+    now[0] = 0.0
+    calls = [0]
+    observations = iter([stable, empty, stable, stable])
+    def separated(_pid: int, _token: str) -> dict[str, object]:
+        calls[0] += 1
+        return next(observations)
+    monkeypatch.setattr(formalizer, "_fingerprint", separated)
+    assert formalizer._attest_initial_launcher(12, token) == stable
+    assert calls[0] == 4
+
     monkeypatch.setattr(formalizer, "_fingerprint", lambda _pid, _token: empty)
     now[0] = 0.0
     with pytest.raises(formalizer._InitialLauncherAttestationFailure, match="S18_PROCESS_INITIAL_LAUNCHER_ATTESTATION_EMPTY_CMDLINE_TIMEOUT") as timed_out:
