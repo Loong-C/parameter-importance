@@ -891,7 +891,7 @@ def validate_parameterized_handoff(data_root: str | Path, index_ref: str, *, exp
     if any(role not in reproduction_refs for role in required_reproduction):
         raise Stage1CheckpointError("S1_10_HANDOFF_REPRODUCTION_ROLE_MISSING")
     expected_source_entries, expected_reproduction_entries = (
-        (61, 84) if expected_task_id == "stage1.08_ddp_and_gradient_accumulation" else (34, 28)
+        (61, 84) if expected_task_id == "stage1.08_ddp_and_gradient_accumulation" else (34, 27)
     )
     if len(report_sources) != expected_source_entries or len(reproduction_hashes) != expected_reproduction_entries:
         raise Stage1CheckpointError("S1_10_HANDOFF_CLOSURE_CARDINALITY_INVALID")

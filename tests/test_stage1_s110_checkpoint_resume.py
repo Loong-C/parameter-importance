@@ -91,7 +91,7 @@ def _schema_handoff(which: str) -> dict[str, object]:
             "post_worker_quiescence": "6" * 64,
         },
         "reproduction_role_set_sha256": "6" * 64,
-        "reproduction_role_count": 28,
+        "reproduction_role_count": 27,
         "schema_version": "stage1-s1-9-formalization-index-v8",
         "task_id": "stage1.09_precision_clipping_and_optimizer_boundaries",
         "gate_id": "G1-NUMERIC",
@@ -240,7 +240,7 @@ def _write_handoff_fixture(
         if task_id == "stage1.08_ddp_and_gradient_accumulation"
         else "numeric_report"
     )
-    source_count, reproduction_count = (61, 84) if task_id == "stage1.08_ddp_and_gradient_accumulation" else (34, 28)
+    source_count, reproduction_count = (61, 84) if task_id == "stage1.08_ddp_and_gradient_accumulation" else (34, 27)
     source_map = {f"src/frozen-producer-{index}.py": "b" * 64 for index in range(source_count)}
     gate = {
         "schema_version": "synthetic-gate-v1",
@@ -289,9 +289,30 @@ def _write_handoff_fixture(
         if task_id == "stage1.08_ddp_and_gradient_accumulation"
         else ("upstream_compatibility", "prelease_gpu", "post_worker_quiescence")
     )
-    reproduction_refs = {role: f"{role}.json" for role in required_reproduction}
-    for index in range(reproduction_count - len(reproduction_refs)):
-        reproduction_refs[f"auxiliary_{index}"] = f"auxiliary-{index}.json"
+    if task_id == "stage1.08_ddp_and_gradient_accumulation":
+        reproduction_refs = {role: f"{role}.json" for role in required_reproduction}
+        for index in range(reproduction_count - len(reproduction_refs)):
+            reproduction_refs[f"auxiliary_{index}"] = f"auxiliary-{index}.json"
+    else:
+        reproduction_refs = {
+            "attempt_start": "attempt-start.json",
+            "upstream_compatibility": "upstream-compatibility.json",
+            "preflight": "preflight.json",
+            "prelease_gpu": "prelease-gpu.json",
+            "post_worker_quiescence": "post-worker-quiescence.json",
+            "lease_history": "lease-history.json",
+            "single_worker": "single-bf16.json",
+            "single_stdout": "single.stdout.txt",
+            "single_stderr": "single.stderr.txt",
+            "single_child_fingerprint": "single-child-fingerprint.json",
+            "bf16_resume_checkpoint_store": "bf16-resume-store-index.json",
+            "ddp_worker": "ddp-skip.json",
+            "ddp_stdout": "ddp.stdout.txt",
+            "ddp_stderr": "ddp.stderr.txt",
+            "ddp_child_fingerprint": "ddp-child-fingerprint.json",
+            **{f"chart_csv_{index}": f"chart-{index}.csv" for index in range(6)},
+            **{f"chart_svg_{index}": f"chart-{index}.svg" for index in range(6)},
+        }
     schema_versions = (
         {
             "prelease_gpu_quiescence": "stage1-s1-8-gpu-quiescence-v4",
