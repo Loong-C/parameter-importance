@@ -361,6 +361,14 @@ def test_s19_ddp_worker_proves_gradscaler_ordering_negative_control() -> None:
     assert worker._cpu_gradscaler_ordering_negative_control() is True
 
 
+def test_s19_ddp_worker_uses_optimizer_group_learning_rate_wire() -> None:
+    worker = _module(ROOT / "ops" / "stage1" / "run_s1_9_ddp_skip_worker.py", "s19_ddp_lr_worker")
+    model = torch.nn.Linear(1, 1, bias=False)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=0.05, weight_decay=0.1, foreach=False, fused=False)
+    registry = worker.ParameterRegistry.from_model(model, optimizer)
+    assert worker._learning_rates_by_group(registry) == {"group_0000": 0.05}
+
+
 def test_s19_formal_helpers_reject_bad_explicit_uuid_sets() -> None:
     formal = _module(ROOT / "ops" / "stage1" / "formalize_s1_9.py", "s19_formalizer")
     with pytest.raises(formal.Stage1S19FormalError, match="S1_9_APPROVED_UUIDS_INVALID"):
