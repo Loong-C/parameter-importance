@@ -617,14 +617,15 @@ def test_s111_chart_projects_only_index_bound_json_measurements(tmp_path: Path) 
     role = tmp_path / "comparison-table.json"
     write_canonical_json(role, {"rows": [
         {"max_abs_error": 1.0e-8, "absolute_threshold": 1.0e-7},
-        {"max_abs_error": 2.0e-8, "absolute_threshold": 1.0e-7},
+        {"max_abs_error": 1.0e-8, "absolute_threshold": 1.0e-7},
+        {"expected_step": 1, "observed": 1},
     ]})
     projection = tmp_path / "projection.csv"
     formalizer._project_role_rows(role, projection, ("max_abs_error", "absolute_threshold"))
     record = formalizer._render_chart(
         projection, chart_id="ddp-identity", x_column="max_abs_error", y_column="absolute_threshold",
         output_csv=tmp_path / "ddp.csv", output_svg=tmp_path / "ddp.svg",
-        source_identity_sha256=_sha(role),
+        source_identity_sha256=_sha(role), allow_duplicate_keys=True,
     )
     assert record["source_csv_sha256"] == _sha(role)
     broken = tmp_path / "broken-table.json"

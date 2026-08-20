@@ -383,7 +383,7 @@ def _verify_chart_geometry(
             raise Stage1S111FormalError("S1_11_CHART_READBACK_INVALID")
 
 
-def _render_chart(source: Path, *, chart_id: str, x_column: str, y_column: str, output_csv: Path, output_svg: Path, value_column: str | None = None, error_column: str | None = None, source_identity_sha256: str | None = None) -> dict[str, object]:
+def _render_chart(source: Path, *, chart_id: str, x_column: str, y_column: str, output_csv: Path, output_svg: Path, value_column: str | None = None, error_column: str | None = None, source_identity_sha256: str | None = None, allow_duplicate_keys: bool = False) -> dict[str, object]:
     """Render the plan-mandated geometry from a typed, finite CSV source."""
 
     kind = "scatter" if chart_id in _SCATTERS else "heatmap" if chart_id in _HEATMAPS else "error" if chart_id in _ERROR_BARS else "line"
@@ -411,7 +411,7 @@ def _render_chart(source: Path, *, chart_id: str, x_column: str, y_column: str, 
     if not points:
         raise Stage1S111FormalError("S1_11_CHART_SOURCE_EMPTY")
     keys = [(point[0], point[1]) for point in points]
-    if len(set(keys)) != len(keys):
+    if not allow_duplicate_keys and len(set(keys)) != len(keys):
         raise Stage1S111FormalError("S1_11_CHART_SOURCE_KEY_DUPLICATE")
     with output_csv.open("w", encoding="utf-8", newline="") as handle:
         writer = csv.writer(handle, lineterminator="\n")
@@ -463,10 +463,19 @@ def _project_role_rows(source: Path, destination: Path, columns: tuple[str, ...]
     with destination.open("w", encoding="utf-8", newline="") as handle:
         writer = csv.writer(handle, lineterminator="\n")
         writer.writerow(columns)
+        projected = 0
         for ordinal, row in enumerate(rows):
-            if not isinstance(row, Mapping) or any(column not in row for column in columns):
+            if not isinstance(row, Mapping):
+                raise Stage1S111FormalError(f"S1_11_CHART_ROLE_ROW_INVALID:{ordinal}")
+            present = tuple(column in row for column in columns)
+            if not any(present):
+                continue
+            if not all(present):
                 raise Stage1S111FormalError(f"S1_11_CHART_ROLE_ROW_INVALID:{ordinal}")
             writer.writerow([row[column] for column in columns])
+            projected += 1
+        if projected == 0:
+            raise Stage1S111FormalError("S1_11_CHART_ROLE_ROWS_INVALID")
 
 
 def _build_charts(evidence_root: Path, work: Path, dependencies: list[Mapping[str, object]], specs: object) -> list[dict[str, object]]:
@@ -499,7 +508,7 @@ def _build_charts(evidence_root: Path, work: Path, dependencies: list[Mapping[st
             columns = tuple(dict.fromkeys(str(value) for value in (item["x_column"], item["y_column"], item["value_column"], item["error_column"]) if value is not None))
             render_source = work / f".{expected}.source.csv"
             _project_role_rows(source, render_source, columns)
-        result.append(_render_chart(render_source, chart_id=expected, x_column=str(item["x_column"]), y_column=str(item["y_column"]), value_column=None if item["value_column"] is None else str(item["value_column"]), error_column=None if item["error_column"] is None else str(item["error_column"]), output_csv=work / f"{expected}.csv", output_svg=work / f"{expected}.svg", source_identity_sha256=str(source_sha)))
+        result.append(_render_chart(render_source, chart_id=expected, x_column=str(item["x_column"]), y_column=str(item["y_column"]), value_column=None if item["value_column"] is None else str(item["value_column"]), error_column=None if item["error_column"] is None else str(item["error_column"]), output_csv=work / f"{expected}.csv", output_svg=work / f"{expected}.svg", source_identity_sha256=str(source_sha), allow_duplicate_keys=role_bound))
         if role_bound:
             render_source.unlink()
     return result
