@@ -852,6 +852,33 @@ def test_s110_source_and_resume_cpu_harness_use_distinct_exited_processes() -> N
     assert worker._source_process_exited(source_pid, source_descriptor["identity"]) is True
 
 
+def test_s110_resume_loads_source_before_isolating_output_store() -> None:
+    worker_spec = importlib.util.spec_from_file_location(
+        "s110_worker_resume_store_test",
+        ROOT / "ops" / "stage1" / "run_s1_10_resume_worker.py",
+    )
+    assert worker_spec is not None and worker_spec.loader is not None
+    worker = importlib.util.module_from_spec(worker_spec)
+    worker_spec.loader.exec_module(worker)
+
+    class FakeEngine:
+        checkpoint_store = "source-store"
+        events: list[object] = []
+
+        def resume_checkpoint(self, checkpoint_id: str) -> None:
+            self.events.append(("resume", checkpoint_id, self.checkpoint_store))
+
+        def run(self) -> None:
+            self.events.append(("run", self.checkpoint_store))
+
+    engine = FakeEngine()
+    worker._resume_and_run(engine, "source-checkpoint", output_store="isolated-output-store")
+    assert engine.events == [
+        ("resume", "source-checkpoint", "source-store"),
+        ("run", "isolated-output-store"),
+    ]
+
+
 def test_s110_source_process_identity_rejects_live_source_and_accepts_pid_reuse(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

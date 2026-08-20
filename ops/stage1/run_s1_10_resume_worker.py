@@ -94,6 +94,14 @@ def _source_process_exited(source_pid: object, source_identity: object) -> bool:
     return True
 
 
+def _resume_and_run(engine: Any, checkpoint_id: str, *, output_store: Any) -> None:
+    """Load from the immutable source store, then isolate resumed writes."""
+
+    engine.resume_checkpoint(checkpoint_id)
+    engine.checkpoint_store = output_store
+    engine.run()
+
+
 def _pre_cuda(args: argparse.Namespace) -> tuple[str, ...]:
     approved = tuple(item for item in args.approved_gpu_uuids.split(",") if item)
     expected = 1 if args.mode == "single" else 4
@@ -403,8 +411,9 @@ def _run(args: argparse.Namespace, *, approved: tuple[str, ...], torch: Any) -> 
             if pre_states[rank]["training_state"]["last_checkpoint_id"] != pre_id or post_states[rank]["training_state"]["last_checkpoint_id"] != post_id:
                 raise RuntimeError("S1_10_GROUP_RECOVERY_RANK_AUTHORITY_MISMATCH")
             group_authoritative = True
-        _seed(torch, np, rank=rank); pre_resume, pre_resume_sink = _engine(torch, rank=rank, world_size=world_size, steps=all_steps, checkpoint_root=pre_root, event_path=None, distributed=distributed); pre_resume.resume_checkpoint(pre_id); pre_resume.run(); assert pre_resume_sink is None
-        _seed(torch, np, rank=rank); post_resume, post_resume_sink = _engine(torch, rank=rank, world_size=world_size, steps=all_steps, checkpoint_root=pre_root, event_path=None, distributed=distributed); post_resume.resume_checkpoint(post_id); post_resume.run(); assert post_resume_sink is None
+        from param_importance_nlp.runtime import CheckpointStore
+        _seed(torch, np, rank=rank); pre_resume, pre_resume_sink = _engine(torch, rank=rank, world_size=world_size, steps=all_steps, checkpoint_root=pre_root, event_path=None, distributed=distributed); _resume_and_run(pre_resume, pre_id, output_store=CheckpointStore(root / "resume-pre" / f"rank-{rank:04d}")); assert pre_resume_sink is None
+        _seed(torch, np, rank=rank); post_resume, post_resume_sink = _engine(torch, rank=rank, world_size=world_size, steps=all_steps, checkpoint_root=pre_root, event_path=None, distributed=distributed); _resume_and_run(post_resume, post_id, output_store=CheckpointStore(root / "resume-post" / f"rank-{rank:04d}")); assert post_resume_sink is None
         pre_state, post_state = (
             _snapshot(pre_resume, checkpoint_state_sha256, steps=all_steps),
             _snapshot(post_resume, checkpoint_state_sha256, steps=all_steps),
