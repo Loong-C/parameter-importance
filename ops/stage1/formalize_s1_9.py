@@ -38,6 +38,14 @@ _ATTEMPT = re.compile(r"^[a-z0-9][a-z0-9-]{0,63}$")
 _CHECKPOINT_STORE_REPRODUCTION_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _DETERMINISM_ENV = {"CUBLAS_WORKSPACE_CONFIG": ":4096:8", "PYTHONHASHSEED": "0"}
 _S1_7_AUTHORIZED_SHARED_DEPENDENCIES = {"src/param_importance_nlp/runtime/optimizer.py"}
+_S1_8_V7_ARRAY_ROUTE_REFS = {
+    "A": {"artifact_ref": "run__route-A-identity-formal__route-output__route-A.safetensors", "manifest_ref": "run__route-A-identity-formal__route-output__route-report.json"},
+    "B": {"artifact_ref": "run__route-B-identity-formal__route-output__route-B.safetensors", "manifest_ref": "run__route-B-identity-formal__route-output__route-report.json"},
+    "C": {"artifact_ref": "run__route-C-identity-formal__route-output__route-C.safetensors", "manifest_ref": "run__route-C-identity-formal__route-output__route-report.json"},
+    "D": {"artifact_ref": "run__route-D-identity-formal__route-output__route-D.safetensors", "manifest_ref": "run__route-D-identity-formal__route-output__route-report.json"},
+    "D-rank_swap": {"artifact_ref": "run__route-D-rank_swap-formal__route-output__route-D.safetensors", "manifest_ref": "run__route-D-rank_swap-formal__route-output__route-report.json"},
+    "D-local_reverse": {"artifact_ref": "run__route-D-local_reverse-formal__route-output__route-D.safetensors", "manifest_ref": "run__route-D-local_reverse-formal__route-output__route-report.json"},
+}
 # S1.10 was implemented after the immutable S1.8 v3 producer.  These are the
 # complete, reviewed files for that one downstream stage; do not turn this
 # into a directory/prefix exemption.  In particular, an extra sibling under
@@ -84,6 +92,7 @@ _S1_9_FROZEN_CONSUMER_FILES = {
     "schemas/stage1/s1-9-ddp-skip-worker-v1.json",
     "schemas/stage1/s1-9-formalization-index-v1.json",
     "schemas/stage1/s1-9-formalization-index-v6.json",
+    "schemas/stage1/s1-9-formalization-index-v7.json",
     "schemas/stage1/s1-9-gate-record-v1.json",
     "schemas/stage1/s1-9-gpu-prelease-v3.json",
     "schemas/stage1/s1-9-gpu-quiescence-v3.json",
@@ -94,6 +103,7 @@ _S1_9_FROZEN_CONSUMER_FILES = {
     "schemas/stage1/s1-9-single-bf16-worker-v1.json",
     "schemas/stage1/s1-9-trace-bundle-v1.json",
     "schemas/stage1/s1-9-upstream-compatibility-v5.json",
+    "schemas/stage1/s1-9-upstream-compatibility-v6.json",
     "schemas/stage1/s1-9-validation-v1.json",
     "src/param_importance_nlp/stage1_precision.py",
     "src/param_importance_nlp/stage1_precision_oracle.py",
@@ -347,44 +357,52 @@ def _source_map(value: Mapping[str, Any], *, field: str) -> dict[str, str]:
     raise Stage1S19FormalError(f"S1_9_UPSTREAM_SOURCE_MAP_MISSING:{field}")
 
 
-def _s1_8_v6_handoff_attestation(data_root: Path, index_ref: str, report: Mapping[str, Any]) -> dict[str, Any]:
-    """Bind S1.8's final v6 index, report, validation, and four phases.
+def _s1_8_v7_handoff_attestation(data_root: Path, index_ref: str, report: Mapping[str, Any]) -> dict[str, Any]:
+    """Bind S1.8's final v7 index, report, validation, and four phases.
 
     This is deliberately a separate attestation rather than a path-only
     assertion.  The S1.8 index pins the report and validation by digest; the
-    validation must carry the same v3 quiescence-role wire as the v6 report.
+    validation must carry the same v3 quiescence-role wire as the v7 report.
     """
 
     from param_importance_nlp.contracts.jsonio import load_canonical_json
 
-    index_path = _logical(data_root, index_ref, field="s1_8.v6_index")
-    index = _mapping(load_canonical_json(index_path), field="s1_8.v6_index")
-    if index.get("schema_version") != "stage1-s1-8-formalization-index-v6":
-        raise Stage1S19FormalError("S1_9_S1_8_V6_INDEX_REQUIRED")
+    index_path = _logical(data_root, index_ref, field="s1_8.v7_index")
+    index = _mapping(load_canonical_json(index_path), field="s1_8.v7_index")
+    if index.get("schema_version") != "stage1-s1-8-formalization-index-v7":
+        raise Stage1S19FormalError("S1_9_S1_8_V7_INDEX_REQUIRED")
     validation_ref, validation_sha = index.get("validation_ref"), index.get("validation_sha256")
     if not isinstance(validation_ref, str) or not isinstance(validation_sha, str):
-        raise Stage1S19FormalError("S1_9_S1_8_V6_VALIDATION_BINDING_INVALID")
+        raise Stage1S19FormalError("S1_9_S1_8_V7_VALIDATION_BINDING_INVALID")
     validation_path = (index_path.parent / validation_ref).resolve()
     if not validation_path.is_file() or _sha(validation_path) != validation_sha:
-        raise Stage1S19FormalError("S1_9_S1_8_V6_VALIDATION_HASH_INVALID")
-    validation = _mapping(load_canonical_json(validation_path), field="s1_8.v6_validation")
+        raise Stage1S19FormalError("S1_9_S1_8_V7_VALIDATION_HASH_INVALID")
+    validation = _mapping(load_canonical_json(validation_path), field="s1_8.v7_validation")
     if (
-        report.get("schema_version") != "stage1-s1-8-ddp-report-v6"
-        or validation.get("schema_version") != "stage1-s1-8-validation-v6"
+        report.get("schema_version") != "stage1-s1-8-ddp-report-v7"
+        or validation.get("schema_version") != "stage1-s1-8-validation-v7"
         or validation.get("gpu_quiescence") != report.get("gpu_quiescence")
     ):
-        raise Stage1S19FormalError("S1_9_S1_8_V6_QUIESCENCE_WIRE_INVALID")
+        raise Stage1S19FormalError("S1_9_S1_8_V7_QUIESCENCE_WIRE_INVALID")
     replay_ref, replay_sha = index.get("replay_ref"), index.get("replay_sha256")
-    role_refs, role_sha = _mapping(index.get("role_refs"), field="s1_8.v6_role_refs"), _mapping(index.get("role_sha256"), field="s1_8.v6_role_sha256")
+    role_refs, role_sha = _mapping(index.get("role_refs"), field="s1_8.v7_role_refs"), _mapping(index.get("role_sha256"), field="s1_8.v7_role_sha256")
+    array_ref, array_sha = role_refs.get("array_bundle"), role_sha.get("array_bundle")
     comparison_ref, comparison_sha = role_refs.get("comparison_table"), role_sha.get("comparison_table")
-    if not all(isinstance(value, str) for value in (replay_ref, replay_sha, comparison_ref, comparison_sha)):
-        raise Stage1S19FormalError("S1_9_S1_8_V6_ROLE_BINDING_INVALID")
-    replay_path, comparison_path = (index_path.parent / str(replay_ref)).resolve(), (index_path.parent / str(comparison_ref)).resolve()
-    if not replay_path.is_file() or not comparison_path.is_file() or _sha(replay_path) != replay_sha or _sha(comparison_path) != comparison_sha:
-        raise Stage1S19FormalError("S1_9_S1_8_V6_ROLE_HASH_INVALID")
-    replay, comparison = _mapping(load_canonical_json(replay_path), field="s1_8.v6_replay"), _mapping(load_canonical_json(comparison_path), field="s1_8.v6_comparison")
+    if not all(isinstance(value, str) for value in (replay_ref, replay_sha, array_ref, array_sha, comparison_ref, comparison_sha)):
+        raise Stage1S19FormalError("S1_9_S1_8_V7_ROLE_BINDING_INVALID")
+    replay_path, array_path, comparison_path = (index_path.parent / str(replay_ref)).resolve(), (index_path.parent / str(array_ref)).resolve(), (index_path.parent / str(comparison_ref)).resolve()
+    if not replay_path.is_file() or not array_path.is_file() or not comparison_path.is_file() or _sha(replay_path) != replay_sha or _sha(array_path) != array_sha or _sha(comparison_path) != comparison_sha:
+        raise Stage1S19FormalError("S1_9_S1_8_V7_ROLE_HASH_INVALID")
+    replay, array_bundle, comparison = _mapping(load_canonical_json(replay_path), field="s1_8.v7_replay"), _mapping(load_canonical_json(array_path), field="s1_8.v7_array_bundle"), _mapping(load_canonical_json(comparison_path), field="s1_8.v7_comparison")
     if replay.get("schema_version") != "stage1-s1-8-replay-validation-v3" or comparison.get("schema_version") != "stage1-s1-8-comparison-table-v2":
-        raise Stage1S19FormalError("S1_9_S1_8_V6_ROLE_VERSION_INVALID")
+        raise Stage1S19FormalError("S1_9_S1_8_V7_ROLE_VERSION_INVALID")
+    array_routes = _mapping(array_bundle.get("route_artifacts"), field="s1_8.v7_array_bundle.routes")
+    if array_bundle.get("schema_version") != "stage1-s1-8-array-bundle-v2" or set(array_routes) != set(_S1_8_V7_ARRAY_ROUTE_REFS):
+        raise Stage1S19FormalError("S1_9_S1_8_V7_ARRAY_BUNDLE_WIRE_INVALID")
+    for route, expected_refs in _S1_8_V7_ARRAY_ROUTE_REFS.items():
+        descriptor = _mapping(array_routes[route], field="s1_8.v7_array_bundle." + route)
+        if {key: descriptor.get(key) for key in expected_refs} != expected_refs:
+            raise Stage1S19FormalError("S1_9_S1_8_V7_ARRAY_BUNDLE_WIRE_INVALID")
     return {
         "index_schema_version": index["schema_version"],
         "ddp_report_schema_version": report["schema_version"],
@@ -395,6 +413,8 @@ def _s1_8_v6_handoff_attestation(data_root: Path, index_ref: str, report: Mappin
         "gpu_quiescence": report.get("gpu_quiescence"),
         "replay_schema_version": replay["schema_version"],
         "comparison_table_schema_version": comparison["schema_version"],
+        "array_bundle_schema_version": array_bundle["schema_version"],
+        "array_bundle_route_refs": _S1_8_V7_ARRAY_ROUTE_REFS,
     }
 
 
@@ -679,7 +699,7 @@ def _upstream_compatibility_attestation(repository: Path, data_root: Path, *, s1
     affected_s17 = sorted(set(changed_s17) & _S1_7_AUTHORIZED_SHARED_DEPENDENCIES)
     s18_report = _upstream_role(data_root, s1_8_ref, "ddp_report")
     s18_sources = _source_map(s18_report, field="s1_8.ddp_report")
-    s18_v6_handoff = _s1_8_v6_handoff_attestation(data_root, s1_8_ref, s18_report)
+    s18_v7_handoff = _s1_8_v7_handoff_attestation(data_root, s1_8_ref, s18_report)
     if replay_root is None:
         replay_root = data_root / "tmp" / "s1-9-compatibility"
     nonproducer_runtime = _nonproducer_runtime_attestation(repository, s1_7_producer=str(s1_7["s1_7_generator_commit"]), s1_7_report=s17_report, s1_8_sources=s18_sources, changed_paths=[*changed_s17, *changed_s18], replay_root=replay_root)
@@ -696,7 +716,7 @@ def _upstream_compatibility_attestation(repository: Path, data_root: Path, *, s1
     replay = _optimizer_clip_cpu_replay()
     if not replay["passed"]:
         raise Stage1S19FormalError("S1_9_OPTIMIZER_CLIP_COMPATIBILITY_REPLAY_FAILED")
-    result = _with_hash({"schema_version": "stage1-s1-9-upstream-compatibility-v5", "status": "PASS", "s1_7_producer": s1_7["s1_7_generator_commit"], "s1_8_producer": s1_8["s1_8_generator_commit"], "consumer_commit": _git(repository, "rev-parse", "HEAD"), "s1_7_to_consumer_changed_paths": changed_s17, "s1_8_to_consumer_changed_paths": changed_s18, "s1_7_source_attestation": s17_attestation, "s1_8_source_dependencies": s18_sources, "s1_8_v6_handoff": s18_v6_handoff, "s1_7_affected_dependencies": affected_s17, "s1_8_affected_dependencies": affected_s18, "s1_8_authorized_shared_drift": s18_authorized_drift, "authorized_shared_change": "src/param_importance_nlp/runtime/optimizer.py", "current_source_cpu_clip_replay": replay, "nonproducer_runtime_attestation": nonproducer_runtime})
+    result = _with_hash({"schema_version": "stage1-s1-9-upstream-compatibility-v6", "status": "PASS", "s1_7_producer": s1_7["s1_7_generator_commit"], "s1_8_producer": s1_8["s1_8_generator_commit"], "consumer_commit": _git(repository, "rev-parse", "HEAD"), "s1_7_to_consumer_changed_paths": changed_s17, "s1_8_to_consumer_changed_paths": changed_s18, "s1_7_source_attestation": s17_attestation, "s1_8_source_dependencies": s18_sources, "s1_8_v7_handoff": s18_v7_handoff, "s1_7_affected_dependencies": affected_s17, "s1_8_affected_dependencies": affected_s18, "s1_8_authorized_shared_drift": s18_authorized_drift, "authorized_shared_change": "src/param_importance_nlp/runtime/optimizer.py", "current_source_cpu_clip_replay": replay, "nonproducer_runtime_attestation": nonproducer_runtime})
     _validate_s1_9_schemas(repository, {"upstream_compatibility": result})
     return result
 
@@ -1404,10 +1424,10 @@ def _deep_role_contract(role: str, value: Mapping[str, Any]) -> None:
             raise Stage1S19FormalError("S1_9_DEEP_SCHEMA_CHECKPOINT_STORE_FILES_INVALID")
         return
     if role == "upstream_compatibility":
-        compatibility = _exact_keys(value, {"schema_version", "status", "s1_7_producer", "s1_8_producer", "consumer_commit", "s1_7_to_consumer_changed_paths", "s1_8_to_consumer_changed_paths", "s1_7_source_attestation", "s1_8_source_dependencies", "s1_8_v6_handoff", "s1_7_affected_dependencies", "s1_8_affected_dependencies", "s1_8_authorized_shared_drift", "authorized_shared_change", "current_source_cpu_clip_replay", "nonproducer_runtime_attestation", "artifact_hash"}, field="upstream_compatibility")
+        compatibility = _exact_keys(value, {"schema_version", "status", "s1_7_producer", "s1_8_producer", "consumer_commit", "s1_7_to_consumer_changed_paths", "s1_8_to_consumer_changed_paths", "s1_7_source_attestation", "s1_8_source_dependencies", "s1_8_v7_handoff", "s1_7_affected_dependencies", "s1_8_affected_dependencies", "s1_8_authorized_shared_drift", "authorized_shared_change", "current_source_cpu_clip_replay", "nonproducer_runtime_attestation", "artifact_hash"}, field="upstream_compatibility")
         runtime = _exact_keys(_mapping(compatibility["nonproducer_runtime_attestation"], field="upstream_compatibility.nonproducer_runtime_attestation"), {"affected_paths", "s1_8_source_map_excludes_paths", "s1_7_oracle_training_import_isolated", "checkpoint_group_producer_math_exclusion", "current_source_cpu_replays"}, field="upstream_compatibility.nonproducer_runtime_attestation")
-        s18_v6 = _exact_keys(_mapping(compatibility["s1_8_v6_handoff"], field="upstream_compatibility.s1_8_v6_handoff"), {"index_schema_version", "ddp_report_schema_version", "validation_schema_version", "implementation_source_sha256", "reproduction_role_refs", "reproduction_role_sha256", "gpu_quiescence", "replay_schema_version", "comparison_table_schema_version"}, field="upstream_compatibility.s1_8_v6_handoff")
-        if runtime["affected_paths"] != runtime["s1_8_source_map_excludes_paths"] or not isinstance(runtime["current_source_cpu_replays"], Mapping) or s18_v6["implementation_source_sha256"] != compatibility["s1_8_source_dependencies"] or s18_v6["index_schema_version"] != "stage1-s1-8-formalization-index-v6" or s18_v6["ddp_report_schema_version"] != "stage1-s1-8-ddp-report-v6" or s18_v6["validation_schema_version"] != "stage1-s1-8-validation-v6" or s18_v6["replay_schema_version"] != "stage1-s1-8-replay-validation-v3" or s18_v6["comparison_table_schema_version"] != "stage1-s1-8-comparison-table-v2":
+        s18_v7 = _exact_keys(_mapping(compatibility["s1_8_v7_handoff"], field="upstream_compatibility.s1_8_v7_handoff"), {"index_schema_version", "ddp_report_schema_version", "validation_schema_version", "implementation_source_sha256", "reproduction_role_refs", "reproduction_role_sha256", "gpu_quiescence", "replay_schema_version", "comparison_table_schema_version", "array_bundle_schema_version", "array_bundle_route_refs"}, field="upstream_compatibility.s1_8_v7_handoff")
+        if runtime["affected_paths"] != runtime["s1_8_source_map_excludes_paths"] or not isinstance(runtime["current_source_cpu_replays"], Mapping) or s18_v7["implementation_source_sha256"] != compatibility["s1_8_source_dependencies"] or s18_v7["index_schema_version"] != "stage1-s1-8-formalization-index-v7" or s18_v7["ddp_report_schema_version"] != "stage1-s1-8-ddp-report-v7" or s18_v7["validation_schema_version"] != "stage1-s1-8-validation-v7" or s18_v7["replay_schema_version"] != "stage1-s1-8-replay-validation-v3" or s18_v7["comparison_table_schema_version"] != "stage1-s1-8-comparison-table-v2" or s18_v7["array_bundle_schema_version"] != "stage1-s1-8-array-bundle-v2" or s18_v7["array_bundle_route_refs"] != _S1_8_V7_ARRAY_ROUTE_REFS:
             raise Stage1S19FormalError("S1_9_DEEP_SCHEMA_UPSTREAM_COMPATIBILITY_INVALID")
         return
     if role == "gpu_quiescence":
@@ -1470,7 +1490,7 @@ def _deep_role_contract(role: str, value: Mapping[str, Any]) -> None:
         for map_name in ("role_refs", "role_sha256", "reproduction_role_refs", "reproduction_role_sha256", "csv_sha256", "svg_sha256"):
             if not isinstance(index[map_name], Mapping) or not index[map_name]:
                 raise Stage1S19FormalError(f"S1_9_DEEP_SCHEMA_MAP_INVALID:index.{map_name}")
-        if index["schema_version"] != "stage1-s1-9-formalization-index-v6" or index["next_task_ids"] != ["stage1.10_checkpoint_resume_and_artifacts"]:
+        if index["schema_version"] != "stage1-s1-9-formalization-index-v7" or index["next_task_ids"] != ["stage1.10_checkpoint_resume_and_artifacts"]:
             raise Stage1S19FormalError("S1_9_DEEP_SCHEMA_NEXT_TASK_INVALID")
 
 
@@ -1485,13 +1505,13 @@ def _validate_s1_9_schemas(repository: Path, values: Mapping[str, Mapping[str, A
         raise Stage1S19FormalError("S1_9_SCHEMA_VALIDATOR_LOAD_FAILED")
     module = importlib.util.module_from_spec(spec); spec.loader.exec_module(module)
     registry: dict[str, Mapping[str, Any]] = {}
-    schema_paths = [*sorted((repository / "schemas" / "stage1").glob("s1-9-*.json")), repository / "schemas" / "stage1" / "s1-8-formalization-index-v1.json", repository / "schemas" / "stage1" / "s1-8-formalization-index-v6.json", repository / "schemas" / "stage1" / "s1-8-ddp-report-v6.json", repository / "schemas" / "stage1" / "s1-8-validation-v6.json", repository / "schemas" / "stage1" / "s1-8-gpu-quiescence-v3.json", repository / "schemas" / "stage1" / "s1-8-replay-validation-v3.json", repository / "schemas" / "stage1" / "s1-8-comparison-table-v2.json"]
+    schema_paths = [*sorted((repository / "schemas" / "stage1").glob("s1-9-*.json")), repository / "schemas" / "stage1" / "s1-8-formalization-index-v1.json", repository / "schemas" / "stage1" / "s1-8-formalization-index-v7.json", repository / "schemas" / "stage1" / "s1-8-ddp-report-v7.json", repository / "schemas" / "stage1" / "s1-8-validation-v7.json", repository / "schemas" / "stage1" / "s1-8-gpu-quiescence-v3.json", repository / "schemas" / "stage1" / "s1-8-replay-validation-v3.json", repository / "schemas" / "stage1" / "s1-8-comparison-table-v2.json", repository / "schemas" / "stage1" / "s1-8-array-bundle-v2.json"]
     for path in schema_paths:
         loaded = loads_strict_json(path.read_bytes())
         if not isinstance(loaded, Mapping) or not isinstance(loaded.get("$id"), str):
             raise Stage1S19FormalError(f"S1_9_SCHEMA_INVALID:{path.name}")
         registry[path.name] = loaded; registry[str(loaded["$id"])] = loaded
-    files = {"numeric_report": "s1-9-numeric-report-v1.json", "oracle_bundle": "s1-9-oracle-bundle-v1.json", "trace_bundle": "s1-9-trace-bundle-v1.json", "comparison_table": "s1-9-comparison-table-v1.json", "gate_record": "s1-9-gate-record-v1.json", "replay": "s1-9-replay-validation-v1.json", "validation": "s1-9-validation-v1.json", "index": "s1-9-formalization-index-v6.json", "single_worker": "s1-9-single-bf16-worker-v1.json", "ddp_worker": "s1-9-ddp-skip-worker-v1.json", "bf16_checkpoint_store": "s1-9-bf16-checkpoint-store-reproduction-v1.json", "upstream_compatibility": "s1-9-upstream-compatibility-v5.json", "gpu_quiescence": "s1-9-gpu-quiescence-v3.json", "gpu_prelease": "s1-9-gpu-prelease-v3.json"}
+    files = {"numeric_report": "s1-9-numeric-report-v1.json", "oracle_bundle": "s1-9-oracle-bundle-v1.json", "trace_bundle": "s1-9-trace-bundle-v1.json", "comparison_table": "s1-9-comparison-table-v1.json", "gate_record": "s1-9-gate-record-v1.json", "replay": "s1-9-replay-validation-v1.json", "validation": "s1-9-validation-v1.json", "index": "s1-9-formalization-index-v7.json", "single_worker": "s1-9-single-bf16-worker-v1.json", "ddp_worker": "s1-9-ddp-skip-worker-v1.json", "bf16_checkpoint_store": "s1-9-bf16-checkpoint-store-reproduction-v1.json", "upstream_compatibility": "s1-9-upstream-compatibility-v6.json", "gpu_quiescence": "s1-9-gpu-quiescence-v3.json", "gpu_prelease": "s1-9-gpu-prelease-v3.json"}
     for role, value in values.items():
         schema = registry.get(files.get(role, ""))
         if schema is None:
@@ -1768,7 +1788,7 @@ def execute(*, repository: str | Path, data_root: str | Path, s1_7_index_ref: st
         _write(staging / "bf16-resume-store-index.json", checkpoint_store_index)
         reproduction = {"attempt_start": "attempt-start.json", "upstream_compatibility": "upstream-compatibility.json", "preflight": "preflight.json", "prelease_gpu": "prelease-gpu.json", "post_worker_quiescence": "post-worker-quiescence.json", "lease_history": "lease-history.json", "single_worker": "single-bf16.json", "single_stdout": "single.stdout.txt", "single_stderr": "single.stderr.txt", "single_child_fingerprint": "single-child-fingerprint.json", "bf16_resume_checkpoint_store": "bf16-resume-store-index.json", "ddp_worker": "ddp-skip.json", "ddp_stdout": "ddp.stdout.txt", "ddp_stderr": "ddp.stderr.txt", "ddp_child_fingerprint": "ddp-child-fingerprint.json", **{f"chart_csv_{index}": name for index, name in enumerate(sorted(csv_hashes))}, **{f"chart_svg_{index}": name for index, name in enumerate(sorted(svg_hashes))}}
         reproduction_sha = {role: _sha(staging / filename) for role, filename in reproduction.items()}
-        index = _with_hash({"schema_version": "stage1-s1-9-formalization-index-v6", "status": "PASS", "gate_id": GATE_ID, "task_id": TASK_ID, "fixture_id": FIXTURE_ID, "generator_git_commit": commit, "consumer_git_commit": commit, "git_branch": _git(repository_root, "branch", "--show-current"), "checked_at": _now(), "s1_7_handoff": upstream_s17, "s1_8_handoff": upstream_s18, "role_refs": role_files, "role_sha256": role_sha, "reproduction_role_refs": reproduction, "reproduction_role_sha256": reproduction_sha, "gate_artifact_hash": evidence["gate_record"]["artifact_hash"], "csv_sha256": csv_hashes, "svg_sha256": svg_hashes, "validation_ref": "validation.json", "validation_sha256": _sha(work / "validation.json"), "replay_ref": "replay-validation.json", "replay_sha256": _sha(work / "replay-validation.json"), "replay_hash": replay["replay_hash"], "next_task_ids": ["stage1.10_checkpoint_resume_and_artifacts"]})
+        index = _with_hash({"schema_version": "stage1-s1-9-formalization-index-v7", "status": "PASS", "gate_id": GATE_ID, "task_id": TASK_ID, "fixture_id": FIXTURE_ID, "generator_git_commit": commit, "consumer_git_commit": commit, "git_branch": _git(repository_root, "branch", "--show-current"), "checked_at": _now(), "s1_7_handoff": upstream_s17, "s1_8_handoff": upstream_s18, "role_refs": role_files, "role_sha256": role_sha, "reproduction_role_refs": reproduction, "reproduction_role_sha256": reproduction_sha, "gate_artifact_hash": evidence["gate_record"]["artifact_hash"], "csv_sha256": csv_hashes, "svg_sha256": svg_hashes, "validation_ref": "validation.json", "validation_sha256": _sha(work / "validation.json"), "replay_ref": "replay-validation.json", "replay_sha256": _sha(work / "replay-validation.json"), "replay_hash": replay["replay_hash"], "next_task_ids": ["stage1.10_checkpoint_resume_and_artifacts"]})
         _validate_s1_9_schemas(repository_root, {"index": index})
         _write(staging / "index.json", index)
         _write(staging / "success.json", _with_hash({"schema_version": "stage1-s1-9-attempt-success-v1", "status": "PASS", "completed_at": _now(), "gate_artifact_hash": evidence["gate_record"]["artifact_hash"], "validation_sha256": _sha(work / "validation.json"), "failed_marker_present": False}))
