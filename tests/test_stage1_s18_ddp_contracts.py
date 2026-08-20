@@ -1868,15 +1868,15 @@ def test_implementation_source_map_is_exact_full_production_closure() -> None:
     formalizer = _formalizer()
     sources = formalizer._implementation_source_map(Path("."))
     assert set(sources) == set(formalizer.IMPLEMENTATION_SOURCE_FILES)
-    assert len(sources) == 44
+    assert len(sources) == 48
     assert "src/param_importance_nlp/runtime/optimizer.py" not in sources
     assert "src/param_importance_nlp/contracts/errors.py" in sources
     assert set(name for name in sources if name.startswith("schemas/stage1/s1-8-")) == {
         "schemas/stage1/s1-8-array-bundle-v1.json", "schemas/stage1/s1-8-comparison-table-v1.json",
-        "schemas/stage1/s1-8-ddp-report-v1.json", "schemas/stage1/s1-8-ddp-report-v2.json", "schemas/stage1/s1-8-ddp-report-v3.json", "schemas/stage1/s1-8-ddp-report-v4.json", "schemas/stage1/s1-8-fixture-manifest-v1.json", "schemas/stage1/s1-8-fixture-manifest-v2.json", "schemas/stage1/s1-8-fixture-manifest-v3.json",
-        "schemas/stage1/s1-8-formalization-index-v1.json", "schemas/stage1/s1-8-formalization-index-v2.json", "schemas/stage1/s1-8-formalization-index-v3.json", "schemas/stage1/s1-8-formalization-index-v4.json", "schemas/stage1/s1-8-gate-record-v1.json", "schemas/stage1/s1-8-gpu-quiescence-v1.json", "schemas/stage1/s1-8-gpu-quiescence-v2.json",
+        "schemas/stage1/s1-8-ddp-report-v1.json", "schemas/stage1/s1-8-ddp-report-v2.json", "schemas/stage1/s1-8-ddp-report-v3.json", "schemas/stage1/s1-8-ddp-report-v4.json", "schemas/stage1/s1-8-ddp-report-v5.json", "schemas/stage1/s1-8-fixture-manifest-v1.json", "schemas/stage1/s1-8-fixture-manifest-v2.json", "schemas/stage1/s1-8-fixture-manifest-v3.json",
+        "schemas/stage1/s1-8-formalization-index-v1.json", "schemas/stage1/s1-8-formalization-index-v2.json", "schemas/stage1/s1-8-formalization-index-v3.json", "schemas/stage1/s1-8-formalization-index-v4.json", "schemas/stage1/s1-8-formalization-index-v5.json", "schemas/stage1/s1-8-gate-record-v1.json", "schemas/stage1/s1-8-gpu-quiescence-v1.json", "schemas/stage1/s1-8-gpu-quiescence-v2.json", "schemas/stage1/s1-8-gpu-quiescence-v3.json",
         "schemas/stage1/s1-8-replay-validation-v1.json", "schemas/stage1/s1-8-replay-validation-v2.json", "schemas/stage1/s1-8-safetensors-manifest-v1.json",
-        "schemas/stage1/s1-8-validation-v1.json", "schemas/stage1/s1-8-validation-v2.json", "schemas/stage1/s1-8-validation-v3.json", "schemas/stage1/s1-8-validation-v4.json", "schemas/stage1/s1-8-worker-report-v1.json",
+        "schemas/stage1/s1-8-validation-v1.json", "schemas/stage1/s1-8-validation-v2.json", "schemas/stage1/s1-8-validation-v3.json", "schemas/stage1/s1-8-validation-v4.json", "schemas/stage1/s1-8-validation-v5.json", "schemas/stage1/s1-8-worker-report-v1.json",
     }
     assert all(len(digest) == 64 and set(digest) <= set("0123456789abcdef") for digest in sources.values())
 
@@ -1887,7 +1887,7 @@ def test_implementation_source_map_rejects_schema_byte_drift() -> None:
     source_map = formalizer._implementation_source_map(repository)
     formalizer._validate_implementation_source_map(repository, source_map)
     drifted = dict(source_map)
-    source = "schemas/stage1/s1-8-formalization-index-v4.json"
+    source = "schemas/stage1/s1-8-formalization-index-v5.json"
     drifted[source] = "0" * 64 if source_map[source] != "0" * 64 else "1" * 64
     with pytest.raises(formalizer.Stage1S18FormalError, match="S18_CANDIDATE_SOURCE_MAP_BYTE_DRIFT"):
         formalizer._validate_implementation_source_map(repository, drifted)
@@ -2108,14 +2108,21 @@ def test_gpu_quiescence_resets_then_requires_three_exact_idle_and_deadline_retai
     monkeypatch.setattr(formalizer, "_probe_approved_gpus", lambda _uuids: next(observations))
     record = formalizer.require_gpu_quiescence(uuids, work=tmp_path, phase="post_release")
     assert record["status"] == "PASS"
-    assert record["timeout_seconds"] == 60.0
+    assert record["timeout_seconds"] == 180.0
     assert record["operational_timeout_basis"] == formalizer.GPU_QUIESCENCE_OPERATIONAL_TIMEOUT_BASIS
     assert [sample["consecutive_exact_idle_samples"] for sample in record["samples"]] == [0, 1, 2, 3]
+    assert [sample["transient_observation_count"] for sample in record["samples"]] == [1, 1, 1, 1]
+    assert record["max_transient_samples"] == 2 and record["transient_observation_count"] == 1
     assert record["samples"][0]["violations"] == ["S18_GPU_NOT_IDLE_A100:" + uuid for uuid in uuids]
     formalizer._validate_output_schemas(Path("."), {"gpu_quiescence": record})
 
-    timeout_dir = tmp_path / "timeout"; timeout_dir.mkdir(); now[0] = 0.0
-    monkeypatch.setattr(formalizer, "_probe_approved_gpus", lambda _uuids: _quiescence_probe(formalizer, uuids, utilization_percent=1))
+    timeout_dir = tmp_path / "timeout"; timeout_dir.mkdir(); now[0] = 0.0; calls = [0]
+    def timeout_after_reset(_uuids: list[str]) -> dict[str, object]:
+        calls[0] += 1
+        if calls[0] == 4:
+            now[0] = 180.01
+        return _quiescence_probe(formalizer, uuids, utilization_percent=1 if calls[0] == 3 else 0)
+    monkeypatch.setattr(formalizer, "_probe_approved_gpus", timeout_after_reset)
     with pytest.raises(formalizer.Stage1S18FormalError, match="S18_GPU_QUIESCENCE_TIMEOUT"):
         formalizer.require_gpu_quiescence(uuids, work=timeout_dir, phase="reacquire_preflight")
     from param_importance_nlp.contracts.jsonio import load_canonical_json
@@ -2123,43 +2130,118 @@ def test_gpu_quiescence_resets_then_requires_three_exact_idle_and_deadline_retai
     assert timed_out["status"] == "FAILED" and len(timed_out["samples"]) >= 2 and timed_out["failure_reason"] == "S18_GPU_QUIESCENCE_TIMEOUT"
     assert formalizer._self_hash(timed_out)
 
-    # Completion time, not loop entry time, defines the frozen 60.0-second
+    # Completion time, not loop entry time, defines the frozen 180.0-second
     # bound.  A third sample that crosses it cannot convert to a PASS.
     crossing_dir = tmp_path / "crossing"; crossing_dir.mkdir(); now[0] = 0.0; calls = [0]
     def cross_deadline(_uuids: list[str]) -> dict[str, object]:
         calls[0] += 1
         if calls[0] == 3:
-            now[0] = 60.01
+            now[0] = 180.01
         return _quiescence_probe(formalizer, uuids)
     monkeypatch.setattr(formalizer, "_probe_approved_gpus", cross_deadline)
     with pytest.raises(formalizer.Stage1S18FormalError, match="S18_GPU_QUIESCENCE_TIMEOUT"):
         formalizer.require_gpu_quiescence(uuids, work=crossing_dir, phase="post_worker")
     crossed = load_canonical_json(crossing_dir / "post-worker-gpu-quiescence.json")
     assert crossed["status"] == "FAILED" and crossed["samples"][-1]["consecutive_exact_idle_samples"] == 3
-    assert crossed["samples"][-1]["monotonic_elapsed_seconds"] == 60.01
+    assert crossed["samples"][-1]["monotonic_elapsed_seconds"] == 180.01
 
     # Equality is explicitly admissible: completion exactly at the deadline is
-    # still within the 60.0-second bound if it provides the third sample.
+    # still within the 180.0-second bound if it provides the third sample.
     equality_dir = tmp_path / "equality"; equality_dir.mkdir(); now[0] = 0.0; calls[0] = 0
     def at_deadline(_uuids: list[str]) -> dict[str, object]:
         calls[0] += 1
         if calls[0] == 3:
-            now[0] = 60.0
+            now[0] = 180.0
         return _quiescence_probe(formalizer, uuids)
     monkeypatch.setattr(formalizer, "_probe_approved_gpus", at_deadline)
     equality = formalizer.require_gpu_quiescence(uuids, work=equality_dir, phase="post_worker")
-    assert equality["status"] == "PASS" and equality["samples"][-1]["monotonic_elapsed_seconds"] == 60.0
+    assert equality["status"] == "PASS" and equality["samples"][-1]["monotonic_elapsed_seconds"] == 180.0
 
 
-def test_gpu_quiescence_v1_remains_30_seconds_and_v2_is_versioned_60_seconds() -> None:
+def test_gpu_quiescence_v3_bounds_two_transients_and_ninth_sample_deadline(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    formalizer = _formalizer(); uuids = [f"GPU-{index:08x}-1111-2222-3333-444444444444" for index in range(4)]
+    now = [0.0]
+    monkeypatch.setattr(formalizer.time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(formalizer.time, "sleep", lambda duration: now.__setitem__(0, now[0] + duration))
+
+    # With at most two non-PID transients, E,E,T,E,E,T,E,E,E is the longest
+    # admissible sequence before the ninth observation establishes E,E,E.
+    worst_case = [False, False, True, False, False, True, False, False, False]
+    observations = iter([_quiescence_probe(formalizer, uuids, memory_used_mib=1 if transient else 0) for transient in worst_case])
+    monkeypatch.setattr(formalizer, "_probe_approved_gpus", lambda _uuids: next(observations))
+    record = formalizer.require_gpu_quiescence(uuids, work=tmp_path, phase="post_release")
+    assert record["status"] == "PASS" and len(record["samples"]) == 9
+    assert record["transient_observation_count"] == 2
+    assert [sample["consecutive_exact_idle_samples"] for sample in record["samples"]] == [1, 2, 0, 1, 2, 0, 1, 2, 3]
+    assert [sample["transient_observation_count"] for sample in record["samples"]] == [0, 0, 1, 1, 1, 2, 2, 2, 2]
+
+    third_transient_dir = tmp_path / "third-transient"; third_transient_dir.mkdir(); now[0] = 0.0
+    observations = iter([_quiescence_probe(formalizer, uuids, utilization_percent=1) for _ in range(3)])
+    monkeypatch.setattr(formalizer, "_probe_approved_gpus", lambda _uuids: next(observations))
+    with pytest.raises(formalizer.Stage1S18FormalError, match="S18_GPU_QUIESCENCE_TRANSIENT_LIMIT_EXCEEDED"):
+        formalizer.require_gpu_quiescence(uuids, work=third_transient_dir, phase="post_release")
+    from param_importance_nlp.contracts.jsonio import load_canonical_json
+    third = load_canonical_json(third_transient_dir / "post-release-gpu-quiescence.json")
+    assert third["status"] == "FAILED" and third["failure_reason"] == "S18_GPU_QUIESCENCE_TRANSIENT_LIMIT_EXCEEDED"
+    assert third["transient_observation_count"] == 3 and third["samples"][-1]["transient_observation_count"] == 3
+
+    def ninth_probe(crosses: float) -> object:
+        calls = [0]
+        def probe(_uuids: list[str]) -> dict[str, object]:
+            calls[0] += 1
+            if calls[0] == 9:
+                now[0] = crosses
+            return _quiescence_probe(formalizer, uuids, memory_used_mib=1 if calls[0] in {3, 6} else 0)
+        return probe
+
+    crossing_dir = tmp_path / "ninth-crossing"; crossing_dir.mkdir(); now[0] = 0.0
+    monkeypatch.setattr(formalizer, "_probe_approved_gpus", ninth_probe(180.01))
+    with pytest.raises(formalizer.Stage1S18FormalError, match="S18_GPU_QUIESCENCE_TIMEOUT"):
+        formalizer.require_gpu_quiescence(uuids, work=crossing_dir, phase="post_release")
+    crossed = load_canonical_json(crossing_dir / "post-release-gpu-quiescence.json")
+    assert crossed["samples"][-1]["sample_index"] == 8 and crossed["samples"][-1]["monotonic_elapsed_seconds"] == 180.01
+
+    equality_dir = tmp_path / "ninth-equality"; equality_dir.mkdir(); now[0] = 0.0
+    monkeypatch.setattr(formalizer, "_probe_approved_gpus", ninth_probe(180.0))
+    equality = formalizer.require_gpu_quiescence(uuids, work=equality_dir, phase="post_release")
+    assert equality["status"] == "PASS" and equality["samples"][-1]["sample_index"] == 8
+    assert equality["samples"][-1]["monotonic_elapsed_seconds"] == 180.0
+
+
+def test_gpu_quiescence_v3_accepts_r11_transient_sequence(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    formalizer = _formalizer(); uuids = [f"GPU-{index:08x}-1111-2222-3333-444444444444" for index in range(4)]
+    now = [0.0]
+    monkeypatch.setattr(formalizer.time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(formalizer.time, "sleep", lambda duration: now.__setitem__(0, now[0] + duration))
+    # r11 was E,T,E,E,E: the one no-PID utilization transient resets only the
+    # direct-idle counter; the later three exact observations are still Gates.
+    observations = iter([
+        _quiescence_probe(formalizer, uuids),
+        _quiescence_probe(formalizer, uuids, utilization_percent=2),
+        _quiescence_probe(formalizer, uuids), _quiescence_probe(formalizer, uuids), _quiescence_probe(formalizer, uuids),
+    ])
+    monkeypatch.setattr(formalizer, "_probe_approved_gpus", lambda _uuids: next(observations))
+    record = formalizer.require_gpu_quiescence(uuids, work=tmp_path, phase="post_release")
+    assert record["status"] == "PASS"
+    assert [sample["consecutive_exact_idle_samples"] for sample in record["samples"]] == [1, 0, 1, 2, 3]
+    assert [sample["transient_observation_count"] for sample in record["samples"]] == [0, 1, 1, 1, 1]
+
+
+def test_gpu_quiescence_v1_v2_remain_immutable_and_v3_is_versioned_180_seconds() -> None:
     v1 = json.loads(Path("schemas/stage1/s1-8-gpu-quiescence-v1.json").read_text(encoding="utf-8"))
     v2 = json.loads(Path("schemas/stage1/s1-8-gpu-quiescence-v2.json").read_text(encoding="utf-8"))
+    v3 = json.loads(Path("schemas/stage1/s1-8-gpu-quiescence-v3.json").read_text(encoding="utf-8"))
     assert v1["properties"]["schema_version"] == {"const": "stage1-s1-8-gpu-quiescence-v1"}
     assert v1["properties"]["timeout_seconds"] == {"const": 30.0}
     assert "operational_timeout_basis" not in v1["properties"]
     assert v2["properties"]["schema_version"] == {"const": "stage1-s1-8-gpu-quiescence-v2"}
     assert v2["properties"]["timeout_seconds"] == {"const": 60.0}
     assert v2["properties"]["operational_timeout_basis"]["additionalProperties"] is False
+    assert "max_transient_samples" not in v2["properties"]
+    assert v3["properties"]["schema_version"] == {"const": "stage1-s1-8-gpu-quiescence-v3"}
+    assert v3["properties"]["timeout_seconds"] == {"const": 180.0}
+    assert v3["properties"]["max_transient_samples"] == {"const": 2}
+    assert v3["properties"]["operational_timeout_basis"]["properties"]["maximum_sample_count"] == {"const": 9}
 
 
 def test_gpu_quiescence_public_role_hash_and_schema_bindings_fail_closed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -2195,6 +2277,14 @@ def test_gpu_quiescence_public_role_hash_and_schema_bindings_fail_closed(tmp_pat
     malformed_basis["artifact_hash"] = formalizer._canonical({key: value for key, value in malformed_basis.items() if key != "artifact_hash"})
     with pytest.raises(formalizer.Stage1S18FormalError, match="S18_SCHEMA_VALIDATION_FAILED:gpu_quiescence"):
         formalizer._validate_output_schemas(Path("."), {"gpu_quiescence": malformed_basis})
+    missing_transient_limit = copy.deepcopy(records["prelease"]); del missing_transient_limit["max_transient_samples"]
+    missing_transient_limit["artifact_hash"] = formalizer._canonical({key: value for key, value in missing_transient_limit.items() if key != "artifact_hash"})
+    with pytest.raises(formalizer.Stage1S18FormalError, match="S18_SCHEMA_VALIDATION_FAILED:gpu_quiescence"):
+        formalizer._validate_output_schemas(Path("."), {"gpu_quiescence": missing_transient_limit})
+    legacy_wire = copy.deepcopy(records["prelease"]); legacy_wire["schema_version"] = "stage1-s1-8-gpu-quiescence-v2"
+    legacy_wire["artifact_hash"] = formalizer._canonical({key: value for key, value in legacy_wire.items() if key != "artifact_hash"})
+    with pytest.raises(formalizer.Stage1S18FormalError, match="S18_SCHEMA_VALIDATION_FAILED:gpu_quiescence"):
+        formalizer._validate_output_schemas(Path("."), {"gpu_quiescence": legacy_wire})
 
 
 def test_pile_audit_binds_ready_provenance_and_never_records_command_text(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -2358,7 +2448,7 @@ def test_index_schema_strictly_freezes_full_s17_handoff_historical_binding() -> 
     }
     uuids = [f"GPU-{index:08x}-1111-2222-3333-444444444444" for index in range(4)]
     index = formalizer._with_hash({
-        "schema_version": "stage1-s1-8-formalization-index-v4", "status": "PASS", "gate_id": "G1-DDP", "task_id": "stage1.08_ddp_and_gradient_accumulation",
+        "schema_version": "stage1-s1-8-formalization-index-v5", "status": "PASS", "gate_id": "G1-DDP", "task_id": "stage1.08_ddp_and_gradient_accumulation",
         "generator_git_commit": "8" * 40, "consumer_git_commit": "8" * 40,
         "fixture_schema_version": "stage1-s1-8-fixture-manifest-v3", "fixture_id": "stage1-s1-8-pythia14m-ddp-conditioned-v3",
         "gpu_capability": {"commit_ref": "commit", "object_ref": "object", "task_id": "stage0.01_baseline_and_safety", "artifact_kind": "capability_cuda", "artifact_hash": formalizer.EXPECTED_GPU_CAPABILITY_ARTIFACT_HASH, "config_hash": "9" * 64, "source_refs": ["source"], "allowed_gpu_uuids": uuids}, "nccl_transport_protocol": formalizer._nccl_transport_protocol(),
@@ -2370,10 +2460,11 @@ def test_index_schema_strictly_freezes_full_s17_handoff_historical_binding() -> 
         "next_task_ids": ["stage1.10_checkpoint_resume_and_artifacts"],
     })
     formalizer._validate_output_schemas(Path("."), {"index": index})
-    old_v3 = copy.deepcopy(index); old_v3["schema_version"] = "stage1-s1-8-formalization-index-v3"
-    old_v3["artifact_hash"] = formalizer._canonical({key: value for key, value in old_v3.items() if key != "artifact_hash"})
-    with pytest.raises(formalizer.Stage1S18FormalError, match="S18_SCHEMA_VALIDATION_FAILED:index"):
-        formalizer._validate_output_schemas(Path("."), {"index": old_v3})
+    for legacy_version in range(1, 5):
+        legacy = copy.deepcopy(index); legacy["schema_version"] = f"stage1-s1-8-formalization-index-v{legacy_version}"
+        legacy["artifact_hash"] = formalizer._canonical({key: value for key, value in legacy.items() if key != "artifact_hash"})
+        with pytest.raises(formalizer.Stage1S18FormalError, match="S18_SCHEMA_VALIDATION_FAILED:index"):
+            formalizer._validate_output_schemas(Path("."), {"index": legacy})
     unknown = copy.deepcopy(index); unknown["s1_7_handoff"]["unbound"] = True; unknown["artifact_hash"] = formalizer._canonical({key: value for key, value in unknown.items() if key != "artifact_hash"})
     with pytest.raises(formalizer.Stage1S18FormalError, match="S18_SCHEMA_VALIDATION_FAILED:index"):
         formalizer._validate_output_schemas(Path("."), {"index": unknown})

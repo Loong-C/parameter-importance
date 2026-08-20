@@ -1,0 +1,999 @@
+{
+  "$id": "stage1-s1-8-formalization-index-v5.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "status",
+    "gate_id",
+    "task_id",
+    "generator_git_commit",
+    "consumer_git_commit",
+    "fixture_schema_version",
+    "fixture_id",
+    "gpu_capability",
+    "nccl_transport_protocol",
+    "implementation_source_sha256",
+    "s1_7_handoff",
+    "role_refs",
+    "role_sha256",
+    "reproduction_role_refs",
+    "reproduction_role_sha256",
+    "gate_artifact_hash",
+    "validation_ref",
+    "validation_sha256",
+    "replay_ref",
+    "replay_sha256",
+    "next_task_ids",
+    "artifact_hash"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "stage1-s1-8-formalization-index-v5"
+    },
+    "status": {
+      "const": "PASS"
+    },
+    "gate_id": {
+      "const": "G1-DDP"
+    },
+    "task_id": {
+      "const": "stage1.08_ddp_and_gradient_accumulation"
+    },
+    "generator_git_commit": {
+      "$ref": "s1-8-formalization-index-v1.json#/$defs/commit"
+    },
+    "consumer_git_commit": {
+      "$ref": "s1-8-formalization-index-v1.json#/$defs/commit"
+    },
+    "fixture_schema_version": {
+      "const": "stage1-s1-8-fixture-manifest-v3"
+    },
+    "fixture_id": {
+      "const": "stage1-s1-8-pythia14m-ddp-conditioned-v3"
+    },
+    "gpu_capability": {
+      "$ref": "s1-8-formalization-index-v1.json#/$defs/gpu_capability"
+    },
+    "nccl_transport_protocol": {
+      "$ref": "s1-8-formalization-index-v1.json#/$defs/nccl_transport_protocol"
+    },
+    "implementation_source_sha256": {
+      "$ref": "#/$defs/source_map"
+    },
+    "s1_7_handoff": {
+      "$ref": "s1-8-formalization-index-v1.json#/$defs/s1_7_handoff"
+    },
+    "role_refs": {
+      "$ref": "s1-8-formalization-index-v1.json#/$defs/public_role_refs"
+    },
+    "role_sha256": {
+      "$ref": "s1-8-formalization-index-v1.json#/$defs/public_role_hashes"
+    },
+    "reproduction_role_refs": {
+      "$ref": "#/$defs/reproduction_role_refs"
+    },
+    "reproduction_role_sha256": {
+      "$ref": "#/$defs/reproduction_hashes"
+    },
+    "gate_artifact_hash": {
+      "$ref": "s1-8-formalization-index-v1.json#/$defs/hash"
+    },
+    "validation_ref": {
+      "const": "validation.json"
+    },
+    "validation_sha256": {
+      "$ref": "s1-8-formalization-index-v1.json#/$defs/hash"
+    },
+    "replay_ref": {
+      "const": "replay-validation.json"
+    },
+    "replay_sha256": {
+      "$ref": "s1-8-formalization-index-v1.json#/$defs/hash"
+    },
+    "next_task_ids": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 1,
+      "prefixItems": [
+        {
+          "const": "stage1.10_checkpoint_resume_and_artifacts"
+        }
+      ]
+    },
+    "artifact_hash": {
+      "$ref": "s1-8-formalization-index-v1.json#/$defs/hash"
+    }
+  },
+  "$defs": {
+    "source_map": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "ops/stage1/formalize_s1_8.py",
+        "ops/stage1/run_s1_8_worker.py",
+        "ops/stage1/run_s1_8_scale_oracle.py",
+        "ops/stage1/run_s1_8_nccl_smoke.py",
+        "ops/stage1/formalize_s1_6.py",
+        "src/param_importance_nlp/stage1_ddp.py",
+        "src/param_importance_nlp/stage1_ddp_oracle.py",
+        "src/param_importance_nlp/stage1_ddp_scale_oracle.py",
+        "src/param_importance_nlp/atomic.py",
+        "src/param_importance_nlp/contracts/errors.py",
+        "src/param_importance_nlp/contracts/jsonio.py",
+        "src/param_importance_nlp/contracts/runtime_evidence.py",
+        "src/param_importance_nlp/core/accumulator.py",
+        "src/param_importance_nlp/core/errors.py",
+        "src/param_importance_nlp/core/tensors.py",
+        "src/param_importance_nlp/g3_runtime_assets.py",
+        "src/param_importance_nlp/runtime/operations.py",
+        "src/param_importance_nlp/runtime/task_artifacts.py",
+        "configs/stage0/g3-asset-requirements-v1.json",
+        "configs/stage0/g3-asset-layout-v1.json",
+        "schemas/stage1/s1-8-array-bundle-v1.json",
+        "schemas/stage1/s1-8-comparison-table-v1.json",
+        "schemas/stage1/s1-8-ddp-report-v1.json",
+        "schemas/stage1/s1-8-ddp-report-v2.json",
+        "schemas/stage1/s1-8-ddp-report-v3.json",
+        "schemas/stage1/s1-8-fixture-manifest-v1.json",
+        "schemas/stage1/s1-8-fixture-manifest-v2.json",
+        "schemas/stage1/s1-8-fixture-manifest-v3.json",
+        "schemas/stage1/s1-8-formalization-index-v1.json",
+        "schemas/stage1/s1-8-formalization-index-v2.json",
+        "schemas/stage1/s1-8-formalization-index-v3.json",
+        "schemas/stage1/s1-8-gate-record-v1.json",
+        "schemas/stage1/s1-8-gpu-quiescence-v1.json",
+        "schemas/stage1/s1-8-replay-validation-v1.json",
+        "schemas/stage1/s1-8-replay-validation-v2.json",
+        "schemas/stage1/s1-8-safetensors-manifest-v1.json",
+        "schemas/stage1/s1-8-validation-v1.json",
+        "schemas/stage1/s1-8-validation-v2.json",
+        "schemas/stage1/s1-8-validation-v3.json",
+        "schemas/stage1/s1-8-worker-report-v1.json",
+        "schemas/stage1/s1-8-ddp-report-v4.json",
+        "schemas/stage1/s1-8-formalization-index-v4.json",
+        "schemas/stage1/s1-8-gpu-quiescence-v2.json",
+        "schemas/stage1/s1-8-validation-v4.json",
+        "schemas/stage1/s1-8-ddp-report-v5.json",
+        "schemas/stage1/s1-8-formalization-index-v5.json",
+        "schemas/stage1/s1-8-gpu-quiescence-v3.json",
+        "schemas/stage1/s1-8-validation-v5.json"
+      ],
+      "properties": {
+        "ops/stage1/formalize_s1_8.py": {
+          "$ref": "s1-8-formalization-index-v1.json#/$defs/hash"
+        },
+        "ops/stage1/run_s1_8_worker.py": {
+          "$ref": "s1-8-formalization-index-v1.json#/$defs/hash"
+        },
+        "ops/stage1/run_s1_8_scale_oracle.py": {
+          "$ref": "s1-8-formalization-index-v1.json#/$defs/hash"
+        },
+        "ops/stage1/run_s1_8_nccl_smoke.py": {
+          "$ref": "s1-8-formalization-index-v1.json#/$defs/hash"
+        },
+        "ops/stage1/formalize_s1_6.py": {
+          "$ref": "s1-8-formalization-index-v1.json#/$defs/hash"
+        },
+        "src/param_importance_nlp/stage1_ddp.py": {
+          "$ref": "s1-8-formalization-index-v1.json#/$defs/hash"
+        },
+        "src/param_importance_nlp/stage1_ddp_oracle.py": {
+          "$ref": "s1-8-formalization-index-v1.json#/$defs/hash"
+        },
+        "src/param_importance_nlp/stage1_ddp_scale_oracle.py": {
+          "$ref": "s1-8-formalization-index-v1.json#/$defs/hash"
+        },
+        "src/param_importance_nlp/atomic.py": {
+          "$ref": "s1-8-formalization-index-v1.json#/$defs/hash"
+        },
+        "src/param_importance_nlp/contracts/errors.py": {
+          "$ref": "s1-8-formalization-index-v1.json#/$defs/hash"
+        },
+        "src/param_importance_nlp/contracts/jsonio.py": {
+          "$ref": "s1-8-formalization-index-v1.json#/$defs/hash"
+        },
+        "src/param_importance_nlp/contracts/runtime_evidence.py": {
+          "$ref": "s1-8-formalization-index-v1.json#/$defs/hash"
+        },
+        "src/param_importance_nlp/core/accumulator.py": {
+          "$ref": "s1-8-formalization-index-v1.json#/$defs/hash"
+        },
+        "src/param_importance_nlp/core/errors.py": {
+          "$ref": "s1-8-formalization-index-v1.json#/$defs/hash"
+        },
+        "src/param_importance_nlp/core/tensors.py": {
+          "$ref": "s1-8-formalization-index-v1.json#/$defs/hash"
+        },
+        "src/param_importance_nlp/g3_runtime_assets.py": {
+          "$ref": "s1-8-formalization-index-v1.json#/$defs/hash"
+        },
+        "src/param_importance_nlp/runtime/operations.py": {
+          "$ref": "s1-8-formalization-index-v1.json#/$defs/hash"
+        },
+        "src/param_importance_nlp/runtime/task_artifacts.py": {
+          "$ref": "s1-8-formalization-index-v1.json#/$defs/hash"
+        },
+        "configs/stage0/g3-asset-requirements-v1.json": {
+          "$ref": "s1-8-formalization-index-v1.json#/$defs/hash"
+        },
+        "configs/stage0/g3-asset-layout-v1.json": {
+          "$ref": "s1-8-formalization-index-v1.json#/$defs/hash"
+        },
+        "schemas/stage1/s1-8-array-bundle-v1.json": {
+          "$ref": "s1-8-formalization-index-v1.json#/$defs/hash"
+        },
+        "schemas/stage1/s1-8-comparison-table-v1.json": {
+          "$ref": "s1-8-formalization-index-v1.json#/$defs/hash"
+        },
+        "schemas/stage1/s1-8-ddp-report-v1.json": {
+          "$ref": "s1-8-formalization-index-v1.json#/$defs/hash"
+        },
+        "schemas/stage1/s1-8-ddp-report-v2.json": {
+          "$ref": "s1-8-formalization-index-v1.json#/$defs/hash"
+        },
+        "schemas/stage1/s1-8-ddp-report-v3.json": {
+          "$ref": "s1-8-formalization-index-v1.json#/$defs/hash"
+        },
+        "schemas/stage1/s1-8-fixture-manifest-v1.json": {
+          "$ref": "s1-8-formalization-index-v1.json#/$defs/hash"
+        },
+        "schemas/stage1/s1-8-fixture-manifest-v2.json": {
+          "$ref": "s1-8-formalization-index-v1.json#/$defs/hash"
+        },
+        "schemas/stage1/s1-8-fixture-manifest-v3.json": {
+          "$ref": "s1-8-formalization-index-v1.json#/$defs/hash"
+        },
+        "schemas/stage1/s1-8-formalization-index-v1.json": {
+          "$ref": "s1-8-formalization-index-v1.json#/$defs/hash"
+        },
+        "schemas/stage1/s1-8-formalization-index-v2.json": {
+          "$ref": "s1-8-formalization-index-v1.json#/$defs/hash"
+        },
+        "schemas/stage1/s1-8-formalization-index-v3.json": {
+          "$ref": "s1-8-formalization-index-v1.json#/$defs/hash"
+        },
+        "schemas/stage1/s1-8-gate-record-v1.json": {
+          "$ref": "s1-8-formalization-index-v1.json#/$defs/hash"
+        },
+        "schemas/stage1/s1-8-gpu-quiescence-v1.json": {
+          "$ref": "s1-8-formalization-index-v1.json#/$defs/hash"
+        },
+        "schemas/stage1/s1-8-replay-validation-v1.json": {
+          "$ref": "s1-8-formalization-index-v1.json#/$defs/hash"
+        },
+        "schemas/stage1/s1-8-replay-validation-v2.json": {
+          "$ref": "s1-8-formalization-index-v1.json#/$defs/hash"
+        },
+        "schemas/stage1/s1-8-safetensors-manifest-v1.json": {
+          "$ref": "s1-8-formalization-index-v1.json#/$defs/hash"
+        },
+        "schemas/stage1/s1-8-validation-v1.json": {
+          "$ref": "s1-8-formalization-index-v1.json#/$defs/hash"
+        },
+        "schemas/stage1/s1-8-validation-v2.json": {
+          "$ref": "s1-8-formalization-index-v1.json#/$defs/hash"
+        },
+        "schemas/stage1/s1-8-validation-v3.json": {
+          "$ref": "s1-8-formalization-index-v1.json#/$defs/hash"
+        },
+        "schemas/stage1/s1-8-worker-report-v1.json": {
+          "$ref": "s1-8-formalization-index-v1.json#/$defs/hash"
+        },
+        "schemas/stage1/s1-8-ddp-report-v4.json": {
+          "$ref": "s1-8-formalization-index-v1.json#/$defs/hash"
+        },
+        "schemas/stage1/s1-8-formalization-index-v4.json": {
+          "$ref": "s1-8-formalization-index-v1.json#/$defs/hash"
+        },
+        "schemas/stage1/s1-8-gpu-quiescence-v2.json": {
+          "$ref": "s1-8-formalization-index-v1.json#/$defs/hash"
+        },
+        "schemas/stage1/s1-8-validation-v4.json": {
+          "$ref": "s1-8-formalization-index-v1.json#/$defs/hash"
+        },
+        "schemas/stage1/s1-8-ddp-report-v5.json": {
+          "$ref": "s1-8-formalization-index-v1.json#/$defs/hash"
+        },
+        "schemas/stage1/s1-8-formalization-index-v5.json": {
+          "$ref": "s1-8-formalization-index-v1.json#/$defs/hash"
+        },
+        "schemas/stage1/s1-8-gpu-quiescence-v3.json": {
+          "$ref": "s1-8-formalization-index-v1.json#/$defs/hash"
+        },
+        "schemas/stage1/s1-8-validation-v5.json": {
+          "$ref": "s1-8-formalization-index-v1.json#/$defs/hash"
+        }
+      }
+    },
+    "reproduction_hashes": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "fixture_inputs",
+        "s1_7_historical_producer_attestation",
+        "s1_7_historical_g3_replay",
+        "model_qualified_resolution",
+        "offline_policy",
+        "nccl_transport_protocol",
+        "pre_route_scale_plan",
+        "pre_route_scale",
+        "preflight",
+        "post_lease_gpu",
+        "prelease_gpu_quiescence",
+        "post_worker_gpu",
+        "post_release_gpu",
+        "post_worker_gpu_quiescence",
+        "post_release_gpu_quiescence",
+        "reacquire_preflight_gpu_quiescence",
+        "resource_summary",
+        "nccl_smoke_report",
+        "nccl_smoke_process",
+        "nccl_smoke_stdout",
+        "nccl_smoke_stderr",
+        "lease_history_first",
+        "lease_history_reacquire",
+        "attempt_start",
+        "run_root_b91aa61c209eb19f",
+        "run_root_1f7b55476eefcf3b",
+        "run_root_5490bed11bae2a7f",
+        "run_root_c522e1e91a6f34cc",
+        "run_root_5dc6c870b013e28f",
+        "run_root_768d48fab8d39f10",
+        "run_root_94eceef183e3b4df",
+        "run_root_4b954702bc784f0f",
+        "run_root_0e00a4e7d6f7ab11",
+        "run_root_8d513ea51d69df79",
+        "run_root_903eb96c82bffd3c",
+        "run_root_b9a0fe6e3cf2ee8d",
+        "run_root_b77f33569a764ebb",
+        "run_root_c2c027ff48aa7191",
+        "run_root_e8927c03c3e7e92a",
+        "run_root_1c2b334e7bf62d2b",
+        "run_root_e67d1ab90877200b",
+        "run_root_a73fe5243fb8e9aa",
+        "run_root_40f2aa7e564fb5e3",
+        "run_root_aecbd2c50177f356",
+        "run_root_9e85bb86d51ad4c8",
+        "run_root_7e41bfd5ff636364",
+        "run_root_969df5f47d2276d9",
+        "run_root_6f59ed7d5b7e3d9c",
+        "run_root_60f19abef802c27c",
+        "run_root_e5ad2b8ac78f25fd",
+        "run_root_69a34e208d3cd093",
+        "run_root_bf814ef274c1a208",
+        "run_root_702e1a6f75606de4",
+        "run_root_47d0709134d1a000",
+        "run_root_09c87d68cfe182a4",
+        "run_root_e58be7983370d153",
+        "run_root_1ecbd97f3d5b884d",
+        "run_root_fa9dc234de91fa6e",
+        "run_root_2ea7a6aa55bb6aa1",
+        "run_root_3ffc516a624be232",
+        "run_root_55dabb7c8f848fdc",
+        "run_root_c6c2a8805111a164",
+        "run_root_d216d3e6d6ceb42b",
+        "run_root_879950eaf816c4b7",
+        "run_5ba0850f6ffe37cb",
+        "run_533e54a8d29b6c38",
+        "run_38184313214adcb8",
+        "run_85be636343d2dc82",
+        "run_e220cf9ce8c782c7",
+        "run_c6310d0de57c9040",
+        "run_b2164b50f2c0a02e",
+        "run_ac62e0b9ba31e921",
+        "run_2f1256c6e7995fbb",
+        "run_2a6d8573f18e9c76",
+        "run_f436f026a9ecdbe1",
+        "run_ccdf0539e0e209fa",
+        "run_78bb71a75052bcc8",
+        "run_ef9b30b6818b0d7e",
+        "run_308c4be6fa85cd1a",
+        "run_5628dca3847a781c",
+        "run_9ed02ee7881ca8c9",
+        "run_e22ed4c08404fd3e",
+        "run_198798654beff4da",
+        "run_dc5e22f4d3af6363"
+      ],
+      "properties": {
+        "fixture_inputs": {
+          "$ref": "s1-8-formalization-index-v1.json#/$defs/hash"
+        },
+        "s1_7_historical_producer_attestation": {
+          "$ref": "s1-8-formalization-index-v1.json#/$defs/hash"
+        },
+        "s1_7_historical_g3_replay": {
+          "$ref": "s1-8-formalization-index-v1.json#/$defs/hash"
+        },
+        "model_qualified_resolution": {
+          "$ref": "s1-8-formalization-index-v1.json#/$defs/hash"
+        },
+        "offline_policy": {
+          "$ref": "s1-8-formalization-index-v1.json#/$defs/hash"
+        },
+        "nccl_transport_protocol": {
+          "$ref": "s1-8-formalization-index-v1.json#/$defs/hash"
+        },
+        "pre_route_scale_plan": {
+          "$ref": "s1-8-formalization-index-v1.json#/$defs/hash"
+        },
+        "pre_route_scale": {
+          "$ref": "s1-8-formalization-index-v1.json#/$defs/hash"
+        },
+        "preflight": {
+          "$ref": "s1-8-formalization-index-v1.json#/$defs/hash"
+        },
+        "post_lease_gpu": {
+          "$ref": "s1-8-formalization-index-v1.json#/$defs/hash"
+        },
+        "post_worker_gpu": {
+          "$ref": "s1-8-formalization-index-v1.json#/$defs/hash"
+        },
+        "post_release_gpu": {
+          "$ref": "s1-8-formalization-index-v1.json#/$defs/hash"
+        },
+        "post_worker_gpu_quiescence": {
+          "$ref": "s1-8-formalization-index-v1.json#/$defs/hash"
+        },
+        "post_release_gpu_quiescence": {
+          "$ref": "s1-8-formalization-index-v1.json#/$defs/hash"
+        },
+        "reacquire_preflight_gpu_quiescence": {
+          "$ref": "s1-8-formalization-index-v1.json#/$defs/hash"
+        },
+        "resource_summary": {
+          "$ref": "s1-8-formalization-index-v1.json#/$defs/hash"
+        },
+        "nccl_smoke_report": {
+          "$ref": "s1-8-formalization-index-v1.json#/$defs/hash"
+        },
+        "nccl_smoke_process": {
+          "$ref": "s1-8-formalization-index-v1.json#/$defs/hash"
+        },
+        "nccl_smoke_stdout": {
+          "$ref": "s1-8-formalization-index-v1.json#/$defs/hash"
+        },
+        "nccl_smoke_stderr": {
+          "$ref": "s1-8-formalization-index-v1.json#/$defs/hash"
+        },
+        "lease_history_first": {
+          "$ref": "s1-8-formalization-index-v1.json#/$defs/hash"
+        },
+        "lease_history_reacquire": {
+          "$ref": "s1-8-formalization-index-v1.json#/$defs/hash"
+        },
+        "attempt_start": {
+          "$ref": "s1-8-formalization-index-v1.json#/$defs/hash"
+        },
+        "run_root_b91aa61c209eb19f": {
+          "$ref": "s1-8-formalization-index-v1.json#/$defs/hash"
+        },
+        "run_root_1f7b55476eefcf3b": {
+          "$ref": "s1-8-formalization-index-v1.json#/$defs/hash"
+        },
+        "run_root_5490bed11bae2a7f": {
+          "$ref": "s1-8-formalization-index-v1.json#/$defs/hash"
+        },
+        "run_root_c522e1e91a6f34cc": {
+          "$ref": "s1-8-formalization-index-v1.json#/$defs/hash"
+        },
+        "run_root_5dc6c870b013e28f": {
+          "$ref": "s1-8-formalization-index-v1.json#/$defs/hash"
+        },
+        "run_root_768d48fab8d39f10": {
+          "$ref": "s1-8-formalization-index-v1.json#/$defs/hash"
+        },
+        "run_root_94eceef183e3b4df": {
+          "$ref": "s1-8-formalization-index-v1.json#/$defs/hash"
+        },
+        "run_root_4b954702bc784f0f": {
+          "$ref": "s1-8-formalization-index-v1.json#/$defs/hash"
+        },
+        "run_root_0e00a4e7d6f7ab11": {
+          "$ref": "s1-8-formalization-index-v1.json#/$defs/hash"
+        },
+        "run_root_8d513ea51d69df79": {
+          "$ref": "s1-8-formalization-index-v1.json#/$defs/hash"
+        },
+        "run_root_903eb96c82bffd3c": {
+          "$ref": "s1-8-formalization-index-v1.json#/$defs/hash"
+        },
+        "run_root_b9a0fe6e3cf2ee8d": {
+          "$ref": "s1-8-formalization-index-v1.json#/$defs/hash"
+        },
+        "run_root_b77f33569a764ebb": {
+          "$ref": "s1-8-formalization-index-v1.json#/$defs/hash"
+        },
+        "run_root_c2c027ff48aa7191": {
+          "$ref": "s1-8-formalization-index-v1.json#/$defs/hash"
+        },
+        "run_root_e8927c03c3e7e92a": {
+          "$ref": "s1-8-formalization-index-v1.json#/$defs/hash"
+        },
+        "run_root_1c2b334e7bf62d2b": {
+          "$ref": "s1-8-formalization-index-v1.json#/$defs/hash"
+        },
+        "run_root_e67d1ab90877200b": {
+          "$ref": "s1-8-formalization-index-v1.json#/$defs/hash"
+        },
+        "run_root_a73fe5243fb8e9aa": {
+          "$ref": "s1-8-formalization-index-v1.json#/$defs/hash"
+        },
+        "run_root_40f2aa7e564fb5e3": {
+          "$ref": "s1-8-formalization-index-v1.json#/$defs/hash"
+        },
+        "run_root_aecbd2c50177f356": {
+          "$ref": "s1-8-formalization-index-v1.json#/$defs/hash"
+        },
+        "run_root_9e85bb86d51ad4c8": {
+          "$ref": "s1-8-formalization-index-v1.json#/$defs/hash"
+        },
+        "run_root_7e41bfd5ff636364": {
+          "$ref": "s1-8-formalization-index-v1.json#/$defs/hash"
+        },
+        "run_root_969df5f47d2276d9": {
+          "$ref": "s1-8-formalization-index-v1.json#/$defs/hash"
+        },
+        "run_root_6f59ed7d5b7e3d9c": {
+          "$ref": "s1-8-formalization-index-v1.json#/$defs/hash"
+        },
+        "run_root_60f19abef802c27c": {
+          "$ref": "s1-8-formalization-index-v1.json#/$defs/hash"
+        },
+        "run_root_e5ad2b8ac78f25fd": {
+          "$ref": "s1-8-formalization-index-v1.json#/$defs/hash"
+        },
+        "run_root_69a34e208d3cd093": {
+          "$ref": "s1-8-formalization-index-v1.json#/$defs/hash"
+        },
+        "run_root_bf814ef274c1a208": {
+          "$ref": "s1-8-formalization-index-v1.json#/$defs/hash"
+        },
+        "run_root_702e1a6f75606de4": {
+          "$ref": "s1-8-formalization-index-v1.json#/$defs/hash"
+        },
+        "run_root_47d0709134d1a000": {
+          "$ref": "s1-8-formalization-index-v1.json#/$defs/hash"
+        },
+        "run_root_09c87d68cfe182a4": {
+          "$ref": "s1-8-formalization-index-v1.json#/$defs/hash"
+        },
+        "run_root_e58be7983370d153": {
+          "$ref": "s1-8-formalization-index-v1.json#/$defs/hash"
+        },
+        "run_root_1ecbd97f3d5b884d": {
+          "$ref": "s1-8-formalization-index-v1.json#/$defs/hash"
+        },
+        "run_root_fa9dc234de91fa6e": {
+          "$ref": "s1-8-formalization-index-v1.json#/$defs/hash"
+        },
+        "run_root_2ea7a6aa55bb6aa1": {
+          "$ref": "s1-8-formalization-index-v1.json#/$defs/hash"
+        },
+        "run_root_3ffc516a624be232": {
+          "$ref": "s1-8-formalization-index-v1.json#/$defs/hash"
+        },
+        "run_root_55dabb7c8f848fdc": {
+          "$ref": "s1-8-formalization-index-v1.json#/$defs/hash"
+        },
+        "run_root_c6c2a8805111a164": {
+          "$ref": "s1-8-formalization-index-v1.json#/$defs/hash"
+        },
+        "run_root_d216d3e6d6ceb42b": {
+          "$ref": "s1-8-formalization-index-v1.json#/$defs/hash"
+        },
+        "run_root_879950eaf816c4b7": {
+          "$ref": "s1-8-formalization-index-v1.json#/$defs/hash"
+        },
+        "run_5ba0850f6ffe37cb": {
+          "$ref": "s1-8-formalization-index-v1.json#/$defs/hash"
+        },
+        "run_533e54a8d29b6c38": {
+          "$ref": "s1-8-formalization-index-v1.json#/$defs/hash"
+        },
+        "run_38184313214adcb8": {
+          "$ref": "s1-8-formalization-index-v1.json#/$defs/hash"
+        },
+        "run_85be636343d2dc82": {
+          "$ref": "s1-8-formalization-index-v1.json#/$defs/hash"
+        },
+        "run_e220cf9ce8c782c7": {
+          "$ref": "s1-8-formalization-index-v1.json#/$defs/hash"
+        },
+        "run_c6310d0de57c9040": {
+          "$ref": "s1-8-formalization-index-v1.json#/$defs/hash"
+        },
+        "run_b2164b50f2c0a02e": {
+          "$ref": "s1-8-formalization-index-v1.json#/$defs/hash"
+        },
+        "run_ac62e0b9ba31e921": {
+          "$ref": "s1-8-formalization-index-v1.json#/$defs/hash"
+        },
+        "run_2f1256c6e7995fbb": {
+          "$ref": "s1-8-formalization-index-v1.json#/$defs/hash"
+        },
+        "run_2a6d8573f18e9c76": {
+          "$ref": "s1-8-formalization-index-v1.json#/$defs/hash"
+        },
+        "run_f436f026a9ecdbe1": {
+          "$ref": "s1-8-formalization-index-v1.json#/$defs/hash"
+        },
+        "run_ccdf0539e0e209fa": {
+          "$ref": "s1-8-formalization-index-v1.json#/$defs/hash"
+        },
+        "run_78bb71a75052bcc8": {
+          "$ref": "s1-8-formalization-index-v1.json#/$defs/hash"
+        },
+        "run_ef9b30b6818b0d7e": {
+          "$ref": "s1-8-formalization-index-v1.json#/$defs/hash"
+        },
+        "run_308c4be6fa85cd1a": {
+          "$ref": "s1-8-formalization-index-v1.json#/$defs/hash"
+        },
+        "run_5628dca3847a781c": {
+          "$ref": "s1-8-formalization-index-v1.json#/$defs/hash"
+        },
+        "run_9ed02ee7881ca8c9": {
+          "$ref": "s1-8-formalization-index-v1.json#/$defs/hash"
+        },
+        "run_e22ed4c08404fd3e": {
+          "$ref": "s1-8-formalization-index-v1.json#/$defs/hash"
+        },
+        "run_198798654beff4da": {
+          "$ref": "s1-8-formalization-index-v1.json#/$defs/hash"
+        },
+        "run_dc5e22f4d3af6363": {
+          "$ref": "s1-8-formalization-index-v1.json#/$defs/hash"
+        },
+        "prelease_gpu_quiescence": {
+          "$ref": "s1-8-formalization-index-v1.json#/$defs/hash"
+        }
+      }
+    },
+    "reproduction_role_refs": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "fixture_inputs",
+        "s1_7_historical_producer_attestation",
+        "s1_7_historical_g3_replay",
+        "model_qualified_resolution",
+        "offline_policy",
+        "nccl_transport_protocol",
+        "pre_route_scale_plan",
+        "pre_route_scale",
+        "preflight",
+        "post_lease_gpu",
+        "prelease_gpu_quiescence",
+        "post_worker_gpu",
+        "post_release_gpu",
+        "post_worker_gpu_quiescence",
+        "post_release_gpu_quiescence",
+        "reacquire_preflight_gpu_quiescence",
+        "resource_summary",
+        "nccl_smoke_report",
+        "nccl_smoke_process",
+        "nccl_smoke_stdout",
+        "nccl_smoke_stderr",
+        "lease_history_first",
+        "lease_history_reacquire",
+        "attempt_start",
+        "run_root_b91aa61c209eb19f",
+        "run_root_1f7b55476eefcf3b",
+        "run_root_5490bed11bae2a7f",
+        "run_root_c522e1e91a6f34cc",
+        "run_root_5dc6c870b013e28f",
+        "run_root_768d48fab8d39f10",
+        "run_root_94eceef183e3b4df",
+        "run_root_4b954702bc784f0f",
+        "run_root_0e00a4e7d6f7ab11",
+        "run_root_8d513ea51d69df79",
+        "run_root_903eb96c82bffd3c",
+        "run_root_b9a0fe6e3cf2ee8d",
+        "run_root_b77f33569a764ebb",
+        "run_root_c2c027ff48aa7191",
+        "run_root_e8927c03c3e7e92a",
+        "run_root_1c2b334e7bf62d2b",
+        "run_root_e67d1ab90877200b",
+        "run_root_a73fe5243fb8e9aa",
+        "run_root_40f2aa7e564fb5e3",
+        "run_root_aecbd2c50177f356",
+        "run_root_9e85bb86d51ad4c8",
+        "run_root_7e41bfd5ff636364",
+        "run_root_969df5f47d2276d9",
+        "run_root_6f59ed7d5b7e3d9c",
+        "run_root_60f19abef802c27c",
+        "run_root_e5ad2b8ac78f25fd",
+        "run_root_69a34e208d3cd093",
+        "run_root_bf814ef274c1a208",
+        "run_root_702e1a6f75606de4",
+        "run_root_47d0709134d1a000",
+        "run_root_09c87d68cfe182a4",
+        "run_root_e58be7983370d153",
+        "run_root_1ecbd97f3d5b884d",
+        "run_root_fa9dc234de91fa6e",
+        "run_root_2ea7a6aa55bb6aa1",
+        "run_root_3ffc516a624be232",
+        "run_root_55dabb7c8f848fdc",
+        "run_root_c6c2a8805111a164",
+        "run_root_d216d3e6d6ceb42b",
+        "run_root_879950eaf816c4b7",
+        "run_5ba0850f6ffe37cb",
+        "run_533e54a8d29b6c38",
+        "run_38184313214adcb8",
+        "run_85be636343d2dc82",
+        "run_e220cf9ce8c782c7",
+        "run_c6310d0de57c9040",
+        "run_b2164b50f2c0a02e",
+        "run_ac62e0b9ba31e921",
+        "run_2f1256c6e7995fbb",
+        "run_2a6d8573f18e9c76",
+        "run_f436f026a9ecdbe1",
+        "run_ccdf0539e0e209fa",
+        "run_78bb71a75052bcc8",
+        "run_ef9b30b6818b0d7e",
+        "run_308c4be6fa85cd1a",
+        "run_5628dca3847a781c",
+        "run_9ed02ee7881ca8c9",
+        "run_e22ed4c08404fd3e",
+        "run_198798654beff4da",
+        "run_dc5e22f4d3af6363"
+      ],
+      "properties": {
+        "fixture_inputs": {
+          "const": "fixture-inputs.safetensors"
+        },
+        "s1_7_historical_producer_attestation": {
+          "const": "s1-7-historical-producer-attestation.json"
+        },
+        "s1_7_historical_g3_replay": {
+          "const": "s1-7-historical-g3-replay.json"
+        },
+        "model_qualified_resolution": {
+          "const": "model-qualified-resolution.json"
+        },
+        "offline_policy": {
+          "const": "offline-policy.json"
+        },
+        "nccl_transport_protocol": {
+          "const": "nccl-transport-protocol.json"
+        },
+        "pre_route_scale_plan": {
+          "const": "pre-route-scale-plan.json"
+        },
+        "pre_route_scale": {
+          "const": "pre-route-scale.json"
+        },
+        "preflight": {
+          "const": "preflight.json"
+        },
+        "post_lease_gpu": {
+          "const": "post-lease-gpu.json"
+        },
+        "post_worker_gpu": {
+          "const": "post-worker-gpu.json"
+        },
+        "post_release_gpu": {
+          "const": "post-release-gpu.json"
+        },
+        "post_worker_gpu_quiescence": {
+          "const": "post-worker-gpu-quiescence.json"
+        },
+        "post_release_gpu_quiescence": {
+          "const": "post-release-gpu-quiescence.json"
+        },
+        "reacquire_preflight_gpu_quiescence": {
+          "const": "reacquire-preflight-gpu-quiescence.json"
+        },
+        "resource_summary": {
+          "const": "resource-summary.json"
+        },
+        "nccl_smoke_report": {
+          "const": "nccl-smoke-report.json"
+        },
+        "nccl_smoke_process": {
+          "const": "nccl-smoke.process.json"
+        },
+        "nccl_smoke_stdout": {
+          "const": "nccl-smoke.stdout.txt"
+        },
+        "nccl_smoke_stderr": {
+          "const": "nccl-smoke.stderr.txt"
+        },
+        "lease_history_first": {
+          "const": "lease-history-first.json"
+        },
+        "lease_history_reacquire": {
+          "const": "lease-history-reacquire.json"
+        },
+        "attempt_start": {
+          "const": "attempt-start.json"
+        },
+        "run_root_b91aa61c209eb19f": {
+          "const": "run__root__nccl-smoke.process.json"
+        },
+        "run_root_1f7b55476eefcf3b": {
+          "const": "run__root__nccl-smoke.stdout.txt"
+        },
+        "run_root_5490bed11bae2a7f": {
+          "const": "run__root__nccl-smoke.stderr.txt"
+        },
+        "run_root_c522e1e91a6f34cc": {
+          "const": "run__root__nccl-smoke-process-tree-initial.json"
+        },
+        "run_root_5dc6c870b013e28f": {
+          "const": "run__root__pre-route-scale.process.json"
+        },
+        "run_root_768d48fab8d39f10": {
+          "const": "run__root__pre-route-scale.stdout.txt"
+        },
+        "run_root_94eceef183e3b4df": {
+          "const": "run__root__pre-route-scale.stderr.txt"
+        },
+        "run_root_4b954702bc784f0f": {
+          "const": "run__root__pre-route-scale-process-tree-initial.json"
+        },
+        "run_root_0e00a4e7d6f7ab11": {
+          "const": "run__root__A-identity-formal.process.json"
+        },
+        "run_root_8d513ea51d69df79": {
+          "const": "run__root__A-identity-formal.stdout.txt"
+        },
+        "run_root_903eb96c82bffd3c": {
+          "const": "run__root__A-identity-formal.stderr.txt"
+        },
+        "run_root_b9a0fe6e3cf2ee8d": {
+          "const": "run__root__A-identity-formal-process-tree-initial.json"
+        },
+        "run_root_b77f33569a764ebb": {
+          "const": "run__root__B-identity-formal.process.json"
+        },
+        "run_root_c2c027ff48aa7191": {
+          "const": "run__root__B-identity-formal.stdout.txt"
+        },
+        "run_root_e8927c03c3e7e92a": {
+          "const": "run__root__B-identity-formal.stderr.txt"
+        },
+        "run_root_1c2b334e7bf62d2b": {
+          "const": "run__root__B-identity-formal-process-tree-initial.json"
+        },
+        "run_root_e67d1ab90877200b": {
+          "const": "run__root__C-identity-formal.process.json"
+        },
+        "run_root_a73fe5243fb8e9aa": {
+          "const": "run__root__C-identity-formal.stdout.txt"
+        },
+        "run_root_40f2aa7e564fb5e3": {
+          "const": "run__root__C-identity-formal.stderr.txt"
+        },
+        "run_root_aecbd2c50177f356": {
+          "const": "run__root__C-identity-formal-process-tree-initial.json"
+        },
+        "run_root_9e85bb86d51ad4c8": {
+          "const": "run__root__D-identity-formal.process.json"
+        },
+        "run_root_7e41bfd5ff636364": {
+          "const": "run__root__D-identity-formal.stdout.txt"
+        },
+        "run_root_969df5f47d2276d9": {
+          "const": "run__root__D-identity-formal.stderr.txt"
+        },
+        "run_root_6f59ed7d5b7e3d9c": {
+          "const": "run__root__D-identity-formal-process-tree-initial.json"
+        },
+        "run_root_60f19abef802c27c": {
+          "const": "run__root__D-rank_swap-formal.process.json"
+        },
+        "run_root_e5ad2b8ac78f25fd": {
+          "const": "run__root__D-rank_swap-formal.stdout.txt"
+        },
+        "run_root_69a34e208d3cd093": {
+          "const": "run__root__D-rank_swap-formal.stderr.txt"
+        },
+        "run_root_bf814ef274c1a208": {
+          "const": "run__root__D-rank_swap-formal-process-tree-initial.json"
+        },
+        "run_root_702e1a6f75606de4": {
+          "const": "run__root__D-local_reverse-formal.process.json"
+        },
+        "run_root_47d0709134d1a000": {
+          "const": "run__root__D-local_reverse-formal.stdout.txt"
+        },
+        "run_root_09c87d68cfe182a4": {
+          "const": "run__root__D-local_reverse-formal.stderr.txt"
+        },
+        "run_root_e58be7983370d153": {
+          "const": "run__root__D-local_reverse-formal-process-tree-initial.json"
+        },
+        "run_root_1ecbd97f3d5b884d": {
+          "const": "run__root__D-identity-ordinary_sync_negative.process.json"
+        },
+        "run_root_fa9dc234de91fa6e": {
+          "const": "run__root__D-identity-ordinary_sync_negative.stdout.txt"
+        },
+        "run_root_2ea7a6aa55bb6aa1": {
+          "const": "run__root__D-identity-ordinary_sync_negative.stderr.txt"
+        },
+        "run_root_3ffc516a624be232": {
+          "const": "run__root__D-identity-ordinary_sync_negative-process-tree-initial.json"
+        },
+        "run_root_55dabb7c8f848fdc": {
+          "const": "run__root__D-identity-inject_rank_failure.process.json"
+        },
+        "run_root_c6c2a8805111a164": {
+          "const": "run__root__D-identity-inject_rank_failure.stdout.txt"
+        },
+        "run_root_d216d3e6d6ceb42b": {
+          "const": "run__root__D-identity-inject_rank_failure.stderr.txt"
+        },
+        "run_root_879950eaf816c4b7": {
+          "const": "run__root__D-identity-inject_rank_failure-process-tree-initial.json"
+        },
+        "run_5ba0850f6ffe37cb": {
+          "const": "run__route-A-identity-formal__worker-plan.json"
+        },
+        "run_533e54a8d29b6c38": {
+          "const": "run__route-B-identity-formal__worker-plan.json"
+        },
+        "run_38184313214adcb8": {
+          "const": "run__route-C-identity-formal__worker-plan.json"
+        },
+        "run_85be636343d2dc82": {
+          "const": "run__route-D-identity-formal__worker-plan.json"
+        },
+        "run_e220cf9ce8c782c7": {
+          "const": "run__route-D-rank_swap-formal__worker-plan.json"
+        },
+        "run_c6310d0de57c9040": {
+          "const": "run__route-D-local_reverse-formal__worker-plan.json"
+        },
+        "run_b2164b50f2c0a02e": {
+          "const": "run__route-D-identity-ordinary_sync_negative__worker-plan.json"
+        },
+        "run_ac62e0b9ba31e921": {
+          "const": "run__route-D-identity-inject_rank_failure__worker-plan.json"
+        },
+        "run_2f1256c6e7995fbb": {
+          "const": "run__route-A-identity-formal__route-output__route-report.json"
+        },
+        "run_2a6d8573f18e9c76": {
+          "const": "run__route-A-identity-formal__route-output__route-A.safetensors"
+        },
+        "run_f436f026a9ecdbe1": {
+          "const": "run__route-B-identity-formal__route-output__route-report.json"
+        },
+        "run_ccdf0539e0e209fa": {
+          "const": "run__route-B-identity-formal__route-output__route-B.safetensors"
+        },
+        "run_78bb71a75052bcc8": {
+          "const": "run__route-C-identity-formal__route-output__route-report.json"
+        },
+        "run_ef9b30b6818b0d7e": {
+          "const": "run__route-C-identity-formal__route-output__route-C.safetensors"
+        },
+        "run_308c4be6fa85cd1a": {
+          "const": "run__route-D-identity-formal__route-output__route-report.json"
+        },
+        "run_5628dca3847a781c": {
+          "const": "run__route-D-identity-formal__route-output__route-D.safetensors"
+        },
+        "run_9ed02ee7881ca8c9": {
+          "const": "run__route-D-rank_swap-formal__route-output__route-report.json"
+        },
+        "run_e22ed4c08404fd3e": {
+          "const": "run__route-D-rank_swap-formal__route-output__route-D.safetensors"
+        },
+        "run_198798654beff4da": {
+          "const": "run__route-D-local_reverse-formal__route-output__route-report.json"
+        },
+        "run_dc5e22f4d3af6363": {
+          "const": "run__route-D-local_reverse-formal__route-output__route-D.safetensors"
+        },
+        "prelease_gpu_quiescence": {
+          "const": "prelease-gpu-quiescence.json"
+        }
+      }
+    }
+  }
+}
