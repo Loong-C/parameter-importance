@@ -492,7 +492,7 @@ def test_s19_new_compatibility_schemas_are_recursively_closed() -> None:
             return [item for child in value for item in walk(child)]
         return []
 
-    names = ("s1-9-upstream-compatibility-v5.json", "s1-9-upstream-compatibility-v6.json", "s1-9-gpu-quiescence-v3.json", "s1-9-gpu-prelease-v3.json", "s1-9-formalization-index-v6.json", "s1-9-formalization-index-v7.json")
+    names = ("s1-9-upstream-compatibility-v5.json", "s1-9-upstream-compatibility-v6.json", "s1-9-upstream-compatibility-v7.json", "s1-9-gpu-quiescence-v3.json", "s1-9-gpu-prelease-v3.json", "s1-9-formalization-index-v6.json", "s1-9-formalization-index-v7.json", "s1-9-formalization-index-v8.json")
     for name in names:
         path = ROOT / "schemas" / "stage1" / name
         for schema in walk(json.loads(path.read_text(encoding="utf-8"))):
@@ -538,16 +538,18 @@ def test_s19_gate_replay_and_validation_schema_sets_are_exact() -> None:
     visible = ",".join(GPU_UUIDS)
     validation = {"schema_version": "stage1-s1-9-validation-v1", "status": "PASS", "gate_id": "G1-NUMERIC", "task_id": precision.TASK_ID, "execution_scope": "formal_server_gpu_single_and_ddp_skip", "fixture_id": precision_oracle.FIXTURE_ID, "producer_commit": commit, "consumer_commit": commit, "upstream": {"s1_7": s17, "s1_8": s18}, "regression": {"bf16": {"algorithms_enabled": True, "cudnn_deterministic": True, "cudnn_benchmark": False, "allowed_nondeterministic_kernel_classes": [], "kernel_policy": "empty_pre_registered_allowlist"}, "ddp_world_size": 4, "kernel_allowlist": [], "environment": {"single": _environment_summary(visible=GPU_UUIDS[0], rank=0, uuid=GPU_UUIDS[0]), "ddp_rank0": _environment_summary(visible=visible, rank=0, uuid=GPU_UUIDS[0]), "ddp_all_ranks": [_environment_summary(visible=visible, rank=rank, uuid=uuid) for rank, uuid in enumerate(GPU_UUIDS)]}}, "direct_checks": [{"check_id": check_id, "status": "PASS", "detail": "checked"} for check_id in (*precision.REQUIREMENT_KEYS, *formal_checks)], "role_sha256": {name: digest for name in ("numeric_report", "oracle_bundle", "trace_bundle", "comparison_table", "gate_record")}, "csv_sha256": {name: digest for name in ("bf16-fp32-heatmap.csv", "clip-norm-factor.csv", "skip-zero-difference.csv", "t-amp-scale.csv", "u-single-factor-identity.csv", "u-single-factor-ratio-diagnostic.csv")}, "svg_sha256": {name: digest for name in ("bf16-fp32-heatmap.svg", "clip-norm-factor.svg", "skip-zero-difference.svg", "t-amp-scale.svg", "u-single-factor-identity.svg", "u-single-factor-ratio-diagnostic.svg")}, "replay_sha256": digest, "replay_hash": digest, "artifact_hash": digest}
     formal._validate_s1_9_schemas(ROOT, {"validation": validation})
-    index_schema = json.loads((ROOT / "schemas" / "stage1" / "s1-9-formalization-index-v7.json").read_text(encoding="utf-8"))
+    index_schema = json.loads((ROOT / "schemas" / "stage1" / "s1-9-formalization-index-v8.json").read_text(encoding="utf-8"))
+    v7_index_schema = json.loads((ROOT / "schemas" / "stage1" / "s1-9-formalization-index-v7.json").read_text(encoding="utf-8"))
     frozen_index_schema = json.loads((ROOT / "schemas" / "stage1" / "s1-9-formalization-index-v6.json").read_text(encoding="utf-8"))
-    assert index_schema["properties"]["reproduction_role_refs"]["$ref"] == "s1-9-formalization-index-v6.json#/properties/reproduction_role_refs"
+    assert index_schema["properties"]["reproduction_role_refs"]["$ref"] == "s1-9-formalization-index-v7.json#/properties/reproduction_role_refs"
+    assert v7_index_schema["properties"]["reproduction_role_refs"]["$ref"] == "s1-9-formalization-index-v6.json#/properties/reproduction_role_refs"
     reproduction = {
         name: definition["const"]
         for name, definition in frozen_index_schema["$defs"]["reproduction_refs"]["properties"].items()
     }
     assert reproduction["prelease_gpu"] == "prelease-gpu.json"
     index = {
-        "schema_version": "stage1-s1-9-formalization-index-v7", "status": "PASS",
+        "schema_version": "stage1-s1-9-formalization-index-v8", "status": "PASS",
         "gate_id": "G1-NUMERIC", "task_id": precision.TASK_ID,
         "fixture_id": precision_oracle.FIXTURE_ID, "generator_git_commit": commit,
         "consumer_git_commit": commit, "git_branch": "main",
@@ -569,7 +571,7 @@ def test_s19_gate_replay_and_validation_schema_sets_are_exact() -> None:
     same_count_key = json.loads(json.dumps(index)); refs = same_count_key["reproduction_role_refs"]; refs["unreviewed"] = refs.pop("preflight"); same_count_key.pop("artifact_hash"); same_count_key["artifact_hash"] = canonical_json_hash(same_count_key)
     with pytest.raises(formal.Stage1S19FormalError, match="SCHEMA_VALIDATION_FAILED:index"):
         formal._validate_s1_9_schemas(ROOT, {"index": same_count_key})
-    old_index = json.loads(json.dumps(index)); old_index["schema_version"] = "stage1-s1-9-formalization-index-v6"; old_index.pop("artifact_hash"); old_index["artifact_hash"] = canonical_json_hash(old_index)
+    old_index = json.loads(json.dumps(index)); old_index["schema_version"] = "stage1-s1-9-formalization-index-v7"; old_index.pop("artifact_hash"); old_index["artifact_hash"] = canonical_json_hash(old_index)
     with pytest.raises(formal.Stage1S19FormalError, match="SCHEMA_VALIDATION_FAILED:index"):
         formal._validate_s1_9_schemas(ROOT, {"index": old_index})
     missing_prelease = json.loads(json.dumps(index)); missing_prelease["reproduction_role_refs"].pop("prelease_gpu"); missing_prelease.pop("artifact_hash"); missing_prelease["artifact_hash"] = canonical_json_hash(missing_prelease)
@@ -727,7 +729,7 @@ def test_s19_s18_source_map_intersection_is_empty_or_revalidated_for_the_one_sha
         "ddp_report": {"source_map": {"src/param_importance_nlp/runtime/training.py": "b" * 64}},
     }
     monkeypatch.setattr(formal, "_upstream_role", lambda _root, _ref, role: roles[role])
-    monkeypatch.setattr(formal, "_s1_8_v7_handoff_attestation", lambda *_args: {"index_schema_version": "stage1-s1-8-formalization-index-v7", "ddp_report_schema_version": "stage1-s1-8-ddp-report-v7", "validation_schema_version": "stage1-s1-8-validation-v7", "implementation_source_sha256": roles["ddp_report"]["source_map"], "reproduction_role_refs": {name: "x" for name in ()}, "reproduction_role_sha256": {}, "gpu_quiescence": {}, "replay_schema_version": "stage1-s1-8-replay-validation-v3", "comparison_table_schema_version": "stage1-s1-8-comparison-table-v2", "array_bundle_schema_version": "stage1-s1-8-array-bundle-v2", "array_bundle_route_refs": formal._S1_8_V7_ARRAY_ROUTE_REFS})
+    monkeypatch.setattr(formal, "_s1_8_v8_handoff_attestation", lambda *_args: {"index_schema_version": "stage1-s1-8-formalization-index-v8", "ddp_report_schema_version": "stage1-s1-8-ddp-report-v8", "validation_schema_version": "stage1-s1-8-validation-v8", "implementation_source_sha256": roles["ddp_report"]["source_map"], "reproduction_role_refs": {name: "x" for name in ()}, "reproduction_role_sha256": {}, "gpu_quiescence": {}, "replay_schema_version": "stage1-s1-8-replay-validation-v3", "comparison_table_schema_version": "stage1-s1-8-comparison-table-v2", "array_bundle_schema_version": "stage1-s1-8-array-bundle-v2", "array_bundle_route_refs": formal._S1_8_ARRAY_BUNDLE_V2_ROUTE_REFS})
     monkeypatch.setattr(formal, "_validate_s1_9_schemas", lambda *_args: None)
     monkeypatch.setattr(formal, "_consumer_diff", lambda _repository, _producer: [path])
     monkeypatch.setattr(formal, "_git", lambda *_args: "c" * 40)
@@ -807,25 +809,27 @@ def test_s19_clean_producer_diff_accepts_only_s110_and_s19_then_rejects_s111(tmp
         formal._consumer_diff(repository, producer)
 
 
-def test_s19_upstream_v6_freezes_s18_v7_source_array_and_reproduction_closure() -> None:
-    formal = _module(ROOT / "ops" / "stage1" / "formalize_s1_9.py", "s19_upstream_v7_closure")
+def test_s19_upstream_v7_freezes_s18_v8_source_array_and_reproduction_closure() -> None:
+    formal = _module(ROOT / "ops" / "stage1" / "formalize_s1_9.py", "s19_upstream_v8_closure")
     digest, commit = "a" * 64, "b" * 40
-    v7 = json.loads((ROOT / "schemas" / "stage1" / "s1-8-formalization-index-v7.json").read_text(encoding="utf-8"))
-    ddp_v7 = json.loads((ROOT / "schemas" / "stage1" / "s1-8-ddp-report-v7.json").read_text(encoding="utf-8"))
-    source_map = {name: digest for name in v7["$defs"]["source_map"]["required"]}
-    reproduction = {name: item["const"] for name, item in v7["$defs"]["reproduction_role_refs"]["properties"].items()}
+    v8 = json.loads((ROOT / "schemas" / "stage1" / "s1-8-formalization-index-v8.json").read_text(encoding="utf-8"))
+    ddp_v8 = json.loads((ROOT / "schemas" / "stage1" / "s1-8-ddp-report-v8.json").read_text(encoding="utf-8"))
+    quiescence_v4 = json.loads((ROOT / "schemas" / "stage1" / "s1-8-gpu-quiescence-v4.json").read_text(encoding="utf-8"))
+    source_map = {name: digest for name in v8["$defs"]["source_map"]["required"]}
+    reproduction = {name: item["const"] for name, item in v8["$defs"]["reproduction_role_refs"]["properties"].items()}
     quiescence = {
-        role: {"ref": ddp_v7["$defs"][f"{role}_binding"]["properties"]["ref"]["const"], "sha256": digest}
+        role: {"ref": ddp_v8["$defs"][f"{role}_binding"]["properties"]["ref"]["const"], "sha256": digest}
         for role in ("prelease", "post_worker", "post_release", "reacquire_preflight")
     }
-    assert len(source_map) == 57
+    assert len(source_map) == 61
     assert len(reproduction) == 84
+    assert quiescence_v4["properties"]["schema_version"]["const"] == "stage1-s1-8-gpu-quiescence-v4"
     result = {
-        "schema_version": "stage1-s1-9-upstream-compatibility-v6", "status": "PASS", "s1_7_producer": commit, "s1_8_producer": commit, "consumer_commit": commit,
+        "schema_version": "stage1-s1-9-upstream-compatibility-v7", "status": "PASS", "s1_7_producer": commit, "s1_8_producer": commit, "consumer_commit": commit,
         "s1_7_to_consumer_changed_paths": ["src/param_importance_nlp/runtime/optimizer.py"], "s1_8_to_consumer_changed_paths": ["src/param_importance_nlp/runtime/checkpoint_group.py", "src/param_importance_nlp/runtime/training.py"],
         "s1_7_source_attestation": {"source_map_mode": "r11_no_per_file_source_map_global_diff_allowlist", "report_source_git_commit": commit, "authorized_shared_dependencies": ["src/param_importance_nlp/runtime/optimizer.py"], "authorized_shared_dependency_hashes": {"src/param_importance_nlp/runtime/optimizer.py": {"producer_sha256": digest, "consumer_sha256": digest, "changed": True}}},
         "s1_8_source_dependencies": source_map,
-        "s1_8_v7_handoff": {"index_schema_version": "stage1-s1-8-formalization-index-v7", "ddp_report_schema_version": "stage1-s1-8-ddp-report-v7", "validation_schema_version": "stage1-s1-8-validation-v7", "implementation_source_sha256": source_map, "reproduction_role_refs": reproduction, "reproduction_role_sha256": {name: digest for name in reproduction}, "gpu_quiescence": quiescence, "replay_schema_version": "stage1-s1-8-replay-validation-v3", "comparison_table_schema_version": "stage1-s1-8-comparison-table-v2", "array_bundle_schema_version": "stage1-s1-8-array-bundle-v2", "array_bundle_route_refs": formal._S1_8_V7_ARRAY_ROUTE_REFS},
+        "s1_8_v8_handoff": {"index_schema_version": "stage1-s1-8-formalization-index-v8", "ddp_report_schema_version": "stage1-s1-8-ddp-report-v8", "validation_schema_version": "stage1-s1-8-validation-v8", "implementation_source_sha256": source_map, "reproduction_role_refs": reproduction, "reproduction_role_sha256": {name: digest for name in reproduction}, "gpu_quiescence": quiescence, "replay_schema_version": "stage1-s1-8-replay-validation-v3", "comparison_table_schema_version": "stage1-s1-8-comparison-table-v2", "array_bundle_schema_version": "stage1-s1-8-array-bundle-v2", "array_bundle_route_refs": formal._S1_8_ARRAY_BUNDLE_V2_ROUTE_REFS},
         "s1_7_affected_dependencies": ["src/param_importance_nlp/runtime/optimizer.py"], "s1_8_affected_dependencies": [], "s1_8_authorized_shared_drift": {}, "authorized_shared_change": "src/param_importance_nlp/runtime/optimizer.py",
         "current_source_cpu_clip_replay": formal._optimizer_clip_cpu_replay(),
         "nonproducer_runtime_attestation": {"affected_paths": ["src/param_importance_nlp/runtime/checkpoint_group.py", "src/param_importance_nlp/runtime/training.py"], "s1_8_source_map_excludes_paths": ["src/param_importance_nlp/runtime/checkpoint_group.py", "src/param_importance_nlp/runtime/training.py"], "s1_7_oracle_training_import_isolated": True, "checkpoint_group_producer_math_exclusion": True, "current_source_cpu_replays": {"src/param_importance_nlp/runtime/training.py": {"profile": "s1_9_current_source_training_checkpoint_resume_cpu", "checkpoint_id": "synthetic", "checkpoint_schema_version": "training-checkpoint-state-v2", "omission_rejected_before_mutation": True, "fresh_engine_next_step_exact": True, "fresh_engine_final_state_exact": True, "passed": True}}},
@@ -834,25 +838,25 @@ def test_s19_upstream_v6_freezes_s18_v7_source_array_and_reproduction_closure() 
     formal._validate_s1_9_schemas(ROOT, {"upstream_compatibility": result})
     for mutate in (
         lambda item: item["s1_8_source_dependencies"].__setitem__("unreviewed.py", item["s1_8_source_dependencies"].pop(next(iter(item["s1_8_source_dependencies"]))),),
-        lambda item: item["s1_8_v7_handoff"]["reproduction_role_refs"].__setitem__("unreviewed", item["s1_8_v7_handoff"]["reproduction_role_refs"].pop("prelease_gpu_quiescence")),
-        lambda item: item["s1_8_v7_handoff"].__setitem__("replay_schema_version", "stage1-s1-8-replay-validation-v2"),
-        lambda item: item["s1_8_v7_handoff"]["array_bundle_route_refs"]["D-rank_swap"].__setitem__("artifact_ref", "unreviewed-route.safetensors"),
+        lambda item: item["s1_8_v8_handoff"]["reproduction_role_refs"].__setitem__("unreviewed", item["s1_8_v8_handoff"]["reproduction_role_refs"].pop("prelease_gpu_quiescence")),
+        lambda item: item["s1_8_v8_handoff"].__setitem__("replay_schema_version", "stage1-s1-8-replay-validation-v2"),
+        lambda item: item["s1_8_v8_handoff"]["array_bundle_route_refs"]["D-rank_swap"].__setitem__("artifact_ref", "unreviewed-route.safetensors"),
     ):
         altered = json.loads(json.dumps(result)); mutate(altered); altered.pop("artifact_hash"); altered["artifact_hash"] = canonical_json_hash(altered)
         with pytest.raises(formal.Stage1S19FormalError, match="SCHEMA_VALIDATION_FAILED:upstream_compatibility"):
             formal._validate_s1_9_schemas(ROOT, {"upstream_compatibility": altered})
-    old_wire = json.loads(json.dumps(result)); old_wire["schema_version"] = "stage1-s1-9-upstream-compatibility-v5"; old_wire["s1_8_v7_handoff"]["index_schema_version"] = "stage1-s1-8-formalization-index-v6"; old_wire.pop("artifact_hash"); old_wire["artifact_hash"] = canonical_json_hash(old_wire)
+    old_wire = json.loads(json.dumps(result)); old_wire["schema_version"] = "stage1-s1-9-upstream-compatibility-v6"; old_wire["s1_8_v8_handoff"]["index_schema_version"] = "stage1-s1-8-formalization-index-v7"; old_wire.pop("artifact_hash"); old_wire["artifact_hash"] = canonical_json_hash(old_wire)
     with pytest.raises(formal.Stage1S19FormalError, match="SCHEMA_VALIDATION_FAILED:upstream_compatibility"):
         formal._validate_s1_9_schemas(ROOT, {"upstream_compatibility": old_wire})
 
 
-def test_s19_s18_pre_v7_handoffs_are_rejected_before_consumption(tmp_path: Path) -> None:
-    formal = _module(ROOT / "ops" / "stage1" / "formalize_s1_9.py", "s19_reject_s18_pre_v7")
+def test_s19_s18_pre_v8_handoffs_are_rejected_before_consumption(tmp_path: Path) -> None:
+    formal = _module(ROOT / "ops" / "stage1" / "formalize_s1_9.py", "s19_reject_s18_pre_v8")
     index = tmp_path / "s18" / "index.json"; index.parent.mkdir()
-    for schema_version in ("stage1-s1-8-formalization-index-v3", "stage1-s1-8-formalization-index-v5", "stage1-s1-8-formalization-index-v6"):
+    for schema_version in ("stage1-s1-8-formalization-index-v3", "stage1-s1-8-formalization-index-v5", "stage1-s1-8-formalization-index-v6", "stage1-s1-8-formalization-index-v7"):
         write_canonical_json(index, {"schema_version": schema_version})
-        with pytest.raises(formal.Stage1S19FormalError, match="S1_9_S1_8_V7_INDEX_REQUIRED"):
-            formal._s1_8_v7_handoff_attestation(tmp_path, "s18/index.json", {})
+        with pytest.raises(formal.Stage1S19FormalError, match="S1_9_S1_8_V8_INDEX_REQUIRED"):
+            formal._s1_8_v8_handoff_attestation(tmp_path, "s18/index.json", {})
 
 
 def test_s19_shared_runtime_drift_fails_closed_without_current_source_replay(
@@ -959,7 +963,7 @@ def test_s19_execute_persists_strict_prelease_gpu_failure_before_any_lease(
     def run_failure(attempt_id: str, record: object) -> Path:
         monkeypatch.setattr(formal, "_gpu_quiescence", lambda *_args, **_kwargs: record)
         with pytest.raises(formal.Stage1S19FormalError, match="S1_9_GPU_PRELEASE_FAILED"):
-            formal.execute(repository=ROOT, data_root=tmp_path, s1_7_index_ref="s1-7/index.json", s1_8_index_ref="s1-8/index.json", s1_8_binding={"index_sha256": digest, "index_artifact_hash": digest, "gate_artifact_hash": digest, "producer_commit": commit, "schema_version": "stage1-s1-8-formalization-index-v7", "task_id": "stage1.08_ddp_and_gradient_accumulation", "gate_id": "G1-DDP"}, gpu_capability_ref="capability.json", capability_binding={"task_id": "x", "artifact_kind": "x", "artifact_hash": digest, "config_hash": digest}, approved_gpu_uuids=GPU_UUIDS, attempt_id=attempt_id, lease_owner="test")
+            formal.execute(repository=ROOT, data_root=tmp_path, s1_7_index_ref="s1-7/index.json", s1_8_index_ref="s1-8/index.json", s1_8_binding={"index_sha256": digest, "index_artifact_hash": digest, "gate_artifact_hash": digest, "producer_commit": commit, "schema_version": "stage1-s1-8-formalization-index-v8", "task_id": "stage1.08_ddp_and_gradient_accumulation", "gate_id": "G1-DDP"}, gpu_capability_ref="capability.json", capability_binding={"task_id": "x", "artifact_kind": "x", "artifact_hash": digest, "config_hash": digest}, approved_gpu_uuids=GPU_UUIDS, attempt_id=attempt_id, lease_owner="test")
         return tmp_path / "tmp" / "stage1-s1-9" / commit / attempt_id / "prelease-gpu.json"
 
     hard_path = run_failure("prelease-hard", quiescence(reason="S1_9_GPU_COMPUTE_PROCESS_PRESENT:" + GPU_UUIDS[0] + ":73"))
