@@ -1,0 +1,66 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://parameter-importance.local/schemas/stage1/s1-9-precision-fixture-v1.json",
+  "type": "object",
+  "const": {
+    "schema_version": "stage1-s19-precision-fixture-v1",
+    "fixture_id": "stage1-s19-precision-fixture-v1",
+    "coordinates": {"w": [1.5, -0.5], "b": [0.25]},
+    "micro_gradients": [
+      {"w": [3.0, -1.0], "b": [2.0]},
+      {"w": [-1.0, 4.0], "b": [-4.0]},
+      {"w": [-2.0, 2.0], "b": [4.0]}
+    ],
+    "loss_scales": [2.0, 8.0, 32.0],
+    "learning_rates": {"w": 0.1, "b": 0.05},
+    "statistical_weights": [1.0, 2.0, 4.0],
+    "mixed_magnitude_gradients": {"stable_norm": [1e20, -1e20, 1e-20], "expected_fp32_second_moment_nonfinite": true},
+    "autocast_regression": {
+      "input_dim": 2,
+      "initial_weight": [0.0, 0.0],
+      "initial_bias": 0.0,
+      "microbatches": [
+        {"input": [1.5, -0.5], "target": -2.0},
+        {"input": [0.25, -1.0], "target": 4.0},
+        {"input": [-0.5, 0.5], "target": -4.0}
+      ],
+      "loss": "half_squared_error",
+      "autocast_dtype": "torch.bfloat16"
+    },
+    "clip": {"max_norm": 1.0, "eps": 1e-12, "near_zero_ratio": 1e-6},
+    "sgd": {"initial": [1.5, -0.5], "gradient": [0.25, -1.0], "learning_rate": 0.2},
+    "adamw": {
+      "initial": [1.0, -2.0],
+      "gradient": [0.5, -0.25],
+      "learning_rate": 0.1,
+      "betas": [0.9, 0.999],
+      "eps": 1e-8,
+      "weight_decay": 0.01,
+      "priming_gradient": [-0.75, 0.5]
+    },
+    "bf16": {"device_type": "cuda", "autocast_dtype": "torch.bfloat16", "statistics_dtype": "torch.float32"},
+    "fixture_hash": "3f0cc79bc6de8837c015a3c74f21bfa7aa2d3114dd4fb9cb036a9e1b9bd18dfd"
+  },
+  "required": ["schema_version", "fixture_id", "coordinates", "micro_gradients", "loss_scales", "learning_rates", "statistical_weights", "mixed_magnitude_gradients", "autocast_regression", "clip", "sgd", "adamw", "bf16", "fixture_hash"],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {"const": "stage1-s19-precision-fixture-v1"},
+    "fixture_id": {"const": "stage1-s19-precision-fixture-v1"},
+    "coordinates": {"$ref": "#/$defs/vectors"},
+    "micro_gradients": {"type": "array", "minItems": 3, "maxItems": 3, "items": {"$ref": "#/$defs/vectors"}},
+    "loss_scales": {"const": [2.0, 8.0, 32.0]},
+    "learning_rates": {"$ref": "#/$defs/positive_number_map"},
+    "statistical_weights": {"type": "array", "minItems": 3, "maxItems": 3, "items": {"type": "number", "exclusiveMinimum": 0}},
+    "mixed_magnitude_gradients": {"type": "object", "required": ["stable_norm", "expected_fp32_second_moment_nonfinite"], "additionalProperties": false, "properties": {"stable_norm": {"type": "array", "minItems": 3, "maxItems": 3, "items": {"type": "number"}}, "expected_fp32_second_moment_nonfinite": {"const": true}}},
+    "autocast_regression": {"type": "object", "required": ["input_dim", "initial_weight", "initial_bias", "microbatches", "loss", "autocast_dtype"], "additionalProperties": false, "properties": {"input_dim": {"const": 2}, "initial_weight": {"type": "array", "minItems": 2, "maxItems": 2, "items": {"type": "number"}}, "initial_bias": {"type": "number"}, "microbatches": {"type": "array", "minItems": 3, "maxItems": 3, "items": {"type": "object", "required": ["input", "target"], "additionalProperties": false, "properties": {"input": {"type": "array", "minItems": 2, "maxItems": 2, "items": {"type": "number"}}, "target": {"type": "number"}}}}, "loss": {"const": "half_squared_error"}, "autocast_dtype": {"const": "torch.bfloat16"}}},
+    "clip": {"type": "object", "required": ["max_norm", "eps", "near_zero_ratio"], "additionalProperties": false, "properties": {"max_norm": {"type": "number", "minimum": 0}, "eps": {"type": "number", "exclusiveMinimum": 0}, "near_zero_ratio": {"type": "number", "exclusiveMinimum": 0, "maximum": 1}}},
+    "sgd": {"type": "object", "required": ["initial", "gradient", "learning_rate"], "additionalProperties": false, "properties": {"initial": {"type": "array", "minItems": 2, "maxItems": 2, "items": {"type": "number"}}, "gradient": {"type": "array", "minItems": 2, "maxItems": 2, "items": {"type": "number"}}, "learning_rate": {"type": "number", "exclusiveMinimum": 0}}},
+    "adamw": {"type": "object", "required": ["initial", "gradient", "learning_rate", "betas", "eps", "weight_decay", "priming_gradient"], "additionalProperties": false, "properties": {"initial": {"type": "array", "minItems": 2, "maxItems": 2, "items": {"type": "number"}}, "gradient": {"type": "array", "minItems": 2, "maxItems": 2, "items": {"type": "number"}}, "learning_rate": {"type": "number", "exclusiveMinimum": 0}, "betas": {"type": "array", "prefixItems": [{"type": "number", "exclusiveMinimum": 0, "exclusiveMaximum": 1}, {"type": "number", "exclusiveMinimum": 0, "exclusiveMaximum": 1}], "minItems": 2, "maxItems": 2}, "eps": {"type": "number", "exclusiveMinimum": 0}, "weight_decay": {"type": "number", "minimum": 0}, "priming_gradient": {"type": "array", "minItems": 2, "maxItems": 2, "items": {"type": "number"}}}},
+    "bf16": {"type": "object", "required": ["device_type", "autocast_dtype", "statistics_dtype"], "additionalProperties": false, "properties": {"device_type": {"const": "cuda"}, "autocast_dtype": {"const": "torch.bfloat16"}, "statistics_dtype": {"const": "torch.float32"}}},
+    "fixture_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+  },
+  "$defs": {
+    "vectors": {"type": "object", "required": ["w", "b"], "additionalProperties": false, "properties": {"w": {"type": "array", "minItems": 2, "maxItems": 2, "items": {"type": "number"}}, "b": {"type": "array", "minItems": 1, "maxItems": 1, "items": {"type": "number"}}}},
+    "positive_number_map": {"type": "object", "required": ["w", "b"], "additionalProperties": false, "properties": {"w": {"type": "number", "exclusiveMinimum": 0}, "b": {"type": "number", "exclusiveMinimum": 0}}}
+  }
+}

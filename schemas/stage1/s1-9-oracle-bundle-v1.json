@@ -1,0 +1,22 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://parameter-importance.local/schemas/stage1/s1-9-oracle-bundle-v1.json",
+  "type": "object",
+  "required": ["schema_version", "fixture_id", "independent_implementation", "statistics", "loss_scale_contract", "clip", "optimizer", "oracle_hash"],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {"const": "stage1-s1-9-oracle-bundle-v1"}, "fixture_id": {"const": "stage1-s19-precision-fixture-v1"},
+    "independent_implementation": {"type": "object", "required": ["formal_estimator_imported", "runtime_or_optimizer_imported", "arithmetic"], "additionalProperties": false, "properties": {"formal_estimator_imported": {"const": false}, "runtime_or_optimizer_imported": {"const": false}, "arithmetic": {"const": "python_fp64_scalar_loops"}}},
+    "statistics": {"$ref": "#/$defs/statistics"}, "loss_scale_contract": {"$ref": "#/$defs/loss_scale_contract"}, "clip": {"$ref": "#/$defs/clip"}, "optimizer": {"$ref": "#/$defs/optimizer"}, "oracle_hash": {"$ref": "#/$defs/hash"}
+  },
+  "$defs": {
+    "hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "vector": {"type": "array", "minItems": 1, "items": {"type": "number"}},
+    "tensor_map": {"type": "object", "required": ["w", "b"], "additionalProperties": false, "properties": {"w": {"$ref": "#/$defs/vector"}, "b": {"$ref": "#/$defs/vector"}}},
+    "statistics": {"type": "object", "required": ["mean_gradient", "s1", "s2", "g1", "g2", "raw_core", "u_core", "weighted_mean_gradient", "weighted_raw_core", "weighted_u_core", "raw_score", "u_score", "weighted_raw_score", "weighted_u_score"], "additionalProperties": false, "properties": {"mean_gradient": {"$ref": "#/$defs/tensor_map"}, "s1": {"$ref": "#/$defs/tensor_map"}, "s2": {"$ref": "#/$defs/tensor_map"}, "g1": {"$ref": "#/$defs/tensor_map"}, "g2": {"$ref": "#/$defs/tensor_map"}, "raw_core": {"$ref": "#/$defs/tensor_map"}, "u_core": {"$ref": "#/$defs/tensor_map"}, "weighted_mean_gradient": {"$ref": "#/$defs/tensor_map"}, "weighted_raw_core": {"$ref": "#/$defs/tensor_map"}, "weighted_u_core": {"$ref": "#/$defs/tensor_map"}, "raw_score": {"$ref": "#/$defs/tensor_map"}, "u_score": {"$ref": "#/$defs/tensor_map"}, "weighted_raw_score": {"$ref": "#/$defs/tensor_map"}, "weighted_u_score": {"$ref": "#/$defs/tensor_map"}}},
+    "loss_scale_contract": {"type": "object", "required": ["scales", "unscaled_statistics_equal", "negative_control_scales_quadratically"], "additionalProperties": false, "properties": {"scales": {"type": "array", "minItems": 3, "maxItems": 3, "uniqueItems": true, "items": {"type": "number", "exclusiveMinimum": 0}}, "unscaled_statistics_equal": {"const": true}, "negative_control_scales_quadratically": {"const": true}}},
+    "clip": {"type": "object", "required": ["global_norm", "clip_factor", "u_clipped_score", "u_wrong_squared_factor"], "additionalProperties": false, "properties": {"global_norm": {"type": "number", "exclusiveMinimum": 0}, "clip_factor": {"type": "number", "exclusiveMinimum": 0, "maximum": 1}, "u_clipped_score": {"$ref": "#/$defs/tensor_map"}, "u_wrong_squared_factor": {"$ref": "#/$defs/tensor_map"}}},
+    "adamw_case": {"type": "object", "required": ["data_delta", "weight_decay_delta", "total_delta", "exp_avg", "exp_avg_sq", "step"], "additionalProperties": false, "properties": {"data_delta": {"$ref": "#/$defs/vector"}, "weight_decay_delta": {"$ref": "#/$defs/vector"}, "total_delta": {"$ref": "#/$defs/vector"}, "exp_avg": {"$ref": "#/$defs/vector"}, "exp_avg_sq": {"$ref": "#/$defs/vector"}, "step": {"type": "integer", "minimum": 1}}},
+    "optimizer": {"type": "object", "required": ["sgd_data_delta", "adamw", "actual_update_uses_negative_data_delta_times_current_gradient"], "additionalProperties": false, "properties": {"sgd_data_delta": {"$ref": "#/$defs/vector"}, "adamw": {"type": "object", "required": ["fresh", "primed_after_parameter_reset", "current_gradient"], "additionalProperties": false, "properties": {"fresh": {"$ref": "#/$defs/adamw_case"}, "primed_after_parameter_reset": {"$ref": "#/$defs/adamw_case"}, "current_gradient": {"$ref": "#/$defs/vector"}}}, "actual_update_uses_negative_data_delta_times_current_gradient": {"$ref": "#/$defs/vector"}}}
+  }
+}

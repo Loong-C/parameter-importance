@@ -1,0 +1,140 @@
+{
+  "schema_version": "stage1-s19-precision-fixture-v1",
+  "fixture_id": "stage1-s19-precision-fixture-v1",
+  "coordinates": {
+    "w": [
+      1.5,
+      -0.5
+    ],
+    "b": [
+      0.25
+    ]
+  },
+  "micro_gradients": [
+    {
+      "w": [
+        3.0,
+        -1.0
+      ],
+      "b": [
+        2.0
+      ]
+    },
+    {
+      "w": [
+        -1.0,
+        4.0
+      ],
+      "b": [
+        -4.0
+      ]
+    },
+    {
+      "w": [
+        -2.0,
+        2.0
+      ],
+      "b": [
+        4.0
+      ]
+    }
+  ],
+  "loss_scales": [
+    2.0,
+    8.0,
+    32.0
+  ],
+  "learning_rates": {
+    "w": 0.1,
+    "b": 0.05
+  },
+  "statistical_weights": [
+    1.0,
+    2.0,
+    4.0
+  ],
+  "mixed_magnitude_gradients": {
+    "stable_norm": [
+      1e+20,
+      -1e+20,
+      1e-20
+    ],
+    "expected_fp32_second_moment_nonfinite": true
+  },
+  "autocast_regression": {
+    "input_dim": 2,
+    "initial_weight": [
+      0.0,
+      0.0
+    ],
+    "initial_bias": 0.0,
+    "microbatches": [
+      {
+        "input": [
+          1.5,
+          -0.5
+        ],
+        "target": -2.0
+      },
+      {
+        "input": [
+          0.25,
+          -1.0
+        ],
+        "target": 4.0
+      },
+      {
+        "input": [
+          -0.5,
+          0.5
+        ],
+        "target": -4.0
+      }
+    ],
+    "loss": "half_squared_error",
+    "autocast_dtype": "torch.bfloat16"
+  },
+  "clip": {
+    "max_norm": 1.0,
+    "eps": 1e-12,
+    "near_zero_ratio": 1e-06
+  },
+  "sgd": {
+    "initial": [
+      1.5,
+      -0.5
+    ],
+    "gradient": [
+      0.25,
+      -1.0
+    ],
+    "learning_rate": 0.2
+  },
+  "adamw": {
+    "initial": [
+      1.0,
+      -2.0
+    ],
+    "gradient": [
+      0.5,
+      -0.25
+    ],
+    "learning_rate": 0.1,
+    "betas": [
+      0.9,
+      0.999
+    ],
+    "eps": 1e-08,
+    "weight_decay": 0.01,
+    "priming_gradient": [
+      -0.75,
+      0.5
+    ]
+  },
+  "bf16": {
+    "device_type": "cuda",
+    "autocast_dtype": "torch.bfloat16",
+    "statistics_dtype": "torch.float32"
+  },
+  "fixture_hash": "3f0cc79bc6de8837c015a3c74f21bfa7aa2d3114dd4fb9cb036a9e1b9bd18dfd"
+}

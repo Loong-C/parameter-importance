@@ -48,7 +48,14 @@ def compute_global_clip_factor(
         if not math.isfinite(max_norm) or max_norm < 0.0:
             raise ValueError("CLIP_MAX_NORM_MUST_BE_FINITE_NONNEGATIVE")
 
-    total = torch.zeros((), dtype=torch.float64)
+    # Do not seed an accumulator on CPU and then add a CUDA scalar to it.
+    # Besides being an immediate device-mismatch on the production BF16 path,
+    # selecting the first gradient's device would make a mixed-device caller
+    # depend on iteration order.  Each reduction is explicitly FP64 on the
+    # source tensor's device and ``math.fsum`` owns the host scalar merge.
+    # This retains the empty-map result (norm zero) and the per-tensor finite
+    # failure boundary while making the contract device independent.
+    sum_squares: list[float] = []
     for name, gradient in gradients.items():
         if gradient is None:
             continue
@@ -58,8 +65,8 @@ def compute_global_clip_factor(
             raise TypeError("SPARSE_GRADIENT_UNSUPPORTED")
         if not bool(torch.isfinite(gradient).all()):
             raise ValueError(f"NONFINITE_GRADIENT:{name}")
-        total += gradient.detach().to(dtype=torch.float64).square().sum()
-    norm = math.sqrt(float(total.item()))
+        sum_squares.append(float(gradient.detach().to(dtype=torch.float64).square().sum().item()))
+    norm = math.sqrt(math.fsum(sum_squares))
     if not math.isfinite(norm):  # 前述逐张量检查后的防御性总量边界。
         raise ValueError("NONFINITE_GLOBAL_GRADIENT_NORM")
     if max_norm is None:
