@@ -523,7 +523,7 @@ def execute(*, repository: Path, evidence_root: Path, attempt_root: Path, depend
     worklog = _validate_bound_file(evidence_root, _load_config(worklog_binding_path, field="worklog_binding"), field="worklog")
     if not isinstance(dependencies, list) or not isinstance(matrix, list):
         raise Stage1S111FormalError("S1_11_INPUT_LIST_INVALID")
-    target = evidence_root / "stage1" / "s1-11-formal" / execution_commit / attempt_id
+    target = evidence_root / "evidence" / "stage1" / "s1-11-formal" / execution_commit / attempt_id
     work = attempt_root / "stage1-s1-11" / attempt_id
     if target.exists() or work.exists():
         raise Stage1S111FormalError("S1_11_ATTEMPT_TARGET_EXISTS")
