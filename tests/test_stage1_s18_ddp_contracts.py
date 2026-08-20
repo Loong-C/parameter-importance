@@ -1433,6 +1433,12 @@ def test_real_linux_procfs_owner_exit_transition_is_known_member_only(monkeypatc
             audit = formalizer._audit_exact_process_group(expected, known_members={pid: expected})
             assert audit["member_pids"] == [pid]
             process.wait(timeout=2)
+        # The positive R path deliberately restored real procfs after reaping
+        # the child.  The following independent negative instead needs the
+        # original still-observable owner-transition snapshot: it proves that
+        # the same transition is rejected when no prior attestation exists.
+        monkeypatch.setattr(formalizer, "_token_process_ids", lambda _: [pid])
+        monkeypatch.setattr(formalizer, "_session_members", lambda _sid: [pid])
         with pytest.raises(formalizer.Stage1S18ManualInterventionRequired):
             formalizer._audit_exact_process_group(expected, known_members={})
     finally:
