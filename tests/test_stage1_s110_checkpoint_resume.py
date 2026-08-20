@@ -108,6 +108,12 @@ class _ScalarModel(torch.nn.Module):
         self.weight = torch.nn.Parameter(torch.tensor([1.0], dtype=torch.float32))
 
 
+def test_s110_checkpoint_state_hash_supports_zero_dim_optimizer_steps() -> None:
+    scalar = torch.tensor(2.0, dtype=torch.float32)
+    assert checkpoint_state_sha256(scalar) == checkpoint_state_sha256(scalar.clone())
+    assert checkpoint_state_sha256(scalar) != checkpoint_state_sha256(scalar.reshape(1))
+
+
 class _InjectedNonfiniteGradient(torch.autograd.Function):
     """Keep loss wire-finite while exercising TrainingEngine's grad preflight."""
 

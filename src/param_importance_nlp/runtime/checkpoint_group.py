@@ -46,7 +46,7 @@ def _update_state_hash(digest: Any, value: Any) -> None:
         digest.update(str(tensor.dtype).encode("ascii"))
         digest.update(b"\0")
         digest.update(stable_json_bytes(list(tensor.shape)))
-        digest.update(tensor.view(torch.uint8).numpy().tobytes(order="C"))
+        digest.update(tensor.reshape(-1).view(torch.uint8).numpy().tobytes(order="C"))
         return
     if isinstance(value, np.ndarray):
         array = np.ascontiguousarray(value)
