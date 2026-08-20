@@ -584,8 +584,9 @@ def test_rank_contract_route_a_requires_one_full_batch_gradient_checksum() -> No
 def test_formal_chart_exports_have_five_csv_data_projections_and_no_a_u_reference(tmp_path: Path) -> None:
     formalizer = _formalizer()
     numeric = {"comparison": "equal:A:a_reference:raw_core", "parameter": "p", "near_zero_branch": False, "natural_scale": 1.0, "near_zero_threshold": 0.0, "absolute_threshold": 0.0, "max_abs_error": 0.0, "max_scaled_error": 0.25, "normalized_l2_error": 0.1, "candidate_dtype": "torch.float32", "reference_dtype": "torch.float64", "within_t32_distributed": True}
+    near_zero = {**numeric, "comparison": "equal:A:a_reference:exp_avg_sq", "parameter": "exp_avg_sq", "near_zero_branch": True, "normalized_l2_error": None}
     step = {"comparison": "equal:A:optimizer_state:step", "parameter": "p", "expected_step": 1, "observed": 1.0, "exact_equality": True, "within_t32_distributed": True}
-    replay = {"comparison_rows": [numeric, step]}
+    replay = {"comparison_rows": [numeric, near_zero, step]}
     arrays = {}
     for route in ("A", "B", "C", "D"):
         prefix = "a-reference/equal" if route == "A" else "scores/equal"
@@ -599,19 +600,59 @@ def test_formal_chart_exports_have_five_csv_data_projections_and_no_a_u_referenc
         text = (tmp_path / svg).read_text(encoding="utf-8")
         assert "data-source=" in text and "data-value=" in text
         assert "A U" not in text
-    assert len((tmp_path / "error-heatmap.csv").read_text(encoding="utf-8").splitlines()) == 2
+    assert len((tmp_path / "error-heatmap.csv").read_text(encoding="utf-8").splitlines()) == 3
     assert len((tmp_path / "error-series.csv").read_text(encoding="utf-8").splitlines()) == 2
+    assert "exp_avg_sq" not in (tmp_path / "error-series.csv").read_text(encoding="utf-8")
 
 
 def test_chart_numeric_projection_excludes_only_complete_step_rows_and_rejects_partial_rows() -> None:
     formalizer = _formalizer()
     numeric = {"comparison": "equal:B:raw", "parameter": "p", "near_zero_branch": False, "natural_scale": 1.0, "near_zero_threshold": 0.0, "absolute_threshold": 0.0, "max_abs_error": 0.0, "max_scaled_error": 0.25, "normalized_l2_error": 0.1, "candidate_dtype": "torch.float32", "reference_dtype": "torch.float64", "within_t32_distributed": True}
+    near_zero = {**numeric, "parameter": "exp_avg_sq", "near_zero_branch": True, "normalized_l2_error": None}
     step = {"comparison": "equal:B:optimizer_state:step", "parameter": "p", "expected_step": 1, "observed": 1.0, "exact_equality": True, "within_t32_distributed": True}
-    assert formalizer._chart_numeric_comparison_rows([numeric, step]) == [numeric]
+    assert formalizer._chart_numeric_comparison_rows([numeric, near_zero, step]) == ([numeric, near_zero], [numeric])
     partial = dict(numeric); del partial["max_scaled_error"]
-    for rows, marker in (([partial], "comparison-row:0"), ([{**step, "unexpected": 1}], "comparison-row:0"), ([step], "heatmap")):
+    wrong_near_zero = {**near_zero, "normalized_l2_error": 0.0}
+    wrong_nonzero = {**numeric, "normalized_l2_error": None}
+    for rows, marker in (([partial], "comparison-row:0"), ([{**step, "unexpected": 1}], "comparison-row:0"), ([step], "heatmap"), ([near_zero], "series.l2"), ([wrong_near_zero], "comparison-row:0:near-zero-l2-contract"), ([wrong_nonzero], "comparison-row:0:near-zero-l2-contract")):
         with pytest.raises(formalizer.Stage1S18FormalError, match="S18_CHART_NUMERIC_INVALID:" + marker):
             formalizer._chart_numeric_comparison_rows(rows)
+
+
+def test_chart_projection_accepts_complete_r14_numeric_domain_without_fabricating_l2() -> None:
+    """The r14 artifact had 26,352 finite and 1,768 near-zero-null rows."""
+
+    formalizer = _formalizer()
+    finite = {"comparison": "equal:A:B:peer_post_parameters", "parameter": "p", "near_zero_branch": False, "natural_scale": 1.0, "near_zero_threshold": 0.0, "absolute_threshold": 0.0, "max_abs_error": 0.0, "max_scaled_error": 0.25, "normalized_l2_error": 0.1, "candidate_dtype": "torch.float32", "reference_dtype": "torch.float64", "within_t32_distributed": True}
+    near_zero = {**finite, "parameter": "exp_avg_sq", "near_zero_branch": True, "normalized_l2_error": None}
+    heatmap, l2_series = formalizer._chart_numeric_comparison_rows([finite] * 26352 + [near_zero] * 1768)
+    assert len(heatmap) == 28120
+    assert len(l2_series) == 26352
+
+
+def test_replay_v3_and_comparison_table_v2_bind_near_zero_l2_nulls_fail_closed() -> None:
+    formalizer = _formalizer()
+    tensor = {"near_zero_branch": True, "natural_scale": 1.0, "near_zero_threshold": 0.0, "absolute_threshold": 0.0, "max_abs_error": 0.0, "max_scaled_error": 0.0, "normalized_l2_error": None, "candidate_dtype": "torch.float32", "reference_dtype": "torch.float64", "within_t32_distributed": True}
+    row = {"comparison": "equal:A:B:peer_exp_avg_sq", "parameter": "exp_avg_sq", **tensor}
+    check = {"max_abs_error": 0.0, "worst_parameter": "exp_avg_sq", "worst_index": [], "normalized_l2_error": None, "near_zero_object_count": 1, "violation_count": 0, "within_t32_distributed": True, "per_tensor": {"exp_avg_sq": tensor}}
+    scalar = {"expected_fp64": 1.0, "observed": 1.0, "absolute_error": 0.0, "within_t32_distributed": True}
+    replay = formalizer._with_hash({"schema_version": "stage1-s1-8-replay-validation-v3", "status": "PASS", "fixture_schema_version": "stage1-s1-8-fixture-manifest-v3", "fixture_id": "stage1-s1-8-pythia14m-ddp-conditioned-v3", "oracle_import_isolated": True, "oracle_reference_dtype": "torch.float64", "production_candidate_dtype": "torch.float32", "checks": {"peer": check}, "scalar_checks": {"scale": scalar}, "comparison_rows": [row]})
+    table = formalizer._with_hash({"schema_version": "stage1-s1-8-comparison-table-v2", "status": "PASS", "rows": [row]})
+    formalizer._validate_output_schemas(Path("."), {"replay": replay, "comparison_table": table})
+    assert formalizer._schema_prepublication_check(Path("."), {"replay": replay, "comparison_table": table}) is True
+    for bad_row in ({**row, "normalized_l2_error": 0.0}, {**row, "near_zero_branch": False}):
+        bad = dict(replay)
+        bad.pop("artifact_hash")
+        bad["comparison_rows"] = [bad_row]
+        bad = formalizer._with_hash(bad)
+        with pytest.raises(formalizer.Stage1S18FormalError, match="S18_SCHEMA_VALIDATION_FAILED:replay"):
+            formalizer._validate_output_schemas(Path("."), {"replay": bad})
+    bad_table = formalizer._with_hash({"schema_version": "stage1-s1-8-comparison-table-v2", "status": "PASS", "rows": [{**row, "near_zero_branch": False}]})
+    with pytest.raises(formalizer.Stage1S18FormalError, match="S18_SCHEMA_VALIDATION_FAILED:comparison_table"):
+        formalizer._validate_output_schemas(Path("."), {"comparison_table": bad_table})
+    legacy_table = formalizer._with_hash({"schema_version": "stage1-s1-8-comparison-table-v1", "status": "PASS", "rows": [row]})
+    with pytest.raises(formalizer.Stage1S18FormalError, match="S18_SCHEMA_VALIDATION_FAILED:comparison_table"):
+        formalizer._validate_output_schemas(Path("."), {"comparison_table": legacy_table})
 
 
 def test_strict_fixture_and_gate_schemas_reject_nested_unknown_missing_and_cardinality() -> None:
@@ -1967,15 +2008,15 @@ def test_implementation_source_map_is_exact_full_production_closure() -> None:
     formalizer = _formalizer()
     sources = formalizer._implementation_source_map(Path("."))
     assert set(sources) == set(formalizer.IMPLEMENTATION_SOURCE_FILES)
-    assert len(sources) == 48
+    assert len(sources) == 53
     assert "src/param_importance_nlp/runtime/optimizer.py" not in sources
     assert "src/param_importance_nlp/contracts/errors.py" in sources
     assert set(name for name in sources if name.startswith("schemas/stage1/s1-8-")) == {
-        "schemas/stage1/s1-8-array-bundle-v1.json", "schemas/stage1/s1-8-comparison-table-v1.json",
-        "schemas/stage1/s1-8-ddp-report-v1.json", "schemas/stage1/s1-8-ddp-report-v2.json", "schemas/stage1/s1-8-ddp-report-v3.json", "schemas/stage1/s1-8-ddp-report-v4.json", "schemas/stage1/s1-8-ddp-report-v5.json", "schemas/stage1/s1-8-fixture-manifest-v1.json", "schemas/stage1/s1-8-fixture-manifest-v2.json", "schemas/stage1/s1-8-fixture-manifest-v3.json",
-        "schemas/stage1/s1-8-formalization-index-v1.json", "schemas/stage1/s1-8-formalization-index-v2.json", "schemas/stage1/s1-8-formalization-index-v3.json", "schemas/stage1/s1-8-formalization-index-v4.json", "schemas/stage1/s1-8-formalization-index-v5.json", "schemas/stage1/s1-8-gate-record-v1.json", "schemas/stage1/s1-8-gpu-quiescence-v1.json", "schemas/stage1/s1-8-gpu-quiescence-v2.json", "schemas/stage1/s1-8-gpu-quiescence-v3.json",
-        "schemas/stage1/s1-8-replay-validation-v1.json", "schemas/stage1/s1-8-replay-validation-v2.json", "schemas/stage1/s1-8-safetensors-manifest-v1.json",
-        "schemas/stage1/s1-8-validation-v1.json", "schemas/stage1/s1-8-validation-v2.json", "schemas/stage1/s1-8-validation-v3.json", "schemas/stage1/s1-8-validation-v4.json", "schemas/stage1/s1-8-validation-v5.json", "schemas/stage1/s1-8-worker-report-v1.json",
+        "schemas/stage1/s1-8-array-bundle-v1.json", "schemas/stage1/s1-8-comparison-table-v1.json", "schemas/stage1/s1-8-comparison-table-v2.json",
+        "schemas/stage1/s1-8-ddp-report-v1.json", "schemas/stage1/s1-8-ddp-report-v2.json", "schemas/stage1/s1-8-ddp-report-v3.json", "schemas/stage1/s1-8-ddp-report-v4.json", "schemas/stage1/s1-8-ddp-report-v5.json", "schemas/stage1/s1-8-ddp-report-v6.json", "schemas/stage1/s1-8-fixture-manifest-v1.json", "schemas/stage1/s1-8-fixture-manifest-v2.json", "schemas/stage1/s1-8-fixture-manifest-v3.json",
+        "schemas/stage1/s1-8-formalization-index-v1.json", "schemas/stage1/s1-8-formalization-index-v2.json", "schemas/stage1/s1-8-formalization-index-v3.json", "schemas/stage1/s1-8-formalization-index-v4.json", "schemas/stage1/s1-8-formalization-index-v5.json", "schemas/stage1/s1-8-formalization-index-v6.json", "schemas/stage1/s1-8-gate-record-v1.json", "schemas/stage1/s1-8-gpu-quiescence-v1.json", "schemas/stage1/s1-8-gpu-quiescence-v2.json", "schemas/stage1/s1-8-gpu-quiescence-v3.json",
+        "schemas/stage1/s1-8-replay-validation-v1.json", "schemas/stage1/s1-8-replay-validation-v2.json", "schemas/stage1/s1-8-replay-validation-v3.json", "schemas/stage1/s1-8-safetensors-manifest-v1.json",
+        "schemas/stage1/s1-8-validation-v1.json", "schemas/stage1/s1-8-validation-v2.json", "schemas/stage1/s1-8-validation-v3.json", "schemas/stage1/s1-8-validation-v4.json", "schemas/stage1/s1-8-validation-v5.json", "schemas/stage1/s1-8-validation-v6.json", "schemas/stage1/s1-8-worker-report-v1.json",
     }
     assert all(len(digest) == 64 and set(digest) <= set("0123456789abcdef") for digest in sources.values())
 
@@ -1986,7 +2027,7 @@ def test_implementation_source_map_rejects_schema_byte_drift() -> None:
     source_map = formalizer._implementation_source_map(repository)
     formalizer._validate_implementation_source_map(repository, source_map)
     drifted = dict(source_map)
-    source = "schemas/stage1/s1-8-formalization-index-v5.json"
+    source = "schemas/stage1/s1-8-formalization-index-v6.json"
     drifted[source] = "0" * 64 if source_map[source] != "0" * 64 else "1" * 64
     with pytest.raises(formalizer.Stage1S18FormalError, match="S18_CANDIDATE_SOURCE_MAP_BYTE_DRIFT"):
         formalizer._validate_implementation_source_map(repository, drifted)
@@ -2547,7 +2588,7 @@ def test_index_schema_strictly_freezes_full_s17_handoff_historical_binding() -> 
     }
     uuids = [f"GPU-{index:08x}-1111-2222-3333-444444444444" for index in range(4)]
     index = formalizer._with_hash({
-        "schema_version": "stage1-s1-8-formalization-index-v5", "status": "PASS", "gate_id": "G1-DDP", "task_id": "stage1.08_ddp_and_gradient_accumulation",
+        "schema_version": "stage1-s1-8-formalization-index-v6", "status": "PASS", "gate_id": "G1-DDP", "task_id": "stage1.08_ddp_and_gradient_accumulation",
         "generator_git_commit": "8" * 40, "consumer_git_commit": "8" * 40,
         "fixture_schema_version": "stage1-s1-8-fixture-manifest-v3", "fixture_id": "stage1-s1-8-pythia14m-ddp-conditioned-v3",
         "gpu_capability": {"commit_ref": "commit", "object_ref": "object", "task_id": "stage0.01_baseline_and_safety", "artifact_kind": "capability_cuda", "artifact_hash": formalizer.EXPECTED_GPU_CAPABILITY_ARTIFACT_HASH, "config_hash": "9" * 64, "source_refs": ["source"], "allowed_gpu_uuids": uuids}, "nccl_transport_protocol": formalizer._nccl_transport_protocol(),
@@ -2559,7 +2600,7 @@ def test_index_schema_strictly_freezes_full_s17_handoff_historical_binding() -> 
         "next_task_ids": ["stage1.10_checkpoint_resume_and_artifacts"],
     })
     formalizer._validate_output_schemas(Path("."), {"index": index})
-    for legacy_version in range(1, 5):
+    for legacy_version in range(1, 6):
         legacy = copy.deepcopy(index); legacy["schema_version"] = f"stage1-s1-8-formalization-index-v{legacy_version}"
         legacy["artifact_hash"] = formalizer._canonical({key: value for key, value in legacy.items() if key != "artifact_hash"})
         with pytest.raises(formalizer.Stage1S18FormalError, match="S18_SCHEMA_VALIDATION_FAILED:index"):
