@@ -217,12 +217,15 @@ def _exact_s111_index_closure(repository: Path, publication: Path, index: Mappin
     sources = index.get("implementation_source_sha256")
     refs, hashes = index.get("role_refs"), index.get("role_sha256")
     csv_hashes, svg_hashes = index.get("chart_csv_sha256"), index.get("chart_svg_sha256")
-    if not all(isinstance(value, Mapping) for value in (sources, refs, hashes, csv_hashes, svg_hashes)):
+    reproduction_refs, reproduction_hashes = index.get("reproduction_role_refs"), index.get("reproduction_role_sha256")
+    if not all(isinstance(value, Mapping) for value in (sources, refs, hashes, csv_hashes, svg_hashes, reproduction_refs, reproduction_hashes)):
         raise Stage1S111FormalError("S1_11_INDEX_CLOSURE_SHAPE_INVALID")
     if set(sources) != set(_IMPLEMENTATION_PATHS) or set(refs) != expected_roles or set(hashes) != expected_roles or set(csv_hashes) != expected_csv or set(svg_hashes) != expected_svg:
         raise Stage1S111FormalError("S1_11_INDEX_CLOSURE_KEYSET_INVALID")
     if dict(refs) != expected_role_refs:
         raise Stage1S111FormalError("S1_11_INDEX_ROLE_REF_WIRE_INVALID")
+    if set(reproduction_refs) != {"test_summary", "sync_audit", "large_artifact_manifest", "worklog"} or set(reproduction_hashes) != set(reproduction_refs) or reproduction_refs.get("large_artifact_manifest") != "large-artifact-manifest.json":
+        raise Stage1S111FormalError("S1_11_INDEX_REPRODUCTION_WIRE_INVALID")
     for path, digest in sources.items():
         if not _digest(digest) or _sha(repository / str(path)) != digest:
             raise Stage1S111FormalError("S1_11_INDEX_SOURCE_HASH_MISMATCH")
@@ -232,6 +235,8 @@ def _exact_s111_index_closure(repository: Path, publication: Path, index: Mappin
     for filename, digest in {**csv_hashes, **svg_hashes}.items():
         if not _digest(digest) or _sha(publication / str(filename)) != digest:
             raise Stage1S111FormalError("S1_11_INDEX_CHART_HASH_MISMATCH")
+    if not _digest(reproduction_hashes["large_artifact_manifest"]) or _sha(publication / "large-artifact-manifest.json") != reproduction_hashes["large_artifact_manifest"]:
+        raise Stage1S111FormalError("S1_11_INDEX_REPRODUCTION_HASH_MISMATCH")
 
 
 def _derived_report_context(root: Path, audits: list[Mapping[str, object]], sync: Mapping[str, object], worklog: Mapping[str, str]) -> dict[str, object]:
@@ -589,6 +594,11 @@ def execute(*, repository: Path, evidence_root: Path, attempt_root: Path, depend
         shutil.copy2(test_source, work / "test-summary.json")
         if _sha(work / "test-summary.json") != test_summary["sha256"]:
             raise Stage1S111FormalError("S1_11_TEST_SUMMARY_COPY_READBACK_MISMATCH")
+        sync_source = _relative(evidence_root, sync_audit["ref"], field="sync_audit")
+        manifest_source = _relative(sync_source.parent, sync_audit["large_artifact_manifest_ref"], field="large_artifact_manifest")
+        shutil.copy2(manifest_source, work / "large-artifact-manifest.json")
+        if _sha(work / "large-artifact-manifest.json") != sync_audit["large_artifact_manifest_sha256"]:
+            raise Stage1S111FormalError("S1_11_LARGE_ARTIFACT_MANIFEST_COPY_READBACK_MISMATCH")
         requirements = {"schema_version": "stage1-s1-11-requirements-matrix-v1", "task_id": TASK_ID, "gate_id": GATE_ID, "rows": matrix_rows}; requirements["artifact_hash"] = canonical_json_hash(requirements); _write(work / "requirements-matrix.json", requirements)
         top20 = _top_errors(evidence_root, dependencies)
         top20_body = {"schema_version": "stage1-s1-11-top-errors-v1", "rows": top20}; top20_body["artifact_hash"] = canonical_json_hash(top20_body); _write(work / "top-errors.json", top20_body)

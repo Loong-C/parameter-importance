@@ -814,12 +814,16 @@ def test_s111_index_closure_rejects_unknown_missing_and_same_count_substitutions
     }
     for filename in role_refs.values():
         (tmp_path / filename).write_text(filename, encoding="utf-8", newline="\n")
+    manifest = tmp_path / "large-artifact-manifest.json"
+    manifest.write_text("large-artifact-manifest.json", encoding="utf-8", newline="\n")
     index = {
         "implementation_source_sha256": {path: _sha(Path.cwd() / path) for path in formalizer._IMPLEMENTATION_PATHS},
         "role_refs": role_refs,
         "role_sha256": {role: _sha(tmp_path / filename) for role, filename in role_refs.items()},
         "chart_csv_sha256": {f"{chart_id}.csv": _sha(tmp_path / f"{chart_id}.csv") for chart_id in REQUIRED_CHARTS},
         "chart_svg_sha256": {f"{chart_id}.svg": _sha(tmp_path / f"{chart_id}.svg") for chart_id in REQUIRED_CHARTS},
+        "reproduction_role_refs": {"test_summary": "inputs/test-summary.json", "sync_audit": "inputs/sync-audit.json", "large_artifact_manifest": manifest.name, "worklog": "inputs/worklog.md"},
+        "reproduction_role_sha256": {"test_summary": "a" * 64, "sync_audit": "b" * 64, "large_artifact_manifest": _sha(manifest), "worklog": "c" * 64},
     }
     formalizer._exact_s111_index_closure(Path.cwd(), tmp_path, index)
     for field, wrong_key in (("implementation_source_sha256", "unknown/source.py"), ("role_refs", "unknown_role"), ("chart_csv_sha256", "unknown.csv"), ("chart_svg_sha256", "unknown.svg")):
@@ -840,6 +844,10 @@ def test_s111_index_closure_rejects_unknown_missing_and_same_count_substitutions
     swapped_ref["role_refs"]["gate_summary"] = "replay-validation.json"
     with pytest.raises(formalizer.Stage1S111FormalError, match="INDEX_ROLE_REF_WIRE_INVALID"):
         formalizer._exact_s111_index_closure(Path.cwd(), tmp_path, swapped_ref)
+    missing_reproduction = {key: (dict(value) if isinstance(value, dict) else value) for key, value in index.items()}
+    missing_reproduction["reproduction_role_refs"].pop("worklog")
+    with pytest.raises(formalizer.Stage1S111FormalError, match="INDEX_REPRODUCTION_WIRE_INVALID"):
+        formalizer._exact_s111_index_closure(Path.cwd(), tmp_path, missing_reproduction)
 
 
 def test_s111_report_context_is_derived_and_missing_upstream_is_fail_closed(tmp_path: Path) -> None:
