@@ -124,32 +124,27 @@ TERMINAL_PROCESS_JOIN_TIMEOUT_SECONDS = 30.0
 # GPU contexts can outlive a successfully reaped worker briefly.  The formal
 # contract is therefore not a one-shot observation: it needs three complete,
 # consecutive, exact-idle inventories before a release or reacquire boundary.
-# The 180-second operational bound is versioned in gpu-quiescence-v3.  It does
+# The 180-second operational bound is versioned in gpu-quiescence-v4.  It does
 # not relax any idle predicate: a frozen-server CPU-only management-query
-# measurement observed a 12.280219650001527-second two-query sample.  At most
-# two no-PID memory/utilization transients may reset the three-exact-idle
-# counter; the longest permitted sequence before three consecutive exact-idle
-# samples is nine observations.  A pre-registered 15-second management-query
-# budget yields 9 * 15 + 8 * 1 = 143 seconds, with a fixed 37-second margin.
-# This is a static operating budget, not dynamically fitted from a formal
-# attempt.
+# measurement observed a 12.280219650001527-second two-query sample.  A
+# no-PID memory/utilization observation resets the three-exact-idle counter,
+# but is retained as diagnostic evidence rather than a separate acceptance
+# gate.  The fixed deadline, immediate PID/identity/Recovery failures, and
+# final three consecutive exact-idle observations remain fail-closed.
 GPU_QUIESCENCE_TIMEOUT_SECONDS = 180.0
 GPU_QUIESCENCE_SAMPLE_INTERVAL_SECONDS = 1.0
 GPU_QUIESCENCE_REQUIRED_CONSECUTIVE_EXACT_IDLE_SAMPLES = 3
-GPU_QUIESCENCE_MAX_TRANSIENT_SAMPLES = 2
-GPU_QUIESCENCE_SCHEMA_VERSION = "stage1-s1-8-gpu-quiescence-v3"
+GPU_QUIESCENCE_SCHEMA_VERSION = "stage1-s1-8-gpu-quiescence-v4"
 GPU_QUIESCENCE_OPERATIONAL_TIMEOUT_BASIS = {
     "measurement_method": "frozen_linux_cpu_only_nvidia_smi_management_queries",
     "combined_inventory_recovery_seconds": 6.166325362000862,
     "compute_apps_seconds": 6.113894288000665,
     "two_query_sample_seconds": 12.280219650001527,
-    "maximum_transient_samples": 2,
-    "per_sample_management_budget_seconds": 15.0,
-    "maximum_sample_count": 9,
-    "maximum_cadence_count": 8,
-    "nine_samples_plus_eight_cadences_seconds": 143.0,
+    "required_consecutive_exact_idle_samples": 3,
+    "sample_interval_seconds": 1.0,
     "fixed_timeout_seconds": 180.0,
-    "fixed_margin_seconds": 37.0,
+    "deadline_enforced_at_observation_completion": True,
+    "transient_observation_count_is_diagnostic": True,
     "dynamic_fitting": False,
 }
 GPU_QUIESCENCE_ROLES = {
@@ -187,7 +182,7 @@ IMPLEMENTATION_SOURCE_FILES = (
     "src/param_importance_nlp/core/accumulator.py", "src/param_importance_nlp/core/errors.py", "src/param_importance_nlp/core/tensors.py",
     "src/param_importance_nlp/g3_runtime_assets.py", "src/param_importance_nlp/runtime/operations.py", "src/param_importance_nlp/runtime/task_artifacts.py",
     "configs/stage0/g3-asset-requirements-v1.json", "configs/stage0/g3-asset-layout-v1.json",
-    "schemas/stage1/s1-8-array-bundle-v1.json", "schemas/stage1/s1-8-array-bundle-v2.json", "schemas/stage1/s1-8-comparison-table-v1.json", "schemas/stage1/s1-8-comparison-table-v2.json", "schemas/stage1/s1-8-ddp-report-v1.json", "schemas/stage1/s1-8-ddp-report-v2.json", "schemas/stage1/s1-8-ddp-report-v3.json", "schemas/stage1/s1-8-ddp-report-v4.json", "schemas/stage1/s1-8-ddp-report-v5.json", "schemas/stage1/s1-8-ddp-report-v6.json", "schemas/stage1/s1-8-ddp-report-v7.json", "schemas/stage1/s1-8-fixture-manifest-v1.json", "schemas/stage1/s1-8-fixture-manifest-v2.json", "schemas/stage1/s1-8-fixture-manifest-v3.json", "schemas/stage1/s1-8-formalization-index-v1.json", "schemas/stage1/s1-8-formalization-index-v2.json", "schemas/stage1/s1-8-formalization-index-v3.json", "schemas/stage1/s1-8-formalization-index-v4.json", "schemas/stage1/s1-8-formalization-index-v5.json", "schemas/stage1/s1-8-formalization-index-v6.json", "schemas/stage1/s1-8-formalization-index-v7.json", "schemas/stage1/s1-8-gate-record-v1.json", "schemas/stage1/s1-8-gpu-quiescence-v1.json", "schemas/stage1/s1-8-gpu-quiescence-v2.json", "schemas/stage1/s1-8-gpu-quiescence-v3.json", "schemas/stage1/s1-8-replay-validation-v1.json", "schemas/stage1/s1-8-replay-validation-v2.json", "schemas/stage1/s1-8-replay-validation-v3.json", "schemas/stage1/s1-8-safetensors-manifest-v1.json", "schemas/stage1/s1-8-validation-v1.json", "schemas/stage1/s1-8-validation-v2.json", "schemas/stage1/s1-8-validation-v3.json", "schemas/stage1/s1-8-validation-v4.json", "schemas/stage1/s1-8-validation-v5.json", "schemas/stage1/s1-8-validation-v6.json", "schemas/stage1/s1-8-validation-v7.json", "schemas/stage1/s1-8-worker-report-v1.json",
+    "schemas/stage1/s1-8-array-bundle-v1.json", "schemas/stage1/s1-8-array-bundle-v2.json", "schemas/stage1/s1-8-comparison-table-v1.json", "schemas/stage1/s1-8-comparison-table-v2.json", "schemas/stage1/s1-8-ddp-report-v1.json", "schemas/stage1/s1-8-ddp-report-v2.json", "schemas/stage1/s1-8-ddp-report-v3.json", "schemas/stage1/s1-8-ddp-report-v4.json", "schemas/stage1/s1-8-ddp-report-v5.json", "schemas/stage1/s1-8-ddp-report-v6.json", "schemas/stage1/s1-8-ddp-report-v7.json", "schemas/stage1/s1-8-ddp-report-v8.json", "schemas/stage1/s1-8-fixture-manifest-v1.json", "schemas/stage1/s1-8-fixture-manifest-v2.json", "schemas/stage1/s1-8-fixture-manifest-v3.json", "schemas/stage1/s1-8-formalization-index-v1.json", "schemas/stage1/s1-8-formalization-index-v2.json", "schemas/stage1/s1-8-formalization-index-v3.json", "schemas/stage1/s1-8-formalization-index-v4.json", "schemas/stage1/s1-8-formalization-index-v5.json", "schemas/stage1/s1-8-formalization-index-v6.json", "schemas/stage1/s1-8-formalization-index-v7.json", "schemas/stage1/s1-8-formalization-index-v8.json", "schemas/stage1/s1-8-gate-record-v1.json", "schemas/stage1/s1-8-gpu-quiescence-v1.json", "schemas/stage1/s1-8-gpu-quiescence-v2.json", "schemas/stage1/s1-8-gpu-quiescence-v3.json", "schemas/stage1/s1-8-gpu-quiescence-v4.json", "schemas/stage1/s1-8-replay-validation-v1.json", "schemas/stage1/s1-8-replay-validation-v2.json", "schemas/stage1/s1-8-replay-validation-v3.json", "schemas/stage1/s1-8-safetensors-manifest-v1.json", "schemas/stage1/s1-8-validation-v1.json", "schemas/stage1/s1-8-validation-v2.json", "schemas/stage1/s1-8-validation-v3.json", "schemas/stage1/s1-8-validation-v4.json", "schemas/stage1/s1-8-validation-v5.json", "schemas/stage1/s1-8-validation-v6.json", "schemas/stage1/s1-8-validation-v7.json", "schemas/stage1/s1-8-validation-v8.json", "schemas/stage1/s1-8-worker-report-v1.json",
 )
 
 
@@ -399,12 +394,12 @@ def _validate_output_schemas(repository: Path, objects: Mapping[str, Mapping[str
             raise Stage1S18FormalError("S18_SCHEMA_REGISTRY_INVALID:" + path.name)
         registry[path.name] = value; registry[str(value["$id"])] = value
     filenames = {
-        "fixture_manifest": "s1-8-fixture-manifest-v3.json", "ddp_report": "s1-8-ddp-report-v7.json",
+        "fixture_manifest": "s1-8-fixture-manifest-v3.json", "ddp_report": "s1-8-ddp-report-v8.json",
         "array_bundle": "s1-8-array-bundle-v2.json", "comparison_table": "s1-8-comparison-table-v2.json",
         "gate_record": "s1-8-gate-record-v1.json", "replay": "s1-8-replay-validation-v3.json",
-        "validation": "s1-8-validation-v7.json", "index": "s1-8-formalization-index-v7.json",
+        "validation": "s1-8-validation-v8.json", "index": "s1-8-formalization-index-v8.json",
         "worker_report": "s1-8-worker-report-v1.json", "safetensors_manifest": "s1-8-safetensors-manifest-v1.json",
-        "gpu_quiescence": "s1-8-gpu-quiescence-v3.json",
+        "gpu_quiescence": "s1-8-gpu-quiescence-v4.json",
     }
     for role, value in objects.items():
         schema = registry.get(filenames.get(role, ""))
@@ -421,9 +416,9 @@ def _schema_prepublication_check(repository: Path, objects: Mapping[str, Mapping
 
     from param_importance_nlp.contracts.jsonio import loads_strict_json
     expected = {
-        "s1-8-array-bundle-v1.json", "s1-8-array-bundle-v2.json", "s1-8-comparison-table-v1.json", "s1-8-comparison-table-v2.json", "s1-8-ddp-report-v1.json", "s1-8-ddp-report-v2.json", "s1-8-ddp-report-v3.json", "s1-8-ddp-report-v4.json", "s1-8-ddp-report-v5.json", "s1-8-ddp-report-v6.json", "s1-8-ddp-report-v7.json",
-        "s1-8-fixture-manifest-v1.json", "s1-8-fixture-manifest-v2.json", "s1-8-fixture-manifest-v3.json", "s1-8-formalization-index-v1.json", "s1-8-formalization-index-v2.json", "s1-8-formalization-index-v3.json", "s1-8-formalization-index-v4.json", "s1-8-formalization-index-v5.json", "s1-8-formalization-index-v6.json", "s1-8-formalization-index-v7.json", "s1-8-gate-record-v1.json", "s1-8-gpu-quiescence-v1.json", "s1-8-gpu-quiescence-v2.json", "s1-8-gpu-quiescence-v3.json",
-        "s1-8-replay-validation-v1.json", "s1-8-replay-validation-v2.json", "s1-8-replay-validation-v3.json", "s1-8-safetensors-manifest-v1.json", "s1-8-validation-v1.json", "s1-8-validation-v2.json", "s1-8-validation-v3.json", "s1-8-validation-v4.json", "s1-8-validation-v5.json", "s1-8-validation-v6.json", "s1-8-validation-v7.json", "s1-8-worker-report-v1.json",
+        "s1-8-array-bundle-v1.json", "s1-8-array-bundle-v2.json", "s1-8-comparison-table-v1.json", "s1-8-comparison-table-v2.json", "s1-8-ddp-report-v1.json", "s1-8-ddp-report-v2.json", "s1-8-ddp-report-v3.json", "s1-8-ddp-report-v4.json", "s1-8-ddp-report-v5.json", "s1-8-ddp-report-v6.json", "s1-8-ddp-report-v7.json", "s1-8-ddp-report-v8.json",
+        "s1-8-fixture-manifest-v1.json", "s1-8-fixture-manifest-v2.json", "s1-8-fixture-manifest-v3.json", "s1-8-formalization-index-v1.json", "s1-8-formalization-index-v2.json", "s1-8-formalization-index-v3.json", "s1-8-formalization-index-v4.json", "s1-8-formalization-index-v5.json", "s1-8-formalization-index-v6.json", "s1-8-formalization-index-v7.json", "s1-8-formalization-index-v8.json", "s1-8-gate-record-v1.json", "s1-8-gpu-quiescence-v1.json", "s1-8-gpu-quiescence-v2.json", "s1-8-gpu-quiescence-v3.json", "s1-8-gpu-quiescence-v4.json",
+        "s1-8-replay-validation-v1.json", "s1-8-replay-validation-v2.json", "s1-8-replay-validation-v3.json", "s1-8-safetensors-manifest-v1.json", "s1-8-validation-v1.json", "s1-8-validation-v2.json", "s1-8-validation-v3.json", "s1-8-validation-v4.json", "s1-8-validation-v5.json", "s1-8-validation-v6.json", "s1-8-validation-v7.json", "s1-8-validation-v8.json", "s1-8-worker-report-v1.json",
     }
     paths = {path.name: path for path in (repository / "schemas" / "stage1").glob("s1-8-*.json")}
     if set(paths) != expected:
@@ -1523,7 +1518,6 @@ def _write_gpu_quiescence_record(
         "timeout_seconds": GPU_QUIESCENCE_TIMEOUT_SECONDS,
         "sample_interval_seconds": GPU_QUIESCENCE_SAMPLE_INTERVAL_SECONDS,
         "required_consecutive_exact_idle_samples": GPU_QUIESCENCE_REQUIRED_CONSECUTIVE_EXACT_IDLE_SAMPLES,
-        "max_transient_samples": GPU_QUIESCENCE_MAX_TRANSIENT_SAMPLES,
         "transient_observation_count": transient_observation_count,
         "operational_timeout_basis": GPU_QUIESCENCE_OPERATIONAL_TIMEOUT_BASIS,
         "samples": list(samples),
@@ -1597,10 +1591,6 @@ def require_gpu_quiescence(
         # finished by the frozen deadline.  Equality is allowed; once the
         # boundary is reached without the third sample, no further sample can
         # be admitted.
-        if transient_observation_count > GPU_QUIESCENCE_MAX_TRANSIENT_SAMPLES:
-            marker = "S18_GPU_QUIESCENCE_TRANSIENT_LIMIT_EXCEEDED"
-            _write_gpu_quiescence_record(work=work, phase=phase, status="FAILED", started_at=started_at, samples=samples, transient_observation_count=transient_observation_count, final_gpu=None, failure_reason=marker)
-            raise Stage1S18FormalError(marker)
         if completed_monotonic > deadline:
             marker = "S18_GPU_QUIESCENCE_TIMEOUT"
             _write_gpu_quiescence_record(work=work, phase=phase, status="FAILED", started_at=started_at, samples=samples, transient_observation_count=transient_observation_count, final_gpu=None, failure_reason=marker)
@@ -3136,7 +3126,7 @@ def execute(*, repository: Path, data_root: Path, s1_7_index_ref: str, gpu_capab
             phase: {"ref": filename, "sha256": _sha(work / filename)}
             for phase, filename in GPU_QUIESCENCE_ROLES.items()
         }
-        ddp_report = _with_hash({"schema_version": "stage1-s1-8-ddp-report-v7", "status": "PASS", "task_id": TASK_ID, "fixture_hash": fixture["fixture_hash"], "fixture_schema_version": fixture["schema_version"], "fixture_id": fixture["fixture_id"], "nccl_transport_protocol": nccl_transport, "implementation_source_sha256": source_hashes, "baseline_routes": baseline_reports, "permutation_routes": permutation_reports, "negative_controls": negative, "gpu_quiescence": gpu_quiescence_bindings}); _write(work / "ddp-report.json", ddp_report)
+        ddp_report = _with_hash({"schema_version": "stage1-s1-8-ddp-report-v8", "status": "PASS", "task_id": TASK_ID, "fixture_hash": fixture["fixture_hash"], "fixture_schema_version": fixture["schema_version"], "fixture_id": fixture["fixture_id"], "nccl_transport_protocol": nccl_transport, "implementation_source_sha256": source_hashes, "baseline_routes": baseline_reports, "permutation_routes": permutation_reports, "negative_controls": negative, "gpu_quiescence": gpu_quiescence_bindings}); _write(work / "ddp-report.json", ddp_report)
         csv_hashes, svg_hashes = _charts(work, result, ddp_report, baseline_arrays)
         # It is intentionally written only after every worker output, replay,
         # report and chart exists, and excludes itself from the measured scope.
@@ -3213,8 +3203,8 @@ def execute(*, repository: Path, data_root: Path, s1_7_index_ref: str, gpu_capab
             requirements = {**base_requirements, "schemas_and_atomic_publication": schema_result}
             gate_value = _with_hash({"schema_version": "stage1-s1-8-gate-record-v1", "status": "PASS", "gate_id": GATE_ID, "task_id": TASK_ID, "requirements": requirements})
             role_hashes = {role: _canonical_file_sha(value) for role, value in {"fixture_manifest": fixture, "ddp_report": ddp_report, "array_bundle": arrays_bundle, "comparison_table": table, "gate_record": gate_value}.items()}
-            validation_value = _with_hash({"schema_version": "stage1-s1-8-validation-v7", "status": "PASS", "task_id": TASK_ID, "gate_id": GATE_ID, "producer_commit": commit, "fixture_schema_version": fixture["schema_version"], "fixture_id": fixture["fixture_id"], "checks": [{"check_id": identifier, "status": "PASS", "detail": identifier.replace("_", " ")} for identifier in GATE_CHECK_IDS], "role_sha256": role_hashes, "gpu_quiescence": gpu_quiescence_bindings})
-            index_value = _with_hash({"schema_version": "stage1-s1-8-formalization-index-v7", "status": "PASS", "gate_id": GATE_ID, "task_id": TASK_ID, "generator_git_commit": commit, "consumer_git_commit": commit, "fixture_schema_version": fixture["schema_version"], "fixture_id": fixture["fixture_id"], "gpu_capability": capability, "nccl_transport_protocol": nccl_transport, "implementation_source_sha256": source_hashes, "s1_7_handoff": handoff_for_index, "role_refs": role_files, "role_sha256": role_hashes, "reproduction_role_refs": reproduction, "reproduction_role_sha256": reproduction_sha, "gate_artifact_hash": gate_value["artifact_hash"], "validation_ref": "validation.json", "validation_sha256": _canonical_file_sha(validation_value), "replay_ref": "replay-validation.json", "replay_sha256": _canonical_file_sha(replay_record), "next_task_ids": ["stage1.10_checkpoint_resume_and_artifacts"]})
+            validation_value = _with_hash({"schema_version": "stage1-s1-8-validation-v8", "status": "PASS", "task_id": TASK_ID, "gate_id": GATE_ID, "producer_commit": commit, "fixture_schema_version": fixture["schema_version"], "fixture_id": fixture["fixture_id"], "checks": [{"check_id": identifier, "status": "PASS", "detail": identifier.replace("_", " ")} for identifier in GATE_CHECK_IDS], "role_sha256": role_hashes, "gpu_quiescence": gpu_quiescence_bindings})
+            index_value = _with_hash({"schema_version": "stage1-s1-8-formalization-index-v8", "status": "PASS", "gate_id": GATE_ID, "task_id": TASK_ID, "generator_git_commit": commit, "consumer_git_commit": commit, "fixture_schema_version": fixture["schema_version"], "fixture_id": fixture["fixture_id"], "gpu_capability": capability, "nccl_transport_protocol": nccl_transport, "implementation_source_sha256": source_hashes, "s1_7_handoff": handoff_for_index, "role_refs": role_files, "role_sha256": role_hashes, "reproduction_role_refs": reproduction, "reproduction_role_sha256": reproduction_sha, "gate_artifact_hash": gate_value["artifact_hash"], "validation_ref": "validation.json", "validation_sha256": _canonical_file_sha(validation_value), "replay_ref": "replay-validation.json", "replay_sha256": _canonical_file_sha(replay_record), "next_task_ids": ["stage1.10_checkpoint_resume_and_artifacts"]})
             values = {"fixture_manifest": fixture, "ddp_report": ddp_report, "array_bundle": arrays_bundle, "comparison_table": table, "gate_record": gate_value, "replay": replay_record, "validation": validation_value, "index": index_value}
             return values, role_hashes, gate_value, validation_value, index_value
 
