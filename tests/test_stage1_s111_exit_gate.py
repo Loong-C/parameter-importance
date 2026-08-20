@@ -52,7 +52,7 @@ def _publish_dependency(root: Path, ordinal: int, gate_id: str, task_id: str) ->
         "G1-STEP": ("stage1-s1-6-formalization-index-v1", {"step_report": "step-report.json", "oracle_bundle": "oracle-bundle.json", "trace_bundle": "trace-bundle.json", "comparison_table": "comparison-table.json", "gate_record": "g1-step-record.json"}),
         "G1-SINGLE": ("stage1-s1-7-formalization-index-v1", {"fixture_manifest": "fixture-manifest.json", "single_gpu_report": "worker-report.json", "gradient_bundle": "arrays-manifest.json", "comparison_table": "comparison-table.json", "gate_record": "g1-single-record.json"}),
         "G1-DDP": ("stage1-s1-8-formalization-index-v2", {"fixture_manifest": "fixture-manifest.json", "ddp_report": "ddp-report.json", "array_bundle": "array-bundle.json", "comparison_table": "comparison-table.json", "gate_record": "g1-ddp-record.json"}),
-        "G1-NUMERIC": ("stage1-s1-9-formalization-index-v1", {"numeric_report": "numeric-report.json", "oracle_bundle": "oracle-bundle.json", "trace_bundle": "trace-bundle.json", "comparison_table": "comparison-table.json", "gate_record": "g1-numeric-record.json"}),
+        "G1-NUMERIC": ("stage1-s1-9-formalization-index-v5", {"numeric_report": "numeric-report.json", "oracle_bundle": "oracle-bundle.json", "trace_bundle": "trace-bundle.json", "comparison_table": "comparison-table.json", "gate_record": "g1-numeric-record.json"}),
         "G1-RESUME": ("stage1-s1-10-formalization-index-v1", {"resume_report": "resume-report.json", "oracle_bundle": "oracle-bundle.json", "trace_bundle": "trace-bundle.json", "comparison_table": "comparison-table.json", "artifact_manifest": "artifact-manifest.json", "gate_record": "g1-resume-record.json"}),
     }
     schema_version, role_files = index_wires[gate_id]
@@ -86,6 +86,42 @@ def _publish_dependency(root: Path, ordinal: int, gate_id: str, task_id: str) ->
         index_body.update({"oracle_validation_report_ref": role_name, "oracle_validation_report_sha256": role_sha["named"]})
     elif gate_id == "G1-GRAD":
         index_body.update({"gate_record_ref": role_name, "gate_record_sha256": role_sha["named"]})
+    elif gate_id == "G1-NUMERIC":
+        reproduction_refs = {
+            "attempt_start": "attempt-start.json", "upstream_compatibility": "upstream-compatibility.json",
+            "preflight": "preflight.json", "prelease_gpu": "prelease-gpu.json",
+            "post_worker_quiescence": "post-worker-quiescence.json", "lease_history": "lease-history.json",
+            "single_worker": "single-bf16.json", "single_stdout": "single.stdout.txt",
+            "single_stderr": "single.stderr.txt", "single_child_fingerprint": "single-child-fingerprint.json",
+            "bf16_resume_checkpoint_store": "bf16-resume-store-index.json", "ddp_worker": "ddp-skip.json",
+            "ddp_stdout": "ddp.stdout.txt", "ddp_stderr": "ddp.stderr.txt",
+            "ddp_child_fingerprint": "ddp-child-fingerprint.json",
+            **{f"chart_csv_{index}": name for index, name in enumerate(("bf16-fp32-heatmap.csv", "clip-norm-factor.csv", "skip-zero-difference.csv", "t-amp-scale.csv", "u-single-factor-identity.csv", "u-single-factor-ratio-diagnostic.csv"))},
+            **{f"chart_svg_{index}": name for index, name in enumerate(("bf16-fp32-heatmap.svg", "clip-norm-factor.svg", "skip-zero-difference.svg", "t-amp-scale.svg", "u-single-factor-identity.svg", "u-single-factor-ratio-diagnostic.svg"))},
+        }
+        for name in reproduction_refs.values():
+            path = published / name
+            if name == "upstream-compatibility.json":
+                write_canonical_json(path, _with_hash({"schema_version": "stage1-s1-9-upstream-compatibility-v4", "status": "PASS", "s1_8_v5_handoff": {"index_schema_version": "stage1-s1-8-formalization-index-v5"}}))
+            elif name == "prelease-gpu.json":
+                quiescence = _with_hash({"schema_version": "stage1-s1-9-gpu-quiescence-v3", "status": "PASS", "phase": "prelease"})
+                write_canonical_json(path, _with_hash({"schema_version": "stage1-s1-9-gpu-prelease-v3", "status": "PASS", "quiescence": quiescence}))
+            elif name == "post-worker-quiescence.json":
+                write_canonical_json(path, _with_hash({"schema_version": "stage1-s1-9-gpu-quiescence-v3", "status": "PASS", "phase": "post_worker"}))
+            elif name.endswith(".json"):
+                write_canonical_json(path, _with_hash({"schema_version": "synthetic-s1-9-reproduction-v1", "status": "PASS", "role": name}))
+            else:
+                path.write_text(name + "\n", encoding="utf-8", newline="\n")
+        index_body.update({
+            "reproduction_role_refs": reproduction_refs,
+            "reproduction_role_sha256": {role: _sha(published / name) for role, name in reproduction_refs.items()},
+            "fixture_id": "stage1-s19-precision-fixture-v1", "git_branch": "fixture",
+            "checked_at": "2026-08-20T00:00:00+00:00", "s1_7_handoff": {}, "s1_8_handoff": {},
+            "csv_sha256": {name: _sha(published / name) for name in ("bf16-fp32-heatmap.csv", "clip-norm-factor.csv", "skip-zero-difference.csv", "t-amp-scale.csv", "u-single-factor-identity.csv", "u-single-factor-ratio-diagnostic.csv")},
+            "svg_sha256": {name: _sha(published / name) for name in ("bf16-fp32-heatmap.svg", "clip-norm-factor.svg", "skip-zero-difference.svg", "t-amp-scale.svg", "u-single-factor-identity.svg", "u-single-factor-ratio-diagnostic.svg")},
+            "replay_hash": replay["artifact_hash"],
+            "next_task_ids": ["stage1.10_checkpoint_resume_and_artifacts"],
+        })
     index = _with_hash(index_body)
     write_canonical_json(published / "index.json", index)
     return {
@@ -237,6 +273,61 @@ def test_s111_missing_future_s19_or_s110_index_fails_closed(tmp_path: Path) -> N
     broken[9] = {**broken[9], "index_ref": "missing/s1-9-index.json"}
     with pytest.raises(Stage1ExitGateError, match="INDEX_FILE_HASH_MISMATCH"):
         build_exit_gate_summary(tmp_path, broken, unresolved_failures=[], charts=charts)
+
+
+def test_s111_requires_final_s19_v5_reproduction_and_source_closure(tmp_path: Path) -> None:
+    dependencies, charts = _inputs(tmp_path)
+    binding = dependencies[9]
+    index_path = tmp_path / binding["index_ref"]
+    from param_importance_nlp.contracts.jsonio import load_canonical_json
+
+    index = load_canonical_json(index_path)
+    assert isinstance(index, dict)
+
+    def resign(body: dict[str, object]) -> dict[str, object]:
+        unsigned = {key: value for key, value in body.items() if key != "artifact_hash"}
+        updated = _with_hash(unsigned)
+        write_canonical_json(index_path, updated)
+        return {**binding, "index_sha256": _sha(index_path), "index_artifact_hash": updated["artifact_hash"]}
+
+    legacy = dict(index)
+    legacy["schema_version"] = "stage1-s1-9-formalization-index-v1"
+    legacy_binding = resign(legacy)
+    legacy_binding["index_schema_version"] = "stage1-s1-9-formalization-index-v1"
+    with pytest.raises(Stage1ExitGateError, match="UNSUPPORTED_INDEX_WIRE_VERSION"):
+        build_exit_gate_summary(tmp_path, [*dependencies[:9], legacy_binding, *dependencies[10:]], unresolved_failures=[], charts=charts)
+
+    write_canonical_json(index_path, index)
+    missing = dict(index)
+    refs = dict(missing["reproduction_role_refs"])
+    refs.pop("prelease_gpu")
+    missing["reproduction_role_refs"] = refs
+    with pytest.raises(Stage1ExitGateError, match="S1_9_V5_REPRODUCTION_REF_WIRE_INVALID"):
+        build_exit_gate_summary(tmp_path, [*dependencies[:9], resign(missing), *dependencies[10:]], unresolved_failures=[], charts=charts)
+
+    write_canonical_json(index_path, index)
+    missing_schema_field = dict(index)
+    missing_schema_field.pop("fixture_id")
+    with pytest.raises(Stage1ExitGateError, match="S1_9_V5_INDEX_SCHEMA_CLOSURE_INVALID"):
+        build_exit_gate_summary(tmp_path, [*dependencies[:9], resign(missing_schema_field), *dependencies[10:]], unresolved_failures=[], charts=charts)
+
+    write_canonical_json(index_path, index)
+    source = tmp_path / binding["index_ref"].replace("index.json", "upstream-compatibility.json")
+    source.write_text('{"schema_version":"tampered"}\n', encoding="utf-8", newline="\n")
+    with pytest.raises(Stage1ExitGateError, match="S1_9_V5_REPRODUCTION_FILE_HASH_MISMATCH"):
+        build_exit_gate_summary(tmp_path, dependencies, unresolved_failures=[], charts=charts)
+
+    write_canonical_json(index_path, index)
+    write_canonical_json(source, _with_hash({
+        "schema_version": "stage1-s1-9-upstream-compatibility-v4", "status": "PASS",
+        "s1_8_v5_handoff": {"index_schema_version": "stage1-s1-8-formalization-index-v4"},
+    }))
+    invalid_source = dict(index)
+    invalid_source["reproduction_role_sha256"] = dict(index["reproduction_role_sha256"])
+    invalid_source["reproduction_role_sha256"]["upstream_compatibility"] = _sha(source)
+    invalid_source_binding = resign(invalid_source)
+    with pytest.raises(Stage1ExitGateError, match="S1_9_V5_UPSTREAM_SOURCE_CLOSURE_INVALID"):
+        build_exit_gate_summary(tmp_path, [*dependencies[:9], invalid_source_binding, *dependencies[10:]], unresolved_failures=[], charts=charts)
 
 
 def test_s111_rejects_self_consistent_text_without_bound_role_hash(tmp_path: Path) -> None:

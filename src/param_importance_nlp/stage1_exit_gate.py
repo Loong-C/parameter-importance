@@ -41,9 +41,51 @@ _STANDARD_INDEX_WIRES: dict[str, tuple[frozenset[str], dict[str, str]]] = {
     "G1-STEP": (frozenset({"stage1-s1-6-formalization-index-v1"}), {"step_report": "step-report.json", "oracle_bundle": "oracle-bundle.json", "trace_bundle": "trace-bundle.json", "comparison_table": "comparison-table.json", "gate_record": "g1-step-record.json"}),
     "G1-SINGLE": (frozenset({"stage1-s1-7-formalization-index-v1"}), {"fixture_manifest": "fixture-manifest.json", "single_gpu_report": "worker-report.json", "gradient_bundle": "arrays-manifest.json", "comparison_table": "comparison-table.json", "gate_record": "g1-single-record.json"}),
     "G1-DDP": (frozenset({"stage1-s1-8-formalization-index-v1", "stage1-s1-8-formalization-index-v2"}), {"fixture_manifest": "fixture-manifest.json", "ddp_report": "ddp-report.json", "array_bundle": "array-bundle.json", "comparison_table": "comparison-table.json", "gate_record": "g1-ddp-record.json"}),
-    "G1-NUMERIC": (frozenset({"stage1-s1-9-formalization-index-v1"}), {"numeric_report": "numeric-report.json", "oracle_bundle": "oracle-bundle.json", "trace_bundle": "trace-bundle.json", "comparison_table": "comparison-table.json", "gate_record": "g1-numeric-record.json"}),
+    "G1-NUMERIC": (frozenset({"stage1-s1-9-formalization-index-v5"}), {"numeric_report": "numeric-report.json", "oracle_bundle": "oracle-bundle.json", "trace_bundle": "trace-bundle.json", "comparison_table": "comparison-table.json", "gate_record": "g1-numeric-record.json"}),
     "G1-RESUME": (frozenset({"stage1-s1-10-formalization-index-v1"}), {"resume_report": "resume-report.json", "oracle_bundle": "oracle-bundle.json", "trace_bundle": "trace-bundle.json", "comparison_table": "comparison-table.json", "artifact_manifest": "artifact-manifest.json", "gate_record": "g1-resume-record.json"}),
 }
+
+# S1.9 v5 is the released G1-NUMERIC producer wire.  Its primary evidence
+# roles intentionally keep their v1 filenames, while the immutable
+# reproduction closure adds the final GPU-quiescence and compatibility roles.
+# Do not accept a predecessor merely because those five primary roles match.
+_S1_9_V5_REPRODUCTION_REFS: dict[str, str] = {
+    "attempt_start": "attempt-start.json",
+    "upstream_compatibility": "upstream-compatibility.json",
+    "preflight": "preflight.json",
+    "prelease_gpu": "prelease-gpu.json",
+    "post_worker_quiescence": "post-worker-quiescence.json",
+    "lease_history": "lease-history.json",
+    "single_worker": "single-bf16.json",
+    "single_stdout": "single.stdout.txt",
+    "single_stderr": "single.stderr.txt",
+    "single_child_fingerprint": "single-child-fingerprint.json",
+    "bf16_resume_checkpoint_store": "bf16-resume-store-index.json",
+    "ddp_worker": "ddp-skip.json",
+    "ddp_stdout": "ddp.stdout.txt",
+    "ddp_stderr": "ddp.stderr.txt",
+    "ddp_child_fingerprint": "ddp-child-fingerprint.json",
+    "chart_csv_0": "bf16-fp32-heatmap.csv",
+    "chart_csv_1": "clip-norm-factor.csv",
+    "chart_csv_2": "skip-zero-difference.csv",
+    "chart_csv_3": "t-amp-scale.csv",
+    "chart_csv_4": "u-single-factor-identity.csv",
+    "chart_csv_5": "u-single-factor-ratio-diagnostic.csv",
+    "chart_svg_0": "bf16-fp32-heatmap.svg",
+    "chart_svg_1": "clip-norm-factor.svg",
+    "chart_svg_2": "skip-zero-difference.svg",
+    "chart_svg_3": "t-amp-scale.svg",
+    "chart_svg_4": "u-single-factor-identity.svg",
+    "chart_svg_5": "u-single-factor-ratio-diagnostic.svg",
+}
+_S1_9_V5_INDEX_FIELDS = frozenset({
+    "schema_version", "status", "gate_id", "task_id", "fixture_id",
+    "generator_git_commit", "consumer_git_commit", "git_branch", "checked_at",
+    "s1_7_handoff", "s1_8_handoff", "role_refs", "role_sha256",
+    "reproduction_role_refs", "reproduction_role_sha256", "gate_artifact_hash",
+    "csv_sha256", "svg_sha256", "validation_ref", "validation_sha256",
+    "replay_ref", "replay_sha256", "replay_hash", "next_task_ids", "artifact_hash",
+})
 REQUIRED_CHARTS: tuple[str, ...] = (
     "gradient-identity", "u-identity", "weighted-reduction", "ddp-identity", 
     "module-metric-heatmap", "clip-factor", "resume-errors", "noise-smoke", "accumulator-residual",
@@ -219,6 +261,14 @@ def _validate_binding(root: Path, binding: DependencyBinding) -> dict[str, objec
         return {"binding": binding.to_dict(), "index_artifact_hash": index["artifact_hash"], "gate_requirements": [binding.gate_id]}
     if index.get("gate_id") != binding.gate_id or index.get("task_id") != binding.task_id:
         raise Stage1ExitGateError("S1_11_INDEX_IDENTITY_OR_STATUS_INVALID")
+    if binding.gate_id == "G1-NUMERIC" and (
+        set(index) != _S1_9_V5_INDEX_FIELDS
+        or index.get("fixture_id") != "stage1-s19-precision-fixture-v1"
+        or index.get("validation_ref") != "validation.json"
+        or index.get("replay_ref") != "replay-validation.json"
+        or index.get("next_task_ids") != ["stage1.10_checkpoint_resume_and_artifacts"]
+    ):
+        raise Stage1ExitGateError("S1_11_S1_9_V5_INDEX_SCHEMA_CLOSURE_INVALID")
     if "consumer_git_commit" in index and _commit(index.get("consumer_git_commit"), field="consumer") != index.get("consumer_git_commit"):
         raise Stage1ExitGateError("S1_11_INDEX_CONSUMER_COMMIT_INVALID")
     # S1.2--S1.4 predate the uniform role_refs wire.  Their named report
@@ -300,6 +350,42 @@ def _validate_binding(root: Path, binding: DependencyBinding) -> dict[str, objec
         raise Stage1ExitGateError("S1_11_REPLAY_NOT_PASS")
     if "artifact_hash" in replay:
         _self_hash(replay, field="replay")
+    if binding.gate_id == "G1-NUMERIC":
+        reproduction_refs = _mapping(index.get("reproduction_role_refs"), field="s1_9.reproduction_role_refs")
+        reproduction_hashes = _mapping(index.get("reproduction_role_sha256"), field="s1_9.reproduction_role_sha256")
+        if reproduction_refs != _S1_9_V5_REPRODUCTION_REFS:
+            raise Stage1ExitGateError("S1_11_S1_9_V5_REPRODUCTION_REF_WIRE_INVALID")
+        if set(reproduction_hashes) != set(_S1_9_V5_REPRODUCTION_REFS):
+            raise Stage1ExitGateError("S1_11_S1_9_V5_REPRODUCTION_HASH_WIRE_INVALID")
+        reproduction_paths: dict[str, Path] = {}
+        for role, ref in reproduction_refs.items():
+            role_path = _safe_relative(index_dir, ref, field=f"s1_9_reproduction_{role}")
+            digest = _hash(reproduction_hashes[role], field=f"s1_9_reproduction_{role}")
+            if not role_path.is_file() or _hash_file(role_path) != digest:
+                raise Stage1ExitGateError("S1_11_S1_9_V5_REPRODUCTION_FILE_HASH_MISMATCH")
+            reproduction_paths[role] = role_path
+        compatibility = _mapping(load_canonical_json(reproduction_paths["upstream_compatibility"]), field="s1_9.upstream_compatibility")
+        _self_hash(compatibility, field="s1_9.upstream_compatibility")
+        handoff = _mapping(compatibility.get("s1_8_v5_handoff"), field="s1_9.upstream_compatibility_handoff")
+        if compatibility.get("schema_version") != "stage1-s1-9-upstream-compatibility-v4" or compatibility.get("status") != "PASS" or handoff.get("index_schema_version") != "stage1-s1-8-formalization-index-v5":
+            raise Stage1ExitGateError("S1_11_S1_9_V5_UPSTREAM_SOURCE_CLOSURE_INVALID")
+        prelease = _mapping(load_canonical_json(reproduction_paths["prelease_gpu"]), field="s1_9.prelease_gpu")
+        _self_hash(prelease, field="s1_9.prelease_gpu")
+        prelease_quiescence = _mapping(prelease.get("quiescence"), field="s1_9.prelease_quiescence")
+        _self_hash(prelease_quiescence, field="s1_9.prelease_quiescence")
+        post_worker = _mapping(load_canonical_json(reproduction_paths["post_worker_quiescence"]), field="s1_9.post_worker_quiescence")
+        _self_hash(post_worker, field="s1_9.post_worker_quiescence")
+        if (
+            prelease.get("schema_version") != "stage1-s1-9-gpu-prelease-v3"
+            or prelease.get("status") != "PASS"
+            or prelease_quiescence.get("schema_version") != "stage1-s1-9-gpu-quiescence-v3"
+            or prelease_quiescence.get("status") != "PASS"
+            or prelease_quiescence.get("phase") != "prelease"
+            or post_worker.get("schema_version") != "stage1-s1-9-gpu-quiescence-v3"
+            or post_worker.get("status") != "PASS"
+            or post_worker.get("phase") != "post_worker"
+        ):
+            raise Stage1ExitGateError("S1_11_S1_9_V5_GPU_SOURCE_CLOSURE_INVALID")
     return {"binding": binding.to_dict(), "index_artifact_hash": index["artifact_hash"], "gate_requirements": sorted(requirements)}
 
 
