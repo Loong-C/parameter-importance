@@ -222,7 +222,7 @@ def _publish_dependency(root: Path, ordinal: int, gate_id: str, task_id: str) ->
 
         upstream = {
             "s1_8": upstream_row(schema="stage1-s1-8-formalization-index-v8", task="stage1.08_ddp_and_gradient_accumulation", gate="G1-DDP", sources=61, reproduction=84, required=("prelease_gpu_quiescence", "post_worker_gpu_quiescence", "post_release_gpu_quiescence", "reacquire_preflight_gpu_quiescence"), roles=("fixture_manifest", "ddp_report", "array_bundle", "comparison_table", "gate_record")),
-            "s1_9": upstream_row(schema="stage1-s1-9-formalization-index-v8", task="stage1.09_precision_clipping_and_optimizer_boundaries", gate="G1-NUMERIC", sources=34, reproduction=27, required=("upstream_compatibility", "prelease_gpu", "post_worker_quiescence"), roles=("numeric_report", "oracle_bundle", "trace_bundle", "comparison_table", "gate_record")),
+            "s1_9": upstream_row(schema="stage1-s1-9-formalization-index-v8", task="stage1.09_precision_clipping_and_optimizer_boundaries", gate="G1-NUMERIC", sources=34, reproduction=27, required=("upstream_compatibility", "prelease_gpu", "post_worker_quiescence", "single_worker", "bf16_resume_checkpoint_store"), roles=("numeric_report", "oracle_bundle", "trace_bundle", "comparison_table", "gate_record")),
         }
         report_path = published / role_files["resume_report"]
         report = json.loads(report_path.read_text(encoding="utf-8")); report["upstream"] = upstream; report.pop("report_hash"); report["report_hash"] = canonical_json_hash(report)

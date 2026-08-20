@@ -683,7 +683,7 @@ def _validate_binding(root: Path, binding: DependencyBinding) -> dict[str, objec
             raise Stage1ExitGateError("S1_11_S1_10_V2_UPSTREAM_BINDING_INVALID")
         expected_upstream = {
             "s1_8": ("stage1-s1-8-formalization-index-v8", "stage1.08_ddp_and_gradient_accumulation", "G1-DDP", 61, 84, {"prelease_gpu_quiescence", "post_worker_gpu_quiescence", "post_release_gpu_quiescence", "reacquire_preflight_gpu_quiescence"}),
-            "s1_9": ("stage1-s1-9-formalization-index-v8", "stage1.09_precision_clipping_and_optimizer_boundaries", "G1-NUMERIC", 34, 27, {"upstream_compatibility", "prelease_gpu", "post_worker_quiescence"}),
+            "s1_9": ("stage1-s1-9-formalization-index-v8", "stage1.09_precision_clipping_and_optimizer_boundaries", "G1-NUMERIC", 34, 27, {"upstream_compatibility", "prelease_gpu", "post_worker_quiescence", "single_worker", "bf16_resume_checkpoint_store"}),
         }
         upstream_fields = {"index_ref", "index_sha256", "index_artifact_hash", "producer_commit", "gate_artifact_hash", "role_sha256", "validation_sha256", "source_map_sha256", "source_map_entries", "reproduction_role_sha256", "reproduction_role_set_sha256", "reproduction_role_count", "schema_version", "task_id", "gate_id"}
         for name, (schema, task, gate_id, sources, reproduction_count, required_reproduction) in expected_upstream.items():
