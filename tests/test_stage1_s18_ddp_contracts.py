@@ -1402,12 +1402,27 @@ def test_real_linux_procfs_owner_exit_transition_is_known_member_only(monkeypatc
 
     process, expected, observed = captured
     pid = int(expected["pid"])
+    real_token_process_ids = formalizer._token_process_ids
+    real_session_members = formalizer._session_members
     monkeypatch.setattr(formalizer, "_token_process_ids", lambda _: [pid])
     monkeypatch.setattr(formalizer, "_fingerprint", lambda _pid, _token: expected)
     monkeypatch.setattr(formalizer, "_session_members", lambda _sid: [pid])
     monkeypatch.setattr(formalizer, "_session_member_stat", lambda _pid: observed)
     try:
         if observed["state"] == "R":
+            # The synthetic audit snapshot above preserves the narrow procfs
+            # owner-transition window until `_audit_exact_process_group`
+            # recognizes it.  After the helper's bounded Popen.wait reaps the
+            # real child, restore the real procfs scanners so its residual
+            # gate observes production's empty post-exit state rather than
+            # this deliberately stale test snapshot.
+            real_wait = process.wait
+            def wait_then_restore_real_procfs(*, timeout: float | None = None) -> int:
+                returncode = real_wait(timeout=timeout)
+                monkeypatch.setattr(formalizer, "_token_process_ids", real_token_process_ids)
+                monkeypatch.setattr(formalizer, "_session_members", real_session_members)
+                return returncode
+            monkeypatch.setattr(process, "wait", wait_then_restore_real_procfs)
             assert formalizer._audit_or_confirmed_launcher_exit(
                 process,
                 expected,
