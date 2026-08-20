@@ -868,7 +868,7 @@ def test_s19_s110_compatibility_paths_are_exact_and_reject_extra_siblings(monkey
 
 def test_s19_consumer_paths_are_exact_and_reject_s18_or_s19_prefix_siblings(monkeypatch: pytest.MonkeyPatch) -> None:
     formal = _module(ROOT / "ops" / "stage1" / "formalize_s1_9.py", "s19_exact_consumer_paths")
-    approved = sorted(formal._S1_9_FROZEN_CONSUMER_FILES)
+    approved = sorted({*formal._S1_9_FROZEN_CONSUMER_FILES, *formal._S1_7_AUTHORIZED_SHARED_DEPENDENCIES})
     monkeypatch.setattr(formal, "_git", lambda *_args: "\n".join(approved))
     assert formal._consumer_diff(ROOT, "0" * 40) == approved
     for extra in (
@@ -892,6 +892,7 @@ def test_s19_clean_producer_diff_accepts_only_s110_and_s19_then_rejects_s111(tmp
     git("commit", "--allow-empty", "-m", "producer")
     producer = git("rev-parse", "HEAD")
     reviewed = {
+        *formal._S1_7_AUTHORIZED_SHARED_DEPENDENCIES,
         *formal._S1_9_FROZEN_CONSUMER_FILES,
         *formal._S1_10_FROZEN_CONSUMER_FILES,
         *formal._S1_10_SHARED_RUNTIME_FILES,
