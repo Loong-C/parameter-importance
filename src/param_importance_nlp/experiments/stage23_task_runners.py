@@ -119,6 +119,13 @@ from .sampling import (
     SamplingUniverse,
     STREAM_NAMES,
 )
+from .stage2_assets import (
+    AssetResolutionManifest,
+    CheckpointFile,
+    CheckpointRecord,
+    DataFile,
+    DataRangeManifest,
+)
 from .stage2 import PairedEstimatorRunner, build_fixture_estimator_decision
 from .preregistration import (
     build_stage2_hypothesis_contract,
@@ -1335,6 +1342,10 @@ def _run_stage2_assets_and_sampling(
         draws=sampling.draws("pilot", 8),
         m_values=(2, 4, 8),
     )
+    stream_manifests = {
+        stream: sampling.draw_manifest(stream, 4).to_manifest()
+        for stream in STREAM_NAMES
+    }
     draw_rows = [
         draw.to_manifest()
         for stream in STREAM_NAMES
@@ -1343,6 +1354,62 @@ def _run_stage2_assets_and_sampling(
     draw_ids = [str(row["draw_id"]) for row in draw_rows]
     if len(draw_ids) != len(set(draw_ids)):
         raise RuntimeError("STAGE2_DRAW_ID_COLLISION")
+    # The fixture matrix exercises the same six-cell/checkpoint and data-range
+    # wire contract as formal S2.3 while remaining explicitly synthetic.  It is
+    # never accepted by the formal provider; formal assets must provide their
+    # own immutable revisions and offline-load evidence.
+    producer_commit, _, _ = _stage2_source_identity()
+    fixture_revision = "0" * 40
+    fixture_files = (
+        CheckpointFile("model.safetensors", 1, "1" * 64, "weights"),
+        CheckpointFile("config.json", 1, "2" * 64, "config"),
+    )
+    fixture_checkpoints = tuple(
+        CheckpointRecord(
+            model_id=model,
+            training_stage=stage,
+            checkpoint_id=f"fixture-{model}-{stage}",
+            training_step={"initialization": 0, "early": 1, "mid_late": 50}[stage],
+            total_training_steps=100,
+            target_fraction={"initialization": 0.0, "early": 0.01, "mid_late": 0.5}[stage],
+            repository=f"fixture/{model}",
+            revision=fixture_revision,
+            root_ref=f"fixture/models/{model}/{stage}",
+            state="ready",
+            files=fixture_files,
+            manifest_ref=f"fixture/manifests/{model}-{stage}.json",
+            manifest_sha256="3" * 64,
+            parameter_registry_hash=context.provider.registry_hash,
+            config_sha256="2" * 64,
+            tokenizer_sha256="4" * 64,
+            load_status="passed",
+            load_evidence_ref=f"fixture/evidence/{model}-{stage}.json",
+            load_evidence_sha256="5" * 64,
+        )
+        for model in ("pythia-14m", "pythia-31m-deduped")
+        for stage in ("initialization", "early", "mid_late")
+    )
+    fixture_data_range = DataRangeManifest(
+        dataset_id="fixture-data-range",
+        revision=fixture_revision,
+        manifest_ref="fixture/manifests/data-range.json",
+        manifest_sha256="6" * 64,
+        files=(
+            # The local provider does not read these paths.  They identify the
+            # same two-file shape as the formal Pile allowlist.
+            # Sizes/hashes are intentionally fixture values.
+            DataFile("document-00000-of-00020.bin", 1, "7" * 64, "token_shard"),
+            DataFile("document.idx", 1, "8" * 64, "index"),
+        ),
+        sample_id_max_exclusive=len(context.sample_ids),
+    )
+    fixture_assets = AssetResolutionManifest(
+        scope="local_fixture",
+        checkpoints=fixture_checkpoints,
+        data_range=fixture_data_range,
+        producer_commit=producer_commit,
+        execution_commit=producer_commit,
+    )
     payloads: dict[str, Mapping[str, JSONValue]] = {
         "sampling_plan": sampling.to_dict(),  # type: ignore[dict-item]
         "draw_manifest": {
@@ -1350,15 +1417,17 @@ def _run_stage2_assets_and_sampling(
             "sampling_plan_hash": sampling.digest,
             "draws": draw_rows,  # type: ignore[dict-item]
             "draw_count_by_stream": {name: 4 for name in STREAM_NAMES},
+            "stream_manifests": stream_manifests,
             "draw_id_unique": True,
             "sample_id_collisions_allowed": True,
             "replay_hash": canonical_json_hash(draw_rows),
-            "nested_mapping": nested_mapping.to_manifest(),
+            "nested_mapping": nested_mapping.to_dict(),
             "nested_mapping_hash": nested_mapping.digest,
         },
         "asset_resolution": {
             "schema_version": "stage2-task-asset-resolution-v1",
             "provider": context.to_payload(),
+            "stage2_asset_manifest": fixture_assets.to_dict(),
             "fixed_state_contract_hash": canonical_json_hash(fixed_state),
             "upstream_binding_hash": inputs.binding_hash,
             "formal_eligible": False,

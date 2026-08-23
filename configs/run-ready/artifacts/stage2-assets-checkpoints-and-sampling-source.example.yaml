@@ -1,0 +1,73 @@
+# S2.3 source contract. This is an input declaration, not a downloaded asset.
+# Formal checkpoint rows remain BLOCKED until immutable upstream revisions,
+# files and offline-load evidence are present on the server.
+schema_version: stage2-assets-checkpoints-and-sampling-source-v1
+gate_id: stage2.G2.2
+scope: formal
+models:
+  - model_id: pythia-14m
+    repository: EleutherAI/pythia-14m
+    data_version: non_deduped
+    stages:
+      initialization:
+        target_fraction: 0.0
+        selected_revision: 56079904bb80b7f36d3b794089f146e7a4d6efae
+        state: ready
+      early:
+        target_fraction: 0.01
+        selected_revision: null
+        state: blocked
+        missing_reason: fixed upstream checkpoint revision is not present on server
+      mid_late:
+        target_fraction: 0.5
+        selected_revision: null
+        state: blocked
+        missing_reason: fixed upstream checkpoint revision is not present on server
+  - model_id: pythia-31m-deduped
+    repository: EleutherAI/pythia-31m-deduped
+    data_version: deduped
+    stages:
+      initialization:
+        target_fraction: 0.0
+        selected_revision: 73628c85dd9d12d43c07be77ebcf10cef5fd9660
+        state: ready
+      early:
+        target_fraction: 0.01
+        selected_revision: null
+        state: blocked
+        missing_reason: fixed upstream checkpoint revision is not present on server
+      mid_late:
+        target_fraction: 0.5
+        selected_revision: null
+        state: blocked
+        missing_reason: fixed upstream checkpoint revision is not present on server
+data_range:
+  dataset_id: dbbfeb12bab4027b386bd97d604d8134699e96f79e309cceacff7999a55b5dad
+  source: EleutherAI/pile-deduped-pythia-preshuffled
+  revision: 4647773ea142ab1ff5694602fa104bbf49088408
+  allowlist:
+    - document-00000-of-00020.bin
+    - document.idx
+  sample_id_interval: [0, 524288]
+  source_tokens_per_record: 2049
+  input_sequence_length: 2048
+  effective_target_tokens: 2048
+  sampling_design: uniform_with_replacement
+  files:
+    document-00000-of-00020.bin:
+      size_bytes: 30000000000
+      sha256: 1ce355bd2683627d0ff689f8578115cf3df84bd1edf3410e6aca9705d31fc6ea
+    document.idx:
+      size_bytes: 1757184042
+      sha256: 1d9fdd760295eb2007a4874440b27c559ca722239fa2814aa8a2ee6724b7852f
+  excluded: ["document-00001-of-00020.bin", "document-00002-of-00020.bin", "document-00003-of-00020.bin", "document-00004-of-00020.bin", "document-00005-of-00020.bin.part", "*.lock", "*.meta"]
+sampling:
+  algorithm_version: stage2-draws-python-randrange-v1
+  stream_names: [reference_sizing, reference_A, reference_B, pilot, confirmatory]
+  seed_namespace_reuse: false
+  sample_id_collision_policy: preserve_and_audit
+  final_reference_and_confirmatory_generation: deferred_until_upstream_scale_freeze
+  generator_state_policy: separate_sampling_generator_from_model_global_rng
+gates:
+  G2.2-dev: PASS_LOCAL_FIXTURE_ONLY
+  G2.2: BLOCKED_MISSING_FOUR_CHECKPOINTS

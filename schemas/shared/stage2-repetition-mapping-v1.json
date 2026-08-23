@@ -1,0 +1,19 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://parameter-importance.invalid/schemas/shared/stage2-repetition-mapping-v1.json",
+  "title": "Stage 2 paired repetition mapping",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "mapping_version", "repetition_id", "batch_size", "m_values", "draws", "double_half_draw_ids", "sample_collision_count", "mapping_hash"],
+  "properties": {
+    "schema_version": {"const": "stage2-repetition-mapping-v1"},
+    "mapping_version": {"const": "stage2-nested-adjacent-v1"},
+    "repetition_id": {"type": "string", "minLength": 1},
+    "batch_size": {"type": "integer", "minimum": 2},
+    "m_values": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"type": "integer", "minimum": 2}},
+    "draws": {"type": "array", "minItems": 2, "items": {"type": "object"}},
+    "double_half_draw_ids": {"type": "array", "minItems": 2, "maxItems": 2, "items": {"type": "array", "items": {"type": "string"}}},
+    "sample_collision_count": {"type": "integer", "minimum": 0},
+    "mapping_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+  }
+}

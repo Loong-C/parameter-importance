@@ -1,0 +1,44 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://parameter-importance.invalid/schemas/shared/stage2-draw-stream-manifest-v1.json",
+  "title": "Stage 2 replayable independent draw stream",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "sampling_plan_hash", "stream_state", "draws", "draw_count", "sample_collision_count", "replay_hash"],
+  "properties": {
+    "schema_version": {"const": "stage2-draw-stream-manifest-v1"},
+    "sampling_plan_hash": {"$ref": "#/$defs/hash"},
+    "stream_state": {"$ref": "#/$defs/state"},
+    "draws": {"type": "array", "items": {"$ref": "#/$defs/draw"}},
+    "draw_count": {"type": "integer", "minimum": 0},
+    "sample_collision_count": {"type": "integer", "minimum": 0},
+    "replay_hash": {"$ref": "#/$defs/hash"}
+  },
+  "$defs": {
+    "hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "stream": {"enum": ["reference_sizing", "reference_A", "reference_B", "pilot", "confirmatory"]},
+    "state": {
+      "type": "object", "additionalProperties": false,
+      "required": ["stream", "start_position", "end_position", "state_before_sha256", "state_after_sha256", "algorithm_version"],
+      "properties": {
+        "stream": {"$ref": "#/$defs/stream"},
+        "start_position": {"type": "integer", "minimum": 0},
+        "end_position": {"type": "integer", "minimum": 0},
+        "state_before_sha256": {"$ref": "#/$defs/hash"},
+        "state_after_sha256": {"$ref": "#/$defs/hash"},
+        "algorithm_version": {"const": "stage2-draws-python-randrange-v1"}
+      }
+    },
+    "draw": {
+      "type": "object", "additionalProperties": false,
+      "required": ["draw_id", "stream", "position", "sample_id", "algorithm_version"],
+      "properties": {
+        "draw_id": {"type": "string", "minLength": 1},
+        "stream": {"$ref": "#/$defs/stream"},
+        "position": {"type": "integer", "minimum": 0},
+        "sample_id": {},
+        "algorithm_version": {"const": "stage2-draws-python-randrange-v1"}
+      }
+    }
+  }
+}

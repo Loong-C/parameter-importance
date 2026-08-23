@@ -1,0 +1,41 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://parameter-importance.invalid/schemas/shared/stage2-data-range-manifest-v1.json",
+  "title": "Stage 2 frozen Pile empirical universe",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "dataset_id", "revision", "manifest_ref", "manifest_sha256", "files", "sample_id_min", "sample_id_max_exclusive", "sample_count", "source_tokens_per_record", "input_sequence_length", "effective_target_tokens", "reader_schema", "sampling_design", "non_overlapping_windows", "excluded_objects", "data_range_hash"],
+  "properties": {
+    "schema_version": {"const": "stage2-data-range-manifest-v1"},
+    "dataset_id": {"type": "string", "minLength": 1},
+    "revision": {"type": "string", "pattern": "^[0-9a-f]{40,64}$"},
+    "manifest_ref": {"type": "string", "minLength": 1},
+    "manifest_sha256": {"$ref": "#/$defs/hash"},
+    "files": {"type": "array", "minItems": 2, "maxItems": 2, "items": {"$ref": "#/$defs/file"}},
+    "sample_id_min": {"type": "integer", "minimum": 0},
+    "sample_id_max_exclusive": {"type": "integer", "minimum": 1},
+    "sample_count": {"type": "integer", "minimum": 1},
+    "source_tokens_per_record": {"const": 2049},
+    "input_sequence_length": {"const": 2048},
+    "effective_target_tokens": {"const": 2048},
+    "reader_schema": {"type": "string", "minLength": 1},
+    "sampling_design": {"const": "uniform_with_replacement"},
+    "non_overlapping_windows": {"const": true},
+    "excluded_objects": {"type": "array", "items": {"type": "string", "minLength": 1}},
+    "data_range_hash": {"$ref": "#/$defs/hash"}
+  },
+  "$defs": {
+    "hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "file": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "size_bytes", "sha256", "role"],
+      "properties": {
+        "path": {"enum": ["document-00000-of-00020.bin", "document.idx"]},
+        "size_bytes": {"type": "integer", "minimum": 0},
+        "sha256": {"$ref": "#/$defs/hash"},
+        "role": {"enum": ["token_shard", "index"]}
+      }
+    }
+  }
+}

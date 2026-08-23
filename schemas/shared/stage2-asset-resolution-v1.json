@@ -1,0 +1,38 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://parameter-importance.invalid/schemas/shared/stage2-asset-resolution-v1.json",
+  "title": "Stage 2 model/data/checkpoint resolution",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "scope", "status", "checkpoint_matrix_complete", "checkpoints", "data_range", "manifest_repairs", "excluded_active_objects", "producer_commit", "execution_commit", "consumer_commit", "asset_resolution_hash"],
+  "properties": {
+    "schema_version": {"const": "stage2-asset-resolution-v1"},
+    "scope": {"enum": ["local_fixture", "formal"]},
+    "status": {"enum": ["READY", "BLOCKED"]},
+    "checkpoint_matrix_complete": {"type": "boolean"},
+    "checkpoints": {"type": "array", "minItems": 6, "maxItems": 6, "items": {"$ref": "stage2-checkpoint-manifest-v1.json"}},
+    "data_range": {"$ref": "stage2-data-range-manifest-v1.json"},
+    "manifest_repairs": {"type": "array", "items": {"$ref": "#/$defs/repair"}},
+    "excluded_active_objects": {"type": "array", "items": {"type": "string", "minLength": 1}},
+    "producer_commit": {"type": "string", "pattern": "^[0-9a-f]{40,64}$"},
+    "execution_commit": {"type": "string", "pattern": "^[0-9a-f]{40,64}$"},
+    "consumer_commit": {"oneOf": [{"type": "null"}, {"type": "string", "pattern": "^[0-9a-f]{40,64}$"}]},
+    "asset_resolution_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+  },
+  "$defs": {
+    "repair": {
+      "type": "object", "additionalProperties": false,
+      "required": ["target", "original_sha256", "canonical_sha256", "original_size_bytes", "canonical_size_bytes", "original_encoding", "canonical_encoding", "replaced_atomically"],
+      "properties": {
+        "target": {"type": "string", "minLength": 1},
+        "original_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "canonical_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "original_size_bytes": {"type": "integer", "minimum": 0},
+        "canonical_size_bytes": {"type": "integer", "minimum": 0},
+        "original_encoding": {"const": "utf-8-bom"},
+        "canonical_encoding": {"const": "utf-8"},
+        "replaced_atomically": {"const": true}
+      }
+    }
+  }
+}
