@@ -6,7 +6,10 @@ import hashlib
 import pytest
 
 from ops.stage2.materialize_s204 import (
+    EXPECTED_CELL_IDS,
     S204MaterializationError,
+    STAGE1_TASK_ID,
+    STAGE1_TASK_INPUTS,
     TASK_INPUTS,
     _PAYLOAD_SCHEMAS,
     generate_six_cell_configs,
@@ -16,6 +19,10 @@ from ops.stage2.materialize_s204 import (
     publish_reference_sizing_plan,
     write_six_cell_configs,
     _load_gpu_health_identity,
+    _load_parameter_registry_artifact,
+    publish_per_cell_delta_sci,
+    publish_per_cell_runtime_environments,
+    publish_per_cell_sizing_plans,
 )
 from param_importance_nlp.contracts import (
     FormalExecutionEvidence,
@@ -24,6 +31,7 @@ from param_importance_nlp.contracts import (
     load_canonical_json,
     write_canonical_json,
 )
+from param_importance_nlp.contracts.jsonio import canonical_json_hash
 from param_importance_nlp.contracts.g21_formal_handoff import (
     ALLOWED_DEVICES,
     AUTH_HASH,
@@ -43,7 +51,13 @@ from param_importance_nlp.experiments import (
     FORMAL_DATA_MANIFEST_SHA256,
     FORMAL_TOTAL_TRAINING_STEPS,
 )
-from param_importance_nlp.runtime import TaskArtifactStore, load_committed_task_artifact
+from param_importance_nlp.runtime import (
+    TaskArtifactStore,
+    TaskRuntimeEnvironment,
+    load_committed_task_artifact,
+)
+from param_importance_nlp.contracts.task_catalog import DEFAULT_TASK_CATALOG
+from param_importance_nlp.experiments.stage23_task_runners import _REQUIRED_PREDECESSORS
 
 
 def _publish(
@@ -53,9 +67,10 @@ def _publish(
     *,
     formal: bool = True,
     payload: dict[str, object] | None = None,
+    namespace: str | None = None,
 ) -> str:
     value = payload or {"schema_version": _PAYLOAD_SCHEMAS[kind]}
-    return TaskArtifactStore(root, f"inputs/{task_id.replace('.', '-')}").publish(
+    return TaskArtifactStore(root, namespace or f"inputs/{task_id.replace('.', '-')}").publish(
         task_id=task_id,
         artifact_kind=kind,
         config_hash="a" * 64,
@@ -111,6 +126,13 @@ def test_raw_bootstrap_requires_explicit_payload_and_config_hash(tmp_path: Path)
     }
     with pytest.raises(S204MaterializationError, match="S204_SOURCE_UNREADABLE"):
         bootstrap_formal_task_inputs(tmp_path, raw)
+
+
+def test_s21_formal_predecessor_contract_matches_task_catalog() -> None:
+    assert _REQUIRED_PREDECESSORS["stage2.01_scope_hypotheses_and_preregistration"] == (
+        STAGE1_TASK_ID,
+    )
+    assert tuple(DEFAULT_TASK_CATALOG.get(STAGE1_TASK_ID).artifact_kinds) == STAGE1_TASK_INPUTS  # type: ignore[union-attr]
 
 
 def test_raw_bootstrap_is_candidate_only_and_cannot_unlock_formal(
@@ -335,6 +357,7 @@ def test_six_cells_have_unique_identity_and_fresh_resume_separation(tmp_path: Pa
         base_config_ref=base_ref,
     )
     assert len(configs) == 6
+    assert tuple(configs) == EXPECTED_CELL_IDS
     assert len({config.config_hash for config in configs.values()}) == 6
     assert len({config.base_config.section("model")["revision"] for config in configs.values()}) == 6  # type: ignore[index]
     refs = write_six_cell_configs(configs, tmp_path)
@@ -348,6 +371,167 @@ def test_six_cells_have_unique_identity_and_fresh_resume_separation(tmp_path: Pa
             base_config_ref=base_ref,
             mode="resume",
         )
+
+
+def test_delta_sci_requires_explicit_frozen_s21_numeric_contract(tmp_path: Path) -> None:
+    sources = _source_set(tmp_path)
+    with pytest.raises(S204MaterializationError, match="S204_REFERENCE_DELTA_SCI_REQUIRED"):
+        publish_per_cell_delta_sci(
+            tmp_path,
+            s21_refs=sources["stage2.01_scope_hypotheses_and_preregistration"],
+        )
+
+    values = {str(count): float(count) for count in (512, 1024, 2048, 4096)}
+    for kind in ("preregistration", "hypothesis_contract"):
+        payload = {
+            "schema_version": _PAYLOAD_SCHEMAS[kind],
+            "delta_sci": {"delta_sci_by_B": values},
+        }
+        sources["stage2.01_scope_hypotheses_and_preregistration"][kind] = _publish(
+            tmp_path,
+            "stage2.01_scope_hypotheses_and_preregistration",
+            kind,
+            payload=payload,
+            namespace=f"inputs/delta-{kind}",
+        )
+    refs = publish_per_cell_delta_sci(
+        tmp_path,
+        s21_refs=sources["stage2.01_scope_hypotheses_and_preregistration"],
+    )
+    assert tuple(refs) == EXPECTED_CELL_IDS
+    assert len(set(refs.values())) == 6
+    tampered = load_canonical_json(tmp_path / refs[EXPECTED_CELL_IDS[0]])
+    assert isinstance(tampered, dict)
+    tampered["delta_sci_by_B"]["512"] = 0.0  # type: ignore[index]
+    write_canonical_json(tmp_path / refs[EXPECTED_CELL_IDS[0]], tampered)
+    with pytest.raises(S204MaterializationError, match="S204_REFERENCE_DELTA_SCI_CANDIDATE_COVERAGE"):
+        from ops.stage2.materialize_s204 import _validate_delta_sci_artifact
+
+        _validate_delta_sci_artifact(
+            tmp_path,
+            refs[EXPECTED_CELL_IDS[0]],
+            cell_id=EXPECTED_CELL_IDS[0],
+        )
+
+
+def test_registry_is_checkpoint_and_config_bound(tmp_path: Path) -> None:
+    checkpoint = _formal_asset_manifest().checkpoints[0]
+    cell_id = EXPECTED_CELL_IDS[0]
+    payload: dict[str, object] = {
+        "schema_version": "stage2-parameter-registry-artifact-v1",
+        "status": "READY",
+        "scope": "formal",
+        "cell_id": cell_id,
+        "checkpoint_id": checkpoint.checkpoint_id,
+        "model_id": checkpoint.model_id,
+        "training_stage": checkpoint.training_stage,
+        "config_hash": "a" * 64,
+        "registry_hash": checkpoint.parameter_registry_hash,
+        "parameter_groups": {"layer0.weight": {"layer": "layer0", "module": "weight"}},
+    }
+    payload["artifact_hash"] = canonical_json_hash(payload)
+    ref = "evidence/registry/pythia-14m-initialization.json"
+    write_canonical_json(tmp_path / ref, payload)
+    loaded = _load_parameter_registry_artifact(
+        tmp_path,
+        ref,
+        cell_id=cell_id,
+        checkpoint=checkpoint,
+        config_hash="a" * 64,
+    )
+    assert loaded["cell_id"] == cell_id
+    tampered = dict(payload)
+    tampered["parameter_groups"] = {"layer0.weight": {"layer": "layer0", "module": "changed"}}
+    write_canonical_json(tmp_path / ref, tampered)
+    with pytest.raises(S204MaterializationError, match="S204_PARAMETER_REGISTRY_HASH_INVALID"):
+        _load_parameter_registry_artifact(
+            tmp_path,
+            ref,
+            cell_id=cell_id,
+            checkpoint=checkpoint,
+            config_hash="a" * 64,
+        )
+
+
+def test_per_cell_environments_are_unique_and_rereadable(tmp_path: Path) -> None:
+    sources = _source_set(tmp_path)
+    values = {str(count): float(count) for count in (512, 1024, 2048, 4096)}
+    for kind in ("preregistration", "hypothesis_contract"):
+        sources["stage2.01_scope_hypotheses_and_preregistration"][kind] = _publish(
+            tmp_path,
+            "stage2.01_scope_hypotheses_and_preregistration",
+            kind,
+            payload={
+                "schema_version": _PAYLOAD_SCHEMAS[kind],
+                "delta_sci": {"delta_sci_by_B": values},
+            },
+            namespace=f"inputs/per-cell-delta-{kind}",
+        )
+    delta_refs = publish_per_cell_delta_sci(
+        tmp_path,
+        s21_refs=sources["stage2.01_scope_hypotheses_and_preregistration"],
+    )
+    gate = GateRecord(
+        gate_id="stage2.G2.2",
+        stage=2,
+        status=GateStatus.PASS,
+        checked_at="2026-08-23T00:00:00+00:00",
+        evidence_refs=("evidence/g2-2.json",),
+    )
+    evidence = FormalExecutionEvidence(
+        run_intent="formal",
+        contract_freeze_hash="a" * 64,
+        asset_manifest_hashes=("b" * 64,),
+        prerequisite_gates=(gate,),
+    )
+    formal_ref = "evidence/formal-execution.json"
+    write_canonical_json(tmp_path / formal_ref, evidence.to_dict())
+    base = TaskRuntimeEnvironment(
+        capabilities=frozenset({"server", "cuda", "model_assets", "data_assets"}),
+        frozen_contract_stages=frozenset({0, 1, 2}),
+        passed_gate_ids=frozenset({"stage2.G2.2"}),
+        evidence_refs={"formal_execution": formal_ref},
+    )
+    base_ref = "evidence/stage2/s204/runtime-environment.json"
+    write_canonical_json(tmp_path / base_ref, base.to_dict())
+    sizing_refs = publish_per_cell_sizing_plans(
+        tmp_path,
+        formal_execution=evidence,
+        output_dir="evidence/stage2/s204/reference-sizing",
+    )
+    registry_refs: dict[str, str] = {}
+    for index, cell_id in enumerate(EXPECTED_CELL_IDS):
+        body: dict[str, object] = {
+            "schema_version": "stage2-parameter-registry-artifact-v1",
+            "status": "READY",
+            "scope": "formal",
+            "cell_id": cell_id,
+            "checkpoint_id": f"checkpoint-{cell_id}",
+            "model_id": cell_id.split(":", 1)[0],
+            "training_stage": cell_id.split(":", 1)[1],
+            "config_hash": "a" * 64,
+            "registry_hash": f"{index + 1:064x}",
+            "parameter_groups": {"p0": {"layer": "layer0", "module": "module0"}},
+        }
+        body["artifact_hash"] = canonical_json_hash(body)
+        ref = f"evidence/registry/{index}.json"
+        write_canonical_json(tmp_path / ref, body)
+        registry_refs[cell_id] = ref
+    environments, environment_refs = publish_per_cell_runtime_environments(
+        tmp_path,
+        base_environment_ref=base_ref,
+        sizing_refs=sizing_refs,
+        registry_refs=registry_refs,
+        delta_refs=delta_refs,
+    )
+    assert tuple(environment_refs) == EXPECTED_CELL_IDS
+    assert len({environment.environment_hash for environment in environments.values()}) == 6
+    for cell_id, ref in environment_refs.items():
+        reread = TaskRuntimeEnvironment.from_mapping(load_canonical_json(tmp_path / ref))
+        assert reread.environment_hash == environments[cell_id].environment_hash
+        assert reread.evidence_refs["stage2_parameter_registry"] == registry_refs[cell_id]
+        assert reread.evidence_refs["stage2_reference_delta_sci"] == delta_refs[cell_id]
+        assert reread.evidence_refs["formal_reference_sizing_plan"] == sizing_refs[cell_id]
 
 
 def test_sizing_plan_binds_formal_execution_evidence(tmp_path: Path) -> None:

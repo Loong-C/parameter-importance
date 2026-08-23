@@ -18,7 +18,11 @@ from __future__ import annotations
 import argparse
 from collections.abc import Mapping, Sequence
 from copy import deepcopy
+from datetime import datetime, timezone
+import hashlib
+import inspect
 import json
+import math
 from pathlib import Path, PurePosixPath
 import re
 import sys
@@ -44,6 +48,8 @@ from param_importance_nlp.contracts.stage0_handoff import (  # noqa: E402
     validate_stage0_handoff,
 )
 from param_importance_nlp.contracts.stage1_handoff import (  # noqa: E402
+    STAGE1_G1_EXIT_GATE_ID,
+    STAGE1_G1_EXIT_TASK_ID,
     validate_stage1_exit_evidence,
 )
 from param_importance_nlp.contracts.g21_formal_handoff import (  # noqa: E402
@@ -97,6 +103,14 @@ DEFAULT_CANDIDATES: Final = (512, 1024, 2048, 4096)
 DEFAULT_BLOCK_SIZE: Final = 32
 DEFAULT_TOKENIZER_ASSET_ID: Final = "pythia-tokenizer"
 DEFAULT_DATA_ASSET_ID: Final = "pile-selected-prefix"
+S204_SIX_CELL_SCHEMA: Final = "stage2-s204-six-cell-manifest-v1"
+S204_REGISTRY_SCHEMA: Final = "stage2-parameter-registry-artifact-v1"
+S204_DELTA_SCHEMA: Final = "stage2-reference-delta-sci-v1"
+EXPECTED_CELL_IDS: Final = tuple(
+    f"{model}:{stage}"
+    for model in ("pythia-14m", "pythia-31m-deduped")
+    for stage in ("initialization", "early", "mid_late")
+)
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _COMMIT = re.compile(r"^[0-9a-f]{40}$")
 _LOGICAL = re.compile(r"^[^\\/][^\\]*$")
@@ -120,6 +134,20 @@ TASK_INPUTS: Final = {
     ),
 }
 
+STAGE1_TASK_ID: Final = "stage1.11_reporting_and_exit_gate"
+STAGE1_TASK_INPUTS: Final = (
+    "stage_report",
+    "requirements_matrix",
+    "gate_summary",
+    "delivery_manifest",
+)
+STAGE1_PAYLOAD_SCHEMAS: Final = {
+    "stage_report": "stage1-s1-11-stage-report-v1",
+    "requirements_matrix": "stage1-s1-11-requirements-matrix-v1",
+    "gate_summary": "stage1-s1-11-gate-summary-v1",
+    "delivery_manifest": "stage1-s1-11-delivery-manifest-v1",
+}
+
 _PAYLOAD_SCHEMAS: Final = {
     "preregistration": "stage2-preregistration-v1",
     "hypothesis_contract": "stage2-hypothesis-contract-v1",
@@ -136,6 +164,29 @@ _PAYLOAD_SCHEMAS: Final = {
 
 class S204MaterializationError(RuntimeError):
     """A required formal source or identity is absent/invalid."""
+
+
+class FormalDAGResult(dict[str, dict[str, str]]):
+    """Mapping-compatible DAG result carrying the final evidence snapshot."""
+
+    def __init__(
+        self,
+        refs_by_task: Mapping[str, Mapping[str, str]],
+        *,
+        final_evidence: FormalExecutionEvidence,
+        final_evidence_ref: str,
+        bridge_gate_refs: Mapping[str, str],
+        authoritative_asset_ref: str,
+        stage1_bridge_ref: str,
+        stage1_bridge_config_ref: str,
+    ) -> None:
+        super().__init__({task: dict(refs) for task, refs in refs_by_task.items()})
+        self.final_evidence = final_evidence
+        self.final_evidence_ref = final_evidence_ref
+        self.bridge_gate_refs = dict(bridge_gate_refs)
+        self.authoritative_asset_ref = authoritative_asset_ref
+        self.stage1_bridge_ref = stage1_bridge_ref
+        self.stage1_bridge_config_ref = stage1_bridge_config_ref
 
 
 def _error(code: str, detail: object = "") -> S204MaterializationError:
@@ -225,7 +276,15 @@ def _reject_nonformal_ref(ref: str, field: str) -> None:
     """
 
     parts = set(PurePosixPath(ref).parts)
-    if parts.intersection({"fixtures", "src", "ops", "configs"}):
+    # Generated formal v2 configs are themselves content-addressed evidence;
+    # only checked-in config layers remain forbidden as formal source refs.
+    generated_config = (
+        "configs" in parts
+        and "generated" in parts
+        and "stage2" in parts
+    )
+    forbidden = parts.intersection({"fixtures", "src", "ops", "configs"})
+    if forbidden and not (forbidden == {"configs"} and generated_config):
         raise _error("FIXTURE_OR_CODE_REF_FORBIDDEN", f"{field}:{ref}")
 
 
@@ -290,6 +349,331 @@ def _load_formal_source(
         _reject_nonformal_ref(source_ref, f"{task_id}.{artifact_kind}.source_ref")
     _validate_payload(artifact_kind, loaded.payload)
     return loaded
+
+
+def _assert_source_file(root: Path, ref: str, field: str, *, sha256: str | None = None) -> str:
+    """Require a source object to exist and, when supplied, match its byte hash."""
+
+    path = _safe_relative(root, ref, field)
+    try:
+        digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    except OSError as error:
+        raise _error("SOURCE_UNREADABLE", f"{field}:{ref}") from error
+    if sha256 is not None and digest != _sha(sha256, f"{field}.sha256"):
+        raise _error("SOURCE_HASH_MISMATCH", field)
+    return digest
+
+
+def _stage1_task_refs(source: Mapping[str, Any]) -> Mapping[str, str]:
+    """Return the four *formal TaskArtifact commits* for Stage 1.11.
+
+    The S1.11 index/role JSONs are evidence of completion, but they are not
+    task-output commits.  A Stage 2 runner must receive the four commits from
+    the Stage 1 producer, so a caller cannot promote the role files directly.
+    """
+
+    raw = source.get("stage1_11_task_outputs", source.get("stage1_task_outputs"))
+    if isinstance(raw, Mapping) and STAGE1_TASK_ID in raw:
+        raw = raw[STAGE1_TASK_ID]
+    if not isinstance(raw, Mapping) or set(raw) != set(STAGE1_TASK_INPUTS):
+        raise _error("STAGE1_FORMAL_COMMITS_REQUIRED")
+    result: dict[str, str] = {}
+    for kind in STAGE1_TASK_INPUTS:
+        result[kind] = _source_ref(raw[kind], f"stage1_11_task_outputs.{kind}")
+    return result
+
+
+def _load_stage1_formal_commits(
+    root: Path,
+    source: Mapping[str, Any],
+    *,
+    stage1_index_ref: str,
+    base_config_ref: str,
+    output_dir: str,
+) -> tuple[dict[str, LoadedTaskArtifact], Any, str, str]:
+    """Validate or bridge S1.11 into four formal TaskArtifact commits.
+
+    The released S1.11 r4 handoff contains seven immutable role documents, not
+    TaskArtifact envelopes and intentionally has no ``config_hash``.  When no
+    explicit producer commits are supplied, this function creates a narrow
+    bridge envelope around those already-validated role documents.  It never
+    changes a role payload, status, or numeric result: the bridge config and
+    evidence document bind the exact index/role bytes and hashes instead.
+    """
+
+    try:
+        stage1_exit = validate_stage1_exit_evidence(root, stage1_index_ref)
+    except Exception as error:
+        raise _error("STAGE1_EXIT_REQUIRED", stage1_index_ref) from error
+    role_refs = _stage1_role_ref_map(root, stage1_index_ref)
+    role_payloads: dict[str, Mapping[str, Any]] = {}
+    for role, ref in role_refs.items():
+        role_payloads[role] = _load_mapping(root, ref, f"stage1.role.{role}")
+
+    explicit = source.get("stage1_11_task_outputs", source.get("stage1_task_outputs"))
+    if explicit is not None:
+        declared_refs = _stage1_task_refs(source)
+        # Some DATA_ROOT manifests name the four released role files under
+        # this key even though they are not task commits.  Treat that exact
+        # index-derived set as a request for the bridge path; any other
+        # explicit value must be an actual formal TaskArtifact commit.
+        if all(declared_refs[kind] == role_refs[kind] for kind in STAGE1_TASK_INPUTS):
+            refs = {}
+        else:
+            refs = declared_refs
+    else:
+        refs = {}
+    loaded: dict[str, LoadedTaskArtifact] = {}
+    if refs:
+        for kind in STAGE1_TASK_INPUTS:
+            try:
+                item = load_committed_task_artifact(root, refs[kind], require_formal=True)
+            except Exception as error:
+                raise _error("STAGE1_FORMAL_COMMIT_REQUIRED", kind) from error
+            if item.identity.task_id != STAGE1_TASK_ID or item.identity.artifact_kind != kind:
+                raise _error("STAGE1_FORMAL_COMMIT_IDENTITY_MISMATCH", kind)
+            if item.run_intent != "formal" or item.identity.formal_eligible is not True:
+                raise _error("STAGE1_FORMAL_SCOPE_REQUIRED", kind)
+            for source_ref in item.source_refs:
+                _reject_nonformal_ref(source_ref, f"stage1_11_task_outputs.{kind}.source_ref")
+            if item.payload.get("schema_version") != STAGE1_PAYLOAD_SCHEMAS[kind]:
+                raise _error("STAGE1_FORMAL_PAYLOAD_SCHEMA_INVALID", kind)
+            loaded[kind] = item
+
+    # A bridge config is required even when a producer supplied envelopes: the
+    # historical role payloads have no config identity of their own.  It is an
+    # evidence/config binding, never a claim that the role producer used this
+    # newly-resolved config.
+    role_input_refs = tuple(
+        dict.fromkeys((stage1_index_ref, *role_refs.values()))
+    )
+    if loaded:
+        payload_hashes = {
+            kind: canonical_json_hash(dict(role_payloads[kind]))
+            for kind in STAGE1_TASK_INPUTS
+        }
+    else:
+        payload_hashes = {
+            kind: canonical_json_hash(dict(role_payloads[kind]))
+            for kind in STAGE1_TASK_INPUTS
+        }
+    config, config_ref = _publish_bridge_config(
+        root,
+        base_config_ref=base_config_ref,
+        # The checked-in formal-stage2 layer is the only resolved science
+        # base available here.  The config is explicitly labelled as the
+        # Stage 2 bridge task; it does not pretend to be S1.11's producer
+        # config (the historical role payloads intentionally have none).
+        task_id="stage2.01_scope_hypotheses_and_preregistration",
+        input_refs=role_input_refs,
+        output_ref=f"{output_dir}/bridges/stage1-11-resolved-config-v2.json",
+    )
+    bridge_payload: dict[str, Any] = {
+        "schema_version": "stage2-s204-stage1-bridge-v1",
+        "status": "PASS",
+        "formal_eligible": True,
+        "task_id": STAGE1_TASK_ID,
+        "gate_id": f"stage1.{STAGE1_G1_EXIT_GATE_ID}",
+        "index_ref": stage1_exit.index_ref,
+        "index_sha256": stage1_exit.index_sha256,
+        "index_artifact_hash": stage1_exit.index_artifact_hash,
+        "execution_commit": stage1_exit.execution_commit,
+        "role_refs": dict(role_refs),
+        "role_sha256": dict(stage1_exit.role_sha256),
+        "payload_hashes": payload_hashes,
+        "bridge_config_ref": config_ref,
+        "bridge_config_hash": config.config_hash,
+        "bridge_config_full_hash": config.full_hash,
+        "source_refs": list(role_input_refs),
+    }
+    bridge_payload["artifact_hash"] = canonical_json_hash(bridge_payload)
+    bridge_ref = f"{output_dir}/bridges/stage1-11-bridge-evidence.json"
+    publish_canonical_immutable(_safe_relative(root, bridge_ref, "stage1_bridge_evidence_output"), bridge_payload)
+    bridge_readback = _load_mapping(root, bridge_ref, "stage1_bridge_evidence")
+    if bridge_readback.get("artifact_hash") != bridge_payload["artifact_hash"]:
+        raise _error("STAGE1_BRIDGE_EVIDENCE_DRIFT")
+
+    if not loaded:
+        store = TaskArtifactStore(root, f"{output_dir}/bridges/stage1-11-task-outputs")
+        source_refs = tuple(dict.fromkeys((*role_input_refs, config_ref, bridge_ref)))
+        for kind in STAGE1_TASK_INPUTS:
+            payload = role_payloads[kind]
+            if payload.get("schema_version") != STAGE1_PAYLOAD_SCHEMAS[kind]:
+                raise _error("STAGE1_FORMAL_PAYLOAD_SCHEMA_INVALID", kind)
+            published = store.publish(
+                task_id=STAGE1_TASK_ID,
+                artifact_kind=kind,
+                config_hash=config.config_hash,
+                run_intent="formal",
+                payload=dict(payload),
+                formal_eligible=True,
+                source_refs=source_refs,
+            )
+            loaded[kind] = load_committed_task_artifact(root, published.commit_ref, require_formal=True)
+    else:
+        # Existing commits remain authoritative; only the bridge evidence is
+        # added as an explicit downstream source, never copied into them.
+        for kind in STAGE1_TASK_INPUTS:
+            if loaded[kind].payload != role_payloads[kind]:
+                raise _error("STAGE1_BRIDGE_PAYLOAD_DRIFT", kind)
+    return loaded, stage1_exit, config_ref, bridge_ref
+
+
+_STAGE1_ROLES: Final = (
+    "formal_observation",
+    "stage_report",
+    "delivery_manifest",
+    "gate_summary",
+    "requirements_matrix",
+    "validation",
+    "replay_validation",
+)
+
+
+def _stage1_role_ref_map(root: Path, index_ref: str) -> dict[str, str]:
+    """Resolve every S1.11 role ref relative to the validated index."""
+
+    index = _load_mapping(root, index_ref, "stage1_g1_exit")
+    role_refs = _mapping(index.get("role_refs"), "stage1.role_refs")
+    base = PurePosixPath(index_ref).parent
+    resolved: dict[str, str] = {}
+    for role in _STAGE1_ROLES:
+        role_ref = role_refs.get(role)
+        if not isinstance(role_ref, str):
+            raise _error("STAGE1_ROLE_REF_MISSING", role)
+        absolute = _safe_relative(
+            root,
+            f"{base.as_posix()}/{role_ref}",
+            f"stage1.role.{role}",
+        )
+        if not absolute.is_file():
+            raise _error("STAGE1_ROLE_REF_MISSING", role)
+        resolved[role] = absolute.relative_to(root).as_posix()
+    return resolved
+
+
+def _stage1_role_refs(root: Path, index_ref: str) -> tuple[str, ...]:
+    """Resolve every S1.11 role ref for bridge evidence lineage."""
+
+    resolved = _stage1_role_ref_map(root, index_ref)
+    return tuple(resolved[role] for role in _STAGE1_ROLES)
+
+
+def _validate_stage1_bridge(
+    root: Path,
+    *,
+    index_ref: str,
+    bridge_ref: str,
+    config_ref: str,
+) -> None:
+    """Re-read the S1.11 role-to-config bridge and verify every binding."""
+
+    index = _source_ref(index_ref, "stage1_g1_exit")
+    bridge = _source_ref(bridge_ref, "stage1_bridge")
+    config = _source_ref(config_ref, "stage1_bridge_config")
+    value = _load_mapping(root, bridge, "stage1_bridge")
+    if value.get("schema_version") != "stage2-s204-stage1-bridge-v1" or value.get("status") != "PASS":
+        raise _error("STAGE1_BRIDGE_EVIDENCE_INVALID")
+    if value.get("formal_eligible") is not True or value.get("task_id") != STAGE1_TASK_ID:
+        raise _error("STAGE1_BRIDGE_SCOPE_INVALID")
+    if value.get("gate_id") != f"stage1.{STAGE1_G1_EXIT_GATE_ID}" or value.get("index_ref") != index:
+        raise _error("STAGE1_BRIDGE_INDEX_BINDING_INVALID")
+    declared_source_refs = value.get("source_refs")
+    expected_roles = _stage1_role_ref_map(root, index)
+    if value.get("role_refs") != expected_roles:
+        raise _error("STAGE1_BRIDGE_ROLE_REF_BINDING_INVALID")
+    if not isinstance(declared_source_refs, list) or set(declared_source_refs) != {index, *expected_roles.values()}:
+        raise _error("STAGE1_BRIDGE_SOURCE_BINDING_INVALID")
+    try:
+        exit_evidence = validate_stage1_exit_evidence(root, index)
+        role_sha = dict(exit_evidence.role_sha256)
+    except Exception as error:
+        raise _error("STAGE1_BRIDGE_STAGE1_INVALID") from error
+    if value.get("index_sha256") != exit_evidence.index_sha256 or value.get("index_artifact_hash") != exit_evidence.index_artifact_hash:
+        raise _error("STAGE1_BRIDGE_INDEX_HASH_INVALID")
+    if value.get("role_sha256") != role_sha or value.get("execution_commit") != exit_evidence.execution_commit:
+        raise _error("STAGE1_BRIDGE_ROLE_HASH_INVALID")
+    payload_hashes = value.get("payload_hashes")
+    if not isinstance(payload_hashes, Mapping) or set(payload_hashes) != set(STAGE1_TASK_INPUTS):
+        raise _error("STAGE1_BRIDGE_PAYLOAD_HASH_SET_INVALID")
+    for kind in STAGE1_TASK_INPUTS:
+        payload = _load_mapping(root, expected_roles[kind], f"stage1.role.{kind}")
+        if payload_hashes[kind] != canonical_json_hash(dict(payload)):
+            raise _error("STAGE1_BRIDGE_PAYLOAD_HASH_INVALID", kind)
+    if value.get("bridge_config_ref") != config:
+        raise _error("STAGE1_BRIDGE_CONFIG_REF_INVALID")
+    try:
+        resolved = ResolvedConfigV2.from_mapping(_load_mapping(root, config, "stage1_bridge_config"))
+    except Exception as error:
+        raise _error("STAGE1_BRIDGE_CONFIG_INVALID") from error
+    if value.get("bridge_config_hash") != resolved.config_hash or value.get("bridge_config_full_hash") != resolved.full_hash:
+        raise _error("STAGE1_BRIDGE_CONFIG_HASH_INVALID")
+    declared_artifact_hash = value.get("artifact_hash")
+    if not isinstance(declared_artifact_hash, str) or canonical_json_hash(
+        {key: item for key, item in value.items() if key != "artifact_hash"}
+    ) != declared_artifact_hash:
+        raise _error("STAGE1_BRIDGE_ARTIFACT_HASH_INVALID")
+
+
+def _publish_authoritative_asset_manifest(
+    root: Path,
+    *,
+    source: Mapping[str, Any],
+    raw_refs: Mapping[str, Mapping[str, Mapping[str, Any]]] | None,
+    output_dir: str,
+) -> tuple[str, AssetResolutionManifest]:
+    """Validate and publish the direct formal S2.3 asset manifest.
+
+    The runner consumes this direct manifest, not a raw task-output envelope.
+    The source may be an existing direct manifest or a raw formal candidate
+    whose nested ``AssetResolutionManifest`` passes the strict semantic loader.
+    A local fixture/candidate manifest cannot satisfy that loader.
+    """
+
+    value: Mapping[str, Any] | None = None
+    source_ref: str | None = None
+    for key in ("stage2_asset_resolution_manifest", "stage2_asset_resolution"):
+        candidate = source.get(key)
+        if isinstance(candidate, str):
+            source_ref = _source_ref(candidate, key)
+            value = _load_mapping(root, source_ref, key)
+            break
+    if value is None and raw_refs is not None:
+        try:
+            spec = raw_refs["stage2.03_assets_checkpoints_and_sampling"]["asset_resolution"]
+            source_ref = _source_ref(spec.get("ref"), "raw.stage2.03.asset_resolution.ref")
+            value = _load_mapping(root, source_ref, "raw.stage2.03.asset_resolution")
+        except (KeyError, TypeError, AttributeError) as error:
+            raise _error("FORMAL_ASSET_MANIFEST_REQUIRED") from error
+    if value is None or source_ref is None:
+        raise _error("FORMAL_ASSET_MANIFEST_REQUIRED")
+    declared_sha = source.get("stage2_asset_resolution_sha256")
+    _assert_source_file(root, source_ref, "stage2_asset_resolution", sha256=(str(declared_sha) if declared_sha is not None else None))
+    payload = value
+    if value.get("schema_version") == "stage2-task-asset-resolution-v1":
+        nested = value.get("stage2_asset_manifest")
+        if not isinstance(nested, Mapping):
+            raise _error("FORMAL_ASSET_MANIFEST_MISSING")
+        # Raw task envelopes are candidates.  They are admissible only as the
+        # source of a newly validated direct manifest; their false eligibility
+        # is never copied into the formal task commit.
+        payload = nested
+    try:
+        manifest = AssetResolutionManifest.from_mapping(dict(payload))
+        validate_formal_asset_identity(manifest)
+    except Exception as error:
+        raise _error("FORMAL_ASSET_MANIFEST_INVALID", source_ref) from error
+    target_ref = f"{output_dir}/authoritative/stage2-asset-resolution-manifest.json"
+    target = _safe_relative(root, target_ref, "formal_asset_manifest_output")
+    publish_canonical_immutable(target, manifest.to_dict())
+    try:
+        round_trip = AssetResolutionManifest.from_mapping(load_canonical_json(target))
+        validate_formal_asset_identity(round_trip)
+    except Exception as error:
+        raise _error("FORMAL_ASSET_MANIFEST_ROUND_TRIP_DRIFT") from error
+    if round_trip.digest != manifest.digest:
+        raise _error("FORMAL_ASSET_MANIFEST_HASH_DRIFT")
+    return PurePosixPath(target_ref).as_posix(), manifest
 
 
 def _find_schema_payload(value: object, schema_version: str) -> tuple[Mapping[str, Any], ...]:
@@ -649,11 +1033,12 @@ def _build_formal_predecessor_environment(
     gpu_ref, allowed_devices = _load_gpu_health_identity(
         root,
         source.get("g21_handoff", source.get("gpu_health")),
+        expected_stage1_ref=stage1_ref,
     )
     gates = _load_formal_gate_refs(
         root,
         _mapping(source.get("gate_refs"), "gate_refs"),
-        required=("stage1.G1-EXIT", "stage2.G2.0", "stage2.G2.1"),
+        required=("stage1.G1-EXIT",),
     )
     capability_values = {
         name: _load_capability(
@@ -701,6 +1086,292 @@ def _build_formal_predecessor_environment(
         passed_gate_ids=frozenset(gates),
         evidence_refs=evidence_refs,
     )
+
+
+def _publish_bridge_config(
+    root: Path,
+    *,
+    base_config_ref: str,
+    task_id: str,
+    input_refs: Sequence[str],
+    output_ref: str,
+) -> tuple[ResolvedConfigV2, str]:
+    """Persist a dedicated v2 config for an evidence bridge.
+
+    Historical Stage1 role documents do not carry a config hash.  The bridge
+    therefore has its own fully resolved identity; it records the role/index
+    hashes as evidence instead of pretending that those documents were
+    produced by this config.
+    """
+
+    config = _formal_dag_config(
+        root,
+        base_config_ref=base_config_ref,
+        task_id=task_id,
+        input_refs=tuple(dict.fromkeys(input_refs)),
+        output_dir=f"{output_ref.rsplit('/', 1)[0]}/outputs",
+    )
+    target = _safe_relative(root, output_ref, "bridge_config_output")
+    publish_canonical_immutable(target, config.to_dict())
+    try:
+        reread = ResolvedConfigV2.from_mapping(load_canonical_json(target))
+    except Exception as error:
+        raise _error("BRIDGE_CONFIG_ROUND_TRIP_DRIFT", output_ref) from error
+    if reread.config_hash != config.config_hash or reread.full_hash != config.full_hash:
+        raise _error("BRIDGE_CONFIG_IDENTITY_DRIFT", output_ref)
+    return config, PurePosixPath(output_ref).as_posix()
+
+
+def _publish_bridge_gate(
+    root: Path,
+    *,
+    gate_id: str,
+    producer_task_id: str,
+    config: ResolvedConfigV2,
+    config_ref: str,
+    upstream_refs: Sequence[str],
+    measured: Mapping[str, Any],
+    output_dir: str,
+) -> tuple[str, GateRecord]:
+    """Publish an independently derived formal GateRecord task commit."""
+
+    refs = tuple(dict.fromkeys((config_ref, *upstream_refs)))
+    for ref in refs:
+        _assert_source_file(root, ref, f"bridge.{gate_id}.source_ref")
+    gate = GateRecord(
+        gate_id=gate_id,
+        stage=2,
+        status=GateStatus.PASS,
+        checked_at=datetime.now(timezone.utc).isoformat(),
+        measured=dict(measured),
+        threshold={"evaluator": "stage2-s204-independent-bridge-v1"},
+        evidence_refs=refs,
+        reasons=("independent_evidence_revalidated",),
+    )
+    store = TaskArtifactStore(root, output_dir)
+    published = store.publish(
+        task_id=producer_task_id,
+        artifact_kind="gate_record",
+        config_hash=config.config_hash,
+        run_intent="formal",
+        payload=gate.to_dict(),
+        formal_eligible=True,
+        source_refs=refs,
+    )
+    loaded = load_committed_task_artifact(root, published.commit_ref, require_formal=True)
+    if loaded.identity.task_id != producer_task_id or loaded.identity.artifact_kind != "gate_record":
+        raise _error("BRIDGE_GATE_IDENTITY_DRIFT", gate_id)
+    try:
+        reread = GateRecord.from_mapping(dict(loaded.payload))
+    except Exception as error:
+        raise _error("BRIDGE_GATE_PAYLOAD_INVALID", gate_id) from error
+    if reread.gate_id != gate_id or reread.status is not GateStatus.PASS:
+        raise _error("BRIDGE_GATE_NOT_PASS", gate_id)
+    if set(refs) - set(loaded.source_refs) or set(refs) - set(reread.evidence_refs):
+        raise _error("BRIDGE_GATE_LINEAGE_DRIFT", gate_id)
+    return published.commit_ref, reread
+
+
+def _extend_formal_execution(
+    root: Path,
+    *,
+    evidence_ref: str,
+    gate: GateRecord,
+    asset_hashes: Sequence[str] = (),
+    destination: str,
+) -> tuple[FormalExecutionEvidence, str]:
+    """Append one derived Gate and asset identity to the execution evidence."""
+
+    value = _load_mapping(root, evidence_ref, "formal_execution")
+    try:
+        previous = FormalExecutionEvidence.from_mapping(value)
+        previous.require_for_stage(2)
+    except Exception as error:
+        raise _error("FORMAL_EXECUTION_INVALID", evidence_ref) from error
+    if gate.gate_id in {item.gate_id for item in previous.prerequisite_gates}:
+        raise _error("FORMAL_EXECUTION_GATE_DUPLICATE", gate.gate_id)
+    hashes = tuple(dict.fromkeys((*previous.asset_manifest_hashes, *asset_hashes)))
+    try:
+        extended = FormalExecutionEvidence(
+            run_intent="formal",
+            contract_freeze_hash=previous.contract_freeze_hash,
+            asset_manifest_hashes=hashes,
+            prerequisite_gates=(*previous.prerequisite_gates, gate),
+            metadata=dict(previous.metadata),
+        )
+    except Exception as error:
+        raise _error("FORMAL_EXECUTION_EXTENSION_INVALID", gate.gate_id) from error
+    target = _safe_relative(root, destination, "formal_execution_extension_output")
+    publish_canonical_immutable(target, extended.to_dict())
+    reread = FormalExecutionEvidence.from_mapping(load_canonical_json(target))
+    reread.require_for_stage(2)
+    if reread.artifact_hash != extended.artifact_hash:
+        raise _error("FORMAL_EXECUTION_EXTENSION_DRIFT", destination)
+    return reread, PurePosixPath(destination).as_posix()
+
+
+def _build_phase_environment(
+    root: Path,
+    *,
+    source: Mapping[str, Any],
+    formal_execution_ref: str,
+    stage0_ref: str,
+    stage1_ref: str,
+    contract_stage_refs: Mapping[int, str],
+    g3_ref: str,
+    stage2_asset_ref: str,
+    gate_refs: Mapping[str, str],
+    phase_gate_ids: Sequence[str],
+    capability_refs: Mapping[str, Any],
+    g21_ref: str,
+    output_ref: str,
+    stage1_bridge_ref: str | None = None,
+    stage1_bridge_config_ref: str | None = None,
+) -> TaskRuntimeEnvironment:
+    """Construct one phase snapshot with current Stage0/1/GPU/G3 identities."""
+
+    formal_value = _load_mapping(root, formal_execution_ref, "formal_execution")
+    try:
+        evidence = FormalExecutionEvidence.from_mapping(formal_value)
+        evidence.require_for_stage(2)
+    except Exception as error:
+        raise _error("FORMAL_EXECUTION_INVALID", formal_execution_ref) from error
+    try:
+        validate_stage0_handoff(root, stage0_ref, require_ready=True)
+        validate_stage1_exit_evidence(root, stage1_ref)
+    except Exception as error:
+        raise _error("STAGE0_STAGE1_READY_REQUIRED") from error
+    stage1_exit = validate_stage1_exit_evidence(root, stage1_ref)
+    contract_refs: dict[int, str] = {}
+    freezes: dict[int, ContractFreeze] = {}
+    for stage in (0, 1, 2):
+        ref, freeze = _load_formal_contract_freeze(
+            root,
+            contract_stage_refs.get(stage),
+            stage=stage,
+        )
+        contract_refs[stage] = ref
+        freezes[stage] = freeze
+    if freezes[2].artifact_hash != evidence.contract_freeze_hash:
+        raise _error("CONTRACT_FREEZE_IDENTITY_MISMATCH", contract_refs[2])
+    contract_doc_ref = _publish_contract_document(
+        root,
+        freezes[2],
+        output_ref=PurePosixPath(output_ref).with_name("contract-freeze-stage2.json").as_posix(),
+    )
+    g3_source = _source_ref(g3_ref, "g3_resolution")
+    try:
+        g3_loaded = load_committed_task_artifact(root, g3_source, require_formal=True)
+        if g3_loaded.identity.task_id != "stage0.04_assets_and_manifests" or g3_loaded.identity.artifact_kind != "asset_resolution":
+            raise ValueError("wrong G3 identity")
+        FormalG3RuntimeAssets.load(root, g3_source)
+    except Exception as error:
+        raise _error("G3_RUNTIME_ASSETS_INVALID", g3_source) from error
+    asset_ref = _source_ref(stage2_asset_ref, "stage2_asset_resolution")
+    try:
+        asset = AssetResolutionManifest.from_mapping(_load_mapping(root, asset_ref, "stage2_asset_resolution"))
+        validate_formal_asset_identity(asset)
+    except Exception as error:
+        raise _error("S23_ASSET_RESOLUTION_INVALID", asset_ref) from error
+    gpu_ref, allowed_devices = _load_gpu_health_identity(
+        root,
+        g21_ref,
+        expected_stage1_ref=stage1_ref,
+    )
+    if set(ALLOWED_GPU_INDICES) & {EXCLUDED_GPU_INDEX}:
+        raise _error("GPU_ALLOWED_INDEX_INCLUDES_EXCLUDED")
+    binding_ref = PurePosixPath(output_ref).with_name("gpu-health-binding.json").as_posix()
+    binding_payload: dict[str, Any] = {
+        "schema_version": "stage2-s204-gpu-health-binding-v1",
+        "source_ref": gpu_ref,
+        "excluded": {"index": 1, "pci_bus_id": EXCLUDED_PCI, "uuid": EXCLUDED_UUID},
+        "allowed_indices": [int(item) for item in sorted(ALLOWED_GPU_INDICES)],
+        "allowed_devices": [{"pci_bus_id": pci, "uuid": uuid} for pci, uuid in allowed_devices],
+    }
+    binding_payload["binding_hash"] = canonical_json_hash(binding_payload)
+    publish_canonical_immutable(_safe_relative(root, binding_ref, "gpu_binding_output"), binding_payload)
+    capability_values = {
+        name: _load_capability(root, _mapping(capability_refs, "capability_refs").get(name), name)
+        for name in ("server", "cuda", "model_assets", "data_assets")
+    }
+    cuda_metadata = capability_values["cuda"][1].metadata
+    runtime_devices = cuda_metadata.get("allowed_devices")
+    if runtime_devices is not None:
+        runtime_pairs = tuple(
+            (str(item.get("pci_bus_id")), str(item.get("uuid")))
+            for item in runtime_devices
+            if isinstance(item, Mapping)
+        )
+        if runtime_pairs != allowed_devices:
+            raise _error("GPU_RUNTIME_INVENTORY_DRIFT")
+    runtime_excluded = cuda_metadata.get("excluded_device")
+    if runtime_excluded is not None and (
+        not isinstance(runtime_excluded, Mapping)
+        or str(runtime_excluded.get("pci_bus_id")) != EXCLUDED_PCI
+        or str(runtime_excluded.get("uuid")) != EXCLUDED_UUID
+    ):
+        raise _error("GPU_RUNTIME_EXCLUDED_IDENTITY_DRIFT")
+    if set(gate_refs) != set(phase_gate_ids):
+        raise _error("PHASE_GATE_REF_SET_INVALID", output_ref)
+    expected_gate_tasks = {
+        "stage1.G1-EXIT": STAGE1_TASK_ID,
+        "stage2.G2.0": "stage2.01_scope_hypotheses_and_preregistration",
+        "stage2.G2.1": "stage2.02_stage1_handoff_and_fixed_state_contract",
+        "stage2.G2.2": "stage2.03_assets_checkpoints_and_sampling",
+    }
+    selected_gates = _load_formal_gate_refs(
+        root,
+        {str(key): str(value) for key, value in gate_refs.items()},
+        required=tuple(phase_gate_ids),
+        expected_task=expected_gate_tasks,
+        expected_artifact_kind={key: "gate_record" for key in expected_gate_tasks},
+    )
+    evidence_refs: dict[str, str] = {
+        "formal_execution": formal_execution_ref,
+        "stage0_handoff": stage0_ref,
+        "stage1_g1_exit": stage1_ref,
+        "contract_stage_0": contract_refs[0],
+        "contract_stage_1": contract_refs[1],
+        "contract_stage_2": contract_refs[2],
+        "contract_freeze": contract_doc_ref,
+        "g3_resolution": g3_source,
+        "stage2_asset_resolution": asset_ref,
+        "gpu_health": gpu_ref,
+        "gpu_health_binding": binding_ref,
+    }
+    if stage1_bridge_ref is not None:
+        bridge_ref = _source_ref(stage1_bridge_ref, "stage1_bridge")
+        if stage1_bridge_config_ref is None:
+            raise _error("STAGE1_BRIDGE_CONFIG_REQUIRED")
+        _validate_stage1_bridge(
+            root,
+            index_ref=stage1_ref,
+            bridge_ref=bridge_ref,
+            config_ref=stage1_bridge_config_ref,
+        )
+        evidence_refs["stage1_11_bridge"] = bridge_ref
+    if stage1_bridge_config_ref is not None:
+        config_ref = _source_ref(stage1_bridge_config_ref, "stage1_bridge_config")
+        _assert_source_file(root, config_ref, "stage1_bridge_config")
+        try:
+            ResolvedConfigV2.from_mapping(_load_mapping(root, config_ref, "stage1_bridge_config"))
+        except Exception as error:
+            raise _error("STAGE1_BRIDGE_CONFIG_INVALID") from error
+        evidence_refs["stage1_11_bridge_config"] = config_ref
+    evidence_refs.update({f"gate_{key.replace('.', '_').replace('-', '_').lower()}": value for key, value in selected_gates.items()})
+    evidence_refs.update({f"capability_{key}": value[0] for key, value in capability_values.items()})
+    environment = TaskRuntimeEnvironment(
+        capabilities=frozenset(capability_values),
+        frozen_contract_stages=frozenset({0, 1, 2}),
+        passed_gate_ids=frozenset(phase_gate_ids),
+        evidence_refs=evidence_refs,
+    )
+    target = _safe_relative(root, output_ref, "phase_environment_output")
+    publish_canonical_immutable(target, environment.to_dict())
+    reread = TaskRuntimeEnvironment.from_mapping(load_canonical_json(target))
+    if reread.environment_hash != environment.environment_hash:
+        raise _error("ENVIRONMENT_ROUND_TRIP_DRIFT", output_ref)
+    return reread
 
 
 def _formal_dag_config(
@@ -767,29 +1438,395 @@ def _formal_dag_config(
     )
 
 
+def _load_task_result_set(
+    root: Path,
+    refs: Mapping[str, str],
+    *,
+    task_id: str,
+) -> dict[str, LoadedTaskArtifact]:
+    expected = TASK_INPUTS[task_id]
+    if set(refs) != set(expected):
+        raise _error("FORMAL_DAG_OUTPUT_SET_INVALID", task_id)
+    loaded: dict[str, LoadedTaskArtifact] = {}
+    for kind in expected:
+        loaded[kind] = _load_formal_source(
+            root,
+            _source_ref(refs[kind], f"formal_dag.{task_id}.{kind}"),
+            task_id=task_id,
+            artifact_kind=kind,
+        )
+    configs = {item.identity.config_hash for item in loaded.values()}
+    if len(configs) != 1:
+        raise _error("FORMAL_DAG_CONFIG_IDENTITY_MISMATCH", task_id)
+    return loaded
+
+
+def _publish_resolved_config(
+    root: Path,
+    config: ResolvedConfigV2,
+    *,
+    output_ref: str,
+) -> str:
+    """Persist one exact runtime config before an independent evaluator reads it."""
+
+    target_ref = PurePosixPath(output_ref).as_posix()
+    target = _safe_relative(root, target_ref, "resolved_config_output")
+    publish_canonical_immutable(target, config.to_dict())
+    try:
+        reread = ResolvedConfigV2.from_mapping(load_canonical_json(target))
+    except Exception as error:
+        raise _error("RESOLVED_CONFIG_ROUND_TRIP_DRIFT", target_ref) from error
+    if reread.task_id != config.task_id or reread.config_hash != config.config_hash or reread.full_hash != config.full_hash:
+        raise _error("RESOLVED_CONFIG_IDENTITY_DRIFT", target_ref)
+    return target_ref
+
+
+def _derive_g20_gate(
+    root: Path,
+    *,
+    s21_refs: Mapping[str, str],
+    stage1_refs: Mapping[str, str],
+    stage1_exit: Any,
+    formal_execution_ref: str,
+    base_config_ref: str,
+    s21_config_ref: str,
+    output_dir: str,
+) -> tuple[str, GateRecord, str | None]:
+    """Consume the independent G2.0 evaluator's formal GateRecord commit.
+
+    The evaluator owns all preregistration/hypothesis semantics.  This module
+    only supplies the verified S2.1/Stage1 lineage and performs the final
+    content-addressed loader checks; it never upgrades the runner candidate.
+    """
+
+    # Keep this import lazy: the evaluator is an independently reviewed Stage
+    # 2.1 component and is merged alongside this materializer.  Do not fall
+    # back to a local formula or to a runner candidate when that component is
+    # absent.
+    persisted_config_ref = _source_ref(s21_config_ref, "g20.s21_config_ref")
+    try:
+        persisted_config = ResolvedConfigV2.from_mapping(
+            _load_mapping(root, persisted_config_ref, "g20.s21_config")
+        )
+    except Exception as error:
+        raise _error("G20_RESOLVED_CONFIG_INVALID") from error
+    if persisted_config.task_id != "stage2.01_scope_hypotheses_and_preregistration" or persisted_config.run_intent != "formal" or persisted_config.formal_eligible is not True:
+        raise _error("G20_RESOLVED_CONFIG_SCOPE_INVALID")
+    if any(item.identity.config_hash != persisted_config.config_hash for item in _load_task_result_set(
+        root,
+        s21_refs,
+        task_id="stage2.01_scope_hypotheses_and_preregistration",
+    ).values()):
+        raise _error("G20_RESOLVED_CONFIG_IDENTITY_MISMATCH")
+
+    try:
+        from param_importance_nlp.experiments.stage2_g20_evaluator import (
+            evaluate_formal_g20,
+        )
+    except ImportError as error:
+        raise _error("G20_INDEPENDENT_EVALUATOR_REQUIRED") from error
+    try:
+        # This is the intentionally narrow API.  The evaluator re-reads the
+        # three formal S2.1 commits and owns the frozen preregistration /
+        # hypothesis validators; no caller status, metrics, or gate envelope
+        # is accepted here.
+        # The first reviewed evaluator release exposed ``output_root`` and
+        # derived repository identity from its own source.  The hardened
+        # release additionally requires an explicit repository root and the
+        # persisted S2.1 ResolvedConfigV2.  Select only these known keyword
+        # names from the callable signature; never pass caller status/metrics
+        # or fall back to a runner candidate.
+        parameters = inspect.signature(evaluate_formal_g20).parameters
+        evaluator_kwargs: dict[str, Any] = {}
+        if "output_root" in parameters:
+            evaluator_kwargs["output_root"] = f"{output_dir}/bridges/stage2-g2-0"
+        elif "output_dir" in parameters:
+            evaluator_kwargs["output_dir"] = f"{output_dir}/bridges/stage2-g2-0"
+        else:
+            raise _error("G20_EVALUATOR_OUTPUT_BOUNDARY_REQUIRED")
+        if "repository_root" in parameters:
+            evaluator_kwargs["repository_root"] = ROOT
+        if "resolved_config_ref" in parameters:
+            evaluator_kwargs["resolved_config_ref"] = persisted_config_ref
+        elif "evaluation_config_ref" in parameters:
+            evaluator_kwargs["evaluation_config_ref"] = persisted_config_ref
+        result = evaluate_formal_g20(root, dict(s21_refs), **evaluator_kwargs)
+    except Exception as error:
+        raise _error("G20_INDEPENDENT_EVALUATOR_FAILED", type(error).__name__) from error
+    if not isinstance(result, Mapping):
+        raise _error("G20_EVALUATOR_RESULT_INVALID")
+    if result.get("status") != GateStatus.PASS.value or result.get("formal_eligible") is not True:
+        raise _error("G20_EVALUATOR_NOT_PASS")
+    gate_ref = _source_ref(result.get("commit_ref"), "g20.evaluator.commit_ref")
+    loaded = load_committed_task_artifact(root, gate_ref, require_formal=True)
+    if loaded.identity.task_id != "stage2.01_scope_hypotheses_and_preregistration" or loaded.identity.artifact_kind != "gate_record":
+        raise _error("G20_GATE_IDENTITY_MISMATCH")
+    try:
+        gate = GateRecord.from_mapping(dict(loaded.payload))
+    except Exception as error:
+        raise _error("G20_GATE_PAYLOAD_INVALID") from error
+    if gate.gate_id != "stage2.G2.0" or gate.status is not GateStatus.PASS:
+        raise _error("G20_GATE_NOT_PASS")
+    # The evaluator's committed envelope must be exactly bound to the S2.1
+    # result set.  Stage0/Stage1/current evidence remain bound by the
+    # phase environment and FormalExecutionEvidence; they are not fabricated
+    # into the evaluator's own source_refs after the fact.
+    expected_upstream = tuple(
+        s21_refs[kind]
+        for kind in TASK_INPUTS["stage2.01_scope_hypotheses_and_preregistration"]
+    )
+    if tuple(loaded.source_refs) != expected_upstream or tuple(gate.evidence_refs) != expected_upstream:
+        raise _error("G20_GATE_LINEAGE_MISMATCH")
+    if isinstance(result.get("envelope_artifact_hash"), str) and result["envelope_artifact_hash"] != loaded.identity.artifact_hash:
+        raise _error("G20_ENVELOPE_HASH_MISMATCH")
+    if not isinstance(gate.measured, Mapping) or gate.measured.get("config_hash") != loaded.identity.config_hash:
+        raise _error("G20_GATE_CONFIG_IDENTITY_MISMATCH")
+    # The S2.1 runner's ResolvedConfigV2 is already the config identity carried
+    # by all three commits.  No synthetic bridge config is attached to this
+    # independent evaluator result; G2.1/G2.2 adapters create their own
+    # dedicated bridge configs when adapting custom authority reports.
+    return gate_ref, gate, None
+
+
+def _derive_g21_gate(
+    root: Path,
+    *,
+    s22_refs: Mapping[str, str],
+    stage1_refs: Mapping[str, str],
+    stage1_ref: str,
+    stage1_bridge_ref: str,
+    stage1_config_ref: str,
+    stage1_exit: Any,
+    g21_ref: str,
+    formal_execution_ref: str,
+    base_config_ref: str,
+    output_dir: str,
+) -> tuple[str, GateRecord, str]:
+    loaded = _load_task_result_set(
+        root,
+        s22_refs,
+        task_id="stage2.02_stage1_handoff_and_fixed_state_contract",
+    )
+    handoff = loaded["handoff_manifest"].payload
+    fixed = loaded["fixed_state_contract"].payload
+    for name, payload in (("handoff", handoff), ("fixed", fixed)):
+        if payload.get("status") != "FORMAL_CANDIDATE" or payload.get("formal_eligible") is not False:
+            raise _error("G21_RUNNER_CANDIDATE_INVALID", name)
+    handoff_stage1 = handoff.get("stage1_g1_exit")
+    if not isinstance(handoff_stage1, Mapping) or handoff_stage1.get("index_ref") != stage1_ref:
+        raise _error("G21_S22_STAGE1_BINDING_INVALID")
+    authoritative = _load_authoritative_g21(root, g21_ref, expected_stage1_ref=stage1_ref)
+    source_refs = tuple(
+        dict.fromkeys(
+            (
+                formal_execution_ref,
+                g21_ref,
+                stage1_ref,
+                stage1_bridge_ref,
+                stage1_config_ref,
+                *_stage1_role_refs(root, stage1_ref),
+                *stage1_refs.values(),
+                *s22_refs.values(),
+            )
+        )
+    )
+    config, config_ref = _publish_bridge_config(
+        root,
+        base_config_ref=base_config_ref,
+        task_id="stage2.02_stage1_handoff_and_fixed_state_contract",
+        input_refs=source_refs,
+        output_ref=f"{output_dir}/bridges/g21-resolved-config-v2.json",
+    )
+    stage1_payload_hashes: dict[str, str] = {}
+    for kind, ref in stage1_refs.items():
+        stage1_payload = load_committed_task_artifact(root, ref, require_formal=True).payload
+        stage1_payload_hashes[kind] = canonical_json_hash(dict(stage1_payload))
+    measured = {
+        "bridge_config_hash": config.config_hash,
+        "bridge_config_full_hash": config.full_hash,
+        "stage1_bridge_evidence_ref": stage1_bridge_ref,
+        "stage1_bridge_config_ref": stage1_config_ref,
+        "execution_commit": stage1_exit.execution_commit,
+        "stage1_index_artifact_hash": stage1_exit.index_artifact_hash,
+        "stage1_role_sha256": dict(stage1_exit.role_sha256),
+        "stage1_task_payload_hashes": stage1_payload_hashes,
+        "g21_authoritative_payload_hash": canonical_json_hash(dict(authoritative)),
+        "s22_payload_hashes": {kind: canonical_json_hash(dict(item.payload)) for kind, item in loaded.items()},
+        "s22_artifact_hashes": {kind: item.identity.artifact_hash for kind, item in loaded.items()},
+        "fixed_state_digest": fixed.get("provider_state_digest"),
+        "registry_hash": fixed.get("registry_hash"),
+    }
+    gate_ref, gate = _publish_bridge_gate(
+        root,
+        gate_id="stage2.G2.1",
+        producer_task_id="stage2.02_stage1_handoff_and_fixed_state_contract",
+        config=config,
+        config_ref=config_ref,
+        upstream_refs=source_refs,
+        measured=measured,
+        output_dir=f"{output_dir}/bridges/stage2-g2-1",
+    )
+    return gate_ref, gate, config_ref
+
+
+def _load_authoritative_g22(
+    root: Path,
+    ref: str,
+    *,
+    manifest: AssetResolutionManifest,
+    expected_sha256: str | None = None,
+) -> Mapping[str, Any]:
+    value = _load_mapping(root, ref, "g22_asset_evidence")
+    _assert_source_file(root, ref, "g22_asset_evidence", sha256=expected_sha256)
+    status = value.get("status", value.get("gate_status"))
+    if status != "PASS" or "BLOCKED" in str(value.get("gate_status", "")):
+        raise _error("G22_AUTHORITATIVE_EVIDENCE_NOT_PASS")
+    schema = value.get("schema_version")
+    schema_text = "" if not isinstance(schema, str) else schema.casefold()
+    gate_text = str(value.get("gate_id", "")).casefold()
+    if not ("g2.2" in schema_text or "g22" in schema_text or "g2.2" in gate_text or "g22" in gate_text):
+        raise _error("G22_AUTHORITATIVE_SCHEMA_INVALID")
+    if isinstance(value.get("artifact_hash"), str):
+        declared = _sha(value["artifact_hash"], "g22_asset_evidence.artifact_hash")
+        if canonical_json_hash({key: item for key, item in value.items() if key != "artifact_hash"}) != declared:
+            raise _error("G22_AUTHORITATIVE_HASH_INVALID")
+    asset_hits = _find_mappings(
+        value,
+        predicate=lambda item: any(
+            key in item and item.get(key) == manifest.digest
+            for key in ("asset_resolution_hash", "asset_manifest_hash", "asset_digest", "manifest_digest")
+        ),
+    )
+    data_hits = _find_mappings(
+        value,
+        predicate=lambda item: any(
+            key in item and item.get(key) == manifest.data_range.digest
+            for key in ("data_range_hash", "data_manifest_hash", "data_digest")
+        ),
+    )
+    if not asset_hits or not data_hits:
+        raise _error("G22_ASSET_DATA_HASH_BINDING_INVALID")
+    return value
+
+
+def _derive_g22_gate(
+    root: Path,
+    *,
+    s23_refs: Mapping[str, str],
+    stage2_asset_ref: str,
+    g22_ref: str,
+    g22_sha256: str | None,
+    stage1_ref: str,
+    stage1_bridge_ref: str,
+    stage1_config_ref: str,
+    formal_execution_ref: str,
+    base_config_ref: str,
+    output_dir: str,
+) -> tuple[str, GateRecord, str]:
+    loaded = _load_task_result_set(
+        root,
+        s23_refs,
+        task_id="stage2.03_assets_checkpoints_and_sampling",
+    )
+    asset_payload = loaded["asset_resolution"].payload
+    manifest = _formal_s23_asset_manifest(asset_payload, field="s23.asset_resolution")
+    authoritative = _load_authoritative_g22(
+        root,
+        g22_ref,
+        manifest=manifest,
+        expected_sha256=g22_sha256,
+    )
+    source_refs = tuple(
+        dict.fromkeys(
+            (
+                formal_execution_ref,
+                g22_ref,
+                stage2_asset_ref,
+                stage1_ref,
+                stage1_bridge_ref,
+                stage1_config_ref,
+                *s23_refs.values(),
+            )
+        )
+    )
+    config, config_ref = _publish_bridge_config(
+        root,
+        base_config_ref=base_config_ref,
+        task_id="stage2.03_assets_checkpoints_and_sampling",
+        input_refs=source_refs,
+        output_ref=f"{output_dir}/bridges/g22-resolved-config-v2.json",
+    )
+    measured = {
+        "bridge_config_hash": config.config_hash,
+        "bridge_config_full_hash": config.full_hash,
+        "stage1_g1_exit_ref": stage1_ref,
+        "stage1_bridge_evidence_ref": stage1_bridge_ref,
+        "stage1_bridge_config_ref": stage1_config_ref,
+        "g22_authoritative_payload_hash": canonical_json_hash(dict(authoritative)),
+        "s23_payload_hashes": {kind: canonical_json_hash(dict(item.payload)) for kind, item in loaded.items()},
+        "s23_artifact_hashes": {kind: item.identity.artifact_hash for kind, item in loaded.items()},
+        "asset_resolution_hash": manifest.digest,
+        "data_range_hash": manifest.data_range.digest,
+        "checkpoint_manifest_hashes": {
+            record.checkpoint_id: record.manifest_sha256 for record in manifest.checkpoints
+        },
+    }
+    gate_ref, gate = _publish_bridge_gate(
+        root,
+        gate_id="stage2.G2.2",
+        producer_task_id="stage2.03_assets_checkpoints_and_sampling",
+        config=config,
+        config_ref=config_ref,
+        upstream_refs=source_refs,
+        measured=measured,
+        output_dir=f"{output_dir}/bridges/stage2-g2-2",
+    )
+    return gate_ref, gate, config_ref
+
+
 def execute_formal_predecessor_dag(
     data_root: str | Path,
     *,
     source: Mapping[str, Any],
-    raw_refs: Mapping[str, Mapping[str, Mapping[str, Any]]],
+    raw_refs: Mapping[str, Mapping[str, Mapping[str, Any]]] | None,
     formal_execution_ref: str,
     base_config_ref: str,
     output_dir: str,
-) -> dict[str, dict[str, str]]:
-    """Run the existing formal S2.1 -> S2.2/S2.3 TaskRuntime DAG.
+) -> FormalDAGResult:
+    """Execute the authoritative S2.1 → S2.2 → S2.3 formal DAG.
 
-    Raw payloads remain candidate evidence; only these formal runner outputs are
-    returned as S2.4 predecessors.
+    G2.0 is derived only after S2.1; G2.1 is bridged only after S2.2 and its
+    dated authority is re-read; G2.2 is bridged only after S2.3 and the
+    authoritative asset report.  Runner gate candidates remain NOT_RUN.
     """
 
     root = Path(data_root).resolve()
-    candidate_asset_ref = _publish_candidate_asset_manifest(root, raw_refs, output_dir=output_dir)
-    environment = _build_formal_predecessor_environment(
+    stage1_ref = _source_ref(source.get("stage1_g1_exit"), "stage1_g1_exit")
+    stage1_commits, stage1_exit, stage1_config_ref, stage1_bridge_ref = _load_stage1_formal_commits(
         root,
-        formal_execution_ref=formal_execution_ref,
-        source=source,
-        candidate_asset_ref=candidate_asset_ref,
+        source,
+        stage1_index_ref=stage1_ref,
+        base_config_ref=base_config_ref,
+        output_dir=output_dir,
     )
+    stage0_ref = _source_ref(source.get("stage0_handoff"), "stage0_handoff")
+    g3_ref = _source_ref(source.get("g3_resolution"), "g3_resolution")
+    g21_ref = _source_ref(source.get("g21_handoff", source.get("gpu_health")), "g21_handoff")
+    capability_refs = _mapping(source.get("capability_refs"), "capability_refs")
+    contract_refs = {
+        0: _source_ref(source.get("contract_stage_0"), "contract_stage_0"),
+        1: _source_ref(source.get("contract_stage_1"), "contract_stage_1"),
+        2: _source_ref(source.get("contract_stage_2", source.get("contract_freeze")), "contract_stage_2"),
+    }
+    asset_ref, asset_manifest = _publish_authoritative_asset_manifest(
+        root,
+        source=source,
+        raw_refs=raw_refs,
+        output_dir=output_dir,
+    )
+    gates_source = _mapping(source.get("gate_refs"), "gate_refs")
+    g1_ref = _source_ref(gates_source.get("stage1.G1-EXIT"), "gate.stage1.G1-EXIT")
+    initial_gate_refs = {"stage1.G1-EXIT": g1_ref}
     runtime = TaskRuntime(workspace_root=root)
     register_stage23_runners(runtime, root)
     refs_by_task: dict[str, dict[str, str]] = {}
@@ -798,23 +1835,184 @@ def execute_formal_predecessor_dag(
         "stage2.02_stage1_handoff_and_fixed_state_contract",
         "stage2.03_assets_checkpoints_and_sampling",
     )
-    for task_id in task_order:
-        if task_id == "stage2.01_scope_hypotheses_and_preregistration":
-            input_refs: tuple[str, ...] = ()
-        else:
-            input_refs = tuple(refs_by_task["stage2.01_scope_hypotheses_and_preregistration"].values())
-        config = _formal_dag_config(
-            root,
-            base_config_ref=base_config_ref,
-            task_id=task_id,
-            input_refs=input_refs,
-            output_dir=f"{output_dir}/formal-dag/{task_id.replace('.', '-')}",
-        )
-        result = runtime.execute(config, environment=environment)
-        if result.status is not TaskRunStatus.PASS or not result.formal_eligible:
-            raise _error("FORMAL_DAG_TASK_NOT_PASS", f"{task_id}:{result.status.value}")
-        refs_by_task[task_id] = dict(result.artifact_refs)
-    return refs_by_task
+    evidence_ref = formal_execution_ref
+    evidence = FormalExecutionEvidence.from_mapping(_load_mapping(root, evidence_ref, "formal_execution"))
+    bridge_refs: dict[str, str] = {}
+
+    # Phase 1: Stage1.11 four formal commits are the actual S2.1 inputs.
+    env1_ref = f"{output_dir}/formal-dag/environment-s201.json"
+    env1 = _build_phase_environment(
+        root,
+        source=source,
+        formal_execution_ref=evidence_ref,
+        stage0_ref=stage0_ref,
+        stage1_ref=stage1_ref,
+        contract_stage_refs=contract_refs,
+        g3_ref=g3_ref,
+        stage2_asset_ref=asset_ref,
+        gate_refs=initial_gate_refs,
+        phase_gate_ids=("stage1.G1-EXIT",),
+        capability_refs=capability_refs,
+        g21_ref=g21_ref,
+        output_ref=env1_ref,
+        stage1_bridge_ref=stage1_bridge_ref,
+        stage1_bridge_config_ref=stage1_config_ref,
+    )
+    s21_config = _formal_dag_config(
+        root,
+        base_config_ref=base_config_ref,
+        task_id=task_order[0],
+        input_refs=tuple(item.commit_ref for item in stage1_commits.values()),
+        output_dir=f"{output_dir}/formal-dag/stage2-01",
+    )
+    s21_config_ref = _publish_resolved_config(
+        root,
+        s21_config,
+        output_ref=f"{output_dir}/formal-dag/stage2-01/resolved-config-v2.json",
+    )
+    result = runtime.execute(s21_config, environment=env1)
+    if result.status is not TaskRunStatus.PASS or not result.formal_eligible:
+        raise _error("FORMAL_DAG_TASK_NOT_PASS", f"{task_order[0]}:{result.status.value}")
+    refs_by_task[task_order[0]] = dict(result.artifact_refs)
+    g20_ref, g20_gate, _ = _derive_g20_gate(
+        root,
+        s21_refs=refs_by_task[task_order[0]],
+        stage1_refs={kind: item.commit_ref for kind, item in stage1_commits.items()},
+        stage1_exit=stage1_exit,
+        formal_execution_ref=evidence_ref,
+        base_config_ref=base_config_ref,
+        s21_config_ref=s21_config_ref,
+        output_dir=output_dir,
+    )
+    bridge_refs["stage2.G2.0"] = g20_ref
+    evidence, evidence_ref = _extend_formal_execution(
+        root,
+        evidence_ref=evidence_ref,
+        gate=g20_gate,
+        asset_hashes=(asset_manifest.digest,),
+        destination=f"{output_dir}/formal-dag/formal-execution-g20.json",
+    )
+
+    # Phase 2: S2.2 consumes S2.1 directly and the newly bridged G2.0.
+    phase2_gates = {"stage1.G1-EXIT": g1_ref, "stage2.G2.0": g20_ref}
+    env2 = _build_phase_environment(
+        root,
+        source=source,
+        formal_execution_ref=evidence_ref,
+        stage0_ref=stage0_ref,
+        stage1_ref=stage1_ref,
+        contract_stage_refs=contract_refs,
+        g3_ref=g3_ref,
+        stage2_asset_ref=asset_ref,
+        gate_refs=phase2_gates,
+        phase_gate_ids=("stage1.G1-EXIT", "stage2.G2.0"),
+        capability_refs=capability_refs,
+        g21_ref=g21_ref,
+        output_ref=f"{output_dir}/formal-dag/environment-s202.json",
+        stage1_bridge_ref=stage1_bridge_ref,
+        stage1_bridge_config_ref=stage1_config_ref,
+    )
+    s22_config = _formal_dag_config(
+        root,
+        base_config_ref=base_config_ref,
+        task_id=task_order[1],
+        input_refs=tuple(refs_by_task[task_order[0]].values()),
+        output_dir=f"{output_dir}/formal-dag/stage2-02",
+    )
+    result = runtime.execute(s22_config, environment=env2)
+    if result.status is not TaskRunStatus.PASS or not result.formal_eligible:
+        raise _error("FORMAL_DAG_TASK_NOT_PASS", f"{task_order[1]}:{result.status.value}")
+    refs_by_task[task_order[1]] = dict(result.artifact_refs)
+    g21_gate_ref, g21_gate, _ = _derive_g21_gate(
+        root,
+        s22_refs=refs_by_task[task_order[1]],
+        stage1_refs={kind: item.commit_ref for kind, item in stage1_commits.items()},
+        stage1_ref=stage1_ref,
+        stage1_bridge_ref=stage1_bridge_ref,
+        stage1_config_ref=stage1_config_ref,
+        stage1_exit=stage1_exit,
+        g21_ref=g21_ref,
+        formal_execution_ref=evidence_ref,
+        base_config_ref=base_config_ref,
+        output_dir=output_dir,
+    )
+    bridge_refs["stage2.G2.1"] = g21_gate_ref
+    evidence, evidence_ref = _extend_formal_execution(
+        root,
+        evidence_ref=evidence_ref,
+        gate=g21_gate,
+        destination=f"{output_dir}/formal-dag/formal-execution-g21.json",
+    )
+
+    # Phase 3: S2.3 consumes the S2.1 sibling plus G2.1 and the direct asset
+    # manifest.  The runner still emits a candidate gate; G2.2 is derived below.
+    phase3_gates = {
+        "stage1.G1-EXIT": g1_ref,
+        "stage2.G2.0": g20_ref,
+        "stage2.G2.1": g21_gate_ref,
+    }
+    env3 = _build_phase_environment(
+        root,
+        source=source,
+        formal_execution_ref=evidence_ref,
+        stage0_ref=stage0_ref,
+        stage1_ref=stage1_ref,
+        contract_stage_refs=contract_refs,
+        g3_ref=g3_ref,
+        stage2_asset_ref=asset_ref,
+        gate_refs=phase3_gates,
+        phase_gate_ids=tuple(phase3_gates),
+        capability_refs=capability_refs,
+        g21_ref=g21_ref,
+        output_ref=f"{output_dir}/formal-dag/environment-s203.json",
+        stage1_bridge_ref=stage1_bridge_ref,
+        stage1_bridge_config_ref=stage1_config_ref,
+    )
+    s23_config = _formal_dag_config(
+        root,
+        base_config_ref=base_config_ref,
+        task_id=task_order[2],
+        input_refs=tuple(refs_by_task[task_order[0]].values()),
+        output_dir=f"{output_dir}/formal-dag/stage2-03",
+    )
+    result = runtime.execute(s23_config, environment=env3)
+    if result.status is not TaskRunStatus.PASS or not result.formal_eligible:
+        raise _error("FORMAL_DAG_TASK_NOT_PASS", f"{task_order[2]}:{result.status.value}")
+    refs_by_task[task_order[2]] = dict(result.artifact_refs)
+    g22_ref = _source_ref(
+        source.get("g22_asset_evidence", source.get("g22_assets", source.get("g22_evidence"))),
+        "g22_asset_evidence",
+    )
+    g22_gate_ref, g22_gate, _ = _derive_g22_gate(
+        root,
+        s23_refs=refs_by_task[task_order[2]],
+        stage2_asset_ref=asset_ref,
+        g22_ref=g22_ref,
+        g22_sha256=(None if source.get("g22_asset_evidence_sha256") is None else str(source["g22_asset_evidence_sha256"])),
+        stage1_ref=stage1_ref,
+        stage1_bridge_ref=stage1_bridge_ref,
+        stage1_config_ref=stage1_config_ref,
+        formal_execution_ref=evidence_ref,
+        base_config_ref=base_config_ref,
+        output_dir=output_dir,
+    )
+    bridge_refs["stage2.G2.2"] = g22_gate_ref
+    evidence, evidence_ref = _extend_formal_execution(
+        root,
+        evidence_ref=evidence_ref,
+        gate=g22_gate,
+        asset_hashes=(asset_manifest.digest, asset_manifest.data_range.digest),
+        destination=f"{output_dir}/formal-dag/formal-execution-g22.json",
+    )
+    return FormalDAGResult(
+        refs_by_task,
+        final_evidence=evidence,
+        final_evidence_ref=evidence_ref,
+        bridge_gate_refs=bridge_refs,
+        authoritative_asset_ref=asset_ref,
+        stage1_bridge_ref=stage1_bridge_ref,
+        stage1_bridge_config_ref=stage1_config_ref,
+    )
 
 
 def _publish_formal_execution(
@@ -878,40 +2076,89 @@ def _load_capability(
     return source, evidence
 
 
-def _load_gpu_health_identity(
-    root: Path,
-    g21_handoff_ref: str | None,
-) -> tuple[str, tuple[tuple[str, str], ...]]:
-    """Validate G2.1 plus its raw smoke report as one PCI+UUID authority."""
+def _find_mappings(value: object, *, predicate: Any) -> tuple[Mapping[str, Any], ...]:
+    found: list[Mapping[str, Any]] = []
 
-    if g21_handoff_ref is None:
-        raise _error("GPU_HEALTH_EVIDENCE_REQUIRED")
-    gpu_ref = _source_ref(g21_handoff_ref, "g21_handoff")
+    def visit(node: object) -> None:
+        if isinstance(node, Mapping):
+            if predicate(node):
+                found.append(node)
+            for child in node.values():
+                visit(child)
+        elif isinstance(node, Sequence) and not isinstance(node, (str, bytes, bytearray)):
+            for child in node:
+                visit(child)
+
+    visit(value)
+    return tuple(found)
+
+
+def _load_authoritative_g21(
+    root: Path,
+    g21_handoff_ref: str,
+    *,
+    expected_stage1_ref: str | None = None,
+) -> Mapping[str, Any]:
+    """Load either the canonical handoff or the dated custom PASS report.
+
+    The custom server report is an adapter input only.  Its status, task/gate
+    identity, Stage1 index identity and raw GPU smoke are checked before any
+    values are projected into a GateRecord.
+    """
+
+    path = _safe_relative(root, g21_handoff_ref, "g21_handoff")
     try:
-        gpu_handoff = load_g21_formal_handoff(
-            _safe_relative(root, gpu_ref, "g21_handoff"),
-            data_root=root,
+        gpu_handoff = load_g21_formal_handoff(path, data_root=root)
+    except Exception:
+        value = _load_mapping(root, g21_handoff_ref, "g21_handoff")
+        if (
+            value.get("schema_version") != "stage2-s2.2-g2.1-handoff-evidence-v1"
+            or value.get("status") != "PASS"
+            or value.get("task_id") != "stage2.02_stage1_handoff_and_fixed_state_contract"
+        ):
+            raise _error("GPU_HEALTH_EVIDENCE_INVALID", g21_handoff_ref)
+        stage1_values = _find_mappings(
+            value,
+            predicate=lambda item: isinstance(item.get("index_ref"), str)
+            and isinstance(item.get("index_artifact_hash"), str),
         )
-    except Exception as error:
-        raise _error("GPU_HEALTH_EVIDENCE_INVALID", gpu_ref) from error
+        if len(stage1_values) != 1:
+            raise _error("G21_STAGE1_BINDING_INVALID", g21_handoff_ref)
+        if expected_stage1_ref is not None and stage1_values[0].get("index_ref") != expected_stage1_ref:
+            raise _error("G21_STAGE1_REF_MISMATCH", g21_handoff_ref)
+        gpu_handoff = value
+
     smoke = gpu_handoff.get("current_gpu_smoke")
     if not isinstance(smoke, Mapping):
-        raise _error("GPU_SMOKE_SUMMARY_INVALID", gpu_ref)
+        candidates = _find_mappings(
+            gpu_handoff,
+            predicate=lambda item: item.get("schema_version") == "stage2-s202-current-gpu-smoke-v1"
+            and isinstance(item.get("ref"), str)
+            and isinstance(item.get("sha256"), str),
+        )
+        if len(candidates) != 1:
+            raise _error("GPU_SMOKE_SUMMARY_INVALID", g21_handoff_ref)
+        smoke = candidates[0]
+    if expected_stage1_ref is not None:
+        stage1_values = _find_mappings(
+            gpu_handoff,
+            predicate=lambda item: isinstance(item.get("ref"), str)
+            and item.get("ref") == expected_stage1_ref,
+        )
+        if not stage1_values:
+            raise _error("G21_STAGE1_REF_MISMATCH", g21_handoff_ref)
     allowed_devices = tuple(
         (str(item.get("pci_bus_id")), str(item.get("uuid")))
         for item in smoke.get("allowed_devices", [])
         if isinstance(item, Mapping)
     )
     if allowed_devices != G21_ALLOWED_DEVICES:
-        raise _error("GPU_ALLOWED_IDENTITY_DRIFT", gpu_ref)
+        raise _error("GPU_ALLOWED_IDENTITY_DRIFT", g21_handoff_ref)
     if smoke.get("excluded_pci_bus_ids") != [G21_EXCLUDED_PCI]:
-        raise _error("GPU_EXCLUDED_PCI_DRIFT", gpu_ref)
-
-    # The handoff schema intentionally contains only the raw report ref/sha;
-    # ``excluded_device`` lives in that report.  Re-read it and bind the bad
-    # card's PCI+UUID instead of trusting a copied index or an optional summary
-    # field.
+        raise _error("GPU_EXCLUDED_PCI_DRIFT", g21_handoff_ref)
     smoke_ref = _source_ref(smoke.get("ref"), "g21_handoff.current_gpu_smoke.ref")
+    report_sha = _sha(smoke.get("sha256"), "g21_current_gpu_smoke.sha256")
+    _assert_source_file(root, smoke_ref, "g21_current_gpu_smoke", sha256=report_sha)
     report = _load_mapping(root, smoke_ref, "g21_current_gpu_smoke")
     if report.get("schema_version") != "stage2-s202-current-gpu-smoke-v1" or report.get("status") != "PASS":
         raise _error("GPU_SMOKE_REPORT_INVALID", smoke_ref)
@@ -933,6 +2180,44 @@ def _load_gpu_health_identity(
     )
     if report_devices != allowed_devices:
         raise _error("GPU_SMOKE_RUNTIME_MAPPING_DRIFT", smoke_ref)
+    return gpu_handoff
+
+
+def _load_gpu_health_identity(
+    root: Path,
+    g21_handoff_ref: str | None,
+    *,
+    expected_stage1_ref: str | None = None,
+) -> tuple[str, tuple[tuple[str, str], ...]]:
+    """Validate current smoke and retain PCI+UUID identity, never only index."""
+
+    if g21_handoff_ref is None:
+        raise _error("GPU_HEALTH_EVIDENCE_REQUIRED")
+    gpu_ref = _source_ref(g21_handoff_ref, "g21_handoff")
+    try:
+        gpu_handoff = _load_authoritative_g21(
+            root,
+            gpu_ref,
+            expected_stage1_ref=expected_stage1_ref,
+        )
+    except S204MaterializationError:
+        raise
+    except Exception as error:
+        raise _error("GPU_HEALTH_EVIDENCE_INVALID", gpu_ref) from error
+    smoke = gpu_handoff.get("current_gpu_smoke")
+    if not isinstance(smoke, Mapping):
+        candidates = _find_mappings(
+            gpu_handoff,
+            predicate=lambda item: item.get("schema_version") == "stage2-s202-current-gpu-smoke-v1",
+        )
+        if len(candidates) != 1:
+            raise _error("GPU_SMOKE_SUMMARY_INVALID", gpu_ref)
+        smoke = candidates[0]
+    allowed_devices = tuple(
+        (str(item.get("pci_bus_id")), str(item.get("uuid")))
+        for item in smoke.get("allowed_devices", [])
+        if isinstance(item, Mapping)
+    )
     return gpu_ref, allowed_devices
 
 
@@ -941,6 +2226,9 @@ def _load_formal_gate_refs(
     gate_refs: Mapping[str, str],
     *,
     required: Sequence[str],
+    expected_task: Mapping[str, str] | None = None,
+    expected_artifact_kind: Mapping[str, str] | None = None,
+    expected_upstream_refs: Mapping[str, Sequence[str]] | None = None,
 ) -> dict[str, str]:
     """Load exactly one PASS GateRecord per formal TaskRuntime gate."""
 
@@ -953,6 +2241,10 @@ def _load_formal_gate_refs(
             loaded = load_committed_task_artifact(root, gate_ref, require_formal=True)
         except Exception as error:
             raise _error("GATE_FORMAL_COMMIT_REQUIRED", gate_id) from error
+        if expected_task is not None and gate_id in expected_task and loaded.identity.task_id != expected_task[gate_id]:
+            raise _error("GATE_TASK_IDENTITY_MISMATCH", gate_id)
+        if expected_artifact_kind is not None and gate_id in expected_artifact_kind and loaded.identity.artifact_kind != expected_artifact_kind[gate_id]:
+            raise _error("GATE_ARTIFACT_KIND_MISMATCH", gate_id)
         for source_ref in loaded.source_refs:
             _reject_nonformal_ref(source_ref, f"gate.{gate_id}.source_ref")
         found: list[GateRecord] = []
@@ -976,6 +2268,10 @@ def _load_formal_gate_refs(
         visit(loaded.payload)
         if len(found) != 1 or found[0].status is not GateStatus.PASS:
             raise _error("GATE_NOT_PASS", gate_id)
+        if expected_upstream_refs is not None:
+            expected = tuple(expected_upstream_refs.get(gate_id, ()))
+            if not set(expected).issubset(set(found[0].evidence_refs)):
+                raise _error("GATE_UPSTREAM_BINDING_MISMATCH", gate_id)
         normalized[gate_id] = gate_ref
     return normalized
 
@@ -995,7 +2291,14 @@ def build_formal_runtime_environment(
     contract_stage_1_ref: str | None = None,
     contract_stage_2_ref: str | None = None,
     g21_handoff_ref: str | None = None,
+    stage1_bridge_ref: str | None = None,
+    stage1_bridge_config_ref: str | None = None,
     reference_sizing_plan_ref: str | None = None,
+    g22_asset_evidence_ref: str | None = None,
+    stage2_parameter_registry_ref: str | None = None,
+    stage2_reference_delta_sci_ref: str | None = None,
+    cell_id: str | None = None,
+    six_cell_manifest_ref: str | None = None,
     output_ref: str = "evidence/stage2/s204/runtime-environment.json",
 ) -> tuple[TaskRuntimeEnvironment, str]:
     """Build a rereadable environment bound to current formal evidence.
@@ -1018,7 +2321,11 @@ def build_formal_runtime_environment(
     # G2.1 is the current hardware identity authority.  Bind the full handoff
     # and its raw smoke report (including PCI+UUID pairs), not a numeric index
     # copied from one inventory.
-    gpu_ref, allowed_devices = _load_gpu_health_identity(root, g21_handoff_ref)
+    gpu_ref, allowed_devices = _load_gpu_health_identity(
+        root,
+        g21_handoff_ref,
+        expected_stage1_ref=stage1_g1_exit_ref,
+    )
     if set(ALLOWED_GPU_INDICES).intersection({EXCLUDED_GPU_INDEX}):
         raise _error("GPU_ALLOWED_INDEX_INCLUDES_EXCLUDED")
 
@@ -1096,10 +2403,12 @@ def build_formal_runtime_environment(
 
     asset_source = _source_ref(stage2_asset_resolution_ref, "stage2_asset_resolution")
     try:
-        asset_commit = load_committed_task_artifact(root, asset_source, require_formal=True)
-        if asset_commit.identity.task_id != "stage2.03_assets_checkpoints_and_sampling" or asset_commit.identity.artifact_kind != "asset_resolution":
-            raise ValueError("wrong S2.3 asset resolution commit")
-        asset_manifest = _formal_s23_asset_manifest(asset_commit.payload, field=asset_source)
+        raw_asset = _load_mapping(root, asset_source, "stage2_asset_resolution")
+        if raw_asset.get("schema_version") == "stage2-task-asset-resolution-v1":
+            asset_manifest = _formal_s23_asset_manifest(raw_asset, field=asset_source)
+        else:
+            asset_manifest = AssetResolutionManifest.from_mapping(raw_asset)
+            validate_formal_asset_identity(asset_manifest)
     except Exception as error:
         raise _error("S23_ASSET_RESOLUTION_INVALID", asset_source) from error
 
@@ -1107,39 +2416,14 @@ def build_formal_runtime_environment(
     optional_gates = {"stage1.G1-EXIT"}
     if not required_gates.issubset(gate_refs) or set(gate_refs) - required_gates - optional_gates:
         raise _error("GATE_REF_SET_INVALID", sorted(set(gate_refs) ^ required_gates))
-    normalized_gate_refs: dict[str, str] = {}
-    for gate_id, ref in gate_refs.items():
-        gate_ref = _source_ref(ref, f"gate.{gate_id}")
-        try:
-            loaded = load_committed_task_artifact(root, gate_ref, require_formal=True)
-        except Exception as error:
-            raise _error("GATE_FORMAL_COMMIT_REQUIRED", gate_id) from error
-        for source_ref in loaded.source_refs:
-            _reject_nonformal_ref(source_ref, f"gate.{gate_id}.source_ref")
-        # A gate may be nested in a formal task payload; TaskRuntime performs
-        # the same exact-one GateRecord check at preflight time.
-        found: list[GateRecord] = []
-
-        def visit(node: object) -> None:
-            if isinstance(node, Mapping):
-                if node.get("schema_version") == "gate-record-v1":
-                    try:
-                        gate = GateRecord.from_mapping(dict(node))
-                    except Exception:
-                        gate = None
-                    if gate is not None and gate.gate_id == gate_id:
-                        found.append(gate)
-                    return
-                for child in node.values():
-                    visit(child)
-            elif isinstance(node, Sequence) and not isinstance(node, (str, bytes, bytearray)):
-                for child in node:
-                    visit(child)
-
-        visit(loaded.payload)
-        if len(found) != 1 or found[0].status is not GateStatus.PASS:
-            raise _error("GATE_NOT_PASS", gate_id)
-        normalized_gate_refs[gate_id] = gate_ref
+    normalized_gate_refs = _load_formal_gate_refs(
+        root,
+        {str(key): str(value) for key, value in gate_refs.items()},
+        required=tuple(gate_refs),
+        expected_task={"stage2.G2.2": "stage2.03_assets_checkpoints_and_sampling"},
+        expected_artifact_kind={"stage2.G2.2": "gate_record"},
+        expected_upstream_refs={"stage2.G2.2": (asset_source,)},
+    )
 
     required_capabilities = {"server", "cuda", "model_assets", "data_assets"}
     if set(capability_refs) != required_capabilities:
@@ -1195,6 +2479,31 @@ def build_formal_runtime_environment(
     ):
         raise _error("SIZING_PLAN_IDENTITY_MISMATCH", sizing_ref)
 
+    if (stage2_parameter_registry_ref is None) != (stage2_reference_delta_sci_ref is None):
+        raise _error("CELL_FORMAL_EVIDENCE_SET_INVALID")
+    cell_registry_ref: str | None = None
+    cell_delta_ref: str | None = None
+    if stage2_parameter_registry_ref is not None and stage2_reference_delta_sci_ref is not None:
+        if cell_id is None:
+            raise _error("CELL_ID_REQUIRED_FOR_FORMAL_EVIDENCE")
+        if cell_id not in EXPECTED_CELL_IDS:
+            raise _error("CELL_ID_INVALID", cell_id)
+        cell_registry_ref = _source_ref(stage2_parameter_registry_ref, "stage2_parameter_registry")
+        cell_delta_ref = _source_ref(stage2_reference_delta_sci_ref, "stage2_reference_delta_sci")
+        registry_value = _load_formal_or_direct_payload(
+            root,
+            cell_registry_ref,
+            field="stage2_parameter_registry",
+            artifact_kind="parameter_registry",
+        )
+        if registry_value.get("schema_version") != S204_REGISTRY_SCHEMA or registry_value.get("status") != "READY" or registry_value.get("cell_id") != cell_id:
+            raise _error("PARAMETER_REGISTRY_FORMAL_REQUIRED", cell_id)
+        if registry_value.get("artifact_hash") != canonical_json_hash(
+            {key: item for key, item in registry_value.items() if key != "artifact_hash"}
+        ):
+            raise _error("PARAMETER_REGISTRY_HASH_INVALID", cell_id)
+        _validate_delta_sci_artifact(root, cell_delta_ref, cell_id=cell_id)
+
     evidence_refs: dict[str, str] = {
         "formal_execution": formal_ref,
         "stage0_handoff": stage0_ref,
@@ -1216,8 +2525,31 @@ def build_formal_runtime_environment(
         # second sizing plan accidentally placed in predecessor commits.
         "formal_reference_sizing_plan": sizing_ref,
     }
+    if g22_asset_evidence_ref is not None:
+        evidence_refs["g22_asset_evidence"] = _source_ref(g22_asset_evidence_ref, "g22_asset_evidence")
+    if stage1_bridge_ref is not None:
+        bridge_ref = _source_ref(stage1_bridge_ref, "stage1_bridge")
+        if stage1_bridge_config_ref is None:
+            raise _error("STAGE1_BRIDGE_CONFIG_REQUIRED")
+        _validate_stage1_bridge(
+            root,
+            index_ref=stage1_ref,
+            bridge_ref=bridge_ref,
+            config_ref=stage1_bridge_config_ref,
+        )
+        evidence_refs["stage1_11_bridge"] = bridge_ref
+    if stage1_bridge_config_ref is not None:
+        bridge_config_ref = _source_ref(stage1_bridge_config_ref, "stage1_bridge_config")
+        evidence_refs["stage1_11_bridge_config"] = bridge_config_ref
     if "stage1.G1-EXIT" in normalized_gate_refs:
         evidence_refs["gate_stage1_g1_exit"] = normalized_gate_refs["stage1.G1-EXIT"]
+    if cell_registry_ref is not None and cell_delta_ref is not None:
+        evidence_refs["stage2_parameter_registry"] = cell_registry_ref
+        evidence_refs["stage2_reference_delta_sci"] = cell_delta_ref
+    if six_cell_manifest_ref is not None:
+        evidence_refs["stage2_s204_six_cell_manifest"] = _source_ref(
+            six_cell_manifest_ref, "six_cell_manifest"
+        )
     evidence_refs.update({f"capability_{key}": value for key, value in normalized_capabilities.items()})
     environment = TaskRuntimeEnvironment(
         capabilities=frozenset(required_capabilities),
@@ -1251,6 +2583,8 @@ def publish_reference_sizing_plan(
 
     if formal_execution.run_intent != "formal":
         raise _error("FORMAL_EXECUTION_REQUIRED_FOR_SIZING")
+    if required_consecutive != 1:
+        raise _error("SIZING_REQUIRED_CONSECUTIVE_FROZEN", required_consecutive)
     plan = ReferenceSizingPlan(
         reference_id=reference_id,
         candidate_sample_counts=tuple(candidate_sample_counts),
@@ -1271,6 +2605,391 @@ def publish_reference_sizing_plan(
     if reread.get("schema_version") != S204_SCHEMA or reread.get("artifact_hash") != plan.artifact_hash:
         raise _error("SIZING_PLAN_ROUND_TRIP_DRIFT")
     return plan, PurePosixPath(output_ref).as_posix()
+
+
+def publish_per_cell_sizing_plans(
+    data_root: str | Path,
+    *,
+    formal_execution: FormalExecutionEvidence,
+    candidate_sample_counts: Sequence[int] = DEFAULT_CANDIDATES,
+    block_size: int = DEFAULT_BLOCK_SIZE,
+    convergence_tolerance: float = 0.02,
+    output_dir: str = "evidence/stage2/s204/reference-sizing",
+) -> dict[str, str]:
+    """Publish six independent sizing studies with stable cell identities."""
+
+    root = Path(data_root).resolve()
+    refs: dict[str, str] = {}
+    for cell_id in EXPECTED_CELL_IDS:
+        component = _cell_path_component(cell_id)
+        reference_id = f"stage2-s204-{component}-sizing"
+        output_ref = f"{output_dir}/{component}/reference-sizing-plan.json"
+        _plan, ref = publish_reference_sizing_plan(
+            root,
+            formal_execution=formal_execution,
+            reference_id=reference_id,
+            candidate_sample_counts=candidate_sample_counts,
+            block_size=block_size,
+            convergence_tolerance=convergence_tolerance,
+            required_consecutive=1,
+            output_ref=output_ref,
+        )
+        refs[cell_id] = ref
+    if len(set(refs.values())) != len(EXPECTED_CELL_IDS):
+        raise _error("SIX_CELL_SIZING_REF_NOT_UNIQUE")
+    return refs
+
+
+def _validate_delta_sci_artifact(
+    root: Path,
+    ref: str,
+    *,
+    cell_id: str,
+    candidate_sample_counts: Sequence[int] = DEFAULT_CANDIDATES,
+) -> Mapping[str, Any]:
+    value = _load_formal_or_direct_payload(
+        root,
+        ref,
+        field="stage2_reference_delta_sci",
+        artifact_kind="reference_delta_sci",
+    )
+    if value.get("schema_version") != S204_DELTA_SCHEMA or value.get("status") != "READY" or value.get("scope") != "formal":
+        raise _error("REFERENCE_DELTA_SCI_FORMAL_REQUIRED", cell_id)
+    if value.get("cell_id") != cell_id:
+        raise _error("REFERENCE_DELTA_SCI_CELL_MISMATCH", cell_id)
+    values = value.get("delta_sci_by_B")
+    if not isinstance(values, Mapping) or any(
+        str(count) not in values
+        or isinstance(values[str(count)], bool)
+        or not isinstance(values[str(count)], (int, float))
+        or not math.isfinite(float(values[str(count)]))
+        or float(values[str(count)]) <= 0
+        for count in candidate_sample_counts
+    ):
+        raise _error("REFERENCE_DELTA_SCI_CANDIDATE_COVERAGE", cell_id)
+    refs = value.get("source_contract_refs")
+    hashes = value.get("source_contract_artifact_hashes")
+    if not isinstance(refs, list) or not refs or not isinstance(hashes, list) or len(refs) != len(hashes):
+        raise _error("REFERENCE_DELTA_SCI_SOURCE_BINDING_INVALID", cell_id)
+    for raw_ref, raw_hash in zip(refs, hashes, strict=True):
+        source_ref = _source_ref(raw_ref, f"delta_sci.{cell_id}.source_ref")
+        loaded = load_committed_task_artifact(root, source_ref, require_formal=True)
+        if loaded.identity.artifact_hash != _sha(raw_hash, f"delta_sci.{cell_id}.source_hash"):
+            raise _error("REFERENCE_DELTA_SCI_SOURCE_BINDING_INVALID", cell_id)
+    declared = value.get("artifact_hash")
+    if not isinstance(declared, str) or canonical_json_hash(
+        {key: item for key, item in value.items() if key != "artifact_hash"}
+    ) != declared:
+        raise _error("REFERENCE_DELTA_SCI_HASH_INVALID", cell_id)
+    return value
+
+
+def _validate_sizing_ref(
+    root: Path,
+    ref: str,
+    *,
+    formal_execution_hash: str,
+    cell_id: str,
+) -> Mapping[str, Any]:
+    value = _load_formal_or_direct_payload(
+        root,
+        ref,
+        field="formal_reference_sizing_plan",
+        artifact_kind="reference_sizing_plan",
+    )
+    if value.get("schema_version") != S204_SCHEMA or value.get("execution_evidence_hash") != formal_execution_hash:
+        raise _error("SIZING_PLAN_IDENTITY_MISMATCH", cell_id)
+    if value.get("required_consecutive") != 1:
+        raise _error("SIZING_REQUIRED_CONSECUTIVE_FROZEN", cell_id)
+    counts = value.get("candidate_sample_counts")
+    if not isinstance(counts, list) or len(counts) < 2 or any(
+        isinstance(item, bool) or not isinstance(item, int) or item <= 0 for item in counts
+    ) or tuple(sorted(set(counts))) != tuple(counts):
+        raise _error("SIZING_PLAN_INVALID", cell_id)
+    if not isinstance(value.get("reference_id"), str) or not value.get("reference_id"):
+        raise _error("SIZING_PLAN_INVALID", cell_id)
+    if value.get("artifact_hash") != canonical_json_hash(
+        {key: item for key, item in value.items() if key != "artifact_hash"}
+    ):
+        raise _error("SIZING_PLAN_HASH_INVALID", cell_id)
+    return value
+
+
+def _publish_auxiliary_task_artifact(
+    root: Path,
+    *,
+    artifact_kind: str,
+    payload: Mapping[str, Any],
+    config_hash: str,
+    source_refs: Sequence[str],
+    output_dir: str,
+) -> str:
+    """Bridge one validated direct auxiliary object into a formal TaskArtifact."""
+
+    refs = tuple(dict.fromkeys(_source_ref(ref, "auxiliary.source_ref") for ref in source_refs))
+    store = TaskArtifactStore(root, output_dir)
+    published = store.publish(
+        task_id=S204_TASK_ID,
+        artifact_kind=artifact_kind,
+        config_hash=config_hash,
+        run_intent="formal",
+        payload=dict(payload),
+        formal_eligible=True,
+        source_refs=refs,
+    )
+    loaded = load_committed_task_artifact(root, published.commit_ref, require_formal=True)
+    if loaded.identity.artifact_kind != artifact_kind or loaded.payload != payload:
+        raise _error("AUXILIARY_TASK_ARTIFACT_DRIFT", artifact_kind)
+    return published.commit_ref
+
+
+def _load_direct_manifest_payload(root: Path, ref: str, field: str) -> Mapping[str, Any]:
+    value = _load_mapping(root, ref, field)
+    if value.get("schema_version") == "stage2-task-asset-resolution-v1":
+        nested = value.get("stage2_asset_manifest")
+        if not isinstance(nested, Mapping):
+            raise _error("DIRECT_MANIFEST_INVALID", field)
+        return nested
+    return value
+
+
+def _load_formal_or_direct_payload(
+    root: Path,
+    ref: str,
+    *,
+    field: str,
+    artifact_kind: str,
+) -> Mapping[str, Any]:
+    """Read a direct artifact or its formal TaskArtifact envelope exactly once."""
+
+    value = _load_mapping(root, ref, field)
+    if value.get("schema_version") != "task-output-commit-v1":
+        return value
+    try:
+        loaded = load_committed_task_artifact(root, ref, require_formal=True)
+    except Exception as error:
+        raise _error("FORMAL_AUXILIARY_COMMIT_REQUIRED", field) from error
+    if loaded.identity.artifact_kind != artifact_kind:
+        raise _error("FORMAL_AUXILIARY_KIND_MISMATCH", field)
+    return loaded.payload
+
+
+def publish_per_cell_runtime_environments(
+    data_root: str | Path,
+    *,
+    base_environment_ref: str,
+    sizing_refs: Mapping[str, str],
+    registry_refs: Mapping[str, str],
+    delta_refs: Mapping[str, str],
+    output_dir: str = "evidence/stage2/s204/environments",
+    six_cell_manifest_ref: str | None = None,
+    configs: Mapping[str, ResolvedConfigV2] | None = None,
+    config_refs: Mapping[str, str] | None = None,
+    s23_asset_task_ref: str | None = None,
+    asset_manifest_ref: str | None = None,
+    g3_resolution_ref: str | None = None,
+    tokenizer_asset_id: str = DEFAULT_TOKENIZER_ASSET_ID,
+    data_asset_id: str = DEFAULT_DATA_ASSET_ID,
+) -> tuple[dict[str, TaskRuntimeEnvironment], dict[str, str]]:
+    """Derive six rereadable environments from one verified final snapshot.
+
+    Each environment has exactly one sizing, registry and delta source under
+    the keys consumed by the formal Stage2.04 runner.  The global environment
+    is never reused as a launch target; it is only the already-verified base
+    evidence snapshot from which these six identities are derived.
+    """
+
+    root = Path(data_root).resolve()
+    base_ref = _source_ref(base_environment_ref, "base_environment")
+    try:
+        base = TaskRuntimeEnvironment.from_mapping(_load_mapping(root, base_ref, "base_environment"))
+    except Exception as error:
+        raise _error("BASE_ENVIRONMENT_INVALID") from error
+    if base.frozen_contract_stages != frozenset({0, 1, 2}) or "stage2.G2.2" not in base.passed_gate_ids:
+        raise _error("BASE_ENVIRONMENT_FORMAL_CHAIN_INVALID")
+    sizing = _cell_ref_map(sizing_refs, field="sizing_refs", required=True, root=root)
+    registries = _cell_ref_map(registry_refs, field="registry_refs", required=True, root=root)
+    deltas = _cell_ref_map(delta_refs, field="delta_refs", required=True, root=root)
+    evidence_ref = base.evidence_refs.get("formal_execution")
+    if evidence_ref is None:
+        raise _error("BASE_ENVIRONMENT_FORMAL_EXECUTION_MISSING")
+    evidence = FormalExecutionEvidence.from_mapping(_load_mapping(root, evidence_ref, "formal_execution"))
+    formal_external_lineage = all(
+        item is not None
+        for item in (
+            configs,
+            config_refs,
+            six_cell_manifest_ref,
+            s23_asset_task_ref,
+            asset_manifest_ref,
+            g3_resolution_ref,
+        )
+    )
+    manifest: AssetResolutionManifest | None = None
+    g3_assets: FormalG3RuntimeAssets | None = None
+    if formal_external_lineage:
+        assert asset_manifest_ref is not None and g3_resolution_ref is not None
+        assert s23_asset_task_ref is not None
+        try:
+            s23_loaded = load_committed_task_artifact(root, _source_ref(s23_asset_task_ref, "s23_asset_task"), require_formal=True)
+            if s23_loaded.identity.artifact_kind != "asset_resolution":
+                raise ValueError("S2.3 asset task kind mismatch")
+            manifest = _formal_s23_asset_manifest(s23_loaded.payload, field="s23_asset_task")
+            g3_assets = FormalG3RuntimeAssets.load(root, _source_ref(g3_resolution_ref, "g3_resolution"))
+        except Exception as error:
+            raise _error("FORMAL_EXTERNAL_LINEAGE_INVALID") from error
+        if tuple(config_refs or {}) != EXPECTED_CELL_IDS:
+            raise _error("CONFIG_REF_SET_INVALID")
+    environments: dict[str, TaskRuntimeEnvironment] = {}
+    refs: dict[str, str] = {}
+    for cell_id in EXPECTED_CELL_IDS:
+        sizing_value = _validate_sizing_ref(
+            root,
+            sizing[cell_id],
+            formal_execution_hash=evidence.artifact_hash,
+            cell_id=cell_id,
+        )
+        _validate_delta_sci_artifact(root, deltas[cell_id], cell_id=cell_id)
+        registry_value = _load_formal_or_direct_payload(
+            root,
+            registries[cell_id],
+            field="stage2_parameter_registry",
+            artifact_kind="parameter_registry",
+        )
+        if registry_value.get("schema_version") != S204_REGISTRY_SCHEMA or registry_value.get("status") != "READY":
+            raise _error("PARAMETER_REGISTRY_FORMAL_REQUIRED", cell_id)
+        if registry_value.get("cell_id") != cell_id:
+            raise _error("PARAMETER_REGISTRY_CELL_MISMATCH", cell_id)
+        groups = registry_value.get("parameter_groups")
+        if not isinstance(groups, Mapping) or not groups:
+            raise _error("PARAMETER_REGISTRY_GROUPS_REQUIRED", cell_id)
+        if configs is not None and registry_value.get("config_hash") != configs[cell_id].config_hash:
+            raise _error("PARAMETER_REGISTRY_CONFIG_MISMATCH", cell_id)
+        declared_registry_hash = registry_value.get("artifact_hash")
+        if not isinstance(declared_registry_hash, str) or canonical_json_hash(
+            {key: item for key, item in registry_value.items() if key != "artifact_hash"}
+        ) != declared_registry_hash:
+            raise _error("PARAMETER_REGISTRY_HASH_INVALID", cell_id)
+
+        auxiliary: dict[str, str] = {}
+        if formal_external_lineage:
+            assert manifest is not None and g3_assets is not None
+            assert configs is not None and config_refs is not None
+            assert six_cell_manifest_ref is not None and s23_asset_task_ref is not None
+            checkpoint = next(item for item in manifest.checkpoints if _cell_id(item) == cell_id)
+            config = configs[cell_id]
+            config_ref = _source_ref(config_refs[cell_id], f"config.{cell_id}")
+            auxiliary["resolved_config"] = _publish_auxiliary_task_artifact(
+                root,
+                artifact_kind="resolved_config",
+                payload=config.to_dict(),
+                config_hash=config.config_hash,
+                source_refs=(config_ref,),
+                output_dir=f"{output_dir}/auxiliary/{_cell_path_component(cell_id)}/resolved-config",
+            )
+            auxiliary["reference_sizing_plan"] = _publish_auxiliary_task_artifact(
+                root,
+                artifact_kind="reference_sizing_plan",
+                payload=sizing_value,
+                config_hash=config.config_hash,
+                source_refs=(sizing[cell_id],),
+                output_dir=f"{output_dir}/auxiliary/{_cell_path_component(cell_id)}/sizing-plan",
+            )
+            auxiliary["parameter_registry"] = _publish_auxiliary_task_artifact(
+                root,
+                artifact_kind="parameter_registry",
+                payload=registry_value,
+                config_hash=config.config_hash,
+                source_refs=(registries[cell_id],),
+                output_dir=f"{output_dir}/auxiliary/{_cell_path_component(cell_id)}/registry",
+            )
+            delta_value = _validate_delta_sci_artifact(root, deltas[cell_id], cell_id=cell_id)
+            auxiliary["reference_delta_sci"] = _publish_auxiliary_task_artifact(
+                root,
+                artifact_kind="reference_delta_sci",
+                payload=delta_value,
+                config_hash=config.config_hash,
+                source_refs=(deltas[cell_id], *tuple(delta_value["source_contract_refs"])),
+                output_dir=f"{output_dir}/auxiliary/{_cell_path_component(cell_id)}/delta-sci",
+            )
+            auxiliary["six_cell_manifest"] = _publish_auxiliary_task_artifact(
+                root,
+                artifact_kind="six_cell_manifest",
+                payload=_load_mapping(root, six_cell_manifest_ref, "six_cell_manifest"),
+                config_hash=config.config_hash,
+                source_refs=(six_cell_manifest_ref, asset_manifest_ref),
+                output_dir=f"{output_dir}/auxiliary/{_cell_path_component(cell_id)}/six-cell-manifest",
+            )
+            checkpoint_payload = _load_mapping(root, checkpoint.manifest_ref, f"checkpoint.{cell_id}.manifest")
+            auxiliary["checkpoint_manifest"] = _publish_auxiliary_task_artifact(
+                root,
+                artifact_kind="checkpoint_manifest",
+                payload=checkpoint_payload,
+                config_hash=config.config_hash,
+                source_refs=(checkpoint.manifest_ref,),
+                output_dir=f"{output_dir}/auxiliary/{_cell_path_component(cell_id)}/checkpoint-manifest",
+            )
+            model_asset = g3_assets.resolve(f"{checkpoint.model_id}-step0", expected_kind="model")
+            tokenizer_asset = g3_assets.resolve(tokenizer_asset_id, expected_kind="tokenizer")
+            data_asset = g3_assets.resolve(data_asset_id, expected_kind="pile")
+            for kind, asset, key in (
+                ("model_manifest", model_asset, "model_manifest"),
+                ("tokenizer_manifest", tokenizer_asset, "tokenizer_manifest"),
+                ("data_manifest", data_asset, "data_manifest"),
+            ):
+                payload = _load_direct_manifest_payload(root, asset.manifest_ref, f"{cell_id}.{kind}")
+                auxiliary[key] = _publish_auxiliary_task_artifact(
+                    root,
+                    artifact_kind=kind,
+                    payload=payload,
+                    config_hash=config.config_hash,
+                    source_refs=(asset.manifest_ref, g3_resolution_ref),
+                    output_dir=f"{output_dir}/auxiliary/{_cell_path_component(cell_id)}/{kind}",
+                )
+            auxiliary["s23_asset_resolution"] = _source_ref(s23_asset_task_ref, "s23_asset_task")
+        evidence_refs = dict(base.evidence_refs)
+        evidence_refs.pop("formal_reference_sizing_plan", None)
+        evidence_refs.pop("stage2_parameter_registry", None)
+        evidence_refs.pop("stage2_reference_delta_sci", None)
+        evidence_refs["formal_reference_sizing_plan"] = auxiliary.get("reference_sizing_plan", sizing[cell_id])
+        evidence_refs["stage2_parameter_registry"] = auxiliary.get("parameter_registry", registries[cell_id])
+        evidence_refs["stage2_reference_delta_sci"] = auxiliary.get("reference_delta_sci", deltas[cell_id])
+        if six_cell_manifest_ref is not None:
+            evidence_refs["stage2_s204_six_cell_manifest"] = _source_ref(
+                six_cell_manifest_ref, "six_cell_manifest"
+            )
+        if formal_external_lineage:
+            evidence_refs.update(
+                {
+                    "stage2_s23_asset_resolution": auxiliary["s23_asset_resolution"],
+                    "stage2_s23_six_cell_manifest": auxiliary["six_cell_manifest"],
+                    "stage2_resolved_config": auxiliary["resolved_config"],
+                    "stage2_checkpoint_manifest": auxiliary["checkpoint_manifest"],
+                    "stage2_model_manifest": auxiliary["model_manifest"],
+                    "stage2_data_manifest": auxiliary["data_manifest"],
+                    "stage2_tokenizer_manifest": auxiliary["tokenizer_manifest"],
+                    "stage2_parameter_registry": auxiliary["parameter_registry"],
+                    "stage2_reference_delta_sci": auxiliary["reference_delta_sci"],
+                    "stage2_reference_sizing_plan": auxiliary["reference_sizing_plan"],
+                }
+            )
+        environment = TaskRuntimeEnvironment(
+            capabilities=base.capabilities,
+            frozen_contract_stages=frozenset({0, 1, 2}),
+            passed_gate_ids=base.passed_gate_ids,
+            estimator_decision_ref=base.estimator_decision_ref,
+            evidence_refs=evidence_refs,
+        )
+        output_ref = f"{output_dir}/{_cell_path_component(cell_id)}.json"
+        publish_canonical_immutable(_safe_relative(root, output_ref, "cell_environment_output"), environment.to_dict())
+        reread = TaskRuntimeEnvironment.from_mapping(_load_mapping(root, output_ref, "cell_environment"))
+        if reread.environment_hash != environment.environment_hash:
+            raise _error("ENVIRONMENT_ROUND_TRIP_DRIFT", cell_id)
+        environments[cell_id] = reread
+        refs[cell_id] = PurePosixPath(output_ref).as_posix()
+    if len({env.environment_hash for env in environments.values()}) != len(EXPECTED_CELL_IDS):
+        raise _error("SIX_CELL_ENVIRONMENT_NOT_UNIQUE")
+    return environments, refs
 
 
 def _asset_id_from_root(root_ref: str) -> str:
@@ -1333,6 +3052,244 @@ def _checkpoint_identity(
     }
 
 
+def _cell_id(checkpoint: CheckpointRecord) -> str:
+    """Return the one canonical G2.3 cell spelling.
+
+    Colons are part of the contract (``model:stage``).  Filesystem names use
+    :func:`_cell_path_component` below; callers must never silently replace the
+    contract ID with a filename-safe variant.
+    """
+
+    return f"{checkpoint.model_id}:{checkpoint.training_stage}"
+
+
+def _cell_path_component(cell_id: str) -> str:
+    if cell_id not in EXPECTED_CELL_IDS:
+        raise _error("CELL_ID_INVALID", cell_id)
+    return cell_id.replace(":", "__")
+
+
+def _expected_cell_checkpoints(
+    manifest: AssetResolutionManifest,
+) -> tuple[CheckpointRecord, ...]:
+    """Require S2.3's six checkpoint rows in the fixed G2.3 order."""
+
+    rows = tuple(manifest.checkpoints)
+    ids = tuple(_cell_id(row) for row in rows)
+    if ids != EXPECTED_CELL_IDS or len(set(ids)) != len(EXPECTED_CELL_IDS):
+        raise _error("SIX_CELL_IDENTITY_NOT_UNIQUE", ids)
+    if any(not row.ready for row in rows):
+        raise _error("SIX_CELL_CHECKPOINT_NOT_READY")
+    return rows
+
+
+def _cell_ref_map(
+    value: Mapping[str, Any] | None,
+    *,
+    field: str,
+    required: bool,
+    root: Path | None = None,
+) -> dict[str, str]:
+    """Normalize an explicit per-cell ref map without name-based discovery."""
+
+    if value is None:
+        if required:
+            raise _error(f"{field.upper()}_REQUIRED")
+        return {}
+    if not isinstance(value, Mapping) or set(value) != set(EXPECTED_CELL_IDS):
+        raise _error(f"{field.upper()}_SET_INVALID")
+    result: dict[str, str] = {}
+    for cell_id in EXPECTED_CELL_IDS:
+        raw = value[cell_id]
+        if isinstance(raw, Mapping):
+            if set(raw) - {"ref", "sha256"} or not isinstance(raw.get("ref"), str):
+                raise _error(f"{field.upper()}_SPEC_INVALID", cell_id)
+            declared_sha = raw.get("sha256")
+            raw = raw["ref"]
+            if declared_sha is not None:
+                if root is None:
+                    raise _error(f"{field.upper()}_HASH_ROOT_REQUIRED", cell_id)
+                _assert_source_file(
+                    root,
+                    _source_ref(raw, f"{field}.{cell_id}"),
+                    f"{field}.{cell_id}",
+                    sha256=str(declared_sha),
+                )
+        result[cell_id] = _source_ref(raw, f"{field}.{cell_id}")
+    if len(set(result.values())) != len(result):
+        raise _error(f"{field.upper()}_MUST_BE_PER_CELL")
+    return result
+
+
+def _load_parameter_registry_artifact(
+    root: Path,
+    ref: str,
+    *,
+    cell_id: str,
+    checkpoint: CheckpointRecord,
+    config_hash: str | None = None,
+) -> Mapping[str, Any]:
+    """Load a producer-published registry and bind it to this checkpoint.
+
+    The registry is intentionally a direct artifact rather than a TaskArtifact
+    wrapper.  It must carry its own content hash and explicit model/checkpoint
+    identity; deriving groups from a model name or parameter names is not a
+    formal fallback.
+    """
+
+    value = _load_formal_or_direct_payload(
+        root,
+        ref,
+        field="stage2_parameter_registry",
+        artifact_kind="parameter_registry",
+    )
+    if value.get("schema_version") != S204_REGISTRY_SCHEMA or value.get("status") != "READY":
+        raise _error("PARAMETER_REGISTRY_FORMAL_REQUIRED", cell_id)
+    if value.get("scope", "formal") != "formal":
+        raise _error("PARAMETER_REGISTRY_SCOPE_INVALID", cell_id)
+    expected_hash = checkpoint.parameter_registry_hash
+    if expected_hash is None or value.get("registry_hash") != expected_hash:
+        raise _error("PARAMETER_REGISTRY_CHECKPOINT_MISMATCH", cell_id)
+    groups = value.get("parameter_groups")
+    if not isinstance(groups, Mapping) or not groups:
+        raise _error("PARAMETER_REGISTRY_GROUPS_REQUIRED", cell_id)
+    for name, group in groups.items():
+        if not isinstance(name, str) or not isinstance(group, Mapping):
+            raise _error("PARAMETER_REGISTRY_GROUP_INVALID", cell_id)
+        if not isinstance(group.get("layer"), str) or not group.get("layer"):
+            raise _error("PARAMETER_REGISTRY_LAYER_REQUIRED", cell_id)
+        if not isinstance(group.get("module"), str) or not group.get("module"):
+            raise _error("PARAMETER_REGISTRY_MODULE_REQUIRED", cell_id)
+    identity = value.get("identity")
+    direct_identity = {
+        "cell_id": value.get("cell_id"),
+        "checkpoint_id": value.get("checkpoint_id"),
+        "model_id": value.get("model_id"),
+        "training_stage": value.get("training_stage"),
+        "config_hash": value.get("config_hash"),
+    }
+    if isinstance(identity, Mapping):
+        for key in direct_identity:
+            if direct_identity[key] is None:
+                direct_identity[key] = identity.get(key)
+    expected_identity = {
+        "cell_id": cell_id,
+        "checkpoint_id": checkpoint.checkpoint_id,
+        "model_id": checkpoint.model_id,
+        "training_stage": checkpoint.training_stage,
+    }
+    for key, expected in expected_identity.items():
+        if direct_identity.get(key) != expected:
+            raise _error("PARAMETER_REGISTRY_IDENTITY_MISMATCH", f"{cell_id}:{key}")
+    if config_hash is not None and direct_identity.get("config_hash") != config_hash:
+        raise _error("PARAMETER_REGISTRY_CONFIG_MISMATCH", cell_id)
+    declared = value.get("artifact_hash")
+    if not isinstance(declared, str) or canonical_json_hash(
+        {key: item for key, item in value.items() if key != "artifact_hash"}
+    ) != declared:
+        raise _error("PARAMETER_REGISTRY_HASH_INVALID", cell_id)
+    return value
+
+
+def _extract_frozen_delta_sci(
+    root: Path,
+    s21_refs: Mapping[str, str],
+    candidate_counts: Sequence[int],
+) -> tuple[dict[str, float], tuple[str, ...], tuple[str, ...]]:
+    """Extract explicit numeric ``delta_sci(B)`` from the frozen S2.1 pair.
+
+    The current S2.1 builder stores the scientific formula, not numeric
+    margins.  In that case this function raises a stable missing-input error;
+    it never evaluates the formula, uses a floor, or accepts a caller scalar.
+    """
+
+    required_order = ("preregistration", "hypothesis_contract")
+    expected = set(required_order)
+    if set(s21_refs) != expected and not expected.issubset(s21_refs):
+        raise _error("REFERENCE_DELTA_SCI_S21_INPUTS_REQUIRED")
+    loaded: dict[str, LoadedTaskArtifact] = {}
+    for kind in required_order:
+        loaded[kind] = _load_formal_source(
+            root,
+            _source_ref(s21_refs[kind], f"s21.{kind}"),
+            task_id="stage2.01_scope_hypotheses_and_preregistration",
+            artifact_kind=kind,
+        )
+    found: dict[str, tuple[dict[str, float], str]] = {}
+
+    def visit(node: object, path: str) -> None:
+        if isinstance(node, Mapping):
+            candidate: object | None = None
+            if "delta_sci_by_B" in node:
+                candidate = node.get("delta_sci_by_B")
+            elif isinstance(node.get("delta_sci"), Mapping):
+                delta = node["delta_sci"]
+                if isinstance(delta, Mapping):
+                    candidate = delta.get("delta_sci_by_B", delta.get("by_B"))
+            if candidate is not None:
+                if not isinstance(candidate, Mapping):
+                    raise _error("REFERENCE_DELTA_SCI_CONTRACT_INVALID", path)
+                values: dict[str, float] = {}
+                for count in candidate_counts:
+                    raw = candidate.get(str(count), candidate.get(count))
+                    if isinstance(raw, bool) or not isinstance(raw, (int, float)) or not math.isfinite(float(raw)) or float(raw) <= 0:
+                        raise _error("REFERENCE_DELTA_SCI_CONTRACT_INVALID", f"{path}:{count}")
+                    values[str(count)] = float(raw)
+                found[canonical_json_hash(values)] = (values, path)
+            for key, child in node.items():
+                visit(child, f"{path}.{key}")
+        elif isinstance(node, Sequence) and not isinstance(node, (str, bytes, bytearray)):
+            for index, child in enumerate(node):
+                visit(child, f"{path}[{index}]")
+
+    for kind in required_order:
+        item = loaded[kind]
+        visit(item.payload, f"s21.{kind}")
+    if len(found) != 1:
+        raise _error("REFERENCE_DELTA_SCI_REQUIRED")
+    values, _ = next(iter(found.values()))
+    return values, tuple(item.identity.artifact_hash for item in loaded.values()), tuple(
+        _source_ref(s21_refs[kind], f"s21.{kind}") for kind in ("preregistration", "hypothesis_contract")
+    )
+
+
+def publish_per_cell_delta_sci(
+    data_root: str | Path,
+    *,
+    s21_refs: Mapping[str, str],
+    candidate_sample_counts: Sequence[int] = DEFAULT_CANDIDATES,
+    cell_ids: Sequence[str] = EXPECTED_CELL_IDS,
+    output_dir: str = "evidence/stage2/s204/reference-delta-sci",
+) -> dict[str, str]:
+    """Publish one hash-bound delta source for each canonical G2.3 cell."""
+
+    root = Path(data_root).resolve()
+    if tuple(cell_ids) != EXPECTED_CELL_IDS:
+        raise _error("SIX_CELL_ID_SET_INVALID")
+    values, contract_hashes, contract_refs = _extract_frozen_delta_sci(
+        root, s21_refs, candidate_sample_counts
+    )
+    refs: dict[str, str] = {}
+    for cell_id in EXPECTED_CELL_IDS:
+        payload: dict[str, Any] = {
+            "schema_version": S204_DELTA_SCHEMA,
+            "status": "READY",
+            "scope": "formal",
+            "cell_id": cell_id,
+            "delta_sci_by_B": dict(values),
+            "source_contract_refs": list(contract_refs),
+            "source_contract_artifact_hashes": list(contract_hashes),
+        }
+        payload["artifact_hash"] = canonical_json_hash(payload)
+        ref = f"{output_dir}/{_cell_path_component(cell_id)}.json"
+        publish_canonical_immutable(_safe_relative(root, ref, "delta_sci_output"), payload)
+        reread = _load_mapping(root, ref, "stage2_reference_delta_sci")
+        if reread != payload:
+            raise _error("REFERENCE_DELTA_SCI_ROUND_TRIP_DRIFT", cell_id)
+        refs[cell_id] = PurePosixPath(ref).as_posix()
+    return refs
+
+
 def generate_six_cell_configs(
     data_root: str | Path,
     *,
@@ -1345,6 +3302,8 @@ def generate_six_cell_configs(
     resume_refs: Mapping[str, str] | None = None,
     tokenizer_asset_id: str = DEFAULT_TOKENIZER_ASSET_ID,
     data_asset_id: str = DEFAULT_DATA_ASSET_ID,
+    parameter_registry_refs: Mapping[str, str] | None = None,
+    delta_sci_refs: Mapping[str, str] | None = None,
 ) -> dict[str, ResolvedConfigV2]:
     """Generate one unique, identity-bound v2 config per formal checkpoint.
 
@@ -1401,6 +3360,31 @@ def generate_six_cell_configs(
             artifact_kind=kind,
         )
 
+    # The real S2.4 producer must expose one authoritative registry and one
+    # frozen delta source per canonical cell.  Local fixture config tests do
+    # not pass G3 and remain intentionally limited to config identity checks.
+    formal_cell_inputs = g3_assets is not None
+    registry_map = _cell_ref_map(
+        parameter_registry_refs,
+        field="parameter_registry_refs",
+        required=formal_cell_inputs,
+        root=root,
+    )
+    if delta_sci_refs is None and formal_cell_inputs:
+        delta_map = publish_per_cell_delta_sci(
+            root,
+            s21_refs=s201,
+            candidate_sample_counts=DEFAULT_CANDIDATES,
+            output_dir=f"{output_root_ref}/reference-delta-sci",
+        )
+    else:
+        delta_map = _cell_ref_map(
+            delta_sci_refs,
+            field="delta_sci_refs",
+            required=formal_cell_inputs,
+            root=root,
+        )
+
     base_path = _config_path(root, base_config_ref)
     try:
         from param_importance_nlp.cli import _load_mapping as cli_load_mapping
@@ -1419,41 +3403,58 @@ def generate_six_cell_configs(
     if base.section("identity").get("run_intent") != "formal":
         raise _error("BASE_CONFIG_FORMAL_REQUIRED")
     data = manifest.data_range
+    checkpoints = _expected_cell_checkpoints(manifest)
+    expected_cell_ids = set(EXPECTED_CELL_IDS)
+    if mode == "resume":
+        if resume_refs is None:
+            raise _error("RESUME_REF_REQUIRED")
+        if set(resume_refs) != expected_cell_ids:
+            raise _error("RESUME_REF_SET_INVALID")
+    elif resume_refs:
+        raise _error("FRESH_CONFIG_CANNOT_CARRY_RESUME_REF")
     cells: dict[str, ResolvedConfigV2] = {}
-    for checkpoint in manifest.checkpoints:
+    for checkpoint in checkpoints:
         identity = _checkpoint_identity(
             checkpoint,
             tokenizer_asset_id=tokenizer_asset_id,
             data_asset_id=data_asset_id,
             data_revision=data.revision,
         )
+        cell_id = _cell_id(checkpoint)
         if g3_assets is not None:
             try:
-                model_asset = g3_assets.resolve(identity["model_asset_id"], expected_kind="model")
+                # G3 qualifies only the base model.  Checkpoint step manifests
+                # are authoritative S2.3 outputs and must never be looked up as
+                # if G3 had published step-1000/71000 entries.
+                base_model_id = f"{checkpoint.model_id}-step0"
+                model_asset = g3_assets.resolve(base_model_id, expected_kind="model")
                 tokenizer_asset = g3_assets.resolve(tokenizer_asset_id, expected_kind="tokenizer")
                 data_asset = g3_assets.resolve(data_asset_id, expected_kind="pile")
             except Exception as error:
                 raise _error("G3_CONFIG_ASSET_ID_UNRESOLVED", cell_id) from error
             if (
-                model_asset.manifest_ref != checkpoint.manifest_ref
-                or model_asset.ready_manifest_sha256 != checkpoint.manifest_sha256
-                or tokenizer_asset.ready_manifest_sha256 != checkpoint.tokenizer_sha256
+                tokenizer_asset.ready_manifest_sha256 != checkpoint.tokenizer_sha256
                 or data_asset.manifest_ref != data.manifest_ref
                 or data_asset.ready_manifest_sha256 != data.manifest_sha256
             ):
                 raise _error("G3_CONFIG_MANIFEST_IDENTITY_MISMATCH", cell_id)
-        cell_id = f"{checkpoint.model_id}-{checkpoint.training_stage}"
+            checkpoint_root = _safe_relative(root, checkpoint.root_ref, f"checkpoint.{cell_id}.root_ref")
+            if not checkpoint_root.is_dir():
+                raise _error("CHECKPOINT_ROOT_MISSING", cell_id)
+            checkpoint_manifest = _load_mapping(root, checkpoint.manifest_ref, f"checkpoint.{cell_id}.manifest")
+            if canonical_json_hash(dict(checkpoint_manifest)) != checkpoint.manifest_sha256:
+                raise _error("CHECKPOINT_MANIFEST_HASH_MISMATCH", cell_id)
+            data_manifest = _load_mapping(root, data.manifest_ref, "data.manifest")
+            if canonical_json_hash(dict(data_manifest)) != data.manifest_sha256:
+                raise _error("DATA_MANIFEST_HASH_MISMATCH", cell_id)
         if cell_id in cells:
             raise _error("CELL_ID_DUPLICATE", cell_id)
         if mode == "resume":
-            if resume_refs is None or cell_id not in resume_refs:
-                raise _error("RESUME_REF_REQUIRED", cell_id)
+            assert resume_refs is not None
             resume_ref = _logical(resume_refs[cell_id], f"resume_ref.{cell_id}")
-            if not resume_ref.startswith(f"{output_root_ref}/{cell_id}/"):
+            if not resume_ref.startswith(f"{output_root_ref}/{_cell_path_component(cell_id)}/"):
                 raise _error("RESUME_REF_CELL_MISMATCH", cell_id)
         else:
-            if resume_refs is not None and cell_id in resume_refs:
-                raise _error("FRESH_CONFIG_CANNOT_CARRY_RESUME_REF", cell_id)
             resume_ref = None
         base_value = base.to_dict()
         model = base_value["model"]
@@ -1474,11 +3475,14 @@ def generate_six_cell_configs(
                 "sequence_length": data.input_sequence_length,
             }
         )
+        # G2.3 derives checkpoint identity from this field.  Leaving it null
+        # makes a config look unique while severing the S2.3 checkpoint link.
+        base_value["identity"]["input_checkpoint_id"] = checkpoint.checkpoint_id
         base_value["identity"]["task"] = S204_TASK_ID
         base_value["identity"]["stage"] = 2
         base_value["identity"]["run_intent"] = "formal"
         base_value["identity"]["formal_eligible"] = True
-        output_ref = f"{output_root_ref}/{cell_id}"
+        output_ref = f"{output_root_ref}/{_cell_path_component(cell_id)}"
         overrides: dict[str, Any] = {
             "providers": {
                 "kind": "offline_hf",
@@ -1509,8 +3513,21 @@ def generate_six_cell_configs(
             "execution": {"runner_kind": "reference", "dry_run": False, "fail_on_blocked": True},
         }
         config = ResolvedConfigV2.resolve(base_value, task_id=S204_TASK_ID, overrides=overrides)
+        if formal_cell_inputs:
+            _load_parameter_registry_artifact(
+                root,
+                registry_map[cell_id],
+                cell_id=cell_id,
+                checkpoint=checkpoint,
+                config_hash=config.config_hash,
+            )
+            _validate_delta_sci_artifact(
+                root,
+                delta_map[cell_id],
+                cell_id=cell_id,
+            )
         cells[cell_id] = config
-    if len(cells) != 6 or len({item.config_hash for item in cells.values()}) != 6:
+    if len(cells) != 6 or tuple(cells) != EXPECTED_CELL_IDS or len({item.config_hash for item in cells.values()}) != 6:
         raise _error("SIX_CELL_IDENTITY_NOT_UNIQUE")
     return cells
 
@@ -1527,7 +3544,7 @@ def write_six_cell_configs(
     root = Path(data_root).resolve()
     refs: dict[str, str] = {}
     for cell_id, config in configs.items():
-        target_ref = f"{output_dir}/{mode}/{cell_id}.json"
+        target_ref = f"{output_dir}/{mode}/{_cell_path_component(cell_id)}.json"
         target = _safe_relative(root, target_ref, "config_output")
         publish_canonical_immutable(target, config.to_dict())
         reread = ResolvedConfigV2.from_mapping(load_canonical_json(target))
@@ -1535,6 +3552,128 @@ def write_six_cell_configs(
             raise _error("CONFIG_ROUND_TRIP_DRIFT", cell_id)
         refs[cell_id] = PurePosixPath(target_ref).as_posix()
     return refs
+
+
+def publish_six_cell_manifest(
+    data_root: str | Path,
+    *,
+    asset_manifest_ref: str,
+    configs: Mapping[str, ResolvedConfigV2],
+    registry_refs: Mapping[str, str],
+    output_ref: str = "evidence/stage2/s204/six-cell-manifest.json",
+) -> str:
+    """Publish the S2.3 checkpoint-root projection consumed by G2.3.
+
+    The projection copies no checkpoint path or model identity from G3.  It
+    binds each row to the exact S2.3 checkpoint manifest and the resolved v2
+    config generated for that row, while retaining a distinct registry source
+    for every cell.
+    """
+
+    root = Path(data_root).resolve()
+    asset_ref = _source_ref(asset_manifest_ref, "stage2_asset_resolution")
+    loaded = load_committed_task_artifact(root, asset_ref, require_formal=True)
+    manifest = _formal_s23_asset_manifest(loaded.payload, field=asset_ref)
+    checkpoints = _expected_cell_checkpoints(manifest)
+    if tuple(configs) != EXPECTED_CELL_IDS:
+        raise _error("SIX_CELL_CONFIG_ORDER_INVALID")
+    refs = _cell_ref_map(registry_refs, field="registry_refs", required=True, root=root)
+    rows: list[dict[str, Any]] = []
+    registry_hashes: dict[str, str] = {}
+    for checkpoint in checkpoints:
+        cell_id = _cell_id(checkpoint)
+        config = configs[cell_id]
+        registry = _load_parameter_registry_artifact(
+            root,
+            refs[cell_id],
+            cell_id=cell_id,
+            checkpoint=checkpoint,
+            config_hash=config.config_hash,
+        )
+        registry_hash = _sha(registry.get("registry_hash"), f"registry.{cell_id}")
+        registry_hashes[cell_id] = registry_hash
+        rows.append(
+            {
+                "cell_id": cell_id,
+                "model_id": checkpoint.model_id,
+                "training_stage": checkpoint.training_stage,
+                "checkpoint_id": checkpoint.checkpoint_id,
+                "checkpoint_hash": _sha(checkpoint.manifest_sha256, f"checkpoint.{cell_id}.manifest_sha256"),
+                "checkpoint_revision": checkpoint.revision,
+                "registry_hash": registry_hash,
+                "config_hash": config.config_hash,
+                "checkpoint_root_ref": checkpoint.root_ref,
+                "checkpoint_manifest_ref": checkpoint.manifest_ref,
+                "parameter_registry_ref": refs[cell_id],
+            }
+        )
+    body: dict[str, Any] = {
+        "schema_version": S204_SIX_CELL_SCHEMA,
+        "status": "READY",
+        "scope": "formal",
+        "asset_resolution_hash": manifest.digest,
+        "asset_producer_commit": manifest.producer_commit,
+        "asset_execution_commit": manifest.execution_commit,
+        "checkpoints": rows,
+        "data": manifest.data_range.to_dict(),
+        "data_range_hash": manifest.data_range.digest,
+        # Keep both the legacy common hash and the explicit per-cell map.  A
+        # producer with model-specific registries must not collapse them into a
+        # guessed shared value; consumers can require the map when present.
+        "registry_hash": (
+            next(iter(set(registry_hashes.values())))
+            if len(set(registry_hashes.values())) == 1
+            else canonical_json_hash(registry_hashes)
+        ),
+        "registry_hashes_by_cell": registry_hashes,
+    }
+    body["manifest_hash"] = canonical_json_hash(body)
+    publish_canonical_immutable(_safe_relative(root, output_ref, "six_cell_manifest_output"), body)
+    reread = _load_mapping(root, output_ref, "six_cell_manifest")
+    if reread != body:
+        raise _error("SIX_CELL_MANIFEST_ROUND_TRIP_DRIFT")
+    return PurePosixPath(output_ref).as_posix()
+
+
+def publish_six_cell_materialization_index(
+    data_root: str | Path,
+    *,
+    config_refs: Mapping[str, str],
+    environment_refs: Mapping[str, str],
+    sizing_refs: Mapping[str, str],
+    registry_refs: Mapping[str, str],
+    delta_refs: Mapping[str, str],
+    six_cell_manifest_ref: str,
+    output_ref: str,
+    mode: str,
+) -> str:
+    """Write the explicit per-cell handoff index used by launch tooling."""
+
+    root = Path(data_root).resolve()
+    maps = {
+        "config_ref": _cell_ref_map(config_refs, field="config_refs", required=True, root=root),
+        "environment_ref": _cell_ref_map(environment_refs, field="environment_refs", required=True, root=root),
+        "sizing_ref": _cell_ref_map(sizing_refs, field="sizing_refs", required=True, root=root),
+        "registry_ref": _cell_ref_map(registry_refs, field="registry_refs", required=True, root=root),
+        "delta_ref": _cell_ref_map(delta_refs, field="delta_refs", required=True, root=root),
+    }
+    manifest_ref = _source_ref(six_cell_manifest_ref, "six_cell_manifest")
+    rows = [
+        {"cell_id": cell_id, **{key: value[cell_id] for key, value in maps.items()}}
+        for cell_id in EXPECTED_CELL_IDS
+    ]
+    payload: dict[str, Any] = {
+        "schema_version": "stage2-s204-six-cell-materialization-index-v1",
+        "scope": "formal",
+        "mode": mode,
+        "six_cell_manifest_ref": manifest_ref,
+        "cells": rows,
+    }
+    payload["index_hash"] = canonical_json_hash(payload)
+    publish_canonical_immutable(_safe_relative(root, output_ref, "six_cell_index_output"), payload)
+    if _load_mapping(root, output_ref, "six_cell_index") != payload:
+        raise _error("SIX_CELL_INDEX_ROUND_TRIP_DRIFT")
+    return PurePosixPath(output_ref).as_posix()
 
 
 def _parse_key_refs(raw: Sequence[str], field: str) -> dict[str, str]:
@@ -1570,17 +3709,18 @@ def main(argv: Sequence[str] | None = None) -> int:
         source = dict(_load_source_manifest(root, args.sources))
         raw_sources: Mapping[str, Mapping[str, Mapping[str, Any]]] | None = None
         candidate_refs: dict[str, dict[str, str]] | None = None
+        # A caller-provided formal task-output map is intentionally not an
+        # execution path: it could self-sign arbitrary envelopes and bypass
+        # the real S2.1→S2.2→S2.3 runner lineage.
         if source.get("task_outputs") is not None:
-            task_sources = _mapping(source.get("task_outputs"), "sources.task_outputs")
-            materialized = materialize_formal_task_inputs(root, task_sources, output_dir=args.output_dir)
-            bootstrap_mode = False
-        elif source.get("raw_task_outputs") is not None:
+            raise _error("CALLER_FORMAL_TASK_OUTPUTS_FORBIDDEN")
+        if source.get("raw_task_outputs") is not None:
             raw_sources = _mapping(source.get("raw_task_outputs"), "sources.raw_task_outputs")
             candidate_refs = bootstrap_formal_task_inputs(root, raw_sources, output_dir=args.output_dir)
             materialized = {}
             bootstrap_mode = True
         else:
-            raise _error("FORMAL_TASK_OUTPUTS_REQUIRED", "task_outputs or raw_task_outputs")
+            raise _error("RAW_TASK_OUTPUTS_REQUIRED", "the formal DAG must execute")
         formal_ref = _source_ref(source["formal_execution"], "sources.formal_execution")
         evidence, evidence_ref = _publish_formal_execution(
             root,
@@ -1596,15 +3736,21 @@ def main(argv: Sequence[str] | None = None) -> int:
                 base_config_ref=args.base_config,
                 output_dir=args.output_dir,
             )
-        gate_refs = _mapping(source.get("gate_refs"), "sources.gate_refs")
+        if not isinstance(materialized, FormalDAGResult):
+            raise _error("FORMAL_DAG_RESULT_REQUIRED")
+        evidence = materialized.final_evidence
+        evidence_ref = materialized.final_evidence_ref
+        gate_refs = {"stage2.G2.2": materialized.bridge_gate_refs["stage2.G2.2"]}
         capability_refs = _mapping(source.get("capability_refs"), "sources.capability_refs")
-        # Publish the sizing document first so the environment can bind and
-        # reread the exact object under the runner's canonical evidence key.
-        _, sizing_ref = publish_reference_sizing_plan(
+        # Every cell receives a separate sizing study.  The first plan is used
+        # only as the base snapshot for the environment validator; no launch
+        # is allowed to consume that global snapshot directly.
+        sizing_refs = publish_per_cell_sizing_plans(
             root,
             formal_execution=evidence,
-            output_ref=args.sizing_output,
+            output_dir=PurePosixPath(args.sizing_output).parent.as_posix(),
         )
+        sizing_ref = sizing_refs[EXPECTED_CELL_IDS[0]]
         environment, environment_ref = build_formal_runtime_environment(
             root,
             formal_execution_ref=evidence_ref,
@@ -1612,17 +3758,39 @@ def main(argv: Sequence[str] | None = None) -> int:
             stage1_g1_exit_ref=str(source["stage1_g1_exit"]),
             contract_freeze_ref=str(source["contract_freeze"]),
             g3_resolution_ref=str(source["g3_resolution"]),
-            stage2_asset_resolution_ref=materialized["stage2.03_assets_checkpoints_and_sampling"]["asset_resolution"],
+            stage2_asset_resolution_ref=materialized.authoritative_asset_ref,
             gate_refs={str(k): str(v) for k, v in gate_refs.items()},
             capability_refs={str(k): str(v) for k, v in capability_refs.items()},
             contract_stage_0_ref=(None if source.get("contract_stage_0") is None else str(source["contract_stage_0"])),
             contract_stage_1_ref=(None if source.get("contract_stage_1") is None else str(source["contract_stage_1"])),
             contract_stage_2_ref=(None if source.get("contract_stage_2") is None else str(source["contract_stage_2"])),
             g21_handoff_ref=str(source.get("g21_handoff", source.get("gpu_health", ""))),
+            stage1_bridge_ref=materialized.stage1_bridge_ref,
+            stage1_bridge_config_ref=materialized.stage1_bridge_config_ref,
             reference_sizing_plan_ref=sizing_ref,
+            g22_asset_evidence_ref=str(source.get("g22_asset_evidence", source.get("g22_assets", source.get("g22_evidence", "")))),
             output_ref=args.environment_output,
         )
         resume_refs = _parse_key_refs(args.resume_ref, "resume_ref") if args.mode == "resume" else None
+        registry_source = source.get(
+            "stage2_parameter_registry_refs",
+            source.get("parameter_registry_refs", source.get("stage2_parameter_registry")),
+        )
+        registry_refs = _cell_ref_map(
+            registry_source if isinstance(registry_source, Mapping) else None,
+            field="parameter_registry_refs",
+            required=True,
+            root=root,
+        )
+        # Numeric margins are accepted only when found in the immutable S2.1
+        # preregistration/hypothesis commits.  The source manifest cannot carry
+        # a parallel scalar or a caller-selected delta artifact.
+        delta_refs = publish_per_cell_delta_sci(
+            root,
+            s21_refs=materialized["stage2.01_scope_hypotheses_and_preregistration"],
+            candidate_sample_counts=DEFAULT_CANDIDATES,
+            output_dir=f"{PurePosixPath(args.output_dir).as_posix()}/reference-delta-sci",
+        )
         configs = generate_six_cell_configs(
             root,
             asset_manifest_ref=materialized["stage2.03_assets_checkpoints_and_sampling"]["asset_resolution"],
@@ -1632,8 +3800,70 @@ def main(argv: Sequence[str] | None = None) -> int:
             output_dir=args.config_output_dir,
             mode=args.mode,
             resume_refs=resume_refs,
+            parameter_registry_refs=registry_refs,
+            delta_sci_refs=delta_refs,
         )
         config_refs = write_six_cell_configs(configs, root, output_dir=args.config_output_dir, mode=args.mode)
+        six_cell_manifest_ref = publish_six_cell_manifest(
+            root,
+            asset_manifest_ref=materialized["stage2.03_assets_checkpoints_and_sampling"]["asset_resolution"],
+            configs=configs,
+            registry_refs=registry_refs,
+        )
+        cell_environments, cell_environment_refs = publish_per_cell_runtime_environments(
+            root,
+            base_environment_ref=environment_ref,
+            sizing_refs=sizing_refs,
+            registry_refs=registry_refs,
+            delta_refs=delta_refs,
+            output_dir=f"{PurePosixPath(args.environment_output).parent.as_posix()}/cells",
+            six_cell_manifest_ref=six_cell_manifest_ref,
+            configs=configs,
+            config_refs=config_refs,
+            s23_asset_task_ref=materialized["stage2.03_assets_checkpoints_and_sampling"]["asset_resolution"],
+            asset_manifest_ref=materialized.authoritative_asset_ref,
+            g3_resolution_ref=str(source["g3_resolution"]),
+        )
+        runtime_sizing_refs = {
+            cell_id: cell_environments[cell_id].evidence_refs["stage2_reference_sizing_plan"]
+            for cell_id in EXPECTED_CELL_IDS
+        }
+        runtime_registry_refs = {
+            cell_id: cell_environments[cell_id].evidence_refs["stage2_parameter_registry"]
+            for cell_id in EXPECTED_CELL_IDS
+        }
+        runtime_delta_refs = {
+            cell_id: cell_environments[cell_id].evidence_refs["stage2_reference_delta_sci"]
+            for cell_id in EXPECTED_CELL_IDS
+        }
+        index_ref = publish_six_cell_materialization_index(
+            root,
+            config_refs=config_refs,
+            environment_refs=cell_environment_refs,
+            sizing_refs=runtime_sizing_refs,
+            registry_refs=runtime_registry_refs,
+            delta_refs=runtime_delta_refs,
+            six_cell_manifest_ref=six_cell_manifest_ref,
+            output_ref=f"{args.config_output_dir}/{args.mode}/materialization-index.json",
+            mode=args.mode,
+        )
+        cell_index = [
+            {
+                "cell_id": cell_id,
+                "config_ref": config_refs[cell_id],
+                "environment_ref": cell_environment_refs[cell_id],
+                "sizing_ref": runtime_sizing_refs[cell_id],
+                "registry_ref": runtime_registry_refs[cell_id],
+                "delta_ref": runtime_delta_refs[cell_id],
+                "sizing_source_ref": sizing_refs[cell_id],
+                "registry_source_ref": registry_refs[cell_id],
+                "delta_source_ref": delta_refs[cell_id],
+                "config_hash": configs[cell_id].config_hash,
+                "full_hash": configs[cell_id].full_hash,
+                "environment_hash": cell_environments[cell_id].environment_hash,
+            }
+            for cell_id in EXPECTED_CELL_IDS
+        ]
         summary = {
             "schema_version": "stage2-s204-materialization-summary-v1",
             "formal_eligible": False,
@@ -1642,10 +3872,18 @@ def main(argv: Sequence[str] | None = None) -> int:
             "candidate_task_output_refs": candidate_refs,
             "runtime_environment_ref": environment_ref,
             "environment_hash": environment.environment_hash,
+            "cell_environment_refs": cell_environment_refs,
             "formal_execution_ref": evidence_ref,
             "sizing_plan_ref": sizing_ref,
+            "sizing_plan_refs": sizing_refs,
+            "runtime_sizing_plan_refs": runtime_sizing_refs,
+            "runtime_registry_refs": runtime_registry_refs,
+            "runtime_delta_refs": runtime_delta_refs,
             "sizing_plan_schema": S204_SCHEMA,
             "config_refs": config_refs,
+            "six_cell_manifest_ref": six_cell_manifest_ref,
+            "materialization_index_ref": index_ref,
+            "cells": cell_index,
             "cell_count": len(config_refs),
             "mode": args.mode,
             "bootstrap_mode": bootstrap_mode,
@@ -1670,7 +3908,11 @@ __all__ = [
     "ALLOWED_GPU_INDICES",
     "EXCLUDED_PCI",
     "EXCLUDED_UUID",
+    "EXPECTED_CELL_IDS",
+    "FormalDAGResult",
     "S204MaterializationError",
+    "STAGE1_TASK_ID",
+    "STAGE1_TASK_INPUTS",
     "TASK_INPUTS",
     "build_formal_runtime_environment",
     "bootstrap_formal_task_inputs",
@@ -1678,6 +3920,11 @@ __all__ = [
     "generate_six_cell_configs",
     "main",
     "materialize_formal_task_inputs",
+    "publish_per_cell_delta_sci",
+    "publish_per_cell_runtime_environments",
+    "publish_per_cell_sizing_plans",
     "publish_reference_sizing_plan",
+    "publish_six_cell_manifest",
+    "publish_six_cell_materialization_index",
     "write_six_cell_configs",
 ]
