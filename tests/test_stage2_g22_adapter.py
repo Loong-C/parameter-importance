@@ -216,7 +216,7 @@ def test_model_manifest_rejects_nonhex_lfs_declaration() -> None:
 
 def _real_asset_validation_fixture(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> tuple[Path, dict[str, object]]:
+) -> tuple[Path, dict[str, object], SimpleNamespace]:
     """Build one real model directory to exercise the post-manifest checks."""
     model_root = tmp_path / "models" / "checkpoint"
     model_root.mkdir(parents=True)
@@ -256,11 +256,18 @@ def _real_asset_validation_fixture(
         "files": manifest_files,
         "repair_scope": "test",
     }
-    manifest_path = tmp_path / "manifests" / "model.json"
-    manifest_path.parent.mkdir()
+    manifest_path = model_root / "model-manifest.json"
     manifest_bytes = canonical_json_bytes(manifest)
     manifest_path.write_bytes(manifest_bytes)
     manifest_sha256 = hashlib.sha256(manifest_bytes).hexdigest()
+    (model_root / "SHA256SUMS").write_text(
+        "".join(
+            f"{checkpoint_file.sha256}  {checkpoint_file.path}\n"
+            for checkpoint_file in checkpoint_files
+        )
+        + f"{manifest_sha256}  model-manifest.json\n",
+        encoding="ascii",
+    )
 
     prefix_path = tmp_path / "data-prefix.json"
     prefix_bytes = b"data-prefix"
@@ -274,7 +281,7 @@ def _real_asset_validation_fixture(
     )
     checkpoint = SimpleNamespace(
         files=checkpoint_files,
-        manifest_ref="manifests/model.json",
+        manifest_ref="models/checkpoint/model-manifest.json",
         manifest_sha256=manifest_sha256,
         repository="fixture/model",
         revision="fixture-revision",
@@ -369,19 +376,19 @@ def _real_asset_validation_fixture(
     )
     monkeypatch.setattr(adapter, "_validate_formal_registry_index", lambda *_args: [])
     monkeypatch.setattr(adapter, "_validate_offline", lambda *_args: [])
-    return tmp_path, {"stage2_asset_manifest": materialized_payload}
+    return tmp_path, {"stage2_asset_manifest": materialized_payload}, checkpoint
 
 
 def test_real_asset_directory_accepts_small_null_lfs_and_weight_lfs(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    root, asset_payload = _real_asset_validation_fixture(tmp_path, monkeypatch)
+    root, asset_payload, _checkpoint = _real_asset_validation_fixture(tmp_path, monkeypatch)
 
     result = _validate_real_assets(root, asset_payload=asset_payload)
 
     assert result["model_manifests"] == [
         {
-            "ref": "manifests/model.json",
+            "ref": "models/checkpoint/model-manifest.json",
             "sha256": result["model_manifests"][0]["sha256"],
             "size_bytes": result["model_manifests"][0]["size_bytes"],
         }
@@ -391,7 +398,7 @@ def test_real_asset_directory_accepts_small_null_lfs_and_weight_lfs(
 def test_real_asset_directory_rejects_checkpoint_bytes_mismatch(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    root, asset_payload = _real_asset_validation_fixture(tmp_path, monkeypatch)
+    root, asset_payload, _checkpoint = _real_asset_validation_fixture(tmp_path, monkeypatch)
     (root / "models" / "checkpoint" / "model.safetensors").write_bytes(b"tampered")
 
     with pytest.raises(G22Blocked, match="G22_CHECKPOINT_FILE_BYTES_MISMATCH"):
@@ -401,10 +408,61 @@ def test_real_asset_directory_rejects_checkpoint_bytes_mismatch(
 def test_real_asset_directory_rejects_checkpoint_file_set_mismatch(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    root, asset_payload = _real_asset_validation_fixture(tmp_path, monkeypatch)
+    root, asset_payload, _checkpoint = _real_asset_validation_fixture(tmp_path, monkeypatch)
     (root / "models" / "checkpoint" / "unexpected.bin").write_bytes(b"extra")
 
     with pytest.raises(G22Blocked, match="G22_MODEL_DIRECTORY_FILE_SET_MISMATCH"):
+        _validate_real_assets(root, asset_payload=asset_payload)
+
+
+def test_real_asset_sidecars_reject_sha256sums_content_drift(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root, asset_payload, _checkpoint = _real_asset_validation_fixture(tmp_path, monkeypatch)
+    sums_path = root / "models" / "checkpoint" / "SHA256SUMS"
+    lines = sums_path.read_text(encoding="ascii").splitlines()
+    lines[0] = ("0" * 64) + lines[0][64:]
+    sums_path.write_text("\n".join(lines) + "\n", encoding="ascii")
+
+    with pytest.raises(G22Blocked, match="G22_CHECKPOINT_SHA256SUMS_MISMATCH"):
+        _validate_real_assets(root, asset_payload=asset_payload)
+
+
+def test_real_asset_sidecars_reject_sha256sums_mode_marker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root, asset_payload, _checkpoint = _real_asset_validation_fixture(tmp_path, monkeypatch)
+    sums_path = root / "models" / "checkpoint" / "SHA256SUMS"
+    lines = sums_path.read_text(encoding="ascii").splitlines()
+    digest, _separator, path = lines[0].partition("  ")
+    lines[0] = f"{digest} *{path}"
+    sums_path.write_text("\n".join(lines) + "\n", encoding="ascii")
+
+    with pytest.raises(G22Blocked, match="G22_CHECKPOINT_SHA256SUMS_FORMAT_INVALID"):
+        _validate_real_assets(root, asset_payload=asset_payload)
+
+
+def test_real_asset_sidecars_reject_manifest_hash_drift(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root, asset_payload, _checkpoint = _real_asset_validation_fixture(tmp_path, monkeypatch)
+    manifest_path = root / "models" / "checkpoint" / "model-manifest.json"
+    manifest_path.write_bytes(manifest_path.read_bytes() + b" ")
+
+    with pytest.raises(G22Blocked, match="G22_CHECKPOINT_MANIFEST_SHA_MISMATCH"):
+        _validate_real_assets(root, asset_payload=asset_payload)
+
+
+def test_real_asset_sidecars_reject_manifest_path_drift(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root, asset_payload, checkpoint = _real_asset_validation_fixture(tmp_path, monkeypatch)
+    manifest_path = root / "models" / "checkpoint" / "model-manifest.json"
+    drifted_path = root / "models" / "checkpoint" / "model-manifest-alt.json"
+    drifted_path.write_bytes(manifest_path.read_bytes())
+    checkpoint.manifest_ref = "models/checkpoint/model-manifest-alt.json"
+
+    with pytest.raises(G22Blocked, match="G22_CHECKPOINT_MANIFEST_PATH_INVALID"):
         _validate_real_assets(root, asset_payload=asset_payload)
 
 

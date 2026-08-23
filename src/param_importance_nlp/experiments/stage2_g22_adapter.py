@@ -94,6 +94,9 @@ _SOURCE_PATHS = (
     "plan/stage2/03_assets_checkpoints_and_sampling.md",
 )
 
+_MODEL_MANIFEST_NAME = "model-manifest.json"
+_SHA256SUMS_NAME = "SHA256SUMS"
+
 
 class G22Blocked(RuntimeError):
     """A fail-closed formal preflight result."""
@@ -641,6 +644,41 @@ def _validate_checkpoint_manifest_files(
     return listed_names
 
 
+def _validate_checkpoint_sidecars(
+    *,
+    model_root: Path,
+    manifest_path: Path,
+    manifest_sha256: str,
+    expected_file_bytes: Mapping[str, tuple[int, str]],
+) -> None:
+    """Bind the two known model-root sidecars without widening the payload set."""
+    try:
+        manifest_rel = manifest_path.relative_to(model_root).as_posix()
+    except ValueError as error:
+        raise G22Blocked("G22_CHECKPOINT_MANIFEST_PATH_INVALID") from error
+    if manifest_rel != _MODEL_MANIFEST_NAME:
+        raise G22Blocked("G22_CHECKPOINT_MANIFEST_PATH_INVALID")
+
+    sums_path = model_root / _SHA256SUMS_NAME
+    if sums_path.is_symlink() or not sums_path.is_file():
+        raise G22Blocked("G22_CHECKPOINT_SHA256SUMS_MISSING")
+    try:
+        lines = sums_path.read_text(encoding="ascii").splitlines()
+    except (OSError, UnicodeDecodeError) as error:
+        raise G22Blocked("G22_CHECKPOINT_SHA256SUMS_FORMAT_INVALID") from error
+    expected = [
+        (name, digest) for name, (_size, digest) in expected_file_bytes.items()
+    ] + [(manifest_rel, manifest_sha256)]
+    observed: list[tuple[str, str]] = []
+    for line in lines:
+        match = re.fullmatch(r"([0-9a-fA-F]{64})[ \t]+([^ \t].*)", line)
+        if match is None or match.group(2).startswith("*"):
+            raise G22Blocked("G22_CHECKPOINT_SHA256SUMS_FORMAT_INVALID")
+        observed.append((match.group(2), match.group(1).lower()))
+    if observed != expected:
+        raise G22Blocked("G22_CHECKPOINT_SHA256SUMS_MISMATCH")
+
+
 def _validate_real_assets(
     root: Path,
     *,
@@ -703,6 +741,12 @@ def _validate_real_assets(
         model_root = _resolve(root, checkpoint.root_ref)
         if not model_root.is_dir():
             raise G22Blocked("G22_CHECKPOINT_ROOT_MISSING")
+        _validate_checkpoint_sidecars(
+            model_root=model_root,
+            manifest_path=manifest_path,
+            manifest_sha256=checkpoint.manifest_sha256,
+            expected_file_bytes=expected_file_bytes,
+        )
         actual_names: list[str] = []
         for candidate in model_root.rglob("*"):
             if candidate.is_symlink():
@@ -711,7 +755,11 @@ def _validate_real_assets(
                 actual_names.append(candidate.relative_to(model_root).as_posix())
             elif not candidate.is_dir():
                 raise G22Blocked(f"G22_CHECKPOINT_NONREGULAR_FILE:{candidate}")
-        if set(actual_names) != set(expected_file_bytes) or len(actual_names) != len(expected_file_bytes):
+        allowed_names = set(expected_file_bytes) | {
+            _MODEL_MANIFEST_NAME,
+            _SHA256SUMS_NAME,
+        }
+        if set(actual_names) != allowed_names or len(actual_names) != len(allowed_names):
             raise G22Blocked("G22_MODEL_DIRECTORY_FILE_SET_MISMATCH")
         for name in expected_file_bytes:
             actual = _resolve(root, checkpoint.root_ref + "/" + name)
