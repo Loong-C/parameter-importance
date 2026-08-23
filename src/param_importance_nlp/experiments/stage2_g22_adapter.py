@@ -31,6 +31,7 @@ from .stage23_task_runners import (
     validate_formal_s203_task_artifacts,
 )
 from .stage2_assets import (
+    CheckpointFile,
     FORMAL_CHECKPOINT_SELECTION,
     FORMAL_TOTAL_TRAINING_STEPS,
     AssetResolutionManifest,
@@ -600,6 +601,46 @@ def _validate_offline(
     return result
 
 
+def _validate_checkpoint_manifest_files(
+    files: object,
+    expected_checkpoint_files: Sequence[CheckpointFile],
+) -> list[str]:
+    """Validate a model manifest's exact file inventory and LFS declarations."""
+    if not isinstance(files, list) or len(files) != len(expected_checkpoint_files):
+        raise G22Blocked("G22_MODEL_MANIFEST_FILES_INVALID")
+    expected_files = {
+        item.path: (item.size_bytes, item.sha256, item.role)
+        for item in expected_checkpoint_files
+    }
+    listed_names: list[str] = []
+    for file in files:
+        if not isinstance(file, Mapping) or set(file) != {
+            "name", "official_lfs_sha256", "sha256", "size_bytes"
+        }:
+            raise G22Blocked("G22_MODEL_MANIFEST_FILE_SCHEMA_INVALID")
+        name = file["name"]
+        if not isinstance(name, str) or name in listed_names or name not in expected_files:
+            raise G22Blocked("G22_CHECKPOINT_FILE_MISMATCH")
+        expected_size, expected_sha, expected_role = expected_files[name]
+        if file["size_bytes"] != expected_size or file["sha256"] != expected_sha:
+            raise G22Blocked("G22_CHECKPOINT_FILE_MISMATCH")
+        official_lfs_sha256 = file["official_lfs_sha256"]
+        if official_lfs_sha256 is None:
+            # The authoritative checkpoint role is the LFS semantic.  Weight
+            # blobs must carry their provider LFS object id; small config and
+            # tokenizer files are Git-managed and canonically use null.
+            if expected_role == "weights":
+                raise G22Blocked("G22_CHECKPOINT_FILE_MISMATCH")
+        elif not isinstance(official_lfs_sha256, str) or not _HEX64.fullmatch(
+            official_lfs_sha256
+        ):
+            raise G22Blocked("G22_CHECKPOINT_FILE_MISMATCH")
+        listed_names.append(name)
+    if set(listed_names) != set(expected_files):
+        raise G22Blocked("G22_MODEL_MANIFEST_FILE_SET_MISMATCH")
+    return listed_names
+
+
 def _validate_real_assets(
     root: Path,
     *,
@@ -655,20 +696,7 @@ def _validate_real_assets(
             raise G22Blocked("G22_MODEL_MANIFEST_FIELDS_INVALID")
         if "transport_endpoint" in value and value["transport_endpoint"] not in {"https://huggingface.co", "https://hf-mirror.com"}:
             raise G22Blocked("G22_MODEL_MANIFEST_ENDPOINT_INVALID")
-        files = value.get("files")
-        if not isinstance(files, list) or len(files) != len(checkpoint.files):
-            raise G22Blocked("G22_MODEL_MANIFEST_FILES_INVALID")
-        expected_files = {item.path: (item.size_bytes, item.sha256) for item in checkpoint.files}
-        listed_names: list[str] = []
-        for file in files:
-            if not isinstance(file, Mapping) or set(file) != {"name", "official_lfs_sha256", "sha256", "size_bytes"}:
-                raise G22Blocked("G22_MODEL_MANIFEST_FILE_SCHEMA_INVALID")
-            name = file["name"]
-            if not isinstance(name, str) or name in listed_names or name not in expected_files or file["size_bytes"] != expected_files[name][0] or file["sha256"] != expected_files[name][1] or not isinstance(file["official_lfs_sha256"], str) or not _HEX64.fullmatch(file["official_lfs_sha256"]):
-                raise G22Blocked("G22_CHECKPOINT_FILE_MISMATCH")
-            listed_names.append(name)
-        if set(listed_names) != set(expected_files):
-            raise G22Blocked("G22_MODEL_MANIFEST_FILE_SET_MISMATCH")
+        _validate_checkpoint_manifest_files(value.get("files"), checkpoint.files)
         model_root = _resolve(root, checkpoint.root_ref)
         if not model_root.is_dir():
             raise G22Blocked("G22_CHECKPOINT_ROOT_MISSING")
