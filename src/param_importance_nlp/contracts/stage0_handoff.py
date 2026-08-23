@@ -16,6 +16,7 @@ import hashlib
 from pathlib import Path, PurePosixPath
 
 from .jsonio import canonical_json_hash, load_canonical_json
+from ..runtime.task_artifacts import load_committed_task_artifact
 
 
 STAGE0_HANDOFF_SCHEMA = "stage0-handoff-manifest-v1"
@@ -34,6 +35,42 @@ STAGE0_HANDOFF_ROLES = (
     "checkpoint_recovery",
     "performance",
 )
+STAGE0_ROLE_PRODUCERS = {
+    "environment_freeze": STAGE0_G10_GENERATOR_COMMIT,
+    "storage_cache": STAGE0_G10_GENERATOR_COMMIT,
+    "single_gpu": STAGE0_G10_GENERATOR_COMMIT,
+    "four_gpu_ddp_no_sync": STAGE0_G10_GENERATOR_COMMIT,
+    "logging_run": STAGE0_G10_GENERATOR_COMMIT,
+    "checkpoint_recovery": STAGE0_G10_GENERATOR_COMMIT,
+    "performance": STAGE0_G10_GENERATOR_COMMIT,
+}
+STAGE0_ROLE_RUN_IDENTITIES = {
+    "environment_freeze": STAGE0_G10_GENERATOR_COMMIT,
+    "storage_cache": "d81a7ce0953a67da8b526ba552a235623401e935eecaea427df610fe854d8d3f",
+    "single_gpu": "d27346187922aba653aa87a92e55810abdae8d60b04290c55b0671ba7ba6f008",
+    "four_gpu_ddp_no_sync": "d9370d54f4ca5ef249fb6e39b453138f1aac6f87d5c56f0bb454b10385cd8ad3",
+    "logging_run": "9e0faf4150f2fceed5e28d5f45433c1f0c0eee1c0dfb689fe7a394755bbdcd5d",
+    "checkpoint_recovery": "99c57c3fbf9e2067f05e1cdfdea21c81fbac10500e7a2c8d597962227e3b4360",
+    "performance": "9e0faf4150f2fceed5e28d5f45433c1f0c0eee1c0dfb689fe7a394755bbdcd5d",
+}
+STAGE0_ROLE_ARTIFACT_KINDS = {
+    "environment_freeze": "contract_freeze",
+    "storage_cache": "capacity_envelope",
+    "single_gpu": "training_smoke_result",
+    "four_gpu_ddp_no_sync": "distributed_validation",
+    "logging_run": "lineage_manifest",
+    "checkpoint_recovery": "resume_equivalence_report",
+    "performance": "logging_overhead_report",
+}
+STAGE0_ROLE_TASK_IDS = {
+    "environment_freeze": "stage0.01_baseline_and_safety",
+    "storage_cache": "stage0.10_capacity_and_operations",
+    "single_gpu": "stage0.06_single_gpu_smoke",
+    "four_gpu_ddp_no_sync": "stage0.07_ddp_and_gradient_semantics",
+    "logging_run": "stage0.08_logging_and_tracking",
+    "checkpoint_recovery": "stage0.09_checkpoint_and_resume",
+    "performance": "stage0.08_logging_and_tracking",
+}
 _CACHE_VARIABLES = (
     "HF_HOME",
     "HF_DATASETS_CACHE",
@@ -64,6 +101,13 @@ def _commit(value: object, *, field: str) -> str:
     value = _text(value, field=field)
     if len(value) != 40 or any(c not in "0123456789abcdef" for c in value):
         raise Stage0HandoffError(f"STAGE0_HANDOFF_{field.upper()}_COMMIT_INVALID")
+    return value
+
+
+def _producer_id(value: object, *, field: str) -> str:
+    value = _text(value, field=field)
+    if len(value) != 40 or any(c not in "0123456789abcdef" for c in value):
+        raise Stage0HandoffError(f"STAGE0_HANDOFF_{field.upper()}_INVALID")
     return value
 
 
@@ -99,11 +143,33 @@ def _role_ref(value: object, *, role: str) -> str:
         raise Stage0HandoffError(
             f"STAGE0_HANDOFF_ROLE_{role.upper()}_CANONICAL_ROOT_REQUIRED"
         )
-    if "tmp" in path.parts or "reports" in path.parts or "fixtures" in path.parts:
+    if (
+        "tmp" in path.parts
+        or "reports" in path.parts
+        or "fixture" in path.parts
+        or "fixtures" in path.parts
+    ):
         raise Stage0HandoffError(
             f"STAGE0_HANDOFF_ROLE_{role.upper()}_TEMPORARY_OR_FIXTURE_FORBIDDEN"
         )
     return ref
+
+
+def _role_run_identity(ref: str, *, role: str) -> str:
+    parts = PurePosixPath(ref).parts
+    if parts[2] == "bootstrap" and len(parts) > 3:
+        observed = parts[3]
+    elif parts[2] == "tasks" and len(parts) > 3 and "-" in parts[3]:
+        observed = parts[3].split("-", 1)[1]
+    else:
+        raise Stage0HandoffError(
+            f"STAGE0_HANDOFF_ROLE_{role.upper()}_RUN_IDENTITY_INVALID"
+        )
+    if observed != STAGE0_ROLE_RUN_IDENTITIES[role]:
+        raise Stage0HandoffError(
+            f"STAGE0_HANDOFF_ROLE_{role.upper()}_RUN_IDENTITY_MISMATCH"
+        )
+    return observed
 
 
 def _artifact_hash(value: Mapping[str, object]) -> str:
@@ -194,25 +260,52 @@ def validate_stage0_handoff(
     if set(roles_value) != set(STAGE0_HANDOFF_ROLES):
         raise Stage0HandoffError("STAGE0_HANDOFF_ROLE_SET_INVALID")
     roles: list[tuple[str, str, str, str, str, str]] = []
+    source_root = evidence_root or root
     for role in STAGE0_HANDOFF_ROLES:
         item = _object(roles_value.get(role), field=f"role.{role}")
         ref = _role_ref(item.get("ref"), role=role)
+        _role_run_identity(ref, role=role)
         sha = _sha(item.get("sha256"), field=f"role.{role}.sha256")
-        role_commit = _commit(item.get("producer_commit"), field=f"role.{role}.producer")
+        role_commit = _producer_id(item.get("producer_commit"), field=f"role.{role}.producer")
+        expected_producer = STAGE0_ROLE_PRODUCERS[role]
+        if role_commit != expected_producer:
+            raise Stage0HandoffError(
+                f"STAGE0_HANDOFF_ROLE_{role.upper()}_PRODUCER_MISMATCH"
+            )
         role_accepted = _text(item.get("accepted_at"), field=f"role.{role}.accepted_at")
         role_status = _text(item.get("status"), field=f"role.{role}.status")
-        if evidence_root is not None:
-            source = _safe_relative(evidence_root, ref, field=f"role.{role}")
-            try:
-                observed = hashlib.sha256(source.read_bytes()).hexdigest()
-            except OSError as error:
-                raise Stage0HandoffError(
-                    f"STAGE0_HANDOFF_ROLE_{role.upper()}_SOURCE_MISSING"
-                ) from error
-            if observed != sha:
-                raise Stage0HandoffError(
-                    f"STAGE0_HANDOFF_ROLE_{role.upper()}_SOURCE_HASH_MISMATCH"
-                )
+        source = _safe_relative(source_root, ref, field=f"role.{role}")
+        try:
+            observed = hashlib.sha256(source.read_bytes()).hexdigest()
+        except OSError as error:
+            raise Stage0HandoffError(
+                f"STAGE0_HANDOFF_ROLE_{role.upper()}_SOURCE_MISSING"
+            ) from error
+        if observed != sha:
+            raise Stage0HandoffError(
+                f"STAGE0_HANDOFF_ROLE_{role.upper()}_SOURCE_HASH_MISMATCH"
+            )
+        try:
+            loaded = load_committed_task_artifact(
+                source_root, ref, require_formal=True
+            )
+        except (FileNotFoundError, OSError, TypeError, ValueError) as error:
+            raise Stage0HandoffError(
+                f"STAGE0_HANDOFF_ROLE_{role.upper()}_SOURCE_INVALID"
+            ) from error
+        if (
+            loaded.identity.artifact_kind != STAGE0_ROLE_ARTIFACT_KINDS[role]
+            or loaded.identity.task_id != STAGE0_ROLE_TASK_IDS[role]
+            or loaded.identity.formal_eligible is not True
+            or (
+                role != "environment_freeze"
+                and loaded.payload.get("generator_git_commit")
+                != STAGE0_G10_GENERATOR_COMMIT
+            )
+        ):
+            raise Stage0HandoffError(
+                f"STAGE0_HANDOFF_ROLE_{role.upper()}_SOURCE_CONTENT_INVALID"
+            )
         roles.append((role, ref, sha, role_commit, role_accepted, role_status))
 
     hardware = _object(manifest.get("hardware_validity"), field="hardware_validity")
@@ -275,6 +368,10 @@ __all__ = [
     "STAGE0_G10_EVIDENCE_ROOT",
     "STAGE0_G10_GENERATOR_COMMIT",
     "STAGE0_HANDOFF_ROLES",
+    "STAGE0_ROLE_ARTIFACT_KINDS",
+    "STAGE0_ROLE_PRODUCERS",
+    "STAGE0_ROLE_RUN_IDENTITIES",
+    "STAGE0_ROLE_TASK_IDS",
     "STAGE0_HANDOFF_SCHEMA",
     "Stage0HandoffError",
     "Stage0HandoffEvidence",

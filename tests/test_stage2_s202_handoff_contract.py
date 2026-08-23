@@ -17,6 +17,10 @@ from param_importance_nlp.contracts import (
     Stage1HandoffError,
     STAGE0_HANDOFF_ROLES,
     STAGE0_G10_GENERATOR_COMMIT,
+    STAGE0_ROLE_ARTIFACT_KINDS,
+    STAGE0_ROLE_PRODUCERS,
+    STAGE0_ROLE_RUN_IDENTITIES,
+    STAGE0_ROLE_TASK_IDS,
     Stage0HandoffError,
     validate_stage0_handoff,
     canonical_json_hash,
@@ -26,6 +30,7 @@ from param_importance_nlp.contracts import (
 )
 from param_importance_nlp.contracts.task_catalog import DEFAULT_TASK_CATALOG
 from param_importance_nlp.experiments import stage23_task_runners as stage23
+from param_importance_nlp.runtime import TaskArtifactStore
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -116,16 +121,43 @@ def _stage0_fixture(
         f"{STAGE0_G10_GENERATOR_COMMIT}/"
         "b4974a642168994eec7d62ba38a453fa3834ee50201da55d9549b1080a5b90f0"
     )
-    source_root = (data_root or workspace) / "evidence" / "stage0" / "fixture"
-    source_root.mkdir(parents=True, exist_ok=True)
     roles: dict[str, dict[str, object]] = {}
     for role in STAGE0_HANDOFF_ROLES:
-        source = source_root / f"{role}.json"
-        write_canonical_json(source, {"role": role, "status": "PASS"})
+        producer = STAGE0_ROLE_PRODUCERS[role]
+        run_identity = STAGE0_ROLE_RUN_IDENTITIES[role]
+        if role == "environment_freeze":
+            output_dir = f"evidence/stage0/bootstrap/{run_identity}"
+        else:
+            task_number = {
+                "storage_cache": "10",
+                "single_gpu": "06",
+                "four_gpu_ddp_no_sync": "07",
+                "logging_run": "08",
+                "checkpoint_recovery": "09",
+                "performance": "08",
+            }[role]
+            artifact_kind = STAGE0_ROLE_ARTIFACT_KINDS[role]
+            output_dir = f"evidence/stage0/tasks/{task_number}-{run_identity}"
+        payload = {
+            "schema_version": "stage0-role-payload-v1",
+            "status": "PASS",
+        }
+        if role != "environment_freeze":
+            payload["generator_git_commit"] = STAGE0_G10_GENERATOR_COMMIT
+        published = TaskArtifactStore(data_root or workspace, output_dir).publish(
+            task_id=STAGE0_ROLE_TASK_IDS[role],
+            artifact_kind=STAGE0_ROLE_ARTIFACT_KINDS[role],
+            config_hash="b" * 64,
+            run_intent="formal",
+            payload=payload,
+            formal_eligible=True,
+            source_refs=(),
+        )
+        source = (data_root or workspace) / published.commit_ref
         roles[role] = {
             "ref": source.relative_to(data_root or workspace).as_posix(),
             "sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
-            "producer_commit": "bff18458c02bfde8ee3610cede0addef3ad93782",
+            "producer_commit": producer,
             "accepted_at": "2026-08-23T00:00:00+00:00",
             "status": "PASS",
         }
@@ -196,6 +228,58 @@ def test_stage0_handoff_validates_roles_and_separate_data_root(tmp_path: Path) -
     assert len(evidence.roles) == len(STAGE0_HANDOFF_ROLES)
 
 
+def test_stage0_handoff_defaults_to_formal_data_root_for_role_sources(tmp_path: Path) -> None:
+    ref = _stage0_fixture(tmp_path)
+    evidence = validate_stage0_handoff(tmp_path, ref, require_ready=True)
+    assert evidence.status == "READY"
+
+
+def test_stage0_handoff_rejects_missing_role_source(tmp_path: Path) -> None:
+    ref = _stage0_fixture(tmp_path)
+    source = (
+        tmp_path
+        / "evidence"
+        / "stage0"
+        / "tasks"
+        / f"06-{STAGE0_ROLE_RUN_IDENTITIES['single_gpu']}"
+        / "commits"
+        / "training_smoke_result.json"
+    )
+    source.unlink()
+    with pytest.raises(Stage0HandoffError, match="SOURCE_MISSING"):
+        validate_stage0_handoff(tmp_path, ref)
+
+
+def test_stage0_handoff_rejects_tampered_role_source(tmp_path: Path) -> None:
+    ref = _stage0_fixture(tmp_path)
+    source = (
+        tmp_path
+        / "evidence"
+        / "stage0"
+        / "tasks"
+        / f"06-{STAGE0_ROLE_RUN_IDENTITIES['single_gpu']}"
+        / "commits"
+        / "training_smoke_result.json"
+    )
+    write_canonical_json(source, {})
+    with pytest.raises(Stage0HandoffError, match="SOURCE_HASH_MISMATCH"):
+        validate_stage0_handoff(tmp_path, ref)
+
+
+def test_stage0_handoff_rejects_role_producer_overwrite(tmp_path: Path) -> None:
+    ref = _stage0_fixture(tmp_path)
+    path = tmp_path / ref
+    value = load_canonical_json(path)
+    assert isinstance(value, dict)
+    roles = value["roles"]
+    assert isinstance(roles, dict)
+    roles["single_gpu"]["producer_commit"] = "0" * 40  # type: ignore[index]
+    value = _with_hash({key: item for key, item in value.items() if key != "artifact_hash"})
+    write_canonical_json(path, value)
+    with pytest.raises(Stage0HandoffError, match="PRODUCER_MISMATCH"):
+        validate_stage0_handoff(tmp_path, ref)
+
+
 def test_stage0_handoff_rejects_wrong_data_root(tmp_path: Path) -> None:
     workspace = tmp_path / "repo"
     data_root = tmp_path / "data-root"
@@ -220,9 +304,9 @@ def test_stage0_handoff_rejects_tmp_role_authority(tmp_path: Path) -> None:
         validate_stage0_handoff(tmp_path, ref)
 
 
-def test_current_stage0_manifest_is_blocked_by_expiry_and_hardware() -> None:
+def test_current_stage0_manifest_is_blocked_without_local_canonical_sources() -> None:
     ref = "reports/stage2/s2.2/stage0-handoff-manifest.json"
-    with pytest.raises(Stage0HandoffError, match="RISK_ACCEPTANCE_EXPIRED"):
+    with pytest.raises(Stage0HandoffError, match="SOURCE_MISSING"):
         validate_stage0_handoff(ROOT, ref, require_ready=True)
 
 
