@@ -1328,7 +1328,7 @@ def _sizing_vectors(evidence: _CellEvidence) -> tuple[list[int], list[dict[str, 
             raise G23Blocked("sizing.moments:STATE_MISSING")
         rebuilt_a = moments_a.to_state()
         _moments_equal(rebuilt_a, state["a"], "sizing.moments_a")
-        vectors.append(_u_from_moments(moments, "sizing.u"))
+        vectors.append(_u_from_moments(moments.to_state(), "sizing.u"))
     return counts[-2:], vectors, plan
 
 
