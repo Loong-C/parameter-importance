@@ -10,7 +10,6 @@ from __future__ import annotations
 import argparse
 import csv
 import hashlib
-import importlib.util
 import json
 import os
 from pathlib import Path
@@ -18,6 +17,7 @@ import shutil
 import subprocess
 import sys
 import math
+import types
 from typing import Any, Mapping
 from xml.etree import ElementTree
 
@@ -44,6 +44,13 @@ class Stage1S111FormalError(RuntimeError):
 # or a tracked/local fixture that merely has PASS-looking JSON.
 S111_R4_PRODUCER_COMMIT = "3f18b04df8922be9894678ae4842bd999c7e8fd5"
 S111_R4_ATTEMPT_ID = "s1-11-r4-20260821"
+S111_R4_INDEX_SHA256 = "6a9af7323df37a55bf4f74f2f505d8999dcf4c588dfd64bd6cdc6f93fbecd1c8"
+S111_R4_INDEX_ARTIFACT_HASH = "361de10b9aba20f5be59cd3ed18b44b16ea98167845b4cf735b299bea0403df0"
+S111_R4_VALIDATOR_SOURCE_SHA256 = "c33e3e365bf3a66c203772de999d8ace0a153bfeb092365dca14f2b32d908320"
+# This is a deployment identity, not the hash of the index.  Emit callers may
+# explicitly supply a different approved root for an isolated test fixture;
+# the root is still required to be an exact, non-symlink identity match.
+S111_APPROVED_DATA_ROOT = "/home/sophgo13/cjl/storage/parameter-importance"
 S111_R4_INDEX_REF = (
     "evidence/stage1/s1-11-formal/"
     f"{S111_R4_PRODUCER_COMMIT}/{S111_R4_ATTEMPT_ID}/index.json"
@@ -51,11 +58,67 @@ S111_R4_INDEX_REF = (
 S111_TASK_OUTPUT_DEFAULT = (
     "evidence/stage1/tasks/11-s1-11-r4-20260821"
 )
+S110_COMPAT_OUTPUT_DEFAULT = "evidence/stage1/tasks/10-s1-10-r12-20260821"
 S111_TASK_ARTIFACT_KINDS = (
     "stage_report",
     "requirements_matrix",
     "gate_summary",
     "delivery_manifest",
+)
+
+# G1-RESUME was published before TaskArtifactStore was required for the
+# historical task.  These constants identify the one accepted formal r12
+# evidence bundle from which compatibility commits may be reconstructed.
+S110_R12_PRODUCER_COMMIT = "fbb09e4d338125954fc614c745cf7ab88c58d3b2"
+S110_R12_ATTEMPT_ID = "s1-10-r12-20260821"
+S110_R12_INDEX_REF = (
+    "evidence/stage1/s1-10-formal/"
+    f"{S110_R12_PRODUCER_COMMIT}/{S110_R12_ATTEMPT_ID}/index.json"
+)
+S110_R12_INDEX_SHA256 = "8dbcc2c0584bae316a56b22fc4da258cb71ef95d1334d0c091f400ef4dba95cc"
+S110_R12_INDEX_ARTIFACT_HASH = "9368f7f853445e666c1be9a197e1766a5ba695cb7354863945634d05b9729797"
+S110_R12_ROLE_REFS = {
+    "artifact_manifest": "artifact-manifest.json",
+    "comparison_table": "comparison-table.json",
+    "gate_record": "g1-resume-record.json",
+    "oracle_bundle": "oracle-bundle.json",
+    "resume_report": "resume-report.json",
+    "trace_bundle": "trace-bundle.json",
+}
+S110_TASK_ARTIFACT_KINDS = (
+    "training_state_manifest",
+    "resume_equivalence_report",
+    "gate_record",
+)
+S110_TASK_ROLE_MAP = {
+    "training_state_manifest": "artifact_manifest",
+    "resume_equivalence_report": "resume_report",
+    "gate_record": "gate_record",
+}
+S110_R12_SOURCE_PATHS = (
+    "fixtures/stage1/stage1-s110-checkpoint-fixture-v1.json",
+    "ops/stage1/formalize_s1_10.py",
+    "ops/stage1/run_s1_10_resume_worker.py",
+    "schemas/stage1/s1-10-artifact-manifest-v1.json",
+    "schemas/stage1/s1-10-checkpoint-fixture-v1.json",
+    "schemas/stage1/s1-10-comparison-table-v1.json",
+    "schemas/stage1/s1-10-formal-observation-v1.json",
+    "schemas/stage1/s1-10-formalization-index-v1.json",
+    "schemas/stage1/s1-10-formalization-index-v2.json",
+    "schemas/stage1/s1-10-gate-record-v1.json",
+    "schemas/stage1/s1-10-oracle-bundle-v1.json",
+    "schemas/stage1/s1-10-replay-validation-v1.json",
+    "schemas/stage1/s1-10-resume-report-v1.json",
+    "schemas/stage1/s1-10-resume-report-v2.json",
+    "schemas/stage1/s1-10-trace-bundle-v1.json",
+    "schemas/stage1/s1-10-validation-v1.json",
+    "schemas/stage1/s1-10-validation-v2.json",
+    "src/param_importance_nlp/runtime/checkpoint.py",
+    "src/param_importance_nlp/runtime/checkpoint_group.py",
+    "src/param_importance_nlp/runtime/training.py",
+    "src/param_importance_nlp/stage1_checkpoint_oracle.py",
+    "src/param_importance_nlp/stage1_checkpoint_resume.py",
+    "tests/test_stage1_s110_checkpoint_resume.py",
 )
 
 # The S1.11 index is an exact wire contract.  Keeping this map in the producer
@@ -196,39 +259,111 @@ def _validate_sync_audit(root: Path, value: object) -> dict[str, object]:
     return {"ref": str(value["ref"]), "sha256": str(value["sha256"]), "artifact_hash": str(audit["artifact_hash"]), "execution_commit": str(git_publish["execution_commit"]), "large_artifact_manifest_ref": str(manifest["ref"]), "large_artifact_manifest_sha256": str(manifest["sha256"])}
 
 
-def _schema_validate(repository: Path, objects: Mapping[str, Mapping[str, object]]) -> None:
-    """Validate every produced role against the repository's strict subset."""
+def _schema_validate(
+    repository: Path,
+    objects: Mapping[str, Mapping[str, object]],
+    *,
+    producer_commit: str | None = None,
+    frozen_source_sha256: Mapping[str, object] | None = None,
+    schema_prefix: str = "s1-11",
+    validator_source_path: str | None = None,
+) -> None:
+    """Validate roles against frozen producer bytes when formal evidence is read.
+
+    The normal execute path retains its historical checkout-local validator.  Emit
+    mode passes the released producer commit and source map, causing both the
+    validator module and every schema byte to be loaded from Git objects.  This
+    prevents a later checkout from silently changing the meaning of an old PASS.
+    """
 
     from param_importance_nlp.contracts.jsonio import loads_strict_json
 
-    validator_path = repository / "ops" / "stage1" / "formalize_s1_6.py"
-    spec = importlib.util.spec_from_file_location("_s111_schema_validator", validator_path)
-    if spec is None or spec.loader is None:
-        raise Stage1S111FormalError("S1_11_SCHEMA_VALIDATOR_UNAVAILABLE")
-    validator = importlib.util.module_from_spec(spec); spec.loader.exec_module(validator)
+    validator_source_path = validator_source_path or "ops/stage1/formalize_s1_6.py"
+    if producer_commit is None:
+        validator_path = repository / validator_source_path
+        try:
+            validator_source = validator_path.read_bytes()
+        except OSError as error:
+            raise Stage1S111FormalError("S1_11_SCHEMA_VALIDATOR_UNAVAILABLE") from error
+    else:
+        if not isinstance(frozen_source_sha256, Mapping) or validator_source_path not in frozen_source_sha256:
+            raise Stage1S111FormalError("S1_11_FROZEN_SCHEMA_SOURCE_MAP_INCOMPLETE")
+        validator_source = _git_blob_bytes(repository, producer_commit, validator_source_path)
+        if hashlib.sha256(validator_source).hexdigest() != frozen_source_sha256[validator_source_path]:
+            raise Stage1S111FormalError("S1_11_FROZEN_VALIDATOR_SOURCE_HASH_MISMATCH")
+    validator = types.ModuleType("_s111_frozen_schema_validator")
+    validator.__file__ = validator_source_path
+    try:
+        exec(compile(validator_source, validator_source_path, "exec"), validator.__dict__)
+    except Exception as error:
+        raise Stage1S111FormalError("S1_11_SCHEMA_VALIDATOR_UNAVAILABLE") from error
+
     names = {
-        "formal_observation": "s1-11-formal-observation-v1.json", "requirements_matrix": "s1-11-requirements-matrix-v1.json",
-        "gate_summary": "s1-11-gate-summary-v1.json", "stage_report": "s1-11-stage-report-v1.json",
-        "delivery_manifest": "s1-11-delivery-manifest-v1.json", "replay": "s1-11-replay-validation-v1.json",
-        "validation": "s1-11-validation-v1.json", "index": "s1-11-formalization-index-v1.json",
+        "formal_observation": f"{schema_prefix}-formal-observation-v1.json",
+        "requirements_matrix": f"{schema_prefix}-requirements-matrix-v1.json",
+        "gate_summary": f"{schema_prefix}-gate-summary-v1.json",
+        "stage_report": f"{schema_prefix}-stage-report-v1.json",
+        "delivery_manifest": f"{schema_prefix}-delivery-manifest-v1.json",
+        "replay": f"{schema_prefix}-replay-validation-v1.json",
+        "validation": f"{schema_prefix}-validation-v2.json",
+        "index": f"{schema_prefix}-formalization-index-v2.json",
     }
-    paths = {path.name: path for path in (repository / "schemas" / "stage1").glob("s1-11-*.json")}
-    if not set(names.values()) <= set(paths):
+    if schema_prefix == "s1-10":
+        names = {
+            "formal_observation": "s1-10-formal-observation-v1.json",
+            "resume_report": "s1-10-resume-report-v2.json",
+            "artifact_manifest": "s1-10-artifact-manifest-v1.json",
+            "gate_record": "s1-10-gate-record-v1.json",
+            "oracle_bundle": "s1-10-oracle-bundle-v1.json",
+            "trace_bundle": "s1-10-trace-bundle-v1.json",
+            "comparison_table": "s1-10-comparison-table-v1.json",
+            "replay": "s1-10-replay-validation-v1.json",
+            "validation": "s1-10-validation-v2.json",
+            "index": "s1-10-formalization-index-v2.json",
+        }
+    # S1.11's frozen schemas use v1 for index/validation; S1.10 uses v2.
+    if schema_prefix == "s1-11":
+        names["validation"] = "s1-11-validation-v1.json"
+        names["index"] = "s1-11-formalization-index-v1.json"
+    if producer_commit is None:
+        paths = {
+            path.name: path
+            for path in (repository / "schemas" / "stage1").glob(f"{schema_prefix}-*.json")
+        }
+        source_bytes = {name: path.read_bytes() for name, path in paths.items()}
+    else:
+        source_bytes = {}
+        prefix = f"schemas/stage1/{schema_prefix}-"
+        for source in frozen_source_sha256:
+            if str(source).startswith(prefix) and str(source).endswith(".json"):
+                source_bytes[Path(str(source)).name] = _git_blob_bytes(
+                    repository, producer_commit, str(source)
+                )
+    if not set(names.values()) <= set(source_bytes):
         raise Stage1S111FormalError("S1_11_SCHEMA_REGISTRY_INCOMPLETE")
     registry: dict[str, Mapping[str, object]] = {}
-    for path in paths.values():
-        schema = loads_strict_json(path.read_bytes())
+    for name, raw in source_bytes.items():
+        try:
+            schema = loads_strict_json(raw)
+        except Exception as error:
+            raise Stage1S111FormalError("S1_11_SCHEMA_INVALID") from error
         if not isinstance(schema, Mapping) or not isinstance(schema.get("$id"), str):
             raise Stage1S111FormalError("S1_11_SCHEMA_INVALID")
-        registry[path.name] = schema; registry[str(schema["$id"])] = schema
+        registry[name] = schema
+        registry[str(schema["$id"])] = schema
     for role, value in objects.items():
         name = names.get(role)
         if name is None:
             raise Stage1S111FormalError("S1_11_SCHEMA_ROLE_UNKNOWN")
         try:
-            validator._validate_schema(value, registry[name], registry, document=registry[name], path=role)
+            validator._validate_schema(
+                value, registry[name], registry,
+                document=registry[name], path=role,
+            )
         except Exception as error:
-            raise Stage1S111FormalError(f"S1_11_SCHEMA_VALIDATION_FAILED:{role}") from error
+            raise Stage1S111FormalError(
+                f"S1_11_SCHEMA_VALIDATION_FAILED:{role}"
+            ) from error
 
 
 _SCATTERS = {"gradient-identity", "u-identity", "ddp-identity", "clip-factor"}
@@ -651,6 +786,44 @@ def _reject_symlink_ancestors(path: Path, root: Path, *, field: str) -> None:
         current = current.parent
 
 
+def _validate_approved_data_root(
+    evidence_root: Path, approved_data_root: Path | str | None,
+) -> dict[str, object]:
+    """Bind evidence to an explicitly approved DATA_ROOT identity.
+
+    ``Path.resolve`` alone is insufficient: it would silently accept a symlink
+    root and make a caller-selected directory look like the deployment root.
+    Keep the pre-resolve symlink checks and record the canonical identity in
+    every producer config/manifest.
+    """
+
+    raw_evidence = Path(evidence_root)
+    approved = Path(approved_data_root or S111_APPROVED_DATA_ROOT)
+    if raw_evidence.is_symlink() or approved.is_symlink():
+        raise Stage1S111FormalError("S1_11_EMIT_DATA_ROOT_SYMLINK_FORBIDDEN")
+    if not raw_evidence.is_dir() or not approved.is_dir():
+        raise Stage1S111FormalError("S1_11_EMIT_DATA_ROOT_INVALID")
+    real_evidence = raw_evidence.resolve()
+    real_approved = approved.resolve()
+    if real_evidence != real_approved:
+        raise Stage1S111FormalError("S1_11_EMIT_DATA_ROOT_IDENTITY_MISMATCH")
+    try:
+        stat_result = raw_evidence.stat()
+    except OSError as error:
+        raise Stage1S111FormalError("S1_11_EMIT_DATA_ROOT_STAT_FAILED") from error
+    return {
+        "approved_ref": str(approved),
+        "realpath": real_evidence.as_posix(),
+        "device": int(stat_result.st_dev),
+        "inode": int(stat_result.st_ino),
+        "identity_hash": canonical_json_hash({
+            "realpath": real_evidence.as_posix(),
+            "device": int(stat_result.st_dev),
+            "inode": int(stat_result.st_ino),
+        }),
+    }
+
+
 def _emit_json(path: Path, value: Mapping[str, object], *, field: str) -> None:
     """Write once, then make every retry compare the exact canonical object."""
 
@@ -682,8 +855,8 @@ def _emit_json(path: Path, value: Mapping[str, object], *, field: str) -> None:
         ) from error
 
 
-def _git_blob_sha256(repository: Path, commit: str, source: str) -> str:
-    """Hash the producer commit's bytes, not the current consumer worktree."""
+def _git_blob_bytes(repository: Path, commit: str, source: str) -> bytes:
+    """Read exact producer bytes from Git, never from the current checkout."""
 
     completed = subprocess.run(
         ["git", "-C", str(repository), "show", f"{commit}:{source}"],
@@ -694,20 +867,34 @@ def _git_blob_sha256(repository: Path, commit: str, source: str) -> str:
         raise Stage1S111FormalError(
             f"S1_11_EMIT_PRODUCER_SOURCE_MISSING:{source}"
         )
-    return hashlib.sha256(completed.stdout).hexdigest()
+    return bytes(completed.stdout)
+
+
+def _git_blob_sha256(repository: Path, commit: str, source: str) -> str:
+    """Hash the producer commit's bytes, not the current consumer worktree."""
+
+    return hashlib.sha256(_git_blob_bytes(repository, commit, source)).hexdigest()
 
 
 def _emit_load_r4(
     *, repository: Path, evidence_root: Path, evidence_ref: str,
+    approved_data_root: Path | str | None = None,
 ) -> dict[str, object]:
     """Read and fully validate the released r4 publication before publishing."""
 
+    data_root_identity = _validate_approved_data_root(
+        evidence_root, approved_data_root,
+    )
     if evidence_ref.replace("\\", "/") != S111_R4_INDEX_REF:
         raise Stage1S111FormalError("S1_11_EMIT_R4_AUTHORITY_REF_REQUIRED")
     index_path = _relative(evidence_root, evidence_ref, field="emit_r4_index")
     index_dir = index_path.parent
     if not index_path.is_file():
         raise Stage1S111FormalError("S1_11_EMIT_R4_INDEX_MISSING")
+    # The canonical artifact_hash is a JSON claim; the file SHA binds the
+    # actual authority bytes before parsing any caller-controlled JSON.
+    if _sha(index_path) != S111_R4_INDEX_SHA256:
+        raise Stage1S111FormalError("S1_11_EMIT_R4_INDEX_SHA256_MISMATCH")
     _reject_symlink_tree(index_dir, field="r4_authority")
     index = _object(index_path, field="emit_r4_index")
     expected_index_fields = {
@@ -732,6 +919,7 @@ def _emit_load_r4(
         or index.get("generator_git_commit") != S111_R4_PRODUCER_COMMIT
         or index.get("consumer_git_commit") != S111_R4_PRODUCER_COMMIT
         or index.get("next_task_ids") != ["stage2", "stage3"]
+        or index.get("artifact_hash") != S111_R4_INDEX_ARTIFACT_HASH
     ):
         raise Stage1S111FormalError("S1_11_EMIT_R4_INDEX_IDENTITY_INVALID")
 
@@ -911,6 +1099,12 @@ def _emit_load_r4(
             "validation": validation,
             "index": index,
         },
+        producer_commit=S111_R4_PRODUCER_COMMIT,
+        frozen_source_sha256={
+            **dict(source_map),
+            "ops/stage1/formalize_s1_6.py": S111_R4_VALIDATOR_SOURCE_SHA256,
+        },
+        validator_source_path="ops/stage1/formalize_s1_6.py",
     )
     source_refs = sorted(
         path.relative_to(evidence_root.resolve()).as_posix()
@@ -941,156 +1135,612 @@ def _emit_load_r4(
         "artifact_hashes": artifact_hashes,
         "producer_source_sha256": dict(source_map),
         "dependency_index_sha256": dict(observation["dependency_index_sha256"]),
+        "data_root_identity": data_root_identity,
+    }
+
+
+def _declared_role_hash(value: Mapping[str, object], *, role: str) -> str:
+    """Return and verify the historical role's own canonical hash field."""
+
+    for field in (
+        "artifact_hash", "manifest_hash", "report_hash", "oracle_hash",
+        "trace_hash", "table_hash", "replay_hash",
+    ):
+        if field in value:
+            body = dict(value)
+            declared = body.pop(field)
+            if not _digest(declared) or declared != canonical_json_hash(body):
+                raise Stage1S111FormalError(
+                    f"S1_11_EMIT_S110_ROLE_SELF_HASH_INVALID:{role}"
+                )
+            return str(declared)
+    raise Stage1S111FormalError(
+        f"S1_11_EMIT_S110_ROLE_SELF_HASH_MISSING:{role}"
+    )
+
+
+def _emit_load_s110(
+    *, repository: Path, evidence_root: Path,
+    approved_data_root: Path | str | None = None,
+) -> dict[str, object]:
+    """Load the frozen G1-RESUME bundle used for compatibility commits.
+
+    The historical task predates the three-kind TaskArtifactStore contract, so
+    this function does not invent new PASS data.  It verifies the exact r12
+    task directory, all six role files, validation/replay/success markers, and
+    every historical producer source byte before returning the three roles that
+    the task catalog names.
+    """
+
+    data_root_identity = _validate_approved_data_root(
+        evidence_root, approved_data_root,
+    )
+    index_path = _emit_relative(evidence_root, S110_R12_INDEX_REF, field="s110_r12_index")
+    index_dir = index_path.parent
+    if not index_path.is_file():
+        raise Stage1S111FormalError("S1_11_EMIT_S110_R12_INDEX_MISSING")
+    if _sha(index_path) != S110_R12_INDEX_SHA256:
+        raise Stage1S111FormalError("S1_11_EMIT_S110_R12_INDEX_SHA256_MISMATCH")
+    _reject_symlink_tree(index_dir, field="s110_r12_authority")
+    index = _object(index_path, field="emit_s110_r12_index")
+    expected_index_fields = {
+        "artifact_hash", "chart_csv_sha256", "chart_svg_sha256", "checked_at",
+        "consumer_git_commit", "fixture_id", "formal_four_rank_report_ref",
+        "formal_four_rank_report_sha256", "formal_observation_artifact_hash",
+        "formal_observation_ref", "formal_observation_sha256",
+        "formal_run_token_sha256", "formal_single_report_ref",
+        "formal_single_report_sha256", "gate_artifact_hash", "gate_id",
+        "generator_git_commit", "git_branch", "next_task_ids", "replay_hash",
+        "replay_ref", "replay_sha256", "role_refs", "role_sha256",
+        "schema_version", "status", "task_id", "upstream", "validation_ref",
+        "validation_sha256",
+    }
+    if set(index) != expected_index_fields:
+        raise Stage1S111FormalError("S1_11_EMIT_S110_R12_INDEX_FIELDS_INVALID")
+    body = dict(index)
+    declared_index_hash = body.pop("artifact_hash")
+    if (
+        declared_index_hash != canonical_json_hash(body)
+        or declared_index_hash != S110_R12_INDEX_ARTIFACT_HASH
+        or index.get("schema_version") != "stage1-s1-10-formalization-index-v2"
+        or index.get("status") != "PASS"
+        or index.get("task_id") != "stage1.10_checkpoint_resume_and_artifacts"
+        or index.get("gate_id") != "G1-RESUME"
+        or index.get("generator_git_commit") != S110_R12_PRODUCER_COMMIT
+        or index.get("consumer_git_commit") != S110_R12_PRODUCER_COMMIT
+        or index.get("fixture_id") != "stage1-s110-checkpoint-fixture-v1"
+        or index.get("next_task_ids") != ["stage1.11_reporting_and_exit_gate"]
+    ):
+        raise Stage1S111FormalError("S1_11_EMIT_S110_R12_INDEX_IDENTITY_INVALID")
+    if index.get("role_refs") != S110_R12_ROLE_REFS or not isinstance(index.get("role_sha256"), Mapping):
+        raise Stage1S111FormalError("S1_11_EMIT_S110_R12_ROLE_WIRE_INVALID")
+    role_hashes = index["role_sha256"]
+    if set(role_hashes) != set(S110_R12_ROLE_REFS) or any(
+        not _digest(role_hashes.get(role)) for role in S110_R12_ROLE_REFS
+    ):
+        raise Stage1S111FormalError("S1_11_EMIT_S110_R12_ROLE_HASH_KEYSET_INVALID")
+
+    roles: dict[str, dict[str, object]] = {}
+    role_declared_hashes: dict[str, str] = {}
+    for role, filename in S110_R12_ROLE_REFS.items():
+        role_path = index_dir / filename
+        if not role_path.is_file() or _sha(role_path) != role_hashes[role]:
+            raise Stage1S111FormalError(
+                f"S1_11_EMIT_S110_R12_ROLE_HASH_MISMATCH:{role}"
+            )
+        role_value = _object(role_path, field=f"emit_s110_r12_{role}")
+        role_declared_hashes[role] = _declared_role_hash(role_value, role=role)
+        roles[role] = role_value
+
+    # The index's independent role and report references must agree with the
+    # exact role files, not merely with a same-shaped local fixture.
+    observation = _object(index_dir / "formal-observation.json", field="emit_s110_observation")
+    observation_declared_hash = _declared_role_hash(
+        observation, role="formal_observation"
+    )
+    resume_report = roles["resume_report"]
+    if (
+        index.get("formal_observation_ref") != "formal-observation.json"
+        or index.get("formal_observation_sha256") != _sha(index_dir / "formal-observation.json")
+        or index.get("formal_observation_artifact_hash") != observation_declared_hash
+        or index.get("formal_single_report_ref") != "formal-single-report.json"
+        or index.get("formal_four_rank_report_ref") != "formal-four-rank-report.json"
+    ):
+        raise Stage1S111FormalError("S1_11_EMIT_S110_R12_OBSERVATION_WIRE_INVALID")
+    for ref_field, hash_field, filename in (
+        ("formal_single_report_ref", "formal_single_report_sha256", "formal-single-report.json"),
+        ("formal_four_rank_report_ref", "formal_four_rank_report_sha256", "formal-four-rank-report.json"),
+    ):
+        path = index_dir / filename
+        if not path.is_file() or index.get(hash_field) != _sha(path):
+            raise Stage1S111FormalError("S1_11_EMIT_S110_R12_REPORT_HASH_MISMATCH")
+    if (
+        observation.get("schema_version") != "stage1-s1-10-formal-observation-v1"
+        or observation.get("status") != "PASS"
+        or observation.get("task_id") != "stage1.10_checkpoint_resume_and_artifacts"
+        or observation.get("gate_id") != "G1-RESUME"
+        or observation.get("execution_commit") != S110_R12_PRODUCER_COMMIT
+        or observation.get("single_process_resume") is not True
+        or observation.get("four_rank_resume") is not True
+        or observation.get("run_owned_resources_released") is not True
+        or resume_report.get("formal_observation") != observation
+        or resume_report.get("report_hash") != role_declared_hashes["resume_report"]
+        or resume_report.get("artifact_manifest_hash") != role_declared_hashes["artifact_manifest"]
+        or resume_report.get("oracle_hash") != role_declared_hashes["oracle_bundle"]
+        or resume_report.get("trace_hash") != role_declared_hashes["trace_bundle"]
+        or resume_report.get("table_hash") != role_declared_hashes["comparison_table"]
+    ):
+        raise Stage1S111FormalError("S1_11_EMIT_S110_R12_MUTUAL_HASH_CLOSURE_INVALID")
+    if (
+        index.get("gate_artifact_hash") != role_declared_hashes["gate_record"]
+        or index.get("formal_run_token_sha256") != observation.get("run_token_sha256")
+    ):
+        raise Stage1S111FormalError("S1_11_EMIT_S110_R12_GATE_HASH_CLOSURE_INVALID")
+
+    validation = _object(index_dir / "validation.json", field="emit_s110_validation")
+    replay = _object(index_dir / "replay-validation.json", field="emit_s110_replay")
+    success = _object(index_dir / "success.json", field="emit_s110_success")
+    if (
+        index.get("validation_ref") != "validation.json"
+        or index.get("validation_sha256") != _sha(index_dir / "validation.json")
+        or index.get("replay_ref") != "replay-validation.json"
+        or index.get("replay_sha256") != _sha(index_dir / "replay-validation.json")
+        or validation.get("schema_version") != "stage1-s1-10-validation-v2"
+        or validation.get("status") != "PASS"
+        or validation.get("task_id") != index.get("task_id")
+        or validation.get("gate_id") != index.get("gate_id")
+        or validation.get("producer_commit") != S110_R12_PRODUCER_COMMIT
+        or validation.get("consumer_commit") != S110_R12_PRODUCER_COMMIT
+        or validation.get("role_sha256") != dict(role_hashes)
+        or validation.get("replay_sha256") != index.get("replay_sha256")
+        or validation.get("replay_hash") != index.get("replay_hash")
+        or not isinstance(validation.get("direct_checks"), Mapping)
+        or any(value is not True for value in validation["direct_checks"].values())
+        or replay.get("schema_version") != "stage1-s1-10-replay-validation-v1"
+        or replay.get("status") != "PASS"
+        or replay.get("replay_hash") != index.get("replay_hash")
+        or replay.get("source_report_hash") != role_declared_hashes["resume_report"]
+        or replay.get("source_manifest_hash") != role_declared_hashes["artifact_manifest"]
+        or replay.get("source_gate_artifact_hash") != role_declared_hashes["gate_record"]
+        or replay.get("source_oracle_hash") != role_declared_hashes["oracle_bundle"]
+        or replay.get("source_trace_hash") != role_declared_hashes["trace_bundle"]
+        or replay.get("source_table_hash") != role_declared_hashes["comparison_table"]
+        or success.get("schema_version") != "stage1-s1-10-attempt-success-v1"
+        or success.get("status") != "PASS"
+        or success.get("index_sha256") != S110_R12_INDEX_SHA256
+        or success.get("validation_sha256") != index.get("validation_sha256")
+        or success.get("gate_artifact_hash") != role_declared_hashes["gate_record"]
+    ):
+        raise Stage1S111FormalError("S1_11_EMIT_S110_R12_VALIDATION_CLOSURE_INVALID")
+    _declared_role_hash(validation, role="validation")
+    _declared_role_hash(replay, role="replay")
+    _declared_role_hash(success, role="success")
+
+    source_map = resume_report.get("implementation_source_sha256")
+    if not isinstance(source_map, Mapping) or set(source_map) != set(S110_R12_SOURCE_PATHS):
+        raise Stage1S111FormalError("S1_11_EMIT_S110_R12_SOURCE_KEYSET_INVALID")
+    for source in S110_R12_SOURCE_PATHS:
+        digest = source_map.get(source)
+        if not _digest(digest) or _git_blob_sha256(
+            repository, S110_R12_PRODUCER_COMMIT, source
+        ) != digest:
+            raise Stage1S111FormalError(
+                f"S1_11_EMIT_S110_R12_SOURCE_HASH_MISMATCH:{source}"
+            )
+    if resume_report.get("producer_commit") != S110_R12_PRODUCER_COMMIT:
+        raise Stage1S111FormalError("S1_11_EMIT_S110_R12_PRODUCER_MISMATCH")
+    _schema_validate(
+        repository,
+        {
+            "formal_observation": observation,
+            "resume_report": resume_report,
+            "artifact_manifest": roles["artifact_manifest"],
+            "gate_record": roles["gate_record"],
+            "oracle_bundle": roles["oracle_bundle"],
+            "trace_bundle": roles["trace_bundle"],
+            "comparison_table": roles["comparison_table"],
+            "replay": replay,
+            "validation": validation,
+            "index": index,
+        },
+        producer_commit=S110_R12_PRODUCER_COMMIT,
+        frozen_source_sha256=source_map,
+        schema_prefix="s1-10",
+        validator_source_path="ops/stage1/formalize_s1_10.py",
+    )
+    source_refs = sorted(
+        path.relative_to(evidence_root.resolve()).as_posix()
+        for path in index_dir.rglob("*") if path.is_file()
+    )
+    if S110_R12_INDEX_REF not in source_refs:
+        raise Stage1S111FormalError("S1_11_EMIT_S110_R12_SOURCE_REF_CLOSURE_INVALID")
+    return {
+        "index": index,
+        "index_path": index_path,
+        "index_dir": index_dir,
+        "roles": roles,
+        "role_hashes": role_declared_hashes,
+        "role_file_sha256": dict(role_hashes),
+        "validation": validation,
+        "replay": replay,
+        "success": success,
+        "source_refs": source_refs,
+        "source_sha256": dict(source_map),
+        "data_root_identity": data_root_identity,
+    }
+
+
+def _task_artifact_hash(
+    *, task_id: str, artifact_kind: str, config_hash: str,
+    run_intent: str, formal_eligible: bool, source_refs: tuple[str, ...],
+    payload: Mapping[str, object],
+) -> str:
+    return canonical_json_hash({
+        "schema_version": "task-output-artifact-v1",
+        "task_id": task_id,
+        "artifact_kind": artifact_kind,
+        "config_hash": config_hash,
+        "run_intent": run_intent,
+        "formal_eligible": formal_eligible,
+        "source_refs": list(source_refs),
+        "payload": dict(payload),
+    })
+
+
+def _publish_emit_group(
+    *, evidence_root: Path, output_dir: str, task_id: str,
+    artifact_kinds: tuple[str, ...], config_hash: str,
+    source_refs: tuple[str, ...], payloads: Mapping[str, Mapping[str, object]],
+) -> dict[str, object]:
+    """Resume an individual group without deleting already published objects.
+
+    The group manifest is written before the first commit.  A separate success
+    marker is written only after every existing/missing commit has been loaded
+    through the full validator.  Thus a crash between any two commits leaves a
+    resumable PUBLISHING state rather than a permanent partial block.
+    """
+
+    output_path = _emit_relative(evidence_root, output_dir, field="task_output")
+    _reject_symlink_ancestors(output_path, evidence_root, field="task_output_parent")
+    if output_path.exists():
+        _reject_symlink_tree(output_path, field="task_output")
+    store = TaskArtifactStore(evidence_root, output_dir)
+    _reject_symlink_tree(store.root, field="task_output")
+    commit_refs = {
+        kind: f"{store.output_dir}/commits/{kind}.json"
+        for kind in artifact_kinds
+    }
+    expected_artifacts = {
+        kind: _task_artifact_hash(
+            task_id=task_id, artifact_kind=kind, config_hash=config_hash,
+            run_intent="formal", formal_eligible=True,
+            source_refs=source_refs, payload=payloads[kind],
+        )
+        for kind in artifact_kinds
+    }
+    group_body = {
+        "schema_version": "stage1-task-artifact-group-manifest-v1",
+        "status": "PUBLISHING",
+        "task_id": task_id,
+        "artifact_kinds": list(artifact_kinds),
+        "config_hash": config_hash,
+        "source_refs_hash": canonical_json_hash(list(source_refs)),
+        "source_refs": list(source_refs),
+        "expected_artifact_hashes": expected_artifacts,
+        "commit_refs": commit_refs,
+    }
+    group_manifest = {**group_body, "artifact_hash": canonical_json_hash(group_body)}
+    _emit_json(output_path / "group-manifest.json", group_manifest, field="group_manifest")
+    success_path = output_path / "success.json"
+    if success_path.exists():
+        success = _object(success_path, field="group_success")
+        success_body = dict(success)
+        success_hash = success_body.pop("artifact_hash", None)
+        if (
+            success_hash != canonical_json_hash(success_body)
+            or success.get("schema_version") != "stage1-task-artifact-group-success-v1"
+            or success.get("status") != "PASS"
+            or success.get("group_manifest_sha256") != _sha(output_path / "group-manifest.json")
+            or success.get("commit_refs") != commit_refs
+        ):
+            raise Stage1S111FormalError("S1_11_EMIT_GROUP_SUCCESS_DRIFT")
+    refs: dict[str, str] = {}
+    for kind in artifact_kinds:
+        commit_path = store.commits / f"{kind}.json"
+        if commit_path.is_symlink():
+            raise Stage1S111FormalError(f"S1_11_EMIT_{kind.upper()}_COMMIT_SYMLINK")
+        if commit_path.exists():
+            ref = commit_refs[kind]
+            try:
+                loaded = load_committed_task_artifact(
+                    evidence_root, ref, require_formal=True,
+                )
+            except Exception as error:
+                raise Stage1S111FormalError(
+                    f"S1_11_EMIT_EXISTING_COMMIT_INVALID:{kind}"
+                ) from error
+            if (
+                loaded.identity.task_id != task_id
+                or loaded.identity.artifact_kind != kind
+                or loaded.identity.config_hash != config_hash
+                or loaded.identity.artifact_hash != expected_artifacts[kind]
+                or loaded.run_intent != "formal"
+                or loaded.identity.formal_eligible is not True
+                or dict(loaded.payload) != dict(payloads[kind])
+                or loaded.source_refs != source_refs
+            ):
+                raise Stage1S111FormalError(
+                    f"S1_11_EMIT_EXISTING_COMMIT_DRIFT:{kind}"
+                )
+            refs[kind] = ref
+            continue
+        published = store.publish(
+            task_id=task_id,
+            artifact_kind=kind,
+            config_hash=config_hash,
+            run_intent="formal",
+            payload=payloads[kind],
+            formal_eligible=True,
+            source_refs=source_refs,
+        )
+        refs[kind] = published.commit_ref
+        # A crash after publish is safe: the next invocation sees and verifies
+        # this commit, then continues with the next missing kind.
+    loaded_hashes: dict[str, str] = {}
+    for kind in artifact_kinds:
+        loaded = load_committed_task_artifact(
+            evidence_root, refs[kind], require_formal=True,
+        )
+        if (
+            loaded.identity.artifact_hash != expected_artifacts[kind]
+            or dict(loaded.payload) != dict(payloads[kind])
+            or loaded.source_refs != source_refs
+        ):
+            raise Stage1S111FormalError(f"S1_11_EMIT_COMMIT_READBACK_INVALID:{kind}")
+        loaded_hashes[kind] = loaded.identity.artifact_hash
+    success_body = {
+        "schema_version": "stage1-task-artifact-group-success-v1",
+        "status": "PASS",
+        "task_id": task_id,
+        "artifact_kinds": list(artifact_kinds),
+        "config_hash": config_hash,
+        "group_manifest_sha256": _sha(output_path / "group-manifest.json"),
+        "commit_refs": refs,
+        "commit_artifact_hashes": loaded_hashes,
+    }
+    success = {**success_body, "artifact_hash": canonical_json_hash(success_body)}
+    _emit_json(success_path, success, field="group_success")
+    return {
+        "output_dir": store.output_dir,
+        "commit_refs": refs,
+        "commit_artifact_hashes": loaded_hashes,
+        "expected_artifact_hashes": expected_artifacts,
+        "group_manifest_ref": f"{store.output_dir}/group-manifest.json",
+        "group_manifest_sha256": _sha(output_path / "group-manifest.json"),
+        "success_ref": f"{store.output_dir}/success.json",
+        "success_sha256": _sha(success_path),
     }
 
 
 def emit_task_artifacts(
     *, repository: Path, evidence_root: Path, output_dir: str,
     evidence_ref: str = S111_R4_INDEX_REF,
+    approved_data_root: Path | str | None = None,
+    s110_output_dir: str = S110_COMPAT_OUTPUT_DEFAULT,
 ) -> dict[str, object]:
-    """Emit the four formal S1.11 TaskArtifactStore commits from r4 only.
+    """Publish S1.11 and historical S1.10 formal task commits.
 
-    This is intentionally separate from the Stage 2 materializer and from the
-    local task runner.  It accepts one fixed authority index, performs a full
-    immutable replay, persists a producer-specific config, and then publishes
-    four role payloads whose original S1.11 JSON remains validator-readable.
+    The only accepted inputs are the fixed r4/r12 authorities.  All payloads
+    are copied from those validated roles; no caller JSON can substitute a
+    PASS-looking artifact.
     """
 
     repository = Path(repository).resolve()
-    evidence_root = Path(evidence_root).resolve()
-    if not repository.is_dir() or not evidence_root.is_dir():
+    raw_evidence_root = Path(evidence_root)
+    data_root_identity = _validate_approved_data_root(
+        raw_evidence_root, approved_data_root,
+    )
+    evidence_root = raw_evidence_root.resolve()
+    if not repository.is_dir():
         raise Stage1S111FormalError("S1_11_EMIT_ROOT_INVALID")
     authority = _emit_load_r4(
-        repository=repository, evidence_root=evidence_root, evidence_ref=evidence_ref,
+        repository=repository,
+        evidence_root=evidence_root,
+        evidence_ref=evidence_ref,
+        approved_data_root=approved_data_root,
     )
-    output_path = _emit_relative(evidence_root, output_dir, field="task_output")
-    # Check existing ancestors before TaskArtifactStore creates anything.
-    parent = output_path
-    while parent != evidence_root and not parent.exists():
-        parent = parent.parent
-    _reject_symlink_ancestors(parent, evidence_root, field="task_output_parent")
-    if output_path.exists():
-        _reject_symlink_tree(output_path, field="task_output")
+    s110 = _emit_load_s110(
+        repository=repository,
+        evidence_root=evidence_root,
+        approved_data_root=approved_data_root,
+    )
+    s111_output = _emit_relative(evidence_root, output_dir, field="task_output")
+    s110_output = _emit_relative(evidence_root, s110_output_dir, field="s110_task_output")
+    if s111_output == s110_output:
+        raise Stage1S111FormalError("S1_11_EMIT_TASK_OUTPUTS_MUST_BE_DISTINCT")
+    for path, field in ((s111_output, "task_output"), (s110_output, "s110_task_output")):
+        _reject_symlink_ancestors(path, evidence_root, field=f"{field}_parent")
+        if path.exists():
+            _reject_symlink_tree(path, field=field)
 
-    config_ref = output_path.relative_to(evidence_root).as_posix() + "/producer-config.json"
-    manifest_ref = output_path.relative_to(evidence_root).as_posix() + "/manifest.json"
-    config_body: dict[str, object] = {
-        "schema_version": "stage1-s1-11-producer-config-v1",
+    s110_config_ref = f"{s110_output.relative_to(evidence_root).as_posix()}/producer-config.json"
+    s110_commit_refs = {
+        kind: f"{s110_output.relative_to(evidence_root).as_posix()}/commits/{kind}.json"
+        for kind in S110_TASK_ARTIFACT_KINDS
+    }
+    s110_source_refs = tuple(sorted({
+        *[str(value) for value in s110["source_refs"]],
+        s110_config_ref,
+        *s110_commit_refs.values(),
+    }))
+    s110_config_body: dict[str, object] = {
+        "schema_version": "stage1-s1-10-compat-producer-config-v1",
+        "config_kind": "s1_10_checkpoint_resume_compatibility_producer",
+        "task_id": "stage1.10_checkpoint_resume_and_artifacts",
+        "gate_id": "G1-RESUME",
+        "run_intent": "formal",
+        "formal_eligible": True,
+        "authority": {
+            "index_ref": S110_R12_INDEX_REF,
+            "index_sha256": S110_R12_INDEX_SHA256,
+            "index_artifact_hash": S110_R12_INDEX_ARTIFACT_HASH,
+            "attempt_id": S110_R12_ATTEMPT_ID,
+            "producer_commit": S110_R12_PRODUCER_COMMIT,
+            "execution_commit": S110_R12_PRODUCER_COMMIT,
+            "consumer_commit": S110_R12_PRODUCER_COMMIT,
+        },
+        "data_root": data_root_identity,
+        "producer_source_sha256": s110["source_sha256"],
+        "producer_source_hash": canonical_json_hash(s110["source_sha256"]),
+        "role_sha256": s110["role_file_sha256"],
+        "role_artifact_hashes": s110["role_hashes"],
+        "r12_artifact_hashes": {
+            "index": S110_R12_INDEX_ARTIFACT_HASH,
+            "validation": _sha(s110["index_dir"] / "validation.json"),
+            "replay_validation": _sha(s110["index_dir"] / "replay-validation.json"),
+            "success": _sha(s110["index_dir"] / "success.json"),
+            **s110["role_hashes"],
+        },
+        "source_refs": list(s110_source_refs),
+        "artifact_kinds": list(S110_TASK_ARTIFACT_KINDS),
+        "commit_refs": s110_commit_refs,
+    }
+    s110_config_hash = canonical_json_hash(s110_config_body)
+    s110_config = {**s110_config_body, "config_hash": s110_config_hash}
+    _emit_json(s110_output / "producer-config.json", s110_config, field="s110_producer_config")
+    s110_config_sha256 = _sha(s110_output / "producer-config.json")
+    s110_payloads = {
+        kind: dict(s110["roles"][role])
+        for kind, role in S110_TASK_ROLE_MAP.items()
+    }
+    s110_group = _publish_emit_group(
+        evidence_root=evidence_root,
+        output_dir=s110_output_dir,
+        task_id="stage1.10_checkpoint_resume_and_artifacts",
+        artifact_kinds=S110_TASK_ARTIFACT_KINDS,
+        config_hash=s110_config_hash,
+        source_refs=s110_source_refs,
+        payloads=s110_payloads,
+    )
+
+    s111_config_ref = f"{s111_output.relative_to(evidence_root).as_posix()}/producer-config.json"
+    s111_commit_refs = {
+        kind: f"{s111_output.relative_to(evidence_root).as_posix()}/commits/{kind}.json"
+        for kind in S111_TASK_ARTIFACT_KINDS
+    }
+    s111_source_refs = tuple(sorted({
+        *[str(value) for value in authority["source_refs"]],
+        *s110_source_refs,
+        s111_config_ref,
+        *s111_commit_refs.values(),
+    }))
+    s111_config_body: dict[str, object] = {
+        "schema_version": "stage1-s1-11-producer-config-v2",
         "config_kind": "s1_11_reporting_producer",
         "task_id": TASK_ID,
         "gate_id": GATE_ID,
         "run_intent": "formal",
         "formal_eligible": True,
+        "data_root": data_root_identity,
         "authority": {
             "index_ref": evidence_ref,
-            "index_sha256": _sha(authority["index_path"]),
-            "index_artifact_hash": authority["index"]["artifact_hash"],
+            "index_sha256": S111_R4_INDEX_SHA256,
+            "index_artifact_hash": S111_R4_INDEX_ARTIFACT_HASH,
             "attempt_id": S111_R4_ATTEMPT_ID,
             "producer_commit": S111_R4_PRODUCER_COMMIT,
             "execution_commit": S111_R4_PRODUCER_COMMIT,
             "consumer_commit": S111_R4_PRODUCER_COMMIT,
         },
         "producer_source_sha256": authority["producer_source_sha256"],
-        "producer_source_hash": canonical_json_hash(
-            authority["producer_source_sha256"]
-        ),
+        "producer_source_hash": canonical_json_hash(authority["producer_source_sha256"]),
         "r4_artifact_hashes": authority["artifact_hashes"],
         "r4_role_sha256": authority["role_file_sha256"],
         "dependency_index_sha256": authority["dependency_index_sha256"],
-        "source_refs": authority["source_refs"],
+        "s110_compatibility": {
+            "task_id": "stage1.10_checkpoint_resume_and_artifacts",
+            "output_dir": s110_output.relative_to(evidence_root).as_posix(),
+            "config_ref": s110_config_ref,
+            "config_hash": s110_config_hash,
+            "config_sha256": s110_config_sha256,
+            "authority_index_ref": S110_R12_INDEX_REF,
+            "authority_index_sha256": S110_R12_INDEX_SHA256,
+            "authority_index_artifact_hash": S110_R12_INDEX_ARTIFACT_HASH,
+            "source_hash": canonical_json_hash(s110["source_sha256"]),
+            "source_sha256": s110["source_sha256"],
+            "commit_refs": s110_group["commit_refs"],
+            "commit_artifact_hashes": s110_group["commit_artifact_hashes"],
+        },
+        "source_refs": list(s111_source_refs),
         "artifact_kinds": list(S111_TASK_ARTIFACT_KINDS),
+        "commit_refs": s111_commit_refs,
     }
-    config_hash = canonical_json_hash(config_body)
-    config = {**config_body, "config_hash": config_hash}
-    _emit_json(output_path / "producer-config.json", config, field="producer_config")
-    config_sha256 = _sha(output_path / "producer-config.json")
-    source_refs = tuple([*authority["source_refs"], config_ref])
-
-    store = TaskArtifactStore(evidence_root, output_dir)
-    commit_paths = [store.commits / f"{kind}.json" for kind in S111_TASK_ARTIFACT_KINDS]
-    existing = [path.is_symlink() or path.exists() for path in commit_paths]
-    if any(existing) and not all(existing):
-        raise Stage1S111FormalError("S1_11_EMIT_PARTIAL_PUBLICATION")
-
-    expected_payloads = {
-        kind: dict(authority["roles"][kind]) for kind in S111_TASK_ARTIFACT_KINDS
+    s111_config_hash = canonical_json_hash(s111_config_body)
+    s111_config = {**s111_config_body, "config_hash": s111_config_hash}
+    _emit_json(s111_output / "producer-config.json", s111_config, field="producer_config")
+    s111_payloads = {
+        kind: dict(authority["roles"][kind])
+        for kind in S111_TASK_ARTIFACT_KINDS
     }
-    if all(existing):
-        refs = store.discover_complete(
-            task_id=TASK_ID, config_hash=config_hash,
-            artifact_kinds=S111_TASK_ARTIFACT_KINDS, formal_eligible=True,
-        )
-        if refs is None:
-            raise Stage1S111FormalError("S1_11_EMIT_EXISTING_PUBLICATION_INCOMPLETE")
-        for kind, ref in refs.items():
-            loaded = load_committed_task_artifact(
-                evidence_root, ref, require_formal=True,
-            )
-            if (
-                dict(loaded.payload) != expected_payloads[kind]
-                or loaded.source_refs != source_refs
-            ):
-                raise Stage1S111FormalError(
-                    f"S1_11_EMIT_EXISTING_PAYLOAD_DRIFT:{kind}"
-                )
-    else:
-        refs = {}
-        for kind in S111_TASK_ARTIFACT_KINDS:
-            published = store.publish(
-                task_id=TASK_ID,
-                artifact_kind=kind,
-                config_hash=config_hash,
-                run_intent="formal",
-                payload=expected_payloads[kind],
-                formal_eligible=True,
-                source_refs=source_refs,
-            )
-            refs[kind] = published.commit_ref
-
-    commit_artifact_hashes: dict[str, str] = {}
-    for kind, ref in refs.items():
-        loaded = load_committed_task_artifact(evidence_root, ref, require_formal=True)
-        commit_artifact_hashes[kind] = loaded.identity.artifact_hash
-        if loaded.identity.config_hash != config_hash or dict(loaded.payload) != expected_payloads[kind] or loaded.source_refs != source_refs:
-            raise Stage1S111FormalError(f"S1_11_EMIT_COMMIT_READBACK_INVALID:{kind}")
-
+    s111_group = _publish_emit_group(
+        evidence_root=evidence_root,
+        output_dir=output_dir,
+        task_id=TASK_ID,
+        artifact_kinds=S111_TASK_ARTIFACT_KINDS,
+        config_hash=s111_config_hash,
+        source_refs=s111_source_refs,
+        payloads=s111_payloads,
+    )
     manifest_body: dict[str, object] = {
-        "schema_version": "stage1-s1-11-task-artifact-manifest-v1",
+        "schema_version": "stage1-s1-11-task-artifact-manifest-v2",
         "status": "PASS",
         "task_id": TASK_ID,
         "gate_id": GATE_ID,
         "run_intent": "formal",
         "formal_eligible": True,
-        "commit_refs": dict(refs),
-        "commit_artifact_hashes": commit_artifact_hashes,
-        "config_ref": config_ref,
-        "config_hash": config_hash,
-        "config_sha256": config_sha256,
+        "data_root": data_root_identity,
+        "commit_refs": s111_group["commit_refs"],
+        "commit_artifact_hashes": s111_group["commit_artifact_hashes"],
+        "config_ref": s111_config_ref,
+        "config_hash": s111_config_hash,
+        "config_sha256": _sha(s111_output / "producer-config.json"),
+        "group_manifest_ref": s111_group["group_manifest_ref"],
+        "group_manifest_sha256": s111_group["group_manifest_sha256"],
+        "success_ref": s111_group["success_ref"],
+        "success_sha256": s111_group["success_sha256"],
         "r4_index_ref": evidence_ref,
-        "r4_index_sha256": _sha(authority["index_path"]),
-        "r4_index_artifact_hash": authority["index"]["artifact_hash"],
+        "r4_index_sha256": S111_R4_INDEX_SHA256,
+        "r4_index_artifact_hash": S111_R4_INDEX_ARTIFACT_HASH,
         "r4_artifact_hashes": authority["artifact_hashes"],
         "r4_role_sha256": authority["role_file_sha256"],
         "producer_commit": S111_R4_PRODUCER_COMMIT,
         "execution_commit": S111_R4_PRODUCER_COMMIT,
         "consumer_commit": S111_R4_PRODUCER_COMMIT,
         "producer_source_sha256": authority["producer_source_sha256"],
-        "producer_source_hash": canonical_json_hash(
-            authority["producer_source_sha256"]
-        ),
+        "producer_source_hash": canonical_json_hash(authority["producer_source_sha256"]),
+        "s110_compatibility": s111_config_body["s110_compatibility"],
     }
     manifest = {**manifest_body, "artifact_hash": canonical_json_hash(manifest_body)}
-    _emit_json(output_path / "manifest.json", manifest, field="manifest")
+    _emit_json(s111_output / "manifest.json", manifest, field="manifest")
     return {
-        "manifest_ref": manifest_ref,
-        "manifest_sha256": _sha(output_path / "manifest.json"),
-        "config_ref": config_ref,
-        "config_hash": config_hash,
-        "config_sha256": config_sha256,
-        "commit_refs": dict(refs),
+        "manifest_ref": f"{s111_output.relative_to(evidence_root).as_posix()}/manifest.json",
+        "manifest_sha256": _sha(s111_output / "manifest.json"),
+        "config_ref": s111_config_ref,
+        "config_hash": s111_config_hash,
+        "config_sha256": _sha(s111_output / "producer-config.json"),
+        "commit_refs": dict(s111_group["commit_refs"]),
         "r4_index_ref": evidence_ref,
-        "r4_index_sha256": _sha(authority["index_path"]),
+        "r4_index_sha256": S111_R4_INDEX_SHA256,
+        "r4_index_artifact_hash": S111_R4_INDEX_ARTIFACT_HASH,
         "r4_artifact_hashes": authority["artifact_hashes"],
+        "s110_compatibility": {
+            "config_ref": s110_config_ref,
+            "config_hash": s110_config_hash,
+            "config_sha256": s110_config_sha256,
+            "commit_refs": dict(s110_group["commit_refs"]),
+            "index_ref": S110_R12_INDEX_REF,
+            "index_sha256": S110_R12_INDEX_SHA256,
+            "index_artifact_hash": S110_R12_INDEX_ARTIFACT_HASH,
+        },
     }
 
 
@@ -1216,19 +1866,52 @@ def main(argv: list[str] | None = None) -> int:
         "--task-output-dir", default=S111_TASK_OUTPUT_DEFAULT,
         help="POSIX-relative TaskArtifactStore output directory",
     )
-    parser.add_argument("--repository", type=Path, required=True); parser.add_argument("--evidence-root", type=Path, required=True); parser.add_argument("--attempt-root", type=Path, required=True)
-    parser.add_argument("--dependencies-json", type=Path, required=True); parser.add_argument("--verification-matrix-json", type=Path, required=True); parser.add_argument("--chart-specs-json", type=Path, required=True)
-    parser.add_argument("--test-summary-binding-json", type=Path, required=True); parser.add_argument("--sync-audit-binding-json", type=Path, required=True); parser.add_argument("--failure-history-json", type=Path, required=True); parser.add_argument("--worklog-binding-json", type=Path, required=True); parser.add_argument("--execution-commit", required=True); parser.add_argument("--attempt-id", required=True)
+    parser.add_argument(
+        "--s110-task-output-dir", default=S110_COMPAT_OUTPUT_DEFAULT,
+        help="POSIX-relative compatibility TaskArtifactStore output for S1.10",
+    )
+    parser.add_argument(
+        "--approved-data-root", type=Path, default=None,
+        help="explicit approved DATA_ROOT identity (defaults to released server root)",
+    )
+    # Execute-mode inputs remain available, but are intentionally optional at
+    # argparse time so emit mode is not forced to supply unrelated JSON files.
+    parser.add_argument("--repository", type=Path, required=True)
+    parser.add_argument("--evidence-root", type=Path, default=None)
+    parser.add_argument("--attempt-root", type=Path, default=None)
+    parser.add_argument("--dependencies-json", type=Path, default=None)
+    parser.add_argument("--verification-matrix-json", type=Path, default=None)
+    parser.add_argument("--chart-specs-json", type=Path, default=None)
+    parser.add_argument("--test-summary-binding-json", type=Path, default=None)
+    parser.add_argument("--sync-audit-binding-json", type=Path, default=None)
+    parser.add_argument("--failure-history-json", type=Path, default=None)
+    parser.add_argument("--worklog-binding-json", type=Path, default=None)
+    parser.add_argument("--execution-commit", default=None)
+    parser.add_argument("--attempt-id", default=None)
     args = parser.parse_args(argv)
     if args.emit_task_artifacts:
         workspace_root = args.workspace_root or args.evidence_root
+        if workspace_root is None:
+            parser.error("--emit-task-artifacts requires --workspace-root (DATA_ROOT)")
         print(emit_task_artifacts(
             repository=args.repository,
             evidence_root=workspace_root,
             output_dir=args.task_output_dir,
             evidence_ref=args.evidence_ref,
+            approved_data_root=args.approved_data_root,
+            s110_output_dir=args.s110_task_output_dir,
         ))
         return 0
+    required_execute = (
+        "evidence_root", "attempt_root", "dependencies_json",
+        "verification_matrix_json", "chart_specs_json",
+        "test_summary_binding_json", "sync_audit_binding_json",
+        "failure_history_json", "worklog_binding_json", "execution_commit",
+        "attempt_id",
+    )
+    missing = [name for name in required_execute if getattr(args, name) is None]
+    if missing:
+        parser.error("execute mode missing: " + ", ".join("--" + name.replace("_", "-") for name in missing))
     print(execute(repository=args.repository, evidence_root=args.evidence_root, attempt_root=args.attempt_root, dependencies_path=args.dependencies_json, matrix_path=args.verification_matrix_json, chart_specs_path=args.chart_specs_json, test_summary_binding_path=args.test_summary_binding_json, sync_audit_binding_path=args.sync_audit_binding_json, failure_history_path=args.failure_history_json, worklog_binding_path=args.worklog_binding_json, execution_commit=args.execution_commit, attempt_id=args.attempt_id))
     return 0
 

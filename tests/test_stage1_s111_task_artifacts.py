@@ -1,10 +1,4 @@
-"""Formal S1.11 producer bridge tests.
-
-The authority replay itself is covered by ``test_stage1_s111_exit_gate``'s
-full S1.1--S1.10-shaped fixture.  These tests exercise the producer-only
-TaskArtifactStore boundary after that replay has admitted the released r4
-roles; no local fixture can enter through ``evidence_ref``.
-"""
+"""Real-loader and recovery tests for the S1.11 formal producer boundary."""
 
 from __future__ import annotations
 
@@ -13,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from param_importance_nlp.contracts.jsonio import canonical_json_hash, load_canonical_json, write_canonical_json
+from param_importance_nlp.contracts.jsonio import canonical_json_hash, write_canonical_json
 
 
 def _formalizer():
@@ -25,47 +19,37 @@ def _formalizer():
     return module
 
 
-def _fake_authority(tmp_path: Path, formalizer: object) -> dict[str, object]:
-    authority = tmp_path / "evidence/stage1/s1-11-formal/3f18b04df8922be9894678ae4842bd999c7e8fd5/s1-11-r4-20260821"
-    authority.mkdir(parents=True)
-    roles: dict[str, dict[str, object]] = {}
-    for kind in formalizer.S111_TASK_ARTIFACT_KINDS:
-        role = {
-            "schema_version": f"stage1-s1-11-{kind.replace('_', '-')}-v1",
-            "status": "PASS",
-            "task_id": formalizer.TASK_ID,
-            "gate_id": formalizer.GATE_ID,
-            "role_shape": {
-                "measured": "PASS",
-                "threshold": "immutable r4 role hash",
-                "evidence": "full-authority-closure",
-            },
-        }
-        role["artifact_hash"] = canonical_json_hash(role)
-        roles[kind] = role
-    source = authority / "full-authority-source.json"
-    write_canonical_json(source, {"schema_version": "full-authority-source-v1", "status": "PASS"})
-    index_path = authority / "index.json"
-    write_canonical_json(index_path, {"schema_version": "full-authority-index-v1"})
-    return {
-        "index": {"artifact_hash": "a" * 64},
-        "index_path": index_path,
-        "index_dir": authority,
-        "roles": roles,
-        "role_file_sha256": {},
-        "validation": {},
-        "replay": {},
-        "source_refs": [source.relative_to(tmp_path).as_posix()],
-        "artifact_hashes": {
-            "index": "a" * 64,
-            **{kind: value["artifact_hash"] for kind, value in roles.items()},
-        },
-        "producer_source_sha256": {"ops/stage1/formalize_s1_11.py": "b" * 64},
-        "dependency_index_sha256": {},
+def _pseudo_r4(tmp_path: Path, formalizer: object) -> Path:
+    """Build a same-path, internally self-hashed pseudo-r4 negative fixture."""
+
+    directory = tmp_path / "evidence/stage1/s1-11-formal/3f18b04df8922be9894678ae4842bd999c7e8fd5/s1-11-r4-20260821"
+    directory.mkdir(parents=True)
+    body = {
+        "schema_version": "stage1-s1-11-formalization-index-v1",
+        "status": "PASS",
+        "task_id": formalizer.TASK_ID,
+        "gate_id": formalizer.GATE_ID,
+        "note": "self-consistent local fixture, deliberately not released r4",
     }
+    body["artifact_hash"] = canonical_json_hash(body)
+    path = directory / "index.json"
+    write_canonical_json(path, body)
+    return path
 
 
-def test_emit_rejects_r3_and_local_fixture_refs_before_reading_json(tmp_path: Path) -> None:
+def test_real_loader_rejects_same_path_self_consistent_local_fixture(tmp_path: Path) -> None:
+    formalizer = _formalizer()
+    _pseudo_r4(tmp_path, formalizer)
+    with pytest.raises(formalizer.Stage1S111FormalError, match="R4_INDEX_SHA256_MISMATCH"):
+        formalizer._emit_load_r4(
+            repository=Path.cwd(),
+            evidence_root=tmp_path,
+            evidence_ref=formalizer.S111_R4_INDEX_REF,
+            approved_data_root=tmp_path,
+        )
+
+
+def test_real_loader_rejects_r3_local_and_caller_selected_refs(tmp_path: Path) -> None:
     formalizer = _formalizer()
     for ref in (
         "evidence/stage1/s1-11-formal/3f18b04df8922be9894678ae4842bd999c7e8fd5/s1-11-r3-20260821/index.json",
@@ -76,67 +60,107 @@ def test_emit_rejects_r3_and_local_fixture_refs_before_reading_json(tmp_path: Pa
             formalizer.emit_task_artifacts(
                 repository=Path.cwd(), evidence_root=tmp_path,
                 output_dir="outputs/s111", evidence_ref=ref,
+                approved_data_root=tmp_path,
             )
 
 
-def test_emit_is_idempotent_and_preserves_original_role_payloads(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_emit_cli_does_not_require_execute_inputs_and_still_uses_real_loader(tmp_path: Path) -> None:
     formalizer = _formalizer()
-    authority = _fake_authority(tmp_path, formalizer)
-    monkeypatch.setattr(formalizer, "_emit_load_r4", lambda **_: authority)
+    _pseudo_r4(tmp_path, formalizer)
+    with pytest.raises(formalizer.Stage1S111FormalError, match="R4_INDEX_SHA256_MISMATCH"):
+        formalizer.main([
+            "--emit-task-artifacts",
+            "--repository", str(Path.cwd()),
+            "--workspace-root", str(tmp_path),
+            "--approved-data-root", str(tmp_path),
+            "--task-output-dir", "outputs/s111",
+        ])
 
-    first = formalizer.emit_task_artifacts(
-        repository=Path.cwd(), evidence_root=tmp_path,
-        output_dir="outputs/s111",
+
+def _payload(kind: str) -> dict[str, object]:
+    # This is a complete formal-shaped task payload, not a minimal PASS blob.
+    value: dict[str, object] = {
+        "schema_version": f"stage1-s1-11-{kind}-v1",
+        "status": "PASS",
+        "task_id": "stage1.11_reporting_and_exit_gate",
+        "gate_id": "G1-EXIT",
+        "scope": "immutable formal evidence",
+        "requirements": {"all_required_checks": True, "unresolved_failure_count": 0},
+        "dependency_index_sha256": {"G1-RESUME": "a" * 64},
+        "source_artifact_hashes": {"formal_observation": "b" * 64},
+        "measured": [{"requirement_id": "S1.11-01", "measured": True, "threshold": "PASS"}],
+    }
+    value["artifact_hash"] = canonical_json_hash(value)
+    return value
+
+
+def test_group_publish_is_idempotent_and_recovers_missing_commit(tmp_path: Path) -> None:
+    formalizer = _formalizer()
+    source = tmp_path / "evidence/source.json"
+    source.parent.mkdir(parents=True)
+    write_canonical_json(source, {"schema_version": "source-v1", "status": "PASS"})
+    kinds = tuple(formalizer.S111_TASK_ARTIFACT_KINDS)
+    payloads = {kind: _payload(kind) for kind in kinds}
+    refs = tuple(sorted(("evidence/source.json", "outputs/s111/producer-config.json")))
+    config_hash = "c" * 64
+    first = formalizer._publish_emit_group(
+        evidence_root=tmp_path, output_dir="outputs/s111",
+        task_id="stage1.11_reporting_and_exit_gate", artifact_kinds=kinds,
+        config_hash=config_hash, source_refs=refs, payloads=payloads,
     )
-    second = formalizer.emit_task_artifacts(
-        repository=Path.cwd(), evidence_root=tmp_path,
-        output_dir="outputs/s111",
+    second = formalizer._publish_emit_group(
+        evidence_root=tmp_path, output_dir="outputs/s111",
+        task_id="stage1.11_reporting_and_exit_gate", artifact_kinds=kinds,
+        config_hash=config_hash, source_refs=refs, payloads=payloads,
     )
     assert first == second
-    assert set(first["commit_refs"]) == set(formalizer.S111_TASK_ARTIFACT_KINDS)
-    for kind, ref in first["commit_refs"].items():
-        commit = load_canonical_json(tmp_path / ref)
-        payload = load_canonical_json(tmp_path / commit["object_ref"])["payload"]
-        assert payload == authority["roles"][kind]
-        assert commit["formal_eligible"] is True
+    missing = tmp_path / first["commit_refs"]["gate_summary"]
+    missing.unlink()
+    (tmp_path / first["success_ref"]).unlink()
+    resumed = formalizer._publish_emit_group(
+        evidence_root=tmp_path, output_dir="outputs/s111",
+        task_id="stage1.11_reporting_and_exit_gate", artifact_kinds=kinds,
+        config_hash=config_hash, source_refs=refs, payloads=payloads,
+    )
+    assert resumed == first
+    assert (tmp_path / resumed["success_ref"]).is_file()
 
 
-def test_emit_fails_closed_on_role_commit_config_and_symlink_drift(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_group_fails_closed_on_payload_config_commit_and_symlink_drift(tmp_path: Path) -> None:
     formalizer = _formalizer()
-    authority = _fake_authority(tmp_path, formalizer)
-    monkeypatch.setattr(formalizer, "_emit_load_r4", lambda **_: authority)
-    result = formalizer.emit_task_artifacts(
-        repository=Path.cwd(), evidence_root=tmp_path,
-        output_dir="outputs/s111",
+    kinds = tuple(formalizer.S111_TASK_ARTIFACT_KINDS)
+    payloads = {kind: _payload(kind) for kind in kinds}
+    refs = ("outputs/s111/producer-config.json",)
+    formalizer._publish_emit_group(
+        evidence_root=tmp_path, output_dir="outputs/s111",
+        task_id="stage1.11_reporting_and_exit_gate", artifact_kinds=kinds,
+        config_hash="d" * 64, source_refs=refs, payloads=payloads,
     )
-
-    # A changed released role cannot be silently republished over an existing
-    # commit, even when the replacement is internally self-hashed.
-    replacement = dict(authority["roles"]["stage_report"])
-    replacement["role_shape"] = {"tampered": True}
-    replacement["artifact_hash"] = canonical_json_hash(
-        {key: value for key, value in replacement.items() if key != "artifact_hash"}
-    )
-    authority["roles"]["stage_report"] = replacement
-    with pytest.raises(formalizer.Stage1S111FormalError, match="EXISTING_PAYLOAD_DRIFT"):
-        formalizer.emit_task_artifacts(
-            repository=Path.cwd(), evidence_root=tmp_path,
-            output_dir="outputs/s111",
+    tampered = dict(payloads["stage_report"])
+    tampered["measured"] = [{"requirement_id": "S1.11-01", "measured": False, "threshold": "PASS"}]
+    tampered["artifact_hash"] = canonical_json_hash({k: v for k, v in tampered.items() if k != "artifact_hash"})
+    changed = dict(payloads)
+    changed["stage_report"] = tampered
+    with pytest.raises(formalizer.Stage1S111FormalError, match="GROUP_MANIFEST_IDENTITY_DRIFT"):
+        formalizer._publish_emit_group(
+            evidence_root=tmp_path, output_dir="outputs/s111",
+            task_id="stage1.11_reporting_and_exit_gate", artifact_kinds=kinds,
+            config_hash="d" * 64, source_refs=refs, payloads=changed,
         )
-
-    # Config drift is checked before the store can discover/reuse commits.
-    config_path = tmp_path / result["config_ref"]
-    config = load_canonical_json(config_path)
-    config["config_kind"] = "training-config-forbidden"
-    write_canonical_json(config_path, config)
-    authority["roles"]["stage_report"] = replacement
-    with pytest.raises(formalizer.Stage1S111FormalError, match="PRODUCER_CONFIG_IDENTITY_DRIFT"):
-        formalizer.emit_task_artifacts(
-            repository=Path.cwd(), evidence_root=tmp_path,
-            output_dir="outputs/s111",
+    with pytest.raises(formalizer.Stage1S111FormalError, match="GROUP_MANIFEST_IDENTITY_DRIFT"):
+        formalizer._publish_emit_group(
+            evidence_root=tmp_path, output_dir="outputs/s111",
+            task_id="stage1.11_reporting_and_exit_gate", artifact_kinds=kinds,
+            config_hash="e" * 64, source_refs=refs, payloads=payloads,
         )
-
-    # Existing output roots are never followed through a symlink.
+    commit = tmp_path / "outputs/s111/commits/stage_report.json"
+    write_canonical_json(commit, {"tampered": True})
+    with pytest.raises(formalizer.Stage1S111FormalError, match="EXISTING_COMMIT_INVALID"):
+        formalizer._publish_emit_group(
+            evidence_root=tmp_path, output_dir="outputs/s111",
+            task_id="stage1.11_reporting_and_exit_gate", artifact_kinds=kinds,
+            config_hash="d" * 64, source_refs=refs, payloads=payloads,
+        )
     linked = tmp_path / "outputs/linked"
     target = tmp_path / "outside"
     target.mkdir()
@@ -145,7 +169,22 @@ def test_emit_fails_closed_on_role_commit_config_and_symlink_drift(tmp_path: Pat
     except (OSError, NotImplementedError):
         pytest.skip("symlink creation is unavailable on this Windows runner")
     with pytest.raises(formalizer.Stage1S111FormalError, match="SYMLINK_FORBIDDEN"):
+        formalizer._publish_emit_group(
+            evidence_root=tmp_path, output_dir="outputs/linked",
+            task_id="stage1.11_reporting_and_exit_gate", artifact_kinds=kinds,
+            config_hash="f" * 64, source_refs=refs, payloads=payloads,
+        )
+
+
+def test_evidence_root_symlink_is_rejected_before_resolution(tmp_path: Path) -> None:
+    formalizer = _formalizer()
+    linked = tmp_path / "linked-root"
+    try:
+        linked.symlink_to(tmp_path, target_is_directory=True)
+    except (OSError, NotImplementedError):
+        pytest.skip("symlink creation is unavailable on this Windows runner")
+    with pytest.raises(formalizer.Stage1S111FormalError, match="DATA_ROOT_SYMLINK_FORBIDDEN"):
         formalizer.emit_task_artifacts(
-            repository=Path.cwd(), evidence_root=tmp_path,
-            output_dir="outputs/linked",
+            repository=Path.cwd(), evidence_root=linked,
+            output_dir="outputs/s111", approved_data_root=tmp_path,
         )
