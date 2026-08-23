@@ -528,7 +528,7 @@ def test_repository_any_tracked_or_untracked_change_blocks(tmp_path: Path) -> No
     subprocess.run(["git", "worktree", "add", "--detach", str(clone), _head()], check=True, capture_output=True)
     data_root, refs, config_ref, _ = _fixture(tmp_path / "fixture-clean-check")
     try:
-        tracked = clone / "README.md"
+        tracked = clone / "Readme.md"
         tracked.write_text(tracked.read_text(encoding="utf-8") + "\ntracked drift\n", encoding="utf-8")
         (clone / "untracked-review-file.txt").write_text("untracked drift\n", encoding="utf-8")
         result = evaluate_formal_g20(
@@ -550,9 +550,9 @@ def test_ancestor_producer_with_critical_sources_equal_is_compatible(tmp_path: P
     try:
         producer_commit = _head(clone)
         subprocess.run(["git", "-C", str(clone), "switch", "-c", "compatibility-test"], check=True, capture_output=True)
-        tracked = clone / "README.md"
+        tracked = clone / "Readme.md"
         tracked.write_text(tracked.read_text(encoding="utf-8") + "\ncompatible producer consumer change\n", encoding="utf-8")
-        subprocess.run(["git", "-C", str(clone), "add", "README.md"], check=True, capture_output=True)
+        subprocess.run(["git", "-C", str(clone), "add", "Readme.md"], check=True, capture_output=True)
         subprocess.run(
             ["git", "-C", str(clone), "-c", "user.name=G20 Test", "-c", "user.email=g20@example.invalid", "commit", "-m", "compatible consumer"],
             check=True,
@@ -573,15 +573,28 @@ def test_ancestor_producer_with_critical_sources_equal_is_compatible(tmp_path: P
 
 
 def test_ancestor_producer_with_critical_source_drift_is_rejected(tmp_path: Path) -> None:
-    old_producer = _head(ROOT)  # the current source family is the trusted consumer
-    # The immediately previous evaluator commit is a real ancestor but has a
-    # different evaluator source blob, so it must not be accepted as compatible.
-    old_producer = subprocess.run(
-        ["git", "-C", str(ROOT), "rev-parse", f"{old_producer}^"],
+    # Find the nearest real ancestor whose evaluator source blob predates the
+    # trusted current source family; it is an ancestor but not compatible.
+    history = subprocess.run(
+        ["git", "-C", str(ROOT), "rev-list", "HEAD"],
         check=True,
         capture_output=True,
         text=True,
-    ).stdout.strip()
+    ).stdout.splitlines()
+    current_blob = subprocess.run(
+        ["git", "-C", str(ROOT), "show", f"{history[0]}:{EVALUATOR_SOURCE_PATH}"],
+        check=True,
+        capture_output=True,
+    ).stdout
+    old_producer = next(
+        candidate
+        for candidate in history[1:]
+        if subprocess.run(
+            ["git", "-C", str(ROOT), "show", f"{candidate}:{EVALUATOR_SOURCE_PATH}"],
+            check=True,
+            capture_output=True,
+        ).stdout != current_blob
+    )
     data_root, refs, config_ref, _ = _fixture(tmp_path, producer_commit=old_producer)
     result = _evaluate(data_root, refs, config_ref)
     assert result["status"] == "BLOCKED"
