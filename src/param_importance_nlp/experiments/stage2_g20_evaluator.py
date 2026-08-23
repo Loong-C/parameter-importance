@@ -454,6 +454,7 @@ def _load_resolved_config(data_root: Path, reference: object) -> _ResolvedConfig
         raise G20Blocked("resolved_config_ref:OBJECT_REQUIRED")
     # A config may itself be persisted as a formal TaskArtifact.  Direct JSON
     # is also accepted, but only when it parses as the strict V2 wire object.
+    envelope_config_hash: str | None = None
     if value.get("schema_version") == "task-output-commit-v1":
         item = _load_committed(data_root, ref)
         payload = item.payload
@@ -461,6 +462,7 @@ def _load_resolved_config(data_root: Path, reference: object) -> _ResolvedConfig
             raise G20Blocked("resolved_config_ref:WRONG_TASK_OR_KIND")
         if payload.get("schema_version") != "resolved-config-v2":
             raise G20Blocked("resolved_config_ref:V2_PAYLOAD_REQUIRED")
+        envelope_config_hash = item.identity.config_hash
         value = payload
     try:
         config = ResolvedConfigV2.from_mapping(value)  # type: ignore[arg-type]
@@ -470,6 +472,8 @@ def _load_resolved_config(data_root: Path, reference: object) -> _ResolvedConfig
         raise G20Blocked("resolved_config_ref:WRONG_TASK_ID")
     if config.run_intent != "formal" or config.formal_eligible is not True:
         raise G20Blocked("resolved_config_ref:FORMAL_CONFIG_REQUIRED")
+    if envelope_config_hash is not None and envelope_config_hash != config.config_hash:
+        raise G20Blocked("resolved_config_ref:ENVELOPE_CONFIG_HASH_MISMATCH")
     return _ResolvedConfigBinding(ref, config)
 
 
