@@ -22,7 +22,9 @@ from param_importance_nlp.experiments import (
     FORMAL_TOTAL_TRAINING_STEPS,
 )
 from param_importance_nlp.experiments.stage23_task_runners import (
+    _formal_stage1_report_artifact_hash,
     _formal_stage2_asset_manifest,
+    _predecessor_context,
     _run_formal_stage2_assets_and_sampling,
     _REQUIRED_PREDECESSORS,
     build_stage23_runner_overrides,
@@ -97,6 +99,69 @@ def _payload(root: Path, commit_ref: str) -> dict[str, object]:
     payload = body["payload"]
     assert isinstance(payload, dict)
     return payload
+
+
+def _formal_stage2_01_request(
+    input_result_refs: tuple[str, ...],
+) -> TaskExecutionRequest:
+    task_id = "stage2.01_scope_hypotheses_and_preregistration"
+    value = _base_for(task_id)
+    identity = value["identity"]
+    assert isinstance(identity, dict)
+    identity.update(
+        {
+            "run_intent": "formal",
+            "formal_eligible": True,
+            "route": "pretrain",
+        }
+    )
+    runtime = value["runtime"]
+    assert isinstance(runtime, dict)
+    runtime.update({"allow_dirty_worktree": False, "device": "cuda"})
+    config = load_resolved_config_compatible(
+        value,
+        task_id=task_id,
+        overrides={
+            "artifacts": {"output_dir": "runs/formal-s21"},
+            "orchestration": {"input_result_refs": list(input_result_refs)},
+        },
+    )
+    return TaskExecutionRequest(
+        config=config,
+        task=DEFAULT_TASK_CATALOG.get(task_id),
+        environment=TaskRuntimeEnvironment(),
+    )
+
+
+def _publish_formal_stage1_predecessor(
+    root: Path,
+) -> tuple[TaskArtifactStore, tuple[str, ...], str]:
+    store = TaskArtifactStore(root, "runs/stage1-11")
+    config_hash = "c" * 64
+    refs: list[str] = []
+    report_hash = ""
+    for kind in DEFAULT_TASK_CATALOG.get(
+        "stage1.11_reporting_and_exit_gate"
+    ).artifact_kinds:
+        payload: dict[str, object] = {"schema_version": f"stage1-{kind}-v1"}
+        if kind == "stage_report":
+            # Deliberately differ from the TaskArtifact envelope hash.  The
+            # runner must bind the latter, not this payload compatibility field.
+            payload["artifact_hash"] = "p" * 64
+        published = store.publish(
+            task_id="stage1.11_reporting_and_exit_gate",
+            artifact_kind=kind,
+            config_hash=config_hash,
+            run_intent="formal",
+            formal_eligible=True,
+            source_refs=("evidence/stage1-11-bridge-evidence.json",),
+            payload=payload,
+        )
+        refs.append(published.commit_ref)
+        if kind == "stage_report":
+            report_hash = published.artifact_hash
+    assert report_hash
+    return store, tuple(refs), report_hash
 
 
 STAGE23_TASK_IDS = tuple(
@@ -667,6 +732,31 @@ def test_formal_runner_missing_execution_evidence_is_blocked_before_synthetic_fa
         artifact_kinds=DEFAULT_TASK_CATALOG.get(task_id).artifact_kinds,
         formal_eligible=True,
     ) is None
+
+
+def test_formal_stage1_predecessor_binds_verified_envelope_hash(
+    tmp_path: Path,
+) -> None:
+    store, refs, envelope_hash = _publish_formal_stage1_predecessor(tmp_path)
+    request = _formal_stage2_01_request(refs)
+
+    inputs = _predecessor_context(request, tmp_path, store)
+
+    assert _formal_stage1_report_artifact_hash(inputs) == envelope_hash
+    assert _formal_stage1_report_artifact_hash(inputs) != "p" * 64
+
+
+def test_formal_stage1_predecessor_wrong_hash_fails_closed(tmp_path: Path) -> None:
+    store, refs, _envelope_hash = _publish_formal_stage1_predecessor(tmp_path)
+    report_commit = tmp_path / Path(refs[0])
+    commit = load_canonical_json(report_commit)
+    assert isinstance(commit, dict)
+    commit["artifact_hash"] = "d" * 64
+    write_canonical_json(report_commit, commit)
+
+    request = _formal_stage2_01_request(refs)
+    with pytest.raises(TaskBlockedError, match="前序引用不可验证"):
+        _predecessor_context(request, tmp_path, store)
 
 
 def _formal_assets_request(tmp_path: Path, *, evidence_ref: str | None) -> TaskExecutionRequest:

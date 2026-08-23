@@ -1559,6 +1559,28 @@ def _stage1_formal_bridge_identity(
     return dict(value)
 
 
+def _formal_stage1_report_artifact_hash(inputs: _PredecessorContext) -> str:
+    """Return the authoritative envelope hash for the formal Stage 1 report.
+
+    ``_BoundInputArtifact.artifact_hash`` is copied from the verified task commit;
+    it is intentionally distinct from a payload field named ``artifact_hash``.
+    The latter is a business-payload hash and is not a valid Stage 1 provenance
+    binding for the formal evaluator.
+    """
+
+    matches = [
+        item
+        for item in inputs.artifacts
+        if item.artifact_kind == "stage_report"
+    ]
+    if len(matches) != 1:
+        raise ValueError("STAGE2_STAGE1_REPORT_ARTIFACT_NOT_UNIQUE")
+    report = matches[0]
+    if report.run_intent != "formal" or report.formal_eligible is not True:
+        raise ValueError("STAGE2_STAGE1_REPORT_FORMAL_ARTIFACT_REQUIRED")
+    return report.artifact_hash
+
+
 def _run_stage2_contract(
     request: TaskExecutionRequest,
     root: Path,
@@ -1589,13 +1611,22 @@ def _run_stage2_contract(
         if request.config.run_intent == "formal"
         else None
     )
+    formal_stage1_report_hash = (
+        _formal_stage1_report_artifact_hash(inputs)
+        if stage1_handoff is not None
+        else None
+    )
     preregistration = build_stage2_preregistration(
         seed_plan_hash=seed_plan.artifact_hash,
         producer_commit=producer_commit,
         mathematics_hash=mathematics_hash,
-        # The repository report is retained only for local-draft compatibility;
-        # formal provenance is the immutable DATA_ROOT bridge below.
-        stage1_report_hash=(None if stage1_handoff is not None else stage1_report_hash),
+        # Formal provenance binds the verified Stage 1 task-artifact envelope;
+        # the tracked report remains local-draft compatibility only.
+        stage1_report_hash=(
+            formal_stage1_report_hash
+            if formal_stage1_report_hash is not None
+            else stage1_report_hash
+        ),
         upstream_binding_hash=inputs.binding_hash,
         stage1_handoff=stage1_handoff,
         scope=request.config.run_intent,
