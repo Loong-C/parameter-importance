@@ -125,6 +125,7 @@ from .stage2_assets import (
     CheckpointRecord,
     DataFile,
     DataRangeManifest,
+    validate_formal_asset_identity,
 )
 from .stage2 import PairedEstimatorRunner, build_fixture_estimator_decision
 from .preregistration import (
@@ -204,6 +205,15 @@ _STAGE23_TASK_ORDER = (
 _REQUIRED_PREDECESSORS: Mapping[str, tuple[str, ...]] = {
     task_id: (() if index == 0 else (_STAGE23_TASK_ORDER[index - 1],))
     for index, task_id in enumerate(_STAGE23_TASK_ORDER)
+}
+# S2.3 is a DAG sibling of the S2.2 handoff: its only task predecessor is the
+# frozen S2.1 preregistration.  Stage 1/formal asset evidence is supplied by
+# the environment and is intentionally not smuggled in through S2.2.
+_REQUIRED_PREDECESSORS = {
+    **_REQUIRED_PREDECESSORS,
+    "stage2.03_assets_checkpoints_and_sampling": (
+        "stage2.01_scope_hypotheses_and_preregistration",
+    ),
 }
 
 
@@ -1080,19 +1090,180 @@ def _provider_context(request: TaskExecutionRequest, root: Path) -> _ProviderCon
 
 
 def _sampling_plan(request: TaskExecutionRequest, context: _ProviderContext) -> SamplingPlan:
-    identity = request.config.base_config.section("identity")
-    seed_plan = SeedPlan.from_master_seed(int(identity["master_seed"]))
-    universe = SamplingUniverse(
+    return _sampling_plan_for_ids(
+        request,
+        context.sample_ids,
         universe_id=f"{context.provider.fixed_state_id}-universe",
-        sample_ids=context.sample_ids,
         metadata={
             "registry_hash": context.provider.registry_hash,
             "provider_state_digest": context.provider.state_digest(),
         },
     )
+
+
+def _sampling_plan_for_ids(
+    request: TaskExecutionRequest,
+    sample_ids: Sequence[Hashable],
+    *,
+    universe_id: str,
+    metadata: Mapping[str, object],
+) -> SamplingPlan:
+    """Build the frozen stream plan without requiring a gradient provider.
+
+    Formal S2.3 validates the six-cell asset resolution independently of the
+    later fixed-state gradient provider, so it still needs a deterministic
+    empirical-universe plan while no model is queried.
+    """
+
+    identity = request.config.base_config.section("identity")
+    seed_plan = SeedPlan.from_master_seed(int(identity["master_seed"]))
+    universe = SamplingUniverse(
+        universe_id=universe_id,
+        sample_ids=tuple(sample_ids),
+        metadata=metadata,
+    )
     return SamplingPlan(
         universe=universe,
         stream_seeds={name: seed_plan.seed_for(name) for name in STREAM_NAMES},
+    )
+
+
+def _formal_stage2_asset_manifest(
+    request: TaskExecutionRequest,
+    root: Path,
+) -> tuple[AssetResolutionManifest, str]:
+    """Load the independently published formal S2.3 asset resolution.
+
+    S2.3 must not synthesize a fixture matrix under ``formal``.  The manifest
+    is supplied through environment evidence so this task remains parallel to
+    the S2.2 handoff and can be audited without reading gradients.
+    """
+
+    reference = request.environment.evidence_refs.get("stage2_asset_resolution")
+    if reference is None:
+        raise _blocked(
+            BlockerCode.ASSET_UNAVAILABLE,
+            "stage2_asset_resolution",
+            "formal S2.3 requires an environment-bound asset resolution manifest",
+        )
+    try:
+        value = load_canonical_json(_workspace_path(root, reference, field="stage2_asset_resolution"))
+        if not isinstance(value, Mapping):
+            raise ValueError("stage2 asset resolution must be an object")
+        manifest = AssetResolutionManifest.from_mapping(value)
+    except (FileNotFoundError, TypeError, ValueError) as error:
+        raise _blocked(
+            BlockerCode.ASSET_UNAVAILABLE,
+            "stage2_asset_resolution",
+            f"formal S2.3 asset resolution is unreadable: {type(error).__name__}: {error}",
+            retryable=False,
+            evidence_refs=(reference,),
+        ) from error
+    if manifest.scope != "formal" or manifest.status != "READY":
+        raise _blocked(
+            BlockerCode.ASSET_UNAVAILABLE,
+            "stage2_asset_resolution",
+            "formal S2.3 requires a READY formal six-cell asset matrix",
+            retryable=False,
+            evidence_refs=(reference,),
+        )
+    try:
+        validate_formal_asset_identity(manifest)
+    except ValueError as error:
+        raise _blocked(
+            BlockerCode.CONTRACT_UNFROZEN,
+            "stage2_asset_identity",
+            f"formal S2.3 asset identity drifted: {error}",
+            retryable=False,
+            evidence_refs=(reference,),
+        ) from error
+    return manifest, reference
+
+
+def _run_formal_stage2_assets_and_sampling(
+    request: TaskExecutionRequest,
+    root: Path,
+    inputs: _PredecessorContext,
+) -> tuple[Mapping[str, Mapping[str, JSONValue]], tuple[str, ...]]:
+    """Publish the formal S2.3 candidate from the independent asset evidence."""
+
+    assets, asset_reference = _formal_stage2_asset_manifest(request, root)
+    data_range = assets.data_range
+    sample_ids = tuple(range(data_range.sample_id_min, data_range.sample_id_max_exclusive))
+    sampling = _sampling_plan_for_ids(
+        request,
+        sample_ids,
+        universe_id=f"{assets.digest}-universe",
+        metadata={
+            "asset_resolution_hash": assets.digest,
+            "data_range_hash": data_range.digest,
+            "sampling_design": data_range.sampling_design,
+            "upstream_binding_hash": inputs.binding_hash,
+        },
+    )
+    if SamplingPlan.from_mapping(sampling.to_dict()).digest != sampling.digest:
+        raise RuntimeError("STAGE2_FORMAL_SAMPLING_PLAN_ROUNDTRIP_DRIFT")
+    stream_manifests = {
+        stream: sampling.draw_manifest(stream, 4).to_manifest()
+        for stream in STREAM_NAMES
+    }
+    draw_rows = [
+        draw.to_manifest()
+        for stream in STREAM_NAMES
+        for draw in sampling.draws(stream, 4)  # type: ignore[arg-type]
+    ]
+    if len({str(row["draw_id"]) for row in draw_rows}) != len(draw_rows):
+        raise RuntimeError("STAGE2_FORMAL_DRAW_ID_COLLISION")
+    nested_mapping = RepetitionMapping.create(
+        repetition_id="stage2-formal-sampling-nested-fixture",
+        draws=sampling.draws("pilot", 8),
+        m_values=(2, 4, 8),
+    )
+    provider_payload: dict[str, JSONValue] = {
+        "provider_kind": "offline_hf_stage2_asset_manifest",
+        "asset_resolution_hash": assets.digest,
+        "data_range_hash": data_range.digest,
+        "sample_universe_size": len(sample_ids),
+        "sampling_design": data_range.sampling_design,
+        "asset_manifest_hashes": [assets.digest],
+        "asset_provenance": [
+            {
+                "model_id": record.model_id,
+                "training_stage": record.training_stage,
+                "revision": record.revision,
+                "load_evidence_ref": record.load_evidence_ref,
+            }
+            for record in assets.checkpoints
+        ],
+    }
+    return (
+        {
+            "sampling_plan": sampling.to_dict(),  # type: ignore[dict-item]
+            "draw_manifest": {
+                "schema_version": "stage2-task-draw-manifest-v1",
+                "sampling_plan_hash": sampling.digest,
+                "draws": draw_rows,  # type: ignore[dict-item]
+                "draw_count_by_stream": {name: 4 for name in STREAM_NAMES},
+                "stream_manifests": stream_manifests,
+                "draw_id_unique": True,
+                "sample_id_collisions_allowed": True,
+                "replay_hash": canonical_json_hash(draw_rows),
+                "nested_mapping": nested_mapping.to_dict(),
+                "nested_mapping_hash": nested_mapping.digest,
+            },
+            "asset_resolution": {
+                "schema_version": "stage2-task-asset-resolution-v1",
+                "provider": provider_payload,
+                "stage2_asset_manifest": assets.to_dict(),
+                "preregistration_contract_hash": canonical_json_hash(
+                    inputs.payload("preregistration")
+                ),
+                "upstream_binding_hash": inputs.binding_hash,
+                "formal_eligible": False,
+            },
+            "gate_record": _gate_candidate(request),
+        },
+        tuple(dict.fromkeys((*inputs.references, asset_reference))),
     )
 
 
@@ -1316,20 +1487,13 @@ def _run_stage2_assets_and_sampling(
     """解析 provider，并实际生成五条可重放 draw stream 的小型 manifest。"""
 
     inputs = _predecessor_context(request, root, store)
-    fixed_state = inputs.payload("fixed_state_contract")
+    # Formal S2.3 is a DAG sibling of S2.2 and consumes only S2.1 plus the
+    # independently published asset evidence; it must never construct a
+    # fixture matrix or bind to a handoff fixed-state contract.
+    if request.config.run_intent == "formal":
+        return _run_formal_stage2_assets_and_sampling(request, root, inputs)
+
     context = _provider_context(request, root)
-    if (
-        fixed_state.get("fixed_state_id") != context.provider.fixed_state_id
-        or fixed_state.get("provider_state_digest") != context.provider.state_digest()
-        or fixed_state.get("registry_hash") != context.provider.registry_hash
-    ):
-        raise _blocked(
-            BlockerCode.ASSET_UNAVAILABLE,
-            "fixed_state_provider_binding",
-            "当前 provider 与前序 fixed_state_contract 身份不一致",
-            retryable=False,
-            evidence_refs=inputs.references,
-        )
     sampling = _sampling_plan(request, context)
     # 公共 loader round-trip 与同区间重放是抽样合同的一部分；两者都在发布前执行。
     if SamplingPlan.from_mapping(sampling.to_dict()).digest != sampling.digest:
@@ -1363,6 +1527,7 @@ def _run_stage2_assets_and_sampling(
     fixture_files = (
         CheckpointFile("model.safetensors", 1, "1" * 64, "weights"),
         CheckpointFile("config.json", 1, "2" * 64, "config"),
+        CheckpointFile("tokenizer.json", 1, "4" * 64, "tokenizer"),
     )
     fixture_checkpoints = tuple(
         CheckpointRecord(
@@ -1428,7 +1593,9 @@ def _run_stage2_assets_and_sampling(
             "schema_version": "stage2-task-asset-resolution-v1",
             "provider": context.to_payload(),
             "stage2_asset_manifest": fixture_assets.to_dict(),
-            "fixed_state_contract_hash": canonical_json_hash(fixed_state),
+            "preregistration_contract_hash": canonical_json_hash(
+                inputs.payload("preregistration")
+            ),
             "upstream_binding_hash": inputs.binding_hash,
             "formal_eligible": False,
         },

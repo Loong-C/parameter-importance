@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import json
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -18,6 +19,13 @@ from param_importance_nlp.experiments import (
     SamplingPlan,
     SamplingUniverse,
     build_data_range_from_prefix,
+    FORMAL_CHECKPOINT_SELECTION,
+    FORMAL_DATASET_ID,
+    FORMAL_DATASET_REVISION,
+    FORMAL_DATA_FILES,
+    FORMAL_DATA_MANIFEST_SHA256,
+    FORMAL_TOTAL_TRAINING_STEPS,
+    validate_formal_asset_identity,
 )
 from param_importance_nlp.cli import _validate_known_artifact
 
@@ -49,7 +57,11 @@ def _checkpoint(model: str, stage: str) -> CheckpointRecord:
         revision="0" * 40,
         root_ref=f"fixture/models/{model}/{stage}",
         state="ready",
-        files=(CheckpointFile("model.safetensors", 1, "1" * 64, "weights"),),
+        files=(
+            CheckpointFile("model.safetensors", 1, "1" * 64, "weights"),
+            CheckpointFile("config.json", 1, "2" * 64, "config"),
+            CheckpointFile("tokenizer.json", 1, "3" * 64, "tokenizer"),
+        ),
         manifest_ref=f"fixture/manifests/{model}-{stage}.json",
         manifest_sha256="2" * 64,
         parameter_registry_hash="3" * 64,
@@ -71,6 +83,56 @@ def _data_range() -> DataRangeManifest:
         shard_size_bytes=30_000_000_000,
         index_sha256="d" * 64,
         index_size_bytes=1_757_184_042,
+    )
+
+
+def _formal_manifest() -> AssetResolutionManifest:
+    records = []
+    for index, ((model, stage), (step, revision)) in enumerate(FORMAL_CHECKPOINT_SELECTION.items()):
+        digest = f"{index + 1:064x}"
+        records.append(
+            CheckpointRecord(
+                model_id=model,
+                training_stage=stage,
+                checkpoint_id=f"formal-{model}-{stage}",
+                training_step=step,
+                total_training_steps=FORMAL_TOTAL_TRAINING_STEPS,
+                target_fraction={"initialization": 0.0, "early": 0.01, "mid_late": 0.5}[stage],
+                repository=f"EleutherAI/{model}",
+                revision=revision,
+                root_ref=f"models/{model}/{stage}",
+                state="ready",
+                files=(
+                    CheckpointFile("model.safetensors", 1, digest, "weights"),
+                    CheckpointFile("config.json", 1, digest, "config"),
+                    CheckpointFile("tokenizer.json", 1, digest, "tokenizer"),
+                ),
+                manifest_ref=f"manifests/{model}-{stage}.json",
+                manifest_sha256=digest,
+                parameter_registry_hash=digest,
+                config_sha256=digest,
+                tokenizer_sha256=digest,
+                load_status="passed",
+                load_evidence_ref=f"evidence/{model}-{stage}.json",
+                load_evidence_sha256=digest,
+            )
+        )
+    data = DataRangeManifest(
+        dataset_id=FORMAL_DATASET_ID,
+        revision=FORMAL_DATASET_REVISION,
+        manifest_ref="manifests/stage2/pile-prefix.json",
+        manifest_sha256=FORMAL_DATA_MANIFEST_SHA256,
+        files=tuple(
+            DataFile(path, size, sha, "token_shard" if path.endswith(".bin") else "index")
+            for path, (size, sha) in FORMAL_DATA_FILES.items()
+        ),
+    )
+    return AssetResolutionManifest(
+        scope="formal",
+        checkpoints=tuple(records),
+        data_range=data,
+        producer_commit="1" * 40,
+        execution_commit="2" * 40,
     )
 
 
@@ -153,6 +215,20 @@ def test_asset_resolution_matrix_reports_missing_stage_as_blocked() -> None:
     assert manifest.status == "BLOCKED"
     restored = AssetResolutionManifest.from_mapping(manifest.to_dict())
     assert restored.digest == manifest.digest
+
+
+def test_formal_asset_identity_rejects_frozen_revision_drift() -> None:
+    manifest = _formal_manifest()
+    validate_formal_asset_identity(manifest)
+    drifted = replace(
+        manifest,
+        checkpoints=tuple(
+            replace(record, revision="f" * 40) if index == 1 else record
+            for index, record in enumerate(manifest.checkpoints)
+        ),
+    )
+    with pytest.raises(ValueError, match="selection/revision drift"):
+        validate_formal_asset_identity(drifted)
 
 
 def test_public_schemas_are_strict_json_objects() -> None:

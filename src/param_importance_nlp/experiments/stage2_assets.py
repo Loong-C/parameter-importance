@@ -27,6 +27,22 @@ TARGET_FRACTIONS = {
     "early": 0.01,
     "mid_late": 0.50,
 }
+FORMAL_CHECKPOINT_SELECTION = {
+    ("pythia-14m", "initialization"): (0, "56079904bb80b7f36d3b794089f146e7a4d6efae"),
+    ("pythia-14m", "early"): (1000, "5b020995bfc7aee2931b0f35bd70cf7ee8b1db62"),
+    ("pythia-14m", "mid_late"): (71000, "6a9156279d41c80dea69f043e25818cb3e596f56"),
+    ("pythia-31m-deduped", "initialization"): (0, "73628c85dd9d12d43c07be77ebcf10cef5fd9660"),
+    ("pythia-31m-deduped", "early"): (1000, "dd4d3eab2b004272fee4a3d321064fa65e5e1ee6"),
+    ("pythia-31m-deduped", "mid_late"): (71000, "aeafbd5e62a3e5cd6e9f4106167f31e7fec47b41"),
+}
+FORMAL_TOTAL_TRAINING_STEPS = 143000
+FORMAL_DATASET_ID = "dbbfeb12bab4027b386bd97d604d8134699e96f79e309cceacff7999a55b5dad"
+FORMAL_DATASET_REVISION = "4647773ea142ab1ff5694602fa104bbf49088408"
+FORMAL_DATA_MANIFEST_SHA256 = "d53e9365bd2da3aab0ea220d496aa793175ba7690daa2180299940a2bd6ca4c9"
+FORMAL_DATA_FILES = {
+    "document-00000-of-00020.bin": (30000000000, "1ce355bd2683627d0ff689f8578115cf3df84bd1edf3410e6aca9705d31fc6ea"),
+    "document.idx": (1757184042, "1d9fdd760295eb2007a4874440b27c559ca722239fa2814aa8a2ee6724b7852f"),
+}
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _REVISION = re.compile(r"^[0-9a-f]{40,64}$")
 
@@ -186,6 +202,21 @@ class CheckpointRecord:
                 raise ValueError("ready checkpoint requires passed offline load evidence")
             if self.load_evidence_ref is None or self.load_evidence_sha256 is None:
                 raise ValueError("ready checkpoint requires load evidence reference and hash")
+            if (
+                self.manifest_ref is None
+                or self.manifest_sha256 is None
+                or self.parameter_registry_hash is None
+                or self.config_sha256 is None
+                or self.tokenizer_sha256 is None
+            ):
+                raise ValueError(
+                    "ready checkpoint requires manifest, registry, config and tokenizer hashes"
+                )
+            roles = {item.role for item in files}
+            if not {"weights", "config", "tokenizer"}.issubset(roles):
+                raise ValueError(
+                    "ready checkpoint files require weights, config and tokenizer roles"
+                )
         else:
             if self.missing_reason is None:
                 raise ValueError("blocked checkpoint requires missing_reason")
@@ -526,6 +557,38 @@ class AssetResolutionManifest:
         return result
 
 
+def validate_formal_asset_identity(manifest: AssetResolutionManifest) -> None:
+    """Reject a structurally valid formal manifest with scientific drift."""
+
+    if manifest.scope != "formal" or manifest.status != "READY":
+        raise ValueError("formal asset manifest must be READY")
+    observed = {
+        (item.model_id, item.training_stage): (item.training_step, item.revision)
+        for item in manifest.checkpoints
+    }
+    if observed != FORMAL_CHECKPOINT_SELECTION:
+        raise ValueError("formal checkpoint selection/revision drift")
+    if any(
+        item.total_training_steps != FORMAL_TOTAL_TRAINING_STEPS
+        or item.repository != f"EleutherAI/{item.model_id}"
+        for item in manifest.checkpoints
+    ):
+        raise ValueError("formal checkpoint repository/total-step drift")
+    data = manifest.data_range
+    observed_files = {item.path: (item.size_bytes, item.sha256) for item in data.files}
+    if (
+        data.dataset_id != FORMAL_DATASET_ID
+        or data.revision != FORMAL_DATASET_REVISION
+        or data.manifest_sha256 != FORMAL_DATA_MANIFEST_SHA256
+        or observed_files != FORMAL_DATA_FILES
+        or (data.sample_id_min, data.sample_id_max_exclusive) != (0, 524_288)
+        or (data.source_tokens_per_record, data.input_sequence_length, data.effective_target_tokens)
+        != (2049, 2048, 2048)
+        or data.sampling_design != "uniform_with_replacement"
+        or not data.non_overlapping_windows
+    ):
+        raise ValueError("formal data range identity drift")
+
 def build_data_range_from_prefix(
     *,
     dataset_id: str,
@@ -571,7 +634,9 @@ def build_checkpoint_matrix(records: Iterable[CheckpointRecord]) -> tuple[Checkp
 
 __all__ = [
     "ASSET_SCHEMA_VERSION", "CHECKPOINT_SCHEMA_VERSION", "DATA_RANGE_SCHEMA_VERSION",
-    "MODEL_NAMES", "TRAINING_STAGES", "TARGET_FRACTIONS", "AssetResolutionManifest",
+    "MODEL_NAMES", "TRAINING_STAGES", "TARGET_FRACTIONS", "FORMAL_CHECKPOINT_SELECTION",
+    "FORMAL_TOTAL_TRAINING_STEPS", "FORMAL_DATASET_ID", "FORMAL_DATASET_REVISION",
+    "FORMAL_DATA_MANIFEST_SHA256", "FORMAL_DATA_FILES", "AssetResolutionManifest",
     "CheckpointFile", "CheckpointRecord", "DataFile", "DataRangeManifest", "ManifestRepair",
-    "build_checkpoint_matrix", "build_data_range_from_prefix",
+    "build_checkpoint_matrix", "build_data_range_from_prefix", "validate_formal_asset_identity",
 ]

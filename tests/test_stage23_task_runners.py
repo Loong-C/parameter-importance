@@ -5,10 +5,25 @@ from pathlib import Path
 
 import pytest
 
-from param_importance_nlp.contracts import load_canonical_json
+from param_importance_nlp.contracts import load_canonical_json, write_canonical_json
 from param_importance_nlp.contracts.config_v2 import load_resolved_config_compatible
 from param_importance_nlp.contracts.task_catalog import DEFAULT_TASK_CATALOG, RunnerKind
+from param_importance_nlp.experiments import (
+    AssetResolutionManifest,
+    CheckpointFile,
+    CheckpointRecord,
+    DataFile,
+    DataRangeManifest,
+    FORMAL_CHECKPOINT_SELECTION,
+    FORMAL_DATASET_ID,
+    FORMAL_DATASET_REVISION,
+    FORMAL_DATA_FILES,
+    FORMAL_DATA_MANIFEST_SHA256,
+    FORMAL_TOTAL_TRAINING_STEPS,
+)
 from param_importance_nlp.experiments.stage23_task_runners import (
+    _formal_stage2_asset_manifest,
+    _run_formal_stage2_assets_and_sampling,
     build_stage23_runner_overrides,
     register_stage23_runners,
 )
@@ -16,6 +31,8 @@ from param_importance_nlp.runtime.task_artifacts import TaskArtifactStore
 from param_importance_nlp.runtime.task_runtime import (
     BlockerCode,
     TaskRunStatus,
+    TaskBlockedError,
+    TaskExecutionRequest,
     TaskRuntime,
     TaskRuntimeEnvironment,
 )
@@ -88,6 +105,55 @@ STAGE23_TASK_IDS = tuple(
 )
 
 
+def _formal_asset_manifest() -> AssetResolutionManifest:
+    records = []
+    for index, ((model, stage), (step, revision)) in enumerate(FORMAL_CHECKPOINT_SELECTION.items()):
+        digest = f"{index + 1:064x}"
+        records.append(
+            CheckpointRecord(
+                model_id=model,
+                training_stage=stage,
+                checkpoint_id=f"formal-{model}-{stage}",
+                training_step=step,
+                total_training_steps=FORMAL_TOTAL_TRAINING_STEPS,
+                target_fraction={"initialization": 0.0, "early": 0.01, "mid_late": 0.5}[stage],
+                repository=f"EleutherAI/{model}",
+                revision=revision,
+                root_ref=f"models/{model}/{stage}",
+                state="ready",
+                files=(
+                    CheckpointFile("model.safetensors", 1, digest, "weights"),
+                    CheckpointFile("config.json", 1, digest, "config"),
+                    CheckpointFile("tokenizer.json", 1, digest, "tokenizer"),
+                ),
+                manifest_ref=f"manifests/{model}-{stage}.json",
+                manifest_sha256=digest,
+                parameter_registry_hash=digest,
+                config_sha256=digest,
+                tokenizer_sha256=digest,
+                load_status="passed",
+                load_evidence_ref=f"evidence/{model}-{stage}.json",
+                load_evidence_sha256=digest,
+            )
+        )
+    return AssetResolutionManifest(
+        scope="formal",
+        checkpoints=tuple(records),
+        data_range=DataRangeManifest(
+            dataset_id=FORMAL_DATASET_ID,
+            revision=FORMAL_DATASET_REVISION,
+            manifest_ref="manifests/stage2/pile-prefix.json",
+            manifest_sha256=FORMAL_DATA_MANIFEST_SHA256,
+            files=tuple(
+                DataFile(path, size, sha, "token_shard" if path.endswith(".bin") else "index")
+                for path, (size, sha) in FORMAL_DATA_FILES.items()
+            ),
+        ),
+        producer_commit="1" * 40,
+        execution_commit="2" * 40,
+    )
+
+
 def _run_chain(
     root: Path,
     *,
@@ -95,13 +161,19 @@ def _run_chain(
 ) -> tuple[TaskRuntime, dict[str, object], dict[str, object]]:
     runtime = _runtime(root)
     previous_refs: tuple[str, ...] = ()
+    stage2_01_refs: tuple[str, ...] = ()
     configs: dict[str, object] = {}
     results: dict[str, object] = {}
     for task_id in STAGE23_TASK_IDS:
+        input_refs = (
+            stage2_01_refs
+            if task_id == "stage2.03_assets_checkpoints_and_sampling"
+            else previous_refs
+        )
         config = _config(
             task_id,
             f"runs/{task_id.replace('.', '-')}",
-            previous_refs,
+            input_refs,
         )
         result = runtime.execute(config)
         assert result.status is TaskRunStatus.PASS, (task_id, result.to_dict())
@@ -109,6 +181,8 @@ def _run_chain(
         configs[task_id] = config
         results[task_id] = result
         previous_refs = tuple(result.artifact_refs.values())
+        if task_id == "stage2.01_scope_hypotheses_and_preregistration":
+            stage2_01_refs = previous_refs
         if task_id == stop_after:
             break
     return runtime, configs, results
@@ -374,10 +448,15 @@ def test_all_stage23_task_ids_are_specialized_and_hash_bound_to_full_predecessor
             task_id
         ).artifact_kinds
         assert result.metadata == {"execution_contract": "stage23-specialized-v1"}
+        source_task_id = (
+            "stage2.01_scope_hypotheses_and_preregistration"
+            if task_id == "stage2.03_assets_checkpoints_and_sampling"
+            else (STAGE23_TASK_IDS[index - 1] if index else None)
+        )
         expected_sources = (
             []
-            if index == 0
-            else list(results[STAGE23_TASK_IDS[index - 1]].artifact_refs.values())
+            if source_task_id is None
+            else list(results[source_task_id].artifact_refs.values())
         )
         for commit_ref in result.artifact_refs.values():
             commit = load_canonical_json(root / Path(commit_ref))
@@ -553,3 +632,58 @@ def test_formal_runner_missing_execution_evidence_is_blocked_before_synthetic_fa
         artifact_kinds=DEFAULT_TASK_CATALOG.get(task_id).artifact_kinds,
         formal_eligible=True,
     ) is None
+
+
+def _formal_assets_request(tmp_path: Path, *, evidence_ref: str | None) -> TaskExecutionRequest:
+    task_id = "stage2.03_assets_checkpoints_and_sampling"
+    value = _base_for(task_id)
+    identity = value["identity"]
+    assert isinstance(identity, dict)
+    identity.update({"run_intent": "formal", "formal_eligible": True, "route": "pretrain"})
+    runtime = value["runtime"]
+    assert isinstance(runtime, dict)
+    runtime.update({"allow_dirty_worktree": False, "device": "cuda"})
+    evidence_refs = {} if evidence_ref is None else {"stage2_asset_resolution": evidence_ref}
+    config = load_resolved_config_compatible(value, task_id=task_id)
+    return TaskExecutionRequest(
+        config=config,
+        task=DEFAULT_TASK_CATALOG.get(task_id),
+        environment=TaskRuntimeEnvironment(evidence_refs=evidence_refs),
+    )
+
+
+def test_formal_stage2_asset_runner_consumes_real_matrix_without_fixture_fallback(
+    tmp_path: Path,
+) -> None:
+    reference = "evidence/stage2-asset-resolution.json"
+    path = tmp_path / reference
+    path.parent.mkdir(parents=True)
+    write_canonical_json(path, _formal_asset_manifest().to_dict())
+    request = _formal_assets_request(tmp_path, evidence_ref=reference)
+    manifest, loaded_ref = _formal_stage2_asset_manifest(request, tmp_path)
+    assert loaded_ref == reference
+    assert manifest.scope == "formal"
+    assert all(record.revision != "0" for record in manifest.checkpoints)
+
+    class _Preregistration:
+        binding_hash = "a" * 64
+        references: tuple[str, ...] = ()
+
+        @staticmethod
+        def payload(_kind: str) -> dict[str, str]:
+            return {"schema_version": "stage2-preregistration-v1", "scope": "formal"}
+
+    outputs, _ = _run_formal_stage2_assets_and_sampling(
+        request, tmp_path, _Preregistration()
+    )
+    resolution = outputs["asset_resolution"]
+    assert resolution["stage2_asset_manifest"]["scope"] == "formal"  # type: ignore[index]
+    assert resolution["provider"]["provider_kind"] == "offline_hf_stage2_asset_manifest"  # type: ignore[index]
+    assert "fixed_state_contract_hash" not in resolution
+
+
+def test_formal_stage2_asset_runner_fails_closed_without_environment_manifest(
+    tmp_path: Path,
+) -> None:
+    with pytest.raises(TaskBlockedError, match="environment-bound asset resolution"):
+        _formal_stage2_asset_manifest(_formal_assets_request(tmp_path, evidence_ref=None), tmp_path)

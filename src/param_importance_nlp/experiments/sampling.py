@@ -390,6 +390,7 @@ class SamplingPlan:
         if isinstance(start, bool) or not isinstance(start, int) or start < 0:
             raise ValueError("start 必须是非负整数")
         rng = random.Random(self._stream_seed(stream))
+        universe_digest = self.universe.digest
         result: list[Draw] = []
         size = len(self.universe.sample_ids)
         for position in range(start + count):
@@ -397,7 +398,7 @@ class SamplingPlan:
             if position < start:
                 continue
             identity = {
-                "universe_digest": self.universe.digest,
+                "universe_digest": universe_digest,
                 "stream": stream,
                 "position": position,
                 "algorithm_version": self.algorithm_version,
@@ -430,6 +431,7 @@ class SamplingPlan:
         if isinstance(start, bool) or not isinstance(start, int) or start < 0:
             raise ValueError("start 必须是非负整数")
         rng = random.Random(self._stream_seed(stream))
+        universe_digest = self.universe.digest
         for _ in range(start):
             rng.randrange(len(self.universe.sample_ids))
         before = _generator_state_digest(rng.getstate())
@@ -437,7 +439,7 @@ class SamplingPlan:
         for position in range(start, start + count):
             sample_id = self.universe.sample_ids[rng.randrange(len(self.universe.sample_ids))]
             identity = {
-                "universe_digest": self.universe.digest,
+                "universe_digest": universe_digest,
                 "stream": stream,
                 "position": position,
                 "algorithm_version": self.algorithm_version,

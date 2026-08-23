@@ -1,6 +1,9 @@
 # S2.3 source contract. This is an input declaration, not a downloaded asset.
 # Formal checkpoint rows remain BLOCKED until immutable upstream revisions,
-# files and offline-load evidence are present on the server.
+# files and offline-load evidence are present on the server.  The revisions
+# below are selected from the official Hub refs API (total steps=143000):
+# 1% target=1430 selects step1000; 50% target=71500 ties step71000/72000,
+# so the frozen tie-break selects the earlier step71000.
 schema_version: stage2-assets-checkpoints-and-sampling-source-v1
 gate_id: stage2.G2.2
 scope: formal
@@ -15,14 +18,18 @@ models:
         state: ready
       early:
         target_fraction: 0.01
-        selected_revision: null
+        selected_checkpoint_step: 1000
+        selected_revision: 5b020995bfc7aee2931b0f35bd70cf7ee8b1db62
+        upstream_ref: step1000
         state: blocked
-        missing_reason: fixed upstream checkpoint revision is not present on server
+        missing_reason: fixed revision selected; download and offline evidence pending
       mid_late:
         target_fraction: 0.5
-        selected_revision: null
+        selected_checkpoint_step: 71000
+        selected_revision: 6a9156279d41c80dea69f043e25818cb3e596f56
+        upstream_ref: step71000
         state: blocked
-        missing_reason: fixed upstream checkpoint revision is not present on server
+        missing_reason: fixed revision selected; download and offline evidence pending
   - model_id: pythia-31m-deduped
     repository: EleutherAI/pythia-31m-deduped
     data_version: deduped
@@ -33,14 +40,18 @@ models:
         state: ready
       early:
         target_fraction: 0.01
-        selected_revision: null
+        selected_checkpoint_step: 1000
+        selected_revision: dd4d3eab2b004272fee4a3d321064fa65e5e1ee6
+        upstream_ref: step1000
         state: blocked
-        missing_reason: fixed upstream checkpoint revision is not present on server
+        missing_reason: fixed revision selected; download and offline evidence pending
       mid_late:
         target_fraction: 0.5
-        selected_revision: null
+        selected_checkpoint_step: 71000
+        selected_revision: aeafbd5e62a3e5cd6e9f4106167f31e7fec47b41
+        upstream_ref: step71000
         state: blocked
-        missing_reason: fixed upstream checkpoint revision is not present on server
+        missing_reason: fixed revision selected; download and offline evidence pending
 data_range:
   dataset_id: dbbfeb12bab4027b386bd97d604d8134699e96f79e309cceacff7999a55b5dad
   source: EleutherAI/pile-deduped-pythia-preshuffled

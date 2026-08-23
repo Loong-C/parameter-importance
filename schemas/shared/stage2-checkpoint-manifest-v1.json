@@ -28,6 +28,32 @@
     "load_evidence_sha256": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/hash"}]},
     "missing_reason": {"oneOf": [{"type": "null"}, {"type": "string", "minLength": 1}]}
   },
+  "allOf": [
+    {
+      "if": {"properties": {"state": {"const": "ready"}}},
+      "then": {
+        "required": ["revision", "files", "manifest_ref", "manifest_sha256", "parameter_registry_hash", "config_sha256", "tokenizer_sha256", "load_status", "load_evidence_ref", "load_evidence_sha256"],
+        "properties": {
+          "revision": {"type": "string", "pattern": "^[0-9a-f]{40,64}$"},
+          "manifest_ref": {"type": "string", "minLength": 1},
+          "manifest_sha256": {"$ref": "#/$defs/hash"},
+          "parameter_registry_hash": {"$ref": "#/$defs/hash"},
+          "config_sha256": {"$ref": "#/$defs/hash"},
+          "tokenizer_sha256": {"$ref": "#/$defs/hash"},
+          "load_status": {"const": "passed"},
+          "load_evidence_ref": {"type": "string", "minLength": 1},
+          "load_evidence_sha256": {"$ref": "#/$defs/hash"},
+          "files": {
+            "allOf": [
+              {"contains": {"properties": {"role": {"const": "weights"}}}},
+              {"contains": {"properties": {"role": {"const": "config"}}}},
+              {"contains": {"properties": {"role": {"const": "tokenizer"}}}}
+            ]
+          }
+        }
+      }
+    }
+  ],
   "$defs": {
     "hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
     "file": {
