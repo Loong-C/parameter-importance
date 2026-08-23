@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import argparse
 from collections.abc import Mapping, Sequence
-from datetime import datetime, timezone
 import hashlib
 from pathlib import Path, PurePosixPath
 import sys
