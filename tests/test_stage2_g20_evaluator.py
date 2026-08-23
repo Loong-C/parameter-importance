@@ -549,7 +549,6 @@ def test_ancestor_producer_with_critical_sources_equal_is_compatible(tmp_path: P
     subprocess.run(["git", "worktree", "add", "--detach", str(clone), _head()], check=True, capture_output=True)
     try:
         producer_commit = _head(clone)
-        subprocess.run(["git", "-C", str(clone), "switch", "-c", "compatibility-test"], check=True, capture_output=True)
         tracked = clone / "Readme.md"
         tracked.write_text(tracked.read_text(encoding="utf-8") + "\ncompatible producer consumer change\n", encoding="utf-8")
         subprocess.run(["git", "-C", str(clone), "add", "Readme.md"], check=True, capture_output=True)
