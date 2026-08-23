@@ -11,7 +11,7 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from datetime import datetime, timezone
 import hashlib
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import re
 import subprocess
 from types import SimpleNamespace
@@ -411,6 +411,26 @@ def _validate_amendment(
     }
 
 
+def _canonical_registry_manifest_ref(declared_ref: str) -> str:
+    """Resolve an r6 index manifest ref relative to the index directory."""
+    if not isinstance(declared_ref, str) or not declared_ref or "\\" in declared_ref:
+        raise G22Blocked("G22_FORMAL_REGISTRY_MANIFEST_REF_INVALID")
+    parts = declared_ref.split("/")
+    relative = PurePosixPath(declared_ref)
+    if (
+        relative.is_absolute()
+        or any(part in {"", ".", ".."} for part in parts)
+        or (parts and parts[0].endswith(":"))
+    ):
+        raise G22Blocked("G22_FORMAL_REGISTRY_MANIFEST_REF_ESCAPE")
+    joined = (PurePosixPath(REGISTRY_INDEX_REF).parent / relative).as_posix()
+    # Keep the generated ref inside DATA_ROOT and reject any future change to
+    # the index constant that could make this join non-relative.
+    if joined.startswith("/") or any(part in {"", ".", ".."} for part in joined.split("/")):
+        raise G22Blocked("G22_FORMAL_REGISTRY_MANIFEST_REF_ESCAPE")
+    return joined
+
+
 def _validate_formal_registry_index(
     root: Path,
     manifest: AssetResolutionManifest,
@@ -454,7 +474,7 @@ def _validate_formal_registry_index(
     if not isinstance(rows, list) or len(rows) != 6 or not isinstance(index.get("source_artifact_refs"), list):
         raise G22Blocked("G22_FORMAL_REGISTRY_INDEX_CELLS_INVALID")
     expected_checkpoints = list(manifest.checkpoints)
-    expected_refs: list[str] = []
+    expected_source_refs: list[str] = []
     result: list[dict[str, JSONValue]] = []
     for checkpoint, raw in zip(expected_checkpoints, rows, strict=True):
         if not isinstance(raw, Mapping) or set(raw) != {"cell_id", "manifest_ref", "manifest_sha256", "manifest_size_bytes", "registry_hash"}:
@@ -465,10 +485,11 @@ def _validate_formal_registry_index(
         binding = bindings.get(checkpoint.checkpoint_id)
         if binding is None or binding.get("cell_id") != cell_id or binding.get("registry_hash") != raw.get("registry_hash"):
             raise G22Blocked("G22_FORMAL_REGISTRY_AMENDMENT_CROSS_BIND_INVALID")
-        ref = raw.get("manifest_ref")
+        declared_ref = raw.get("manifest_ref")
         sha = raw.get("manifest_sha256")
-        if not isinstance(ref, str) or not isinstance(sha, str) or not isinstance(raw.get("manifest_size_bytes"), int):
+        if not isinstance(declared_ref, str) or not isinstance(sha, str) or not isinstance(raw.get("manifest_size_bytes"), int):
             raise G22Blocked("G22_FORMAL_REGISTRY_MANIFEST_REF_INVALID")
+        ref = _canonical_registry_manifest_ref(declared_ref)
         value = _load_hashed(root, ref, sha)
         manifest_path = _resolve(root, ref)
         manifest_size, _ = _sha256(manifest_path)
@@ -500,9 +521,9 @@ def _validate_formal_registry_index(
             raise G22Blocked("G22_FORMAL_REGISTRY_MANIFEST_REGISTRY_INVALID") from error
         if registry.coordinate_registry_hash != raw.get("registry_hash") or value.get("parameter_count") != len(registry) or value.get("parameter_numel") != sum(item.numel for item in registry):
             raise G22Blocked("G22_FORMAL_REGISTRY_MANIFEST_REGISTRY_CROSS_BIND_INVALID")
-        expected_refs.append(ref)
+        expected_source_refs.append(declared_ref)
         result.append({"ref": ref, "sha256": sha, "size_bytes": raw["manifest_size_bytes"], "cell_id": cell_id, "registry_hash": str(raw["registry_hash"])})
-    if index["source_artifact_refs"] != expected_refs:
+    if index["source_artifact_refs"] != expected_source_refs:
         raise G22Blocked("G22_FORMAL_REGISTRY_SOURCE_REFS_INVALID")
     return result
 
