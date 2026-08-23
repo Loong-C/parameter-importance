@@ -326,10 +326,11 @@ def _fixture(
 
 
 def _evaluate(data_root: Path, refs: dict[str, str], config_ref: str, **kwargs: object):
+    repository_root = kwargs.pop("repository_root", ROOT)
     return evaluate_formal_g20(
         data_root,
         refs,
-        repository_root=ROOT,
+        repository_root=repository_root,
         resolved_config_ref=config_ref,
         output_dir="runs/evaluations",
         **kwargs,
@@ -432,6 +433,52 @@ def test_fake_producer_commit_is_rejected(tmp_path: Path) -> None:
     assert "GIT_OBJECT_MISSING" in " ".join(result["gate_record"]["reasons"])  # type: ignore[index]
 
 
+def _resign_existing_gate(data_root: Path, commit_ref: str, mutate) -> None:
+    """Rewrite a temporary gate object with valid outer and inner hashes."""
+
+    commit_path = data_root / Path(*commit_ref.split("/"))
+    commit = load_canonical_json(commit_path)
+    assert isinstance(commit, dict)
+    object_path = data_root / Path(*str(commit["object_ref"]).split("/"))
+    envelope = load_canonical_json(object_path)
+    assert isinstance(envelope, dict)
+    payload = dict(envelope["payload"])
+    mutate(payload)
+    payload["artifact_hash"] = canonical_json_hash(
+        {key: item for key, item in payload.items() if key != "artifact_hash"}
+    )
+    body = {key: item for key, item in envelope.items() if key != "artifact_hash"}
+    body["payload"] = payload
+    artifact_hash = canonical_json_hash(body)
+    body["artifact_hash"] = artifact_hash
+    object_dir = data_root / "runs/evaluations" / "g2.0-attempts" / commit_path.parent.parent.name / "objects/gate_record"
+    object_dir.mkdir(parents=True, exist_ok=True)
+    new_object_ref = (
+        f"runs/evaluations/g2.0-attempts/{commit_path.parent.parent.name}/objects/gate_record/{artifact_hash}.json"
+    )
+    write_canonical_json(data_root / Path(*new_object_ref.split("/")), body)
+    commit["artifact_hash"] = artifact_hash
+    commit["object_ref"] = new_object_ref
+    write_canonical_json(commit_path, commit)
+
+
+@pytest.mark.parametrize("mutation", [
+    lambda value: value.update({"gate_id": "stage2.G2.0-tampered"}),
+    lambda value: value.update({"status": "FAIL"}),
+    lambda value: value["reasons"].append("tampered reason"),
+    lambda value: value["measured"]["evaluator"].update({"source_sha256": "0" * 64}),
+])
+def test_resigned_existing_gate_semantics_are_recomputed_and_blocked(tmp_path: Path, mutation) -> None:
+    data_root, refs, config_ref, _ = _fixture(tmp_path)
+    first = _evaluate(data_root, refs, config_ref)
+    assert first["status"] == "PASS"
+    _resign_existing_gate(data_root, str(first["commit_ref"]), mutation)
+    second = _evaluate(data_root, refs, config_ref)
+    assert second["status"] == "BLOCKED"
+    assert second["commit_ref"] is None
+    assert "SEMANTIC_GATE_DRIFT" in " ".join(second["gate_record"]["reasons"])  # type: ignore[index]
+
+
 def test_dual_root_and_output_root_symlink_fail_closed(tmp_path: Path) -> None:
     data_root, refs, config_ref, _ = _fixture(tmp_path)
     assert not (data_root / "docs").exists()
@@ -474,6 +521,71 @@ def test_repository_dirty_and_source_drift_fail_closed(tmp_path: Path) -> None:
         assert "WORKTREE_DRIFT" in " ".join(result["gate_record"]["reasons"])  # type: ignore[index]
     finally:
         subprocess.run(["git", "worktree", "remove", "--force", str(clone)], check=False, capture_output=True)
+
+
+def test_repository_any_tracked_or_untracked_change_blocks(tmp_path: Path) -> None:
+    clone = tmp_path / "repository-clone-clean-check"
+    subprocess.run(["git", "worktree", "add", "--detach", str(clone), _head()], check=True, capture_output=True)
+    data_root, refs, config_ref, _ = _fixture(tmp_path / "fixture-clean-check")
+    try:
+        tracked = clone / "README.md"
+        tracked.write_text(tracked.read_text(encoding="utf-8") + "\ntracked drift\n", encoding="utf-8")
+        (clone / "untracked-review-file.txt").write_text("untracked drift\n", encoding="utf-8")
+        result = evaluate_formal_g20(
+            data_root,
+            refs,
+            repository_root=clone,
+            resolved_config_ref=config_ref,
+            output_dir="runs/evaluations",
+        )
+        assert result["status"] == "BLOCKED"
+        assert "repository:WORKTREE_DIRTY" in " ".join(result["gate_record"]["reasons"])  # type: ignore[index]
+    finally:
+        subprocess.run(["git", "worktree", "remove", "--force", str(clone)], check=False, capture_output=True)
+
+
+def test_ancestor_producer_with_critical_sources_equal_is_compatible(tmp_path: Path) -> None:
+    clone = tmp_path / "repository-clone-compatible-producer"
+    subprocess.run(["git", "worktree", "add", "--detach", str(clone), _head()], check=True, capture_output=True)
+    try:
+        producer_commit = _head(clone)
+        subprocess.run(["git", "-C", str(clone), "switch", "-c", "compatibility-test"], check=True, capture_output=True)
+        tracked = clone / "README.md"
+        tracked.write_text(tracked.read_text(encoding="utf-8") + "\ncompatible producer consumer change\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(clone), "add", "README.md"], check=True, capture_output=True)
+        subprocess.run(
+            ["git", "-C", str(clone), "-c", "user.name=G20 Test", "-c", "user.email=g20@example.invalid", "commit", "-m", "compatible consumer"],
+            check=True,
+            capture_output=True,
+        )
+        # The fixture is signed by the detached producer parent; the consumer
+        # repository is the clean child whose critical source bytes are equal.
+        data_root, refs, config_ref, _ = _fixture(
+            tmp_path / "fixture-compatible-producer", producer_commit=producer_commit
+        )
+        result = _evaluate(data_root, refs, config_ref, repository_root=clone)
+        assert result["status"] == "PASS"
+        evaluator = result["gate_record"]["measured"]["evaluator"]  # type: ignore[index]
+        assert evaluator["producer_compatibility"]["mode"] == "ancestor_critical_sources_equal"  # type: ignore[index]
+        assert evaluator["producer_compatibility"]["producer_commit"] == producer_commit  # type: ignore[index]
+    finally:
+        subprocess.run(["git", "worktree", "remove", "--force", str(clone)], check=False, capture_output=True)
+
+
+def test_ancestor_producer_with_critical_source_drift_is_rejected(tmp_path: Path) -> None:
+    old_producer = _head(ROOT)  # the current source family is the trusted consumer
+    # The immediately previous evaluator commit is a real ancestor but has a
+    # different evaluator source blob, so it must not be accepted as compatible.
+    old_producer = subprocess.run(
+        ["git", "-C", str(ROOT), "rev-parse", f"{old_producer}^"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    data_root, refs, config_ref, _ = _fixture(tmp_path, producer_commit=old_producer)
+    result = _evaluate(data_root, refs, config_ref)
+    assert result["status"] == "BLOCKED"
+    assert "CRITICAL_SOURCE_DRIFT" in " ".join(result["gate_record"]["reasons"])  # type: ignore[index]
 
 
 def test_input_object_symlink_is_rejected(tmp_path: Path) -> None:
