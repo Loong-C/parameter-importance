@@ -111,7 +111,7 @@ def test_missing_or_fixture_predecessor_fails_closed(tmp_path: Path) -> None:
 
 
 def test_raw_bootstrap_requires_explicit_payload_and_config_hash(tmp_path: Path) -> None:
-    with pytest.raises(S204MaterializationError, match="S204_RAW_TASK_SET_INVALID"):
+    with pytest.raises(S204MaterializationError, match="S204_CANDIDATE_BOOTSTRAP_FORBIDDEN"):
         bootstrap_formal_task_inputs(tmp_path, {})
     raw = {
         task_id: {
@@ -124,7 +124,7 @@ def test_raw_bootstrap_requires_explicit_payload_and_config_hash(tmp_path: Path)
         }
         for task_id, kinds in TASK_INPUTS.items()
     }
-    with pytest.raises(S204MaterializationError, match="S204_SOURCE_UNREADABLE"):
+    with pytest.raises(S204MaterializationError, match="S204_CANDIDATE_BOOTSTRAP_FORBIDDEN"):
         bootstrap_formal_task_inputs(tmp_path, raw)
 
 
@@ -135,13 +135,7 @@ def test_s21_formal_predecessor_contract_matches_task_catalog() -> None:
     assert tuple(DEFAULT_TASK_CATALOG.get(STAGE1_TASK_ID).artifact_kinds) == STAGE1_TASK_INPUTS  # type: ignore[union-attr]
 
 
-def test_raw_bootstrap_is_candidate_only_and_cannot_unlock_formal(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    monkeypatch.setattr(
-        "ops.stage2.materialize_s204._validate_raw_payload",
-        lambda _task, _kind, _payload: None,
-    )
+def test_raw_bootstrap_is_rejected_and_cannot_unlock_formal(tmp_path: Path) -> None:
     raw: dict[str, dict[str, dict[str, object]]] = {}
     for task_id, kinds in TASK_INPUTS.items():
         raw[task_id] = {}
@@ -153,14 +147,8 @@ def test_raw_bootstrap_is_candidate_only_and_cannot_unlock_formal(
                 "config_hash": "a" * 64,
                 "source_refs": ("raw/upstream.json",),
             }
-    refs = bootstrap_formal_task_inputs(tmp_path, raw)
-    for task_id, kinds in TASK_INPUTS.items():
-        for kind in kinds:
-            loaded = load_committed_task_artifact(tmp_path, refs[task_id][kind])
-            assert loaded.run_intent == "local_fixture"
-            assert loaded.identity.formal_eligible is False
-            with pytest.raises(ValueError):
-                load_committed_task_artifact(tmp_path, refs[task_id][kind], require_formal=True)
+    with pytest.raises(S204MaterializationError, match="S204_CANDIDATE_BOOTSTRAP_FORBIDDEN"):
+        bootstrap_formal_task_inputs(tmp_path, raw)
 
 
 def _g21_handoff_with_raw_report(root: Path) -> str:

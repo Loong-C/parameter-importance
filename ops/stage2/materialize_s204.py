@@ -135,6 +135,12 @@ TASK_INPUTS: Final = {
 }
 
 STAGE1_TASK_ID: Final = "stage1.11_reporting_and_exit_gate"
+STAGE1_10_TASK_ID: Final = "stage1.10_checkpoint_resume_and_artifacts"
+STAGE1_10_TASK_INPUTS: Final = (
+    "training_state_manifest",
+    "resume_equivalence_report",
+    "gate_record",
+)
 STAGE1_TASK_INPUTS: Final = (
     "stage_report",
     "requirements_matrix",
@@ -177,8 +183,11 @@ class FormalDAGResult(dict[str, dict[str, str]]):
         final_evidence_ref: str,
         bridge_gate_refs: Mapping[str, str],
         authoritative_asset_ref: str,
-        stage1_bridge_ref: str,
-        stage1_bridge_config_ref: str,
+        stage1_bridge_ref: str | None = None,
+        stage1_bridge_config_ref: str | None = None,
+        stage1_10_refs: Mapping[str, str] | None = None,
+        stage1_11_refs: Mapping[str, str] | None = None,
+        blocked_reason: str | None = None,
     ) -> None:
         super().__init__({task: dict(refs) for task, refs in refs_by_task.items()})
         self.final_evidence = final_evidence
@@ -187,6 +196,9 @@ class FormalDAGResult(dict[str, dict[str, str]]):
         self.authoritative_asset_ref = authoritative_asset_ref
         self.stage1_bridge_ref = stage1_bridge_ref
         self.stage1_bridge_config_ref = stage1_bridge_config_ref
+        self.stage1_10_refs = dict(stage1_10_refs or {})
+        self.stage1_11_refs = dict(stage1_11_refs or {})
+        self.blocked_reason = blocked_reason
 
 
 def _error(code: str, detail: object = "") -> S204MaterializationError:
@@ -365,22 +377,82 @@ def _assert_source_file(root: Path, ref: str, field: str, *, sha256: str | None 
 
 
 def _stage1_task_refs(source: Mapping[str, Any]) -> Mapping[str, str]:
-    """Return the four *formal TaskArtifact commits* for Stage 1.11.
+    """Return the actual four S1.11 TaskRuntime commits.
 
-    The S1.11 index/role JSONs are evidence of completion, but they are not
-    task-output commits.  A Stage 2 runner must receive the four commits from
-    the Stage 1 producer, so a caller cannot promote the role files directly.
+    The released S1.11 index/role files are evidence, not task-output commits.
+    This loader intentionally has no import/bridge path: a role path, source
+    file, fixture, or code hash can never satisfy a Stage 2 predecessor.
     """
 
-    raw = source.get("stage1_11_task_outputs", source.get("stage1_task_outputs"))
+    raw = source.get("stage1_11_task_outputs")
     if isinstance(raw, Mapping) and STAGE1_TASK_ID in raw:
         raw = raw[STAGE1_TASK_ID]
     if not isinstance(raw, Mapping) or set(raw) != set(STAGE1_TASK_INPUTS):
-        raise _error("STAGE1_FORMAL_COMMITS_REQUIRED")
-    result: dict[str, str] = {}
-    for kind in STAGE1_TASK_INPUTS:
-        result[kind] = _source_ref(raw[kind], f"stage1_11_task_outputs.{kind}")
-    return result
+        raise _error("STAGE1_11_FORMAL_COMMITS_REQUIRED")
+    return {
+        kind: _source_ref(raw[kind], f"stage1_11_task_outputs.{kind}")
+        for kind in STAGE1_TASK_INPUTS
+    }
+
+
+def _stage1_10_task_refs(source: Mapping[str, Any]) -> Mapping[str, str]:
+    """Return the actual three S1.10 TaskRuntime commits.
+
+    S1.10 is not a direct S2.1 predecessor in the task catalog, but its group
+    success and commit identities are part of the formal Stage 1 handoff used
+    by the G2.1 adapter.  It is therefore loaded and bound, never inferred.
+    """
+
+    raw = source.get("stage1_10_task_outputs")
+    if isinstance(raw, Mapping) and STAGE1_10_TASK_ID in raw:
+        raw = raw[STAGE1_10_TASK_ID]
+    if not isinstance(raw, Mapping) or set(raw) != set(STAGE1_10_TASK_INPUTS):
+        raise _error("STAGE1_10_FORMAL_COMMITS_REQUIRED")
+    return {
+        kind: _source_ref(raw[kind], f"stage1_10_task_outputs.{kind}")
+        for kind in STAGE1_10_TASK_INPUTS
+    }
+
+
+def _load_stage1_commit_group(
+    root: Path,
+    refs: Mapping[str, str],
+    *,
+    task_id: str,
+    kinds: Sequence[str],
+) -> dict[str, LoadedTaskArtifact]:
+    """Load one completed formal TaskRuntime group without promotion."""
+
+    loaded: dict[str, LoadedTaskArtifact] = {}
+    for kind in kinds:
+        ref = _source_ref(refs[kind], f"{task_id}.{kind}")
+        try:
+            item = load_committed_task_artifact(root, ref, require_formal=True)
+        except Exception as error:
+            raise _error("STAGE1_FORMAL_COMMIT_REQUIRED", f"{task_id}.{kind}") from error
+        if item.identity.task_id != task_id or item.identity.artifact_kind != kind:
+            raise _error("STAGE1_FORMAL_COMMIT_IDENTITY_MISMATCH", f"{task_id}.{kind}")
+        if item.run_intent != "formal" or item.identity.formal_eligible is not True:
+            raise _error("STAGE1_FORMAL_SCOPE_REQUIRED", f"{task_id}.{kind}")
+        for source_ref in item.source_refs:
+            _reject_nonformal_ref(source_ref, f"{task_id}.{kind}.source_ref")
+        payload = item.payload
+        # Explicit candidate/failure statuses are never a successful group.
+        status_values = {
+            str(payload.get(name)).upper()
+            for name in ("status", "gate_status", "exit_verdict", "overall_status")
+            if payload.get(name) is not None
+        }
+        if status_values.intersection({"NOT_RUN", "BLOCKED", "FAIL", "FAILED", "FORMAL_CANDIDATE"}):
+            raise _error("STAGE1_GROUP_NOT_SUCCESS", f"{task_id}.{kind}")
+        loaded[kind] = item
+    config_hashes = {item.identity.config_hash for item in loaded.values()}
+    if len(config_hashes) != 1:
+        raise _error("STAGE1_GROUP_CONFIG_IDENTITY_MISMATCH", task_id)
+    source_sets = {item.source_refs for item in loaded.values()}
+    if len(source_sets) != 1:
+        raise _error("STAGE1_GROUP_SOURCE_CLOSURE_MISMATCH", task_id)
+    return loaded
 
 
 def _load_stage1_formal_commits(
@@ -390,133 +462,31 @@ def _load_stage1_formal_commits(
     stage1_index_ref: str,
     base_config_ref: str,
     output_dir: str,
-) -> tuple[dict[str, LoadedTaskArtifact], Any, str, str]:
-    """Validate or bridge S1.11 into four formal TaskArtifact commits.
-
-    The released S1.11 r4 handoff contains seven immutable role documents, not
-    TaskArtifact envelopes and intentionally has no ``config_hash``.  When no
-    explicit producer commits are supplied, this function creates a narrow
-    bridge envelope around those already-validated role documents.  It never
-    changes a role payload, status, or numeric result: the bridge config and
-    evidence document bind the exact index/role bytes and hashes instead.
-    """
+) -> tuple[dict[str, LoadedTaskArtifact], Any, str | None, str | None]:
+    """Load the actual S1.10/S1.11 groups; never bridge role documents."""
 
     try:
         stage1_exit = validate_stage1_exit_evidence(root, stage1_index_ref)
     except Exception as error:
         raise _error("STAGE1_EXIT_REQUIRED", stage1_index_ref) from error
-    role_refs = _stage1_role_ref_map(root, stage1_index_ref)
-    role_payloads: dict[str, Mapping[str, Any]] = {}
-    for role, ref in role_refs.items():
-        role_payloads[role] = _load_mapping(root, ref, f"stage1.role.{role}")
-
-    explicit = source.get("stage1_11_task_outputs", source.get("stage1_task_outputs"))
-    if explicit is not None:
-        declared_refs = _stage1_task_refs(source)
-        # Some DATA_ROOT manifests name the four released role files under
-        # this key even though they are not task commits.  Treat that exact
-        # index-derived set as a request for the bridge path; any other
-        # explicit value must be an actual formal TaskArtifact commit.
-        if all(declared_refs[kind] == role_refs[kind] for kind in STAGE1_TASK_INPUTS):
-            refs = {}
-        else:
-            refs = declared_refs
-    else:
-        refs = {}
-    loaded: dict[str, LoadedTaskArtifact] = {}
-    if refs:
-        for kind in STAGE1_TASK_INPUTS:
-            try:
-                item = load_committed_task_artifact(root, refs[kind], require_formal=True)
-            except Exception as error:
-                raise _error("STAGE1_FORMAL_COMMIT_REQUIRED", kind) from error
-            if item.identity.task_id != STAGE1_TASK_ID or item.identity.artifact_kind != kind:
-                raise _error("STAGE1_FORMAL_COMMIT_IDENTITY_MISMATCH", kind)
-            if item.run_intent != "formal" or item.identity.formal_eligible is not True:
-                raise _error("STAGE1_FORMAL_SCOPE_REQUIRED", kind)
-            for source_ref in item.source_refs:
-                _reject_nonformal_ref(source_ref, f"stage1_11_task_outputs.{kind}.source_ref")
-            if item.payload.get("schema_version") != STAGE1_PAYLOAD_SCHEMAS[kind]:
-                raise _error("STAGE1_FORMAL_PAYLOAD_SCHEMA_INVALID", kind)
-            loaded[kind] = item
-
-    # A bridge config is required even when a producer supplied envelopes: the
-    # historical role payloads have no config identity of their own.  It is an
-    # evidence/config binding, never a claim that the role producer used this
-    # newly-resolved config.
-    role_input_refs = tuple(
-        dict.fromkeys((stage1_index_ref, *role_refs.values()))
-    )
-    if loaded:
-        payload_hashes = {
-            kind: canonical_json_hash(dict(role_payloads[kind]))
-            for kind in STAGE1_TASK_INPUTS
-        }
-    else:
-        payload_hashes = {
-            kind: canonical_json_hash(dict(role_payloads[kind]))
-            for kind in STAGE1_TASK_INPUTS
-        }
-    config, config_ref = _publish_bridge_config(
+    s110_refs = _stage1_10_task_refs(source)
+    s111_refs = _stage1_task_refs(source)
+    _load_stage1_commit_group(
         root,
-        base_config_ref=base_config_ref,
-        # The checked-in formal-stage2 layer is the only resolved science
-        # base available here.  The config is explicitly labelled as the
-        # Stage 2 bridge task; it does not pretend to be S1.11's producer
-        # config (the historical role payloads intentionally have none).
-        task_id="stage2.01_scope_hypotheses_and_preregistration",
-        input_refs=role_input_refs,
-        output_ref=f"{output_dir}/bridges/stage1-11-resolved-config-v2.json",
+        s110_refs,
+        task_id=STAGE1_10_TASK_ID,
+        kinds=STAGE1_10_TASK_INPUTS,
     )
-    bridge_payload: dict[str, Any] = {
-        "schema_version": "stage2-s204-stage1-bridge-v1",
-        "status": "PASS",
-        "formal_eligible": True,
-        "task_id": STAGE1_TASK_ID,
-        "gate_id": f"stage1.{STAGE1_G1_EXIT_GATE_ID}",
-        "index_ref": stage1_exit.index_ref,
-        "index_sha256": stage1_exit.index_sha256,
-        "index_artifact_hash": stage1_exit.index_artifact_hash,
-        "execution_commit": stage1_exit.execution_commit,
-        "role_refs": dict(role_refs),
-        "role_sha256": dict(stage1_exit.role_sha256),
-        "payload_hashes": payload_hashes,
-        "bridge_config_ref": config_ref,
-        "bridge_config_hash": config.config_hash,
-        "bridge_config_full_hash": config.full_hash,
-        "source_refs": list(role_input_refs),
-    }
-    bridge_payload["artifact_hash"] = canonical_json_hash(bridge_payload)
-    bridge_ref = f"{output_dir}/bridges/stage1-11-bridge-evidence.json"
-    publish_canonical_immutable(_safe_relative(root, bridge_ref, "stage1_bridge_evidence_output"), bridge_payload)
-    bridge_readback = _load_mapping(root, bridge_ref, "stage1_bridge_evidence")
-    if bridge_readback.get("artifact_hash") != bridge_payload["artifact_hash"]:
-        raise _error("STAGE1_BRIDGE_EVIDENCE_DRIFT")
-
-    if not loaded:
-        store = TaskArtifactStore(root, f"{output_dir}/bridges/stage1-11-task-outputs")
-        source_refs = tuple(dict.fromkeys((*role_input_refs, config_ref, bridge_ref)))
-        for kind in STAGE1_TASK_INPUTS:
-            payload = role_payloads[kind]
-            if payload.get("schema_version") != STAGE1_PAYLOAD_SCHEMAS[kind]:
-                raise _error("STAGE1_FORMAL_PAYLOAD_SCHEMA_INVALID", kind)
-            published = store.publish(
-                task_id=STAGE1_TASK_ID,
-                artifact_kind=kind,
-                config_hash=config.config_hash,
-                run_intent="formal",
-                payload=dict(payload),
-                formal_eligible=True,
-                source_refs=source_refs,
-            )
-            loaded[kind] = load_committed_task_artifact(root, published.commit_ref, require_formal=True)
-    else:
-        # Existing commits remain authoritative; only the bridge evidence is
-        # added as an explicit downstream source, never copied into them.
-        for kind in STAGE1_TASK_INPUTS:
-            if loaded[kind].payload != role_payloads[kind]:
-                raise _error("STAGE1_BRIDGE_PAYLOAD_DRIFT", kind)
-    return loaded, stage1_exit, config_ref, bridge_ref
+    loaded = _load_stage1_commit_group(
+        root,
+        s111_refs,
+        task_id=STAGE1_TASK_ID,
+        kinds=STAGE1_TASK_INPUTS,
+    )
+    # The tuple shape is kept for callers from the previous API.  None is
+    # intentional: S1.11 commits and their producer config are authoritative;
+    # no Stage2 bridge config/evidence is manufactured here.
+    return loaded, stage1_exit, None, None
 
 
 _STAGE1_ROLES: Final = (
@@ -622,12 +592,11 @@ def _publish_authoritative_asset_manifest(
     raw_refs: Mapping[str, Mapping[str, Mapping[str, Any]]] | None,
     output_dir: str,
 ) -> tuple[str, AssetResolutionManifest]:
-    """Validate and publish the direct formal S2.3 asset manifest.
+    """Load an already-published formal S2.3 six-checkpoint manifest.
 
-    The runner consumes this direct manifest, not a raw task-output envelope.
-    The source may be an existing direct manifest or a raw formal candidate
-    whose nested ``AssetResolutionManifest`` passes the strict semantic loader.
-    A local fixture/candidate manifest cannot satisfy that loader.
+    S2.3 is the canonical producer for this object.  This function is only a
+    strict reader: it does not unwrap a task candidate, copy an asset payload,
+    infer G3 aliases, or republish a manifest under a new authority.
     """
 
     value: Mapping[str, Any] | None = None
@@ -639,41 +608,24 @@ def _publish_authoritative_asset_manifest(
             value = _load_mapping(root, source_ref, key)
             break
     if value is None and raw_refs is not None:
-        try:
-            spec = raw_refs["stage2.03_assets_checkpoints_and_sampling"]["asset_resolution"]
-            source_ref = _source_ref(spec.get("ref"), "raw.stage2.03.asset_resolution.ref")
-            value = _load_mapping(root, source_ref, "raw.stage2.03.asset_resolution")
-        except (KeyError, TypeError, AttributeError) as error:
-            raise _error("FORMAL_ASSET_MANIFEST_REQUIRED") from error
+        raise _error("CANDIDATE_ASSET_INPUTS_FORBIDDEN")
     if value is None or source_ref is None:
         raise _error("FORMAL_ASSET_MANIFEST_REQUIRED")
     declared_sha = source.get("stage2_asset_resolution_sha256")
     _assert_source_file(root, source_ref, "stage2_asset_resolution", sha256=(str(declared_sha) if declared_sha is not None else None))
     payload = value
     if value.get("schema_version") == "stage2-task-asset-resolution-v1":
-        nested = value.get("stage2_asset_manifest")
-        if not isinstance(nested, Mapping):
-            raise _error("FORMAL_ASSET_MANIFEST_MISSING")
-        # Raw task envelopes are candidates.  They are admissible only as the
-        # source of a newly validated direct manifest; their false eligibility
-        # is never copied into the formal task commit.
-        payload = nested
+        # A TaskRuntime S2.3 output is a candidate payload, not an asset
+        # authority.  Only the existing direct manifest can seed the runner.
+        raise _error("CANDIDATE_ASSET_INPUTS_FORBIDDEN", source_ref)
     try:
         manifest = AssetResolutionManifest.from_mapping(dict(payload))
         validate_formal_asset_identity(manifest)
     except Exception as error:
         raise _error("FORMAL_ASSET_MANIFEST_INVALID", source_ref) from error
-    target_ref = f"{output_dir}/authoritative/stage2-asset-resolution-manifest.json"
-    target = _safe_relative(root, target_ref, "formal_asset_manifest_output")
-    publish_canonical_immutable(target, manifest.to_dict())
-    try:
-        round_trip = AssetResolutionManifest.from_mapping(load_canonical_json(target))
-        validate_formal_asset_identity(round_trip)
-    except Exception as error:
-        raise _error("FORMAL_ASSET_MANIFEST_ROUND_TRIP_DRIFT") from error
-    if round_trip.digest != manifest.digest:
-        raise _error("FORMAL_ASSET_MANIFEST_HASH_DRIFT")
-    return PurePosixPath(target_ref).as_posix(), manifest
+    if manifest.scope != "formal" or manifest.status != "READY":
+        raise _error("FORMAL_ASSET_MANIFEST_NOT_READY", source_ref)
+    return source_ref, manifest
 
 
 def _find_schema_payload(value: object, schema_version: str) -> tuple[Mapping[str, Any], ...]:
@@ -897,56 +849,16 @@ def bootstrap_formal_task_inputs(
     *,
     output_dir: str = "evidence/stage2/s204/materialized-task-inputs",
 ) -> dict[str, dict[str, str]]:
-    """Import raw manifests as explicit nonformal candidates.
+    """Reject raw/candidate bootstrap.
 
-    This helper never creates a formal predecessor.  It is used by the DAG
-    bootstrap path to retain auditable raw inputs while the existing formal
-    TaskRuntime runners recompute and publish authoritative commits.
+    A prior implementation published ``local_fixture`` candidate commits and
+    then fed those paths to a formal DAG.  That made a caller-controlled JSON
+    look like a producer result.  The only supported bootstrap now is the
+    canonical TaskRuntime producer invoked by :func:`execute_formal_predecessor_dag`.
     """
 
-    root = Path(data_root).resolve()
-    if set(raw_refs) != set(TASK_INPUTS):
-        raise _error("RAW_TASK_SET_INVALID")
-    loaded: dict[str, dict[str, tuple[Mapping[str, Any], str, tuple[str, ...]]]] = {}
-    for task_id in TASK_INPUTS:
-        specs = _raw_task_specs(raw_refs[task_id], task_id=task_id)
-        values: dict[str, tuple[Mapping[str, Any], str, tuple[str, ...]]] = {}
-        for kind in TASK_INPUTS[task_id]:
-            spec = specs[kind]
-            payload = _load_mapping(root, spec["ref"], f"raw.{task_id}.{kind}")
-            _validate_raw_payload(task_id, kind, payload)
-            values[kind] = (payload, spec["config_hash"], tuple(spec["source_refs"]))
-        if len({item[1] for item in values.values()}) != 1:
-            raise _error("RAW_TASK_CONFIG_IDENTITY_MISMATCH", task_id)
-        loaded[task_id] = values
-
-    result: dict[str, dict[str, str]] = {}
-    stores = {
-        task_id: TaskArtifactStore(root, f"{output_dir}/candidates/{task_id.replace('.', '-')}")
-        for task_id in TASK_INPUTS
-    }
-    for task_id in TASK_INPUTS:
-        task_result: dict[str, str] = {}
-        for kind in TASK_INPUTS[task_id]:
-            payload, config_hash, source_refs = loaded[task_id][kind]
-            published = stores[task_id].publish(
-                task_id=task_id,
-                artifact_kind=kind,
-                config_hash=config_hash,
-                # Raw manifests are scientific candidates only.  The formal
-                # envelope is reserved for the TaskRuntime DAG below, which
-                # executes the existing S2.1 -> S2.2/S2.3 runners.
-                run_intent="local_fixture",
-                payload=payload,
-                formal_eligible=False,
-                source_refs=source_refs,
-            )
-            reread = load_committed_task_artifact(root, published.commit_ref, require_formal=False)
-            if reread.payload != payload:
-                raise _error("RAW_BOOTSTRAP_PAYLOAD_DRIFT", f"{task_id}.{kind}")
-            task_result[kind] = published.commit_ref
-        result[task_id] = task_result
-    return result
+    del data_root, raw_refs, output_dir
+    raise _error("CANDIDATE_BOOTSTRAP_FORBIDDEN")
 
 
 def _publish_candidate_asset_manifest(
@@ -955,27 +867,8 @@ def _publish_candidate_asset_manifest(
     *,
     output_dir: str,
 ) -> str:
-    """Expose the raw S2.3 asset candidate to the formal asset runner."""
-
-    task_id = "stage2.03_assets_checkpoints_and_sampling"
-    try:
-        spec = raw_refs[task_id]["asset_resolution"]
-    except (KeyError, TypeError) as error:
-        raise _error("RAW_ASSET_CANDIDATE_REQUIRED") from error
-    if not isinstance(spec, Mapping) or not isinstance(spec.get("ref"), str):
-        raise _error("RAW_ASSET_CANDIDATE_REQUIRED")
-    raw_ref = _source_ref(spec["ref"], "raw.stage2.03.asset_resolution.ref")
-    payload = _load_mapping(root, raw_ref, "raw.stage2.03.asset_resolution")
-    manifest = _formal_s23_asset_manifest(payload, field=raw_ref)
-    target_ref = f"{output_dir}/candidates/stage2-asset-resolution-manifest.json"
-    target = _safe_relative(root, target_ref, "raw_asset_candidate_output")
-    publish_canonical_immutable(target, manifest.to_dict())
-    try:
-        reread = AssetResolutionManifest.from_mapping(load_canonical_json(target))
-        validate_formal_asset_identity(reread)
-    except Exception as error:
-        raise _error("RAW_ASSET_CANDIDATE_ROUND_TRIP_DRIFT", target_ref) from error
-    return PurePosixPath(target_ref).as_posix()
+    del root, raw_refs, output_dir
+    raise _error("CANDIDATE_ASSET_PROMOTION_FORBIDDEN")
 
 
 def _build_formal_predecessor_environment(
@@ -1784,6 +1677,147 @@ def _derive_g22_gate(
     return gate_ref, gate, config_ref
 
 
+def _adapter_gate_ref(source: Mapping[str, Any], name: str) -> str:
+    """Read an already-published adapter commit, never a caller GateRecord."""
+
+    candidates = (
+        f"{name}_adapter_output",
+        f"{name}_adapter",
+        f"{name}_gate",
+        name,
+    )
+    raw: object = None
+    for key in candidates:
+        if key in source:
+            raw = source[key]
+            break
+    if isinstance(raw, Mapping):
+        raw = raw.get("commit_ref")
+    if not isinstance(raw, str):
+        raise _error(f"{name.upper()}_ADAPTER_OUTPUT_REQUIRED")
+    return _source_ref(raw, f"{name}.adapter.commit_ref")
+
+
+def _load_adapter_gate(
+    root: Path,
+    source: Mapping[str, Any],
+    *,
+    name: str,
+    gate_id: str,
+    task_id: str,
+    expected_refs: Sequence[str],
+) -> tuple[str, GateRecord]:
+    """Reload and bind one independent G2.0/G2.1 adapter output."""
+
+    ref = _adapter_gate_ref(source, name)
+    try:
+        loaded = load_committed_task_artifact(root, ref, require_formal=True)
+    except Exception as error:
+        raise _error(f"{name.upper()}_ADAPTER_COMMIT_INVALID", ref) from error
+    if loaded.identity.task_id != task_id or loaded.identity.artifact_kind != "gate_record":
+        raise _error(f"{name.upper()}_ADAPTER_COMMIT_IDENTITY_INVALID")
+    if loaded.run_intent != "formal" or loaded.identity.formal_eligible is not True:
+        raise _error(f"{name.upper()}_ADAPTER_FORMAL_REQUIRED")
+    try:
+        gate = GateRecord.from_mapping(dict(loaded.payload))
+    except Exception as error:
+        raise _error(f"{name.upper()}_ADAPTER_GATE_INVALID") from error
+    if gate.gate_id != gate_id or gate.status is not GateStatus.PASS:
+        raise _error(f"{name.upper()}_ADAPTER_GATE_NOT_PASS")
+    observed = set(loaded.source_refs) | set(gate.evidence_refs)
+    if not set(expected_refs).issubset(observed):
+        raise _error(f"{name.upper()}_ADAPTER_LINEAGE_MISMATCH")
+    return ref, gate
+
+
+def _build_narrow_formal_environment(
+    root: Path,
+    *,
+    formal_execution_ref: str,
+    stage0_ref: str,
+    stage1_ref: str,
+    contract_refs: Mapping[int, str],
+    stage1_10_refs: Mapping[str, str],
+    stage1_11_refs: Mapping[str, str],
+    asset_ref: str,
+    g1_ref: str | None,
+    gate_refs: Mapping[str, str],
+    required_gate_ids: Sequence[str],
+    output_ref: str,
+) -> TaskRuntimeEnvironment:
+    """Build the S2.1/S2.3 preflight snapshot without G2.2/G2.3 work.
+
+    The environment binds contract stages 0/1/2, the actual Stage 1 commit
+    groups, the direct six-checkpoint manifest, and adapter Gate commits.  It
+    deliberately does not probe devices or construct any G3 alias.
+    """
+
+    evidence = FormalExecutionEvidence.from_mapping(
+        _load_mapping(root, _source_ref(formal_execution_ref, "formal_execution"), "formal_execution")
+    )
+    evidence.require_for_stage(2)
+    stage0 = _source_ref(stage0_ref, "stage0_handoff")
+    stage1 = _source_ref(stage1_ref, "stage1_g1_exit")
+    try:
+        validate_stage0_handoff(root, stage0, require_ready=True)
+        validate_stage1_exit_evidence(root, stage1)
+    except Exception as error:
+        raise _error("STAGE0_STAGE1_READY_REQUIRED") from error
+    freezes: dict[int, ContractFreeze] = {}
+    normalized_contracts: dict[int, str] = {}
+    for stage in (0, 1, 2):
+        ref, freeze = _load_formal_contract_freeze(root, contract_refs.get(stage), stage=stage)
+        normalized_contracts[stage] = ref
+        freezes[stage] = freeze
+    if evidence.contract_freeze_hash != freezes[2].artifact_hash:
+        raise _error("CONTRACT_FREEZE_IDENTITY_MISMATCH", normalized_contracts[2])
+    asset_value = _load_mapping(root, asset_ref, "stage2_asset_resolution")
+    try:
+        asset = AssetResolutionManifest.from_mapping(dict(asset_value))
+        validate_formal_asset_identity(asset)
+    except Exception as error:
+        raise _error("FORMAL_ASSET_MANIFEST_INVALID", asset_ref) from error
+    if asset.scope != "formal" or asset.status != "READY":
+        raise _error("FORMAL_ASSET_MANIFEST_NOT_READY", asset_ref)
+    all_gate_refs = dict(gate_refs)
+    if g1_ref is not None:
+        all_gate_refs["stage1.G1-EXIT"] = _source_ref(g1_ref, "gate.stage1.G1-EXIT")
+    normalized_gates = _load_formal_gate_refs(
+        root,
+        all_gate_refs,
+        required=tuple(all_gate_refs),
+        expected_task={
+            "stage2.G2.0": "stage2.01_scope_hypotheses_and_preregistration",
+            "stage2.G2.1": "stage2.02_stage1_handoff_and_fixed_state_contract",
+        },
+        expected_artifact_kind={key: "gate_record" for key in ("stage2.G2.0", "stage2.G2.1")},
+    )
+    evidence_refs: dict[str, str] = {
+        "formal_execution": _source_ref(formal_execution_ref, "formal_execution"),
+        "stage0_handoff": stage0,
+        "stage1_g1_exit": stage1,
+        "contract_stage_0": normalized_contracts[0],
+        "contract_stage_1": normalized_contracts[1],
+        "contract_stage_2": normalized_contracts[2],
+        "stage2_asset_resolution": _source_ref(asset_ref, "stage2_asset_resolution"),
+    }
+    evidence_refs.update({f"stage1_10_{kind}": _source_ref(ref, f"stage1_10.{kind}") for kind, ref in stage1_10_refs.items()})
+    evidence_refs.update({f"stage1_11_{kind}": _source_ref(ref, f"stage1_11.{kind}") for kind, ref in stage1_11_refs.items()})
+    evidence_refs.update({f"gate_{key.replace('.', '_').replace('-', '_').lower()}": ref for key, ref in normalized_gates.items()})
+    environment = TaskRuntimeEnvironment(
+        capabilities=frozenset(),
+        frozen_contract_stages=frozenset({0, 1, 2}),
+        passed_gate_ids=frozenset(required_gate_ids),
+        evidence_refs=evidence_refs,
+    )
+    target = _safe_relative(root, output_ref, "formal_environment_output")
+    publish_canonical_immutable(target, environment.to_dict())
+    reread = TaskRuntimeEnvironment.from_mapping(load_canonical_json(target))
+    if reread.environment_hash != environment.environment_hash:
+        raise _error("ENVIRONMENT_ROUND_TRIP_DRIFT", output_ref)
+    return reread
+
+
 def execute_formal_predecessor_dag(
     data_root: str | Path,
     *,
@@ -1793,16 +1827,20 @@ def execute_formal_predecessor_dag(
     base_config_ref: str,
     output_dir: str,
 ) -> FormalDAGResult:
-    """Execute the authoritative S2.1 → S2.2 → S2.3 formal DAG.
+    """Produce only the canonical S2.1 and S2.3 formal task commits.
 
-    G2.0 is derived only after S2.1; G2.1 is bridged only after S2.2 and its
-    dated authority is re-read; G2.2 is bridged only after S2.3 and the
-    authoritative asset report.  Runner gate candidates remain NOT_RUN.
+    G2.0/G2.1 are independent adapter authorities.  Their existing commits
+    are consumed after S2.1 and before S2.3; if either is absent this function
+    fails closed instead of signing a candidate or running S2.2/G2.2.
     """
 
+    if raw_refs is not None:
+        raise _error("CANDIDATE_INPUTS_FORBIDDEN")
     root = Path(data_root).resolve()
     stage1_ref = _source_ref(source.get("stage1_g1_exit"), "stage1_g1_exit")
-    stage1_commits, stage1_exit, stage1_config_ref, stage1_bridge_ref = _load_stage1_formal_commits(
+    stage1_10 = _stage1_10_task_refs(source)
+    stage1_11 = _stage1_task_refs(source)
+    stage1_commits, _stage1_exit, _, _ = _load_stage1_formal_commits(
         root,
         source,
         stage1_index_ref=stage1_ref,
@@ -1810,9 +1848,6 @@ def execute_formal_predecessor_dag(
         output_dir=output_dir,
     )
     stage0_ref = _source_ref(source.get("stage0_handoff"), "stage0_handoff")
-    g3_ref = _source_ref(source.get("g3_resolution"), "g3_resolution")
-    g21_ref = _source_ref(source.get("g21_handoff", source.get("gpu_health")), "g21_handoff")
-    capability_refs = _mapping(source.get("capability_refs"), "capability_refs")
     contract_refs = {
         0: _source_ref(source.get("contract_stage_0"), "contract_stage_0"),
         1: _source_ref(source.get("contract_stage_1"), "contract_stage_1"),
@@ -1821,197 +1856,122 @@ def execute_formal_predecessor_dag(
     asset_ref, asset_manifest = _publish_authoritative_asset_manifest(
         root,
         source=source,
-        raw_refs=raw_refs,
+        raw_refs=None,
         output_dir=output_dir,
     )
-    gates_source = _mapping(source.get("gate_refs"), "gate_refs")
-    g1_ref = _source_ref(gates_source.get("stage1.G1-EXIT"), "gate.stage1.G1-EXIT")
-    initial_gate_refs = {"stage1.G1-EXIT": g1_ref}
+    formal_value = _load_mapping(root, _source_ref(formal_execution_ref, "formal_execution"), "formal_execution")
+    evidence = FormalExecutionEvidence.from_mapping(formal_value)
+    evidence.require_for_stage(2)
+    gate_source = _mapping(source.get("gate_refs"), "gate_refs")
+    g1_ref = _source_ref(gate_source.get("stage1.G1-EXIT"), "gate.stage1.G1-EXIT")
     runtime = TaskRuntime(workspace_root=root)
     register_stage23_runners(runtime, root)
     refs_by_task: dict[str, dict[str, str]] = {}
-    task_order = (
-        "stage2.01_scope_hypotheses_and_preregistration",
-        "stage2.02_stage1_handoff_and_fixed_state_contract",
-        "stage2.03_assets_checkpoints_and_sampling",
-    )
-    evidence_ref = formal_execution_ref
-    evidence = FormalExecutionEvidence.from_mapping(_load_mapping(root, evidence_ref, "formal_execution"))
-    bridge_refs: dict[str, str] = {}
-
-    # Phase 1: Stage1.11 four formal commits are the actual S2.1 inputs.
-    env1_ref = f"{output_dir}/formal-dag/environment-s201.json"
-    env1 = _build_phase_environment(
-        root,
-        source=source,
-        formal_execution_ref=evidence_ref,
-        stage0_ref=stage0_ref,
-        stage1_ref=stage1_ref,
-        contract_stage_refs=contract_refs,
-        g3_ref=g3_ref,
-        stage2_asset_ref=asset_ref,
-        gate_refs=initial_gate_refs,
-        phase_gate_ids=("stage1.G1-EXIT",),
-        capability_refs=capability_refs,
-        g21_ref=g21_ref,
-        output_ref=env1_ref,
-        stage1_bridge_ref=stage1_bridge_ref,
-        stage1_bridge_config_ref=stage1_config_ref,
-    )
+    s21_task = "stage2.01_scope_hypotheses_and_preregistration"
     s21_config = _formal_dag_config(
         root,
         base_config_ref=base_config_ref,
-        task_id=task_order[0],
-        input_refs=tuple(item.commit_ref for item in stage1_commits.values()),
-        output_dir=f"{output_dir}/formal-dag/stage2-01",
+        task_id=s21_task,
+        input_refs=tuple(stage1_11.values()),
+        output_dir=f"{output_dir}/task-outputs/stage2-01",
     )
     s21_config_ref = _publish_resolved_config(
         root,
         s21_config,
-        output_ref=f"{output_dir}/formal-dag/stage2-01/resolved-config-v2.json",
+        output_ref=f"{output_dir}/configs/stage2-01/resolved-config-v2.json",
+    )
+    env1 = _build_narrow_formal_environment(
+        root,
+        formal_execution_ref=formal_execution_ref,
+        stage0_ref=stage0_ref,
+        stage1_ref=stage1_ref,
+        contract_refs=contract_refs,
+        stage1_10_refs=stage1_10,
+        stage1_11_refs=stage1_11,
+        asset_ref=asset_ref,
+        g1_ref=g1_ref,
+        gate_refs={},
+        required_gate_ids=("stage1.G1-EXIT",),
+        output_ref=f"{output_dir}/environments/stage2-01.json",
     )
     result = runtime.execute(s21_config, environment=env1)
     if result.status is not TaskRunStatus.PASS or not result.formal_eligible:
-        raise _error("FORMAL_DAG_TASK_NOT_PASS", f"{task_order[0]}:{result.status.value}")
-    refs_by_task[task_order[0]] = dict(result.artifact_refs)
-    g20_ref, g20_gate, _ = _derive_g20_gate(
+        raise _error("FORMAL_DAG_TASK_NOT_PASS", f"{s21_task}:{result.status.value}")
+    refs_by_task[s21_task] = dict(result.artifact_refs)
+
+    g20_ref, g20_gate = _load_adapter_gate(
         root,
-        s21_refs=refs_by_task[task_order[0]],
-        stage1_refs={kind: item.commit_ref for kind, item in stage1_commits.items()},
-        stage1_exit=stage1_exit,
-        formal_execution_ref=evidence_ref,
-        base_config_ref=base_config_ref,
-        s21_config_ref=s21_config_ref,
-        output_dir=output_dir,
+        source,
+        name="g20",
+        gate_id="stage2.G2.0",
+        task_id=s21_task,
+        expected_refs=tuple(refs_by_task[s21_task].values()),
     )
-    bridge_refs["stage2.G2.0"] = g20_ref
-    evidence, evidence_ref = _extend_formal_execution(
+    g21_ref, _g21_gate = _load_adapter_gate(
         root,
-        evidence_ref=evidence_ref,
+        source,
+        name="g21",
+        gate_id="stage2.G2.1",
+        task_id="stage2.02_stage1_handoff_and_fixed_state_contract",
+        expected_refs=tuple((*refs_by_task[s21_task].values(), *stage1_10.values(), *stage1_11.values())),
+    )
+    # Extend only the execution-evidence snapshot with the independently
+    # signed adapter GateRecords.  This is lineage binding, not a new Gate or
+    # a promotion of either runner candidate.
+    evidence, phase_evidence_ref = _extend_formal_execution(
+        root,
+        evidence_ref=formal_execution_ref,
         gate=g20_gate,
         asset_hashes=(asset_manifest.digest,),
-        destination=f"{output_dir}/formal-dag/formal-execution-g20.json",
+        destination=f"{output_dir}/formal-execution-g20.json",
     )
-
-    # Phase 2: S2.2 consumes S2.1 directly and the newly bridged G2.0.
-    phase2_gates = {"stage1.G1-EXIT": g1_ref, "stage2.G2.0": g20_ref}
-    env2 = _build_phase_environment(
+    evidence, phase_evidence_ref = _extend_formal_execution(
         root,
-        source=source,
-        formal_execution_ref=evidence_ref,
-        stage0_ref=stage0_ref,
-        stage1_ref=stage1_ref,
-        contract_stage_refs=contract_refs,
-        g3_ref=g3_ref,
-        stage2_asset_ref=asset_ref,
-        gate_refs=phase2_gates,
-        phase_gate_ids=("stage1.G1-EXIT", "stage2.G2.0"),
-        capability_refs=capability_refs,
-        g21_ref=g21_ref,
-        output_ref=f"{output_dir}/formal-dag/environment-s202.json",
-        stage1_bridge_ref=stage1_bridge_ref,
-        stage1_bridge_config_ref=stage1_config_ref,
+        evidence_ref=phase_evidence_ref,
+        gate=_g21_gate,
+        destination=f"{output_dir}/formal-execution-g21.json",
     )
-    s22_config = _formal_dag_config(
-        root,
-        base_config_ref=base_config_ref,
-        task_id=task_order[1],
-        input_refs=tuple(refs_by_task[task_order[0]].values()),
-        output_dir=f"{output_dir}/formal-dag/stage2-02",
-    )
-    result = runtime.execute(s22_config, environment=env2)
-    if result.status is not TaskRunStatus.PASS or not result.formal_eligible:
-        raise _error("FORMAL_DAG_TASK_NOT_PASS", f"{task_order[1]}:{result.status.value}")
-    refs_by_task[task_order[1]] = dict(result.artifact_refs)
-    g21_gate_ref, g21_gate, _ = _derive_g21_gate(
-        root,
-        s22_refs=refs_by_task[task_order[1]],
-        stage1_refs={kind: item.commit_ref for kind, item in stage1_commits.items()},
-        stage1_ref=stage1_ref,
-        stage1_bridge_ref=stage1_bridge_ref,
-        stage1_config_ref=stage1_config_ref,
-        stage1_exit=stage1_exit,
-        g21_ref=g21_ref,
-        formal_execution_ref=evidence_ref,
-        base_config_ref=base_config_ref,
-        output_dir=output_dir,
-    )
-    bridge_refs["stage2.G2.1"] = g21_gate_ref
-    evidence, evidence_ref = _extend_formal_execution(
-        root,
-        evidence_ref=evidence_ref,
-        gate=g21_gate,
-        destination=f"{output_dir}/formal-dag/formal-execution-g21.json",
-    )
-
-    # Phase 3: S2.3 consumes the S2.1 sibling plus G2.1 and the direct asset
-    # manifest.  The runner still emits a candidate gate; G2.2 is derived below.
-    phase3_gates = {
-        "stage1.G1-EXIT": g1_ref,
-        "stage2.G2.0": g20_ref,
-        "stage2.G2.1": g21_gate_ref,
-    }
-    env3 = _build_phase_environment(
-        root,
-        source=source,
-        formal_execution_ref=evidence_ref,
-        stage0_ref=stage0_ref,
-        stage1_ref=stage1_ref,
-        contract_stage_refs=contract_refs,
-        g3_ref=g3_ref,
-        stage2_asset_ref=asset_ref,
-        gate_refs=phase3_gates,
-        phase_gate_ids=tuple(phase3_gates),
-        capability_refs=capability_refs,
-        g21_ref=g21_ref,
-        output_ref=f"{output_dir}/formal-dag/environment-s203.json",
-        stage1_bridge_ref=stage1_bridge_ref,
-        stage1_bridge_config_ref=stage1_config_ref,
-    )
+    s23_task = "stage2.03_assets_checkpoints_and_sampling"
     s23_config = _formal_dag_config(
         root,
         base_config_ref=base_config_ref,
-        task_id=task_order[2],
-        input_refs=tuple(refs_by_task[task_order[0]].values()),
-        output_dir=f"{output_dir}/formal-dag/stage2-03",
+        task_id=s23_task,
+        input_refs=tuple(refs_by_task[s21_task].values()),
+        output_dir=f"{output_dir}/task-outputs/stage2-03",
+    )
+    _publish_resolved_config(
+        root,
+        s23_config,
+        output_ref=f"{output_dir}/configs/stage2-03/resolved-config-v2.json",
+    )
+    env3 = _build_narrow_formal_environment(
+        root,
+        formal_execution_ref=phase_evidence_ref,
+        stage0_ref=stage0_ref,
+        stage1_ref=stage1_ref,
+        contract_refs=contract_refs,
+        stage1_10_refs=stage1_10,
+        stage1_11_refs=stage1_11,
+        asset_ref=asset_ref,
+        g1_ref=g1_ref,
+        gate_refs={"stage2.G2.0": g20_ref, "stage2.G2.1": g21_ref},
+        required_gate_ids=("stage2.G2.1",),
+        output_ref=f"{output_dir}/environments/stage2-03.json",
     )
     result = runtime.execute(s23_config, environment=env3)
     if result.status is not TaskRunStatus.PASS or not result.formal_eligible:
-        raise _error("FORMAL_DAG_TASK_NOT_PASS", f"{task_order[2]}:{result.status.value}")
-    refs_by_task[task_order[2]] = dict(result.artifact_refs)
-    g22_ref = _source_ref(
-        source.get("g22_asset_evidence", source.get("g22_assets", source.get("g22_evidence"))),
-        "g22_asset_evidence",
-    )
-    g22_gate_ref, g22_gate, _ = _derive_g22_gate(
-        root,
-        s23_refs=refs_by_task[task_order[2]],
-        stage2_asset_ref=asset_ref,
-        g22_ref=g22_ref,
-        g22_sha256=(None if source.get("g22_asset_evidence_sha256") is None else str(source["g22_asset_evidence_sha256"])),
-        stage1_ref=stage1_ref,
-        stage1_bridge_ref=stage1_bridge_ref,
-        stage1_config_ref=stage1_config_ref,
-        formal_execution_ref=evidence_ref,
-        base_config_ref=base_config_ref,
-        output_dir=output_dir,
-    )
-    bridge_refs["stage2.G2.2"] = g22_gate_ref
-    evidence, evidence_ref = _extend_formal_execution(
-        root,
-        evidence_ref=evidence_ref,
-        gate=g22_gate,
-        asset_hashes=(asset_manifest.digest, asset_manifest.data_range.digest),
-        destination=f"{output_dir}/formal-dag/formal-execution-g22.json",
-    )
+        raise _error("FORMAL_DAG_TASK_NOT_PASS", f"{s23_task}:{result.status.value}")
+    refs_by_task[s23_task] = dict(result.artifact_refs)
     return FormalDAGResult(
         refs_by_task,
         final_evidence=evidence,
-        final_evidence_ref=evidence_ref,
-        bridge_gate_refs=bridge_refs,
+        final_evidence_ref=phase_evidence_ref,
+        bridge_gate_refs={"stage2.G2.0": g20_ref, "stage2.G2.1": g21_ref},
         authoritative_asset_ref=asset_ref,
-        stage1_bridge_ref=stage1_bridge_ref,
-        stage1_bridge_config_ref=stage1_config_ref,
+        stage1_bridge_ref=None,
+        stage1_bridge_config_ref=None,
+        stage1_10_refs=stage1_10,
+        stage1_11_refs=stage1_11,
     )
 
 
@@ -3707,188 +3667,43 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         root = args.data_root.resolve()
         source = dict(_load_source_manifest(root, args.sources))
-        raw_sources: Mapping[str, Mapping[str, Mapping[str, Any]]] | None = None
-        candidate_refs: dict[str, dict[str, str]] | None = None
-        # A caller-provided formal task-output map is intentionally not an
-        # execution path: it could self-sign arbitrary envelopes and bypass
-        # the real S2.1→S2.2→S2.3 runner lineage.
+        # Caller-supplied task outputs and raw/candidate envelopes are never
+        # accepted as formal input.  The canonical producer below is the only
+        # path that emits S2.1/S2.3 commits.
         if source.get("task_outputs") is not None:
             raise _error("CALLER_FORMAL_TASK_OUTPUTS_FORBIDDEN")
         if source.get("raw_task_outputs") is not None:
-            raw_sources = _mapping(source.get("raw_task_outputs"), "sources.raw_task_outputs")
-            candidate_refs = bootstrap_formal_task_inputs(root, raw_sources, output_dir=args.output_dir)
-            materialized = {}
-            bootstrap_mode = True
-        else:
-            raise _error("RAW_TASK_OUTPUTS_REQUIRED", "the formal DAG must execute")
+            raise _error("CANDIDATE_INPUTS_FORBIDDEN")
         formal_ref = _source_ref(source["formal_execution"], "sources.formal_execution")
         evidence, evidence_ref = _publish_formal_execution(
             root,
             formal_ref,
             destination=str(source.get("materialized_formal_execution", "evidence/stage2/s204/formal-execution.json")),
         )
-        if raw_sources is not None:
-            materialized = execute_formal_predecessor_dag(
-                root,
-                source=source,
-                raw_refs=raw_sources,
-                formal_execution_ref=evidence_ref,
-                base_config_ref=args.base_config,
-                output_dir=args.output_dir,
-            )
+        materialized = execute_formal_predecessor_dag(
+            root,
+            source=source,
+            raw_refs=None,
+            formal_execution_ref=evidence_ref,
+            base_config_ref=args.base_config,
+            output_dir=args.output_dir,
+        )
         if not isinstance(materialized, FormalDAGResult):
             raise _error("FORMAL_DAG_RESULT_REQUIRED")
         evidence = materialized.final_evidence
         evidence_ref = materialized.final_evidence_ref
-        gate_refs = {"stage2.G2.2": materialized.bridge_gate_refs["stage2.G2.2"]}
-        capability_refs = _mapping(source.get("capability_refs"), "sources.capability_refs")
-        # Every cell receives a separate sizing study.  The first plan is used
-        # only as the base snapshot for the environment validator; no launch
-        # is allowed to consume that global snapshot directly.
-        sizing_refs = publish_per_cell_sizing_plans(
-            root,
-            formal_execution=evidence,
-            output_dir=PurePosixPath(args.sizing_output).parent.as_posix(),
-        )
-        sizing_ref = sizing_refs[EXPECTED_CELL_IDS[0]]
-        environment, environment_ref = build_formal_runtime_environment(
-            root,
-            formal_execution_ref=evidence_ref,
-            stage0_handoff_ref=str(source["stage0_handoff"]),
-            stage1_g1_exit_ref=str(source["stage1_g1_exit"]),
-            contract_freeze_ref=str(source["contract_freeze"]),
-            g3_resolution_ref=str(source["g3_resolution"]),
-            stage2_asset_resolution_ref=materialized.authoritative_asset_ref,
-            gate_refs={str(k): str(v) for k, v in gate_refs.items()},
-            capability_refs={str(k): str(v) for k, v in capability_refs.items()},
-            contract_stage_0_ref=(None if source.get("contract_stage_0") is None else str(source["contract_stage_0"])),
-            contract_stage_1_ref=(None if source.get("contract_stage_1") is None else str(source["contract_stage_1"])),
-            contract_stage_2_ref=(None if source.get("contract_stage_2") is None else str(source["contract_stage_2"])),
-            g21_handoff_ref=str(source.get("g21_handoff", source.get("gpu_health", ""))),
-            stage1_bridge_ref=materialized.stage1_bridge_ref,
-            stage1_bridge_config_ref=materialized.stage1_bridge_config_ref,
-            reference_sizing_plan_ref=sizing_ref,
-            g22_asset_evidence_ref=str(source.get("g22_asset_evidence", source.get("g22_assets", source.get("g22_evidence", "")))),
-            output_ref=args.environment_output,
-        )
-        resume_refs = _parse_key_refs(args.resume_ref, "resume_ref") if args.mode == "resume" else None
-        registry_source = source.get(
-            "stage2_parameter_registry_refs",
-            source.get("parameter_registry_refs", source.get("stage2_parameter_registry")),
-        )
-        registry_refs = _cell_ref_map(
-            registry_source if isinstance(registry_source, Mapping) else None,
-            field="parameter_registry_refs",
-            required=True,
-            root=root,
-        )
-        # Numeric margins are accepted only when found in the immutable S2.1
-        # preregistration/hypothesis commits.  The source manifest cannot carry
-        # a parallel scalar or a caller-selected delta artifact.
-        delta_refs = publish_per_cell_delta_sci(
-            root,
-            s21_refs=materialized["stage2.01_scope_hypotheses_and_preregistration"],
-            candidate_sample_counts=DEFAULT_CANDIDATES,
-            output_dir=f"{PurePosixPath(args.output_dir).as_posix()}/reference-delta-sci",
-        )
-        configs = generate_six_cell_configs(
-            root,
-            asset_manifest_ref=materialized["stage2.03_assets_checkpoints_and_sampling"]["asset_resolution"],
-            predecessor_refs=materialized,
-            base_config_ref=args.base_config,
-            g3_resolution_ref=str(source["g3_resolution"]),
-            output_dir=args.config_output_dir,
-            mode=args.mode,
-            resume_refs=resume_refs,
-            parameter_registry_refs=registry_refs,
-            delta_sci_refs=delta_refs,
-        )
-        config_refs = write_six_cell_configs(configs, root, output_dir=args.config_output_dir, mode=args.mode)
-        six_cell_manifest_ref = publish_six_cell_manifest(
-            root,
-            asset_manifest_ref=materialized["stage2.03_assets_checkpoints_and_sampling"]["asset_resolution"],
-            configs=configs,
-            registry_refs=registry_refs,
-        )
-        cell_environments, cell_environment_refs = publish_per_cell_runtime_environments(
-            root,
-            base_environment_ref=environment_ref,
-            sizing_refs=sizing_refs,
-            registry_refs=registry_refs,
-            delta_refs=delta_refs,
-            output_dir=f"{PurePosixPath(args.environment_output).parent.as_posix()}/cells",
-            six_cell_manifest_ref=six_cell_manifest_ref,
-            configs=configs,
-            config_refs=config_refs,
-            s23_asset_task_ref=materialized["stage2.03_assets_checkpoints_and_sampling"]["asset_resolution"],
-            asset_manifest_ref=materialized.authoritative_asset_ref,
-            g3_resolution_ref=str(source["g3_resolution"]),
-        )
-        runtime_sizing_refs = {
-            cell_id: cell_environments[cell_id].evidence_refs["stage2_reference_sizing_plan"]
-            for cell_id in EXPECTED_CELL_IDS
-        }
-        runtime_registry_refs = {
-            cell_id: cell_environments[cell_id].evidence_refs["stage2_parameter_registry"]
-            for cell_id in EXPECTED_CELL_IDS
-        }
-        runtime_delta_refs = {
-            cell_id: cell_environments[cell_id].evidence_refs["stage2_reference_delta_sci"]
-            for cell_id in EXPECTED_CELL_IDS
-        }
-        index_ref = publish_six_cell_materialization_index(
-            root,
-            config_refs=config_refs,
-            environment_refs=cell_environment_refs,
-            sizing_refs=runtime_sizing_refs,
-            registry_refs=runtime_registry_refs,
-            delta_refs=runtime_delta_refs,
-            six_cell_manifest_ref=six_cell_manifest_ref,
-            output_ref=f"{args.config_output_dir}/{args.mode}/materialization-index.json",
-            mode=args.mode,
-        )
-        cell_index = [
-            {
-                "cell_id": cell_id,
-                "config_ref": config_refs[cell_id],
-                "environment_ref": cell_environment_refs[cell_id],
-                "sizing_ref": runtime_sizing_refs[cell_id],
-                "registry_ref": runtime_registry_refs[cell_id],
-                "delta_ref": runtime_delta_refs[cell_id],
-                "sizing_source_ref": sizing_refs[cell_id],
-                "registry_source_ref": registry_refs[cell_id],
-                "delta_source_ref": delta_refs[cell_id],
-                "config_hash": configs[cell_id].config_hash,
-                "full_hash": configs[cell_id].full_hash,
-                "environment_hash": cell_environments[cell_id].environment_hash,
-            }
-            for cell_id in EXPECTED_CELL_IDS
-        ]
         summary = {
             "schema_version": "stage2-s204-materialization-summary-v1",
-            "formal_eligible": False,
-            "excluded_gpu": {"index": 1, "pci": EXCLUDED_PCI, "allowed_indices": sorted(ALLOWED_GPU_INDICES)},
+            "formal_eligible": True,
             "task_output_refs": materialized,
-            "candidate_task_output_refs": candidate_refs,
-            "runtime_environment_ref": environment_ref,
-            "environment_hash": environment.environment_hash,
-            "cell_environment_refs": cell_environment_refs,
+            "adapter_gate_refs": materialized.bridge_gate_refs,
+            "stage1_10_task_output_refs": materialized.stage1_10_refs,
+            "stage1_11_task_output_refs": materialized.stage1_11_refs,
             "formal_execution_ref": evidence_ref,
-            "sizing_plan_ref": sizing_ref,
-            "sizing_plan_refs": sizing_refs,
-            "runtime_sizing_plan_refs": runtime_sizing_refs,
-            "runtime_registry_refs": runtime_registry_refs,
-            "runtime_delta_refs": runtime_delta_refs,
-            "sizing_plan_schema": S204_SCHEMA,
-            "config_refs": config_refs,
-            "six_cell_manifest_ref": six_cell_manifest_ref,
-            "materialization_index_ref": index_ref,
-            "cells": cell_index,
-            "cell_count": len(config_refs),
+            "asset_manifest_ref": materialized.authoritative_asset_ref,
             "mode": args.mode,
-            "bootstrap_mode": bootstrap_mode,
         }
-        summary_ref = f"{args.config_output_dir}/{args.mode}/materialization-summary.json"
+        summary_ref = f"{args.output_dir}/materialization-summary.json"
         publish_canonical_immutable(_safe_relative(root, summary_ref, "summary_output"), summary)
         print(json.dumps(summary, ensure_ascii=False, sort_keys=True, indent=2))
         return 0
@@ -3911,6 +3726,8 @@ __all__ = [
     "EXPECTED_CELL_IDS",
     "FormalDAGResult",
     "S204MaterializationError",
+    "STAGE1_10_TASK_ID",
+    "STAGE1_10_TASK_INPUTS",
     "STAGE1_TASK_ID",
     "STAGE1_TASK_INPUTS",
     "TASK_INPUTS",
