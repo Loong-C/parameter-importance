@@ -210,3 +210,130 @@ def test_tiny_real_model_registry_is_idempotent_and_tamper_closed() -> None:
             provider_builder=builder, formal=False,
         )
     shutil.rmtree(tmp_path, ignore_errors=True)
+
+
+def test_checkpoint_registry_hash_mismatch_reports_identity() -> None:
+    tmp_path = Path(__file__).resolve().parent / ".tmp-s203-registry-mismatch"
+    shutil.rmtree(tmp_path, ignore_errors=True)
+    tmp_path.mkdir(parents=True)
+    try:
+        fixture = build_tiny_training_fixture(
+            task_type="causal_lm", seed=17, steps=1, microbatches_per_step=1, microbatch_size=1
+        )
+        batch = fixture.dataset.steps[0][0]
+        resolver = InMemoryFrozenSampleResolver(
+            {batch.sample_ids[0]: batch},
+            resolver_id="tiny-registry-mismatch-v1",
+            loss_unit="target_token",
+            statistical_unit="tiny_sequence",
+            weight_unit="effective_target_tokens",
+            sampling_design="uniform_with_replacement",
+            weights_exogenous=True,
+            common_mean_assumption=True,
+        )
+        optimizer_options = {
+            "type": "sgd", "learning_rate": 0.1, "momentum": 0.0,
+            "weight_decay": 0.0, "fused": False, "foreach": False,
+        }
+        _, expected_registry = construct_registry_provider(
+            fixture.model, resolver, optimizer=optimizer_options,
+            optimizer_runtime={}, fixed_state_id="tiny-registry-mismatch-preview",
+        )
+        observed = expected_registry.coordinate_registry_hash
+        expected = "0" * 64
+        assert expected != observed
+
+        data_root = tmp_path / "assets"
+        root = data_root / "models" / "shared"
+        root.mkdir(parents=True)
+        (root / "model.safetensors").write_bytes(b"tiny-model")
+        (root / "config.json").write_text('{"model_type":"tiny"}\n', encoding="utf-8")
+        (root / "tokenizer.json").write_bytes(b"tiny-tokenizer")
+        manifest = data_root / "manifests" / "shared.json"
+        manifest.parent.mkdir(parents=True)
+        manifest.write_text('{"files":[]}\n', encoding="utf-8")
+        checkpoint_files = tuple(
+            CheckpointFile(
+                name, (root / name).stat().st_size, _sha(root / name), role
+            )
+            for name, role in (
+                ("model.safetensors", "weights"),
+                ("config.json", "config"),
+                ("tokenizer.json", "tokenizer"),
+            )
+        )
+        checkpoints = []
+        for model in ("pythia-14m", "pythia-31m-deduped"):
+            for stage, step in (
+                ("initialization", 0), ("early", 1000), ("mid_late", 71000)
+            ):
+                checkpoints.append(
+                    CheckpointRecord(
+                        model_id=model,
+                        training_stage=stage,
+                        checkpoint_id=f"{model}-{stage}",
+                        training_step=step,
+                        total_training_steps=143000,
+                        target_fraction={
+                            "initialization": 0.0, "early": 0.01, "mid_late": 0.5
+                        }[stage],
+                        repository=f"fixture/{model}",
+                        revision="a" * 40,
+                        root_ref="models/shared",
+                        state="ready",
+                        files=checkpoint_files,
+                        manifest_ref="manifests/shared.json",
+                        manifest_sha256=_sha(manifest),
+                        parameter_registry_hash=(
+                            expected
+                            if model == "pythia-14m" and stage == "initialization"
+                            else observed
+                        ),
+                        config_sha256=_sha(root / "config.json"),
+                        tokenizer_sha256=_sha(root / "tokenizer.json"),
+                        load_status="passed",
+                        load_evidence_ref=f"evidence/{model}-{stage}.json",
+                        load_evidence_sha256="b" * 64,
+                    )
+                )
+        assets = AssetResolutionManifest(
+            scope="local_fixture",
+            checkpoints=tuple(checkpoints),
+            data_range=build_data_range_from_prefix(
+                dataset_id="tiny",
+                revision="b" * 40,
+                manifest_ref="manifests/data.json",
+                manifest_sha256="c" * 64,
+                shard_sha256="d" * 64,
+                shard_size_bytes=1,
+                index_sha256="e" * 64,
+                index_size_bytes=1,
+            ),
+            producer_commit="f" * 40,
+            execution_commit="f" * 40,
+        )
+
+        def builder(_checkpoint: CheckpointRecord, _root: Path):
+            return fixture.model, resolver
+
+        with pytest.raises(RegistryProducerError) as caught:
+            produce_registry_manifests(
+                assets,
+                data_root=data_root,
+                manifest_root=data_root,
+                output_root=tmp_path / "output",
+                resolved_config={
+                    "optimizer": optimizer_options,
+                    "providers": {"task_type": "causal_lm"},
+                },
+                provider_builder=builder,
+                formal=False,
+            )
+
+        assert str(caught.value) == (
+            "S203_REGISTRY_CHECKPOINT_REGISTRY_HASH_MISMATCH:"
+            "checkpoint_id=pythia-14m-initialization:"
+            f"expected={expected}:observed={observed}"
+        )
+    finally:
+        shutil.rmtree(tmp_path, ignore_errors=True)
