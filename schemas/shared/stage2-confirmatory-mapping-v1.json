@@ -1,0 +1,41 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://parameter-importance.invalid/schemas/shared/stage2-confirmatory-mapping-v1.json",
+  "title": "Stage 2 confirmatory repetition mapping manifest",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "mapping_id", "scope", "stream", "freeze_hash", "sampling_plan_hash", "pilot_draw_ids", "confirmatory_draw_ids", "mappings", "draw_id_unique", "sample_id_collision_count", "complete", "formal_eligible", "qualification_gate_hash", "artifact_hash"],
+  "properties": {
+    "schema_version": {"const": "stage2-confirmatory-mapping-v1"},
+    "mapping_id": {"$ref": "#/$defs/id"},
+    "scope": {"enum": ["local_fixture", "formal"]},
+    "stream": {"const": "confirmatory"},
+    "freeze_hash": {"$ref": "#/$defs/hash"},
+    "sampling_plan_hash": {"$ref": "#/$defs/hash"},
+    "pilot_draw_ids": {"type": "array", "uniqueItems": true, "items": {"type": "string", "minLength": 1}},
+    "confirmatory_draw_ids": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"type": "string", "minLength": 1}},
+    "mappings": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"$ref": "#/$defs/mapping"}},
+    "draw_id_unique": {"const": true},
+    "sample_id_collision_count": {"type": "integer", "minimum": 0},
+    "complete": {"type": "boolean"},
+    "formal_eligible": {"const": false},
+    "qualification_gate_hash": {"type": "null"},
+    "artifact_hash": {"$ref": "#/$defs/hash"}
+  },
+  "$defs": {
+    "id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,159}$"},
+    "hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "mapping": {
+      "type": "object", "additionalProperties": false,
+      "required": ["repetition_id", "batch_size", "m_values", "mapping_hash", "draw_ids", "double_half_draw_ids"],
+      "properties": {
+        "repetition_id": {"$ref": "#/$defs/id"},
+        "batch_size": {"type": "integer", "minimum": 2},
+        "m_values": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"enum": [2, 4, 8, 16, 32]}},
+        "mapping_hash": {"$ref": "#/$defs/hash"},
+        "draw_ids": {"type": "array", "minItems": 2, "uniqueItems": true, "items": {"type": "string", "minLength": 1}},
+        "double_half_draw_ids": {"type": "array", "minItems": 2, "maxItems": 2, "items": {"type": "array", "items": {"type": "string", "minLength": 1}}}
+      }
+    }
+  }
+}

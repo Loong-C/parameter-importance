@@ -1,0 +1,48 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://parameter-importance.invalid/schemas/shared/stage2-pilot-matrix-freeze-v1.json",
+  "title": "Stage 2 pilot and confirmatory matrix freeze contract",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "freeze_id", "scope", "status", "anchor_ids", "candidate_evaluations", "b_primary", "m_primary", "r_primary", "completion_denominator", "cost_semantics", "cost_observations", "cost_io_quiescent", "confirmatory_draw_stream", "pilot_draw_stream", "formal_eligible", "qualification_gate_hash", "artifact_hash"],
+  "properties": {
+    "schema_version": {"const": "stage2-pilot-matrix-freeze-v1"},
+    "freeze_id": {"$ref": "#/$defs/id"},
+    "scope": {"enum": ["local_fixture", "formal"]},
+    "status": {"enum": ["UNFROZEN", "FIXTURE_FROZEN", "FORMAL_FROZEN", "BLOCKED"]},
+    "anchor_ids": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"$ref": "#/$defs/id"}},
+    "candidate_evaluations": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/candidate"}},
+    "b_primary": {"oneOf": [{"type": "null"}, {"enum": [32, 64, 128, 256]}]},
+    "m_primary": {"oneOf": [{"type": "null"}, {"enum": [4, 8, 16, 32]}]},
+    "r_primary": {"oneOf": [{"type": "null"}, {"type": "integer", "minimum": 1}]},
+    "completion_denominator": {"type": "integer", "minimum": 0},
+    "cost_semantics": {"type": "array", "minItems": 3, "uniqueItems": true, "items": {"enum": ["scientific_equal_sample_cost", "isolated_estimator_cost", "online_training_incremental_cost"]}},
+    "cost_observations": {"type": "object", "minProperties": 3},
+    "cost_io_quiescent": {"type": "boolean"},
+    "confirmatory_draw_stream": {"const": "confirmatory"},
+    "pilot_draw_stream": {"const": "pilot"},
+    "formal_eligible": {"const": false},
+    "qualification_gate_hash": {"type": "null"},
+    "artifact_hash": {"$ref": "#/$defs/hash"}
+  },
+  "$defs": {
+    "id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,159}$"},
+    "hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "candidate": {
+      "type": "object", "additionalProperties": false,
+      "required": ["batch_size", "microbatch_count", "m_candidate", "anchors_runnable", "finite", "aggregation_overhead_ratio", "r_required", "resource_within_budget", "selected", "reasons"],
+      "properties": {
+        "batch_size": {"enum": [32, 64, 128, 256]},
+        "microbatch_count": {"enum": [2, 4, 8, 16, 32]},
+        "m_candidate": {"type": "boolean"},
+        "anchors_runnable": {"type": "boolean"},
+        "finite": {"type": "boolean"},
+        "aggregation_overhead_ratio": {"type": "number", "minimum": 0},
+        "r_required": {"type": "integer", "minimum": 1},
+        "resource_within_budget": {"type": "boolean"},
+        "selected": {"type": "boolean"},
+        "reasons": {"type": "array", "items": {"type": "string", "minLength": 1}}
+      }
+    }
+  }
+}
