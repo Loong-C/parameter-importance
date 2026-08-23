@@ -62,6 +62,7 @@ from .sampling import (
     RepetitionMapping,
 )
 from .stage2 import EstimatorDecision, PairedEstimatorRunner
+from .stage2_g23_contracts import boundary_digest, validate_sizing_plan_contract, validate_weighting_contract
 
 
 _SAFE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,159}$")
@@ -422,7 +423,7 @@ def _weighting_contract(provider: FixedStateGradientProvider) -> dict[str, objec
     for name in fields[3:]:
         if type(contract[name]) is not bool:
             raise TypeError(f"GRADIENT_PROVIDER_{name.upper()}_MUST_BE_BOOL")
-    return contract
+    return validate_weighting_contract(contract)
 
 
 class _GradientMoments:
@@ -459,6 +460,33 @@ class _GradientMoments:
         self.count += 1
         self.n1 += weight
         self.n2 += weight**2
+
+    def update_vector(
+        self,
+        gradients: Mapping[str, object],
+        weight: float,
+        expected: Mapping[str, object],
+    ) -> None:
+        """Update from an immutable shard without retaining the raw block."""
+
+        if not math.isfinite(float(weight)) or float(weight) <= 0.0:
+            raise ValueError("statistical_weight 必须是有限正数")
+        vector = _as_vector(gradients, field_name="reference_shard.gradients")
+        if self.g1:
+            _assert_compatible(self.g1, vector, field_name="reference_gradient")
+        else:
+            self.g1 = {name: np.zeros_like(item) for name, item in vector.items()}
+            self.g2 = {name: np.zeros_like(item) for name, item in vector.items()}
+        if self.first_weight is None:
+            self.first_weight = float(weight)
+        elif float(weight) != self.first_weight:
+            self.all_equal_weights = False
+        for name, gradient in vector.items():
+            self.g1[name] += float(weight) * gradient
+            self.g2[name] += float(weight) ** 2 * np.square(gradient)
+        self.count += 1
+        self.n1 += float(weight)
+        self.n2 += float(weight) ** 2
 
     def mean(self) -> dict[str, np.ndarray]:
         if self.count <= 0 or self.n1 <= 0:
@@ -623,6 +651,18 @@ class ReferenceSizingPlan:
             raise ValueError("required_consecutive 必须是正整数")
         if self.execution.run_intent == "formal":
             self.execution.require_for_stage(2)
+        # The fixed doubling/one-consecutive ladder is the formal S2.4
+        # entrance contract.  Local/generic Stage-2 recovery tests may still
+        # use exploratory ladders; they never become formal evidence.
+        if self.execution.run_intent == "formal":
+            validate_sizing_plan_contract(
+                {
+                    "schema_version": self.schema_version,
+                    "candidate_sample_counts": list(counts),
+                    "block_size": self.block_size,
+                    "required_consecutive": self.required_consecutive,
+                }
+            )
 
     @property
     def scope(self) -> str:
@@ -1083,6 +1123,119 @@ def estimate_reference_uncertainty(
     )
 
 
+def _moment_without(
+    total: _GradientMoments,
+    vector: Mapping[str, object],
+    weight: float,
+) -> _GradientMoments:
+    """Subtract one immutable shard from sufficient statistics."""
+
+    parsed = _as_vector(vector, field_name="reference_shard.vector")
+    if total.count <= 1 or total.n1 <= weight:
+        raise ValueError("REFERENCE_JACKKNIFE_WEIGHT_DENOMINATOR_INVALID")
+    result = _GradientMoments()
+    result.count = total.count - 1
+    result.n1 = total.n1 - float(weight)
+    result.n2 = total.n2 - float(weight) ** 2
+    result.first_weight = None
+    result.all_equal_weights = False
+    _assert_compatible(total.g1, parsed, field_name="reference_shard.vector")
+    result.g1 = {name: total.g1[name] - float(weight) * parsed[name] for name in total.g1}
+    result.g2 = {name: total.g2[name] - float(weight) ** 2 * np.square(parsed[name]) for name in total.g2}
+    return result
+
+
+def _jackknife_variance(values: Sequence[Mapping[str, np.ndarray]], center: Mapping[str, np.ndarray]) -> dict[str, np.ndarray]:
+    if len(values) < 3:
+        raise ValueError("REFERENCE_JACKKNIFE_REQUIRES_THREE_BLOCKS")
+    factor = (len(values) - 1) / len(values)
+    return {
+        name: factor * np.sum(
+            np.square(np.stack([value[name] for value in values], axis=0) - center[name]),
+            axis=0,
+        )
+        for name in center
+    }
+
+
+def estimate_reference_uncertainty_shards(
+    store: _ReferenceShardStore,
+    refs_a: Sequence[Mapping[str, object]],
+    refs_b: Sequence[Mapping[str, object]],
+    assumptions: Mapping[str, object],
+) -> ReferenceUncertainty:
+    """Independent-stream weighted block jackknife directly over shard refs."""
+
+    if len(refs_a) < 3 or len(refs_b) < 3:
+        raise ValueError("REFERENCE_UNCERTAINTY_REQUIRES_THREE_BLOCKS_PER_STREAM")
+    total_a = _moments_from_shards(store, refs_a, assumptions)
+    total_b = _moments_from_shards(store, refs_b, assumptions)
+    total = total_a.combine(total_b)
+    bias_center = total.u(assumptions=assumptions)
+    bias_loo: list[dict[str, np.ndarray]] = []
+    for refs, other in ((refs_a, total_b), (refs_b, total_a)):
+        for reference in refs:
+            vector, weight, _ = store.load(reference)
+            left = _moment_without(total_a if refs is refs_a else total_b, vector, weight)
+            combined = left.combine(other)
+            bias_loo.append(combined.u(assumptions=assumptions))
+    bias_variance = _jackknife_variance(bias_loo, bias_center)
+
+    mean_a, mean_b = total_a.mean(), total_b.mean()
+    cross_center = {name: mean_a[name] * mean_b[name] for name in mean_a}
+    cross_loo: list[dict[str, np.ndarray]] = []
+    for reference in refs_a:
+        vector, weight, _ = store.load(reference)
+        cross_a = _moment_without(total_a, vector, weight).mean()
+        cross_loo.append({name: cross_a[name] * mean_b[name] for name in cross_a})
+    for reference in refs_b:
+        vector, weight, _ = store.load(reference)
+        cross_b = _moment_without(total_b, vector, weight).mean()
+        cross_loo.append({name: mean_a[name] * cross_b[name] for name in cross_b})
+    cross_variance = _jackknife_variance(cross_loo, cross_center)
+
+    merged_mean = total.mean()
+    ranking_center = {name: np.square(value) for name, value in merged_mean.items()}
+    ranking_loo: list[dict[str, np.ndarray]] = []
+    for refs, other in ((refs_a, total_b), (refs_b, total_a)):
+        for reference in refs:
+            vector, weight, _ = store.load(reference)
+            mean = _moment_without(total_a if refs is refs_a else total_b, vector, weight).combine(other).mean()
+            ranking_loo.append({name: np.square(value) for name, value in mean.items()})
+    ranking_variance = _jackknife_variance(ranking_loo, ranking_center)
+    return ReferenceUncertainty(
+        bias_variance=bias_variance,
+        cross_variance=cross_variance,
+        ranking_variance=ranking_variance,
+        block_count_a=len(refs_a),
+        block_count_b=len(refs_b),
+    )
+
+
+def estimate_sequence_variance_shards(
+    store: _ReferenceShardStore,
+    refs: Sequence[Mapping[str, object]],
+    *,
+    block_size: int,
+) -> Mapping[str, np.ndarray]:
+    if block_size <= 0 or len(refs) < 2:
+        raise ValueError("SEQUENCE_VARIANCE_REQUIRES_TWO_BLOCKS")
+    moments = _GradientMoments()
+    for reference in refs:
+        vector, weight, _ = store.load(reference)
+        moments.update_vector(vector, weight, {})
+    mean = moments.mean()
+    total_weight = moments.n1
+    result = {name: np.zeros_like(value) for name, value in mean.items()}
+    # Re-read each immutable shard for the second central-moment pass.  The
+    # caller keeps only the current block plus aggregate arrays in memory.
+    for reference in refs:
+        vector, weight, _ = store.load(reference)
+        for name in result:
+            result[name] += float(weight) * np.square(vector[name] - mean[name])
+    return {name: value * float(block_size) / total_weight for name, value in result.items()}
+
+
 @dataclass(frozen=True, slots=True)
 class OneShotReferencePlan:
     """Frozen final A/B run created only after sizing has selected B_ref."""
@@ -1314,6 +1467,123 @@ class _ReferenceSnapshotStore:
         return state
 
 
+class _ReferenceShardStore:
+    """Content-addressed storage for one completed reference block.
+
+    A progress snapshot must contain only references to these immutable shards;
+    putting the vectors in every snapshot makes a long run grow quadratically
+    and makes resume provenance impossible to audit.  The digest deliberately
+    excludes stream/sequence labels so equal vector/weight pairs are stored
+    once even when they occur in both independent streams.
+    """
+
+    SCHEMA = "stage2-reference-block-shard-v1"
+    REF_SCHEMA = "stage2-reference-block-shard-ref-v1"
+
+    def __init__(self, root: str | Path) -> None:
+        self.root = Path(root)
+        self.shards = self.root / "shards"
+        self.shards.mkdir(parents=True, exist_ok=True)
+
+    @staticmethod
+    def _digest(vector: Mapping[str, object], weight: float) -> str:
+        return canonical_json_hash(
+            {
+                "schema_version": _ReferenceShardStore.SCHEMA,
+                "vector_hash": _vector_digest(vector),
+                "weight": float(weight),
+            }
+        )
+
+    def publish(self, vector: Mapping[str, object], weight: float) -> dict[str, object]:
+        if not math.isfinite(float(weight)) or float(weight) <= 0.0:
+            raise ValueError("REFERENCE_SHARD_WEIGHT_INVALID")
+        parsed = _as_vector(vector, field_name="reference_shard.vector")
+        digest = self._digest(parsed, float(weight))
+        path = self.shards / digest
+        state = {
+            "schema_version": self.SCHEMA,
+            "vector": parsed,
+            "weight": float(weight),
+            "vector_hash": _vector_digest(parsed),
+            "shard_hash": digest,
+        }
+        if path.exists():
+            restored, bundle = load_tensor_bundle(path)
+            if not isinstance(restored, Mapping):
+                raise ValueError("REFERENCE_SHARD_IDENTITY_COLLISION")
+            loaded_vector = _as_vector(restored.get("vector"), field_name="reference_shard.vector")
+            loaded_weight = float(restored.get("weight"))
+            if (
+                restored.get("schema_version") != self.SCHEMA
+                or restored.get("vector_hash") != _vector_digest(loaded_vector)
+                or restored.get("shard_hash") != digest
+                or loaded_weight != float(weight)
+                or _vector_digest(loaded_vector) != _vector_digest(parsed)
+            ):
+                raise ValueError("REFERENCE_SHARD_IDENTITY_COLLISION")
+        else:
+            bundle = publish_tensor_bundle(path, state)
+        return {
+            "schema_version": self.REF_SCHEMA,
+            "shard_ref": f"shards/{digest}",
+            "shard_hash": digest,
+            "manifest_hash": bundle.manifest_sha256,
+            "weight": float(weight),
+        }
+
+    def load(self, reference: Mapping[str, object]) -> tuple[dict[str, np.ndarray], float, str]:
+        if set(reference) != {"schema_version", "shard_ref", "shard_hash", "manifest_hash", "weight"}:
+            raise ValueError("REFERENCE_SHARD_REF_FIELDS_MISMATCH")
+        if reference.get("schema_version") != self.REF_SCHEMA:
+            raise ValueError("REFERENCE_SHARD_REF_SCHEMA_MISMATCH")
+        ref = reference.get("shard_ref")
+        if not isinstance(ref, str) or "\\" in ref or Path(ref).is_absolute() or ".." in PurePosixPath(ref).parts:
+            raise ValueError("REFERENCE_SHARD_REF_PATH_INVALID")
+        parts = PurePosixPath(ref).parts
+        if len(parts) != 2 or parts[0] != "shards" or not parts[1]:
+            raise ValueError("REFERENCE_SHARD_REF_PATH_INVALID")
+        digest = reference.get("shard_hash")
+        if not isinstance(digest, str) or digest != parts[1] or digest != self._digest_from_ref(reference):
+            raise ValueError("REFERENCE_SHARD_REF_HASH_INVALID")
+        path = self.root.joinpath(*parts)
+        if path.is_symlink():
+            raise ValueError("REFERENCE_SHARD_SYMLINK_FORBIDDEN")
+        state, bundle = load_tensor_bundle(path)
+        if not isinstance(state, Mapping) or state.get("schema_version") != self.SCHEMA:
+            raise ValueError("REFERENCE_SHARD_SCHEMA_INVALID")
+        if bundle.manifest_sha256 != reference.get("manifest_hash"):
+            raise ValueError("REFERENCE_SHARD_MANIFEST_MISMATCH")
+        vector = _as_vector(state.get("vector"), field_name="reference_shard.vector")
+        weight = float(state.get("weight"))
+        if not math.isfinite(weight) or weight <= 0.0 or weight != float(reference.get("weight")):
+            raise ValueError("REFERENCE_SHARD_WEIGHT_MISMATCH")
+        if state.get("vector_hash") != _vector_digest(vector) or state.get("shard_hash") != digest:
+            raise ValueError("REFERENCE_SHARD_CONTENT_HASH_MISMATCH")
+        if self._digest(vector, weight) != digest:
+            raise ValueError("REFERENCE_SHARD_DIGEST_MISMATCH")
+        return vector, weight, digest
+
+    @staticmethod
+    def _digest_from_ref(reference: Mapping[str, object]) -> str:
+        # This check is intentionally only structural.  The content digest is
+        # recomputed by load() after the immutable bundle has been opened.
+        value = reference.get("shard_hash")
+        return value if isinstance(value, str) else ""
+
+
+def _moments_from_shards(
+    store: _ReferenceShardStore,
+    references: Sequence[Mapping[str, object]],
+    assumptions: Mapping[str, object],
+) -> "_GradientMoments":
+    moments = _GradientMoments()
+    for reference in references:
+        vector, weight, _ = store.load(reference)
+        moments.update_vector(vector, weight, assumptions)
+    return moments
+
+
 def _draw_digest(draws: Sequence[object]) -> str:
     """Stable identity for a frozen draw prefix without serialising provider data."""
 
@@ -1372,6 +1642,9 @@ class OneShotReferenceRunner:
         artifact_root: str | Path,
         sizing_draws: Sequence[object] | None = None,
         max_new_block_pairs: int | None = None,
+        rng_boundaries_a: Sequence[Mapping[str, object]] | None = None,
+        rng_boundaries_b: Sequence[Mapping[str, object]] | None = None,
+        require_rng_boundaries: bool = False,
     ) -> OneShotReferenceResult:
         if max_new_block_pairs is not None and max_new_block_pairs <= 0:
             raise ValueError("max_new_block_pairs 必须为正整数或 null")
@@ -1401,12 +1674,28 @@ class OneShotReferenceRunner:
 
         provider_state = self.provider.state_digest()
         assumptions = _weighting_contract(self.provider)
+        sizing_result_identity_hash = canonical_json_hash(
+            {
+                "sizing_result_hash": plan.sizing_result_hash,
+                "provider_state_digest": provider_state,
+                "registry_hash": self.provider.registry_hash,
+                "stream_a_draw_hash": _draw_digest(draws_a),
+                "stream_b_draw_hash": _draw_digest(draws_b),
+            }
+        )
         total_pairs = plan.sample_count_per_stream // plan.block_size
+        if require_rng_boundaries and (rng_boundaries_a is None or rng_boundaries_b is None):
+            raise ValueError("ONE_SHOT_REFERENCE_FORMAL_RNG_BOUNDARIES_REQUIRED")
+        if rng_boundaries_a is not None and len(rng_boundaries_a) < total_pairs + 1:
+            raise ValueError("ONE_SHOT_REFERENCE_RNG_BOUNDARIES_A_INCOMPLETE")
+        if rng_boundaries_b is not None and len(rng_boundaries_b) < total_pairs + 1:
+            raise ValueError("ONE_SHOT_REFERENCE_RNG_BOUNDARIES_B_INCOMPLETE")
         processed_pairs = 0
         moments_a, moments_b = _GradientMoments(), _GradientMoments()
-        blocks_a: list[dict[str, np.ndarray]] = []
-        blocks_b: list[dict[str, np.ndarray]] = []
         root = Path(artifact_root)
+        shard_store = _ReferenceShardStore(root)
+        shard_refs_a: list[Mapping[str, object]] = []
+        shard_refs_b: list[Mapping[str, object]] = []
         with _ReferenceSnapshotStore(root) as store:
             restored = store.latest()
             if restored is not None:
@@ -1422,16 +1711,38 @@ class OneShotReferenceRunner:
                     raise ValueError("ONE_SHOT_REFERENCE_RESUME_DRAW_A_HASH_MISMATCH")
                 if restored.get("stream_b_draw_hash") != _draw_digest(draws_b):
                     raise ValueError("ONE_SHOT_REFERENCE_RESUME_DRAW_B_HASH_MISMATCH")
+                if restored.get("sizing_result_identity_hash") != sizing_result_identity_hash:
+                    raise ValueError("ONE_SHOT_REFERENCE_RESUME_SIZING_IDENTITY_MISMATCH")
                 processed_pairs = int(restored["processed_block_pairs"])
+                if rng_boundaries_a is not None and rng_boundaries_b is not None:
+                    expected_rng = {
+                        "a": dict(rng_boundaries_a[processed_pairs]),
+                        "b": dict(rng_boundaries_b[processed_pairs]),
+                    }
+                    if restored.get("rng_state") != expected_rng or restored.get("rng_state_digest") != boundary_digest(expected_rng):
+                        raise ValueError("ONE_SHOT_REFERENCE_RESUME_RNG_STATE_MISMATCH")
                 moments_a = _GradientMoments.from_state(restored["a"])  # type: ignore[arg-type]
                 moments_b = _GradientMoments.from_state(restored["b"])  # type: ignore[arg-type]
-                raw_a, raw_b = restored.get("blocks_a", []), restored.get("blocks_b", [])
+                raw_a, raw_b = restored.get("shard_refs_a"), restored.get("shard_refs_b")
                 if not isinstance(raw_a, list) or not isinstance(raw_b, list):
-                    raise ValueError("ONE_SHOT_REFERENCE_RESUME_BLOCKS_NOT_ARRAY")
-                blocks_a = [_as_vector(item, field_name="blocks_a") for item in raw_a]  # type: ignore[arg-type]
-                blocks_b = [_as_vector(item, field_name="blocks_b") for item in raw_b]  # type: ignore[arg-type]
-                if len(blocks_a) != processed_pairs or len(blocks_b) != processed_pairs:
-                    raise ValueError("ONE_SHOT_REFERENCE_RESUME_BLOCK_COUNT_MISMATCH")
+                    raise ValueError("ONE_SHOT_REFERENCE_RESUME_SHARD_REFS_MISSING")
+                shard_refs_a = [dict(item) for item in raw_a if isinstance(item, Mapping)]
+                shard_refs_b = [dict(item) for item in raw_b if isinstance(item, Mapping)]
+                if len(shard_refs_a) != processed_pairs or len(shard_refs_b) != processed_pairs:
+                    raise ValueError("ONE_SHOT_REFERENCE_RESUME_SHARD_COUNT_MISMATCH")
+                rebuilt_a = _moments_from_shards(shard_store, shard_refs_a, assumptions)
+                rebuilt_b = _moments_from_shards(shard_store, shard_refs_b, assumptions)
+                # ndarray equality is not safe; compare each sufficient
+                # statistic with strict tolerances before resuming.
+                comparisons = [(rebuilt_a, moments_a, "a")]
+                if shard_refs_b:
+                    comparisons.append((rebuilt_b, moments_b, "b"))
+                for rebuilt, saved, label in comparisons:
+                    if rebuilt.count != saved.count or not math.isclose(rebuilt.n1, saved.n1, rel_tol=0.0, abs_tol=1e-12) or not math.isclose(rebuilt.n2, saved.n2, rel_tol=0.0, abs_tol=1e-12):
+                        raise ValueError(f"ONE_SHOT_REFERENCE_RESUME_{label.upper()}_MOMENTS_DRIFT")
+                    _assert_compatible(rebuilt.g1, saved.g1, field_name="reference_resume_moments")
+                    if any(not np.array_equal(rebuilt.g1[name], saved.g1[name]) or not np.array_equal(rebuilt.g2[name], saved.g2[name]) for name in rebuilt.g1):
+                        raise ValueError(f"ONE_SHOT_REFERENCE_RESUME_{label.upper()}_MOMENTS_DRIFT")
 
             new_pairs = 0
             while processed_pairs < total_pairs:
@@ -1445,8 +1756,8 @@ class OneShotReferenceRunner:
                 vector_b = _as_vector(batch_b.gradients, field_name="reference_B.block")
                 moments_a.update(batch_a, assumptions)
                 moments_b.update(batch_b, assumptions)
-                blocks_a.append(vector_a)
-                blocks_b.append(vector_b)
+                shard_refs_a.append(shard_store.publish(vector_a, float(batch_a.statistical_weight)))
+                shard_refs_b.append(shard_store.publish(vector_b, float(batch_b.statistical_weight)))
                 self.provider.assert_unchanged(provider_state)
                 processed_pairs += 1
                 new_pairs += 1
@@ -1462,15 +1773,35 @@ class OneShotReferenceRunner:
                     "processed_block_pairs": processed_pairs,
                     "a": moments_a.to_state(),
                     "b": moments_b.to_state(),
-                    "blocks_a": blocks_a,
-                    "blocks_b": blocks_b,
+                    "shard_refs_a": list(shard_refs_a),
+                    "shard_refs_b": list(shard_refs_b),
+                    "shard_count": processed_pairs * 2,
                     "final_length_required": True,
+                    "sizing_result_identity_hash": sizing_result_identity_hash,
+                    "rng_state": (
+                        {
+                            "a": dict(rng_boundaries_a[processed_pairs]),
+                            "b": dict(rng_boundaries_b[processed_pairs]),
+                        }
+                        if rng_boundaries_a is not None and rng_boundaries_b is not None
+                        else None
+                    ),
+                    "rng_state_digest": (
+                        boundary_digest(
+                            {
+                                "a": dict(rng_boundaries_a[processed_pairs]),
+                                "b": dict(rng_boundaries_b[processed_pairs]),
+                            }
+                        )
+                        if rng_boundaries_a is not None and rng_boundaries_b is not None
+                        else ""
+                    ),
                 }
                 store.publish(processed_pairs, state)
             # A partial state is itself a valid recoverable boundary, but it is
             # never emitted as a final reference manifest.
             if processed_pairs < total_pairs:
-                empty = blocks_a[0] if blocks_a else {"_empty": np.zeros(1, dtype=np.float64)}
+                empty = moments_a.mean() if moments_a.count else {"_empty": np.zeros(1, dtype=np.float64)}
                 return OneShotReferenceResult(
                     plan_hash=plan.artifact_hash,
                     sizing_result_hash=plan.sizing_result_hash,
@@ -1490,12 +1821,14 @@ class OneShotReferenceRunner:
                     status="IN_PROGRESS",
                 )
 
-        bias = _u_vector(blocks_a + blocks_b)
-        mean_a, mean_b = _mean_vector(blocks_a), _mean_vector(blocks_b)
+        bias = moments_a.combine(moments_b).u(assumptions=assumptions)
+        mean_a, mean_b = moments_a.mean(), moments_b.mean()
         cross = {name: mean_a[name] * mean_b[name] for name in mean_a}
-        merged_mean = _mean_vector(blocks_a + blocks_b)
+        merged_mean = moments_a.combine(moments_b).mean()
         ranking = {name: np.square(value) for name, value in merged_mean.items()}
-        uncertainty = estimate_reference_uncertainty(blocks_a, blocks_b)
+        uncertainty = estimate_reference_uncertainty_shards(
+            shard_store, shard_refs_a, shard_refs_b, assumptions
+        )
         return OneShotReferenceResult(
             plan_hash=plan.artifact_hash,
             sizing_result_hash=plan.sizing_result_hash,
@@ -1507,8 +1840,8 @@ class OneShotReferenceRunner:
             ranking_reference=ranking,
             uncertainty=uncertainty,
             weighting_assumptions=assumptions,
-            sequence_variance=estimate_sequence_variance(
-                blocks_a + blocks_b, block_size=plan.block_size
+            sequence_variance=estimate_sequence_variance_shards(
+                shard_store, shard_refs_a + shard_refs_b, block_size=plan.block_size
             ),
             stream_a_draw_hash=_draw_digest(draws_a),
             stream_b_draw_hash=_draw_digest(draws_b),
@@ -1538,12 +1871,19 @@ class StreamingReferenceSizer:
         artifact_root: str | Path,
         max_new_block_pairs: int | None = None,
         draws_sizing: Sequence[object] | None = None,
+        rng_boundaries: Sequence[Mapping[str, object]] | None = None,
+        require_rng_boundaries: bool = False,
     ) -> ReferenceSizingResult:
         if plan.scope == "formal":
             plan.execution.require_for_stage(2)
         if max_new_block_pairs is not None and max_new_block_pairs <= 0:
             raise ValueError("max_new_block_pairs 必须为正整数或 null")
         maximum = plan.candidate_sample_counts[-1]
+        total_pairs = maximum // plan.block_size
+        if require_rng_boundaries and rng_boundaries is None:
+            raise ValueError("REFERENCE_SIZING_FORMAL_RNG_BOUNDARIES_REQUIRED")
+        if rng_boundaries is not None and len(rng_boundaries) < total_pairs + 1:
+            raise ValueError("REFERENCE_SIZING_RNG_BOUNDARIES_INCOMPLETE")
         if draws_sizing is None:
             if len(draws_a) < maximum or len(draws_b) < maximum:
                 raise ValueError("冻结 A/B draws 少于 reference sizing 最大候选")
@@ -1565,12 +1905,27 @@ class StreamingReferenceSizer:
 
         provider_state = self.provider.state_digest()
         assumptions = _weighting_contract(self.provider)
+        sizing_draw_hash = _draw_digest(
+            draws_sizing[:maximum] if draws_sizing is not None else draws_a[:maximum]
+        )
+        sizing_identity_hash = canonical_json_hash(
+            {
+                "plan_hash": plan.artifact_hash,
+                "provider_state_digest": provider_state,
+                "registry_hash": self.provider.registry_hash,
+                "sizing_draw_hash": sizing_draw_hash,
+                "sizing_stream": "reference_sizing" if draws_sizing is not None else "reference_A_B",
+            }
+        )
         processed_pairs = 0
         points: list[ReferenceSizingPoint] = []
         streak = 0
         selected: int | None = None
         last_bias: dict[str, np.ndarray] | None = None
         moments_a, moments_b = _GradientMoments(), _GradientMoments()
+        shard_store = _ReferenceShardStore(artifact_root)
+        shard_refs_a: list[Mapping[str, object]] = []
+        shard_refs_b: list[Mapping[str, object]] = []
 
         with _ReferenceSnapshotStore(artifact_root) as store:
             restored = store.latest()
@@ -1583,12 +1938,39 @@ class StreamingReferenceSizer:
                     raise ValueError("REFERENCE_RESUME_REGISTRY_HASH_MISMATCH")
                 if restored.get("weighting_assumptions") != assumptions:
                     raise ValueError("REFERENCE_RESUME_WEIGHTING_CONTRACT_MISMATCH")
+                if restored.get("sizing_draw_hash") != sizing_draw_hash:
+                    raise ValueError("REFERENCE_RESUME_SIZING_DRAW_HASH_MISMATCH")
+                if restored.get("sizing_identity_hash") != sizing_identity_hash:
+                    raise ValueError("REFERENCE_RESUME_SIZING_IDENTITY_MISMATCH")
                 processed_pairs = int(restored["processed_block_pairs"])
+                if rng_boundaries is not None:
+                    expected_rng = dict(rng_boundaries[processed_pairs])
+                    if restored.get("rng_state") != expected_rng or restored.get("rng_state_digest") != boundary_digest(expected_rng):
+                        raise ValueError("REFERENCE_RESUME_RNG_STATE_MISMATCH")
                 streak = int(restored["convergence_streak"])
                 selected_value = restored["selected_sample_count_per_stream"]
                 selected = None if selected_value is None else int(selected_value)
                 moments_a = _GradientMoments.from_state(restored["a"])  # type: ignore[arg-type]
                 moments_b = _GradientMoments.from_state(restored["b"])  # type: ignore[arg-type]
+                raw_a, raw_b = restored.get("shard_refs_a"), restored.get("shard_refs_b")
+                if not isinstance(raw_a, list) or not isinstance(raw_b, list):
+                    raise ValueError("REFERENCE_RESUME_SHARD_REFS_MISSING")
+                shard_refs_a = [dict(item) for item in raw_a if isinstance(item, Mapping)]
+                shard_refs_b = [dict(item) for item in raw_b if isinstance(item, Mapping)]
+                expected_b_refs = 0 if draws_sizing is not None else processed_pairs
+                if len(shard_refs_a) != processed_pairs or len(shard_refs_b) != expected_b_refs:
+                    raise ValueError("REFERENCE_RESUME_SHARD_COUNT_MISMATCH")
+                rebuilt_a = _moments_from_shards(shard_store, shard_refs_a, assumptions)
+                rebuilt_b = _moments_from_shards(shard_store, shard_refs_b, assumptions) if shard_refs_b else _GradientMoments()
+                comparisons = [(rebuilt_a, moments_a, "a")]
+                if shard_refs_b:
+                    comparisons.append((rebuilt_b, moments_b, "b"))
+                for rebuilt, saved, label in comparisons:
+                    if rebuilt.count != saved.count or not math.isclose(rebuilt.n1, saved.n1, rel_tol=0.0, abs_tol=1e-12) or not math.isclose(rebuilt.n2, saved.n2, rel_tol=0.0, abs_tol=1e-12):
+                        raise ValueError(f"REFERENCE_RESUME_{label.upper()}_MOMENTS_DRIFT")
+                    _assert_compatible(rebuilt.g1, saved.g1, field_name="reference_resume_moments")
+                    if any(not np.array_equal(rebuilt.g1[name], saved.g1[name]) or not np.array_equal(rebuilt.g2[name], saved.g2[name]) for name in rebuilt.g1):
+                        raise ValueError(f"REFERENCE_RESUME_{label.upper()}_MOMENTS_DRIFT")
                 raw_points = restored["points"]
                 if not isinstance(raw_points, list):
                     raise ValueError("REFERENCE_RESUME_POINTS_NOT_ARRAY")
@@ -1611,9 +1993,25 @@ class StreamingReferenceSizer:
                     (draws_sizing if draws_sizing is not None else draws_a)[start:stop]
                 )
                 moments_a.update(batch_a, assumptions)
+                shard_refs_a.append(
+                    shard_store.publish(
+                        _as_vector(batch_a.gradients, field_name="sizing.blocks_a"),
+                        float(batch_a.statistical_weight),
+                    )
+                )
                 if draws_sizing is None:
                     batch_b = self.provider.gradient(draws_b[start:stop])
                     moments_b.update(batch_b, assumptions)
+                    shard_refs_b.append(
+                        shard_store.publish(
+                            _as_vector(batch_b.gradients, field_name="sizing.blocks_b"),
+                            float(batch_b.statistical_weight),
+                        )
+                    )
+                else:
+                    # The single sizing stream has no B endpoint.  Keep an
+                    # empty ref list rather than materialising zero vectors.
+                    pass
                 self.provider.assert_unchanged(provider_state)
                 processed_pairs += 1
                 new_pairs += 1
@@ -1676,7 +2074,22 @@ class StreamingReferenceSizer:
                     "last_bias": {} if last_bias is None else last_bias,
                     "a": moments_a.to_state(),
                     "b": moments_b.to_state(),
+                    "shard_refs_a": list(shard_refs_a),
+                    "shard_refs_b": list(shard_refs_b),
+                    "shard_count": len(shard_refs_a) + len(shard_refs_b),
                     "sizing_stream": draws_sizing is not None,
+                    "sizing_draw_hash": sizing_draw_hash,
+                    "sizing_identity_hash": sizing_identity_hash,
+                    "rng_state": (
+                        dict(rng_boundaries[processed_pairs])
+                        if rng_boundaries is not None
+                        else None
+                    ),
+                    "rng_state_digest": (
+                        boundary_digest(rng_boundaries[processed_pairs])
+                        if rng_boundaries is not None
+                        else ""
+                    ),
                 }
                 store.publish(processed_pairs, state)
 
