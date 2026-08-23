@@ -41,6 +41,15 @@ class SmokeError(RuntimeError):
     pass
 
 
+def canonical_pci(value: str) -> str:
+    """Normalize nvidia-smi's eight-zero domain prefix to the contract form."""
+    value = value.strip().upper()
+    match = re.fullmatch(r"(?:[0-9A-F]{4}|[0-9A-F]{8}):([0-9A-F]{2}):([0-9A-F]{2})\.([0-9])", value)
+    if not match:
+        raise SmokeError(f"invalid PCI bus id: {value!r}")
+    return f"0000:{match.group(1)}:{match.group(2)}.{match.group(3)}"
+
+
 def command(argv: list[str], timeout: int = 60) -> str:
     completed = subprocess.run(
         argv, capture_output=True, text=True, timeout=timeout, check=False
@@ -78,6 +87,8 @@ def gpu_rows() -> list[dict[str, str]]:
         "ecc_aggregate_uncorrected",
     )
     result = [dict(zip(fields, (item.strip() for item in row))) for row in rows]
+    for row in result:
+        row["pci_bus_id"] = canonical_pci(row["pci_bus_id"])
     by_pci = {row["pci_bus_id"].upper(): row for row in result}
     if EXCLUDED_PCI.upper() not in by_pci:
         raise SmokeError(f"excluded PCI device missing from inventory: {by_pci!r}")
