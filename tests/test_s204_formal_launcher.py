@@ -12,6 +12,7 @@ from ops.stage2.run_s204_formal import (
     EXCLUDED_PCI,
     EXCLUDED_UUID,
     _Heartbeat,
+    _AttemptLease,
     _canonical_hash,
     _g23_gate,
     _bind_gpu,
@@ -21,6 +22,19 @@ from ops.stage2.run_s204_formal import (
     G21_ARTIFACT,
     build_plan,
     execute_with_task_runtime,
+)
+from param_importance_nlp.experiments import (
+    AssetResolutionManifest,
+    CheckpointFile,
+    CheckpointRecord,
+    DataFile,
+    DataRangeManifest,
+    FORMAL_CHECKPOINT_SELECTION,
+    FORMAL_DATASET_ID,
+    FORMAL_DATASET_REVISION,
+    FORMAL_DATA_FILES,
+    FORMAL_DATA_MANIFEST_SHA256,
+    FORMAL_TOTAL_TRAINING_STEPS,
 )
 
 
@@ -39,38 +53,62 @@ def _inputs() -> tuple[dict[str, object], dict[str, object], dict[str, object]]:
             ],
         },
     }
-    checkpoints = [
-        {
-            "checkpoint_id": f"cell-{i}",
-            "model_id": "pythia-14m" if i < 3 else "pythia-31m-deduped",
-            "training_stage": ("initialization", "early", "mid_late")[i % 3],
-            "asset_id": f"asset-{i}",
-            "initialization_id": f"init-{i}",
-            "architecture": "pythia-14m" if i < 3 else "pythia-31m-deduped",
-            "revision": f"r{i}",
-            "parameter_registry_hash": "a" * 64,
-            "state": "ready",
-        }
-        for i in range(6)
-    ]
-    assets = {
-        "asset_resolution_hash": ASSET_DIGEST,
-        "status": "READY",
-        "checkpoint_matrix_complete": True,
-        "checkpoints": checkpoints,
-    }
-    data = {
-        "data_range_hash": DATA_DIGEST,
-        "sample_id_min": 0,
-        "sample_id_max_exclusive": 524288,
-        "input_sequence_length": 2048,
-        "dataset_id": "dataset-formal",
-        "revision": "data-r1",
-    }
-    return g21, assets, data
+    records = []
+    for i, ((model, stage), (step, revision)) in enumerate(FORMAL_CHECKPOINT_SELECTION.items()):
+        digest = f"{i + 1:064x}"
+        records.append(
+            CheckpointRecord(
+                model_id=model,
+                training_stage=stage,
+                checkpoint_id=f"cell-{i}",
+                training_step=step,
+                total_training_steps=FORMAL_TOTAL_TRAINING_STEPS,
+                target_fraction={"initialization": 0.0, "early": 0.01, "mid_late": 0.5}[stage],
+                repository=f"EleutherAI/{model}",
+                revision=revision,
+                root_ref=f"models/{model}/step{step}",
+                state="ready",
+                files=(
+                    CheckpointFile("model.safetensors", 1, digest, "weights"),
+                    CheckpointFile("config.json", 1, digest, "config"),
+                    CheckpointFile("tokenizer.json", 1, digest, "tokenizer"),
+                ),
+                manifest_ref=f"manifests/{model}-step{step}.json",
+                manifest_sha256=digest,
+                parameter_registry_hash=digest,
+                config_sha256=digest,
+                tokenizer_sha256=digest,
+                load_status="passed",
+                load_evidence_ref=f"evidence/{model}-step{step}.json",
+                load_evidence_sha256=digest,
+            )
+        )
+    data_manifest = DataRangeManifest(
+        dataset_id=FORMAL_DATASET_ID,
+        revision=FORMAL_DATASET_REVISION,
+        manifest_ref="manifests/stage2/pile-prefix.json",
+        manifest_sha256=FORMAL_DATA_MANIFEST_SHA256,
+        files=tuple(
+            DataFile(path, size, sha, "token_shard" if path.endswith(".bin") else "index")
+            for path, (size, sha) in FORMAL_DATA_FILES.items()
+        ),
+    )
+    asset_manifest = AssetResolutionManifest(
+        scope="formal",
+        checkpoints=tuple(records),
+        data_range=data_manifest,
+        producer_commit="1" * 40,
+        execution_commit="2" * 40,
+    )
+    return g21, asset_manifest.to_dict(), data_manifest.to_dict()
 
 
-def test_plan_only_is_six_cell_and_does_not_freeze_b_ref(tmp_path: Path) -> None:
+def test_plan_only_is_six_cell_and_does_not_freeze_b_ref(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _, assets, data = _inputs()
+    monkeypatch.setattr("ops.stage2.run_s204_formal.ASSET_DIGEST", assets["asset_resolution_hash"])
+    monkeypatch.setattr("ops.stage2.run_s204_formal.DATA_DIGEST", data["data_range_hash"])
     plan = build_plan(*_inputs(), output_root=tmp_path, candidates=(512, 1024), block_size=32)
     assert plan["cell_count"] == 6
     assert plan["b_ref_status"] == "UNFROZEN_UNTIL_INDEPENDENT_SIZING_PASS"
@@ -83,6 +121,17 @@ def test_plan_rejects_missing_failed_gpu_exclusion(tmp_path: Path) -> None:
     g21["current_gpu_smoke"] = {"status": "PASS", "excluded_pci_bus_ids": [], "excluded_scheduled": True}
     with pytest.raises(ValueError, match="GPU exclusion"):
         build_plan(g21, assets, data, output_root=tmp_path)
+
+
+def test_handoff_shape_without_excluded_device_is_validated_at_raw_report_boundary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    g21, assets, data = _inputs()
+    g21["current_gpu_smoke"].pop("excluded_device")  # type: ignore[union-attr]
+    monkeypatch.setattr("ops.stage2.run_s204_formal.ASSET_DIGEST", assets["asset_resolution_hash"])
+    monkeypatch.setattr("ops.stage2.run_s204_formal.DATA_DIGEST", data["data_range_hash"])
+    plan = build_plan(g21, assets, data, output_root=tmp_path, candidates=(512, 1024))
+    assert plan["formal_eligible"] is False
 
 
 def test_runtime_launcher_requires_smoke_approved_gpu_set(tmp_path: Path) -> None:
@@ -112,9 +161,72 @@ def test_gpu_binding_rejects_index_reordering(monkeypatch: pytest.MonkeyPatch) -
         _bind_gpu("0")
 
 
+def _healthy_inventory() -> list[dict[str, object]]:
+    rows = [
+        {"index": "0", "pci_bus_id": EXCLUDED_PCI, "uuid": EXCLUDED_UUID},
+        {"index": "2", "pci_bus_id": "0000:53:00.0", "uuid": APPROVED_GPU_BINDINGS["0000:53:00.0"]},
+        {"index": "3", "pci_bus_id": "0000:9C:00.0", "uuid": APPROVED_GPU_BINDINGS["0000:9C:00.0"]},
+        {"index": "4", "pci_bus_id": "0000:9D:00.0", "uuid": APPROVED_GPU_BINDINGS["0000:9D:00.0"]},
+        {"index": "5", "pci_bus_id": "0000:A0:00.0", "uuid": APPROVED_GPU_BINDINGS["0000:A0:00.0"]},
+    ]
+    for row in rows:
+        row.update(
+            {
+                "memory_used_mib": "0",
+                "memory_total_mib": "40960",
+                "utilization_gpu_percent": "0",
+                "ecc_uncorrected_volatile": "0",
+                "ecc_uncorrected_aggregate": "0",
+                "gpu_recovery_action": "None",
+            }
+        )
+    return rows
+
+
+def test_gpu_live_inventory_requires_idle_clean_health_and_complete_set(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    healthy = _healthy_inventory()
+    monkeypatch.setattr("ops.stage2.run_s204_formal._gpu_inventory", lambda: healthy)
+    monkeypatch.setattr("ops.stage2.run_s204_formal._gpu_compute_apps", lambda: [])
+    selected, inventory, digest = _bind_gpu("2")
+    assert selected == APPROVED_GPU_BINDINGS["0000:53:00.0"]
+    assert len(inventory) == 5 and len(digest) == 64
+
+    busy = _healthy_inventory()
+    busy[1]["memory_used_mib"] = "1"
+    monkeypatch.setattr("ops.stage2.run_s204_formal._gpu_inventory", lambda: busy)
+    with pytest.raises(ValueError, match="not idle"):
+        _bind_gpu("2")
+
+    ecc = _healthy_inventory()
+    ecc[1]["ecc_uncorrected_volatile"] = "1"
+    monkeypatch.setattr("ops.stage2.run_s204_formal._gpu_inventory", lambda: ecc)
+    with pytest.raises(ValueError, match="ECC"):
+        _bind_gpu("2")
+
+    monkeypatch.setattr("ops.stage2.run_s204_formal._gpu_inventory", _healthy_inventory)
+    monkeypatch.setattr(
+        "ops.stage2.run_s204_formal._gpu_compute_apps",
+        lambda: [{"pid": "123", "process_name": "other", "gpu_uuid": APPROVED_GPU_BINDINGS["0000:53:00.0"]}],
+    )
+    with pytest.raises(ValueError, match="compute apps"):
+        _bind_gpu("2")
+
+
+def test_duplicate_formal_writer_is_rejected_by_output_lease(tmp_path: Path) -> None:
+    output = tmp_path / "artifacts" / "cell-0"
+    with _AttemptLease(output, cell_id="cell-0", attempt_id="fresh-a"):
+        with pytest.raises(RuntimeError, match="LEASE_HELD"):
+            with _AttemptLease(output, cell_id="cell-0", attempt_id="resume-b"):
+                pass
+
+
 def test_execute_reloads_hash_bound_g21_smoke_report(tmp_path: Path) -> None:
     report = {
+        "schema_version": "stage2-s202-current-gpu-smoke-v1",
         "status": "PASS",
+        "atomic_publication": True,
         "excluded_pci_bus_ids": [EXCLUDED_PCI],
         "excluded_device": {
             "pci_bus_id": EXCLUDED_PCI,

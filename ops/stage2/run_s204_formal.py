@@ -24,6 +24,16 @@ import sys
 import threading
 from typing import Any, Mapping
 
+from param_importance_nlp.contracts.g21_formal_handoff import (
+    G21FormalHandoffError,
+    load_g21_formal_handoff,
+)
+from param_importance_nlp.experiments import (
+    AssetResolutionManifest,
+    DataRangeManifest,
+    validate_formal_asset_identity,
+)
+
 
 G21_ARTIFACT = "259831e2a1b16afbbef34c9cea602e636756b0f6173d1a8f4c32ec554c653f79"
 ASSET_DIGEST = "f57decd5cf00e69e45ab2f02c994abb202f5c614e1441acb8aebcb1807ff76ee"
@@ -53,6 +63,39 @@ G23_REQUIRED_METRICS = (
     "epsilon_num",
 )
 
+# S2.3 deliberately does not duplicate the G3 logical asset/config fields in
+# each checkpoint row.  This is the one formal selection/config mapping used by
+# this launcher.  It is derived from the frozen model/stage/step selection, not
+# from optional ad-hoc fields in a manifest (and never from a fixture fallback).
+_FORMAL_BASE_REVISIONS = {
+    "pythia-14m": "56079904bb80b7f36d3b794089f146e7a4d6efae",
+    "pythia-31m-deduped": "73628c85dd9d12d43c07be77ebcf10cef5fd9660",
+}
+
+
+def _formal_logical_identity(checkpoint: Mapping[str, Any]) -> dict[str, str]:
+    model_id = checkpoint.get("model_id")
+    stage = checkpoint.get("training_stage")
+    step = checkpoint.get("training_step")
+    revision = checkpoint.get("revision")
+    checkpoint_id = checkpoint.get("checkpoint_id")
+    if not all(isinstance(value, str) and value for value in (model_id, stage, revision, checkpoint_id)):
+        raise ValueError("formal checkpoint row identity is incomplete")
+    if not isinstance(step, int) or isinstance(step, bool) or step < 0:
+        raise ValueError("formal checkpoint row training_step is invalid")
+    base_revision = _FORMAL_BASE_REVISIONS.get(model_id)
+    if base_revision is None:
+        raise ValueError(f"formal checkpoint model is not selected: {model_id}")
+    expected_asset_id = f"{model_id}-step{step}"
+    expected_architecture = model_id
+    initialization_id = f"EleutherAI/{model_id}@{base_revision}:step0"
+    return {
+        "asset_id": expected_asset_id,
+        "initialization_id": initialization_id,
+        "architecture": expected_architecture,
+        "input_checkpoint_id": checkpoint_id,
+    }
+
 
 def _canonical_hash(value: Mapping[str, Any]) -> str:
     body = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
@@ -80,13 +123,20 @@ def _file_sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _gpu_inventory() -> list[dict[str, str]]:
-    """Read the live index/PCI/UUID mapping; never infer identity from index."""
+_GPU_QUERY_FIELDS = (
+    "index,pci.bus_id,uuid,memory.used,memory.total,utilization.gpu,"
+    "ecc.errors.uncorrected.volatile.total,ecc.errors.uncorrected.aggregate.total,"
+    "gpu_recovery_action"
+)
+
+
+def _gpu_inventory() -> list[dict[str, Any]]:
+    """Read identity plus health/idle fields from the live nvidia-smi inventory."""
 
     completed = subprocess.run(
         [
             "nvidia-smi",
-            "--query-gpu=index,pci.bus_id,uuid",
+            f"--query-gpu={_GPU_QUERY_FIELDS}",
             "--format=csv,noheader,nounits",
         ],
         capture_output=True,
@@ -96,11 +146,13 @@ def _gpu_inventory() -> list[dict[str, str]]:
     )
     if completed.returncode != 0:
         raise ValueError(f"nvidia-smi inventory failed: {completed.stderr.strip()}")
-    rows: list[dict[str, str]] = []
+    rows: list[dict[str, Any]] = []
     for fields in csv.reader(line for line in completed.stdout.splitlines() if line.strip()):
-        if len(fields) != 3:
+        if len(fields) != 9:
             raise ValueError(f"invalid nvidia-smi inventory row: {fields!r}")
-        index, pci, uuid = (item.strip() for item in fields)
+        index, pci, uuid, memory_used, memory_total, utilization, ecc_volatile, ecc_aggregate, recovery = (
+            item.strip() for item in fields
+        )
         if not index.isdigit() or not pci or not uuid:
             raise ValueError(f"invalid nvidia-smi inventory identity: {fields!r}")
         pci_match = re.fullmatch(
@@ -109,16 +161,111 @@ def _gpu_inventory() -> list[dict[str, str]]:
         )
         if pci_match is None:
             raise ValueError(f"invalid nvidia-smi PCI identity: {pci!r}")
-        pci = f"0000:{pci_match.group(1)}:{pci_match.group(2)}.{pci_match.group(3)}"
+        # nvidia-smi may print a four- or eight-digit PCI domain.  The system
+        # contract uses the canonical four-digit domain.
+        pci = f"0000:{pci_match.group(1)[-4:]}:{pci_match.group(2)}.{pci_match.group(3)}"
         if not uuid.upper().startswith("GPU-"):
             uuid = "GPU-" + uuid
-        rows.append({"index": index, "pci_bus_id": pci, "uuid": uuid})
+        for value, label in (
+            (memory_used, "memory.used"),
+            (memory_total, "memory.total"),
+            (utilization, "utilization.gpu"),
+            (ecc_volatile, "ecc.errors.uncorrected.volatile.total"),
+            (ecc_aggregate, "ecc.errors.uncorrected.aggregate.total"),
+        ):
+            try:
+                float(value)
+            except ValueError as error:
+                raise ValueError(f"invalid nvidia-smi {label}: {value!r}") from error
+        rows.append(
+            {
+                "index": index,
+                "pci_bus_id": pci,
+                "uuid": uuid,
+                "memory_used_mib": memory_used,
+                "memory_total_mib": memory_total,
+                "utilization_gpu_percent": utilization,
+                "ecc_uncorrected_volatile": ecc_volatile,
+                "ecc_uncorrected_aggregate": ecc_aggregate,
+                "gpu_recovery_action": recovery,
+            }
+        )
     if not rows or len({row["index"] for row in rows}) != len(rows):
         raise ValueError("nvidia-smi inventory is empty or has duplicate indices")
     return rows
 
 
-def _bind_gpu(token: str) -> tuple[str, list[dict[str, str]], str]:
+def _gpu_compute_apps() -> list[dict[str, str]]:
+    completed = subprocess.run(
+        [
+            "nvidia-smi",
+            "--query-compute-apps=pid,process_name,gpu_uuid",
+            "--format=csv,noheader,nounits",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    if completed.returncode != 0:
+        raise ValueError(f"nvidia-smi compute-app inventory failed: {completed.stderr.strip()}")
+    apps: list[dict[str, str]] = []
+    for fields in csv.reader(line for line in completed.stdout.splitlines() if line.strip()):
+        if len(fields) != 3:
+            raise ValueError(f"invalid nvidia-smi compute-app row: {fields!r}")
+        pid, name, uuid = (item.strip() for item in fields)
+        if not pid.isdigit() or not uuid:
+            raise ValueError(f"invalid nvidia-smi compute-app identity: {fields!r}")
+        apps.append({"pid": pid, "process_name": name, "gpu_uuid": uuid})
+    return apps
+
+
+def _validate_live_gpu_health(
+    inventory: list[dict[str, Any]], apps: list[dict[str, str]]
+) -> None:
+    expected = {pci.casefold(): uuid.casefold() for pci, uuid in APPROVED_GPU_BINDINGS.items()}
+    expected[EXCLUDED_PCI.casefold()] = EXCLUDED_UUID.casefold()
+    observed: dict[str, str] = {}
+    for row in inventory:
+        pci = str(row.get("pci_bus_id", "")).casefold()
+        uuid = str(row.get("uuid", "")).casefold()
+        if pci in expected:
+            if pci in observed and observed[pci] != uuid:
+                raise ValueError(f"duplicate live PCI identity: {row}")
+            observed[pci] = uuid
+    if observed != expected:
+        raise ValueError(
+            "live GPU inventory must contain the complete approved+excluded PCI/UUID set"
+        )
+    pci_ids = [str(row.get("pci_bus_id", "")).casefold() for row in inventory]
+    if len(set(pci_ids)) != len(pci_ids):
+        raise ValueError("live GPU inventory contains duplicate PCI identities")
+    if len({str(row.get("uuid", "")).casefold() for row in inventory}) != len(inventory):
+        raise ValueError("live GPU inventory contains duplicate UUIDs")
+    if apps:
+        raise ValueError(f"approved GPU inventory is not idle; compute apps present: {apps}")
+    for row in inventory:
+        pci = str(row.get("pci_bus_id", "")).casefold()
+        if pci not in expected:
+            continue
+        try:
+            memory_used = float(row["memory_used_mib"])
+            memory_total = float(row["memory_total_mib"])
+            utilization = float(row["utilization_gpu_percent"])
+            ecc_volatile = float(row["ecc_uncorrected_volatile"])
+            ecc_aggregate = float(row["ecc_uncorrected_aggregate"])
+        except (KeyError, TypeError, ValueError) as error:
+            raise ValueError(f"live GPU health fields missing: {row}") from error
+        if memory_total <= 0.0 or memory_used != 0.0 or utilization != 0.0:
+            raise ValueError(f"GPU is not idle: {row}")
+        if ecc_volatile != 0.0 or ecc_aggregate != 0.0:
+            raise ValueError(f"GPU ECC health is not clean: {row}")
+        recovery = str(row.get("gpu_recovery_action", "")).strip().casefold()
+        if recovery not in {"none", "0", "n/a", "na"}:
+            raise ValueError(f"GPU recovery/health state is not clean: {row}")
+
+
+def _bind_gpu(token: str) -> tuple[str, list[dict[str, Any]], str]:
     inventory = _gpu_inventory()
     selected = next(
         (
@@ -135,7 +282,17 @@ def _bind_gpu(token: str) -> tuple[str, list[dict[str, str]], str]:
     expected_uuid = APPROVED_GPU_BINDINGS.get(selected["pci_bus_id"])
     if expected_uuid is None or expected_uuid.casefold() != selected["uuid"].casefold():
         raise ValueError(f"GPU PCI/UUID mapping is not in the approved smoke set: {selected}")
-    inventory_hash = _canonical_hash({"schema_version": "stage2-s204-gpu-inventory-v1", "rows": inventory})
+    apps = _gpu_compute_apps()
+    _validate_live_gpu_health(inventory, apps)
+    for row in inventory:
+        row["compute_apps"] = [dict(item) for item in apps]
+    inventory_hash = _canonical_hash(
+        {
+            "schema_version": "stage2-s204-gpu-inventory-v2",
+            "rows": inventory,
+            "compute_apps": apps,
+        }
+    )
     return selected["uuid"], inventory, inventory_hash
 
 
@@ -146,6 +303,7 @@ def _validate_gpu_smoke_artifact(plan: Mapping[str, Any], data_root: Path) -> di
     declared = plan.get("gpu_smoke_sha256")
     if not isinstance(ref, str) or not ref or not isinstance(declared, str):
         raise ValueError("G2.1 current GPU smoke ref/hash is required for formal execute")
+    declared = _require_sha256(declared, "G2.1 current GPU smoke sha256")
     normalized_ref = ref.replace("\\", "/")
     if normalized_ref.startswith("$DATA_ROOT/"):
         normalized_ref = normalized_ref[len("$DATA_ROOT/") :]
@@ -159,7 +317,11 @@ def _validate_gpu_smoke_artifact(plan: Mapping[str, Any], data_root: Path) -> di
     if _file_sha256(path) != declared:
         raise ValueError("G2.1 current GPU smoke sha256 drift")
     report = _load(path)
-    if report.get("status") != "PASS":
+    if (
+        report.get("schema_version") != "stage2-s202-current-gpu-smoke-v1"
+        or report.get("status") != "PASS"
+        or report.get("atomic_publication") is not True
+    ):
         raise ValueError("G2.1 current GPU smoke report is not PASS")
     if EXCLUDED_PCI not in report.get("excluded_pci_bus_ids", []):
         raise ValueError("G2.1 smoke report does not exclude required PCI")
@@ -190,7 +352,48 @@ def _validate_gpu_smoke_artifact(plan: Mapping[str, Any], data_root: Path) -> di
     }
 
 
-def validate_inputs(g21: Mapping[str, Any], assets: Mapping[str, Any], data: Mapping[str, Any]) -> None:
+def _formal_asset_manifests(
+    assets: Mapping[str, Any], data: Mapping[str, Any]
+) -> tuple[AssetResolutionManifest, DataRangeManifest]:
+    """Load both independent S2.3 manifest shapes before projecting a plan."""
+
+    try:
+        asset_manifest = AssetResolutionManifest.from_mapping(assets)
+        data_manifest = DataRangeManifest.from_mapping(data)
+        validate_formal_asset_identity(asset_manifest)
+    except (TypeError, ValueError) as error:
+        raise ValueError(f"S2.3 formal manifest loader rejected input: {error}") from error
+    if asset_manifest.digest != ASSET_DIGEST:
+        raise ValueError("S2.3 asset digest mismatch")
+    if data_manifest.digest != DATA_DIGEST:
+        raise ValueError("S2.3 data digest mismatch")
+    if data_manifest.to_dict() != asset_manifest.data_range.to_dict():
+        raise ValueError("S2.3 data range differs between independent manifests")
+    if asset_manifest.status != "READY" or not asset_manifest.checkpoint_matrix_complete:
+        raise ValueError("S2.3 does not contain the six ready checkpoints")
+    if any(not checkpoint.ready for checkpoint in asset_manifest.checkpoints):
+        raise ValueError("S2.3 checkpoint matrix contains a non-ready checkpoint")
+    return asset_manifest, data_manifest
+
+
+def validate_inputs(
+    g21: Mapping[str, Any],
+    assets: Mapping[str, Any],
+    data: Mapping[str, Any],
+    *,
+    g21_path: Path | None = None,
+    data_root: Path | None = None,
+) -> None:
+    # The CLI calls load_g21_formal_handoff before this projection.  Keeping an
+    # optional path here also makes direct callers use the canonical loader
+    # instead of treating a hand-written mapping as a formal handoff.
+    if g21_path is not None:
+        try:
+            loaded = load_g21_formal_handoff(g21_path, data_root=data_root)
+        except G21FormalHandoffError as error:
+            raise ValueError(f"G2.1 formal handoff rejected: {error}") from error
+        if dict(loaded) != dict(g21):
+            raise ValueError("G2.1 loaded handoff differs from caller mapping")
     if g21.get("status") != "PASS":
         raise ValueError("G2.1 evidence is not PASS")
     if g21.get("artifact_hash") != G21_ARTIFACT:
@@ -199,14 +402,23 @@ def validate_inputs(g21: Mapping[str, Any], assets: Mapping[str, Any], data: Map
     if not isinstance(smoke, Mapping) or smoke.get("status") != "PASS":
         raise ValueError("G2.1 current GPU smoke is not PASS")
     excluded = smoke.get("excluded_pci_bus_ids", [])
-    excluded_device = smoke.get("excluded_device", {})
+    # The canonical handoff intentionally omits the raw excluded-device object;
+    # only the bound raw smoke report is required to carry it.  If a mapping
+    # does include the field, validate it, but absence is not a failure here.
+    excluded_device = smoke.get("excluded_device")
+    excluded_device_valid = True
+    if "excluded_device" in smoke:
+        excluded_device_valid = (
+            isinstance(excluded_device, Mapping)
+            and str(excluded_device.get("pci_bus_id", EXCLUDED_PCI)).casefold()
+            == EXCLUDED_PCI.casefold()
+            and str(excluded_device.get("uuid", "")).casefold()
+            == EXCLUDED_UUID.casefold()
+        )
     if (
         EXCLUDED_PCI not in excluded
         or smoke.get("excluded_scheduled") is not False
-        or (
-            isinstance(excluded_device, Mapping)
-            and str(excluded_device.get("uuid", "")).casefold() != EXCLUDED_UUID.casefold()
-        )
+        or not excluded_device_valid
     ):
         raise ValueError("required failed GPU exclusion is not bound")
     allowed_devices = smoke.get("allowed_devices")
@@ -222,19 +434,7 @@ def validate_inputs(g21: Mapping[str, Any], assets: Mapping[str, Any], data: Map
         key: value.casefold() for key, value in observed_gpu_bindings.items()
     } != {key: value.casefold() for key, value in expected_gpu_bindings.items()}:
         raise ValueError("G2.1 approved GPU PCI/UUID inventory drift")
-    if assets.get("asset_resolution_hash") != ASSET_DIGEST or assets.get("status") != "READY":
-        raise ValueError("S2.3 asset digest/status mismatch")
-    checkpoints = assets.get("checkpoints")
-    if assets.get("checkpoint_matrix_complete") is not True or not isinstance(checkpoints, list) or len(checkpoints) != 6:
-        raise ValueError("S2.3 does not contain the six ready checkpoints")
-    if any(not isinstance(item, Mapping) or item.get("state") != "ready" for item in checkpoints):
-        raise ValueError("S2.3 checkpoint matrix contains a non-ready checkpoint")
-    if data.get("data_range_hash") != DATA_DIGEST:
-        raise ValueError("S2.3 data digest mismatch")
-    if data.get("sample_id_min") != 0 or data.get("sample_id_max_exclusive") != 524288:
-        raise ValueError("S2.3 sample range drift")
-    if data.get("input_sequence_length") != 2048:
-        raise ValueError("S2.3 sequence length drift")
+    _formal_asset_manifests(assets, data)
 
 
 def build_plan(
@@ -248,6 +448,7 @@ def build_plan(
     per_sequence_seconds: float = 0.25,
 ) -> dict[str, Any]:
     validate_inputs(g21, assets, data)
+    asset_manifest, data_manifest = _formal_asset_manifests(assets, data)
     smoke = g21["current_gpu_smoke"]
     if not isinstance(smoke, Mapping):  # validate_inputs already checks this
         raise ValueError("G2.1 current GPU smoke is malformed")
@@ -258,27 +459,24 @@ def build_plan(
     if not math.isfinite(per_sequence_seconds) or per_sequence_seconds <= 0:
         raise ValueError("per_sequence_seconds must be finite and positive")
     cells: list[dict[str, Any]] = []
-    rows = assets["checkpoints"]
-    for checkpoint in rows:
-        cell_id = str(checkpoint["checkpoint_id"])
-        checkpoint_asset_id = checkpoint.get("asset_id", checkpoint.get("logical_asset_id"))
-        checkpoint_initialization_id = checkpoint.get("initialization_id")
-        checkpoint_architecture = checkpoint.get("architecture", checkpoint.get("model_id"))
-        data_asset_id = data.get("logical_asset_id", data.get("asset_id", data.get("dataset_id")))
-        if not all(
-            isinstance(value, str) and value
-            for value in (
-                checkpoint_asset_id,
-                checkpoint_initialization_id,
-                checkpoint_architecture,
-                data_asset_id,
-                data.get("revision"),
-            )
+    rows = asset_manifest.checkpoints
+    for checkpoint_record in rows:
+        checkpoint = checkpoint_record.to_dict()
+        identity = _formal_logical_identity(checkpoint)
+        cell_id = str(checkpoint_record.checkpoint_id)
+        if (
+            not cell_id
+            or "\\" in cell_id
+            or PurePosixPath(cell_id).is_absolute()
+            or any(part in {"", ".", ".."} for part in PurePosixPath(cell_id).parts)
+            or len(PurePosixPath(cell_id).parts) != 1
         ):
-            raise ValueError(
-                "S2.3 checkpoint/data rows must expose asset_id, revision, "
-                "initialization_id, architecture, and data identity"
-            )
+            raise ValueError("formal checkpoint_id must be one safe cell path component")
+        checkpoint_asset_id = identity["asset_id"]
+        checkpoint_initialization_id = identity["initialization_id"]
+        checkpoint_architecture = identity["architecture"]
+        input_checkpoint_id = identity["input_checkpoint_id"]
+        data_asset_id = "pile-selected-prefix"
         # Sizing is one independent stream; final A and B are each full-length.
         sizing_draws = candidates[-1]
         final_draws_per_stream = "UNFROZEN"
@@ -289,14 +487,18 @@ def build_plan(
                 "model_id": checkpoint["model_id"],
                 "training_stage": checkpoint["training_stage"],
                 "checkpoint_id": checkpoint["checkpoint_id"],
+                "input_checkpoint_id": input_checkpoint_id,
                 "checkpoint_asset_id": checkpoint_asset_id,
                 "checkpoint_initialization_id": checkpoint_initialization_id,
                 "checkpoint_architecture": checkpoint_architecture,
                 "checkpoint_revision": checkpoint["revision"],
+                "checkpoint_root_ref": checkpoint["root_ref"],
+                "checkpoint_manifest_ref": checkpoint["manifest_ref"],
+                "checkpoint_manifest_sha256": checkpoint["manifest_sha256"],
                 "parameter_registry_hash": checkpoint["parameter_registry_hash"],
                 "data_asset_id": data_asset_id,
-                "data_revision": data.get("revision"),
-                "data_sequence_length": data["input_sequence_length"],
+                "data_revision": data_manifest.revision,
+                "data_sequence_length": data_manifest.input_sequence_length,
                 "candidate_sample_counts": list(candidates),
                 "block_size": block_size,
                 "b_ref_status": "UNFROZEN_UNTIL_SIZING_PASS",
@@ -320,6 +522,7 @@ def build_plan(
         "g2_1_artifact_hash": G21_ARTIFACT,
         "asset_resolution_digest": ASSET_DIGEST,
         "data_range_digest": DATA_DIGEST,
+        "logical_identity_mapping": "formal-stage2-checkpoint-selection-v1",
         "excluded_pci": EXCLUDED_PCI,
         "excluded_uuid": EXCLUDED_UUID,
         "approved_gpu_bindings": dict(APPROVED_GPU_BINDINGS),
@@ -402,6 +605,87 @@ def _publish_json_once(path: Path, value: Mapping[str, Any]) -> None:
             raise RuntimeError(f"IMMUTABLE_JSON_IDENTITY_CONFLICT:{path}")
         return
     _atomic_json(path, value)
+
+
+def _append_event(path: Path, payload: Mapping[str, Any]) -> None:
+    """Append one fsync'd attempt event; existing events are never rewritten."""
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    row = {
+        "schema_version": "stage2-s204-attempt-event-v1",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        **dict(payload),
+    }
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+
+
+class _AttemptLease:
+    """Exclusive lease for one resolved TaskRuntime artifacts.output_dir."""
+
+    def __init__(self, output_dir: Path, *, cell_id: str, attempt_id: str) -> None:
+        self.output_dir = output_dir.resolve()
+        self.cell_id = cell_id
+        self.attempt_id = attempt_id
+        self.path = self.output_dir / ".stage2-s204-lease.json"
+        self._acquired = False
+
+    def __enter__(self) -> "_AttemptLease":
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "schema_version": "stage2-s204-lease-v1",
+            "cell_id": self.cell_id,
+            "attempt_id": self.attempt_id,
+            "pid": os.getpid(),
+            "started_at": datetime.now(timezone.utc).isoformat(),
+        }
+        try:
+            with self.path.open("x", encoding="utf-8") as handle:
+                handle.write(json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+        except FileExistsError as error:
+            raise RuntimeError(
+                f"S2.4_TASK_OUTPUT_LEASE_HELD:{self.output_dir.as_posix()}"
+            ) from error
+        self._acquired = True
+        return self
+
+    def __exit__(self, exc_type: object, *_: object) -> None:
+        if not self._acquired:
+            return
+        if exc_type is not None:
+            # Preserve the lease after an interrupted/failed attempt.  An
+            # operator must inspect the append-only events before removing it
+            # and starting a distinct resume attempt.
+            self._acquired = False
+            return
+        try:
+            owner = _load(self.path)
+            if owner.get("cell_id") != self.cell_id or owner.get("attempt_id") != self.attempt_id:
+                raise RuntimeError("S2.4_TASK_OUTPUT_LEASE_OWNER_DRIFT")
+            # Releasing the lease is safe only after the caller has published its
+            # immutable final-status/result.  A crash leaves the lease for an
+            # operator-reviewed resume instead of allowing a competing writer.
+            self.path.unlink()
+        finally:
+            self._acquired = False
+
+
+def _resolve_data_root_ref(root: Path, reference: str, *, field: str) -> Path:
+    if not isinstance(reference, str) or not reference or "\\" in reference:
+        raise ValueError(f"{field}: invalid logical reference")
+    logical = PurePosixPath(reference)
+    if logical.is_absolute() or any(part in {"", ".", ".."} for part in logical.parts):
+        raise ValueError(f"{field}: reference escapes DATA_ROOT")
+    candidate = root.joinpath(*logical.parts).resolve()
+    try:
+        candidate.relative_to(root.resolve())
+    except ValueError as error:
+        raise ValueError(f"{field}: reference escapes DATA_ROOT") from error
+    return candidate
 
 
 def _publish_preflight(output_root: Path, payload: Mapping[str, Any]) -> Path:
@@ -616,12 +900,21 @@ def _runtime_cell_configs(
             raise ValueError(f"{path}: task_id must be stage2.04_reference_target")
         resolved = ResolvedConfigV2.from_mapping(config)
         base = resolved.base_config
+        identity = base.section("identity")
         model = base.section("model")
         data = base.section("data")
         expected = plan["cells"][index]
-        if not isinstance(model, Mapping) or not isinstance(data, Mapping):
-            raise ValueError(f"{path}: model/data binding is not an object")
+        if not isinstance(identity, Mapping) or not isinstance(model, Mapping) or not isinstance(data, Mapping):
+            raise ValueError(f"{path}: identity/model/data binding is not an object")
         mismatches: list[str] = []
+        if str(identity.get("input_checkpoint_id")) != str(expected["input_checkpoint_id"]):
+            mismatches.append("identity.input_checkpoint_id")
+        if str(identity.get("stage")) != "2":
+            mismatches.append("identity.stage")
+        if identity.get("task") != "stage2.04_reference_target":
+            mismatches.append("identity.task")
+        if identity.get("run_intent") != "formal":
+            mismatches.append("identity.run_intent")
         if str(model.get("asset_id")) != str(expected["checkpoint_asset_id"]):
             mismatches.append("model.asset_id")
         if str(model.get("revision")) != str(expected["checkpoint_revision"]):
@@ -644,8 +937,8 @@ def _runtime_cell_configs(
         try:
             output_section = resolved.section("artifacts")
             output_dir = str(output_section["output_dir"])
-            output_parts = set(PurePosixPath(output_dir).parts)
-            if str(expected["cell_id"]) not in output_parts:
+            output_parts = PurePosixPath(output_dir).parts
+            if not output_parts or output_parts[-1] != str(expected["cell_id"]):
                 mismatches.append("artifacts.output_dir.cell_id")
         except (KeyError, TypeError, ValueError):
             mismatches.append("artifacts.output_dir")
@@ -665,24 +958,86 @@ def _validate_task_result_bindings(
     """Re-open every formal task commit and bind its provider registry/bundle to cell."""
 
     from param_importance_nlp.runtime.task_artifacts import load_committed_task_artifact
+    from param_importance_nlp.runtime.tensor_bundle import load_tensor_bundle
+    from param_importance_nlp.experiments.stage23_task_runners import _vector_digest
 
-    if result.task_id != "stage2.04_reference_target" or result.run_intent != "formal":
+    task_definition = config.task_definition
+    execution = config.section("execution")
+    if not isinstance(execution, Mapping):
+        raise ValueError("S2.4 config execution section is malformed")
+    expected_formal = config.run_intent == "formal" and not bool(execution.get("dry_run"))
+    if (
+        result.task_id != "stage2.04_reference_target"
+        or result.task_id != config.task_id
+        or result.stage != task_definition.stage
+        or result.runner_kind is not task_definition.runner_kind
+        or result.run_intent != config.run_intent
+        or result.run_intent != "formal"
+        or result.config_hash != config.config_hash
+        or result.formal_eligible is not expected_formal
+        or result.recovery_mode is not task_definition.recovery_mode
+    ):
         raise ValueError("S2.4 TaskRuntime result task/run identity mismatch")
     convergence_payload: Mapping[str, Any] | None = None
+    reference_payload: Mapping[str, Any] | None = None
     bundle_hash: str | None = None
+    if set(result.artifact_refs) != {
+        "reference_result",
+        "reference_convergence_report",
+        "gate_record",
+    }:
+        raise ValueError("S2.4 TaskRuntime result artifact kinds are incomplete or drifted")
     for kind, reference in result.artifact_refs.items():
         loaded = load_committed_task_artifact(data_root, str(reference), require_formal=True)
-        if loaded.identity.config_hash != config.config_hash or loaded.identity.task_id != result.task_id:
+        if (
+            loaded.identity.config_hash != config.config_hash
+            or loaded.identity.task_id != result.task_id
+            or loaded.run_intent != result.run_intent
+            or loaded.identity.formal_eligible is not result.formal_eligible
+        ):
             raise ValueError(f"S2.4 result artifact identity mismatch: {kind}")
         if kind == "reference_convergence_report":
             convergence_payload = loaded.payload
         if kind == "reference_result":
+            reference_payload = loaded.payload
             declared = loaded.payload.get("tensor_bundle_manifest_hash")
-            if not isinstance(declared, str) or len(declared) != 64:
+            if not isinstance(declared, str) or not re.fullmatch(r"[0-9a-f]{64}", declared):
                 raise ValueError("S2.4 reference_result missing bundle manifest hash")
             bundle_hash = declared
-    if convergence_payload is None or bundle_hash is None:
+    if convergence_payload is None or reference_payload is None or bundle_hash is None:
         raise ValueError("S2.4 result is missing convergence/reference bundle commits")
+    bundle_ref = reference_payload.get("tensor_bundle_ref")
+    if not isinstance(bundle_ref, str) or not bundle_ref:
+        raise ValueError("S2.4 reference_result missing tensor bundle ref")
+    artifacts = config.section("artifacts")
+    if not isinstance(artifacts, Mapping) or not isinstance(artifacts.get("output_dir"), str):
+        raise ValueError("S2.4 config artifacts.output_dir is malformed")
+    task_output_root = _resolve_data_root_ref(
+        data_root, str(artifacts["output_dir"]), field="artifacts.output_dir"
+    )
+    bundle_path = _resolve_data_root_ref(
+        task_output_root, bundle_ref, field="reference_result.tensor_bundle_ref"
+    )
+    try:
+        bundle_state, bundle = load_tensor_bundle(bundle_path)
+    except (OSError, TypeError, ValueError) as error:
+        raise ValueError(f"S2.4 tensor bundle cannot be reloaded: {error}") from error
+    if bundle.manifest_sha256 != bundle_hash or not isinstance(bundle_state, Mapping):
+        raise ValueError("S2.4 tensor bundle manifest/root binding failed")
+    for vector_name in ("bias_reference", "cross_reference", "ranking_reference"):
+        vector = bundle_state.get(vector_name)
+        declared_vector_hash = reference_payload.get(f"{vector_name}_hash")
+        if not isinstance(vector, Mapping) or not isinstance(declared_vector_hash, str):
+            raise ValueError(f"S2.4 tensor bundle missing {vector_name} or hash")
+        if _vector_digest(vector) != declared_vector_hash:
+            raise ValueError(f"S2.4 {vector_name} vector hash mismatch")
+    metadata = reference_payload.get("metadata")
+    sequence_variance = bundle_state.get("sequence_variance")
+    if not isinstance(metadata, Mapping) or not isinstance(sequence_variance, Mapping):
+        raise ValueError("S2.4 tensor bundle missing sequence variance metadata")
+    sequence_hash = metadata.get("sequence_variance_hash")
+    if not isinstance(sequence_hash, str) or _vector_digest(sequence_variance) != sequence_hash:
+        raise ValueError("S2.4 sequence variance hash mismatch")
     provider = convergence_payload.get("provider")
     expected_registry = str(expected["parameter_registry_hash"])
     if not isinstance(provider, Mapping):
@@ -699,6 +1054,12 @@ def _validate_task_result_bindings(
         for item in model_rows
     ):
         raise ValueError("S2.4 result checkpoint asset binding failed")
+    if not any(
+        item.get("ready_manifest_sha256") == expected["checkpoint_manifest_sha256"]
+        and item.get("logical_asset_id") == expected_model
+        for item in model_rows
+    ):
+        raise ValueError("S2.4 result checkpoint manifest binding failed")
     expected_data = str(expected["data_asset_id"])
     if not any(
         item.get("asset_id") == expected_data or item.get("logical_asset_id") == expected_data
@@ -718,10 +1079,12 @@ def _cell_identity(expected: Mapping[str, Any]) -> dict[str, Any]:
         "model_id": str(expected["model_id"]),
         "training_stage": str(expected["training_stage"]),
         "checkpoint_id": str(expected["checkpoint_id"]),
+        "input_checkpoint_id": str(expected["input_checkpoint_id"]),
         "checkpoint_asset_id": str(expected["checkpoint_asset_id"]),
         "checkpoint_initialization_id": str(expected["checkpoint_initialization_id"]),
         "checkpoint_architecture": str(expected["checkpoint_architecture"]),
         "checkpoint_revision": str(expected["checkpoint_revision"]),
+        "checkpoint_manifest_sha256": str(expected["checkpoint_manifest_sha256"]),
         "parameter_registry_hash": str(expected["parameter_registry_hash"]),
         "data_asset_id": str(expected["data_asset_id"]),
         "data_revision": str(expected["data_revision"]),
@@ -760,6 +1123,9 @@ def execute_with_task_runtime(
     Stage 0/G3 records, predecessor commits, draw manifests, or providers.
     """
 
+    data_root = data_root.resolve()
+    output_root = output_root.resolve()
+
     allowed = {"0", "2", "3", "4"}
     visible_tokens = [item.strip() for item in cuda_visible_devices.split(",") if item.strip()]
     visible = set(visible_tokens)
@@ -787,6 +1153,7 @@ def execute_with_task_runtime(
     selected = _runtime_cell_configs(plan, runtime_config_paths, cell_id)
     results: list[dict[str, Any]] = []
     for config_wire, config_path, current_cell_id in selected:
+        config_path = config_path.resolve()
         config = ResolvedConfigV2.from_mapping(config_wire)
         expected = next(item for item in plan["cells"] if item["cell_id"] == current_cell_id)
         artifacts = config.section("artifacts")
@@ -795,84 +1162,107 @@ def execute_with_task_runtime(
             raise ValueError(f"{config_path}: malformed artifacts/recovery section")
         attempt_id, run_kind, resume_ref_text = _cell_attempt_id(config)
         cell_root = output_root / current_cell_id / "attempts" / attempt_id
-        status_path = cell_root / "cell-status.json"
+        event_path = cell_root / "attempt-events.jsonl"
+        final_status_path = cell_root / "final-status.json"
+        task_output_dir = _resolve_data_root_ref(
+            data_root, str(artifacts["output_dir"]), field="artifacts.output_dir"
+        )
         recovery_refs = {
             "resume_ref": resume_ref_text,
             "task_output_dir": str(artifacts["output_dir"]),
             "heartbeat": (cell_root / "progress.jsonl").as_posix(),
         }
-        _atomic_json(
-            status_path,
-            {
-                "schema_version": "stage2-s204-cell-status-v2",
-                "cell_id": current_cell_id,
-                "attempt_id": attempt_id,
-                "run_kind": run_kind,
-                "config_path": config_path.as_posix(),
-                "config_hash": config.config_hash,
-                "config_full_hash": config.full_hash,
-                "cell_identity": _cell_identity(expected),
-                "cell_identity_hash": _canonical_hash(_cell_identity(expected)),
-                "gpu": {
-                    "requested_token": visible_tokens[0],
-                    "selected_uuid": selected_gpu_uuid,
-                    "inventory": gpu_inventory,
-                    "inventory_sha256": gpu_inventory_hash,
-                    "g21_smoke": gpu_smoke,
+        with _AttemptLease(task_output_dir, cell_id=current_cell_id, attempt_id=attempt_id):
+            _append_event(
+                event_path,
+                {
+                    "event": "STARTED",
+                    "cell_id": current_cell_id,
+                    "attempt_id": attempt_id,
+                    "run_kind": run_kind,
+                    "config_hash": config.config_hash,
+                    "config_full_hash": config.full_hash,
+                    "cell_identity": _cell_identity(expected),
+                    "cell_identity_hash": _canonical_hash(_cell_identity(expected)),
+                    "gpu": {
+                        "requested_token": visible_tokens[0],
+                        "selected_uuid": selected_gpu_uuid,
+                        "inventory": gpu_inventory,
+                        "inventory_sha256": gpu_inventory_hash,
+                        "g21_smoke": gpu_smoke,
+                    },
+                    "recovery": recovery_refs,
                 },
-                "checkpoint_revision": expected["checkpoint_revision"],
-                "parameter_registry_hash": expected["parameter_registry_hash"],
-                "status": "IN_PROGRESS",
-                "formal_provider": "TaskRuntime.stage2.04_reference_target",
-                "formal_eligible": False,
-                "g2_3_gate": "NOT_RUN",
-                "recovery": recovery_refs,
-            },
-        )
-        with _Heartbeat(cell_root / "progress.jsonl", current_cell_id, heartbeat_seconds):
-            result = runtime.execute(config, environment=environment)
-        bundle_hash = None
-        if result.status is TaskRunStatus.PASS:
-            bundle_hash = _validate_task_result_bindings(
-                result, config=config, data_root=data_root, expected=expected
             )
-        wire = result.to_dict()
-        task_result_path = cell_root / "task-results" / f"{result.result_hash}.json"
-        _publish_json_once(task_result_path, wire)
-        status = "COMPLETE" if result.status is TaskRunStatus.PASS else result.status.value
-        _atomic_json(
-            status_path,
-            {
-                "schema_version": "stage2-s204-cell-status-v2",
-                "cell_id": current_cell_id,
-                "attempt_id": attempt_id,
-                "run_kind": run_kind,
-                "config_path": config_path.as_posix(),
-                "config_hash": config.config_hash,
-                "config_full_hash": config.full_hash,
-                "cell_identity": _cell_identity(expected),
-                "cell_identity_hash": _canonical_hash(_cell_identity(expected)),
-                "gpu": {
-                    "requested_token": visible_tokens[0],
-                    "selected_uuid": selected_gpu_uuid,
-                    "inventory": gpu_inventory,
-                    "inventory_sha256": gpu_inventory_hash,
-                    "g21_smoke": gpu_smoke,
-                },
-                "checkpoint_revision": expected["checkpoint_revision"],
-                "parameter_registry_hash": expected["parameter_registry_hash"],
-                "status": status,
-                "formal_provider": "TaskRuntime.stage2.04_reference_target",
-                "formal_eligible": bool(result.formal_eligible),
-                "g2_3_gate": "NOT_RUN",
-                "task_result_hash": result.result_hash,
-                "task_result_ref": task_result_path.as_posix(),
-                "bundle_manifest_sha256": bundle_hash,
-                "artifact_refs": dict(result.artifact_refs),
-                "blockers": [item.to_dict() for item in result.blockers],
-                "recovery": recovery_refs,
-            },
-        )
+            try:
+                with _Heartbeat(cell_root / "progress.jsonl", current_cell_id, heartbeat_seconds):
+                    result = runtime.execute(config, environment=environment)
+                bundle_hash = None
+                if result.status is TaskRunStatus.PASS:
+                    bundle_hash = _validate_task_result_bindings(
+                        result, config=config, data_root=data_root, expected=expected
+                    )
+                wire = result.to_dict()
+                task_result_path = cell_root / "task-results" / f"{result.result_hash}.json"
+                _publish_json_once(task_result_path, wire)
+                status = "COMPLETE" if result.status is TaskRunStatus.PASS else result.status.value
+                final_status_payload = {
+                    "schema_version": "stage2-s204-cell-final-status-v3",
+                    "cell_id": current_cell_id,
+                    "attempt_id": attempt_id,
+                    "run_kind": run_kind,
+                    "config_path": config_path.as_posix(),
+                    "config_hash": config.config_hash,
+                    "config_full_hash": config.full_hash,
+                    "cell_identity": _cell_identity(expected),
+                    "cell_identity_hash": _canonical_hash(_cell_identity(expected)),
+                    "gpu": {
+                        "requested_token": visible_tokens[0],
+                        "selected_uuid": selected_gpu_uuid,
+                        "inventory": gpu_inventory,
+                        "inventory_sha256": gpu_inventory_hash,
+                        "g21_smoke": gpu_smoke,
+                    },
+                    "checkpoint_revision": expected["checkpoint_revision"],
+                    "input_checkpoint_id": expected["input_checkpoint_id"],
+                    "parameter_registry_hash": expected["parameter_registry_hash"],
+                    "status": status,
+                    "formal_provider": "TaskRuntime.stage2.04_reference_target",
+                    "formal_eligible": bool(result.formal_eligible),
+                    "g2_3_gate": "NOT_RUN",
+                    "task_result_hash": result.result_hash,
+                    "task_result_ref": task_result_path.as_posix(),
+                    "bundle_manifest_sha256": bundle_hash,
+                    "artifact_refs": dict(result.artifact_refs),
+                    "blockers": [item.to_dict() for item in result.blockers],
+                    "recovery": recovery_refs,
+                    "events_ref": event_path.as_posix(),
+                }
+                final_status = {
+                    **final_status_payload,
+                    "artifact_hash": _canonical_hash(final_status_payload),
+                }
+                _publish_json_once(final_status_path, final_status)
+                _append_event(
+                    event_path,
+                    {
+                        "event": "FINAL_PUBLISHED",
+                        "status": status,
+                        "task_result_hash": result.result_hash,
+                        "bundle_manifest_sha256": bundle_hash,
+                        "final_status_ref": final_status_path.as_posix(),
+                    },
+                )
+            except Exception as error:
+                _append_event(
+                    event_path,
+                    {
+                        "event": "FAILED",
+                        "error_type": type(error).__name__,
+                        "error": str(error),
+                    },
+                )
+                raise
         results.append(
             {
                 "cell_id": current_cell_id,
@@ -887,6 +1277,7 @@ def execute_with_task_runtime(
                 "status": status,
                 "formal_eligible": bool(result.formal_eligible),
                 "g2_3_gate": "NOT_RUN",
+                "final_status_ref": final_status_path.as_posix(),
             }
         )
     return results
@@ -906,9 +1297,13 @@ def aggregate_g23(
     preflight note, while a complete set gets one content-addressed G2.3 attempt.
     """
 
+    data_root = data_root.resolve()
+    output_root = output_root.resolve()
+
     from param_importance_nlp.contracts.config_v2 import ResolvedConfigV2
     from param_importance_nlp.runtime import TaskRunResult, TaskRunStatus
 
+    gpu_smoke = _validate_gpu_smoke_artifact(plan, data_root)
     reasons: list[str] = []
     selected: dict[str, dict[str, Any]] = {}
     task_refs: dict[str, str] = {}
@@ -918,7 +1313,7 @@ def aggregate_g23(
     for expected in plan["cells"]:
         current_cell_id = str(expected["cell_id"])
         status_paths = sorted(
-            (output_root / current_cell_id).rglob("cell-status.json")
+            (output_root / current_cell_id).rglob("final-status.json")
             if (output_root / current_cell_id).exists()
             else []
         )
@@ -932,6 +1327,18 @@ def aggregate_g23(
                 continue
             if row.get("cell_id") != current_cell_id:
                 reasons.append(f"{current_cell_id}:CELL_STATUS_ID_MISMATCH")
+                continue
+            if (
+                not isinstance(row.get("artifact_hash"), str)
+                or _canonical_hash(
+                    {key: value for key, value in row.items() if key != "artifact_hash"}
+                )
+                != row.get("artifact_hash")
+            ):
+                reasons.append(f"{current_cell_id}:FINAL_STATUS_HASH_INVALID")
+                continue
+            if row.get("input_checkpoint_id") != expected.get("input_checkpoint_id"):
+                reasons.append(f"{current_cell_id}:INPUT_CHECKPOINT_ID_BINDING_FAILED")
                 continue
             identity = _cell_identity(expected)
             if row.get("cell_identity") != identity or row.get("cell_identity_hash") != _canonical_hash(identity):
@@ -964,6 +1371,27 @@ def aggregate_g23(
             if selected_cell != current_cell_id:
                 raise ValueError("config cell ordering mismatch")
             config = ResolvedConfigV2.from_mapping(config_wire)
+            execution = config.section("execution")
+            recovery = config.section("recovery")
+            row_recovery = row.get("recovery")
+            if (
+                not isinstance(execution, Mapping)
+                or not isinstance(recovery, Mapping)
+                or not isinstance(row_recovery, Mapping)
+            ):
+                raise ValueError("config execution/recovery sections malformed")
+            expected_formal = config.run_intent == "formal" and not bool(execution.get("dry_run"))
+            if (
+                result.task_id != config.task_id
+                or result.stage != config.task_definition.stage
+                or result.run_intent != config.run_intent
+                or result.config_hash != config.config_hash
+                or result.formal_eligible is not expected_formal
+                or result.recovery_mode is not config.task_definition.recovery_mode
+                or row.get("formal_eligible") is not result.formal_eligible
+                or row_recovery.get("resume_ref") != recovery.get("resume_ref")
+            ):
+                raise ValueError("TaskRunResult/config/recovery identity mismatch")
             bundle_hash = _validate_task_result_bindings(
                 result, config=config, data_root=data_root, expected=expected
             )
@@ -1022,6 +1450,7 @@ def aggregate_g23(
         "bundle_manifest_hashes": bundle_hashes,
         "provider_entry": "TaskRuntime.stage2.04_reference_target",
         "excluded_pci": EXCLUDED_PCI,
+        "g21_smoke": gpu_smoke,
     }
     summary_hash = _canonical_hash(summary)
     summary_path = output_root / "aggregate-attempts" / summary_hash / "formal-run-summary.json"
@@ -1073,7 +1502,11 @@ def _parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     try:
-        g21, assets, data = _load(args.g21_evidence), _load(args.asset_resolution), _load(args.data_range)
+        g21_root = args.data_root if (args.execute or args.aggregate) else None
+        # Always consume the canonical formal handoff loader.  In execute and
+        # aggregate mode it additionally re-hashes the bound raw smoke report.
+        g21 = load_g21_formal_handoff(args.g21_evidence, data_root=g21_root)
+        assets, data = _load(args.asset_resolution), _load(args.data_range)
         plan = build_plan(
             g21,
             assets,
