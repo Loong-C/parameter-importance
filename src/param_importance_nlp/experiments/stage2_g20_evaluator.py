@@ -1092,6 +1092,8 @@ def _make_gate(
                     "commit_ref": loaded.stage1.refs_by_kind[kind],
                     "artifact_hash": loaded.stage1.artifacts_by_kind[kind].identity.artifact_hash,
                     "config_hash": loaded.stage1.artifacts_by_kind[kind].identity.config_hash,
+                    "run_intent": loaded.stage1.artifacts_by_kind[kind].run_intent,
+                    "formal_eligible": loaded.stage1.artifacts_by_kind[kind].identity.formal_eligible,
                 }
                 for kind in STAGE1_ARTIFACT_KINDS
             ]
