@@ -535,6 +535,12 @@ def _g23_gate(
                     reasons.append(f"{cell_id}:{boolean_name}:REQUIRED_TRUE")
         except (TypeError, ValueError, OverflowError):
             reasons.append(f"{cell_id}:G2.3_METRICS_NON_NUMERIC")
+    # This launcher is only the execution/lineage boundary.  It must not turn
+    # caller-supplied numeric JSON into a scientific Gate; the dedicated
+    # output-derived evaluator owns that decision and will replace this
+    # fail-closed adapter during integration.
+    if not preflight_only:
+        reasons.append("G2.3_OUTPUT_DERIVED_EVALUATOR_NOT_BOUND")
     status = GateStatus.PASS if not reasons else GateStatus.BLOCKED
     gate = GateRecord(
         G23_GATE_ID,
