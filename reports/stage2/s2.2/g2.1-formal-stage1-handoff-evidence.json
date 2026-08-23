@@ -1,0 +1,49 @@
+{
+  "schema_version": "stage2-s2.2-g2.1-handoff-evidence-v1",
+  "task_id": "stage2.02_stage1_handoff_and_fixed_state_contract",
+  "status": "BLOCKED",
+  "blocker": "STAGE2_FORMAL_GPU_EXECUTION_NOT_RUN",
+  "scope": "stage1_handoff_contract_and_local_revalidation",
+  "stage1_formal_evidence": {
+    "authority": "server_read_only",
+    "data_root": "/home/sophgo13/cjl/storage/parameter-importance",
+    "index_ref": "tmp/stage1-s1-11/s1-11-r4-20260821/index.json",
+    "index_sha256": "6a9af7323df37a55bf4f74f2f505d8999dcf4c588dfd64bd6cdc6f93fbecd1c8",
+    "index_artifact_hash": "361de10b9aba20f5be59cd3ed18b44b16ea98167845b4cf735b299bea0403df0",
+    "formal_observation_ref": "tmp/stage1-s1-11/s1-11-r4-20260821/formal-observation.json",
+    "formal_observation_sha256": "d2c2b35005dbdb8ddee88a0139ead04489b50a7a82db6d3814d62984a4448d62",
+    "formal_observation_artifact_hash": "01cc3b0ee5b2b223c022017525b87ee96a05bc2f578aa3ab4a932acff049a54d",
+    "stage_report_sha256": "a2666ff09285883cb7dfb35bf76b0a1bf2556e8fd1c19e8bb8793126f1d3dcc8",
+    "stage_report_artifact_hash": "0a2cd2228d6a9ff379a398bd7276a0840a2b16e46194540187e0c111cb6e8fac",
+    "delivery_manifest_sha256": "5b9904ec3cee3a6f2793b085d799d80f824299acc52ba322239e1979347be7ae",
+    "gate_summary_sha256": "e2fdc98ae402af65d246740710aa37330d0c8856518e314d4c126cce18018672",
+    "requirements_matrix_sha256": "4479fd9e09578d8dd648566c37387be39cac84761316ca35774ec32a163015e8",
+    "validation_sha256": "8bb3a2fc7e09217c8f02649143b6968386d4d6deac8f5c9a29ef287148b6131d",
+    "replay_validation_sha256": "bf245bcb1f68841bc9b823ec3ef6326889409151237998ab9618d852504ff093",
+    "task_id": "stage1.11_reporting_and_exit_gate",
+    "gate_id": "G1-EXIT",
+    "status": "PASS",
+    "producer_commit": "3f18b04df8922be9894678ae4842bd999c7e8fd5",
+    "generator_git_commit": "3f18b04df8922be9894678ae4842bd999c7e8fd5",
+    "consumer_git_commit": "3f18b04df8922be9894678ae4842bd999c7e8fd5",
+    "execution_commit": "3f18b04df8922be9894678ae4842bd999c7e8fd5",
+    "requirements_count": 28,
+    "requirements_status": "PASS"
+  },
+  "local_revalidation": {
+    "stage1_handoff_contract_tests": {"command": "tests/test_stage2_s202_handoff_contract.py", "passed": 7, "failed": 0},
+    "formal_adapter_tests": {"command": "tests/test_stage2_formal_handoff_adapter.py", "passed": 1, "failed": 0},
+    "task_runner_tests": {"command": "tests/test_stage23_task_runners.py", "passed": 17, "failed": 0},
+    "formal_orchestration_tests": {"command": "tests/test_stage23_formal_orchestration.py", "passed": 18, "failed": 0},
+    "stage2_regression_suite": {"command": "tests/*stage2*.py", "passed": 61, "failed": 0},
+    "state_digest_unchanged": true,
+    "signed_u_preserved": true,
+    "gpu_execution": "NOT_RUN"
+  },
+  "consumer_contract": {
+    "stage2_code_producer_commit": "PENDING_COMMIT",
+    "stage2_execution_commit": null,
+    "stage2_consumer_commit": "PENDING_COMMIT",
+    "three_end_sync": "BLOCKED_UNTIL_STAGE2_FORMAL_GPU_EXECUTION"
+  }
+}
