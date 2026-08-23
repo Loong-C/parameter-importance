@@ -702,15 +702,28 @@ def test_s111_standard_s17_s18_s19_s110_wires_reject_role_field_drift(tmp_path: 
 
 def test_s111_sync_audit_requires_the_current_six_agent_documents(tmp_path: Path) -> None:
     formalizer = _formalizer()
+    commit = formalizer.S111_R4_PRODUCER_COMMIT
+    manifest_path = tmp_path / "large-artifact-manifest.json"
+    write_canonical_json(manifest_path, {})
     audit = _with_hash({
         "schema_version": "stage1-s1-11-sync-audit-v1", "status": "PASS",
-        "git_publish": {}, "server_execution": {},
+        "git_publish": {"remote_ref": "origin/feat/stage1-s111-task-commits", "execution_commit": commit, "remote_commit": commit, "worktree_clean": True},
+        "server_execution": {"execution_commit": commit, "worktree_clean": True, "evidence_root": "/srv/parameter-importance"},
         "agent_sha256": {name: "a" * 64 for name in ("remote_access.md", "server.md", "git.md", "sync.md", "worklogs.md")},
-        "large_artifact_manifest": {},
+        "large_artifact_manifest": {"ref": manifest_path.name, "sha256": _sha(manifest_path)},
     })
     path = tmp_path / "sync-audit.json"; write_canonical_json(path, audit)
-    with pytest.raises(formalizer.Stage1S111FormalError, match="SYNC_AUDIT_(SHAPE|CLOSURE)_INVALID"):
-        formalizer._validate_sync_audit(tmp_path, {"ref": path.name, "sha256": _sha(path)})
+    binding = {"ref": path.name, "sha256": _sha(path), "artifact_hash": audit["artifact_hash"], "execution_commit": commit}
+    with pytest.raises(formalizer.Stage1S111FormalError, match="SYNC_AUDIT_BINDING_INVALID"):
+        formalizer._validate_sync_audit(tmp_path, {key: binding[key] for key in ("ref", "sha256")})
+    with pytest.raises(formalizer.Stage1S111FormalError, match="SYNC_AUDIT_BINDING_INVALID"):
+        formalizer._validate_sync_audit(tmp_path, {**binding, "unexpected": True})
+    with pytest.raises(formalizer.Stage1S111FormalError, match="SYNC_AUDIT_BINDING_INVALID"):
+        formalizer._validate_sync_audit(tmp_path, {**binding, "artifact_hash": "0" * 64})
+    with pytest.raises(formalizer.Stage1S111FormalError, match="SYNC_AUDIT_BINDING_INVALID"):
+        formalizer._validate_sync_audit(tmp_path, {**binding, "execution_commit": "0" * 40})
+    with pytest.raises(formalizer.Stage1S111FormalError, match="SYNC_AUDIT_CLOSURE_INVALID"):
+        formalizer._validate_sync_audit(tmp_path, binding)
 
 
 def test_s111_test_summary_rejects_nested_type_and_key_cardinality_drift(tmp_path: Path) -> None:
