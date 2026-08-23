@@ -26,6 +26,7 @@ import hashlib
 from pathlib import Path, PurePosixPath
 import re
 import subprocess
+import sys
 from types import SimpleNamespace
 from typing import Any
 
@@ -80,7 +81,7 @@ STAGE1_REPORT_PATH = (
 )
 STAGE1_FORMALIZER_SOURCE_PATH = "ops/stage1/formalize_s1_11.py"
 STAGE1_CANONICAL_VALIDATOR_SOURCE_PATH = "ops/stage1/formalize_s1_6.py"
-FROZEN_PLAN_SHA256 = "9af31ee0b82cbb0526817c7bb741ca708e33f96e7be3dda65d54b188e942fe12"
+FROZEN_PLAN_SHA256 = "0e8b1944968205a4484f3b414294b3209a5e53b84babd105fdce267b2998e66f"
 
 EVALUATOR_SOURCE_PATH = "src/param_importance_nlp/experiments/stage2_g20_evaluator.py"
 PREREGISTRATION_SOURCE_PATH = "src/param_importance_nlp/experiments/preregistration.py"
@@ -656,9 +657,12 @@ def _load_stage1_sources(data_root: Path, refs: Sequence[str]) -> _Stage1SourceS
     )
 
 
-def _canonical_stage1_formalizer() -> Any:
+def _canonical_stage1_formalizer(repository_root: Path) -> Any:
     """Load the released Stage1 authority implementation, never a local adapter."""
 
+    repository_entry = str(repository_root)
+    if repository_entry not in sys.path:
+        sys.path.insert(0, repository_entry)
     try:
         from ops.stage1 import formalize_s1_11
     except (ImportError, OSError) as error:
@@ -743,7 +747,7 @@ def _load_stage1_sources(data_root: Path, refs: Sequence[str], repository: Path)
 
     if len(refs) not in {4, 7}:
         raise G20Blocked("source_refs:STAGE1_DIRECT_COMMIT_SET_INVALID")
-    canonical = _canonical_stage1_formalizer()
+    canonical = _canonical_stage1_formalizer(repository)
     direct = [_load_committed(data_root, _logical_path(ref, "stage1_source.commit_ref")) for ref in refs]
     if any(item.identity.task_id not in {STAGE1_TASK_ID, STAGE1_10_TASK_ID} or item.run_intent != "formal" or item.identity.formal_eligible is not True for item in direct):
         raise G20Blocked("source_refs:FORMAL_CANONICAL_STAGE1_COMMITS_REQUIRED")

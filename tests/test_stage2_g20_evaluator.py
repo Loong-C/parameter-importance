@@ -13,6 +13,7 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
+import sys
 
 import pytest
 
@@ -27,12 +28,15 @@ from param_importance_nlp.experiments.preregistration import (
 from param_importance_nlp.experiments.stage2_g20_evaluator import (
     ARTIFACT_KINDS,
     EVALUATOR_SOURCE_PATH,
+    FROZEN_PLAN_SHA256,
     MATHEMATICS_PATH,
+    PLAN_PATH,
     STAGE1_ARTIFACT_KINDS,
     STAGE1_REPORT_PATH,
     STAGE1_TASK_ID,
     TASK_ID,
     evaluate_formal_g20,
+    _canonical_stage1_formalizer,
 )
 from param_importance_nlp.runtime.task_artifacts import (
     TaskArtifactStore,
@@ -46,6 +50,31 @@ BASE_CONFIG = ROOT / "configs" / "local-fixtures" / "resolved-config-v1.json"
 
 def _sha(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def test_canonical_stage1_formalizer_bootstraps_explicit_repository_root(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Script-like imports must not depend on pytest's repository-root path."""
+
+    for name in tuple(sys.modules):
+        if name == "ops" or name.startswith("ops."):
+            monkeypatch.delitem(sys.modules, name, raising=False)
+    repository = str(ROOT)
+    monkeypatch.setattr(
+        sys,
+        "path",
+        [entry for entry in sys.path if entry and Path(entry).resolve() != ROOT],
+    )
+
+    formalizer = _canonical_stage1_formalizer(ROOT)
+
+    assert Path(formalizer.__file__).resolve() == ROOT / "ops" / "stage1" / "formalize_s1_11.py"
+
+
+def test_frozen_plan_hash_matches_tracked_plan() -> None:
+    assert FROZEN_PLAN_SHA256 == "0e8b1944968205a4484f3b414294b3209a5e53b84babd105fdce267b2998e66f"
+    assert _sha(ROOT / PLAN_PATH) == FROZEN_PLAN_SHA256
 
 
 def _head(repository: Path = ROOT) -> str:
