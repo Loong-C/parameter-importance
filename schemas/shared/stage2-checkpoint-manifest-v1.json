@@ -1,0 +1,71 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://parameter-importance.invalid/schemas/shared/stage2-checkpoint-manifest-v1.json",
+  "title": "Stage 2 immutable checkpoint selection",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "model_id", "training_stage", "checkpoint_id", "training_step", "total_training_steps", "target_fraction", "repository", "revision", "root_ref", "state", "files", "manifest_ref", "manifest_sha256", "parameter_registry_hash", "config_sha256", "tokenizer_sha256", "load_status", "load_evidence_ref", "load_evidence_sha256", "missing_reason"],
+  "properties": {
+    "schema_version": {"const": "stage2-checkpoint-manifest-v1"},
+    "model_id": {"enum": ["pythia-14m", "pythia-31m-deduped"]},
+    "training_stage": {"enum": ["initialization", "early", "mid_late"]},
+    "checkpoint_id": {"type": "string", "minLength": 1},
+    "training_step": {"type": "integer", "minimum": 0},
+    "total_training_steps": {"type": "integer", "minimum": 1},
+    "target_fraction": {"type": "number", "minimum": 0, "maximum": 1},
+    "repository": {"type": "string", "minLength": 1},
+    "revision": {"oneOf": [{"type": "null"}, {"type": "string", "pattern": "^[0-9a-f]{40,64}$"}]},
+    "root_ref": {"type": "string", "pattern": "^[^./\\\\][^\\\\]*$"},
+    "state": {"enum": ["ready", "blocked"]},
+    "files": {"type": "array", "items": {"$ref": "#/$defs/file"}},
+    "manifest_ref": {"oneOf": [{"type": "null"}, {"type": "string", "minLength": 1}]},
+    "manifest_sha256": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/hash"}]},
+    "parameter_registry_hash": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/hash"}]},
+    "config_sha256": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/hash"}]},
+    "tokenizer_sha256": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/hash"}]},
+    "load_status": {"enum": ["not_run", "passed", "blocked"]},
+    "load_evidence_ref": {"oneOf": [{"type": "null"}, {"type": "string", "minLength": 1}]},
+    "load_evidence_sha256": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/hash"}]},
+    "missing_reason": {"oneOf": [{"type": "null"}, {"type": "string", "minLength": 1}]}
+  },
+  "allOf": [
+    {
+      "if": {"properties": {"state": {"const": "ready"}}},
+      "then": {
+        "required": ["revision", "files", "manifest_ref", "manifest_sha256", "parameter_registry_hash", "config_sha256", "tokenizer_sha256", "load_status", "load_evidence_ref", "load_evidence_sha256"],
+        "properties": {
+          "revision": {"type": "string", "pattern": "^[0-9a-f]{40,64}$"},
+          "manifest_ref": {"type": "string", "minLength": 1},
+          "manifest_sha256": {"$ref": "#/$defs/hash"},
+          "parameter_registry_hash": {"$ref": "#/$defs/hash"},
+          "config_sha256": {"$ref": "#/$defs/hash"},
+          "tokenizer_sha256": {"$ref": "#/$defs/hash"},
+          "load_status": {"const": "passed"},
+          "load_evidence_ref": {"type": "string", "minLength": 1},
+          "load_evidence_sha256": {"$ref": "#/$defs/hash"},
+          "files": {
+            "allOf": [
+              {"contains": {"properties": {"role": {"const": "weights"}}}},
+              {"contains": {"properties": {"role": {"const": "config"}}}},
+              {"contains": {"properties": {"role": {"const": "tokenizer"}}}}
+            ]
+          }
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "file": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "size_bytes", "sha256", "role"],
+      "properties": {
+        "path": {"type": "string", "minLength": 1},
+        "size_bytes": {"type": "integer", "minimum": 0},
+        "sha256": {"$ref": "#/$defs/hash"},
+        "role": {"type": "string", "minLength": 1}
+      }
+    }
+  }
+}

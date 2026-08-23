@@ -129,6 +129,14 @@ from .sampling import (
     SamplingUniverse,
     STREAM_NAMES,
 )
+from .stage2_assets import (
+    AssetResolutionManifest,
+    CheckpointFile,
+    CheckpointRecord,
+    DataFile,
+    DataRangeManifest,
+    validate_formal_asset_identity,
+)
 from .stage2 import PairedEstimatorRunner, build_fixture_estimator_decision
 from .preregistration import (
     build_stage2_hypothesis_contract,
@@ -245,6 +253,15 @@ _REQUIRED_PREDECESSORS = {
         for index, task_id in enumerate(_STAGE23_TASK_ORDER)
         if task_id.startswith("stage3.")
     },
+}
+# S2.3 is a DAG sibling of the S2.2 handoff: its only task predecessor is the
+# frozen S2.1 preregistration.  Stage 1/formal asset evidence is supplied by
+# the environment and is intentionally not smuggled in through S2.2.
+_REQUIRED_PREDECESSORS = {
+    **_REQUIRED_PREDECESSORS,
+    "stage2.03_assets_checkpoints_and_sampling": (
+        "stage2.01_scope_hypotheses_and_preregistration",
+    ),
 }
 
 
@@ -1214,19 +1231,180 @@ def _provider_context(request: TaskExecutionRequest, root: Path) -> _ProviderCon
 
 
 def _sampling_plan(request: TaskExecutionRequest, context: _ProviderContext) -> SamplingPlan:
-    identity = request.config.base_config.section("identity")
-    seed_plan = SeedPlan.from_master_seed(int(identity["master_seed"]))
-    universe = SamplingUniverse(
+    return _sampling_plan_for_ids(
+        request,
+        context.sample_ids,
         universe_id=f"{context.provider.fixed_state_id}-universe",
-        sample_ids=context.sample_ids,
         metadata={
             "registry_hash": context.provider.registry_hash,
             "provider_state_digest": context.provider.state_digest(),
         },
     )
+
+
+def _sampling_plan_for_ids(
+    request: TaskExecutionRequest,
+    sample_ids: Sequence[Hashable],
+    *,
+    universe_id: str,
+    metadata: Mapping[str, object],
+) -> SamplingPlan:
+    """Build the frozen stream plan without requiring a gradient provider.
+
+    Formal S2.3 validates the six-cell asset resolution independently of the
+    later fixed-state gradient provider, so it still needs a deterministic
+    empirical-universe plan while no model is queried.
+    """
+
+    identity = request.config.base_config.section("identity")
+    seed_plan = SeedPlan.from_master_seed(int(identity["master_seed"]))
+    universe = SamplingUniverse(
+        universe_id=universe_id,
+        sample_ids=tuple(sample_ids),
+        metadata=metadata,
+    )
     return SamplingPlan(
         universe=universe,
         stream_seeds={name: seed_plan.seed_for(name) for name in STREAM_NAMES},
+    )
+
+
+def _formal_stage2_asset_manifest(
+    request: TaskExecutionRequest,
+    root: Path,
+) -> tuple[AssetResolutionManifest, str]:
+    """Load the independently published formal S2.3 asset resolution.
+
+    S2.3 must not synthesize a fixture matrix under ``formal``.  The manifest
+    is supplied through environment evidence so this task remains parallel to
+    the S2.2 handoff and can be audited without reading gradients.
+    """
+
+    reference = request.environment.evidence_refs.get("stage2_asset_resolution")
+    if reference is None:
+        raise _blocked(
+            BlockerCode.ASSET_UNAVAILABLE,
+            "stage2_asset_resolution",
+            "formal S2.3 requires an environment-bound asset resolution manifest",
+        )
+    try:
+        value = load_canonical_json(_workspace_path(root, reference, field="stage2_asset_resolution"))
+        if not isinstance(value, Mapping):
+            raise ValueError("stage2 asset resolution must be an object")
+        manifest = AssetResolutionManifest.from_mapping(value)
+    except (FileNotFoundError, TypeError, ValueError) as error:
+        raise _blocked(
+            BlockerCode.ASSET_UNAVAILABLE,
+            "stage2_asset_resolution",
+            f"formal S2.3 asset resolution is unreadable: {type(error).__name__}: {error}",
+            retryable=False,
+            evidence_refs=(reference,),
+        ) from error
+    if manifest.scope != "formal" or manifest.status != "READY":
+        raise _blocked(
+            BlockerCode.ASSET_UNAVAILABLE,
+            "stage2_asset_resolution",
+            "formal S2.3 requires a READY formal six-cell asset matrix",
+            retryable=False,
+            evidence_refs=(reference,),
+        )
+    try:
+        validate_formal_asset_identity(manifest)
+    except ValueError as error:
+        raise _blocked(
+            BlockerCode.CONTRACT_UNFROZEN,
+            "stage2_asset_identity",
+            f"formal S2.3 asset identity drifted: {error}",
+            retryable=False,
+            evidence_refs=(reference,),
+        ) from error
+    return manifest, reference
+
+
+def _run_formal_stage2_assets_and_sampling(
+    request: TaskExecutionRequest,
+    root: Path,
+    inputs: _PredecessorContext,
+) -> tuple[Mapping[str, Mapping[str, JSONValue]], tuple[str, ...]]:
+    """Publish the formal S2.3 candidate from the independent asset evidence."""
+
+    assets, asset_reference = _formal_stage2_asset_manifest(request, root)
+    data_range = assets.data_range
+    sample_ids = tuple(range(data_range.sample_id_min, data_range.sample_id_max_exclusive))
+    sampling = _sampling_plan_for_ids(
+        request,
+        sample_ids,
+        universe_id=f"{assets.digest}-universe",
+        metadata={
+            "asset_resolution_hash": assets.digest,
+            "data_range_hash": data_range.digest,
+            "sampling_design": data_range.sampling_design,
+            "upstream_binding_hash": inputs.binding_hash,
+        },
+    )
+    if SamplingPlan.from_mapping(sampling.to_dict()).digest != sampling.digest:
+        raise RuntimeError("STAGE2_FORMAL_SAMPLING_PLAN_ROUNDTRIP_DRIFT")
+    stream_manifests = {
+        stream: sampling.draw_manifest(stream, 4).to_manifest()
+        for stream in STREAM_NAMES
+    }
+    draw_rows = [
+        draw.to_manifest()
+        for stream in STREAM_NAMES
+        for draw in sampling.draws(stream, 4)  # type: ignore[arg-type]
+    ]
+    if len({str(row["draw_id"]) for row in draw_rows}) != len(draw_rows):
+        raise RuntimeError("STAGE2_FORMAL_DRAW_ID_COLLISION")
+    nested_mapping = RepetitionMapping.create(
+        repetition_id="stage2-formal-sampling-nested-fixture",
+        draws=sampling.draws("pilot", 8),
+        m_values=(2, 4, 8),
+    )
+    provider_payload: dict[str, JSONValue] = {
+        "provider_kind": "offline_hf_stage2_asset_manifest",
+        "asset_resolution_hash": assets.digest,
+        "data_range_hash": data_range.digest,
+        "sample_universe_size": len(sample_ids),
+        "sampling_design": data_range.sampling_design,
+        "asset_manifest_hashes": [assets.digest],
+        "asset_provenance": [
+            {
+                "model_id": record.model_id,
+                "training_stage": record.training_stage,
+                "revision": record.revision,
+                "load_evidence_ref": record.load_evidence_ref,
+            }
+            for record in assets.checkpoints
+        ],
+    }
+    return (
+        {
+            "sampling_plan": sampling.to_dict(),  # type: ignore[dict-item]
+            "draw_manifest": {
+                "schema_version": "stage2-task-draw-manifest-v1",
+                "sampling_plan_hash": sampling.digest,
+                "draws": draw_rows,  # type: ignore[dict-item]
+                "draw_count_by_stream": {name: 4 for name in STREAM_NAMES},
+                "stream_manifests": stream_manifests,
+                "draw_id_unique": True,
+                "sample_id_collisions_allowed": True,
+                "replay_hash": canonical_json_hash(draw_rows),
+                "nested_mapping": nested_mapping.to_dict(),
+                "nested_mapping_hash": nested_mapping.digest,
+            },
+            "asset_resolution": {
+                "schema_version": "stage2-task-asset-resolution-v1",
+                "provider": provider_payload,
+                "stage2_asset_manifest": assets.to_dict(),
+                "preregistration_contract_hash": canonical_json_hash(
+                    inputs.payload("preregistration")
+                ),
+                "upstream_binding_hash": inputs.binding_hash,
+                "formal_eligible": False,
+            },
+            "gate_record": _gate_candidate(request),
+        },
+        tuple(dict.fromkeys((*inputs.references, asset_reference))),
     )
 
 
@@ -1537,20 +1715,13 @@ def _run_stage2_assets_and_sampling(
     """解析 provider，并实际生成五条可重放 draw stream 的小型 manifest。"""
 
     inputs = _predecessor_context(request, root, store)
-    fixed_state = inputs.payload("fixed_state_contract")
+    # Formal S2.3 is a DAG sibling of S2.2 and consumes only S2.1 plus the
+    # independently published asset evidence; it must never construct a
+    # fixture matrix or bind to a handoff fixed-state contract.
+    if request.config.run_intent == "formal":
+        return _run_formal_stage2_assets_and_sampling(request, root, inputs)
+
     context = _provider_context(request, root)
-    if (
-        fixed_state.get("fixed_state_id") != context.provider.fixed_state_id
-        or fixed_state.get("provider_state_digest") != context.provider.state_digest()
-        or fixed_state.get("registry_hash") != context.provider.registry_hash
-    ):
-        raise _blocked(
-            BlockerCode.ASSET_UNAVAILABLE,
-            "fixed_state_provider_binding",
-            "当前 provider 与前序 fixed_state_contract 身份不一致",
-            retryable=False,
-            evidence_refs=inputs.references,
-        )
     sampling = _sampling_plan(request, context)
     # 公共 loader round-trip 与同区间重放是抽样合同的一部分；两者都在发布前执行。
     if SamplingPlan.from_mapping(sampling.to_dict()).digest != sampling.digest:
@@ -1563,6 +1734,10 @@ def _run_stage2_assets_and_sampling(
         draws=sampling.draws("pilot", 8),
         m_values=(2, 4, 8),
     )
+    stream_manifests = {
+        stream: sampling.draw_manifest(stream, 4).to_manifest()
+        for stream in STREAM_NAMES
+    }
     draw_rows = [
         draw.to_manifest()
         for stream in STREAM_NAMES
@@ -1571,6 +1746,63 @@ def _run_stage2_assets_and_sampling(
     draw_ids = [str(row["draw_id"]) for row in draw_rows]
     if len(draw_ids) != len(set(draw_ids)):
         raise RuntimeError("STAGE2_DRAW_ID_COLLISION")
+    # The fixture matrix exercises the same six-cell/checkpoint and data-range
+    # wire contract as formal S2.3 while remaining explicitly synthetic.  It is
+    # never accepted by the formal provider; formal assets must provide their
+    # own immutable revisions and offline-load evidence.
+    producer_commit, _, _ = _stage2_source_identity()
+    fixture_revision = "0" * 40
+    fixture_files = (
+        CheckpointFile("model.safetensors", 1, "1" * 64, "weights"),
+        CheckpointFile("config.json", 1, "2" * 64, "config"),
+        CheckpointFile("tokenizer.json", 1, "4" * 64, "tokenizer"),
+    )
+    fixture_checkpoints = tuple(
+        CheckpointRecord(
+            model_id=model,
+            training_stage=stage,
+            checkpoint_id=f"fixture-{model}-{stage}",
+            training_step={"initialization": 0, "early": 1, "mid_late": 50}[stage],
+            total_training_steps=100,
+            target_fraction={"initialization": 0.0, "early": 0.01, "mid_late": 0.5}[stage],
+            repository=f"fixture/{model}",
+            revision=fixture_revision,
+            root_ref=f"fixture/models/{model}/{stage}",
+            state="ready",
+            files=fixture_files,
+            manifest_ref=f"fixture/manifests/{model}-{stage}.json",
+            manifest_sha256="3" * 64,
+            parameter_registry_hash=context.provider.registry_hash,
+            config_sha256="2" * 64,
+            tokenizer_sha256="4" * 64,
+            load_status="passed",
+            load_evidence_ref=f"fixture/evidence/{model}-{stage}.json",
+            load_evidence_sha256="5" * 64,
+        )
+        for model in ("pythia-14m", "pythia-31m-deduped")
+        for stage in ("initialization", "early", "mid_late")
+    )
+    fixture_data_range = DataRangeManifest(
+        dataset_id="fixture-data-range",
+        revision=fixture_revision,
+        manifest_ref="fixture/manifests/data-range.json",
+        manifest_sha256="6" * 64,
+        files=(
+            # The local provider does not read these paths.  They identify the
+            # same two-file shape as the formal Pile allowlist.
+            # Sizes/hashes are intentionally fixture values.
+            DataFile("document-00000-of-00020.bin", 1, "7" * 64, "token_shard"),
+            DataFile("document.idx", 1, "8" * 64, "index"),
+        ),
+        sample_id_max_exclusive=len(context.sample_ids),
+    )
+    fixture_assets = AssetResolutionManifest(
+        scope="local_fixture",
+        checkpoints=fixture_checkpoints,
+        data_range=fixture_data_range,
+        producer_commit=producer_commit,
+        execution_commit=producer_commit,
+    )
     payloads: dict[str, Mapping[str, JSONValue]] = {
         "sampling_plan": sampling.to_dict(),  # type: ignore[dict-item]
         "draw_manifest": {
@@ -1578,16 +1810,20 @@ def _run_stage2_assets_and_sampling(
             "sampling_plan_hash": sampling.digest,
             "draws": draw_rows,  # type: ignore[dict-item]
             "draw_count_by_stream": {name: 4 for name in STREAM_NAMES},
+            "stream_manifests": stream_manifests,
             "draw_id_unique": True,
             "sample_id_collisions_allowed": True,
             "replay_hash": canonical_json_hash(draw_rows),
-            "nested_mapping": nested_mapping.to_manifest(),
+            "nested_mapping": nested_mapping.to_dict(),
             "nested_mapping_hash": nested_mapping.digest,
         },
         "asset_resolution": {
             "schema_version": "stage2-task-asset-resolution-v1",
             "provider": context.to_payload(),
-            "fixed_state_contract_hash": canonical_json_hash(fixed_state),
+            "stage2_asset_manifest": fixture_assets.to_dict(),
+            "preregistration_contract_hash": canonical_json_hash(
+                inputs.payload("preregistration")
+            ),
             "upstream_binding_hash": inputs.binding_hash,
             "formal_eligible": False,
         },
@@ -1984,31 +2220,46 @@ def _run_stage2_estimator(
     )
     mappings = _paired_mappings(sampling, stream=stream, plan=experiment_plan)
     if request.task.task_id == "stage2.05_paired_estimator_runner":
-        reference_manifest = inputs.payload("reference_result")
         try:
-            bundle_ref = str(reference_manifest["tensor_bundle_ref"])
-            reference_state, bundle = load_tensor_bundle(
-                _workspace_path(root, bundle_ref, field="reference_tensor_bundle")
-            )
-            if bundle.manifest_sha256 != reference_manifest.get(
-                "tensor_bundle_manifest_hash"
-            ):
-                raise ValueError("REFERENCE_TENSOR_BUNDLE_HASH_MISMATCH")
-            if not isinstance(reference_state, Mapping):
-                raise ValueError("REFERENCE_TENSOR_BUNDLE_ROOT_NOT_MAPPING")
-            reference = _as_numpy_vector(reference_state["bias_reference"])  # type: ignore[arg-type]
-            if _vector_digest(reference) != reference_manifest.get(
-                "bias_reference_hash"
-            ):
-                raise ValueError("REFERENCE_VECTOR_HASH_MISMATCH")
-        except (KeyError, TypeError, ValueError) as error:
-            raise _blocked(
-                BlockerCode.ASSET_UNAVAILABLE,
-                "stage2_reference_tensor_bundle",
-                f"前序 reference_result 无法恢复：{error}",
-                retryable=False,
-                evidence_refs=inputs.references,
-            ) from error
+            reference_manifest = inputs.payload("reference_result")
+        except RuntimeError as error:
+            if request.config.run_intent != "local_fixture":
+                raise _blocked(
+                    BlockerCode.ASSET_UNAVAILABLE,
+                    "stage2_reference_tensor_bundle",
+                    "formal S2.5 requires an independently published reference_result",
+                    retryable=False,
+                    evidence_refs=inputs.references,
+                ) from error
+            # The plan DAG intentionally runs S2.5 from S2.2+S2.3.  The local
+            # provider can derive the exact fixture anchor directly; formal
+            # execution remains fail-closed until S2.4 publishes its bundle.
+            reference = _exact_importance_reference(context)
+        else:
+            try:
+                bundle_ref = str(reference_manifest["tensor_bundle_ref"])
+                reference_state, bundle = load_tensor_bundle(
+                    _workspace_path(root, bundle_ref, field="reference_tensor_bundle")
+                )
+                if bundle.manifest_sha256 != reference_manifest.get(
+                    "tensor_bundle_manifest_hash"
+                ):
+                    raise ValueError("REFERENCE_TENSOR_BUNDLE_HASH_MISMATCH")
+                if not isinstance(reference_state, Mapping):
+                    raise ValueError("REFERENCE_TENSOR_BUNDLE_ROOT_NOT_MAPPING")
+                reference = _as_numpy_vector(reference_state["bias_reference"])  # type: ignore[arg-type]
+                if _vector_digest(reference) != reference_manifest.get(
+                    "bias_reference_hash"
+                ):
+                    raise ValueError("REFERENCE_VECTOR_HASH_MISMATCH")
+            except (KeyError, TypeError, ValueError) as error:
+                raise _blocked(
+                    BlockerCode.ASSET_UNAVAILABLE,
+                    "stage2_reference_tensor_bundle",
+                    f"前序 reference_result 无法恢复：{error}",
+                    retryable=False,
+                    evidence_refs=inputs.references,
+                ) from error
     else:
         reference = _exact_importance_reference(context)
     summary = RecoverablePairedWaveRunner(
@@ -2493,18 +2744,26 @@ def _run_stage2_capacity(
     """核对三种成本语义，并保留本机未测 wall/system 能力的显式状态。"""
 
     inputs = _predecessor_context(request, root, store)
+    confirmatory = inputs.payload("confirmatory_results")
+    shards = inputs.payload("sufficient_stat_shards")
+    if confirmatory.get("complete") is not True or shards.get("complete") is not True:
+        raise _blocked(
+            BlockerCode.ASSET_UNAVAILABLE,
+            "complete_confirmatory_results",
+            "S2.9 requires complete S2.7 confirmatory results and sufficient-stat shards",
+            evidence_refs=inputs.references,
+        )
     try:
-        statistics = FrozenSourceTable.from_mapping(inputs.payload("frozen_source_table"))
+        statistics = _stage2_statistics_table(confirmatory)
     except (TypeError, ValueError) as error:
         raise _blocked(
             BlockerCode.CONTRACT_UNFROZEN,
-            "stage2_frozen_statistics_table",
-            f"冻结统计源表不可用：{error}",
+            "stage2_confirmatory_statistics_table",
+            f"S2.7 confirmatory statistics are invalid: {error}",
             retryable=False,
             evidence_refs=inputs.references,
         ) from error
-    quality = inputs.payload("quality_gates")
-    costs = quality.get("cost_statistics")
+    costs = confirmatory.get("cost_statistics")
     if not isinstance(costs, Mapping) or set(costs) != {
         "scientific_equal_sample_cost",
         "isolated_estimator_cost",
@@ -2564,7 +2823,7 @@ def _run_stage2_capacity(
         "stage2-local-fixture",
         experiment_bytes,
     )
-    recommendation = quality.get("pilot_recommendation")
+    recommendation = confirmatory.get("pilot_recommendation")
     if not isinstance(recommendation, Mapping):
         raise ValueError("STAGE2_CAPACITY_RECOMMENDATION_MISSING")
     system_report: dict[str, JSONValue] = {

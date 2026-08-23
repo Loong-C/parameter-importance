@@ -547,6 +547,31 @@ def _validate_known_artifact(value: dict[str, Any]) -> tuple[str, str | None]:
 
         index = DerivedTableIndex.from_mapping(value)
         return "derived_table_index", str(index.to_dict()["artifact_hash"])
+    if schema == "stage2-draw-stream-manifest-v1":
+        from .experiments import DrawStreamManifest
+
+        manifest = DrawStreamManifest.from_manifest(value)
+        return "stage2_draw_stream_manifest", manifest.replay_hash
+    if schema == "stage2-repetition-mapping-v1":
+        from .experiments import RepetitionMapping
+
+        mapping = RepetitionMapping.from_manifest(value)
+        return "stage2_repetition_mapping", mapping.digest
+    if schema == "stage2-checkpoint-manifest-v1":
+        from .experiments import CheckpointRecord
+
+        record = CheckpointRecord.from_mapping(value)
+        return "stage2_checkpoint_manifest", canonical_json_hash(record.to_dict())
+    if schema == "stage2-data-range-manifest-v1":
+        from .experiments import DataRangeManifest
+
+        manifest = DataRangeManifest.from_mapping(value)
+        return "stage2_data_range_manifest", manifest.digest
+    if schema == "stage2-asset-resolution-v1":
+        from .experiments import AssetResolutionManifest
+
+        manifest = AssetResolutionManifest.from_mapping(value)
+        return "stage2_asset_resolution", manifest.digest
     if isinstance(schema, str) and (
         schema.startswith("stage2-") or schema.startswith("stage3-")
     ):

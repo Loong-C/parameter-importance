@@ -12,6 +12,7 @@ import hashlib
 import json
 import math
 import random
+import re
 from dataclasses import dataclass, field
 from typing import Hashable, Iterable, Literal, Mapping, Sequence
 
@@ -157,6 +158,16 @@ class Draw:
     sample_id: Hashable
     algorithm_version: str
 
+    def __post_init__(self) -> None:
+        if not isinstance(self.draw_id, str) or not self.draw_id:
+            raise TypeError("draw_id 必须是非空字符串")
+        if self.stream not in STREAM_NAMES:
+            raise ValueError(f"未知 stream: {self.stream!r}")
+        if isinstance(self.position, bool) or not isinstance(self.position, int) or self.position < 0:
+            raise TypeError("position 必须是非负整数")
+        if self.algorithm_version != "stage2-draws-python-randrange-v1":
+            raise ValueError("不支持的 draw 算法版本")
+
     def to_manifest(self) -> dict[str, object]:
         return {
             "draw_id": self.draw_id,
@@ -165,6 +176,162 @@ class Draw:
             "sample_id": self.sample_id,
             "algorithm_version": self.algorithm_version,
         }
+
+
+def _generator_state_digest(state: object) -> str:
+    """Hash a Python generator state without serializing it as a run identity."""
+
+    return _sha256_json(
+        {
+            "algorithm_version": "stage2-draws-python-randrange-v1",
+            "state": state,
+        }
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class SamplingStreamState:
+    """Replay boundary for one stream interval.
+
+    The model/global RNG state is intentionally not represented here.  This
+    object only covers the independent sampling generator, so a fixed-state
+    provider can separately attest that model and global RNG stayed unchanged.
+    """
+
+    stream: StreamName
+    start_position: int
+    end_position: int
+    state_before_sha256: str
+    state_after_sha256: str
+    algorithm_version: str = "stage2-draws-python-randrange-v1"
+
+    def __post_init__(self) -> None:
+        if self.stream not in STREAM_NAMES:
+            raise ValueError(f"unknown stream: {self.stream!r}")
+        for name in ("start_position", "end_position"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise TypeError(f"{name} must be a non-negative integer")
+        if self.end_position < self.start_position:
+            raise ValueError("end_position must not precede start_position")
+        if self.algorithm_version != "stage2-draws-python-randrange-v1":
+            raise ValueError("unsupported sampling generator algorithm")
+        _sha256 = re.compile(r"^[0-9a-f]{64}$")
+        if any(
+            not isinstance(value, str) or _sha256.fullmatch(value) is None
+            for value in (self.state_before_sha256, self.state_after_sha256)
+        ):
+            raise ValueError("generator state digests must be lowercase SHA-256")
+
+    def to_manifest(self) -> dict[str, object]:
+        return {
+            "stream": self.stream,
+            "start_position": self.start_position,
+            "end_position": self.end_position,
+            "state_before_sha256": self.state_before_sha256,
+            "state_after_sha256": self.state_after_sha256,
+            "algorithm_version": self.algorithm_version,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class DrawStreamManifest:
+    """A self-contained, replayable draw interval for one named stream."""
+
+    sampling_plan_hash: str
+    stream_state: SamplingStreamState
+    draws: tuple[Draw, ...]
+    schema_version: str = "stage2-draw-stream-manifest-v1"
+
+    def __post_init__(self) -> None:
+        if self.schema_version != "stage2-draw-stream-manifest-v1":
+            raise ValueError("unsupported draw stream manifest schema")
+        if not isinstance(self.sampling_plan_hash, str) or len(self.sampling_plan_hash) != 64:
+            raise ValueError("sampling_plan_hash must be SHA-256")
+        if any(character not in "0123456789abcdef" for character in self.sampling_plan_hash):
+            raise ValueError("sampling_plan_hash must be lowercase SHA-256")
+        values = tuple(self.draws)
+        if any(not isinstance(item, Draw) for item in values):
+            raise TypeError("draws must contain Draw values")
+        start = self.stream_state.start_position
+        expected_positions = list(range(start, start + len(values)))
+        if [item.position for item in values] != expected_positions:
+            raise ValueError("draw positions must be contiguous from stream start")
+        if any(item.stream != self.stream_state.stream for item in values):
+            raise ValueError("draw stream does not match stream_state")
+        if len({item.draw_id for item in values}) != len(values):
+            raise ValueError("draw IDs must be unique")
+        if self.stream_state.end_position != start + len(values):
+            raise ValueError("stream_state end_position does not match draws")
+        object.__setattr__(self, "draws", values)
+
+    @property
+    def sample_collision_count(self) -> int:
+        return len(self.draws) - len({item.sample_id for item in self.draws})
+
+    @property
+    def replay_hash(self) -> str:
+        return _sha256_json(self.to_manifest(include_hash=False))
+
+    def to_manifest(self, *, include_hash: bool = True) -> dict[str, object]:
+        value: dict[str, object] = {
+            "schema_version": self.schema_version,
+            "sampling_plan_hash": self.sampling_plan_hash,
+            "stream_state": self.stream_state.to_manifest(),
+            "draws": [item.to_manifest() for item in self.draws],
+            "draw_count": len(self.draws),
+            "sample_collision_count": self.sample_collision_count,
+        }
+        if include_hash:
+            value["replay_hash"] = self.replay_hash
+        return value
+
+    @classmethod
+    def from_manifest(cls, value: Mapping[str, object]) -> "DrawStreamManifest":
+        required = {
+            "schema_version", "sampling_plan_hash", "stream_state", "draws",
+            "draw_count", "sample_collision_count", "replay_hash",
+        }
+        if set(value) != required or value["schema_version"] != "stage2-draw-stream-manifest-v1":
+            raise ValueError("draw stream manifest fields or schema mismatch")
+        state = value["stream_state"]
+        draws = value["draws"]
+        if not isinstance(state, Mapping) or not isinstance(draws, list):
+            raise TypeError("stream_state/draws have invalid types")
+        if set(state) != {
+            "stream", "start_position", "end_position", "state_before_sha256",
+            "state_after_sha256", "algorithm_version",
+        }:
+            raise ValueError("stream_state fields mismatch")
+        parsed_draws: list[Draw] = []
+        for item in draws:
+            if not isinstance(item, Mapping) or set(item) != {
+                "draw_id", "stream", "position", "sample_id", "algorithm_version"
+            }:
+                raise ValueError("draw fields mismatch")
+            parsed_draws.append(
+                Draw(
+                    draw_id=item["draw_id"], stream=item["stream"], position=item["position"],
+                    sample_id=item["sample_id"], algorithm_version=item["algorithm_version"],
+                )  # type: ignore[arg-type]
+            )
+        result = cls(
+            sampling_plan_hash=value["sampling_plan_hash"],
+            stream_state=SamplingStreamState(
+                stream=state["stream"], start_position=state["start_position"],
+                end_position=state["end_position"], state_before_sha256=state["state_before_sha256"],
+                state_after_sha256=state["state_after_sha256"], algorithm_version=state["algorithm_version"],
+            ),
+            draws=tuple(parsed_draws),
+            schema_version=value["schema_version"],
+        )  # type: ignore[arg-type]
+        if value["draw_count"] != len(result.draws):
+            raise ValueError("draw_count does not match draws")
+        if value["sample_collision_count"] != result.sample_collision_count:
+            raise ValueError("sample_collision_count does not match draws")
+        if value["replay_hash"] != result.replay_hash:
+            raise ValueError("replay_hash does not match draw manifest")
+        return result
 
 
 @dataclass(frozen=True, slots=True)
@@ -223,6 +390,7 @@ class SamplingPlan:
         if isinstance(start, bool) or not isinstance(start, int) or start < 0:
             raise ValueError("start 必须是非负整数")
         rng = random.Random(self._stream_seed(stream))
+        universe_digest = self.universe.digest
         result: list[Draw] = []
         size = len(self.universe.sample_ids)
         for position in range(start + count):
@@ -230,7 +398,7 @@ class SamplingPlan:
             if position < start:
                 continue
             identity = {
-                "universe_digest": self.universe.digest,
+                "universe_digest": universe_digest,
                 "stream": stream,
                 "position": position,
                 "algorithm_version": self.algorithm_version,
@@ -246,6 +414,70 @@ class SamplingPlan:
                 )
             )
         return tuple(result)
+
+    def draws_with_state(
+        self,
+        stream: StreamName,
+        count: int,
+        *,
+        start: int = 0,
+    ) -> tuple[tuple[Draw, ...], SamplingStreamState]:
+        """Generate draws and retain independent generator replay boundaries."""
+
+        if stream not in STREAM_NAMES:
+            raise ValueError(f"未知 stream: {stream!r}")
+        if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+            raise ValueError("count 必须是非负整数")
+        if isinstance(start, bool) or not isinstance(start, int) or start < 0:
+            raise ValueError("start 必须是非负整数")
+        rng = random.Random(self._stream_seed(stream))
+        universe_digest = self.universe.digest
+        for _ in range(start):
+            rng.randrange(len(self.universe.sample_ids))
+        before = _generator_state_digest(rng.getstate())
+        values: list[Draw] = []
+        for position in range(start, start + count):
+            sample_id = self.universe.sample_ids[rng.randrange(len(self.universe.sample_ids))]
+            identity = {
+                "universe_digest": universe_digest,
+                "stream": stream,
+                "position": position,
+                "algorithm_version": self.algorithm_version,
+            }
+            values.append(
+                Draw(
+                    draw_id=f"{stream}:{position:012d}:{_sha256_json(identity)[:16]}",
+                    stream=stream,
+                    position=position,
+                    sample_id=sample_id,
+                    algorithm_version=self.algorithm_version,
+                )
+            )
+        after = _generator_state_digest(rng.getstate())
+        return tuple(values), SamplingStreamState(
+            stream=stream,
+            start_position=start,
+            end_position=start + count,
+            state_before_sha256=before,
+            state_after_sha256=after,
+            algorithm_version=self.algorithm_version,
+        )
+
+    def draw_manifest(
+        self,
+        stream: StreamName,
+        count: int,
+        *,
+        start: int = 0,
+    ) -> DrawStreamManifest:
+        """Return a hash-bound stream manifest suitable for replay/resume."""
+
+        draws, state = self.draws_with_state(stream, count, start=start)
+        return DrawStreamManifest(
+            sampling_plan_hash=self.digest,
+            stream_state=state,
+            draws=draws,
+        )
 
     @property
     def digest(self) -> str:
@@ -405,6 +637,7 @@ class RepetitionMapping:
 
     def to_manifest(self) -> dict[str, object]:
         return {
+            "schema_version": "stage2-repetition-mapping-v1",
             "mapping_version": self.mapping_version,
             "repetition_id": self.repetition_id,
             "batch_size": self.batch_size,
@@ -415,6 +648,52 @@ class RepetitionMapping:
             ],
             "sample_collision_count": self.sample_collision_count,
         }
+
+    def to_dict(self) -> dict[str, object]:
+        value = self.to_manifest()
+        value["mapping_hash"] = self.digest
+        return value
+
+    @classmethod
+    def from_manifest(cls, value: Mapping[str, object]) -> "RepetitionMapping":
+        required = {
+            "schema_version", "mapping_version", "repetition_id", "batch_size",
+            "m_values", "draws", "double_half_draw_ids", "sample_collision_count",
+            "mapping_hash",
+        }
+        if set(value) != required or value["schema_version"] != "stage2-repetition-mapping-v1":
+            raise ValueError("repetition mapping fields or schema mismatch")
+        draws = value["draws"]
+        m_values = value["m_values"]
+        halves = value["double_half_draw_ids"]
+        if not isinstance(draws, list) or not all(isinstance(item, Mapping) for item in draws):
+            raise TypeError("repetition draws must be an object array")
+        if not isinstance(m_values, list):
+            raise TypeError("m_values must be an integer array")
+        if not isinstance(halves, list) or len(halves) != 2:
+            raise ValueError("double_half_draw_ids must contain two arrays")
+        result = cls(
+            repetition_id=value["repetition_id"],
+            draws=tuple(
+                Draw(
+                    draw_id=item["draw_id"], stream=item["stream"], position=item["position"],
+                    sample_id=item["sample_id"], algorithm_version=item["algorithm_version"],
+                )  # type: ignore[arg-type]
+                for item in draws
+            ),
+            m_values=tuple(m_values),  # type: ignore[arg-type]
+            mapping_version=value["mapping_version"],  # type: ignore[arg-type]
+        )
+        if value["batch_size"] != result.batch_size:
+            raise ValueError("batch_size does not match draws")
+        if value["sample_collision_count"] != result.sample_collision_count:
+            raise ValueError("sample_collision_count does not match draws")
+        expected_halves = [[item.draw_id for item in half] for half in result.double_halves]
+        if halves != expected_halves:
+            raise ValueError("double_half_draw_ids do not match draw order")
+        if value["mapping_hash"] != result.digest:
+            raise ValueError("mapping_hash does not match mapping content")
+        return result
 
     @property
     def digest(self) -> str:
