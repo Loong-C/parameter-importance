@@ -195,13 +195,26 @@ def _load_config(path: Path, *, field: str) -> Any:
     return load_canonical_json(path)
 
 
-def _validate_bound_file(root: Path, value: object, *, field: str) -> dict[str, str]:
-    if not isinstance(value, Mapping) or set(value) != {"ref", "sha256"}:
+def _validate_bound_artifact(
+    root: Path,
+    value: object,
+    *,
+    field: str,
+    extra_keys: tuple[str, ...] = (),
+) -> dict[str, object]:
+    expected = {"ref", "sha256", *extra_keys}
+    if not isinstance(value, Mapping) or set(value) != expected:
         raise Stage1S111FormalError(f"S1_11_{field.upper()}_BINDING_INVALID")
     path = _relative(root, value["ref"], field=field)
     if not path.is_file() or not _digest(value["sha256"]) or _sha(path) != value["sha256"]:
         raise Stage1S111FormalError(f"S1_11_{field.upper()}_HASH_MISMATCH")
-    return {"ref": str(value["ref"]), "sha256": str(value["sha256"])}
+    if "artifact_hash" in extra_keys and not _digest(value["artifact_hash"]):
+        raise Stage1S111FormalError(f"S1_11_{field.upper()}_BINDING_INVALID")
+    return {
+        "ref": str(value["ref"]),
+        "sha256": str(value["sha256"]),
+        **{key: value[key] for key in extra_keys},
+    }
 
 
 def _validate_failure_history(root: Path, value: object) -> list[dict[str, str]]:
@@ -225,23 +238,19 @@ def _validate_failure_history(root: Path, value: object) -> list[dict[str, str]]
 
 
 def _validate_test_summary(root: Path, value: object) -> dict[str, object]:
-    if not isinstance(value, Mapping) or set(value) != {"ref", "sha256", "artifact_hash"}:
-        raise Stage1S111FormalError("S1_11_TEST_SUMMARY_BINDING_INVALID")
-    path = _relative(root, value["ref"], field="test_summary")
-    if not path.is_file() or not _digest(value["sha256"]) or _sha(path) != value["sha256"]:
-        raise Stage1S111FormalError("S1_11_TEST_SUMMARY_HASH_MISMATCH")
+    binding = _validate_bound_artifact(
+        root, value, field="test_summary", extra_keys=("artifact_hash",)
+    )
+    path = _relative(root, binding["ref"], field="test_summary")
     report = _object(path, field="test_summary")
     expected = {"schema_version", "status", "groups", "artifact_hash"}
     if set(report) != expected or report.get("schema_version") != "stage1-s1-11-test-summary-v1" or report.get("status") != "PASS":
         raise Stage1S111FormalError("S1_11_TEST_SUMMARY_SCHEMA_INVALID")
     body = dict(report); declared = body.pop("artifact_hash")
-    if (
-        not _digest(value["artifact_hash"])
-        or value["artifact_hash"] != declared
-    ):
-        raise Stage1S111FormalError("S1_11_TEST_SUMMARY_BINDING_INVALID")
     if not _digest(declared) or declared != canonical_json_hash(body) or not isinstance(report.get("groups"), list) or not report["groups"]:
         raise Stage1S111FormalError("S1_11_TEST_SUMMARY_SELF_HASH_INVALID")
+    if binding["artifact_hash"] != declared:
+        raise Stage1S111FormalError("S1_11_TEST_SUMMARY_BINDING_INVALID")
     names: set[str] = set()
     for group in report["groups"]:
         if not isinstance(group, Mapping) or set(group) != {"name", "collected", "passed", "failed", "errors", "skipped", "duration_seconds", "junit_ref", "junit_sha256"}:
@@ -252,15 +261,17 @@ def _validate_test_summary(root: Path, value: object) -> dict[str, object]:
         if not junit.is_file() or not _digest(group["junit_sha256"]) or _sha(junit) != group["junit_sha256"]:
             raise Stage1S111FormalError("S1_11_TEST_SUMMARY_JUNIT_HASH_MISMATCH")
         names.add(group["name"])
-    return {"ref": str(value["ref"]), "sha256": str(value["sha256"]), "artifact_hash": str(report["artifact_hash"])}
+    return {"ref": str(binding["ref"]), "sha256": str(binding["sha256"]), "artifact_hash": str(binding["artifact_hash"])}
 
 
 def _validate_sync_audit(root: Path, value: object) -> dict[str, object]:
-    if not isinstance(value, Mapping) or set(value) != {"ref", "sha256"}:
-        raise Stage1S111FormalError("S1_11_SYNC_AUDIT_BINDING_INVALID")
-    path = _relative(root, value["ref"], field="sync_audit")
-    if not path.is_file() or not _digest(value["sha256"]) or _sha(path) != value["sha256"]:
-        raise Stage1S111FormalError("S1_11_SYNC_AUDIT_HASH_MISMATCH")
+    binding = _validate_bound_artifact(
+        root,
+        value,
+        field="sync_audit",
+        extra_keys=("artifact_hash", "execution_commit"),
+    )
+    path = _relative(root, binding["ref"], field="sync_audit")
     audit = _object(path, field="sync_audit")
     expected = {"schema_version", "status", "git_publish", "server_execution", "agent_sha256", "large_artifact_manifest", "artifact_hash"}
     if set(audit) != expected or audit.get("schema_version") != "stage1-s1-11-sync-audit-v1" or audit.get("status") != "PASS":
@@ -272,9 +283,15 @@ def _validate_sync_audit(root: Path, value: object) -> dict[str, object]:
         raise Stage1S111FormalError("S1_11_SYNC_AUDIT_SHAPE_INVALID")
     manifest_path = _relative(path.parent, manifest["ref"], field="large_artifact_manifest")
     commits = (git_publish["execution_commit"], git_publish["remote_commit"], server_execution["execution_commit"])
-    if declared != canonical_json_hash(body) or not isinstance(audit["agent_sha256"], Mapping) or set(audit["agent_sha256"]) != expected_agents or any(not _digest(digest) for digest in audit["agent_sha256"].values()) or any(not isinstance(commit, str) or len(commit) != 40 or any(character not in "0123456789abcdef" for character in commit) for commit in commits) or len(set(commits)) != 1 or git_publish["worktree_clean"] is not True or server_execution["worktree_clean"] is not True or not isinstance(git_publish["remote_ref"], str) or not git_publish["remote_ref"] or not isinstance(server_execution["evidence_root"], str) or not server_execution["evidence_root"] or not manifest_path.is_file() or not _digest(manifest["sha256"]) or _sha(manifest_path) != manifest["sha256"]:
+    if not _digest(declared) or declared != canonical_json_hash(body):
         raise Stage1S111FormalError("S1_11_SYNC_AUDIT_CLOSURE_INVALID")
-    return {"ref": str(value["ref"]), "sha256": str(value["sha256"]), "artifact_hash": str(audit["artifact_hash"]), "execution_commit": str(git_publish["execution_commit"]), "large_artifact_manifest_ref": str(manifest["ref"]), "large_artifact_manifest_sha256": str(manifest["sha256"])}
+    if binding["artifact_hash"] != declared:
+        raise Stage1S111FormalError("S1_11_SYNC_AUDIT_BINDING_INVALID")
+    if not isinstance(binding["execution_commit"], str) or len(binding["execution_commit"]) != 40 or any(character not in "0123456789abcdef" for character in binding["execution_commit"]) or binding["execution_commit"] != git_publish["execution_commit"] or binding["execution_commit"] != server_execution["execution_commit"]:
+        raise Stage1S111FormalError("S1_11_SYNC_AUDIT_BINDING_INVALID")
+    if not isinstance(audit["agent_sha256"], Mapping) or set(audit["agent_sha256"]) != expected_agents or any(not _digest(digest) for digest in audit["agent_sha256"].values()) or any(not isinstance(commit, str) or len(commit) != 40 or any(character not in "0123456789abcdef" for character in commit) for commit in commits) or len(set(commits)) != 1 or git_publish["worktree_clean"] is not True or server_execution["worktree_clean"] is not True or not isinstance(git_publish["remote_ref"], str) or not git_publish["remote_ref"] or not isinstance(server_execution["evidence_root"], str) or not server_execution["evidence_root"] or not manifest_path.is_file() or not _digest(manifest["sha256"]) or _sha(manifest_path) != manifest["sha256"]:
+        raise Stage1S111FormalError("S1_11_SYNC_AUDIT_CLOSURE_INVALID")
+    return {"ref": str(binding["ref"]), "sha256": str(binding["sha256"]), "artifact_hash": str(binding["artifact_hash"]), "execution_commit": str(binding["execution_commit"]), "large_artifact_manifest_ref": str(manifest["ref"]), "large_artifact_manifest_sha256": str(manifest["sha256"])}
 
 
 def _schema_validate(
@@ -1778,7 +1795,7 @@ def execute(*, repository: Path, evidence_root: Path, attempt_root: Path, depend
     failures = _validate_failure_history(evidence_root, _load_config(failure_history_path, field="failure_history"))
     if worklog_binding_path is None:
         raise Stage1S111FormalError("S1_11_WORKLOG_BINDING_REQUIRED")
-    worklog = _validate_bound_file(evidence_root, _load_config(worklog_binding_path, field="worklog_binding"), field="worklog")
+    worklog = _validate_bound_artifact(evidence_root, _load_config(worklog_binding_path, field="worklog_binding"), field="worklog")
     if not isinstance(dependencies, list) or not isinstance(matrix, list):
         raise Stage1S111FormalError("S1_11_INPUT_LIST_INVALID")
     target = evidence_root / "evidence" / "stage1" / "s1-11-formal" / execution_commit / attempt_id
