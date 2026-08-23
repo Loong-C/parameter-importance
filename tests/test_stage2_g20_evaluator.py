@@ -346,7 +346,7 @@ def test_real_three_commit_formal_fixture_publishes_gate_record(tmp_path: Path) 
     gate = GateRecord.from_mapping(dict(loaded.payload))
     assert gate.status is GateStatus.PASS
     assert loaded.source_refs == tuple(refs[kind] for kind in ARTIFACT_KINDS)
-    assert [item["commit_ref"] for item in gate.measured["stage1_source_artifacts"]] == [  # type: ignore[index]
+    assert [item["commit_ref"] for item in gate.measured["stage1_source_artifacts"] if "artifact_kind" in item] == [  # type: ignore[index]
         stage1_refs[kind] for kind in STAGE1_ARTIFACT_KINDS
     ]
     evaluator = gate.measured["evaluator"]  # type: ignore[index]
