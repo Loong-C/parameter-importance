@@ -134,15 +134,15 @@ def test_handoff_shape_without_excluded_device_is_validated_at_raw_report_bounda
     assert plan["formal_eligible"] is False
 
 
-def test_runtime_launcher_requires_smoke_approved_gpu_set(tmp_path: Path) -> None:
-    with pytest.raises(ValueError, match="smoke-approved"):
+def test_runtime_launcher_requires_one_gpu_token(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="exactly one"):
         execute_with_task_runtime(
             {"cells": []},
             runtime_config_paths=(),
             runtime_environment_path=tmp_path / "environment.json",
             data_root=tmp_path,
             output_root=tmp_path / "out",
-            cuda_visible_devices="0,1",
+            cuda_visible_devices="2,4",
             cell_id=None,
             heartbeat_seconds=1.0,
         )
@@ -165,9 +165,9 @@ def _healthy_inventory() -> list[dict[str, object]]:
     rows = [
         {"index": "0", "pci_bus_id": EXCLUDED_PCI, "uuid": EXCLUDED_UUID},
         {"index": "2", "pci_bus_id": "0000:53:00.0", "uuid": APPROVED_GPU_BINDINGS["0000:53:00.0"]},
-        {"index": "3", "pci_bus_id": "0000:9C:00.0", "uuid": APPROVED_GPU_BINDINGS["0000:9C:00.0"]},
-        {"index": "4", "pci_bus_id": "0000:9D:00.0", "uuid": APPROVED_GPU_BINDINGS["0000:9D:00.0"]},
-        {"index": "5", "pci_bus_id": "0000:A0:00.0", "uuid": APPROVED_GPU_BINDINGS["0000:A0:00.0"]},
+        {"index": "4", "pci_bus_id": "0000:9C:00.0", "uuid": APPROVED_GPU_BINDINGS["0000:9C:00.0"]},
+        {"index": "5", "pci_bus_id": "0000:9D:00.0", "uuid": APPROVED_GPU_BINDINGS["0000:9D:00.0"]},
+        {"index": "6", "pci_bus_id": "0000:A0:00.0", "uuid": APPROVED_GPU_BINDINGS["0000:A0:00.0"]},
     ]
     for row in rows:
         row.update(
@@ -196,9 +196,9 @@ def _eight_card_inventory() -> list[dict[str, object]]:
     )
     rows.extend(
         [
-            {"index": "5", "pci_bus_id": "0000:51:00.0", "uuid": "GPU-other-1"},
-            {"index": "6", "pci_bus_id": "0000:52:00.0", "uuid": "GPU-other-2"},
-            {"index": "7", "pci_bus_id": "0000:54:00.0", "uuid": "GPU-other-3"},
+            {"index": "7", "pci_bus_id": "0000:51:00.0", "uuid": "GPU-other-1"},
+            {"index": "8", "pci_bus_id": "0000:52:00.0", "uuid": "GPU-other-2"},
+            {"index": "9", "pci_bus_id": "0000:54:00.0", "uuid": "GPU-other-3"},
         ]
     )
     for row in rows[5:]:
@@ -243,6 +243,41 @@ def test_gpu_live_inventory_requires_idle_clean_health_and_complete_set(
         lambda: [{"pid": "123", "process_name": "other", "gpu_uuid": APPROVED_GPU_BINDINGS["0000:53:00.0"]}],
     )
     with pytest.raises(ValueError, match="compute apps"):
+        _bind_gpu("2")
+
+
+def test_gpu_binding_resolves_any_current_index_by_approved_identity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    inventory = _healthy_inventory()
+    monkeypatch.setattr("ops.stage2.run_s204_formal._gpu_inventory", lambda: inventory)
+    monkeypatch.setattr("ops.stage2.run_s204_formal._gpu_compute_apps", lambda: [])
+
+    for token, (pci, uuid) in zip(("2", "4", "5", "6"), APPROVED_GPU_BINDINGS.items()):
+        selected, _, _ = _bind_gpu(token)
+        assert selected == uuid
+        assert next(row for row in inventory if row["index"] == token)["pci_bus_id"] == pci
+
+
+def test_gpu_binding_rejects_unknown_tokens_and_excluded_identity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    inventory = _healthy_inventory()
+    # Put the excluded card at an arbitrary live index so 0 and 3 are truly
+    # absent selectors; the PCI/UUID identity remains the exclusion authority.
+    inventory[0]["index"] = "1"
+    monkeypatch.setattr("ops.stage2.run_s204_formal._gpu_inventory", lambda: inventory)
+    monkeypatch.setattr("ops.stage2.run_s204_formal._gpu_compute_apps", lambda: [])
+    for token in ("0", "3"):
+        with pytest.raises(ValueError, match="absent from live inventory"):
+            _bind_gpu(token)
+    with pytest.raises(ValueError, match="excluded GPU"):
+        _bind_gpu(EXCLUDED_UUID)
+
+    drifted = _healthy_inventory()
+    drifted[1]["uuid"] = "GPU-drifted-approved-card"
+    monkeypatch.setattr("ops.stage2.run_s204_formal._gpu_inventory", lambda: drifted)
+    with pytest.raises(ValueError, match="approved smoke set"):
         _bind_gpu("2")
 
 
