@@ -15,7 +15,7 @@ import pytest
 import torch
 
 from param_importance_nlp.core.losses import LossBatch
-from param_importance_nlp.contracts.jsonio import canonical_json_hash, write_canonical_json
+from param_importance_nlp.contracts.jsonio import canonical_json_hash, load_canonical_json, write_canonical_json
 from param_importance_nlp.providers import DeterministicBatchCursor, TorchModelAdapter, TrainingMicrobatch
 from param_importance_nlp.runtime import CheckpointStore, JsonlEventSink
 from param_importance_nlp.runtime.checkpoint_group import GROUP_COMMIT_SCHEMA, GROUP_COMMIT_SCHEMA_V2, CheckpointGroupStore
@@ -398,6 +398,15 @@ def test_s110_fixture_oracle_evidence_and_independent_replay(tmp_path: Path) -> 
     replay = replay_stage1_s110_evidence(evidence, source_root=ROOT, scratch_root=tmp_path / "replay")
     assert replay["status"] == "PASS"
     assert replay["source_gate_artifact_hash"] == hashes["gate_artifact_hash"]
+    persisted: dict[str, object] = {}
+    for role, value in evidence.items():
+        role_path = tmp_path / f"{role}.json"
+        write_canonical_json(role_path, value)
+        persisted[role] = load_canonical_json(role_path)
+    validate_stage1_s110_evidence(persisted, source_root=ROOT)
+    assert replay_stage1_s110_evidence(
+        persisted, source_root=ROOT, scratch_root=tmp_path / "persisted-replay"
+    )["status"] == "PASS"
     formalizer_spec = importlib.util.spec_from_file_location(
         "s110_formalizer_schema_test", ROOT / "ops" / "stage1" / "formalize_s1_10.py"
     )
@@ -805,6 +814,79 @@ def test_s110_formal_observation_requires_bound_pass_reports(tmp_path: Path) -> 
         formalizer._formal_observation(ROOT, tmp_path, "formal-observation.json", expected_commit="0" * 40)
 
 
+def test_s110_formal_observation_report_refs_are_bundle_relative_or_data_root_relative(tmp_path: Path) -> None:
+    published = tmp_path / "published"
+    published.mkdir()
+    run_token_sha256 = "f" * 64
+    for name, mode, world_size in (
+        ("single-report.json", "single", 1),
+        ("four-rank-report.json", "four-rank", 4),
+    ):
+        write_canonical_json(
+            published / name,
+            {
+                "schema_version": "synthetic-worker-v1",
+                "status": "PASS",
+                "task_id": TASK_ID,
+                "gate_id": "G1-RESUME",
+                "fixture_id": "stage1-s110-checkpoint-fixture-v1",
+                "execution_commit": "0" * 40,
+                "run_token_sha256": run_token_sha256,
+                "mode": mode,
+                "phase": "resume",
+                "world_size": world_size,
+            },
+        )
+    observation = {
+        "schema_version": "stage1-s1-10-formal-observation-v1",
+        "status": "PASS",
+        "task_id": TASK_ID,
+        "gate_id": "G1-RESUME",
+        "fixture_id": "stage1-s110-checkpoint-fixture-v1",
+        "execution_commit": "0" * 40,
+        "run_token_sha256": run_token_sha256,
+        "single_process_resume": True,
+        "four_rank_resume": True,
+        "run_owned_resources_released": True,
+        "single_cases": ["pre_skip", "post_skip"],
+        "four_rank_cases": ["pre_skip", "post_skip"],
+        "single_report_ref": "single-report.json",
+        "single_report_sha256": _file_sha256(published / "single-report.json"),
+        "four_rank_report_ref": "four-rank-report.json",
+        "four_rank_report_sha256": _file_sha256(published / "four-rank-report.json"),
+    }
+    formalizer_spec = importlib.util.spec_from_file_location(
+        "s110_formal_observation_report_ref_test", ROOT / "ops" / "stage1" / "formalize_s1_10.py"
+    )
+    assert formalizer_spec is not None and formalizer_spec.loader is not None
+    formalizer = importlib.util.module_from_spec(formalizer_spec)
+    formalizer_spec.loader.exec_module(formalizer)
+
+    observation["artifact_hash"] = canonical_json_hash(observation)
+    write_canonical_json(published / "formal-observation.json", observation)
+    assert formalizer._formal_observation(
+        ROOT, tmp_path, "published/formal-observation.json", expected_commit="0" * 40
+    )["status"] == "PASS"
+
+    observation["single_report_ref"] = "published/single-report.json"
+    observation["four_rank_report_ref"] = "published/four-rank-report.json"
+    observation["artifact_hash"] = canonical_json_hash(
+        {key: value for key, value in observation.items() if key != "artifact_hash"}
+    )
+    write_canonical_json(published / "formal-observation.json", observation)
+    assert formalizer._formal_observation(
+        ROOT, tmp_path, "published/formal-observation.json", expected_commit="0" * 40
+    )["status"] == "PASS"
+
+    observation["single_report_ref"] = "../outside.json"
+    observation["artifact_hash"] = canonical_json_hash(
+        {key: value for key, value in observation.items() if key != "artifact_hash"}
+    )
+    write_canonical_json(published / "formal-observation.json", observation)
+    with pytest.raises(formalizer.Stage1S110FormalError, match="REFERENCE_ESCAPE:single_report"):
+        formalizer._formal_observation(ROOT, tmp_path, "published/formal-observation.json", expected_commit="0" * 40)
+
+
 def test_training_resume_rejects_bad_checkpoint_before_mutating_active_engine(tmp_path: Path) -> None:
     state, metadata = _published_state(CheckpointStore(tmp_path / "source"))
     malformed = deepcopy(state)
@@ -852,6 +934,112 @@ def test_s110_source_and_resume_cpu_harness_use_distinct_exited_processes() -> N
     assert worker._source_process_exited(source_pid, source_descriptor["identity"]) is True
 
 
+def test_s110_resume_loads_source_before_isolating_output_store() -> None:
+    worker_spec = importlib.util.spec_from_file_location(
+        "s110_worker_resume_store_test",
+        ROOT / "ops" / "stage1" / "run_s1_10_resume_worker.py",
+    )
+    assert worker_spec is not None and worker_spec.loader is not None
+    worker = importlib.util.module_from_spec(worker_spec)
+    worker_spec.loader.exec_module(worker)
+
+    class Commit:
+        def __init__(self, *, parent: str | None, generation: int) -> None:
+            self.parent_checkpoint_id = parent
+            self.generation = generation
+            self.metadata = {"source": True}
+
+    class SourceStore:
+        def load(self, checkpoint_id: str) -> tuple[dict[str, str], Commit]:
+            if checkpoint_id == "source-parent":
+                return {"checkpoint_id": checkpoint_id}, Commit(parent=None, generation=1)
+            return {"checkpoint_id": checkpoint_id}, Commit(parent="source-parent", generation=2)
+
+    class OutputStore:
+        published: list[tuple[object, ...]] = []
+
+        def publish(self, checkpoint_id: str, state: object, **kwargs: object) -> None:
+            self.published.append((checkpoint_id, state, kwargs))
+
+    source_store = SourceStore()
+    output_store = OutputStore()
+
+    class FakeEngine:
+        checkpoint_store = source_store
+        events: list[object] = []
+
+        def resume_checkpoint(self, checkpoint_id: str) -> None:
+            self.events.append(("resume", checkpoint_id, self.checkpoint_store))
+
+        def run(self) -> None:
+            self.events.append(("run", self.checkpoint_store))
+
+    engine = FakeEngine()
+    worker._resume_and_run(engine, "source-checkpoint", output_store=output_store)
+    assert output_store.published == [
+        (
+            "source-parent",
+            {"checkpoint_id": "source-parent"},
+            {"generation": 1, "metadata": {"source": True}, "parent_checkpoint_id": None},
+        ),
+        (
+            "source-checkpoint",
+            {"checkpoint_id": "source-checkpoint"},
+            {"generation": 2, "metadata": {"source": True}, "parent_checkpoint_id": "source-parent"},
+        )
+    ]
+    assert engine.events == [
+        ("resume", "source-checkpoint", source_store),
+        ("run", output_store),
+    ]
+
+
+def test_s110_group_broadcast_seeds_rank_zero_output() -> None:
+    worker_spec = importlib.util.spec_from_file_location(
+        "s110_worker_group_broadcast_test",
+        ROOT / "ops" / "stage1" / "run_s1_10_resume_worker.py",
+    )
+    assert worker_spec is not None and worker_spec.loader is not None
+    worker = importlib.util.module_from_spec(worker_spec)
+    worker_spec.loader.exec_module(worker)
+
+    class FakeDist:
+        observed: object = None
+        barriers = 0
+
+        def broadcast_object_list(self, slot: list[object], *, src: int) -> None:
+            assert src == 0
+            self.observed = slot[0]
+
+        def barrier(self) -> None:
+            self.barriers += 1
+
+    dist = FakeDist()
+    assert worker._broadcast_group_output(dist, rank=0, output={"commit_sha256": "a" * 64}) == {
+        "commit_sha256": "a" * 64
+    }
+    assert dist.observed == {"commit_sha256": "a" * 64}
+    assert dist.barriers == 1
+
+
+def test_s110_group_event_snapshots_are_boundary_immutable(tmp_path: Path) -> None:
+    worker_spec = importlib.util.spec_from_file_location(
+        "s110_worker_event_snapshot_test",
+        ROOT / "ops" / "stage1" / "run_s1_10_resume_worker.py",
+    )
+    assert worker_spec is not None and worker_spec.loader is not None
+    worker = importlib.util.module_from_spec(worker_spec)
+    worker_spec.loader.exec_module(worker)
+    event_path = tmp_path / "live.jsonl"
+    event_path.write_bytes(b'{"boundary":"pre"}\n')
+    snapshot = worker._immutable_event_snapshot(tmp_path, event_path, label="pre", rank=0)
+    original = snapshot.read_bytes()
+    event_path.write_bytes(original + b'{"boundary":"post"}\n')
+    assert snapshot.read_bytes() == original
+    with pytest.raises(RuntimeError, match="S1_10_EVENT_SNAPSHOT_EXISTS"):
+        worker._immutable_event_snapshot(tmp_path, event_path, label="pre", rank=0)
+
+
 def test_s110_source_process_identity_rejects_live_source_and_accepts_pid_reuse(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -883,9 +1071,19 @@ def test_s110_worker_snapshot_comparison_is_closed_over_required_observations(mu
         "cursor": {"index": 6}, "next_cursor": {"index": 6}, "sample_multiset": ["sample-a"],
         "rng_sha256": "b", "next_rng_state_sha256": "b", "per_rank_cuda_rng_state_hex": ["00"],
         "optimizer_sha256": "c", "scheduler_sha256": "d", "scaler_sha256": "e", "importance_sha256": "f",
-        "records_sha256": "g", "object_digests": {"importance_accumulator": "f"}, "checkpoint_ids": ["c"],
+        "records_sha256": "g", "object_digests": {
+            "parameters": "p", "buffers": "b", "optimizer": "c", "scheduler": "d",
+            "scaler": "e", "importance_accumulator": "f", "records": "g",
+            "importance_points": "checkpoint-specific",
+        }, "checkpoint_ids": ["c"],
         "bridge_optimizer_alias": True,
     }
+    assert worker._assert_trajectory(snapshot, snapshot, label="pre_skip") is True
+    checkpoint_variant = deepcopy(snapshot)
+    checkpoint_variant["object_digests"]["importance_points"] = "different-checkpoint-cadence"
+    checkpoint_variant["training_state"]["event_sequence"] = 12
+    checkpoint_variant["training_state"]["last_checkpoint_id"] = "resumed-output"
+    assert worker._assert_trajectory(snapshot, checkpoint_variant, label="post_skip") is True
     altered = deepcopy(snapshot)
     if mutation == "missing":
         altered.pop("sample_multiset")

@@ -94,6 +94,31 @@ def _source_process_exited(source_pid: object, source_identity: object) -> bool:
     return True
 
 
+def _copy_checkpoint_lineage(source_store: Any, output_store: Any, checkpoint_id: str) -> None:
+    state, commit = source_store.load(checkpoint_id)
+    if commit.parent_checkpoint_id is not None:
+        _copy_checkpoint_lineage(source_store, output_store, commit.parent_checkpoint_id)
+    output_store.publish(
+        checkpoint_id,
+        state,
+        generation=commit.generation,
+        metadata=commit.metadata,
+        parent_checkpoint_id=commit.parent_checkpoint_id,
+    )
+
+
+def _resume_and_run(engine: Any, checkpoint_id: str, *, output_store: Any) -> None:
+    """Load from immutable source, clone only its lineage, then isolate writes."""
+
+    source_store = engine.checkpoint_store
+    if source_store is None:
+        raise RuntimeError("S1_10_RESUME_SOURCE_STORE_MISSING")
+    _copy_checkpoint_lineage(source_store, output_store, checkpoint_id)
+    engine.resume_checkpoint(checkpoint_id)
+    engine.checkpoint_store = output_store
+    engine.run()
+
+
 def _pre_cuda(args: argparse.Namespace) -> tuple[str, ...]:
     approved = tuple(item for item in args.approved_gpu_uuids.split(",") if item)
     expected = 1 if args.mode == "single" else 4
@@ -171,6 +196,12 @@ def _snapshot(
         for microbatch in attempt
         for sample_id in microbatch.sample_ids
     )
+    records = [row.to_dict() for row in engine._records]
+    semantic_records = [
+        {key: value for key, value in row.items() if key != "attempt_commit_state_hash"}
+        for row in records
+    ]
+    semantic_records_sha256 = checkpoint_state_sha256(semantic_records)
     object_digests = {
         "parameters": checkpoint_state_sha256(state["parameters"]),
         "buffers": checkpoint_state_sha256(state["buffers"]),
@@ -178,7 +209,7 @@ def _snapshot(
         "scheduler": checkpoint_state_sha256(state["scheduler"]),
         "scaler": checkpoint_state_sha256(state["scaler"]),
         "importance_accumulator": checkpoint_state_sha256(complete["importance"]),
-        "records": checkpoint_state_sha256(complete["records"]),
+        "records": semantic_records_sha256,
         "importance_points": checkpoint_state_sha256(complete["points"]),
     }
     return {
@@ -194,7 +225,7 @@ def _snapshot(
         "scheduler_sha256": object_digests["scheduler"],
         "scaler_sha256": object_digests["scaler"],
         "importance_sha256": object_digests["importance_accumulator"],
-        "records_sha256": object_digests["records"],
+        "records_sha256": semantic_records_sha256,
         "object_digests": object_digests,
         "checkpoint_ids": complete["checkpoint_ids"],
         "bridge_optimizer_alias": complete["bridge_optimizer_alias"],
@@ -210,8 +241,14 @@ def _assert_trajectory(reference: Mapping[str, Any], resumed: Mapping[str, Any],
     }
     if set(reference) != expected_snapshot_fields or set(resumed) != expected_snapshot_fields:
         return False
-    keys = ("rng_sha256", "next_rng_state_sha256", "per_rank_cuda_rng_state_hex", "optimizer_sha256", "scheduler_sha256", "scaler_sha256", "importance_sha256", "records_sha256", "cursor", "next_cursor", "sample_multiset", "object_digests", "bridge_optimizer_alias")
+    keys = ("rng_sha256", "next_rng_state_sha256", "per_rank_cuda_rng_state_hex", "optimizer_sha256", "scheduler_sha256", "scaler_sha256", "importance_sha256", "records_sha256", "cursor", "next_cursor", "sample_multiset", "bridge_optimizer_alias")
     if any(reference.get(key) != resumed.get(key) for key in keys):
+        return False
+    object_keys = {"parameters", "buffers", "optimizer", "scheduler", "scaler", "importance_accumulator", "records", "importance_points"}
+    reference_objects, resumed_objects = reference.get("object_digests"), resumed.get("object_digests")
+    if not isinstance(reference_objects, Mapping) or not isinstance(resumed_objects, Mapping) or set(reference_objects) != object_keys or set(resumed_objects) != object_keys:
+        return False
+    if any(reference_objects[key] != resumed_objects[key] for key in object_keys - {"importance_points"}):
         return False
     state, expected_state = resumed.get("training_state"), reference.get("training_state")
     if not isinstance(state, Mapping) or not isinstance(expected_state, Mapping) or int(state.get("attempt_index", -1)) < 6:
@@ -293,11 +330,32 @@ def _event_pointer(root: Path, store: Any, checkpoint_id: str, event_path: Path)
     return {"event_ref": event_path.relative_to(root).as_posix(), "event_sha256": _file_sha(event_path), "checkpoint_event_sequence": int(state["training_state"]["event_sequence"]) - 1}
 
 
+def _immutable_event_snapshot(root: Path, event_path: Path, *, label: str, rank: int) -> Path:
+    snapshot = root / "event-snapshots" / f"{label}-rank-{rank:04d}.jsonl"
+    snapshot.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with snapshot.open("xb") as stream:
+            stream.write(event_path.read_bytes())
+    except FileExistsError as error:
+        raise RuntimeError(f"S1_10_EVENT_SNAPSHOT_EXISTS:{snapshot.name}") from error
+    return snapshot
+
+
+def _broadcast_group_output(dist: Any, *, rank: int, output: Mapping[str, Any]) -> dict[str, Any]:
+    slot: list[Any] = [dict(output) if rank == 0 else None]
+    dist.broadcast_object_list(slot, src=0)
+    if not isinstance(slot[0], Mapping):
+        raise RuntimeError("S1_10_GROUP_BROADCAST_OUTPUT_INVALID")
+    dist.barrier()
+    return dict(slot[0])
+
+
 def _group_publish(torch: Any, *, root: Path, rank: int, world_size: int, label: str, checkpoint_root: Path, checkpoint_id: str, event_path: Path, parent: str | None, generation: int, config_hash: str, environment_hash: str) -> dict[str, Any]:
     from param_importance_nlp.runtime import CheckpointStore
     from param_importance_nlp.runtime.checkpoint_group import CheckpointGroupStore
     import torch.distributed as dist
-    local = {"rank": rank, "checkpoint_store_ref": checkpoint_root.relative_to(root).as_posix(), "checkpoint_id": checkpoint_id, "event_pointer": _event_pointer(root, CheckpointStore(checkpoint_root), checkpoint_id, event_path)}
+    event_snapshot = _immutable_event_snapshot(root, event_path, label=label, rank=rank)
+    local = {"rank": rank, "checkpoint_store_ref": checkpoint_root.relative_to(root).as_posix(), "checkpoint_id": checkpoint_id, "event_pointer": _event_pointer(root, CheckpointStore(checkpoint_root), checkpoint_id, event_snapshot)}
     gathered: list[Any] = [None] * world_size; dist.all_gather_object(gathered, local); dist.barrier()
     output: dict[str, Any] = {}
     if rank == 0:
@@ -319,8 +377,7 @@ def _group_publish(torch: Any, *, root: Path, rank: int, world_size: int, label:
             "broadcast_commit_sha256": reloaded.commit_sha256,
             "reload_commit_sha256": reloaded.commit_sha256,
         }
-    gathered_output: list[Any] = [None]; dist.broadcast_object_list(gathered_output, src=0); dist.barrier()
-    return dict(gathered_output[0])
+    return _broadcast_group_output(dist, rank=rank, output=output)
 
 
 def _run(args: argparse.Namespace, *, approved: tuple[str, ...], torch: Any) -> dict[str, Any]:
@@ -403,8 +460,9 @@ def _run(args: argparse.Namespace, *, approved: tuple[str, ...], torch: Any) -> 
             if pre_states[rank]["training_state"]["last_checkpoint_id"] != pre_id or post_states[rank]["training_state"]["last_checkpoint_id"] != post_id:
                 raise RuntimeError("S1_10_GROUP_RECOVERY_RANK_AUTHORITY_MISMATCH")
             group_authoritative = True
-        _seed(torch, np, rank=rank); pre_resume, pre_resume_sink = _engine(torch, rank=rank, world_size=world_size, steps=all_steps, checkpoint_root=pre_root, event_path=None, distributed=distributed); pre_resume.resume_checkpoint(pre_id); pre_resume.run(); assert pre_resume_sink is None
-        _seed(torch, np, rank=rank); post_resume, post_resume_sink = _engine(torch, rank=rank, world_size=world_size, steps=all_steps, checkpoint_root=pre_root, event_path=None, distributed=distributed); post_resume.resume_checkpoint(post_id); post_resume.run(); assert post_resume_sink is None
+        from param_importance_nlp.runtime import CheckpointStore
+        _seed(torch, np, rank=rank); pre_resume, pre_resume_sink = _engine(torch, rank=rank, world_size=world_size, steps=all_steps, checkpoint_root=pre_root, event_path=None, distributed=distributed); _resume_and_run(pre_resume, pre_id, output_store=CheckpointStore(root / "resume-pre" / f"rank-{rank:04d}")); assert pre_resume_sink is None
+        _seed(torch, np, rank=rank); post_resume, post_resume_sink = _engine(torch, rank=rank, world_size=world_size, steps=all_steps, checkpoint_root=pre_root, event_path=None, distributed=distributed); _resume_and_run(post_resume, post_id, output_store=CheckpointStore(root / "resume-post" / f"rank-{rank:04d}")); assert post_resume_sink is None
         pre_state, post_state = (
             _snapshot(pre_resume, checkpoint_state_sha256, steps=all_steps),
             _snapshot(post_resume, checkpoint_state_sha256, steps=all_steps),

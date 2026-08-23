@@ -222,7 +222,7 @@ def _publish_dependency(root: Path, ordinal: int, gate_id: str, task_id: str) ->
 
         upstream = {
             "s1_8": upstream_row(schema="stage1-s1-8-formalization-index-v8", task="stage1.08_ddp_and_gradient_accumulation", gate="G1-DDP", sources=61, reproduction=84, required=("prelease_gpu_quiescence", "post_worker_gpu_quiescence", "post_release_gpu_quiescence", "reacquire_preflight_gpu_quiescence"), roles=("fixture_manifest", "ddp_report", "array_bundle", "comparison_table", "gate_record")),
-            "s1_9": upstream_row(schema="stage1-s1-9-formalization-index-v8", task="stage1.09_precision_clipping_and_optimizer_boundaries", gate="G1-NUMERIC", sources=34, reproduction=27, required=("upstream_compatibility", "prelease_gpu", "post_worker_quiescence"), roles=("numeric_report", "oracle_bundle", "trace_bundle", "comparison_table", "gate_record")),
+            "s1_9": upstream_row(schema="stage1-s1-9-formalization-index-v8", task="stage1.09_precision_clipping_and_optimizer_boundaries", gate="G1-NUMERIC", sources=34, reproduction=27, required=("upstream_compatibility", "prelease_gpu", "post_worker_quiescence", "single_worker", "bf16_resume_checkpoint_store"), roles=("numeric_report", "oracle_bundle", "trace_bundle", "comparison_table", "gate_record")),
         }
         report_path = published / role_files["resume_report"]
         report = json.loads(report_path.read_text(encoding="utf-8")); report["upstream"] = upstream; report.pop("report_hash"); report["report_hash"] = canonical_json_hash(report)
@@ -326,6 +326,17 @@ def test_s111_rehearsal_is_not_run_but_offline_replays_immutable_roles(tmp_path:
     assert summary["status"] == "NOT_RUN"
     assert summary["exit_verdict"] == "BLOCKED_FORMAL_OBSERVATION_MISSING"
     assert len(summary["dependency_audits"]) == 11
+    schema_summary = {
+        **summary,
+        "charts": [
+            {**chart, "source_csv_sha256": chart["csv_sha256"], "row_count": 2}
+            for chart in summary["charts"]
+        ],
+    }
+    schema_summary["artifact_hash"] = canonical_json_hash(
+        {key: value for key, value in schema_summary.items() if key != "artifact_hash"}
+    )
+    _formalizer()._schema_validate(Path.cwd(), {"gate_summary": schema_summary})
     assert replay_exit_gate_summary(tmp_path, summary)["status"] == "PASS"
 
 
@@ -612,6 +623,28 @@ def test_s111_chart_renderer_requires_real_numeric_csv_and_reads_back(tmp_path: 
         )
 
 
+def test_s111_chart_projects_only_index_bound_json_measurements(tmp_path: Path) -> None:
+    formalizer = _formalizer()
+    role = tmp_path / "comparison-table.json"
+    write_canonical_json(role, {"rows": [
+        {"max_abs_error": 1.0e-8, "absolute_threshold": 1.0e-7},
+        {"max_abs_error": 1.0e-8, "absolute_threshold": 1.0e-7},
+        {"expected_step": 1, "observed": 1},
+    ]})
+    projection = tmp_path / "projection.csv"
+    formalizer._project_role_rows(role, projection, ("max_abs_error", "absolute_threshold"))
+    record = formalizer._render_chart(
+        projection, chart_id="ddp-identity", x_column="max_abs_error", y_column="absolute_threshold",
+        output_csv=tmp_path / "ddp.csv", output_svg=tmp_path / "ddp.svg",
+        source_identity_sha256=_sha(role), allow_duplicate_keys=True,
+    )
+    assert record["source_csv_sha256"] == _sha(role)
+    broken = tmp_path / "broken-table.json"
+    write_canonical_json(broken, {"rows": [{"max_abs_error": 1.0e-8}]})
+    with pytest.raises(formalizer.Stage1S111FormalError, match="CHART_ROLE_ROW_INVALID"):
+        formalizer._project_role_rows(broken, projection, ("max_abs_error", "absolute_threshold"))
+
+
 def test_s111_chart_geometry_is_typed_and_rejects_wrong_columns_nan_and_duplicate_keys(tmp_path: Path) -> None:
     formalizer = _formalizer()
     cases = (
@@ -781,12 +814,16 @@ def test_s111_index_closure_rejects_unknown_missing_and_same_count_substitutions
     }
     for filename in role_refs.values():
         (tmp_path / filename).write_text(filename, encoding="utf-8", newline="\n")
+    manifest = tmp_path / "large-artifact-manifest.json"
+    manifest.write_text("large-artifact-manifest.json", encoding="utf-8", newline="\n")
     index = {
         "implementation_source_sha256": {path: _sha(Path.cwd() / path) for path in formalizer._IMPLEMENTATION_PATHS},
         "role_refs": role_refs,
         "role_sha256": {role: _sha(tmp_path / filename) for role, filename in role_refs.items()},
         "chart_csv_sha256": {f"{chart_id}.csv": _sha(tmp_path / f"{chart_id}.csv") for chart_id in REQUIRED_CHARTS},
         "chart_svg_sha256": {f"{chart_id}.svg": _sha(tmp_path / f"{chart_id}.svg") for chart_id in REQUIRED_CHARTS},
+        "reproduction_role_refs": {"test_summary": "inputs/test-summary.json", "sync_audit": "inputs/sync-audit.json", "large_artifact_manifest": manifest.name, "worklog": "inputs/worklog.md"},
+        "reproduction_role_sha256": {"test_summary": "a" * 64, "sync_audit": "b" * 64, "large_artifact_manifest": _sha(manifest), "worklog": "c" * 64},
     }
     formalizer._exact_s111_index_closure(Path.cwd(), tmp_path, index)
     for field, wrong_key in (("implementation_source_sha256", "unknown/source.py"), ("role_refs", "unknown_role"), ("chart_csv_sha256", "unknown.csv"), ("chart_svg_sha256", "unknown.svg")):
@@ -807,6 +844,10 @@ def test_s111_index_closure_rejects_unknown_missing_and_same_count_substitutions
     swapped_ref["role_refs"]["gate_summary"] = "replay-validation.json"
     with pytest.raises(formalizer.Stage1S111FormalError, match="INDEX_ROLE_REF_WIRE_INVALID"):
         formalizer._exact_s111_index_closure(Path.cwd(), tmp_path, swapped_ref)
+    missing_reproduction = {key: (dict(value) if isinstance(value, dict) else value) for key, value in index.items()}
+    missing_reproduction["reproduction_role_refs"].pop("worklog")
+    with pytest.raises(formalizer.Stage1S111FormalError, match="INDEX_REPRODUCTION_WIRE_INVALID"):
+        formalizer._exact_s111_index_closure(Path.cwd(), tmp_path, missing_reproduction)
 
 
 def test_s111_report_context_is_derived_and_missing_upstream_is_fail_closed(tmp_path: Path) -> None:

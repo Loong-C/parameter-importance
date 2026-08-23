@@ -217,12 +217,15 @@ def _exact_s111_index_closure(repository: Path, publication: Path, index: Mappin
     sources = index.get("implementation_source_sha256")
     refs, hashes = index.get("role_refs"), index.get("role_sha256")
     csv_hashes, svg_hashes = index.get("chart_csv_sha256"), index.get("chart_svg_sha256")
-    if not all(isinstance(value, Mapping) for value in (sources, refs, hashes, csv_hashes, svg_hashes)):
+    reproduction_refs, reproduction_hashes = index.get("reproduction_role_refs"), index.get("reproduction_role_sha256")
+    if not all(isinstance(value, Mapping) for value in (sources, refs, hashes, csv_hashes, svg_hashes, reproduction_refs, reproduction_hashes)):
         raise Stage1S111FormalError("S1_11_INDEX_CLOSURE_SHAPE_INVALID")
     if set(sources) != set(_IMPLEMENTATION_PATHS) or set(refs) != expected_roles or set(hashes) != expected_roles or set(csv_hashes) != expected_csv or set(svg_hashes) != expected_svg:
         raise Stage1S111FormalError("S1_11_INDEX_CLOSURE_KEYSET_INVALID")
     if dict(refs) != expected_role_refs:
         raise Stage1S111FormalError("S1_11_INDEX_ROLE_REF_WIRE_INVALID")
+    if set(reproduction_refs) != {"test_summary", "sync_audit", "large_artifact_manifest", "worklog"} or set(reproduction_hashes) != set(reproduction_refs) or reproduction_refs.get("large_artifact_manifest") != "large-artifact-manifest.json":
+        raise Stage1S111FormalError("S1_11_INDEX_REPRODUCTION_WIRE_INVALID")
     for path, digest in sources.items():
         if not _digest(digest) or _sha(repository / str(path)) != digest:
             raise Stage1S111FormalError("S1_11_INDEX_SOURCE_HASH_MISMATCH")
@@ -232,6 +235,8 @@ def _exact_s111_index_closure(repository: Path, publication: Path, index: Mappin
     for filename, digest in {**csv_hashes, **svg_hashes}.items():
         if not _digest(digest) or _sha(publication / str(filename)) != digest:
             raise Stage1S111FormalError("S1_11_INDEX_CHART_HASH_MISMATCH")
+    if not _digest(reproduction_hashes["large_artifact_manifest"]) or _sha(publication / "large-artifact-manifest.json") != reproduction_hashes["large_artifact_manifest"]:
+        raise Stage1S111FormalError("S1_11_INDEX_REPRODUCTION_HASH_MISMATCH")
 
 
 def _derived_report_context(root: Path, audits: list[Mapping[str, object]], sync: Mapping[str, object], worklog: Mapping[str, str]) -> dict[str, object]:
@@ -383,7 +388,7 @@ def _verify_chart_geometry(
             raise Stage1S111FormalError("S1_11_CHART_READBACK_INVALID")
 
 
-def _render_chart(source: Path, *, chart_id: str, x_column: str, y_column: str, output_csv: Path, output_svg: Path, value_column: str | None = None, error_column: str | None = None) -> dict[str, object]:
+def _render_chart(source: Path, *, chart_id: str, x_column: str, y_column: str, output_csv: Path, output_svg: Path, value_column: str | None = None, error_column: str | None = None, source_identity_sha256: str | None = None, allow_duplicate_keys: bool = False) -> dict[str, object]:
     """Render the plan-mandated geometry from a typed, finite CSV source."""
 
     kind = "scatter" if chart_id in _SCATTERS else "heatmap" if chart_id in _HEATMAPS else "error" if chart_id in _ERROR_BARS else "line"
@@ -411,7 +416,7 @@ def _render_chart(source: Path, *, chart_id: str, x_column: str, y_column: str, 
     if not points:
         raise Stage1S111FormalError("S1_11_CHART_SOURCE_EMPTY")
     keys = [(point[0], point[1]) for point in points]
-    if len(set(keys)) != len(keys):
+    if not allow_duplicate_keys and len(set(keys)) != len(keys):
         raise Stage1S111FormalError("S1_11_CHART_SOURCE_KEY_DUPLICATE")
     with output_csv.open("w", encoding="utf-8", newline="") as handle:
         writer = csv.writer(handle, lineterminator="\n")
@@ -450,7 +455,32 @@ def _render_chart(source: Path, *, chart_id: str, x_column: str, y_column: str, 
         if reader.fieldnames != expected_header or len(rows) != len(points):
             raise Stage1S111FormalError("S1_11_CHART_READBACK_INVALID")
     _verify_chart_geometry(output_svg.read_text(encoding="utf-8"), chart_id=chart_id, kind=kind, points=points, coordinates=coordinates, heat_cells=heat_cells)
-    return {"chart_id": chart_id, "source_csv_sha256": _sha(source), "row_count": len(points), "csv_ref": output_csv.name, "csv_sha256": _sha(output_csv), "svg_ref": output_svg.name, "svg_sha256": _sha(output_svg)}
+    return {"chart_id": chart_id, "source_csv_sha256": source_identity_sha256 or _sha(source), "row_count": len(points), "csv_ref": output_csv.name, "csv_sha256": _sha(output_csv), "svg_ref": output_svg.name, "svg_sha256": _sha(output_svg)}
+
+
+def _project_role_rows(source: Path, destination: Path, columns: tuple[str, ...]) -> None:
+    """Project an index-bound JSON table to CSV without inventing measurements."""
+
+    value = _object(source, field="chart_role_source")
+    rows = value.get("rows")
+    if not isinstance(rows, list) or not rows:
+        raise Stage1S111FormalError("S1_11_CHART_ROLE_ROWS_INVALID")
+    with destination.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.writer(handle, lineterminator="\n")
+        writer.writerow(columns)
+        projected = 0
+        for ordinal, row in enumerate(rows):
+            if not isinstance(row, Mapping):
+                raise Stage1S111FormalError(f"S1_11_CHART_ROLE_ROW_INVALID:{ordinal}")
+            present = tuple(column in row for column in columns)
+            if not any(present):
+                continue
+            if not all(present):
+                raise Stage1S111FormalError(f"S1_11_CHART_ROLE_ROW_INVALID:{ordinal}")
+            writer.writerow([row[column] for column in columns])
+            projected += 1
+        if projected == 0:
+            raise Stage1S111FormalError("S1_11_CHART_ROLE_ROWS_INVALID")
 
 
 def _build_charts(evidence_root: Path, work: Path, dependencies: list[Mapping[str, object]], specs: object) -> list[dict[str, object]]:
@@ -467,12 +497,28 @@ def _build_charts(evidence_root: Path, work: Path, dependencies: list[Mapping[st
         index = _object(_relative(evidence_root, binding["index_ref"], field="chart_index"), field="chart_index")
         hashes = index.get("chart_csv_sha256", index.get("csv_sha256"))
         source_ref, source_sha = item["source_csv_ref"], item["source_csv_sha256"]
-        if not isinstance(hashes, Mapping) or Path(str(source_ref)).name not in hashes or hashes[Path(str(source_ref)).name] != source_sha:
+        role_refs, role_hashes = index.get("role_refs"), index.get("role_sha256")
+        csv_bound = isinstance(hashes, Mapping) and Path(str(source_ref)).name in hashes and hashes[Path(str(source_ref)).name] == source_sha
+        matching_roles = [] if not isinstance(role_refs, Mapping) or not isinstance(role_hashes, Mapping) else [
+            role for role, ref in role_refs.items() if ref == source_ref and role_hashes.get(role) == source_sha
+        ]
+        role_bound = len(matching_roles) == 1
+        if not csv_bound and not role_bound:
             raise Stage1S111FormalError("S1_11_CHART_SOURCE_INDEX_BINDING_INVALID")
         source = _relative(_relative(evidence_root, binding["index_ref"], field="chart_index").parent, source_ref, field="chart_source")
         if not source.is_file() or _sha(source) != source_sha:
             raise Stage1S111FormalError("S1_11_CHART_SOURCE_HASH_MISMATCH")
-        result.append(_render_chart(source, chart_id=expected, x_column=str(item["x_column"]), y_column=str(item["y_column"]), value_column=None if item["value_column"] is None else str(item["value_column"]), error_column=None if item["error_column"] is None else str(item["error_column"]), output_csv=work / f"{expected}.csv", output_svg=work / f"{expected}.svg"))
+        render_source = source
+        if role_bound:
+            columns = tuple(dict.fromkeys(str(value) for value in (item["x_column"], item["y_column"], item["value_column"], item["error_column"]) if value is not None))
+            render_source = work / f".{expected}.source.csv"
+            _project_role_rows(source, render_source, columns)
+        # Repeated plotted coordinates are legitimate when an immutable source
+        # contains multiple parameter identities that project to the same 2-D
+        # point.  The exact index/file hash remains the anti-tamper boundary.
+        result.append(_render_chart(render_source, chart_id=expected, x_column=str(item["x_column"]), y_column=str(item["y_column"]), value_column=None if item["value_column"] is None else str(item["value_column"]), error_column=None if item["error_column"] is None else str(item["error_column"]), output_csv=work / f"{expected}.csv", output_svg=work / f"{expected}.svg", source_identity_sha256=str(source_sha), allow_duplicate_keys=True))
+        if role_bound:
+            render_source.unlink()
     return result
 
 
@@ -493,9 +539,10 @@ def _top_errors(evidence_root: Path, dependencies: list[Mapping[str, object]]) -
         for row in candidates:
             if not isinstance(row, Mapping):
                 continue
-            error = next((row[key] for key in ("original_unit_max_abs_error", "max_abs_error", "maximum_absolute_error") if isinstance(row.get(key), (int, float)) and not isinstance(row.get(key), bool)), None)
-            parameter = row.get("parameter_name", row.get("parameter", row.get("tensor_name")))
-            coordinate = row.get("coordinate", row.get("worst_coordinate"))
+            actual = row.get("actual") if isinstance(row.get("actual"), Mapping) else {}
+            error = next((source[key] for source in (row, actual) for key in ("original_unit_max_abs_error", "max_abs_error", "max_absolute_error", "maximum_absolute_error", "absolute_error") if isinstance(source.get(key), (int, float)) and not isinstance(source.get(key), bool)), None)
+            parameter = row.get("parameter_name", row.get("parameter", row.get("tensor_name", row.get("object_id", actual.get("object")))))
+            coordinate = row.get("coordinate", row.get("worst_coordinate", row.get("comparison", row.get("comparison_id", row.get("field", actual.get("coordinate"))))))
             if error is not None and isinstance(parameter, str) and isinstance(coordinate, (str, int)):
                 rows.append({"gate_id": binding["gate_id"], "parameter": parameter, "coordinate": str(coordinate), "max_abs_error": float(error)})
     rows.sort(key=lambda row: (-float(row["max_abs_error"]), str(row["gate_id"]), str(row["parameter"]), str(row["coordinate"])))
@@ -547,6 +594,11 @@ def execute(*, repository: Path, evidence_root: Path, attempt_root: Path, depend
         shutil.copy2(test_source, work / "test-summary.json")
         if _sha(work / "test-summary.json") != test_summary["sha256"]:
             raise Stage1S111FormalError("S1_11_TEST_SUMMARY_COPY_READBACK_MISMATCH")
+        sync_source = _relative(evidence_root, sync_audit["ref"], field="sync_audit")
+        manifest_source = _relative(sync_source.parent, sync_audit["large_artifact_manifest_ref"], field="large_artifact_manifest")
+        shutil.copy2(manifest_source, work / "large-artifact-manifest.json")
+        if _sha(work / "large-artifact-manifest.json") != sync_audit["large_artifact_manifest_sha256"]:
+            raise Stage1S111FormalError("S1_11_LARGE_ARTIFACT_MANIFEST_COPY_READBACK_MISMATCH")
         requirements = {"schema_version": "stage1-s1-11-requirements-matrix-v1", "task_id": TASK_ID, "gate_id": GATE_ID, "rows": matrix_rows}; requirements["artifact_hash"] = canonical_json_hash(requirements); _write(work / "requirements-matrix.json", requirements)
         top20 = _top_errors(evidence_root, dependencies)
         top20_body = {"schema_version": "stage1-s1-11-top-errors-v1", "rows": top20}; top20_body["artifact_hash"] = canonical_json_hash(top20_body); _write(work / "top-errors.json", top20_body)
