@@ -1952,7 +1952,7 @@ def _sequence_scaling(
         )
     mean = _weighted_mean_from_moments(moments, "variance_scaling.mean")
     expected = {name: np.zeros_like(value) for name, value in mean.items()}
-    factor = float(block_size) / max(float(moments.n1), 1e-300)
+    factor = float(block_size) / max(_finite(moments.get("n1"), "variance_scaling.n1"), 1e-300)
     for block, weight in zip(blocks, parsed_weights):
         for name in expected:
             expected[name] += float(weight) * np.square(block[name] - mean[name]) * factor
