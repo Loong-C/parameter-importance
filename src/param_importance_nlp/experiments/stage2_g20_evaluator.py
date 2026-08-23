@@ -325,7 +325,9 @@ def _validate_stage1_payload(kind: str, item: LoadedTaskArtifact) -> None:
     elif schema == STAGE1_PAYLOAD_SCHEMAS[kind]:
         if payload.get("task_id") != STAGE1_TASK_ID or payload.get("gate_id") != STAGE1_GATE_ID:
             raise G20Blocked(f"stage1_source:{kind}:IDENTITY_INVALID")
-        if kind != "delivery_manifest" and _payload_status(payload) != "PASS":
+        if kind not in {"delivery_manifest", "requirements_matrix"} and _payload_status(payload) != "PASS":
+            raise G20Blocked(f"stage1_source:{kind}:STATUS_NOT_PASS")
+        if kind in {"delivery_manifest", "requirements_matrix"} and _payload_status(payload) not in {None, "PASS"}:
             raise G20Blocked(f"stage1_source:{kind}:STATUS_NOT_PASS")
     else:
         raise G20Blocked(f"stage1_source:{kind}:PAYLOAD_SCHEMA_INVALID")
