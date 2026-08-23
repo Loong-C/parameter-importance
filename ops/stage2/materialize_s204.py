@@ -62,6 +62,10 @@ from param_importance_nlp.experiments.stage2_assets import (  # noqa: E402
     CheckpointRecord,
     validate_formal_asset_identity,
 )
+from param_importance_nlp.experiments.stage2_registry_qualification import (  # noqa: E402
+    ASSET_RESOLUTION_AMENDMENT_SCHEMA,
+    load_asset_resolution_input,
+)
 from param_importance_nlp.experiments.stage2_formal import (  # noqa: E402
     ReferenceSizingPlan,
 )
@@ -612,12 +616,30 @@ def _publish_authoritative_asset_manifest(
     if value is None or source_ref is None:
         raise _error("FORMAL_ASSET_MANIFEST_REQUIRED")
     declared_sha = source.get("stage2_asset_resolution_sha256")
-    _assert_source_file(root, source_ref, "stage2_asset_resolution", sha256=(str(declared_sha) if declared_sha is not None else None))
+    source_sha256 = _assert_source_file(
+        root,
+        source_ref,
+        "stage2_asset_resolution",
+        sha256=(str(declared_sha) if declared_sha is not None else None),
+    )
     payload = value
     if value.get("schema_version") == "stage2-task-asset-resolution-v1":
         # A TaskRuntime S2.3 output is a candidate payload, not an asset
         # authority.  Only the existing direct manifest can seed the runner.
         raise _error("CANDIDATE_ASSET_INPUTS_FORBIDDEN", source_ref)
+    if value.get("schema_version") == ASSET_RESOLUTION_AMENDMENT_SCHEMA:
+        # Registry qualification owns the amendment contract.  In particular,
+        # it verifies the immutable parent and all six qualification refs and
+        # hashes before exposing the materialized v1 manifest.  Do not copy or
+        # interpret any nested field locally: the loader is the sole authority.
+        try:
+            payload = load_asset_resolution_input(
+                _safe_relative(root, source_ref, "stage2_asset_resolution"),
+                root=root,
+                data_root=root,
+            )
+        except Exception as error:
+            raise _error("FORMAL_ASSET_MANIFEST_INVALID", source_ref) from error
     try:
         manifest = AssetResolutionManifest.from_mapping(dict(payload))
         validate_formal_asset_identity(manifest)
@@ -625,7 +647,35 @@ def _publish_authoritative_asset_manifest(
         raise _error("FORMAL_ASSET_MANIFEST_INVALID", source_ref) from error
     if manifest.scope != "formal" or manifest.status != "READY":
         raise _error("FORMAL_ASSET_MANIFEST_NOT_READY", source_ref)
-    return source_ref, manifest
+    if value.get("schema_version") != ASSET_RESOLUTION_AMENDMENT_SCHEMA:
+        return source_ref, manifest
+
+    # TaskRuntime's S2.3 runner intentionally accepts only a direct v1
+    # AssetResolutionManifest.  Publish the loader's verified materialization
+    # under the append-only run root and retain the amendment's ref/hash in a
+    # separate lineage object rather than weakening that runner contract.
+    authoritative_ref = PurePosixPath(output_dir, "asset-resolution-manifest.json").as_posix()
+    authoritative_path = _safe_relative(root, authoritative_ref, "asset_resolution_output")
+    publish_canonical_immutable(authoritative_path, manifest.to_dict())
+    if _load_mapping(root, authoritative_ref, "asset_resolution_output") != manifest.to_dict():
+        raise _error("FORMAL_ASSET_MANIFEST_ROUND_TRIP_DRIFT", authoritative_ref)
+    lineage_ref = PurePosixPath(output_dir, "asset-resolution-input-lineage.json").as_posix()
+    lineage: dict[str, Any] = {
+        "schema_version": "stage2-s204-asset-resolution-input-lineage-v1",
+        "input_ref": source_ref,
+        "input_sha256": source_sha256,
+        "input_schema_version": ASSET_RESOLUTION_AMENDMENT_SCHEMA,
+        "materialized_asset_resolution_ref": authoritative_ref,
+        "materialized_asset_resolution_hash": manifest.digest,
+    }
+    lineage["lineage_hash"] = canonical_json_hash(lineage)
+    publish_canonical_immutable(
+        _safe_relative(root, lineage_ref, "asset_resolution_input_lineage_output"),
+        lineage,
+    )
+    if _load_mapping(root, lineage_ref, "asset_resolution_input_lineage") != lineage:
+        raise _error("FORMAL_ASSET_MANIFEST_LINEAGE_ROUND_TRIP_DRIFT", lineage_ref)
+    return authoritative_ref, manifest
 
 
 def _find_schema_payload(value: object, schema_version: str) -> tuple[Mapping[str, Any], ...]:
@@ -1745,6 +1795,8 @@ def _build_narrow_formal_environment(
     required_gate_ids: Sequence[str],
     output_ref: str,
     capability_refs: Mapping[str, Any] | None = None,
+    asset_input_ref: str | None = None,
+    asset_input_lineage_ref: str | None = None,
 ) -> TaskRuntimeEnvironment:
     """Build the S2.1/S2.3 preflight snapshot without G2.2/G2.3 work.
 
@@ -1803,6 +1855,16 @@ def _build_narrow_formal_environment(
         "contract_freeze": normalized_contracts[2],
         "stage2_asset_resolution": _source_ref(asset_ref, "stage2_asset_resolution"),
     }
+    if asset_input_ref is not None:
+        evidence_refs["stage2_asset_resolution_input"] = _source_ref(
+            asset_input_ref,
+            "stage2_asset_resolution_input",
+        )
+    if asset_input_lineage_ref is not None:
+        evidence_refs["stage2_asset_resolution_input_lineage"] = _source_ref(
+            asset_input_lineage_ref,
+            "stage2_asset_resolution_input_lineage",
+        )
     evidence_refs.update({f"stage1_10_{kind}": _source_ref(ref, f"stage1_10.{kind}") for kind, ref in stage1_10_refs.items()})
     evidence_refs.update({f"stage1_11_{kind}": _source_ref(ref, f"stage1_11.{kind}") for kind, ref in stage1_11_refs.items()})
     evidence_refs.update({f"gate_{key.replace('.', '_').replace('-', '_').lower()}": ref for key, ref in normalized_gates.items()})
@@ -1871,11 +1933,24 @@ def execute_formal_predecessor_dag(
         1: _source_ref(source.get("contract_stage_1"), "contract_stage_1"),
         2: _source_ref(source.get("contract_stage_2", source.get("contract_freeze")), "contract_stage_2"),
     }
+    asset_input_ref: str | None = None
+    for key in ("stage2_asset_resolution_manifest", "stage2_asset_resolution"):
+        candidate = source.get(key)
+        if isinstance(candidate, str):
+            asset_input_ref = _source_ref(candidate, key)
+            break
     asset_ref, asset_manifest = _publish_authoritative_asset_manifest(
         root,
         source=source,
         raw_refs=None,
         output_dir=output_dir,
+    )
+    if asset_ref == asset_input_ref:
+        asset_input_ref = None
+    asset_input_lineage_ref = (
+        PurePosixPath(output_dir, "asset-resolution-input-lineage.json").as_posix()
+        if asset_input_ref is not None
+        else None
     )
     formal_value = _load_mapping(root, _source_ref(formal_execution_ref, "formal_execution"), "formal_execution")
     evidence = FormalExecutionEvidence.from_mapping(formal_value)
@@ -1911,6 +1986,8 @@ def execute_formal_predecessor_dag(
         gate_refs={},
         required_gate_ids=("stage1.G1-EXIT",),
         output_ref=f"{output_dir}/environments/stage2-01.json",
+        asset_input_ref=asset_input_ref,
+        asset_input_lineage_ref=asset_input_lineage_ref,
     )
     result = runtime.execute(s21_config, environment=env1)
     if result.status is not TaskRunStatus.PASS or not result.formal_eligible:
@@ -1976,6 +2053,8 @@ def execute_formal_predecessor_dag(
         required_gate_ids=("stage2.G2.1",),
         output_ref=f"{output_dir}/environments/stage2-03.json",
         capability_refs=_mapping(source.get("capability_refs"), "capability_refs"),
+        asset_input_ref=asset_input_ref,
+        asset_input_lineage_ref=asset_input_lineage_ref,
     )
     result = runtime.execute(s23_config, environment=env3)
     if result.status is not TaskRunStatus.PASS or not result.formal_eligible:

@@ -22,6 +22,10 @@ from param_importance_nlp.experiments.stage2_registry_qualification import (
     qualify_registry_assets,
 )
 from param_importance_nlp.providers import InMemoryFrozenSampleResolver, build_tiny_training_fixture
+from ops.stage2.materialize_s204 import (
+    S204MaterializationError,
+    _publish_authoritative_asset_manifest,
+)
 
 
 def _sha(path: Path) -> str:
@@ -247,8 +251,34 @@ def test_append_only_registry_qualification_materializes_six_cells_and_rejects_h
         try:
             with pytest.raises(RegistryQualificationError, match="EVIDENCE_FILE_MISMATCH"):
                 load_asset_resolution_input(amendment_path, root=manifest_root, data_root=data_root)
+            with pytest.raises(S204MaterializationError, match="S204_FORMAL_ASSET_MANIFEST_INVALID"):
+                _publish_authoritative_asset_manifest(
+                    manifest_root,
+                    source={
+                        "stage2_asset_resolution_manifest": result.amendment_ref,
+                        "stage2_asset_resolution_sha256": result.amendment_sha256,
+                    },
+                    raw_refs=None,
+                    output_dir="evidence/stage2/s204/materialized-task-inputs-tampered-qualification",
+                )
         finally:
             evidence_path.write_bytes(evidence_before)
+
+        parent_before_tamper = parent_path.read_bytes()
+        parent_path.write_bytes(parent_before_tamper + b"\n")
+        try:
+            with pytest.raises(S204MaterializationError, match="S204_FORMAL_ASSET_MANIFEST_INVALID"):
+                _publish_authoritative_asset_manifest(
+                    manifest_root,
+                    source={
+                        "stage2_asset_resolution_manifest": result.amendment_ref,
+                        "stage2_asset_resolution_sha256": result.amendment_sha256,
+                    },
+                    raw_refs=None,
+                    output_dir="evidence/stage2/s204/materialized-task-inputs-tampered-parent",
+                )
+        finally:
+            parent_path.write_bytes(parent_before_tamper)
         assert parent_path.read_bytes() == parent_before
     finally:
         shutil.rmtree(tmp_path, ignore_errors=True)
