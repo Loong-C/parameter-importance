@@ -450,9 +450,18 @@ def _validate_stage1_bridge(
     bridge_candidates = [
         ref for ref in envelope_source_refs if ref.endswith("/stage1-11-bridge-evidence.json")
     ]
-    config_candidates = [
-        ref for ref in envelope_source_refs if ref.endswith("/stage1-11-resolved-config-v2.json")
-    ]
+    config_candidates: list[str] = []
+    for ref in envelope_source_refs:
+        if ref in index_candidates or ref in bridge_candidates:
+            continue
+        try:
+            candidate = load_canonical_json(_resolve(data_root, ref, "stage1_source.config_candidate"))
+            if isinstance(candidate, Mapping):
+                parsed = ResolvedConfigV2.from_mapping(candidate)
+                if parsed.run_intent == "formal" and parsed.formal_eligible is True:
+                    config_candidates.append(ref)
+        except (OSError, TypeError, ValueError, KeyError):
+            continue
     if len(index_candidates) != 1 or len(bridge_candidates) != 1 or len(config_candidates) != 1:
         raise G20Blocked("stage1_source:BRIDGE_INDEX_CONFIG_REFS_REQUIRED")
     index_ref = index_candidates[0]
