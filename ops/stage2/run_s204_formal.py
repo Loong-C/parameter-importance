@@ -25,6 +25,9 @@ import threading
 from typing import Any, Mapping
 
 from param_importance_nlp.contracts.g21_formal_handoff import (
+    ALLOWED_DEVICES as G21_ALLOWED_DEVICES,
+    EXCLUDED_PCI as G21_EXCLUDED_PCI,
+    EXCLUDED_UUID as G21_EXCLUDED_UUID,
     G21FormalHandoffError,
     load_g21_formal_handoff,
 )
@@ -38,14 +41,11 @@ from param_importance_nlp.experiments import (
 G21_ARTIFACT = "259831e2a1b16afbbef34c9cea602e636756b0f6173d1a8f4c32ec554c653f79"
 ASSET_DIGEST = "f57decd5cf00e69e45ab2f02c994abb202f5c614e1441acb8aebcb1807ff76ee"
 DATA_DIGEST = "df8eeac5178305d409cf6128ac5d5648567aae895592c79fa21542e84a28e0f1"
-EXCLUDED_PCI = "0000:50:00.0"
-EXCLUDED_UUID = "GPU-dc6cfc60-41dd-7bcf-ed09-b7deb5be342c"
-APPROVED_GPU_BINDINGS = {
-    "0000:53:00.0": "GPU-180ff767-885a-7dc9-c8a9-921d65a01bbd",
-    "0000:9C:00.0": "GPU-5c672d04-4f83-3cc0-80d0-0108b1b63267",
-    "0000:9D:00.0": "GPU-e78c55cd-db97-b761-f559-dc6eae3be81d",
-    "0000:A0:00.0": "GPU-9b2b2a3b-3547-187f-ca29-2c02624e2e4f",
-}
+# G2.1 is the sole hardware identity authority.  Numeric nvidia-smi indices
+# are runtime selectors only and deliberately do not appear in this contract.
+EXCLUDED_PCI = G21_EXCLUDED_PCI
+EXCLUDED_UUID = G21_EXCLUDED_UUID
+APPROVED_GPU_BINDINGS = dict(G21_ALLOWED_DEVICES)
 DEFAULT_CANDIDATES = (512, 1024, 2048, 4096)
 DEFAULT_BLOCK_SIZE = 32
 G23_GATE_ID = "stage2.G2.3"
@@ -313,7 +313,15 @@ def _bind_gpu(token: str) -> tuple[str, list[dict[str, Any]], str]:
         raise ValueError(f"requested GPU is absent from live inventory: {token}")
     if selected["pci_bus_id"].casefold() == EXCLUDED_PCI.casefold() or selected["uuid"].casefold() == EXCLUDED_UUID.casefold():
         raise ValueError(f"excluded GPU selected: {selected}")
-    expected_uuid = APPROVED_GPU_BINDINGS.get(selected["pci_bus_id"])
+    selected_pci = selected["pci_bus_id"].casefold()
+    expected_uuid = next(
+        (
+            uuid
+            for pci, uuid in APPROVED_GPU_BINDINGS.items()
+            if pci.casefold() == selected_pci
+        ),
+        None,
+    )
     if expected_uuid is None or expected_uuid.casefold() != selected["uuid"].casefold():
         raise ValueError(f"GPU PCI/UUID mapping is not in the approved smoke set: {selected}")
     apps = _gpu_compute_apps()
@@ -1170,13 +1178,13 @@ def execute_with_task_runtime(
     data_root = data_root.resolve()
     output_root = output_root.resolve()
 
-    allowed = {"0", "2", "3", "4"}
+    if not isinstance(cuda_visible_devices, str):
+        raise ValueError("exactly one current nvidia-smi GPU index or approved GPU UUID is required")
     visible_tokens = [item.strip() for item in cuda_visible_devices.split(",") if item.strip()]
-    visible = set(visible_tokens)
-    if len(visible_tokens) != 1 or not visible.issubset(allowed) or "1" in visible:
+    if len(visible_tokens) != 1:
         raise ValueError(
-            "each formal process must bind exactly one smoke-approved physical GPU "
-            "(0,2,3,4); four-card parallelism is four independent processes; "
+            "each formal process must bind exactly one current nvidia-smi GPU index "
+            "or approved GPU UUID; four-card parallelism is four independent processes; "
             f"PCI {EXCLUDED_PCI} is excluded"
         )
     if cell_id is None:
@@ -1534,8 +1542,9 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--cell-id", help="execute only one checkpoint cell (recovery/debug)")
     parser.add_argument(
         "--cuda-visible-devices",
-        default="0",
-        help="exactly one smoke-approved physical index per process: 0,2,3,4; 0000:50:00.0 excluded",
+        default=None,
+        help="exactly one current nvidia-smi index or approved GPU UUID per process; "
+        f"PCI {EXCLUDED_PCI} is excluded",
     )
     parser.add_argument("--heartbeat-seconds", type=float, default=30.0)
     parser.add_argument("--candidate-sizes", type=int, nargs="+", default=list(DEFAULT_CANDIDATES))
