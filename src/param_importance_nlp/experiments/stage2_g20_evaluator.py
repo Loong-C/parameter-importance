@@ -294,6 +294,9 @@ def _validate_stage1_payload(kind: str, item: LoadedTaskArtifact) -> None:
     declared_config = payload.get("config_hash")
     if declared_config is not None and declared_config != item.identity.config_hash:
         raise G20Blocked(f"stage1_source:{kind}:CONFIG_HASH_MISMATCH")
+    task_definition_hash = payload.get("task_definition_hash")
+    if task_definition_hash is not None:
+        _sha(task_definition_hash, f"stage1_source:{kind}.task_definition_hash")
     core = payload.get("core_evidence")
     core_hash = payload.get("core_evidence_hash")
     if core is not None:
