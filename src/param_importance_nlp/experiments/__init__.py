@@ -65,6 +65,7 @@ from .stage2_registry_producer import (
     S203_ARTIFACT_KINDS,
     S203_TASK_ID,
     construct_registry_provider,
+    main as stage2_registry_producer_main,
     produce_registry_manifests,
 )
 from .stage2 import (
@@ -255,6 +256,7 @@ __all__ = [
     "S203_ARTIFACT_KINDS",
     "S203_TASK_ID",
     "construct_registry_provider",
+    "stage2_registry_producer_main",
     "produce_registry_manifests",
     "ConfiguredAblationTrainingBuilder",
     "CANDIDATE_BATCH_SIZES",

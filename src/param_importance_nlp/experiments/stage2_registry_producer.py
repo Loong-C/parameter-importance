@@ -20,6 +20,7 @@ import json
 from pathlib import Path, PurePosixPath
 import stat
 import subprocess
+import argparse
 from typing import Any
 
 import torch
@@ -537,6 +538,46 @@ def produce_registry_manifests(
     )
 
 
+def main(argv: Sequence[str] | None = None) -> int:
+    """Offline server entry point; all six cells are processed in order."""
+    parser = argparse.ArgumentParser(description="Produce immutable S2.3 six-cell registries")
+    parser.add_argument("--asset-resolution", required=True, type=Path)
+    parser.add_argument("--resolved-config", required=True, type=Path)
+    parser.add_argument("--data-root", required=True, type=Path)
+    parser.add_argument("--manifest-root", type=Path)
+    parser.add_argument("--output-root", required=True, type=Path)
+    parser.add_argument("--source-root", type=Path)
+    args = parser.parse_args(argv)
+    asset = load_canonical_json(args.asset_resolution)
+    config = load_canonical_json(args.resolved_config)
+    if not isinstance(asset, Mapping) or not isinstance(config, Mapping):
+        raise RegistryProducerError("S203_REGISTRY_CLI_INPUT_NOT_OBJECT")
+    resolved: Mapping[str, Any] | ResolvedConfigV2
+    if config.get("schema_version") == "resolved-config-v2":
+        resolved = ResolvedConfigV2.from_mapping(config)
+    else:
+        resolved = config
+    result = produce_registry_manifests(
+        asset,
+        data_root=args.data_root,
+        manifest_root=args.manifest_root or args.data_root,
+        output_root=args.output_root,
+        resolved_config=resolved,
+        resolved_config_path=args.resolved_config,
+        source_root=args.source_root,
+    )
+    print(json.dumps({
+        "index_ref": result.index_ref,
+        "index_sha256": result.index_sha256,
+        "cells": [
+            {"cell_id": item.cell_id, "manifest_ref": item.manifest_ref,
+             "manifest_sha256": item.manifest_sha256, "registry_hash": item.registry_hash}
+            for item in result.cells
+        ],
+    }, sort_keys=True))
+    return 0
+
+
 __all__ = [
     "REGISTRY_INDEX_SCHEMA",
     "REGISTRY_MANIFEST_SCHEMA",
@@ -546,5 +587,10 @@ __all__ = [
     "S203_ARTIFACT_KINDS",
     "S203_TASK_ID",
     "construct_registry_provider",
+    "main",
     "produce_registry_manifests",
 ]
+
+
+if __name__ == "__main__":  # pragma: no cover - exercised by server command
+    raise SystemExit(main())
