@@ -17,6 +17,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -96,11 +97,33 @@ def gpu_rows() -> list[dict[str, str]]:
         row = by_pci.get(pci.upper())
         if row is None or row["uuid"].lower() != uuid.lower():
             raise SmokeError(f"allowed identity mismatch for {pci}: {row!r}")
-        if row["memory_used_mib"] != "0" or row["utilization_percent"] != "0":
-            raise SmokeError(f"allowed GPU is busy: {row!r}")
         if int(row["ecc_volatile_uncorrected"]) or int(row["ecc_aggregate_uncorrected"]):
             raise SmokeError(f"allowed GPU has uncorrected ECC: {row!r}")
     return result
+
+
+def idle_inventory() -> list[dict[str, str]]:
+    """Require two consecutive idle samples before admitting CUDA work."""
+    latest: list[dict[str, str]] = []
+    for _ in range(12):
+        latest = gpu_rows()
+        by_pci = {row["pci_bus_id"]: row for row in latest}
+        if all(
+            by_pci[pci]["memory_used_mib"] == "0"
+            and by_pci[pci]["utilization_percent"] == "0"
+            for pci, _ in ALLOWED
+        ):
+            time.sleep(2)
+            confirm = gpu_rows()
+            confirm_by_pci = {row["pci_bus_id"]: row for row in confirm}
+            if all(
+                confirm_by_pci[pci]["memory_used_mib"] == "0"
+                and confirm_by_pci[pci]["utilization_percent"] == "0"
+                for pci, _ in ALLOWED
+            ):
+                return confirm
+        time.sleep(2)
+    raise SmokeError(f"allowed GPUs did not become idle after 12 samples: {latest!r}")
 
 
 def no_compute_apps() -> None:
@@ -176,7 +199,7 @@ def main() -> int:
     tmp.mkdir(parents=True)
     env = os.environ.copy()
     env["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
-    rows_before = gpu_rows()
+    rows_before = idle_inventory()
     no_compute_apps()
     excluded = next(row for row in rows_before if row["pci_bus_id"].upper() == EXCLUDED_PCI.upper())
     if excluded["uuid"].lower() != EXCLUDED_UUID.lower():
@@ -207,7 +230,7 @@ def main() -> int:
     (tmp / "four-gpu-runner.stderr.log").write_text(four.stderr, encoding="utf-8")
     if four.returncode:
         raise SmokeError(f"four-GPU smoke failed (rc={four.returncode}); see {tmp}")
-    rows_after = gpu_rows()
+    rows_after = idle_inventory()
     no_compute_apps()
     write_json(tmp / "gpu-inventory-after.json", {"rows": rows_after})
     report = {
