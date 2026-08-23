@@ -26,17 +26,12 @@ import hashlib
 from pathlib import Path, PurePosixPath
 import re
 import subprocess
+from types import SimpleNamespace
 from typing import Any
 
 from ..contracts.config_v2 import ResolvedConfigV2
 from ..contracts.jsonio import JSONValue, canonical_json_hash, load_canonical_json
 from ..contracts.seed import SeedPlan
-from ..contracts.stage1_handoff import (
-    STAGE1_G1_EXIT_PRODUCER_COMMIT,
-    Stage1ExitEvidence,
-    Stage1HandoffError,
-    validate_stage1_exit_evidence,
-)
 from ..contracts.status import GateRecord, GateStatus
 from ..runtime.task_artifacts import (
     LoadedTaskArtifact,
@@ -69,13 +64,13 @@ STAGE1_ARTIFACT_KINDS: tuple[str, ...] = (
     "gate_summary",
     "delivery_manifest",
 )
-STAGE1_PAYLOAD_SCHEMAS = {
-    "stage_report": "stage1-s1-11-stage-report-v1",
-    "requirements_matrix": "stage1-s1-11-requirements-matrix-v1",
-    "gate_summary": "stage1-s1-11-gate-summary-v1",
-    "delivery_manifest": "stage1-s1-11-delivery-manifest-v1",
-}
-STAGE1_LEGACY_PAYLOAD_SCHEMA = "stage01-task-evidence-v1"
+STAGE1_10_TASK_ID = "stage1.10_checkpoint_resume_and_artifacts"
+STAGE1_10_GATE_ID = "G1-RESUME"
+STAGE1_10_ARTIFACT_KINDS: tuple[str, ...] = (
+    "training_state_manifest",
+    "resume_equivalence_report",
+    "gate_record",
+)
 
 PLAN_PATH = "plan/stage2/01_scope_hypotheses_and_preregistration.md"
 MATHEMATICS_PATH = "docs/mathematics.md"
@@ -83,6 +78,8 @@ STAGE1_REPORT_PATH = (
     "reports/stage1/cpu-evidence-20260814-s12-r2/"
     "stage1.11_reporting_and_exit_gate/stage_report.json"
 )
+STAGE1_FORMALIZER_SOURCE_PATH = "ops/stage1/formalize_s1_11.py"
+STAGE1_CANONICAL_VALIDATOR_SOURCE_PATH = "ops/stage1/formalize_s1_6.py"
 FROZEN_PLAN_SHA256 = "9af31ee0b82cbb0526817c7bb741ca708e33f96e7be3dda65d54b188e942fe12"
 
 EVALUATOR_SOURCE_PATH = "src/param_importance_nlp/experiments/stage2_g20_evaluator.py"
@@ -101,6 +98,8 @@ REPOSITORY_SOURCE_PATHS: tuple[str, ...] = (
     PLAN_PATH,
     MATHEMATICS_PATH,
     STAGE1_REPORT_PATH,
+    STAGE1_FORMALIZER_SOURCE_PATH,
+    STAGE1_CANONICAL_VALIDATOR_SOURCE_PATH,
 )
 
 # These are the source/contract bytes whose identity makes an older producer
@@ -117,6 +116,8 @@ PRODUCER_COMPATIBILITY_PATHS: tuple[str, ...] = (
     PLAN_PATH,
     MATHEMATICS_PATH,
     STAGE1_REPORT_PATH,
+    STAGE1_FORMALIZER_SOURCE_PATH,
+    STAGE1_CANONICAL_VALIDATOR_SOURCE_PATH,
 )
 
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
@@ -136,11 +137,11 @@ EVALUATION_CONFIG: Mapping[str, JSONValue] = {
     "frozen_plan_sha256": FROZEN_PLAN_SHA256,
     "mathematics_path": MATHEMATICS_PATH,
     "non_authoritative_report_rule": "tracked_stage1_report_hash_only_never_stage1_authority",
-    "stage1_provenance_rule": "formal_stage1_11_bridge_index_and_role_hashes_only",
+    "stage1_provenance_rule": "canonical_s1_10_s1_11_group_manifest_success_and_authority_loaders_only",
     "runner_candidate_rule": "candidate_must_be_NOT_RUN_and_formal_eligible_false",
     "decision_rule": "PASS_only_after_rebuilt_preregistration_and_hypothesis_contract_match",
     "resolved_config_rule": "persisted_resolved_config_v2_must_match_all_three_s21_commits",
-    "source_rule": "four_formal_stage1_11_task_commits_with_content_and_bridge_evidence",
+    "source_rule": "seven_formal_stage1_10_s1_11_task_commits_with_canonical_authority_and_group_success",
 }
 EVALUATION_CONFIG_HASH = canonical_json_hash(EVALUATION_CONFIG)
 
@@ -199,6 +200,25 @@ def _root(value: str | Path, field: str) -> Path:
     if not candidate.is_dir():
         raise G20Blocked(f"{field}:DIRECTORY_REQUIRED")
     return candidate
+
+
+def _assert_separate_roots(data_root: Path, repository_root: Path) -> None:
+    """DATA_ROOT and repository_root are independent trust boundaries."""
+
+    if data_root == repository_root:
+        raise G20Blocked("roots:SAME_ROOT_FORBIDDEN")
+    try:
+        data_root.relative_to(repository_root)
+        nested = True
+    except ValueError:
+        nested = False
+    try:
+        repository_root.relative_to(data_root)
+        nested = True
+    except ValueError:
+        pass
+    if nested:
+        raise G20Blocked("roots:NESTED_ROOTS_FORBIDDEN")
 
 
 def _reject_symlink_chain(root: Path, logical: str, field: str) -> None:
@@ -636,6 +656,145 @@ def _load_stage1_sources(data_root: Path, refs: Sequence[str]) -> _Stage1SourceS
     )
 
 
+def _canonical_stage1_formalizer() -> Any:
+    """Load the released Stage1 authority implementation, never a local adapter."""
+
+    try:
+        from ops.stage1 import formalize_s1_11
+    except (ImportError, OSError) as error:
+        raise G20Blocked("stage1_source:CANONICAL_FORMALIZER_UNAVAILABLE") from error
+    if not callable(getattr(formalize_s1_11, "_emit_load_r4", None)) or not callable(
+        getattr(formalize_s1_11, "_emit_load_s110", None)
+    ):
+        raise G20Blocked("stage1_source:CANONICAL_AUTHORITY_LOADERS_REQUIRED")
+    return formalize_s1_11
+
+
+def _canonical_group_identity(
+    data_root: Path,
+    *,
+    canonical: Any,
+    task_id: str,
+    artifact_kinds: Sequence[str],
+    refs_by_kind: Mapping[str, str],
+    artifacts_by_kind: Mapping[str, LoadedTaskArtifact],
+    source_refs: tuple[str, ...],
+) -> tuple[str, Mapping[str, JSONValue], Mapping[str, JSONValue]]:
+    output_dir = PurePosixPath(next(iter(refs_by_kind.values()))).parent.parent.as_posix()
+    expected_output = canonical.S111_TASK_OUTPUT_DEFAULT if task_id == STAGE1_TASK_ID else canonical.S110_COMPAT_OUTPUT_DEFAULT
+    if output_dir != expected_output or any(
+        PurePosixPath(ref).parent.parent.as_posix() != output_dir for ref in refs_by_kind.values()
+    ):
+        raise G20Blocked(f"stage1_source:{task_id}:NONCANONICAL_OUTPUT_DIR")
+    config_ref = f"{output_dir}/producer-config.json"
+    config = _load_stage1_json(data_root, config_ref, f"stage1_source:{task_id}.config")
+    config_hash = _sha(config.get("config_hash"), f"stage1_source:{task_id}.config_hash")
+    if canonical_json_hash({key: value for key, value in config.items() if key != "config_hash"}) != config_hash:
+        raise G20Blocked(f"stage1_source:{task_id}:CONFIG_SELF_HASH_MISMATCH")
+    if (
+        config.get("task_id") != task_id
+        or config.get("run_intent") != "formal"
+        or config.get("formal_eligible") is not True
+        or config.get("artifact_kinds") != list(artifact_kinds)
+        or config.get("commit_refs") != dict(refs_by_kind)
+        or config.get("source_refs") != list(source_refs)
+    ):
+        raise G20Blocked(f"stage1_source:{task_id}:CONFIG_IDENTITY_INVALID")
+    for kind, item in artifacts_by_kind.items():
+        if item.identity.config_hash != config_hash or item.source_refs != source_refs:
+            raise G20Blocked(f"stage1_source:{task_id}:COMMIT_CONFIG_SOURCE_MISMATCH:{kind}")
+    group_ref = f"{output_dir}/group-manifest.json"
+    group = _load_stage1_json(data_root, group_ref, f"stage1_source:{task_id}.group_manifest")
+    expected_hashes = {kind: item.identity.artifact_hash for kind, item in artifacts_by_kind.items()}
+    group_hash = _sha(group.get("artifact_hash"), f"stage1_source:{task_id}.group_manifest_hash")
+    if (
+        canonical_json_hash({key: value for key, value in group.items() if key != "artifact_hash"}) != group_hash
+        or group.get("schema_version") != "stage1-task-artifact-group-manifest-v1"
+        or group.get("status") != "PUBLISHING"
+        or group.get("task_id") != task_id
+        or group.get("artifact_kinds") != list(artifact_kinds)
+        or group.get("config_hash") != config_hash
+        or group.get("source_refs_hash") != canonical_json_hash(list(source_refs))
+        or group.get("source_refs") != list(source_refs)
+        or group.get("expected_artifact_hashes") != expected_hashes
+        or group.get("commit_refs") != dict(refs_by_kind)
+    ):
+        raise G20Blocked(f"stage1_source:{task_id}:GROUP_MANIFEST_INVALID")
+    success_ref = f"{output_dir}/success.json"
+    success = _load_stage1_json(data_root, success_ref, f"stage1_source:{task_id}.group_success")
+    success_hash = _sha(success.get("artifact_hash"), f"stage1_source:{task_id}.group_success_hash")
+    if (
+        canonical_json_hash({key: value for key, value in success.items() if key != "artifact_hash"}) != success_hash
+        or success.get("schema_version") != "stage1-task-artifact-group-success-v1"
+        or success.get("status") != "PASS"
+        or success.get("task_id") != task_id
+        or success.get("artifact_kinds") != list(artifact_kinds)
+        or success.get("config_hash") != config_hash
+        or success.get("group_manifest_sha256") != _file_sha256(_resolve(data_root, group_ref, "stage1.group_manifest"), "stage1.group_manifest")
+        or success.get("commit_refs") != dict(refs_by_kind)
+        or success.get("commit_artifact_hashes") != expected_hashes
+    ):
+        raise G20Blocked(f"stage1_source:{task_id}:GROUP_SUCCESS_INVALID")
+    return config_ref, config, {"group_manifest_ref": group_ref, "success_ref": success_ref, **dict(success)}
+
+
+def _load_stage1_sources(data_root: Path, refs: Sequence[str], repository: Path) -> _Stage1SourceSet:
+    """Load seven released commits through canonical S1.10/S1.11 authority loaders."""
+
+    if len(refs) not in {4, 7}:
+        raise G20Blocked("source_refs:STAGE1_DIRECT_COMMIT_SET_INVALID")
+    canonical = _canonical_stage1_formalizer()
+    direct = [_load_committed(data_root, _logical_path(ref, "stage1_source.commit_ref")) for ref in refs]
+    if any(item.identity.task_id not in {STAGE1_TASK_ID, STAGE1_10_TASK_ID} or item.run_intent != "formal" or item.identity.formal_eligible is not True for item in direct):
+        raise G20Blocked("source_refs:FORMAL_CANONICAL_STAGE1_COMMITS_REQUIRED")
+    s111_direct = [item for item in direct if item.identity.task_id == STAGE1_TASK_ID]
+    if len(s111_direct) != len(STAGE1_ARTIFACT_KINDS):
+        raise G20Blocked("source_refs:COMPLETE_STAGE1_11_SET_REQUIRED")
+    envelope_sets = {
+        tuple(_logical_path(value, "stage1_source.envelope_source_ref") for value in item.source_refs)
+        for item in s111_direct
+    }
+    if len(envelope_sets) != 1:
+        raise G20Blocked("stage1_source:SOURCE_REFS_NOT_COMMON")
+    envelope_source_refs = next(iter(envelope_sets))
+    candidate_refs = set(refs)
+    candidate_refs.update(
+        ref for ref in envelope_source_refs
+        if "/commits/" in ref and ref.endswith(".json")
+    )
+    loaded = {
+        ref: _load_committed(data_root, ref)
+        for ref in sorted(candidate_refs)
+    }
+    s111 = {item.identity.artifact_kind: item for ref, item in loaded.items() if item.identity.task_id == STAGE1_TASK_ID}
+    s110 = {item.identity.artifact_kind: item for ref, item in loaded.items() if item.identity.task_id == STAGE1_10_TASK_ID}
+    if set(s111) != set(STAGE1_ARTIFACT_KINDS) or set(s110) != set(STAGE1_10_ARTIFACT_KINDS):
+        raise G20Blocked("source_refs:EXACTLY_SEVEN_CANONICAL_STAGE1_COMMITS_REQUIRED")
+    s111_refs = {kind: next(ref for ref, item in loaded.items() if item is s111[kind]) for kind in s111}
+    s110_refs = {kind: next(ref for ref, item in loaded.items() if item is s110[kind]) for kind in s110}
+    if len({item.identity.config_hash for item in s111.values()}) != 1 or len({item.identity.config_hash for item in s110.values()}) != 1:
+        raise G20Blocked("source_refs:MIXED_STAGE1_CONFIG_HASH")
+    try:
+        r4 = canonical._emit_load_r4(repository=repository, evidence_root=data_root, evidence_ref=canonical.S111_R4_INDEX_REF, approved_data_root=data_root)
+        r12 = canonical._emit_load_s110(repository=repository, evidence_root=data_root, approved_data_root=data_root)
+    except Exception as error:
+        raise G20Blocked(f"stage1_source:CANONICAL_AUTHORITY_REJECTED:{type(error).__name__}") from error
+    if any(dict(s111[k].payload) != dict(r4["roles"][k]) for k in STAGE1_ARTIFACT_KINDS) or any(dict(s110[k].payload) != dict(r12["roles"][canonical.S110_TASK_ROLE_MAP[k]]) for k in STAGE1_10_ARTIFACT_KINDS):
+        raise G20Blocked("stage1_source:PAYLOAD_AUTHORITY_MISMATCH")
+    s111_source_refs = tuple(s111[next(iter(s111))].source_refs)
+    s110_config_ref, _s110_config, _s110_success = _canonical_group_identity(data_root, canonical=canonical, task_id=STAGE1_10_TASK_ID, artifact_kinds=STAGE1_10_ARTIFACT_KINDS, refs_by_kind=s110_refs, artifacts_by_kind=s110, source_refs=tuple(s110[next(iter(s110))].source_refs))
+    s111_config_ref, s111_config, s111_success = _canonical_group_identity(data_root, canonical=canonical, task_id=STAGE1_TASK_ID, artifact_kinds=STAGE1_ARTIFACT_KINDS, refs_by_kind=s111_refs, artifacts_by_kind=s111, source_refs=s111_source_refs)
+    manifest_ref = f"{canonical.S111_TASK_OUTPUT_DEFAULT}/manifest.json"
+    manifest = _load_stage1_json(data_root, manifest_ref, "stage1_source.s111_manifest")
+    manifest_hash = _sha(manifest.get("artifact_hash"), "stage1_source.s111_manifest_hash")
+    if canonical_json_hash({key: value for key, value in manifest.items() if key != "artifact_hash"}) != manifest_hash or manifest.get("commit_refs") != s111_refs or manifest.get("config_ref") != s111_config_ref or manifest.get("config_hash") != s111_config.get("config_hash") or manifest.get("s110_compatibility", {}).get("commit_refs") != s110_refs:
+        raise G20Blocked("stage1_source:S111_MANIFEST_IDENTITY_INVALID")
+    refs_by_kind = dict(s111_refs)
+    artifacts_by_kind = dict(s111)
+    handoff = SimpleNamespace(index_ref=canonical.S111_R4_INDEX_REF, index_sha256=canonical.S111_R4_INDEX_SHA256, index_artifact_hash=canonical.S111_R4_INDEX_ARTIFACT_HASH, producer_commit=canonical.S111_R4_PRODUCER_COMMIT, execution_commit=canonical.S111_R4_PRODUCER_COMMIT, role_sha256=dict(r4["role_file_sha256"]))
+    return _Stage1SourceSet(refs_by_kind, artifacts_by_kind, next(iter({item.identity.config_hash for item in s111.values()})), _stage1_binding_hash(artifacts_by_kind, refs_by_kind), s111_source_refs, manifest_ref, manifest, handoff)
+
+
 def _load_s21_core(data_root: Path, references: object) -> _LoadedSet:
     refs = _normalise_refs(references)
     loaded: list[tuple[str, LoadedTaskArtifact, str]] = []
@@ -671,9 +830,9 @@ def _load_s21_core(data_root: Path, references: object) -> _LoadedSet:
     return _LoadedSet(refs_by_kind, artifacts_by_kind, config_hash, source_refs, None)
 
 
-def _load_and_bind(data_root: Path, references: object) -> _LoadedSet:
+def _load_and_bind(data_root: Path, references: object, repository: Path) -> _LoadedSet:
     core = _load_s21_core(data_root, references)
-    stage1 = _load_stage1_sources(data_root, core.source_refs)
+    stage1 = _load_stage1_sources(data_root, core.source_refs, repository)
     return _LoadedSet(
         core.refs_by_kind,
         core.artifacts_by_kind,
@@ -816,6 +975,8 @@ def _repository_identity(repository_root: Path) -> _RepositoryIdentity:
         EVALUATOR_SOURCE_PATH: Path(__file__).resolve(),
         PREREGISTRATION_SOURCE_PATH: Path(__file__).resolve().with_name("preregistration.py"),
         RUNNER_SOURCE_PATH: Path(__file__).resolve().with_name("stage23_task_runners.py"),
+        STAGE1_FORMALIZER_SOURCE_PATH: Path(__file__).resolve().parents[3] / STAGE1_FORMALIZER_SOURCE_PATH,
+        STAGE1_CANONICAL_VALIDATOR_SOURCE_PATH: Path(__file__).resolve().parents[3] / STAGE1_CANONICAL_VALIDATOR_SOURCE_PATH,
     }
     for relative, runtime_path in runtime_sources.items():
         try:
@@ -949,13 +1110,15 @@ def _validate_document_bindings(
         raise G20Blocked("provenance.mathematics_path:FROZEN_PATH_MISMATCH")
     if mathematics_hash != repository.source_hashes[MATHEMATICS_PATH]:
         raise G20Blocked("provenance.mathematics_hash:CONTENT_MISMATCH")
-    # Stage1 provenance is the DATA_ROOT bridge/index closure.  A tracked
-    # reports/... local fixture is deliberately not read or compared here.
+    # The historical reports/... file is never the Stage1 authority.  The
+    # compatibility field is bound to the formal TaskArtifact hash instead.
+    if provenance.get("stage1_report_hash") != stage1_binding.artifacts_by_kind["stage_report"].identity.artifact_hash:
+        raise G20Blocked("provenance.stage1_report_hash:FORMAL_ARTIFACT_REQUIRED")
     declared_handoff = provenance.get("stage1_handoff")
     if not isinstance(declared_handoff, Mapping):
-        raise G20Blocked("provenance.stage1_handoff:FORMAL_BRIDGE_REQUIRED")
+        raise G20Blocked("provenance.stage1_handoff:CANONICAL_MANIFEST_REQUIRED")
     if dict(declared_handoff) != dict(stage1_binding.bridge_payload):
-        raise G20Blocked("provenance.stage1_handoff:BRIDGE_CONTENT_MISMATCH")
+        raise G20Blocked("provenance.stage1_handoff:CANONICAL_MANIFEST_MISMATCH")
     return compatibility
 
 
@@ -1104,8 +1267,9 @@ def _make_gate(
             ]
             stage1_identity.append(
                 {
-                    "bridge_ref": loaded.stage1.bridge_ref,
-                    "bridge_artifact_hash": loaded.stage1.bridge_payload.get("artifact_hash"),
+                    "group_manifest_ref": loaded.stage1.bridge_payload.get("group_manifest_ref"),
+                    "group_success_ref": loaded.stage1.bridge_payload.get("success_ref"),
+                    "group_success_artifact_hash": loaded.stage1.bridge_payload.get("artifact_hash"),
                     "index_ref": loaded.stage1.handoff.index_ref,
                     "index_sha256": loaded.stage1.handoff.index_sha256,
                     "index_artifact_hash": loaded.stage1.handoff.index_artifact_hash,
@@ -1113,6 +1277,7 @@ def _make_gate(
                     "execution_commit": loaded.stage1.handoff.execution_commit,
                     "role_sha256": dict(loaded.stage1.handoff.role_sha256),
                     "envelope_source_refs": list(loaded.stage1.source_refs),
+                    "s110_compatibility": loaded.stage1.bridge_payload.get("s110_compatibility"),
                 }
             )
     measured: dict[str, JSONValue] = {
@@ -1302,7 +1467,10 @@ def _result(
         "envelope_artifact_hash": None if published is None else published.artifact_hash,
         "provenance": {
             "repository_head": None if repository is None else repository.head,
+            "consumer_commit": None if repository is None else repository.head,
             "evaluation_config_hash": None if repository is None else repository.evaluation_config_hash,
+            "evaluation_config": None if repository is None else dict(repository.evaluation_config),
+            "source_hashes": None if repository is None else dict(repository.source_hashes),
             "resolved_config_ref": None if config is None else config.ref,
             "resolved_config_full_hash": None if config is None else config.full_hash,
         },
@@ -1338,12 +1506,17 @@ def evaluate_formal_g20(
     reasons: list[str] = []
     try:
         try:
-            repository = _repository_identity(_root(repository_root, "repository_root"))
+            data = _root(data_root, "data_root")
+            repository_path = _root(repository_root, "repository_root")
+            _assert_separate_roots(data, repository_path)
+            repository = _repository_identity(repository_path)
         except G20Blocked as error:
             reasons.append(str(error))
-        data = _root(data_root, "data_root")
+            data = _root(data_root, "data_root")
         try:
-            loaded = _load_and_bind(data, artifact_refs)
+            if repository is None:
+                raise G20Blocked("repository_root:UNAVAILABLE")
+            loaded = _load_and_bind(data, artifact_refs, repository.root)
         except G20Failed as error:
             status = GateStatus.FAIL
             reasons.append(str(error))
