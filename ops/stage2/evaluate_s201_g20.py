@@ -1,8 +1,8 @@
 """CLI for the independent Stage 2 G2.0 evaluator.
 
-The command accepts only workspace-relative formal TaskArtifact commit refs.
-It intentionally has no ``--status``, ``--metric`` or threshold override: all
-Gate fields are derived by :mod:`stage2_g20_evaluator`.
+The data and repository roots are explicit.  The command has no status,
+metric, threshold, or formal-eligibility override: all Gate fields are derived
+by :mod:`stage2_g20_evaluator`.
 """
 
 from __future__ import annotations
@@ -24,8 +24,10 @@ from param_importance_nlp.experiments.stage2_g20_evaluator import (  # noqa: E40
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Evaluate formal Stage 2 G2.0 preregistration evidence")
-    parser.add_argument("--workspace-root", type=Path, required=True)
-    parser.add_argument("--output-root", type=Path, required=True)
+    parser.add_argument("--data-root", type=Path, required=True)
+    parser.add_argument("--repository-root", type=Path, required=True)
+    parser.add_argument("--resolved-config-ref", required=True)
+    parser.add_argument("--output-dir", default="runs/stage2-g20-evaluation")
     parser.add_argument(
         "--artifact-ref",
         action="append",
@@ -53,9 +55,11 @@ def main(argv: list[str] | None = None) -> int:
                 raise ValueError("--artifact-ref must be supplied exactly three times")
             refs = tuple(args.artifact_ref)
         result = evaluate_formal_g20(
-            args.workspace_root,
+            args.data_root,
             refs,
-            output_root=args.output_root,
+            repository_root=args.repository_root,
+            resolved_config_ref=args.resolved_config_ref,
+            output_dir=args.output_dir,
         )
         print(json.dumps(result, ensure_ascii=False, sort_keys=True, indent=2))
         return 0 if result.get("status") == "PASS" and result.get("formal_eligible") is True else 3
