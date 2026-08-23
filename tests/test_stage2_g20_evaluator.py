@@ -309,7 +309,8 @@ def test_source_refs_must_be_four_real_formal_task_commits(tmp_path: Path) -> No
         write_canonical_json(data_root / f"ordinary/{name}.json", {"schema_version": "ordinary-v1"})
     result = _evaluate(data_root, refs, config_ref)
     assert result["status"] == "BLOCKED"
-    assert result["commit_ref"] is None
+    assert isinstance(result["commit_ref"], str)
+    assert "source_refs" in " ".join(result["gate_record"]["reasons"])  # type: ignore[index]
 
 
 def test_wrong_resolved_config_and_tampered_payload_are_blocked(tmp_path: Path) -> None:

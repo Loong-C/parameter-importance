@@ -266,7 +266,7 @@ class _LoadedSet:
     artifacts_by_kind: Mapping[str, LoadedTaskArtifact]
     config_hash: str
     source_refs: tuple[str, ...]
-    stage1: _Stage1SourceSet
+    stage1: _Stage1SourceSet | None
 
 
 def _payload_status(payload: Mapping[str, JSONValue]) -> object:
@@ -401,7 +401,7 @@ def _load_stage1_sources(data_root: Path, refs: Sequence[str]) -> _Stage1SourceS
     )
 
 
-def _load_and_bind(data_root: Path, references: object) -> _LoadedSet:
+def _load_s21_core(data_root: Path, references: object) -> _LoadedSet:
     refs = _normalise_refs(references)
     loaded: list[tuple[str, LoadedTaskArtifact, str]] = []
     for ref in refs:
@@ -431,10 +431,21 @@ def _load_and_bind(data_root: Path, references: object) -> _LoadedSet:
         _logical_path(item, f"source_refs[{index}]")
         for index, item in enumerate(next(iter(source_sets)))
     )
-    stage1 = _load_stage1_sources(data_root, source_refs)
     refs_by_kind = {kind: ref for kind, _, ref in loaded}
     artifacts_by_kind = {kind: item for kind, item, _ in loaded}
-    return _LoadedSet(refs_by_kind, artifacts_by_kind, config_hash, source_refs, stage1)
+    return _LoadedSet(refs_by_kind, artifacts_by_kind, config_hash, source_refs, None)
+
+
+def _load_and_bind(data_root: Path, references: object) -> _LoadedSet:
+    core = _load_s21_core(data_root, references)
+    stage1 = _load_stage1_sources(data_root, core.source_refs)
+    return _LoadedSet(
+        core.refs_by_kind,
+        core.artifacts_by_kind,
+        core.config_hash,
+        core.source_refs,
+        stage1,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -749,15 +760,16 @@ def _make_gate(
             }
             for kind in ARTIFACT_KINDS
         ]
-        stage1_identity = [
-            {
-                "artifact_kind": kind,
-                "commit_ref": loaded.stage1.refs_by_kind[kind],
-                "artifact_hash": loaded.stage1.artifacts_by_kind[kind].identity.artifact_hash,
-                "config_hash": loaded.stage1.artifacts_by_kind[kind].identity.config_hash,
-            }
-            for kind in STAGE1_ARTIFACT_KINDS
-        ]
+        if loaded.stage1 is not None:
+            stage1_identity = [
+                {
+                    "artifact_kind": kind,
+                    "commit_ref": loaded.stage1.refs_by_kind[kind],
+                    "artifact_hash": loaded.stage1.artifacts_by_kind[kind].identity.artifact_hash,
+                    "config_hash": loaded.stage1.artifacts_by_kind[kind].identity.config_hash,
+                }
+                for kind in STAGE1_ARTIFACT_KINDS
+            ]
     measured: dict[str, JSONValue] = {
         "input_artifact_count": 3 if loaded is not None else 0,
         "task_id": TASK_ID,
@@ -848,6 +860,8 @@ def _attempt_id(
             "resolved_config_full_hash": config.full_hash,
             "evaluation_config_hash": repository.evaluation_config_hash,
             "output_dir": base_dir,
+            "stage1_binding_hash": None if loaded.stage1 is None else loaded.stage1.binding_hash,
+            "stage1_source_refs": list(loaded.source_refs),
         }
     )
 
@@ -974,6 +988,14 @@ def evaluate_formal_g20(
             reasons.append(str(error))
         except (G20Blocked, OSError, TypeError, ValueError, KeyError) as error:
             reasons.append(str(error))
+            # The three S2.1 commits are still sufficient evidence to publish
+            # a formal BLOCKED GateRecord when only a Stage1 source member is
+            # missing/tampered.  Keep the failed source binding out of the
+            # semantic PASS path, but preserve the immutable S2.1 lineage.
+            try:
+                loaded = _load_s21_core(data, artifact_refs)
+            except (G20Blocked, OSError, TypeError, ValueError, KeyError):
+                loaded = None
         if loaded is not None:
             try:
                 config = _load_resolved_config(data, resolved_config_ref)
@@ -985,7 +1007,7 @@ def evaluate_formal_g20(
                 pass
             elif repository.validation_error is not None:
                 reasons.append(repository.validation_error)
-            elif config is not None:
+            elif config is not None and loaded.stage1 is not None:
                 try:
                     prereg = loaded.artifacts_by_kind["preregistration"].payload
                     hypothesis = loaded.artifacts_by_kind["hypothesis_contract"].payload
