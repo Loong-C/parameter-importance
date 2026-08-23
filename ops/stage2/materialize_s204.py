@@ -62,10 +62,16 @@ from param_importance_nlp.experiments.stage2_assets import (  # noqa: E402
     CheckpointRecord,
     validate_formal_asset_identity,
 )
+from param_importance_nlp.experiments.stage2_s204_ids import (  # noqa: E402
+    EXPECTED_CELL_IDS,
+    canonical_cell_id,
+    cell_path_component,
+)
 from param_importance_nlp.experiments.stage2_registry_qualification import (  # noqa: E402
     ASSET_RESOLUTION_AMENDMENT_SCHEMA,
     load_asset_resolution_input,
 )
+from param_importance_nlp.core.registry import ParameterRegistry  # noqa: E402
 from param_importance_nlp.experiments.stage2_formal import (  # noqa: E402
     ReferenceSizingPlan,
 )
@@ -110,11 +116,7 @@ DEFAULT_DATA_ASSET_ID: Final = "pile-selected-prefix"
 S204_SIX_CELL_SCHEMA: Final = "stage2-s204-six-cell-manifest-v1"
 S204_REGISTRY_SCHEMA: Final = "stage2-parameter-registry-artifact-v1"
 S204_DELTA_SCHEMA: Final = "stage2-reference-delta-sci-v1"
-EXPECTED_CELL_IDS: Final = tuple(
-    f"{model}:{stage}"
-    for model in ("pythia-14m", "pythia-31m-deduped")
-    for stage in ("initialization", "early", "mid_late")
-)
+S204_DELTA_PLAN_SCHEMA: Final = "stage2-reference-delta-sci-plan-v1"
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _COMMIT = re.compile(r"^[0-9a-f]{40}$")
 _LOGICAL = re.compile(r"^[^\\/][^\\]*$")
@@ -2357,6 +2359,7 @@ def build_formal_runtime_environment(
     stage2_reference_delta_sci_ref: str | None = None,
     cell_id: str | None = None,
     six_cell_manifest_ref: str | None = None,
+    delta_phase: str = "pre_sizing",
     output_ref: str = "evidence/stage2/s204/runtime-environment.json",
 ) -> tuple[TaskRuntimeEnvironment, str]:
     """Build a rereadable environment bound to current formal evidence.
@@ -2469,6 +2472,14 @@ def build_formal_runtime_environment(
             validate_formal_asset_identity(asset_manifest)
     except Exception as error:
         raise _error("S23_ASSET_RESOLUTION_INVALID", asset_source) from error
+    asset_gate_refs: tuple[str, ...] = (asset_source,)
+    try:
+        asset_task = load_committed_task_artifact(root, asset_source, require_formal=True)
+        asset_gate_refs = (asset_source, *tuple(asset_task.source_refs))
+    except Exception:
+        # Direct formal manifests remain accepted by the narrow base API.  The
+        # six-cell external-lineage path separately requires the TaskArtifact.
+        pass
 
     required_gates = {"stage2.G2.2"}
     optional_gates = {"stage1.G1-EXIT"}
@@ -2480,7 +2491,7 @@ def build_formal_runtime_environment(
         required=tuple(gate_refs),
         expected_task={"stage2.G2.2": "stage2.03_assets_checkpoints_and_sampling"},
         expected_artifact_kind={"stage2.G2.2": "gate_record"},
-        expected_upstream_refs={"stage2.G2.2": (asset_source,)},
+        expected_upstream_refs={"stage2.G2.2": asset_gate_refs},
     )
 
     required_capabilities = {"server", "cuda", "model_assets", "data_assets"}
@@ -2560,7 +2571,12 @@ def build_formal_runtime_environment(
             {key: item for key, item in registry_value.items() if key != "artifact_hash"}
         ):
             raise _error("PARAMETER_REGISTRY_HASH_INVALID", cell_id)
-        _validate_delta_sci_artifact(root, cell_delta_ref, cell_id=cell_id)
+        _validate_delta_sci_artifact(
+            root,
+            cell_delta_ref,
+            cell_id=cell_id,
+            allow_pre_sizing_plan=delta_phase == "pre_sizing",
+        )
 
     evidence_refs: dict[str, str] = {
         "formal_execution": formal_ref,
@@ -2704,6 +2720,7 @@ def _validate_delta_sci_artifact(
     *,
     cell_id: str,
     candidate_sample_counts: Sequence[int] = DEFAULT_CANDIDATES,
+    allow_pre_sizing_plan: bool = False,
 ) -> Mapping[str, Any]:
     value = _load_formal_or_direct_payload(
         root,
@@ -2711,6 +2728,33 @@ def _validate_delta_sci_artifact(
         field="stage2_reference_delta_sci",
         artifact_kind="reference_delta_sci",
     )
+    if value.get("schema_version") == S204_DELTA_PLAN_SCHEMA:
+        if not allow_pre_sizing_plan:
+            raise _error("REFERENCE_DELTA_SCI_NUMERIC_REQUIRED", cell_id)
+        if value.get("status") != "READY" or value.get("scope") != "formal" or value.get("phase") != "pre_sizing":
+            raise _error("REFERENCE_DELTA_SCI_PLAN_FORMAL_REQUIRED", cell_id)
+        if value.get("cell_id") != cell_id:
+            raise _error("REFERENCE_DELTA_SCI_CELL_MISMATCH", cell_id)
+        counts = value.get("candidate_sample_counts")
+        if not isinstance(counts, list) or tuple(counts) != tuple(candidate_sample_counts):
+            raise _error("REFERENCE_DELTA_SCI_PLAN_CANDIDATES_INVALID", cell_id)
+        refs = value.get("source_contract_refs")
+        hashes = value.get("source_contract_artifact_hashes")
+        if not isinstance(refs, list) or not refs or not isinstance(hashes, list) or len(refs) != len(hashes):
+            raise _error("REFERENCE_DELTA_SCI_SOURCE_BINDING_INVALID", cell_id)
+        for raw_ref, raw_hash in zip(refs, hashes, strict=True):
+            source_ref = _source_ref(raw_ref, f"delta_sci_plan.{cell_id}.source_ref")
+            loaded = load_committed_task_artifact(root, source_ref, require_formal=True)
+            if loaded.identity.artifact_hash != _sha(raw_hash, f"delta_sci_plan.{cell_id}.source_hash"):
+                raise _error("REFERENCE_DELTA_SCI_SOURCE_BINDING_INVALID", cell_id)
+        declared = value.get("artifact_hash")
+        if not isinstance(declared, str) or canonical_json_hash(
+            {key: item for key, item in value.items() if key != "artifact_hash"}
+        ) != declared:
+            raise _error("REFERENCE_DELTA_SCI_HASH_INVALID", cell_id)
+        if "delta_sci_by_B" in value:
+            raise _error("REFERENCE_DELTA_SCI_PLAN_MUST_NOT_CONTAIN_NUMBERS", cell_id)
+        return value
     if value.get("schema_version") != S204_DELTA_SCHEMA or value.get("status") != "READY" or value.get("scope") != "formal":
         raise _error("REFERENCE_DELTA_SCI_FORMAL_REQUIRED", cell_id)
     if value.get("cell_id") != cell_id:
@@ -2848,6 +2892,7 @@ def publish_per_cell_runtime_environments(
     g3_resolution_ref: str | None = None,
     tokenizer_asset_id: str = DEFAULT_TOKENIZER_ASSET_ID,
     data_asset_id: str = DEFAULT_DATA_ASSET_ID,
+    delta_phase: str = "pre_sizing",
 ) -> tuple[dict[str, TaskRuntimeEnvironment], dict[str, str]]:
     """Derive six rereadable environments from one verified final snapshot.
 
@@ -2858,6 +2903,8 @@ def publish_per_cell_runtime_environments(
     """
 
     root = Path(data_root).resolve()
+    if delta_phase not in {"pre_sizing", "post_sizing"}:
+        raise _error("DELTA_PHASE_INVALID", delta_phase)
     base_ref = _source_ref(base_environment_ref, "base_environment")
     try:
         base = TaskRuntimeEnvironment.from_mapping(_load_mapping(root, base_ref, "base_environment"))
@@ -2907,7 +2954,12 @@ def publish_per_cell_runtime_environments(
             formal_execution_hash=evidence.artifact_hash,
             cell_id=cell_id,
         )
-        _validate_delta_sci_artifact(root, deltas[cell_id], cell_id=cell_id)
+        _validate_delta_sci_artifact(
+            root,
+            deltas[cell_id],
+            cell_id=cell_id,
+            allow_pre_sizing_plan=delta_phase == "pre_sizing",
+        )
         registry_value = _load_formal_or_direct_payload(
             root,
             registries[cell_id],
@@ -2921,7 +2973,11 @@ def publish_per_cell_runtime_environments(
         groups = registry_value.get("parameter_groups")
         if not isinstance(groups, Mapping) or not groups:
             raise _error("PARAMETER_REGISTRY_GROUPS_REQUIRED", cell_id)
-        if configs is not None and registry_value.get("config_hash") != configs[cell_id].config_hash:
+        if (
+            configs is not None
+            and registry_value.get("config_hash") is not None
+            and registry_value.get("config_hash") != configs[cell_id].config_hash
+        ):
             raise _error("PARAMETER_REGISTRY_CONFIG_MISMATCH", cell_id)
         declared_registry_hash = registry_value.get("artifact_hash")
         if not isinstance(declared_registry_hash, str) or canonical_json_hash(
@@ -2961,7 +3017,12 @@ def publish_per_cell_runtime_environments(
                 source_refs=(registries[cell_id],),
                 output_dir=f"{output_dir}/auxiliary/{_cell_path_component(cell_id)}/registry",
             )
-            delta_value = _validate_delta_sci_artifact(root, deltas[cell_id], cell_id=cell_id)
+            delta_value = _validate_delta_sci_artifact(
+                root,
+                deltas[cell_id],
+                cell_id=cell_id,
+                allow_pre_sizing_plan=delta_phase == "pre_sizing",
+            )
             auxiliary["reference_delta_sci"] = _publish_auxiliary_task_artifact(
                 root,
                 artifact_kind="reference_delta_sci",
@@ -3118,13 +3179,14 @@ def _cell_id(checkpoint: CheckpointRecord) -> str:
     contract ID with a filename-safe variant.
     """
 
-    return f"{checkpoint.model_id}:{checkpoint.training_stage}"
+    return canonical_cell_id(checkpoint.model_id, checkpoint.training_stage)
 
 
 def _cell_path_component(cell_id: str) -> str:
-    if cell_id not in EXPECTED_CELL_IDS:
-        raise _error("CELL_ID_INVALID", cell_id)
-    return cell_id.replace(":", "__")
+    try:
+        return cell_path_component(cell_id)
+    except ValueError as error:
+        raise _error("CELL_ID_INVALID", cell_id) from error
 
 
 def _expected_cell_checkpoints(
@@ -3186,6 +3248,7 @@ def _load_parameter_registry_artifact(
     cell_id: str,
     checkpoint: CheckpointRecord,
     config_hash: str | None = None,
+    require_config_hash: bool = True,
 ) -> Mapping[str, Any]:
     """Load a producer-published registry and bind it to this checkpoint.
 
@@ -3239,14 +3302,189 @@ def _load_parameter_registry_artifact(
     for key, expected in expected_identity.items():
         if direct_identity.get(key) != expected:
             raise _error("PARAMETER_REGISTRY_IDENTITY_MISMATCH", f"{cell_id}:{key}")
-    if config_hash is not None and direct_identity.get("config_hash") != config_hash:
-        raise _error("PARAMETER_REGISTRY_CONFIG_MISMATCH", cell_id)
+    if config_hash is not None:
+        declared_config = direct_identity.get("config_hash")
+        if declared_config is not None and declared_config != config_hash:
+            raise _error("PARAMETER_REGISTRY_CONFIG_MISMATCH", cell_id)
+        if require_config_hash and declared_config is None:
+            raise _error("PARAMETER_REGISTRY_CONFIG_REQUIRED", cell_id)
     declared = value.get("artifact_hash")
     if not isinstance(declared, str) or canonical_json_hash(
         {key: item for key, item in value.items() if key != "artifact_hash"}
     ) != declared:
         raise _error("PARAMETER_REGISTRY_HASH_INVALID", cell_id)
     return value
+
+
+def publish_per_cell_delta_sci_plans(
+    data_root: str | Path,
+    *,
+    s21_refs: Mapping[str, str],
+    candidate_sample_counts: Sequence[int] = DEFAULT_CANDIDATES,
+    cell_ids: Sequence[str] = EXPECTED_CELL_IDS,
+    output_dir: str = "evidence/stage2/s204/reference-delta-sci-plans",
+) -> dict[str, str]:
+    """Publish pre-sizing formula plans without inventing numeric margins.
+
+    Numeric ``delta_sci(B)`` values are intentionally absent.  The Stage 2.4
+    runner derives the v2 artifact from committed sizing shards; this plan is
+    only the immutable pre-sizing contract and candidate ladder.
+    """
+
+    root = Path(data_root).resolve()
+    if tuple(cell_ids) != EXPECTED_CELL_IDS:
+        raise _error("SIX_CELL_ID_SET_INVALID")
+    required = ("preregistration", "hypothesis_contract")
+    if set(s21_refs) != set(required):
+        raise _error("REFERENCE_DELTA_SCI_S21_INPUTS_REQUIRED")
+    contracts: list[tuple[str, LoadedTaskArtifact, Mapping[str, Any]]] = []
+    for kind in required:
+        ref = _source_ref(s21_refs[kind], f"s21.{kind}")
+        loaded = _load_formal_source(
+            root,
+            ref,
+            task_id="stage2.01_scope_hypotheses_and_preregistration",
+            artifact_kind=kind,
+        )
+        precision = loaded.payload.get("equivalence_and_precision")
+        if not isinstance(precision, Mapping) or not precision:
+            raise _error("REFERENCE_DELTA_SCI_FORMULA_CONTRACT_REQUIRED", kind)
+        contracts.append((ref, loaded, dict(precision)))
+    formula_hashes = {canonical_json_hash(item[2]) for item in contracts}
+    if len(formula_hashes) != 1:
+        raise _error("REFERENCE_DELTA_SCI_FORMULA_CONTRACT_DRIFT")
+    counts = tuple(int(item) for item in candidate_sample_counts)
+    if tuple(sorted(set(counts))) != counts or any(item <= 0 for item in counts):
+        raise _error("REFERENCE_DELTA_SCI_CANDIDATES_INVALID")
+    refs: dict[str, str] = {}
+    for cell_id in EXPECTED_CELL_IDS:
+        payload: dict[str, Any] = {
+            "schema_version": S204_DELTA_PLAN_SCHEMA,
+            "status": "READY",
+            "scope": "formal",
+            "phase": "pre_sizing",
+            "cell_id": cell_id,
+            "candidate_sample_counts": list(counts),
+            "formula_contract": contracts[0][2],
+            "formula_contract_hash": next(iter(formula_hashes)),
+            "source_contract_refs": [item[0] for item in contracts],
+            "source_contract_artifact_hashes": [item[1].identity.artifact_hash for item in contracts],
+            "numeric_delta_source": "stage2-reference-sizing-raw-shards-v2-after-sizing-commit",
+        }
+        payload["artifact_hash"] = canonical_json_hash(payload)
+        ref = f"{output_dir}/{_cell_path_component(cell_id)}.json"
+        publish_canonical_immutable(_safe_relative(root, ref, f"delta_sci_plan_output.{cell_id}"), payload)
+        if _load_mapping(root, ref, f"delta_sci_plan.{cell_id}") != payload:
+            raise _error("REFERENCE_DELTA_SCI_PLAN_ROUND_TRIP_DRIFT", cell_id)
+        refs[cell_id] = PurePosixPath(ref).as_posix()
+    return refs
+
+
+def publish_formal_registry_artifacts(
+    data_root: str | Path,
+    *,
+    asset_manifest_ref: str,
+    g22_gate_ref: str,
+    output_dir: str = "evidence/stage2/s204/parameter-registry",
+) -> dict[str, str]:
+    """Convert the validated S2.3/r6 registry source artifacts for S2.4.
+
+    The S2.3 producer's ``stage2-parameter-registry-manifest-v1`` is the
+    authoritative source.  This function only projects its already validated
+    ``ParameterRegistry`` records into the narrower S2.4 artifact consumed by
+    the reference runner; it never infers coordinates from model names.
+    The conversion is deliberately not config-bound: the per-cell auxiliary
+    TaskArtifact published by ``publish_per_cell_runtime_environments`` binds
+    the resulting registry to the resolved config hash after config creation.
+    """
+
+    root = Path(data_root).resolve()
+    asset_ref = _source_ref(asset_manifest_ref, "stage2_asset_resolution")
+    try:
+        asset_task = load_committed_task_artifact(root, asset_ref, require_formal=True)
+        if asset_task.identity.task_id != "stage2.03_assets_checkpoints_and_sampling" or asset_task.identity.artifact_kind != "asset_resolution":
+            raise ValueError("S2.3 asset TaskArtifact identity mismatch")
+        manifest = _formal_s23_asset_manifest(asset_task.payload, field=asset_ref)
+    except Exception as error:
+        raise _error("S23_ASSET_COMMIT_IDENTITY_MISMATCH", asset_ref) from error
+
+    gate_ref = _source_ref(g22_gate_ref, "g22_gate")
+    try:
+        gate_task = load_committed_task_artifact(root, gate_ref, require_formal=True)
+        if gate_task.identity.task_id != "stage2.03_assets_checkpoints_and_sampling" or gate_task.identity.artifact_kind != "gate_record":
+            raise ValueError("G2.2 adapter task identity mismatch")
+        gate = GateRecord.from_mapping(dict(gate_task.payload))
+    except Exception as error:
+        raise _error("G22_FORMAL_COMMIT_REQUIRED", gate_ref) from error
+    if gate.gate_id != "stage2.G2.2" or gate.status is not GateStatus.PASS:
+        raise _error("G22_GATE_NOT_PASS", gate_ref)
+    if not any(ref in set(gate.evidence_refs) for ref in (asset_ref, *asset_task.source_refs)):
+        raise _error("G22_ASSET_UPSTREAM_BINDING_MISMATCH", gate_ref)
+
+    # Reuse the reviewed r6 validator.  It checks the fixed amendment parent,
+    # registry-index hash, all six source-manifest hashes, and every
+    # checkpoint/registry cross-binding before this projection is written.
+    try:
+        from param_importance_nlp.experiments import stage2_g22_adapter as g22
+
+        parent_value = _load_mapping(root, g22.ASSET_REF, "g22_parent_asset")
+        parent = AssetResolutionManifest.from_mapping(parent_value)
+        materialized, bindings, _ = g22._validate_amendment(root, parent)
+        if materialized.digest != manifest.digest:
+            raise ValueError("G2.2 amendment asset digest differs from S2.3 task")
+        rows = g22._validate_formal_registry_index(root, materialized, bindings)
+    except Exception as error:
+        raise _error("FORMAL_R6_REGISTRY_VALIDATION_FAILED", type(error).__name__) from error
+
+    by_cell = {str(row["cell_id"]): row for row in rows}
+    if tuple(by_cell) != EXPECTED_CELL_IDS:
+        raise _error("FORMAL_R6_REGISTRY_CELL_SET_INVALID")
+    refs: dict[str, str] = {}
+    for checkpoint in manifest.checkpoints:
+        cell_id = _cell_id(checkpoint)
+        source = by_cell.get(cell_id)
+        if source is None:
+            raise _error("FORMAL_R6_REGISTRY_CELL_MISSING", cell_id)
+        source_ref = _source_ref(source["ref"], f"registry_source.{cell_id}")
+        source_value = _load_mapping(root, source_ref, f"registry_source.{cell_id}")
+        try:
+            registry = ParameterRegistry.from_manifest(source_value["registry"])
+        except Exception as error:
+            raise _error("FORMAL_R6_REGISTRY_PAYLOAD_INVALID", cell_id) from error
+        groups: dict[str, dict[str, str]] = {}
+        for record in registry.eligible_records:
+            layer = record.tags.get("layer")
+            module = record.tags.get("module")
+            if not isinstance(layer, str) or not layer or not isinstance(module, str) or not module:
+                raise _error("FORMAL_R6_REGISTRY_GROUP_TAGS_REQUIRED", cell_id)
+            groups[record.canonical_name] = {"layer": layer, "module": module}
+        if set(groups) != set(registry.eligible_names):
+            raise _error("FORMAL_R6_REGISTRY_ELIGIBLE_SET_INVALID", cell_id)
+        payload: dict[str, Any] = {
+            "schema_version": S204_REGISTRY_SCHEMA,
+            "status": "READY",
+            "scope": "formal",
+            "cell_id": cell_id,
+            "checkpoint_id": checkpoint.checkpoint_id,
+            "model_id": checkpoint.model_id,
+            "training_stage": checkpoint.training_stage,
+            "registry_hash": str(source["registry_hash"]),
+            "parameter_groups": groups,
+            "source_s203_manifest_ref": source_ref,
+            "source_s203_manifest_sha256": str(source["sha256"]),
+            "source_asset_resolution_hash": manifest.digest,
+            "source_g22_gate_ref": gate_ref,
+            "source_g22_gate_artifact_hash": gate_task.identity.artifact_hash,
+        }
+        payload["artifact_hash"] = canonical_json_hash(payload)
+        ref = f"{output_dir}/{_cell_path_component(cell_id)}.json"
+        publish_canonical_immutable(_safe_relative(root, ref, f"registry_output.{cell_id}"), payload)
+        if _load_mapping(root, ref, f"registry_output.{cell_id}") != payload:
+            raise _error("FORMAL_R6_REGISTRY_ROUND_TRIP_DRIFT", cell_id)
+        refs[cell_id] = PurePosixPath(ref).as_posix()
+    if len(refs) != len(EXPECTED_CELL_IDS):
+        raise _error("FORMAL_R6_REGISTRY_CELL_COUNT_INVALID")
+    return refs
 
 
 def _extract_frozen_delta_sci(
@@ -3362,6 +3600,7 @@ def generate_six_cell_configs(
     data_asset_id: str = DEFAULT_DATA_ASSET_ID,
     parameter_registry_refs: Mapping[str, str] | None = None,
     delta_sci_refs: Mapping[str, str] | None = None,
+    delta_phase: str = "pre_sizing",
 ) -> dict[str, ResolvedConfigV2]:
     """Generate one unique, identity-bound v2 config per formal checkpoint.
 
@@ -3372,6 +3611,8 @@ def generate_six_cell_configs(
 
     if mode not in {"fresh", "resume"}:
         raise _error("CONFIG_MODE_INVALID", mode)
+    if delta_phase not in {"pre_sizing", "post_sizing"}:
+        raise _error("DELTA_PHASE_INVALID", delta_phase)
     root = Path(data_root).resolve()
     output_root_ref = _logical(output_dir, "config_output_dir")
     manifest_ref = _source_ref(asset_manifest_ref, "stage2_asset_resolution")
@@ -3429,12 +3670,15 @@ def generate_six_cell_configs(
         root=root,
     )
     if delta_sci_refs is None and formal_cell_inputs:
-        delta_map = publish_per_cell_delta_sci(
-            root,
-            s21_refs=s201,
-            candidate_sample_counts=DEFAULT_CANDIDATES,
-            output_dir=f"{output_root_ref}/reference-delta-sci",
-        )
+        if delta_phase == "pre_sizing":
+            delta_map = publish_per_cell_delta_sci_plans(
+                root,
+                s21_refs=s201,
+                candidate_sample_counts=DEFAULT_CANDIDATES,
+                output_dir=f"{output_root_ref}/reference-delta-sci-plans",
+            )
+        else:
+            raise _error("POST_SIZING_DELTA_REF_REQUIRED")
     else:
         delta_map = _cell_ref_map(
             delta_sci_refs,
@@ -3578,11 +3822,13 @@ def generate_six_cell_configs(
                 cell_id=cell_id,
                 checkpoint=checkpoint,
                 config_hash=config.config_hash,
+                require_config_hash=False,
             )
             _validate_delta_sci_artifact(
                 root,
                 delta_map[cell_id],
                 cell_id=cell_id,
+                allow_pre_sizing_plan=delta_phase == "pre_sizing",
             )
         cells[cell_id] = config
     if len(cells) != 6 or tuple(cells) != EXPECTED_CELL_IDS or len({item.config_hash for item in cells.values()}) != 6:
@@ -3647,6 +3893,7 @@ def publish_six_cell_manifest(
             cell_id=cell_id,
             checkpoint=checkpoint,
             config_hash=config.config_hash,
+            require_config_hash=False,
         )
         registry_hash = _sha(registry.get("registry_hash"), f"registry.{cell_id}")
         registry_hashes[cell_id] = registry_hash
@@ -3836,6 +4083,8 @@ __all__ = [
     "main",
     "materialize_formal_task_inputs",
     "publish_per_cell_delta_sci",
+    "publish_per_cell_delta_sci_plans",
+    "publish_formal_registry_artifacts",
     "publish_per_cell_runtime_environments",
     "publish_per_cell_sizing_plans",
     "publish_reference_sizing_plan",
