@@ -28,6 +28,8 @@ from dataclasses import dataclass
 import hashlib
 import math
 from pathlib import Path, PurePosixPath
+import random
+import shutil
 import subprocess
 from time import perf_counter
 
@@ -45,6 +47,7 @@ from ..contracts.jsonio import (
     JSONValue,
     canonical_json_hash,
     load_canonical_json,
+    write_canonical_json,
 )
 from ..contracts.stage1_handoff import (
     Stage1ExitEvidence,
@@ -58,6 +61,7 @@ from ..contracts.stage0_handoff import (
 )
 from ..contracts.seed import SeedPlan
 from ..contracts.stage23 import FormalExecutionEvidence
+from ..contracts.freeze import ContractFreeze
 from ..contracts.task_catalog import DEFAULT_TASK_CATALOG, RecoveryMode, RunnerKind
 from ..analysis import (
     AnalysisReportBuilder,
@@ -144,6 +148,8 @@ from .stage2_assets import (
 )
 from .stage2 import PairedEstimatorRunner, build_fixture_estimator_decision
 from .preregistration import (
+    ABSOLUTE_FLOORS,
+    PREREGISTRATION_SCHEMA_VERSION,
     build_stage2_hypothesis_contract,
     build_stage2_preregistration,
     validate_stage2_preregistration,
@@ -163,6 +169,18 @@ from .stage2_formal import (
     ReferenceSizingPlan,
     Stage2RecommendationEngine,
     StreamingReferenceSizer,
+    _ReferenceSnapshotStore,
+    _ReferenceShardStore,
+    _moments_from_shards,
+    _draw_digest,
+)
+from .stage2_g23_contracts import (
+    boundary_digest,
+    generator_boundary,
+    source_manifest_for_refs,
+    validate_external_manifest,
+    validate_sizing_plan_contract,
+    validate_weighting_contract,
 )
 from .stage3 import (
     EndpointState,
@@ -226,7 +244,13 @@ _STAGE23_TASK_ORDER = (
 # independent consumers of 2.01; later tasks consume only the listed direct
 # predecessors, rather than accidentally serializing the whole experiment.
 _REQUIRED_PREDECESSORS: Mapping[str, tuple[str, ...]] = {
-    "stage2.01_scope_hypotheses_and_preregistration": (),
+    # Stage 2 enters only from the completed formal Stage 1.11 delivery set.
+    # Local fixture callers may still use the isolated S2.1 contract helper;
+    # ``_predecessor_context`` keeps that explicit test-only exception while
+    # formal execution always consumes all four Stage 1.11 commits.
+    "stage2.01_scope_hypotheses_and_preregistration": (
+        "stage1.11_reporting_and_exit_gate",
+    ),
     "stage2.02_stage1_handoff_and_fixed_state_contract": (
         "stage2.01_scope_hypotheses_and_preregistration",
     ),
@@ -290,6 +314,13 @@ def _logical_path(value: str, *, field: str) -> PurePosixPath:
 
 def _workspace_path(root: Path, value: str, *, field: str) -> Path:
     logical = _logical_path(value, field=field)
+    if root.is_symlink():
+        raise ValueError(f"STAGE23_TASK_SYMLINK_FORBIDDEN:{field}")
+    current = root
+    for part in logical.parts:
+        current = current / part
+        if current.is_symlink():
+            raise ValueError(f"STAGE23_TASK_SYMLINK_FORBIDDEN:{field}")
     target = root.joinpath(*logical.parts).resolve()
     try:
         target.relative_to(root)
@@ -688,6 +719,47 @@ def _document_hash(path: Path) -> str:
     return canonical_json_hash(value)
 
 
+def _formal_contract_freeze_hash(
+    root: Path,
+    reference: str,
+    *,
+    stage: int,
+) -> str:
+    """读取 formal contract freeze，严格区分 TaskArtifact 与旧裸文档。"""
+
+    path = _workspace_path(root, reference, field="contract_freeze")
+    value = load_canonical_json(path)
+    if not isinstance(value, Mapping) or value.get("schema_version") != (
+        "task-output-commit-v1"
+    ):
+        # Historical handoff documents predate the TaskArtifact envelope and remain
+        # readable only through the narrowly scoped legacy hash path.
+        return _document_hash(path)
+
+    # Once the root advertises a TaskArtifact commit, every validation below is
+    # mandatory.  In particular, never fall back to hashing the commit envelope
+    # when its object, kind, or payload is malformed.
+    loaded = load_committed_task_artifact(root, reference, require_formal=True)
+    if loaded.identity.artifact_kind != "contract_freeze":
+        raise ValueError(
+            "CONTRACT_FREEZE_COMMIT_ARTIFACT_KIND_INVALID:"
+            f"{loaded.identity.artifact_kind}"
+        )
+    payload = loaded.payload
+    if payload.get("schema_version") != "contract-freeze-v1":
+        raise ValueError("CONTRACT_FREEZE_COMMIT_PAYLOAD_SCHEMA_INVALID")
+    freeze = ContractFreeze.from_mapping(dict(payload))
+    if freeze.stage != stage or not freeze.formal_eligible:
+        raise ValueError("CONTRACT_FREEZE_COMMIT_NOT_FORMAL_FOR_STAGE")
+    payload_hash = payload.get("artifact_hash")
+    if not isinstance(payload_hash, str):
+        raise ValueError("CONTRACT_FREEZE_COMMIT_PAYLOAD_HASH_MISSING")
+    # ContractFreeze.from_mapping already binds this field to the payload; return
+    # the payload hash (rather than the enclosing TaskArtifact hash) to compare
+    # against FormalExecutionEvidence.contract_freeze_hash.
+    return payload_hash
+
+
 def _blocked(
     code: BlockerCode,
     requirement: str,
@@ -712,6 +784,7 @@ class _BoundInputArtifact:
     run_intent: str
     formal_eligible: bool
     commit_ref: str
+    source_refs: tuple[str, ...]
     payload: Mapping[str, object]
 
 
@@ -792,6 +865,11 @@ def _load_bound_task_input(
     payload = body.get("payload")
     if not isinstance(payload, Mapping):
         raise ValueError("STAGE23_INPUT_PAYLOAD_NOT_MAPPING")
+    source_refs = body.get("source_refs")
+    if not isinstance(source_refs, (list, tuple)) or not all(
+        isinstance(value, str) and value for value in source_refs
+    ):
+        raise ValueError("STAGE23_INPUT_SOURCE_REFS_INVALID")
     run_intent = body.get("run_intent")
     if run_intent not in {"local_fixture", "formal"}:
         raise ValueError("STAGE23_INPUT_RUN_INTENT_INVALID")
@@ -803,6 +881,7 @@ def _load_bound_task_input(
         run_intent=str(run_intent),
         formal_eligible=published.formal_eligible,
         commit_ref=published.commit_ref,
+        source_refs=tuple(source_refs),
         payload=dict(payload),
     )
 
@@ -834,6 +913,14 @@ def _predecessor_context(
             "input_result_refs 含重复引用，无法形成唯一 lineage",
             retryable=False,
         )
+
+    if (
+        request.config.run_intent == "local_fixture"
+        and request.task.task_id == "stage2.01_scope_hypotheses_and_preregistration"
+        and not raw_refs
+        and expected_tasks == ("stage1.11_reporting_and_exit_gate",)
+    ):
+        expected_tasks = ()
 
     grouped: dict[str, dict[str, _BoundInputArtifact]] = {}
     auxiliaries: list[str] = []
@@ -895,7 +982,6 @@ def _predecessor_context(
             )
         ordered.extend(observed[kind] for kind in definition.artifact_kinds)
 
-    # Stage2.01 是本链入口；它可以绑定额外预注册附件，但不能伪造前驱 task。
     return _PredecessorContext(expected_tasks, tuple(ordered), tuple(auxiliaries))
 
 
@@ -1099,10 +1185,12 @@ def _formal_execution_evidence(
             evidence_refs=(reference,),
         )
     try:
-        observed = _document_hash(
-            _workspace_path(root, freeze_ref, field="contract_freeze")
+        observed = _formal_contract_freeze_hash(
+            root,
+            freeze_ref,
+            stage=request.task.stage,
         )
-    except (FileNotFoundError, ValueError) as error:
+    except Exception as error:
         raise _blocked(
             BlockerCode.CONTRACT_UNFROZEN,
             "contract_freeze",
@@ -1526,8 +1614,8 @@ def _stage2_source_identity() -> tuple[str, str | None, str | None]:
 
     Local fixture tests execute with a temporary artifact root, so the repository
     identity comes from this source module's worktree rather than that output root.
-    Missing report files are represented as ``None`` for development; formal
-    preflight remains responsible for requiring the Stage 1 evidence.
+    Stage1 formal provenance is supplied by the immutable DATA_ROOT bridge; the
+    tracked ``reports/...local_fixture`` file is intentionally never used.
     """
 
     repository_root = Path(__file__).resolve().parents[3]
@@ -1547,14 +1635,123 @@ def _stage2_source_identity() -> tuple[str, str | None, str | None]:
             return None
         return hashlib.sha256(path.read_bytes()).hexdigest()
 
-    return (
-        producer_commit,
-        file_hash("docs/mathematics.md"),
-        file_hash(
-            "reports/stage1/cpu-evidence-20260814-s12-r2/"
-            "stage1.11_reporting_and_exit_gate/stage_report.json"
-        ),
+    return (producer_commit, file_hash("docs/mathematics.md"), None)
+
+
+def _stage1_formal_bridge_identity(
+    root: Path,
+    inputs: _PredecessorContext,
+) -> Mapping[str, JSONValue] | None:
+    """Load and verify the canonical S1.11 manifest from formal predecessor commits.
+
+    Formal S1.11 TaskArtifact envelopes carry the complete source closure but do
+    not carry the historical ``stage1-11-bridge-evidence.json`` compatibility
+    ref.  The manifest is therefore discovered from the common output root of
+    the four already-verified commit refs and returned byte-for-byte as the
+    evaluator's ``bridge_payload``.
+    """
+
+    expected_kinds = (
+        "stage_report",
+        "requirements_matrix",
+        "gate_summary",
+        "delivery_manifest",
     )
+    if tuple(item.artifact_kind for item in inputs.artifacts) != expected_kinds:
+        raise ValueError("STAGE2_STAGE1_MANIFEST_ARTIFACT_SET_INVALID")
+    output_roots: set[str] = set()
+    for item in inputs.artifacts:
+        commit_path = PurePosixPath(item.commit_ref)
+        if len(commit_path.parts) < 3 or commit_path.parent.name != "commits":
+            raise ValueError("STAGE2_STAGE1_MANIFEST_OUTPUT_ROOT_INVALID")
+        output_roots.add(commit_path.parent.parent.as_posix())
+    if len(output_roots) != 1:
+        raise ValueError("STAGE2_STAGE1_MANIFEST_OUTPUT_ROOT_NOT_COMMON")
+    output_root = next(iter(output_roots))
+    manifest_ref = f"{output_root}/manifest.json"
+    value = load_canonical_json(
+        _workspace_path(root, manifest_ref, field="stage1_manifest")
+    )
+    if not isinstance(value, Mapping):
+        raise ValueError("STAGE2_STAGE1_MANIFEST_NOT_OBJECT")
+
+    def is_sha256(candidate: object) -> bool:
+        return (
+            isinstance(candidate, str)
+            and len(candidate) == 64
+            and all(character in "0123456789abcdef" for character in candidate)
+        )
+
+    manifest_hash = value.get("artifact_hash")
+    if not is_sha256(manifest_hash) or canonical_json_hash(
+        {key: item for key, item in value.items() if key != "artifact_hash"}
+    ) != manifest_hash:
+        raise ValueError("STAGE2_STAGE1_MANIFEST_SELF_HASH_INVALID")
+    if (
+        value.get("schema_version") != "stage1-s1-11-task-artifact-manifest-v2"
+        or value.get("status") != "PASS"
+        or value.get("run_intent") != "formal"
+        or value.get("formal_eligible") is not True
+        or value.get("task_id") != "stage1.11_reporting_and_exit_gate"
+        or value.get("gate_id") != "G1-EXIT"
+    ):
+        raise ValueError("STAGE2_STAGE1_MANIFEST_IDENTITY_INVALID")
+
+    config_hashes = {item.config_hash for item in inputs.artifacts}
+    if len(config_hashes) != 1:
+        raise ValueError("STAGE2_STAGE1_MANIFEST_CONFIG_IDENTITY_INVALID")
+    config_hash = next(iter(config_hashes))
+    config_ref = value.get("config_ref")
+    if config_ref != f"{output_root}/producer-config.json" or value.get(
+        "config_hash"
+    ) != config_hash:
+        raise ValueError("STAGE2_STAGE1_MANIFEST_CONFIG_INVALID")
+    config = load_canonical_json(
+        _workspace_path(root, str(config_ref), field="stage1_manifest_config")
+    )
+    if (
+        not isinstance(config, Mapping)
+        or config.get("config_hash") != config_hash
+        or canonical_json_hash(
+            {key: item for key, item in config.items() if key != "config_hash"}
+        )
+        != config_hash
+    ):
+        raise ValueError("STAGE2_STAGE1_MANIFEST_CONFIG_SELF_HASH_INVALID")
+
+    expected_commit_refs = {
+        item.artifact_kind: item.commit_ref for item in inputs.artifacts
+    }
+    expected_envelope_hashes = {
+        item.artifact_kind: item.artifact_hash for item in inputs.artifacts
+    }
+    if value.get("commit_refs") != expected_commit_refs:
+        raise ValueError("STAGE2_STAGE1_MANIFEST_COMMIT_REFS_INVALID")
+    if value.get("commit_artifact_hashes") != expected_envelope_hashes:
+        raise ValueError("STAGE2_STAGE1_MANIFEST_ENVELOPE_HASHES_INVALID")
+    return dict(value)
+
+
+def _formal_stage1_report_artifact_hash(inputs: _PredecessorContext) -> str:
+    """Return the authoritative envelope hash for the formal Stage 1 report.
+
+    ``_BoundInputArtifact.artifact_hash`` is copied from the verified task commit;
+    it is intentionally distinct from a payload field named ``artifact_hash``.
+    The latter is a business-payload hash and is not a valid Stage 1 provenance
+    binding for the formal evaluator.
+    """
+
+    matches = [
+        item
+        for item in inputs.artifacts
+        if item.artifact_kind == "stage_report"
+    ]
+    if len(matches) != 1:
+        raise ValueError("STAGE2_STAGE1_REPORT_ARTIFACT_NOT_UNIQUE")
+    report = matches[0]
+    if report.run_intent != "formal" or report.formal_eligible is not True:
+        raise ValueError("STAGE2_STAGE1_REPORT_FORMAL_ARTIFACT_REQUIRED")
+    return report.artifact_hash
 
 
 def _run_stage2_contract(
@@ -1582,12 +1779,29 @@ def _run_stage2_contract(
             )
     seed_plan = SeedPlan.from_master_seed(int(identity["master_seed"]))
     producer_commit, mathematics_hash, stage1_report_hash = _stage2_source_identity()
+    stage1_handoff = (
+        _stage1_formal_bridge_identity(root, inputs)
+        if request.config.run_intent == "formal"
+        else None
+    )
+    formal_stage1_report_hash = (
+        _formal_stage1_report_artifact_hash(inputs)
+        if request.config.run_intent == "formal"
+        else None
+    )
     preregistration = build_stage2_preregistration(
         seed_plan_hash=seed_plan.artifact_hash,
         producer_commit=producer_commit,
         mathematics_hash=mathematics_hash,
-        stage1_report_hash=stage1_report_hash,
+        # Formal provenance binds the verified Stage 1 task-artifact envelope;
+        # the tracked report remains local-draft compatibility only.
+        stage1_report_hash=(
+            formal_stage1_report_hash
+            if request.config.run_intent == "formal"
+            else stage1_report_hash
+        ),
         upstream_binding_hash=inputs.binding_hash,
+        stage1_handoff=stage1_handoff,
         scope=request.config.run_intent,
     )
     validate_stage2_preregistration(preregistration)
@@ -2012,6 +2226,7 @@ def _stage2_reference_plan(
     request: TaskExecutionRequest,
     root: Path,
     context: _ProviderContext,
+    authoritative: Mapping[str, object] | None = None,
 ) -> tuple[ReferenceSizingPlan, tuple[str, ...]]:
     if request.config.run_intent == "local_fixture":
         return (
@@ -2025,12 +2240,16 @@ def _stage2_reference_plan(
             ),
             (),
         )
-    value, reference = _formal_input_document(
-        request,
-        root,
-        schema_version="stage2-reference-sizing-plan-v1",
-        requirement="formal_reference_sizing_plan",
-    )
+    if authoritative is not None:
+        value = authoritative
+        reference = str(request.environment.evidence_refs.get("stage2_reference_sizing_plan"))
+    else:
+        value, reference = _formal_input_document(
+            request,
+            root,
+            schema_version="stage2-reference-sizing-plan-v1",
+            requirement="formal_reference_sizing_plan",
+        )
     if value.get("execution_evidence_hash") != context.evidence.artifact_hash:
         raise _blocked(
             BlockerCode.CONTRACT_UNFROZEN,
@@ -2108,6 +2327,769 @@ def _stable_reference_artifact(
     return payload
 
 
+def _reference_identity_hash(value: Mapping[str, object]) -> str:
+    """Hash an identity object without allowing a caller-supplied digest."""
+
+    return canonical_json_hash(dict(value))
+
+
+def _reference_parameter_registry(
+    request: TaskExecutionRequest,
+    root: Path,
+    context: _ProviderContext,
+    authoritative: Mapping[str, object] | None = None,
+) -> Mapping[str, object] | None:
+    """Load the canonical parameter grouping used by every G2.3 endpoint.
+
+    Formal execution must receive this artifact from the frozen Stage 1/S2.2
+    handoff.  A local fixture may derive its tiny registry from the fixed
+    provider only because the fixture provider itself publishes the explicit
+    mapping; the evaluator never guesses groups from parameter names.
+    """
+
+    if authoritative is not None:
+        value = authoritative
+        reference = str(request.environment.evidence_refs.get("stage2_parameter_registry"))
+        groups = value.get("parameter_groups") if isinstance(value, Mapping) else None
+        if (
+            not isinstance(value, Mapping)
+            or value.get("schema_version") != "stage2-parameter-registry-artifact-v1"
+            or value.get("registry_hash") != context.provider.registry_hash
+            or not isinstance(groups, Mapping)
+            or not isinstance(value.get("artifact_hash"), str)
+            or value.get("artifact_hash") != canonical_json_hash({k: v for k, v in value.items() if k != "artifact_hash"})
+        ):
+            return None
+        return value
+    reference = request.environment.evidence_refs.get("stage2_parameter_registry")
+    if reference is not None:
+        try:
+            value = load_canonical_json(_workspace_path(
+                root,
+                reference,
+                field="stage2_parameter_registry",
+            ))
+        except (OSError, TypeError, ValueError):
+            # The task runner's formal root is not carried by the context; the
+            # caller will report the missing artifact as an explicit blocker.
+            return None
+        if not isinstance(value, Mapping):
+            return None
+        if value.get("schema_version") != "stage2-parameter-registry-artifact-v1":
+            return None
+        if value.get("registry_hash") != context.provider.registry_hash:
+            return None
+        groups = value.get("parameter_groups")
+        if not isinstance(groups, Mapping):
+            return None
+        return value
+    if request.config.run_intent != "local_fixture":
+        return None
+    groups: dict[str, object] = {}
+    for name in context.provider.parameter_names:
+        parts = str(name).split(".")
+        groups[str(name)] = {
+            "layer": ".".join(parts[:2]) if len(parts) > 1 else parts[0],
+            "module": parts[0],
+        }
+    body: dict[str, object] = {
+        "schema_version": "stage2-parameter-registry-artifact-v1",
+        "registry_hash": context.provider.registry_hash,
+        "parameter_groups": groups,
+        "source": "local_fixed_state_provider_registry",
+    }
+    body["artifact_hash"] = canonical_json_hash(body)
+    return body
+
+
+def _reference_formula_contract(
+    request: TaskExecutionRequest,
+    authoritative: Mapping[str, object] | None,
+) -> tuple[Mapping[str, object], str]:
+    """Validate the S2.1 formula/floor contract without consuming numbers."""
+
+    if authoritative is None:
+        if request.config.run_intent != "local_fixture":
+            raise _blocked(
+                BlockerCode.CONTRACT_UNFROZEN,
+                "stage2_preregistration",
+                "formal reference requires the hash-bound S2.1 formula contract",
+                retryable=False,
+            )
+        body: dict[str, object] = {
+            "schema_version": PREREGISTRATION_SCHEMA_VERSION,
+            "scope": "local_fixture",
+            "equivalence_and_precision": {
+                "scientific_margin_formula": "max(0.10*Delta_c_e(B),0.01*S_c_e)",
+                "signal_definition": "S_model=max(abs(sum(a_k)),tau_model); S_q=max(sum_g(abs(sum_g(a_k))),tau_q)",
+                "noise_definition": "Delta_model=abs(sum_k(d_k(B))); Delta_q=sum_g(abs(sum_g(d_k(B))))",
+                "sizing_vectors": {"a": "mu_sizing^2", "d": "sigma_squared_over_B"},
+                "group_registry": "canonical_non_overlapping_layer_and_module_registry",
+                "absolute_floors": dict(ABSOLUTE_FLOORS),
+            },
+        }
+        return dict(body, preregistration_hash=canonical_json_hash(body)), canonical_json_hash(body)
+
+    value = authoritative
+    if value.get("schema_version") != PREREGISTRATION_SCHEMA_VERSION or value.get("scope") != "formal":
+        raise _blocked(BlockerCode.CONTRACT_UNFROZEN, "stage2_preregistration", "S2.1 formula contract must be formal", retryable=False)
+    supplied = value.get("preregistration_hash")
+    if not isinstance(supplied, str) or supplied != canonical_json_hash({key: item for key, item in value.items() if key != "preregistration_hash"}):
+        raise _blocked(BlockerCode.CONTRACT_UNFROZEN, "stage2_preregistration", "S2.1 preregistration hash is not content-bound", retryable=False)
+    precision = value.get("equivalence_and_precision")
+    if not isinstance(precision, Mapping):
+        raise _blocked(BlockerCode.CONTRACT_UNFROZEN, "stage2_preregistration", "S2.1 equivalence_and_precision contract is missing", retryable=False)
+    expected_formulas = {
+        "scientific_margin_formula": "max(0.10*Delta_c_e(B),0.01*S_c_e)",
+        "signal_definition": "S_model=max(abs(sum(a_k)),tau_model); S_q=max(sum_g(abs(sum_g(a_k))),tau_q)",
+        "noise_definition": "Delta_model=abs(sum_k(d_k(B))); Delta_q=sum_g(abs(sum_g(d_k(B))))",
+        "sizing_vectors": {"a": "mu_sizing^2", "d": "sigma_squared_over_B"},
+        "group_registry": "canonical_non_overlapping_layer_and_module_registry",
+    }
+    if any(precision.get(key) != expected for key, expected in expected_formulas.items()):
+        raise _blocked(BlockerCode.CONTRACT_UNFROZEN, "stage2_preregistration", "S2.1 formula contract drifted", retryable=False)
+    floors = precision.get("absolute_floors")
+    if not isinstance(floors, Mapping) or set(floors) != set(ABSOLUTE_FLOORS):
+        raise _blocked(BlockerCode.CONTRACT_UNFROZEN, "stage2_preregistration", "S2.1 absolute floors are missing or changed", retryable=False)
+    for name, expected in ABSOLUTE_FLOORS.items():
+        actual = floors.get(name)
+        if isinstance(actual, bool) or not isinstance(actual, (int, float)) or not math.isfinite(float(actual)) or float(actual) != float(expected) or float(actual) <= 0:
+            raise _blocked(BlockerCode.CONTRACT_UNFROZEN, "stage2_preregistration", f"S2.1 absolute floor invalid: {name}", retryable=False)
+    return value, supplied
+
+
+def _weighted_sequence_variance_from_shards(
+    store: _ReferenceShardStore,
+    refs: Sequence[Mapping[str, object]],
+    assumptions: Mapping[str, object],
+    block_size: int,
+) -> Mapping[str, np.ndarray]:
+    """Compute sequence variance in two streaming passes over immutable shards."""
+
+    if block_size <= 0 or len(refs) < 2:
+        raise ValueError("STAGE2_SIZING_VARIANCE_REQUIRES_TWO_BLOCKS")
+    moments = _moments_from_shards(store, refs, assumptions)
+    mean = moments.mean()
+    variance = {name: np.zeros_like(value, dtype=np.float64) for name, value in mean.items()}
+    for ref in refs:
+        vector, weight, _ = store.load(ref)
+        for name in variance:
+            variance[name] += float(weight) * np.square(vector[name] - mean[name])
+    return {name: value * float(block_size) / float(moments.n1) for name, value in variance.items()}
+
+
+def _sizing_groups(
+    parameter_registry: Mapping[str, object],
+    names: Sequence[str],
+) -> tuple[dict[str, tuple[str, ...]], dict[str, tuple[str, ...]]]:
+    groups = parameter_registry.get("parameter_groups")
+    if not isinstance(groups, Mapping) or set(str(name) for name in groups) != set(names):
+        raise ValueError("STAGE2_SIZING_PARAMETER_REGISTRY_SET_MISMATCH")
+    layer: dict[str, list[str]] = {}
+    module: dict[str, list[str]] = {}
+    for name in names:
+        entry = groups.get(name)
+        if not isinstance(entry, Mapping):
+            raise ValueError(f"STAGE2_SIZING_PARAMETER_GROUP_MISSING:{name}")
+        layer_name, module_name = entry.get("layer"), entry.get("module")
+        if not isinstance(layer_name, str) or not layer_name or not isinstance(module_name, str) or not module_name:
+            raise ValueError(f"STAGE2_SIZING_PARAMETER_GROUP_INVALID:{name}")
+        layer.setdefault(layer_name, []).append(name)
+        module.setdefault(module_name, []).append(name)
+    return {key: tuple(value) for key, value in sorted(layer.items())}, {key: tuple(value) for key, value in sorted(module.items())}
+
+
+def _sizing_delta_sci(signal: float, noise: float) -> float:
+    """Apply the frozen sizing margin formula to one endpoint and one B.
+
+    Keeping this as a small pure operation makes the numeric contract
+    independently testable.  The caller still derives ``signal`` and
+    ``noise`` from raw sizing shards; this helper never accepts a caller
+    supplied margin.
+    """
+
+    signal_f, noise_f = float(signal), float(noise)
+    if not math.isfinite(signal_f) or not math.isfinite(noise_f) or signal_f <= 0.0 or noise_f <= 0.0:
+        raise ValueError("STAGE2_SIZING_MARGIN_SCALES_MUST_BE_FINITE_POSITIVE")
+    delta = max(0.10 * noise_f, 0.01 * signal_f)
+    if not math.isfinite(delta) or delta <= 0.0:
+        raise ValueError("STAGE2_SIZING_MARGIN_INVALID")
+    return delta
+
+
+def _derive_sizing_delta_sci(
+    *,
+    root: Path,
+    sizing_root: Path,
+    plan: ReferenceSizingPlan,
+    parameter_registry: Mapping[str, object],
+    formula_contract: Mapping[str, object],
+    formula_contract_hash: str,
+    provider: FixedStateGradientProvider,
+    sizing_result_hash: str,
+) -> Mapping[str, object]:
+    """Derive and freeze all candidate margins from sizing shards before A/B."""
+
+    commits = sorted((sizing_root / "commits").glob("*.json"))
+    if not commits:
+        raise _blocked(BlockerCode.CONTRACT_UNFROZEN, "stage2_reference_sizing", "sizing commits missing", retryable=False)
+    assumptions = {
+        "statistical_unit": provider.statistical_unit,
+        "weight_unit": provider.weight_unit,
+        "sampling_design": provider.sampling_design,
+        "weights_exogenous": provider.weights_exogenous,
+        "common_mean_assumption": provider.common_mean_assumption,
+    }
+    shard_store = _ReferenceShardStore(sizing_root)
+    state_by_count: dict[int, tuple[Mapping[str, object], Mapping[str, object]]] = {}
+    for commit_path in commits:
+        commit = load_canonical_json(commit_path)
+        if not isinstance(commit, Mapping):
+            raise _blocked(BlockerCode.CONTRACT_UNFROZEN, "stage2_reference_sizing", "sizing commit invalid", retryable=False)
+        object_ref = commit.get("object_ref")
+        if not isinstance(object_ref, str):
+            raise _blocked(BlockerCode.CONTRACT_UNFROZEN, "stage2_reference_sizing", "sizing object ref missing", retryable=False)
+        state, bundle = load_tensor_bundle(sizing_root / object_ref)
+        if not isinstance(state, Mapping) or state.get("schema_version") != "stage2-reference-progress-state-v1" or bundle.manifest_sha256 != commit.get("object_manifest_hash"):
+            raise _blocked(BlockerCode.CONTRACT_UNFROZEN, "stage2_reference_sizing", "sizing state invalid", retryable=False)
+        count = int(state.get("processed_block_pairs", 0)) * plan.block_size
+        refs = state.get("shard_refs_a")
+        if count <= 0 or not isinstance(refs, list) or len(refs) != int(state.get("processed_block_pairs", 0)) or state.get("shard_refs_b") not in ([], None):
+            raise _blocked(BlockerCode.CONTRACT_UNFROZEN, "stage2_reference_sizing", "sizing shard prefix invalid", retryable=False)
+        for ref in refs:
+            if not isinstance(ref, Mapping):
+                raise _blocked(BlockerCode.CONTRACT_UNFROZEN, "stage2_reference_sizing", "sizing shard ref invalid", retryable=False)
+            shard_store.load(ref)
+        state_by_count[count] = (state, {"commit": commit, "refs": refs})
+    if any(count not in state_by_count for count in plan.candidate_sample_counts):
+        raise _blocked(BlockerCode.CONTRACT_UNFROZEN, "stage2_reference_sizing", "sizing shards do not cover every candidate B", retryable=False)
+    latest_refs = state_by_count[plan.candidate_sample_counts[-1]][1]["refs"]
+    assert isinstance(latest_refs, list) and latest_refs
+    first_vector, _, _ = shard_store.load(latest_refs[0])
+    names = tuple(sorted(first_vector))
+    layer_groups, module_groups = _sizing_groups(parameter_registry, names)
+    precision = formula_contract.get("equivalence_and_precision")
+    if not isinstance(precision, Mapping) or not isinstance(precision.get("absolute_floors"), Mapping):
+        raise _blocked(BlockerCode.CONTRACT_UNFROZEN, "stage2_preregistration", "absolute floors missing", retryable=False)
+    floors = precision["absolute_floors"]
+    endpoints = ("model_total", "layer", "module")
+    delta_by_endpoint: dict[str, dict[str, float]] = {endpoint: {} for endpoint in endpoints}
+    signal_by_endpoint: dict[str, dict[str, float]] = {endpoint: {} for endpoint in endpoints}
+    noise_by_endpoint: dict[str, dict[str, float]] = {endpoint: {} for endpoint in endpoints}
+    nodes: list[dict[str, object]] = []
+    for count in plan.candidate_sample_counts:
+        state, raw = state_by_count[count]
+        refs = raw["refs"]
+        assert isinstance(refs, list)
+        moments = _moments_from_shards(shard_store, refs, assumptions)
+        mean = moments.mean()
+        sigma2 = _weighted_sequence_variance_from_shards(shard_store, refs, assumptions, plan.block_size)
+        a = {name: np.square(mean[name]) for name in names}
+        model_s = max(abs(float(sum(np.sum(value) for value in a.values()))), float(floors["tau_model"]))
+        model_d = abs(float(sum(np.sum(value) for value in sigma2.values()))) / float(count)
+        layer_a = [float(sum(np.sum(a[name]) for name in group)) for group in layer_groups.values()]
+        layer_d = [float(sum(np.sum(sigma2[name]) for name in group)) / float(count) for group in layer_groups.values()]
+        module_a = [float(sum(np.sum(a[name]) for name in group)) for group in module_groups.values()]
+        module_d = [float(sum(np.sum(sigma2[name]) for name in group)) / float(count) for group in module_groups.values()]
+        endpoint_values = {
+            "model_total": (max(abs(model_s), float(floors["tau_model"])), abs(model_d)),
+            "layer": (max(float(sum(abs(value) for value in layer_a)), float(floors["tau_layer"])), float(sum(abs(value) for value in layer_d))),
+            "module": (max(float(sum(abs(value) for value in module_a)), float(floors["tau_module"])), float(sum(abs(value) for value in module_d))),
+        }
+        for endpoint, (signal, noise) in endpoint_values.items():
+            try:
+                delta = _sizing_delta_sci(signal, noise)
+            except (TypeError, ValueError, OverflowError) as error:
+                raise _blocked(BlockerCode.CONTRACT_UNFROZEN, "stage2_reference_delta_sci", f"invalid sizing margin: {endpoint}/{count}", retryable=False)
+            signal_by_endpoint[endpoint][str(count)] = signal
+            noise_by_endpoint[endpoint][str(count)] = noise
+            delta_by_endpoint[endpoint][str(count)] = delta
+        commit = raw["commit"]
+        assert isinstance(commit, Mapping)
+        nodes.append({
+            "sample_count": count,
+            "state_digest": commit.get("state_digest"),
+            "shard_refs_hash": canonical_json_hash([
+                {"shard_hash": ref.get("shard_hash"), "manifest_hash": ref.get("manifest_hash"), "weight": ref.get("weight")}
+                for ref in refs if isinstance(ref, Mapping)
+            ]),
+            "mean_hash": _vector_digest(mean),
+            "sequence_variance_hash": _vector_digest(sigma2),
+        })
+    body: dict[str, object] = {
+        "schema_version": "stage2-reference-delta-sci-v2",
+        "source_kind": "reference_sizing_raw_shards",
+        "formula_contract_hash": formula_contract_hash,
+        "formula_version": "stage2-reference-sizing-margin-v1",
+        "formula": "delta_sci=max(0.10*Delta,0.01*S); a=mu_sizing^2; d=sigma_squared_over_B",
+        "absolute_floors": dict(floors),
+        "reference_id": plan.reference_id,
+        "sizing_result_hash": sizing_result_hash,
+        "sizing_plan_hash": plan.artifact_hash,
+        "candidate_sample_counts": list(plan.candidate_sample_counts),
+        "delta_sci_by_endpoint": delta_by_endpoint,
+        "signal_scale_by_endpoint": signal_by_endpoint,
+        "noise_scale_by_endpoint": noise_by_endpoint,
+        "sizing_nodes": nodes,
+        "registry_hash": provider.registry_hash,
+    }
+    body["artifact_hash"] = canonical_json_hash(body)
+    derived_dir = sizing_root / "derived"
+    derived_dir.mkdir(parents=True, exist_ok=True)
+    derived_path = derived_dir / f"{body['artifact_hash']}.json"
+    if derived_path.exists():
+        if load_canonical_json(derived_path) != body:
+            raise _blocked(BlockerCode.CONTRACT_UNFROZEN, "stage2_reference_delta_sci", "sizing-derived artifact drift", retryable=False)
+    else:
+        write_canonical_json(derived_path, body)
+    source_ref = derived_path.relative_to(root).as_posix()
+    published = dict(body)
+    published["source_ref"] = source_ref
+    published["source_hash"] = body["artifact_hash"]
+    published["source_artifact_hash"] = body["artifact_hash"]
+    return published
+
+
+def _reference_six_cell_manifest(
+    inputs: _PredecessorContext,
+    context: _ProviderContext,
+    authoritative: Mapping[str, object] | None = None,
+) -> Mapping[str, object]:
+    """Project the validated S2.3 six-cell asset matrix into S2.4 output."""
+
+    try:
+        asset_resolution = authoritative if authoritative is not None else inputs.payload("asset_resolution")
+    except (KeyError, ValueError, TypeError):
+        return {
+            "schema_version": "stage2-s204-six-cell-manifest-v1",
+            "status": "MISSING",
+            "checkpoints": [],
+        }
+    if isinstance(asset_resolution, Mapping) and asset_resolution.get("schema_version") == "stage2-s204-six-cell-manifest-v1":
+        return dict(asset_resolution)
+    manifest = asset_resolution.get("stage2_asset_manifest") if isinstance(asset_resolution, Mapping) else None
+    if not isinstance(manifest, Mapping):
+        return {
+            "schema_version": "stage2-s204-six-cell-manifest-v1",
+            "status": "MISSING",
+            "checkpoints": [],
+        }
+    raw = manifest.get("checkpoints")
+    rows: list[Mapping[str, object]] = []
+    if isinstance(raw, list):
+        for item in raw:
+            if not isinstance(item, Mapping):
+                continue
+            rows.append({
+                "cell_id": f"{item.get('model_id')}:{item.get('training_stage')}",
+                "model_id": item.get("model_id"),
+                "training_stage": item.get("training_stage"),
+                "checkpoint_id": item.get("checkpoint_id"),
+                "checkpoint_hash": item.get("manifest_sha256"),
+                "checkpoint_revision": item.get("revision"),
+                "registry_hash": item.get("parameter_registry_hash"),
+                "config_hash": item.get("config_sha256"),
+            })
+    # Keep the S2.3 order frozen (model-major, then initialization/early/
+    # mid_late); the evaluator derives this order from the manifest and never
+    # accepts a caller supplied permutation.
+    model_order = {"pythia-14m": 0, "pythia-31m-deduped": 1}
+    stage_order = {"initialization": 0, "early": 1, "mid_late": 2}
+    rows.sort(
+        key=lambda item: (
+            model_order.get(str(item.get("model_id")), 99),
+            stage_order.get(str(item.get("training_stage")), 99),
+        )
+    )
+    data_range = manifest.get("data_range")
+    body: dict[str, object] = {
+        "schema_version": "stage2-s204-six-cell-manifest-v1",
+        "status": "READY" if len(rows) == 6 else "MISSING",
+        "scope": manifest.get("scope"),
+        "asset_resolution_hash": manifest.get("asset_resolution_hash"),
+        "asset_producer_commit": manifest.get("producer_commit"),
+        "asset_execution_commit": manifest.get("execution_commit"),
+        "checkpoints": rows,
+        "data": dict(data_range) if isinstance(data_range, Mapping) else None,
+        "registry_hash": context.provider.registry_hash,
+    }
+    if isinstance(data_range, Mapping):
+        body["data_range_hash"] = data_range.get("data_range_hash")
+    else:
+        body["data_range_hash"] = None
+    body["manifest_hash"] = canonical_json_hash(body)
+    return body
+
+
+def _trusted_stage2_provenance(*, require_clean: bool) -> Mapping[str, object]:
+    """Bind producer output to an actual repository object and source bytes."""
+
+    repository_root = Path(__file__).resolve().parents[3]
+    try:
+        def git(*arguments: str) -> str:
+            return subprocess.run(
+                ["git", "-C", str(repository_root), *arguments],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+
+        head = git("rev-parse", "HEAD")
+        tree = git("rev-parse", "HEAD^{tree}")
+        git("cat-file", "-e", f"{head}^{{commit}}")
+        status = git("status", "--porcelain", "--untracked-files=no")
+        tracked_clean = status == ""
+        source_paths = (
+            "src/param_importance_nlp/experiments/stage2_formal.py",
+            "src/param_importance_nlp/experiments/stage23_task_runners.py",
+            "src/param_importance_nlp/experiments/stage2_g23_evaluator.py",
+            "ops/stage2/evaluate_s204_g23.py",
+        )
+        source_bytes: list[dict[str, object]] = []
+        for relative in source_paths:
+            path = repository_root / Path(relative)
+            if not path.is_file():
+                raise RuntimeError(f"STAGE2_SOURCE_MISSING:{relative}")
+            source_bytes.append(
+                {
+                    "path": relative,
+                    "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+                    "git_blob": git("hash-object", relative),
+                }
+            )
+    except (OSError, subprocess.SubprocessError) as error:
+        raise RuntimeError("STAGE2_TRUSTED_REPOSITORY_UNAVAILABLE") from error
+    if require_clean and not tracked_clean:
+        raise RuntimeError("STAGE2_PRODUCER_REPOSITORY_DIRTY")
+    return {
+        "schema_version": "stage2-reference-producer-provenance-v2",
+        "repository_root_name": repository_root.name,
+        "head_commit": head,
+        "head_tree": tree,
+        "tracked_clean": tracked_clean,
+        "source_bytes": source_bytes,
+        "provenance_hash": canonical_json_hash(
+            {
+                "head_commit": head,
+                "head_tree": tree,
+                "tracked_clean": tracked_clean,
+                "source_bytes": source_bytes,
+            }
+        ),
+    }
+
+
+def _actual_sampling_state(
+    sampling: SamplingPlan,
+    stream: str,
+    count: int,
+) -> Mapping[str, object]:
+    """Capture real Python generator states and verify the frozen draws."""
+
+    if stream not in STREAM_NAMES or count < 0:
+        raise ValueError("STAGE2_SAMPLING_STATE_ARGUMENT_INVALID")
+    return generator_boundary(sampling, stream, count)
+
+
+def _available_ram_bytes() -> int | None:
+    try:
+        import ctypes
+
+        class _MemoryStatus(ctypes.Structure):
+            _fields_ = [
+                ("dwLength", ctypes.c_uint32),
+                ("dwMemoryLoad", ctypes.c_uint32),
+                ("ullTotalPhys", ctypes.c_uint64),
+                ("ullAvailPhys", ctypes.c_uint64),
+                ("ullTotalPageFile", ctypes.c_uint64),
+                ("ullAvailPageFile", ctypes.c_uint64),
+                ("ullTotalVirtual", ctypes.c_uint64),
+                ("ullAvailVirtual", ctypes.c_uint64),
+                ("sullAvailExtendedVirtual", ctypes.c_uint64),
+            ]
+
+        status = _MemoryStatus()
+        status.dwLength = ctypes.sizeof(_MemoryStatus)
+        if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
+            return int(status.ullAvailPhys)
+    except (AttributeError, OSError, TypeError):
+        pass
+    try:
+        values = {}
+        for line in Path("/proc/meminfo").read_text(encoding="ascii").splitlines():
+            key, raw = line.split(":", 1)
+            values[key] = int(raw.strip().split()[0]) * 1024
+        if "MemAvailable" in values:
+            return values["MemAvailable"]
+    except (OSError, ValueError, IndexError):
+        pass
+    return None
+
+
+def _reference_capacity_preflight(
+    provider: FixedStateGradientProvider,
+    plan: ReferenceSizingPlan,
+    output_root: Path,
+    *,
+    model_manifest: Mapping[str, object] | None = None,
+    stable_identity: bool = False,
+) -> Mapping[str, object]:
+    """Fail closed on actual model-size, RAM, and single-copy shard capacity."""
+
+    parameter_count: int | None = None
+    parameters = getattr(provider, "_parameters", None)
+    if isinstance(parameters, Mapping):
+        values = list(parameters.values())
+        if values and all(hasattr(value, "numel") for value in values):
+            parameter_count = sum(int(value.numel()) for value in values)
+    if parameter_count is None and isinstance(model_manifest, Mapping):
+        candidate = model_manifest.get("parameter_count")
+        if isinstance(candidate, int) and not isinstance(candidate, bool) and candidate > 0:
+            parameter_count = candidate
+    if parameter_count is None:
+        table = getattr(provider, "_table", None)
+        if isinstance(table, Mapping) and table:
+            first = next(iter(table.values()))
+            if isinstance(first, Mapping):
+                parameter_count = sum(int(np.asarray(value).size) for value in first.values())
+    if parameter_count is None:
+        raise _blocked(
+            BlockerCode.CONTRACT_UNFROZEN,
+            "stage2_capacity_preflight",
+            "formal capacity preflight requires actual parameter_count from model/provider",
+            retryable=False,
+        )
+    max_blocks = int(plan.candidate_sample_counts[-1] // plan.block_size)
+    # Sizing and one-shot are retained until the task result is published.  A
+    # block is one FP64 vector plus a small manifest; moments are two FP64
+    # vectors per stream per commit.  No B/parameter/sample reduction is used.
+    shard_bytes = max_blocks * 2 * parameter_count * 8
+    snapshot_moment_bytes = max_blocks * 4 * parameter_count * 8
+    estimated_disk = int((shard_bytes + snapshot_moment_bytes) * 1.20 + 64 * 1024**2)
+    free_disk = shutil.disk_usage(output_root).free
+    available_ram = _available_ram_bytes()
+    peak_ram = int(3 * parameter_count * 8 + 64 * 1024**2)
+    capacity = {
+        "schema_version": "stage2-reference-capacity-preflight-v1",
+        "parameter_count": parameter_count,
+        "candidate_max_sample_count_per_stream": int(plan.candidate_sample_counts[-1]),
+        "block_size": plan.block_size,
+        "max_block_count_per_stream": max_blocks,
+        "single_copy_shard_bytes": shard_bytes,
+        "snapshot_moment_bytes": snapshot_moment_bytes,
+        "estimated_disk_bytes": estimated_disk,
+        "free_disk_bytes": None if stable_identity else int(free_disk),
+        "peak_ram_bytes": peak_ram,
+        "available_ram_bytes": None if stable_identity else available_ram,
+        "disk_ok": free_disk >= estimated_disk,
+        "ram_ok": available_ram is not None and available_ram >= peak_ram,
+        "fail_closed_if_unknown": True,
+    }
+    capacity["artifact_hash"] = canonical_json_hash(capacity)
+    if not capacity["disk_ok"] or not capacity["ram_ok"]:
+        raise _blocked(
+            BlockerCode.CONTRACT_UNFROZEN,
+            "stage2_capacity_preflight",
+            f"reference capacity insufficient: disk_ok={capacity['disk_ok']} ram_ok={capacity['ram_ok']}",
+            retryable=True,
+        )
+    return capacity
+
+
+def _load_reference_external_lineage(
+    request: TaskExecutionRequest,
+    root: Path,
+) -> tuple[Mapping[str, object], Mapping[str, Mapping[str, object]]]:
+    """Load all formal S2.3/materializer refs as authoritative TaskArtifacts.
+
+    The keys are intentionally explicit.  This prevents a producer from
+    recursively searching arbitrary predecessor JSON and accidentally binding
+    to a similarly named plan, delta, or manifest.
+    """
+
+    if request.config.run_intent != "formal":
+        return {}, {}
+    key_to_kind = {
+        "s23_asset_resolution": ("stage2_s23_asset_resolution", "asset_resolution"),
+        "s23_six_cell_manifest": ("stage2_s23_six_cell_manifest", "six_cell_manifest"),
+        "resolved_config": ("stage2_resolved_config", "resolved_config"),
+        "checkpoint_manifest": ("stage2_checkpoint_manifest", "checkpoint_manifest"),
+        "model_manifest": ("stage2_model_manifest", "model_manifest"),
+        "data_manifest": ("stage2_data_manifest", "data_manifest"),
+        "tokenizer_manifest": ("stage2_tokenizer_manifest", "tokenizer_manifest"),
+        "parameter_registry": ("stage2_parameter_registry", "parameter_registry"),
+        # S2.1 freezes the formula and native-unit floors.  Numeric
+        # ``delta_sci_by_B`` is deliberately *not* an external input: S2.4
+        # derives it from the immutable sizing shards before creating A/B.
+        "preregistration": ("stage2_preregistration", "preregistration"),
+        "sizing_plan": ("stage2_reference_sizing_plan", "reference_sizing_plan"),
+    }
+    lineage: dict[str, object] = {}
+    payloads: dict[str, Mapping[str, object]] = {}
+    for name, (environment_key, expected_kind) in key_to_kind.items():
+        reference = request.environment.evidence_refs.get(environment_key)
+        if not isinstance(reference, str) or not reference:
+            raise _blocked(
+                BlockerCode.CONTRACT_UNFROZEN,
+                environment_key,
+                f"formal S2.4 requires explicit TaskArtifact ref: {environment_key}",
+                retryable=False,
+            )
+        _workspace_path(root, reference, field=environment_key)
+        try:
+            loaded = load_committed_task_artifact(root, reference, require_formal=True)
+        except (OSError, ValueError, TypeError) as error:
+            raise _blocked(
+                BlockerCode.CONTRACT_UNFROZEN,
+                environment_key,
+                f"external TaskArtifact invalid: {type(error).__name__}",
+                retryable=False,
+                evidence_refs=(reference,),
+            ) from error
+        _workspace_path(root, loaded.identity.object_ref, field=f"{environment_key}.object_ref")
+        if loaded.identity.artifact_kind != expected_kind:
+            raise _blocked(
+                BlockerCode.CONTRACT_UNFROZEN,
+                environment_key,
+                f"external artifact kind mismatch: expected {expected_kind}",
+                retryable=False,
+                evidence_refs=(reference,),
+            )
+        if not isinstance(loaded.payload, Mapping):
+            raise _blocked(BlockerCode.CONTRACT_UNFROZEN, environment_key, "external payload object required", retryable=False, evidence_refs=(reference,))
+        try:
+            source_manifest = validate_external_manifest(
+                loaded,
+                root,
+                expected_kind=expected_kind,
+            )
+        except (OSError, TypeError, ValueError) as error:
+            raise _blocked(
+                BlockerCode.CONTRACT_UNFROZEN,
+                environment_key,
+                f"external source manifest invalid: {type(error).__name__}",
+                retryable=False,
+                evidence_refs=(reference,),
+            ) from error
+        payload = dict(loaded.payload)
+        payloads[name] = payload
+        lineage[name] = {
+            "commit_ref": reference,
+            "artifact_kind": loaded.identity.artifact_kind,
+            "artifact_hash": loaded.identity.artifact_hash,
+            "config_hash": loaded.identity.config_hash,
+            "task_id": loaded.identity.task_id,
+            "formal_eligible": loaded.identity.formal_eligible,
+            "payload_hash": canonical_json_hash(payload),
+            "source_refs": list(loaded.source_refs),
+            "source_manifest": source_manifest,
+        }
+    resolved = payloads.get("resolved_config")
+    resolved_lineage = lineage.get("resolved_config")
+    if not isinstance(resolved, Mapping) or not isinstance(resolved_lineage, Mapping):
+        raise _blocked(
+            BlockerCode.CONTRACT_UNFROZEN,
+            "stage2_resolved_config",
+            "resolved formal config lineage missing",
+            retryable=False,
+        )
+    if (
+        resolved.get("task_id") != request.task.task_id
+        or resolved.get("config_hash") != request.config.config_hash
+        or resolved_lineage.get("config_hash") != request.config.config_hash
+    ):
+        raise _blocked(
+            BlockerCode.CONTRACT_UNFROZEN,
+            "stage2_resolved_config",
+            "resolved formal config is not bound to the current TaskRuntime config",
+            retryable=False,
+        )
+    return lineage, payloads
+
+
+def _reference_numeric_diagnostics(
+    *,
+    final_root: Path,
+    result: OneShotReferenceResult,
+) -> tuple[Mapping[str, object], Mapping[str, object]]:
+    """Recompute U from raw committed blocks with long-double accumulation.
+
+    The returned first object is JSON metadata; the second is stored in the
+    tensor bundle because it contains the signed vectors.
+    """
+
+    commits = sorted((final_root / "commits").glob("*.json"))
+    if not commits:
+        raise RuntimeError("STAGE2_REFERENCE_NUMERIC_BLOCK_COMMITS_MISSING")
+    latest = load_canonical_json(commits[-1])
+    if not isinstance(latest, Mapping):
+        raise RuntimeError("STAGE2_REFERENCE_NUMERIC_LATEST_COMMIT_INVALID")
+    state, bundle = load_tensor_bundle(final_root / str(latest["object_ref"]))
+    if not isinstance(state, Mapping):
+        raise RuntimeError("STAGE2_REFERENCE_NUMERIC_BLOCK_STATE_INVALID")
+    raw_a, raw_b = state.get("shard_refs_a"), state.get("shard_refs_b")
+    if not isinstance(raw_a, list) or not isinstance(raw_b, list) or not raw_a or len(raw_a) != len(raw_b):
+        raise RuntimeError("STAGE2_REFERENCE_NUMERIC_SHARD_REFS_MISSING")
+    shard_store = _ReferenceShardStore(final_root)
+    raw_digest_rows: list[Mapping[str, object]] = []
+    names: tuple[str, ...] | None = None
+    first_sums: dict[str, np.ndarray] = {}
+    second_sums: dict[str, np.ndarray] = {}
+    n1 = np.longdouble(0)
+    n2 = np.longdouble(0)
+    for ref in list(raw_a) + list(raw_b):
+        if not isinstance(ref, Mapping):
+            raise RuntimeError("STAGE2_REFERENCE_NUMERIC_SHARD_REF_INVALID")
+        vector, weight, _ = shard_store.load(ref)
+        current_names = tuple(vector)
+        if names is None:
+            names = current_names
+            first_sums = {name: np.zeros_like(vector[name], dtype=np.longdouble) for name in names}
+            second_sums = {name: np.zeros_like(vector[name], dtype=np.longdouble) for name in names}
+        if current_names != names:
+            raise RuntimeError("STAGE2_REFERENCE_NUMERIC_PARAMETER_SET_DRIFT")
+        long_weight = np.longdouble(weight)
+        if not np.isfinite(long_weight) or long_weight <= 0:
+            raise RuntimeError("STAGE2_REFERENCE_NUMERIC_BLOCK_WEIGHTS_INVALID")
+        n1 += long_weight
+        n2 += long_weight * long_weight
+        raw_digest_rows.append({"vector_hash": _vector_digest(vector), "weight": float(weight)})
+        for name in names:
+            value = np.asarray(vector[name], dtype=np.longdouble)
+            first_sums[name] += long_weight * value
+            second_sums[name] += long_weight * long_weight * value * value
+    if names is None:
+        raise RuntimeError("STAGE2_REFERENCE_NUMERIC_SHARDS_EMPTY")
+    denominator = n1 * n1 - n2
+    if denominator <= 0:
+        raise RuntimeError("STAGE2_REFERENCE_NUMERIC_U_DENOMINATOR_INVALID")
+    high: dict[str, np.ndarray] = {}
+    accumulated: dict[str, np.ndarray] = {}
+    for name in names:
+        high[name] = np.asarray((first_sums[name] * first_sums[name] - second_sums[name]) / denominator, dtype=np.float64)
+        accumulated[name] = np.asarray(result.bias_reference[name], dtype=np.float64)
+    raw_block_digest = canonical_json_hash(raw_digest_rows)
+    numeric_vectors = {
+        "high_precision": high,
+        "accumulated": accumulated,
+    }
+    metadata: dict[str, object] = {
+        "schema_version": "stage2-reference-numerical-diagnostics-v1",
+        "recompute_method": "longdouble_pairwise_u_from_content_addressed_shards",
+        "raw_block_digest": raw_block_digest,
+        "raw_block_count_a": len(raw_a),
+        "raw_block_count_b": len(raw_b),
+        "high_precision_hash": _vector_digest(high),
+        "accumulated_hash": _vector_digest(accumulated),
+        "max_abs_error": max(float(np.max(np.abs(high[name] - accumulated[name]))) for name in names),
+        "resume_latest_commit_ref": commits[-1].relative_to(final_root).as_posix(),
+        "resume_latest_commit_hash": str(latest.get("artifact_hash")),
+        "resume_latest_manifest_hash": str(bundle.manifest_sha256),
+    }
+    metadata["artifact_hash"] = canonical_json_hash(metadata)
+    return metadata, numeric_vectors
+
+
 def _run_stage2_reference(
     request: TaskExecutionRequest,
     root: Path,
@@ -2133,10 +3115,75 @@ def _run_stage2_reference(
             retryable=False,
             evidence_refs=inputs.references,
         )
-    plan, plan_refs = _stage2_reference_plan(request, root, context)
+    external_lineage: Mapping[str, object] = {}
+    external_payloads: Mapping[str, Mapping[str, object]] = {}
+    if request.config.run_intent == "formal":
+        external_lineage, external_payloads = _load_reference_external_lineage(request, root)
+    plan, plan_refs = _stage2_reference_plan(
+        request,
+        root,
+        context,
+        external_payloads.get("sizing_plan"),
+    )
+    capacity_preflight = _reference_capacity_preflight(
+        context.provider,
+        plan,
+        store.root,
+        model_manifest=external_payloads.get("model_manifest"),
+        stable_identity=request.config.run_intent == "local_fixture",
+    )
     sampling = upstream_sampling
+    provider_state_before = context.provider.state_digest()
+    six_cell_manifest = _reference_six_cell_manifest(
+        inputs,
+        context,
+        external_payloads.get("s23_six_cell_manifest"),
+    )
+    if request.config.run_intent == "formal" and (
+        six_cell_manifest.get("status") != "READY"
+        or six_cell_manifest.get("scope") != "formal"
+    ):
+        raise _blocked(
+            BlockerCode.CONTRACT_UNFROZEN,
+            "stage2_s204_six_cell_manifest",
+            "formal reference requires the validated S2.3 six-cell manifest",
+            retryable=False,
+            evidence_refs=inputs.references,
+        )
+    formula_contract, formula_contract_hash = _reference_formula_contract(
+        request,
+        external_payloads.get("preregistration"),
+    )
+    if request.config.run_intent == "formal":
+        lineage_formula = external_lineage.get("preregistration")
+        if not isinstance(lineage_formula, Mapping) or not isinstance(lineage_formula.get("artifact_hash"), str):
+            raise _blocked(BlockerCode.CONTRACT_UNFROZEN, "stage2_preregistration", "formula contract TaskArtifact lineage missing", retryable=False)
+        formula_contract_hash = str(lineage_formula["artifact_hash"])
+    parameter_registry = _reference_parameter_registry(
+        request,
+        root,
+        context,
+        external_payloads.get("parameter_registry"),
+    )
+    if request.config.run_intent == "formal" and parameter_registry is None:
+        raise _blocked(
+            BlockerCode.CONTRACT_UNFROZEN,
+            "stage2_parameter_registry",
+            "formal reference requires the hash-bound parameter registry artifact",
+            retryable=False,
+            evidence_refs=tuple(
+                [request.environment.evidence_refs["stage2_parameter_registry"]]
+                if "stage2_parameter_registry" in request.environment.evidence_refs
+                else inputs.references
+            ),
+        )
     maximum = plan.candidate_sample_counts[-1]
     sizing_draws = sampling.draws("reference_sizing", maximum)
+    sizing_rng_state = _actual_sampling_state(sampling, "reference_sizing", maximum)
+    sizing_rng_boundaries = tuple(
+        generator_boundary(sampling, "reference_sizing", index * plan.block_size)
+        for index in range(maximum // plan.block_size + 1)
+    )
     result = StreamingReferenceSizer(context.provider).run(
         plan,
         # Keep the old positional API available for direct callers, while the
@@ -2145,6 +3192,8 @@ def _run_stage2_reference(
         draws_b=(),
         draws_sizing=sizing_draws,
         artifact_root=store.root / "resume" / "reference-sizing",
+        rng_boundaries=sizing_rng_boundaries,
+        require_rng_boundaries=request.config.run_intent == "formal",
     )
     if not result.converged or result.selected_sample_count_per_stream is None:
         raise _blocked(
@@ -2155,20 +3204,67 @@ def _run_stage2_reference(
             evidence_refs=inputs.references,
         )
     final_count = result.selected_sample_count_per_stream
+    validate_sizing_plan_contract(
+        plan.to_dict(),
+        selected_sample_count=final_count,
+        field="formal_reference_sizing_plan",
+    )
+    sizing_draw_hash = _draw_digest(sizing_draws)
+    sizing_identity_hash = canonical_json_hash(
+        {
+            "plan_hash": plan.artifact_hash,
+            "provider_state_digest": result.provider_state_digest,
+            "registry_hash": result.registry_hash,
+            "sizing_draw_hash": sizing_draw_hash,
+            "sizing_stream": "reference_sizing",
+        }
+    )
+    # Freeze the sizing-derived numeric margin before *any* final A/B draw is
+    # materialized.  This source is built only from the sizing shard prefix;
+    # it is never included in the final A/B estimand.
+    delta_sci = _derive_sizing_delta_sci(
+        root=root,
+        sizing_root=store.root / "resume" / "reference-sizing",
+        plan=plan,
+        parameter_registry=parameter_registry,
+        formula_contract=formula_contract,
+        formula_contract_hash=(
+            str(external_lineage.get("preregistration", {}).get("artifact_hash"))
+            if isinstance(external_lineage.get("preregistration"), Mapping)
+            else formula_contract_hash
+        ),
+        provider=context.provider,
+        sizing_result_hash=result.scientific_artifact_hash,
+    )
     one_shot_plan = OneShotReferencePlan(
         reference_id=plan.reference_id,
         sizing_result_hash=result.scientific_artifact_hash,
         sample_count_per_stream=final_count,
         block_size=plan.block_size,
     )
+    # The final draw manifests are created only after the sizing-derived
+    # margin has been atomically published.
     final_a = sampling.draws("reference_A", final_count)
     final_b = sampling.draws("reference_B", final_count)
+    final_a_rng_state = _actual_sampling_state(sampling, "reference_A", final_count)
+    final_b_rng_state = _actual_sampling_state(sampling, "reference_B", final_count)
+    final_a_rng_boundaries = tuple(
+        generator_boundary(sampling, "reference_A", index * plan.block_size)
+        for index in range(final_count // plan.block_size + 1)
+    )
+    final_b_rng_boundaries = tuple(
+        generator_boundary(sampling, "reference_B", index * plan.block_size)
+        for index in range(final_count // plan.block_size + 1)
+    )
     one_shot = OneShotReferenceRunner(context.provider).run(
         one_shot_plan,
         draws_a=final_a,
         draws_b=final_b,
         sizing_draws=sizing_draws,
         artifact_root=store.root / "resume" / "reference-final",
+        rng_boundaries_a=final_a_rng_boundaries,
+        rng_boundaries_b=final_b_rng_boundaries,
+        require_rng_boundaries=request.config.run_intent == "formal",
     )
     if one_shot.status != "COMPLETE":
         raise _blocked(
@@ -2178,6 +3274,168 @@ def _run_stage2_reference(
             retryable=False,
             evidence_refs=inputs.references,
         )
+    provider_state_after = context.provider.state_digest()
+    replay = OneShotReferenceRunner(context.provider).run(
+        one_shot_plan,
+        draws_a=final_a,
+        draws_b=final_b,
+        sizing_draws=sizing_draws,
+        artifact_root=store.root / "resume" / "reference-final",
+        rng_boundaries_a=final_a_rng_boundaries,
+        rng_boundaries_b=final_b_rng_boundaries,
+        require_rng_boundaries=request.config.run_intent == "formal",
+    )
+    if replay.status != "COMPLETE" or replay.artifact_hash != one_shot.artifact_hash:
+        raise _blocked(
+            BlockerCode.CONTRACT_UNFROZEN,
+            "stage2_reference_resume_replay",
+            "one-shot resume replay did not reproduce the complete artifact",
+            retryable=False,
+            evidence_refs=inputs.references,
+        )
+    numerical_metadata, numerical_vectors = _reference_numeric_diagnostics(
+        final_root=store.root / "resume" / "reference-final",
+        result=one_shot,
+    )
+    if parameter_registry is None:
+        parameter_registry = {
+            "schema_version": "stage2-parameter-registry-artifact-v1",
+            "status": "MISSING",
+            "registry_hash": context.provider.registry_hash,
+            "parameter_groups": None,
+        }
+    config_identity = {
+        "config_hash": request.config.config_hash,
+        "task_id": request.task.task_id,
+    }
+    # Scientific identity belongs to the immutable v1 base config.  The v2
+    # execution envelope intentionally exposes only execution sections at the
+    # top level, so asking it for ``model``/``data`` would be an accidental
+    # KeyError in the producer rather than a published diagnostic.
+    model_section = request.config.base_config.section("model")
+    data_section = request.config.base_config.section("data")
+    checkpoint_section = request.config.base_config.section("identity")
+    tokenizer_section = request.config.base_config.section("tokenizer")
+    model_identity = dict(model_section) if isinstance(model_section, Mapping) else {}
+    data_identity = dict(data_section) if isinstance(data_section, Mapping) else {}
+    identity_section = dict(checkpoint_section) if isinstance(checkpoint_section, Mapping) else {}
+    tokenizer_identity = dict(tokenizer_section) if isinstance(tokenizer_section, Mapping) else {}
+    data_identity["data_range_hash"] = six_cell_manifest.get("data_range_hash")
+    manifest_rows = six_cell_manifest.get("checkpoints")
+    current_checkpoint_id = identity_section.get("input_checkpoint_id")
+    current_manifest_row: Mapping[str, object] | None = None
+    if isinstance(manifest_rows, list) and current_checkpoint_id is not None:
+        matches = [
+            item for item in manifest_rows
+            if isinstance(item, Mapping) and item.get("checkpoint_id") == current_checkpoint_id
+        ]
+        if len(matches) == 1:
+            current_manifest_row = matches[0]
+    if request.config.run_intent == "formal" and current_manifest_row is None:
+        raise _blocked(
+            BlockerCode.CONTRACT_UNFROZEN,
+            "stage2_s204_checkpoint_identity",
+            "formal reference config checkpoint is not one of the six validated S2.3 cells",
+            retryable=False,
+            evidence_refs=inputs.references,
+        )
+    checkpoint_identity: dict[str, object] = {
+        "checkpoint_id": identity_section.get("input_checkpoint_id"),
+        "checkpoint_revision": model_identity.get("revision"),
+        "checkpoint_asset_id": model_identity.get("asset_id"),
+        "model_id": model_identity.get("asset_id"),
+        "training_stage": None,
+        "checkpoint_hash": None,
+    }
+    if current_manifest_row is not None:
+        config_identity["checkpoint_config_hash"] = current_manifest_row.get("config_hash")
+        checkpoint_identity.update(
+            {
+                "cell_id": current_manifest_row.get("cell_id"),
+                "model_id": current_manifest_row.get("model_id"),
+                "training_stage": current_manifest_row.get("training_stage"),
+                "checkpoint_revision": current_manifest_row.get("checkpoint_revision"),
+                "checkpoint_hash": current_manifest_row.get("checkpoint_hash"),
+                "registry_hash": current_manifest_row.get("registry_hash"),
+                "config_hash": current_manifest_row.get("config_hash"),
+            }
+        )
+    checkpoint_identity["identity_hash"] = _reference_identity_hash(checkpoint_identity)
+    config_identity["identity_hash"] = _reference_identity_hash(config_identity)
+    model_identity["identity_hash"] = _reference_identity_hash(model_identity)
+    data_identity["identity_hash"] = _reference_identity_hash(data_identity)
+    external_tokenizer = external_payloads.get("tokenizer_manifest")
+    if request.config.run_intent == "formal":
+        if not isinstance(external_tokenizer, Mapping):
+            raise _blocked(
+                BlockerCode.CONTRACT_UNFROZEN,
+                "stage2_tokenizer_manifest",
+                "formal reference requires the hash-bound tokenizer manifest",
+                retryable=False,
+                evidence_refs=inputs.references,
+            )
+        tokenizer_identity = {
+            key: external_tokenizer.get(key)
+            for key in ("asset_id", "revision", "checkpoint_id")
+        }
+    tokenizer_identity["identity_hash"] = _reference_identity_hash(tokenizer_identity)
+    registry_identity = {
+        "registry_hash": context.provider.registry_hash,
+        "parameter_registry_artifact_hash": parameter_registry.get("artifact_hash"),
+    }
+    registry_identity["identity_hash"] = _reference_identity_hash(registry_identity)
+    sizing_plan = plan.to_dict()
+    sizing_plan_hash = plan.artifact_hash
+    final_commits = sorted((store.root / "resume" / "reference-final" / "commits").glob("*.json"))
+    replay_commit_ref = (
+        final_commits[-1]
+        .relative_to(store.root / "resume" / "reference-final")
+        .as_posix()
+        if final_commits
+        else None
+    )
+    replay_commit = load_canonical_json(final_commits[-1]) if final_commits else {}
+    replay_diagnostic = {
+        "schema_version": "stage2-reference-resume-replay-v1",
+        "artifact_ref": replay_commit_ref,
+        "artifact_hash": replay_commit.get("artifact_hash"),
+        "state_digest": replay_commit.get("state_digest"),
+        "object_manifest_hash": replay_commit.get("object_manifest_hash"),
+        "source_one_shot_result_hash": one_shot.artifact_hash,
+        "replayed_one_shot_result_hash": replay.artifact_hash,
+        "sizing_result_identity_hash": canonical_json_hash(
+            {
+                "sizing_result_hash": one_shot_plan.sizing_result_hash,
+                "provider_state_digest": one_shot.provider_state_digest,
+                "registry_hash": one_shot.registry_hash,
+                "stream_a_draw_hash": one_shot.stream_a_draw_hash,
+                "stream_b_draw_hash": one_shot.stream_b_draw_hash,
+            }
+        ),
+    }
+    replay_diagnostic["replay_hash"] = canonical_json_hash(replay_diagnostic)
+    rng_before_state = {
+        "sampling_plan_hash": sampling.digest,
+        "streams": {
+            "reference_sizing": sizing_rng_state["state_before"],
+            "reference_A": final_a_rng_state["state_before"],
+            "reference_B": final_b_rng_state["state_before"],
+        },
+    }
+    rng_after_state = {
+        "sampling_plan_hash": sampling.digest,
+        "streams": {
+            "reference_sizing": sizing_rng_state["state_after"],
+            "reference_A": final_a_rng_state["state_after"],
+            "reference_B": final_b_rng_state["state_after"],
+        },
+    }
+    rng_before = canonical_json_hash(rng_before_state)
+    rng_after = canonical_json_hash(rng_after_state)
+    producer_provenance = _trusted_stage2_provenance(
+        require_clean=request.config.run_intent == "formal"
+    )
+    producer_commit = str(producer_provenance["head_commit"])
     bundle_path = store.root / "tensor-bundles" / "reference-final"
     bundle = _publish_or_load_bundle(
         bundle_path,
@@ -2191,6 +3449,14 @@ def _run_stage2_reference(
                 "ranking_variance": one_shot.uncertainty.ranking_variance,
             },
             "sequence_variance": one_shot.sequence_variance,
+            "numerical_diagnostics": {
+                "schema_version": "stage2-reference-numerical-diagnostics-v1",
+                "raw_block_digest": numerical_metadata["raw_block_digest"],
+                "high_precision": numerical_vectors["high_precision"],
+                "accumulated": numerical_vectors["accumulated"],
+                "high_precision_hash": numerical_metadata["high_precision_hash"],
+                "accumulated_hash": numerical_metadata["accumulated_hash"],
+            },
         },
     )
     bundle_ref = bundle_path.relative_to(root).as_posix()
@@ -2230,14 +3496,76 @@ def _run_stage2_reference(
         "sampling_plan_hash": sampling.digest,
         "recovery_semantics": "authoritative_block_pair_commits",
         "reference_protocol": "authoritative_sizing_and_one_shot_block_pair_commits",
+        "diagnostics_schema_version": "stage2-reference-producer-diagnostics-v1",
+        "stage2_reference_producer_commit": producer_commit,
+        "producer_provenance": producer_provenance,
+        "external_lineage": external_lineage,
+        "formal_scope": request.config.run_intent,
+        "cell_id": checkpoint_identity.get("cell_id"),
+        "six_cell_manifest": six_cell_manifest,
+        "six_cell_manifest_hash": six_cell_manifest.get("manifest_hash"),
+        "sizing_plan": sizing_plan,
+        "sizing_plan_artifact_hash": sizing_plan_hash,
+        "sizing_draw_hash": sizing_draw_hash,
+        "sizing_identity_hash": sizing_identity_hash,
+        "formula_contract": formula_contract,
+        "formula_contract_hash": formula_contract_hash,
+        "candidate_delta_sci": delta_sci,
+        "candidate_delta_sci_source": delta_sci.get("source_ref"),
+        "candidate_delta_sci_source_hash": delta_sci.get("source_hash"),
+        "config_identity": config_identity,
+        "model_identity": model_identity,
+        "data_identity": data_identity,
+        "tokenizer_identity": tokenizer_identity,
+        "checkpoint_identity": checkpoint_identity,
+        "registry_identity": registry_identity,
+        "parameter_registry_artifact": parameter_registry,
+        "numerical_diagnostics": numerical_metadata,
+        "state_invariance": {
+            "model_state_before_hash": provider_state_before,
+            "model_state_after_hash": provider_state_after,
+            "rng_state_before_hash": rng_before,
+            "rng_state_after_hash": rng_after,
+            "rng_state_before": rng_before_state,
+            "rng_state_after": rng_after_state,
+        },
+        "draw_artifacts": {
+            "reference_sizing": {
+                "sampling_plan": sampling.to_dict(),
+                "manifest": sampling.draw_manifest("reference_sizing", maximum).to_manifest(),
+                "actual_state": sizing_rng_state,
+            },
+            "reference_A": {
+                "sampling_plan": sampling.to_dict(),
+                "manifest": sampling.draw_manifest("reference_A", final_count).to_manifest(),
+                "actual_state": final_a_rng_state,
+            },
+            "reference_B": {
+                "sampling_plan": sampling.to_dict(),
+                "manifest": sampling.draw_manifest("reference_B", final_count).to_manifest(),
+                "actual_state": final_b_rng_state,
+            },
+        },
+        "resume_replay": replay_diagnostic,
+        "sizing_result_identity_hash": replay_diagnostic["sizing_result_identity_hash"],
+        "numerical_floor": 1.0e-12,
+        "capacity_preflight": capacity_preflight,
         "formal_eligible": False,
     }
+    convergence["reference_producer_diagnostics_hash"] = canonical_json_hash(
+        {key: value for key, value in convergence.items() if key != "reference_producer_diagnostics_hash"}
+    )
     payload_by_kind: dict[str, Mapping[str, JSONValue]] = {
         "reference_result": reference,  # type: ignore[dict-item]
         "reference_convergence_report": convergence,
         "gate_record": _gate_candidate(request),
     }
-    return payload_by_kind, _source_refs(request, plan_refs)
+    external_refs = tuple(
+        str(item.get("commit_ref"))
+        for item in external_lineage.values()
+        if isinstance(item, Mapping) and isinstance(item.get("commit_ref"), str)
+    )
+    return payload_by_kind, tuple(dict.fromkeys((*_source_refs(request, plan_refs), *external_refs)))
 
 
 def _exact_importance_reference(context: _ProviderContext) -> Mapping[str, np.ndarray]:
@@ -5502,11 +6830,41 @@ class _Stage23Runner(TaskRunner):
             payloads,
             source_refs=source_refs,
         )
+        metadata: dict[str, JSONValue] = {
+            "execution_contract": "stage23-specialized-v1"
+        }
+        if request.task.task_id == _STAGE2_REFERENCE_TASK and request.config.run_intent == "formal":
+            convergence = payloads.get("reference_convergence_report", {})
+            if isinstance(convergence, Mapping):
+                bindings = {
+                    key: convergence.get(key)
+                    for key in (
+                        "stage2_reference_producer_commit",
+                        "producer_provenance",
+                        "config_identity",
+                        "checkpoint_identity",
+                        "registry_identity",
+                        "model_identity",
+                        "data_identity",
+                        "tokenizer_identity",
+                        "external_lineage",
+                    )
+                    if convergence.get(key) is not None
+                }
+                metadata["identity_bindings"] = bindings  # type: ignore[assignment]
+        checkpoint_ref = None
+        if request.config.run_intent == "formal":
+            convergence = payloads.get("reference_convergence_report", {})
+            lineage = convergence.get("external_lineage") if isinstance(convergence, Mapping) else None
+            checkpoint = lineage.get("checkpoint_manifest") if isinstance(lineage, Mapping) else None
+            if isinstance(checkpoint, Mapping) and isinstance(checkpoint.get("commit_ref"), str):
+                checkpoint_ref = checkpoint["commit_ref"]
         return TaskRunResult.passed(
             request,
             artifact_refs=references,
+            checkpoint_ref=checkpoint_ref,
             message="stage2/3 specialized task completed",
-            metadata={"execution_contract": "stage23-specialized-v1"},
+            metadata=metadata,
         )
 
 

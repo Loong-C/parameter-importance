@@ -105,6 +105,7 @@ def build_stage2_preregistration(
     mathematics_hash: str | None = None,
     stage1_report_hash: str | None = None,
     upstream_binding_hash: str | None = None,
+    stage1_handoff: Mapping[str, JSONValue] | None = None,
     scope: str = "local_fixture",
 ) -> dict[str, JSONValue]:
     """Build the immutable S2.1 registration payload.
@@ -274,6 +275,25 @@ def build_stage2_preregistration(
             tie_breaker="none",
         ),
     ]
+    provenance: dict[str, JSONValue] = {
+        "producer_commit": producer_commit,
+        "seed_plan_hash": seed_plan_hash,
+        "mathematics_path": "docs/mathematics.md",
+        "mathematics_hash": mathematics_hash,
+        # Retained as a non-authoritative compatibility field for older local
+        # drafts.  Formal G2.0 requires ``stage1_handoff`` below and never
+        # treats this tracked report as Stage1 evidence.
+        "stage1_report_path": "reports/stage1/cpu-evidence-20260814-s12-r2/stage1.11_reporting_and_exit_gate/stage_report.json",
+        "stage1_report_hash": stage1_report_hash,
+        "upstream_binding_hash": upstream_binding_hash,
+        "sample_generation_allowed_after": "this_payload_and_hash_committed",
+        "amendment_policy": "append_only; never_overwrite_original_registration",
+    }
+    if stage1_handoff is not None:
+        if not isinstance(stage1_handoff, Mapping):
+            raise ValueError("stage1_handoff must be a mapping")
+        provenance["stage1_handoff"] = dict(stage1_handoff)
+
     body: dict[str, JSONValue] = {
         "schema_version": PREREGISTRATION_SCHEMA_VERSION,
         "registration_id": "stage2-s2.1-fixed-state-estimator-v1",
@@ -434,17 +454,7 @@ def build_stage2_preregistration(
             "quality_failure": "do_not_interpret_hypothesis_results",
             "hypothesis_failure": "retain_complete_results_and_follow_method_branch",
         },
-        "provenance": {
-            "producer_commit": producer_commit,
-            "seed_plan_hash": seed_plan_hash,
-            "mathematics_path": "docs/mathematics.md",
-            "mathematics_hash": mathematics_hash,
-            "stage1_report_path": "reports/stage1/cpu-evidence-20260814-s12-r2/stage1.11_reporting_and_exit_gate/stage_report.json",
-            "stage1_report_hash": stage1_report_hash,
-            "upstream_binding_hash": upstream_binding_hash,
-            "sample_generation_allowed_after": "this_payload_and_hash_committed",
-            "amendment_policy": "append_only; never_overwrite_original_registration",
-        },
+        "provenance": provenance,
     }
     body["preregistration_hash"] = _canonical_without_hash(body, "preregistration_hash")
     return body
@@ -597,6 +607,53 @@ def validate_stage2_preregistration(value: Mapping[str, Any]) -> None:
         raise ValueError("STAGE2_PREREG_HASH_MISMATCH")
 
 
+def validate_stage2_hypothesis_contract(
+    value: Mapping[str, Any],
+    *,
+    preregistration: Mapping[str, Any] | None = None,
+) -> None:
+    """Fail-closed validation for the H1--H6 contract.
+
+    The original producer only needed to build this object, while formal G2.0
+    qualification is a consumer boundary.  Rebuilding the contract from its
+    declared parent is intentional: a caller cannot change a claim, decision
+    rule, or multiplicity policy and merely recompute ``hypothesis_contract_hash``.
+    """
+
+    if not isinstance(value, Mapping):
+        raise ValueError("STAGE2_HYPOTHESIS_CONTRACT_NOT_OBJECT")
+    if value.get("schema_version") != HYPOTHESIS_SCHEMA_VERSION:
+        raise ValueError("STAGE2_HYPOTHESIS_SCHEMA_UNSUPPORTED")
+    if value.get("contract_id") != "stage2-hypotheses-h1-h6-v1":
+        raise ValueError("STAGE2_HYPOTHESIS_CONTRACT_ID_MISMATCH")
+    parent_hash = value.get("preregistration_hash")
+    if not isinstance(parent_hash, str) or not _is_sha256(parent_hash):
+        raise ValueError("STAGE2_HYPOTHESIS_PREREGISTRATION_HASH_INVALID")
+    upstream = value.get("upstream_binding_hash")
+    if not isinstance(upstream, str) or not _is_sha256(upstream):
+        raise ValueError("STAGE2_HYPOTHESIS_UPSTREAM_BINDING_HASH_INVALID")
+    if preregistration is None:
+        raise ValueError("STAGE2_HYPOTHESIS_PREREGISTRATION_REQUIRED")
+    validate_stage2_preregistration(preregistration)
+    if parent_hash != preregistration.get("preregistration_hash"):
+        raise ValueError("STAGE2_HYPOTHESIS_PARENT_HASH_MISMATCH")
+    provenance = preregistration.get("provenance")
+    if not isinstance(provenance, Mapping):
+        raise ValueError("STAGE2_HYPOTHESIS_PREREGISTRATION_PROVENANCE_MISSING")
+    if upstream != provenance.get("upstream_binding_hash"):
+        raise ValueError("STAGE2_HYPOTHESIS_UPSTREAM_BINDING_MISMATCH")
+    expected = build_stage2_hypothesis_contract(
+        preregistration,
+        upstream_binding_hash=upstream,
+    )
+    if dict(value) != expected:
+        raise ValueError("STAGE2_HYPOTHESIS_CONTRACT_CONTENT_MISMATCH")
+
+
+def _is_sha256(value: str) -> bool:
+    return len(value) == 64 and all(character in "0123456789abcdef" for character in value)
+
+
 __all__ = [
     "ABSOLUTE_FLOORS",
     "AMENDMENT_SCHEMA_VERSION",
@@ -614,5 +671,6 @@ __all__ = [
     "build_stage2_amendment_template",
     "build_stage2_hypothesis_contract",
     "build_stage2_preregistration",
+    "validate_stage2_hypothesis_contract",
     "validate_stage2_preregistration",
 ]

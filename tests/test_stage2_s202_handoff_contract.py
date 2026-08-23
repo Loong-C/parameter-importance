@@ -9,6 +9,8 @@ from types import SimpleNamespace
 import pytest
 
 from param_importance_nlp.contracts import (
+    ContractFreeze,
+    ContractState,
     FormalExecutionEvidence,
     GateRecord,
     GateStatus,
@@ -30,7 +32,7 @@ from param_importance_nlp.contracts import (
 )
 from param_importance_nlp.contracts.task_catalog import DEFAULT_TASK_CATALOG
 from param_importance_nlp.experiments import stage23_task_runners as stage23
-from param_importance_nlp.runtime import TaskArtifactStore
+from param_importance_nlp.runtime import TaskArtifactStore, TaskBlockedError
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -323,6 +325,40 @@ def test_formal_stage1_exit_closure_binds_exact_producer_and_all_roles(tmp_path:
     }
 
 
+def test_stage1_exit_accepts_r4_top_level_validation_and_requires_hash(tmp_path: Path) -> None:
+    """Released r4 binds validation via index fields, never an unbound file."""
+
+    ref = _stage1_fixture(tmp_path)
+    index_path = tmp_path / ref
+    index = load_canonical_json(index_path)
+    assert isinstance(index, dict)
+    validation_path = index_path.parent / "validation.json"
+    validation = load_canonical_json(validation_path)
+    assert isinstance(validation, dict)
+    validation.pop("gate_id", None)
+    validation = _with_hash({key: value for key, value in validation.items() if key != "artifact_hash"})
+    write_canonical_json(validation_path, validation)
+    role_refs = dict(index["role_refs"])
+    role_hashes = dict(index["role_sha256"])
+    role_refs.pop("validation")
+    role_hashes.pop("validation")
+    index["role_refs"] = role_refs
+    index["role_sha256"] = role_hashes
+    index["validation_ref"] = "validation.json"
+    index["validation_sha256"] = hashlib.sha256(validation_path.read_bytes()).hexdigest()
+    index = _with_hash({key: value for key, value in index.items() if key != "artifact_hash"})
+    write_canonical_json(index_path, index)
+
+    evidence = validate_stage1_exit_evidence(tmp_path, ref)
+    assert dict(evidence.role_sha256)["validation"] == index["validation_sha256"]
+
+    index.pop("validation_sha256")
+    index = _with_hash({key: value for key, value in index.items() if key != "artifact_hash"})
+    write_canonical_json(index_path, index)
+    with pytest.raises(Stage1HandoffError, match="ROLE_VALIDATION_HASH_MISSING"):
+        validate_stage1_exit_evidence(tmp_path, ref)
+
+
 @pytest.mark.parametrize("ref", [
     "reports/stage1/cpu-evidence/stage_report.json",
     "fixtures/stage1/stage1-s111-exit.json",
@@ -409,3 +445,111 @@ def test_formal_execution_evidence_consumes_same_stage1_index_ref(tmp_path: Path
     loaded, loaded_ref = stage23._formal_execution_evidence(request, tmp_path)
     assert loaded.artifact_hash == execution.artifact_hash
     assert loaded_ref == execution_ref
+
+
+def _stage2_formal_freeze() -> ContractFreeze:
+    return ContractFreeze(
+        contract_id="stage2.contract.test",
+        stage=2,
+        scope="formal",
+        state=ContractState.FROZEN,
+        formula_version="test-v1",
+        config_hash="a" * 64,
+        schema_hashes={"schema": "b" * 64},
+        source_hashes={"source": "c" * 64},
+        required_gate_ids=("stage2.G2.0",),
+        frozen_at="2026-08-23T00:00:00+00:00",
+    )
+
+
+def _stage2_formal_request(
+    root: Path,
+    *,
+    freeze_ref: str,
+    contract_freeze_hash: str,
+) -> tuple[SimpleNamespace, FormalExecutionEvidence, str]:
+    stage1_ref = _stage1_fixture(root)
+    stage0_ref = _stage0_fixture(root)
+    execution = FormalExecutionEvidence(
+        "formal",
+        contract_freeze_hash=contract_freeze_hash,
+        asset_manifest_hashes=("a" * 64,),
+        prerequisite_gates=(
+            GateRecord(
+                "stage2.G2.0", 2, GateStatus.PASS,
+                "2026-08-23T00:00:00+00:00", evidence_refs=("g2-0.json",)
+            ),
+            GateRecord(
+                "stage1.G1-EXIT", 1, GateStatus.PASS,
+                "2026-08-23T00:00:00+00:00", evidence_refs=(stage1_ref,)
+            ),
+        ),
+    )
+    execution_ref = "formal-execution.json"
+    write_canonical_json(root / execution_ref, execution.to_dict())
+    task = DEFAULT_TASK_CATALOG.get(
+        "stage2.02_stage1_handoff_and_fixed_state_contract"
+    )
+    request = SimpleNamespace(
+        task=task,
+        environment=SimpleNamespace(
+            evidence_refs={
+                "formal_execution": execution_ref,
+                "contract_freeze": freeze_ref,
+                "stage1_g1_exit": stage1_ref,
+                "stage0_handoff": stage0_ref,
+            },
+            passed_gate_ids=("stage2.G2.0", "stage1.G1-EXIT"),
+        ),
+    )
+    return request, execution, execution_ref
+
+
+def test_formal_execution_evidence_consumes_formal_contract_freeze_commit(
+    tmp_path: Path,
+) -> None:
+    freeze = _stage2_formal_freeze()
+    published = TaskArtifactStore(tmp_path, "evidence/contracts").publish(
+        task_id="stage2_contract_freeze_s202",
+        artifact_kind="contract_freeze",
+        config_hash="a" * 64,
+        run_intent="formal",
+        payload=freeze.to_dict(),
+        formal_eligible=True,
+    )
+    request, execution, execution_ref = _stage2_formal_request(
+        tmp_path,
+        freeze_ref=published.commit_ref,
+        contract_freeze_hash=freeze.artifact_hash,
+    )
+
+    loaded, loaded_ref = stage23._formal_execution_evidence(request, tmp_path)
+    assert loaded.artifact_hash == execution.artifact_hash
+    assert loaded_ref == execution_ref
+
+
+def test_formal_execution_evidence_rejects_wrong_kind_commit_without_fallback(
+    tmp_path: Path,
+) -> None:
+    freeze = _stage2_formal_freeze()
+    published = TaskArtifactStore(tmp_path, "evidence/contracts").publish(
+        task_id="stage2_contract_freeze_s202",
+        artifact_kind="asset_manifest",
+        config_hash="a" * 64,
+        run_intent="formal",
+        payload=freeze.to_dict(),
+        formal_eligible=True,
+    )
+    # This deliberately uses the enclosing commit hash: a legacy document-hash
+    # fallback could otherwise accidentally accept the wrong-kind commit.
+    request, _execution, _execution_ref = _stage2_formal_request(
+        tmp_path,
+        freeze_ref=published.commit_ref,
+        contract_freeze_hash=published.artifact_hash,
+    )
+
+    with pytest.raises(TaskBlockedError) as captured:
+        stage23._formal_execution_evidence(request, tmp_path)
+    blocker = captured.value.blockers[0]
+    assert blocker.requirement == "contract_freeze"
+    assert "CONTRACT_FREEZE_COMMIT_ARTIFACT_KIND_INVALID" in blocker.message
