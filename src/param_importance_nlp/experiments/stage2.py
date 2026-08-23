@@ -95,9 +95,6 @@ def _vector_digest(value: object) -> str:
 def _clone_vector(value: object) -> object:
     """冻结小型向量，避免 shard 发布后被调用方原地修改。"""
 
-    clone = getattr(value, "clone", None)
-    if callable(clone):
-        return clone()
     copied: dict[str, np.ndarray] = {}
     for name, tensor in _tensor_items(value):
         array = np.array(_to_numpy(tensor), copy=True)
@@ -119,6 +116,39 @@ def _max_abs_difference(left: object, right: object) -> float:
             raise ValueError(f"参数 {name!r} 的 shape 不一致")
         maximum = max(maximum, float(np.max(np.abs(lhs - rhs), initial=0.0)))
     return maximum
+
+
+def _validate_gradient_batch(
+    provider: FixedStateGradientProvider,
+    batch: GradientBatch,
+    draws: Sequence[object],
+    *,
+    expected_names: Sequence[str] | None = None,
+) -> None:
+    """Fail closed when an adapter returns a batch for a different draw pool.
+
+    The provider is the only component allowed to turn frozen draw IDs into a
+    gradient.  Checking the returned sample IDs here prevents a buggy adapter
+    from silently breaking the paired-design invariant while still returning a
+    finite tensor.  Names are checked against the provider registry when the
+    protocol exposes it, and against the first batch for lightweight fixtures.
+    """
+
+    expected_samples = tuple(
+        getattr(draw, "sample_id", draw) for draw in draws
+    )
+    if tuple(batch.sample_ids) != expected_samples:
+        raise ValueError("GRADIENT_BATCH_SAMPLE_IDS_DRIFT")
+    names = tuple(batch.gradients)
+    if expected_names is not None and names != tuple(expected_names):
+        raise ValueError("GRADIENT_BATCH_PARAMETER_NAMES_DRIFT")
+    provider_names = getattr(provider, "parameter_names", None)
+    if provider_names is not None and tuple(names) != tuple(provider_names):
+        raise ValueError("GRADIENT_BATCH_PARAMETER_REGISTRY_DRIFT")
+    for name, value in batch.gradients.items():
+        array = _to_numpy(value)
+        if array.ndim < 0:  # pragma: no cover - defensive, ndarray always >= 0
+            raise ValueError(f"GRADIENT_BATCH_INVALID_DIMENSION:{name}")
 
 
 _WEIGHTING_CONTRACT_FIELDS = (
@@ -536,6 +566,14 @@ class PairedEstimatorResult:
     formula_seconds: float
     state_digest: str
     weighting_assumptions: Mapping[str, object]
+    # Budget and cost fields are explicit so an equal-sample comparison cannot
+    # be confused with an equal-wall-clock or isolated-estimator comparison.
+    sample_budget: int = 0
+    sample_count: int = 0
+    statistical_weight: float = 0.0
+    gradient_seconds: float = 0.0
+    wall_seconds: float = 0.0
+    peak_memory_bytes: int | None = None
     scope: str = "local_fixture"
     formal_eligible: bool = False
 
@@ -548,6 +586,28 @@ class PairedEstimatorResult:
             self.m2_double_max_abs_error
         ):
             raise ValueError("M=2 误差必须是非负有限数")
+        for field_name in (
+            "sample_budget",
+            "sample_count",
+            "gradient_evaluations",
+        ):
+            value = getattr(self, field_name)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(f"{field_name} 必须是非负整数")
+        if self.sample_budget <= 0 or self.sample_count != self.sample_budget:
+            raise ValueError("sample_count 必须等于冻结 repetition 的 sample_budget")
+        if not math.isfinite(self.statistical_weight) or self.statistical_weight <= 0:
+            raise ValueError("statistical_weight 必须是严格为正的有限数")
+        for field_name in ("gradient_seconds", "formula_seconds", "wall_seconds"):
+            value = float(getattr(self, field_name))
+            if not math.isfinite(value) or value < 0:
+                raise ValueError(f"{field_name} 必须是非负有限数")
+        if self.peak_memory_bytes is not None and (
+            isinstance(self.peak_memory_bytes, bool)
+            or not isinstance(self.peak_memory_bytes, int)
+            or self.peak_memory_bytes < 0
+        ):
+            raise ValueError("peak_memory_bytes 必须是非负整数或 null")
         object.__setattr__(self, "u_by_m", MappingProxyType(dict(self.u_by_m)))
         object.__setattr__(
             self,
@@ -578,6 +638,9 @@ class PairedEstimatorResult:
                         for name, value in sorted(self.vectors.items())
                     },
                     "sample_collision_count": self.sample_collision_count,
+                    "sample_budget": self.sample_budget,
+                    "sample_count": self.sample_count,
+                    "statistical_weight": self.statistical_weight.hex(),
                     "m2_double_max_abs_error": self.m2_double_max_abs_error,
                     "state_digest": self.state_digest,
                     "weighting_assumptions": thaw_json_value(
@@ -607,11 +670,38 @@ class PairedEstimatorRunner:
     def run(self, mapping: RepetitionMapping) -> PairedEstimatorResult:
         """在不修改 provider 固定状态的前提下执行一个 repetition。"""
 
+        if not isinstance(mapping, RepetitionMapping):
+            raise TypeError("PAIRED_MAPPING_REQUIRED")
+        if mapping.batch_size < 2 or mapping.batch_size % 2:
+            raise ValueError("PAIRED_SAMPLE_BUDGET_MUST_BE_EVEN")
+        # M=2 is an invariant, not an optional output column.  Formal plans may
+        # request only a primary M>2; the runner still computes M=2 from the
+        # same immutable base pool for the paired double check.
+        requested_m = tuple(mapping.m_values)
+        evaluation_m = tuple(sorted(set(requested_m) | {2}))
+        max_m = max(evaluation_m)
+        if max_m != max(mapping.m_values):
+            raise ValueError("PAIRED_MAPPING_MAX_M_INVALID")
         before = self.provider.state_digest()
         # 只求值 M_max 个基础 microbatches；raw、double 和更粗 M 都从同一梯度池
         # 合并，避免把 B/M 变化与额外梯度抽样混在一起。
-        max_m = max(mapping.m_values)
-        base_batches = [self.provider.gradient(group) for group in mapping.groups(max_m)]
+        gradient_start = time.perf_counter()
+        base_batches: list[GradientBatch] = []
+        expected_names: tuple[str, ...] | None = None
+        for group in mapping.groups(max_m):
+            batch = self.provider.gradient(group)
+            _validate_gradient_batch(
+                self.provider,
+                batch,
+                group,
+                expected_names=expected_names,
+            )
+            if expected_names is None:
+                expected_names = tuple(batch.gradients)
+            base_batches.append(batch)
+        gradient_seconds = time.perf_counter() - gradient_start
+        if len(base_batches) != max_m:
+            raise RuntimeError("PAIRED_GRADIENT_POOL_SIZE_MISMATCH")
         weighting_contract = _shared_weighting_contract(self.provider, base_batches)
         base_maps = [self.kernel.tensor_map(batch) for batch in base_batches]
         base_weights = [batch.statistical_weight for batch in base_batches]
@@ -629,7 +719,7 @@ class PairedEstimatorRunner:
         double = self.kernel.double(left_mean, right_mean)
 
         u_by_m: dict[int, object] = {}
-        for microbatch_count in mapping.m_values:
+        for microbatch_count in evaluation_m:
             merge_width = max_m // microbatch_count
             gradients: list[object] = []
             weights: list[float] = []
@@ -651,6 +741,14 @@ class PairedEstimatorRunner:
                 f"tolerance={self.m2_tolerance:.6g}"
             )
         self.provider.assert_unchanged(before)
+        peak_memory_bytes: int | None = None
+        try:
+            import torch
+
+            if torch.cuda.is_available():  # pragma: no cover - server-only path
+                peak_memory_bytes = int(torch.cuda.max_memory_allocated())
+        except (ImportError, RuntimeError):
+            peak_memory_bytes = None
         return PairedEstimatorResult(
             unit_id=mapping.repetition_id,
             mapping_digest=mapping.digest,
@@ -664,6 +762,12 @@ class PairedEstimatorRunner:
             formula_seconds=formula_seconds,
             state_digest=before,
             weighting_assumptions=weighting_contract,
+            sample_budget=mapping.batch_size,
+            sample_count=mapping.batch_size,
+            statistical_weight=float(sum(base_weights)),
+            gradient_seconds=gradient_seconds,
+            wall_seconds=gradient_seconds + formula_seconds,
+            peak_memory_bytes=peak_memory_bytes,
         )
 
 
@@ -679,12 +783,48 @@ class SufficientStatisticShard:
     attempt_id: str
     input_hash: str
     vectors: Mapping[str, object]
+    registry_hash: str = ""
+    state_digest: str = ""
+    sample_budget: int = 1
+    statistical_weight: float = 1.0
+    gradient_evaluations: int = 0
+    gradient_seconds: float = 0.0
+    formula_seconds: float = 0.0
+    wall_seconds: float = 0.0
+    peak_memory_bytes: int | None = None
+    weighting_assumptions: Mapping[str, object] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if not self.unit_id or not self.attempt_id or not self.input_hash:
             raise ValueError("unit_id、attempt_id 与 input_hash 都不能为空")
         if not self.vectors:
             raise ValueError("shard vectors 不能为空")
+        for field_name in ("sample_budget", "gradient_evaluations"):
+            value = getattr(self, field_name)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(f"shard {field_name} 必须是非负整数")
+        if self.sample_budget <= 0:
+            raise ValueError("shard sample_budget 必须严格为正")
+        if not math.isfinite(self.statistical_weight) or self.statistical_weight <= 0:
+            raise ValueError("shard statistical_weight 必须严格为正有限数")
+        for field_name in ("gradient_seconds", "formula_seconds", "wall_seconds"):
+            value = float(getattr(self, field_name))
+            if not math.isfinite(value) or value < 0:
+                raise ValueError(f"shard {field_name} 必须是非负有限数")
+        if self.peak_memory_bytes is not None and (
+            isinstance(self.peak_memory_bytes, bool)
+            or not isinstance(self.peak_memory_bytes, int)
+            or self.peak_memory_bytes < 0
+        ):
+            raise ValueError("shard peak_memory_bytes 必须是非负整数或 null")
+        object.__setattr__(
+            self,
+            "weighting_assumptions",
+            freeze_json_mapping(
+                self.weighting_assumptions,
+                field="SufficientStatisticShard.weighting_assumptions",
+            ),
+        )
         object.__setattr__(
             self,
             "vectors",
@@ -705,6 +845,16 @@ class SufficientStatisticShard:
             attempt_id=attempt_id,
             input_hash=result.mapping_digest,
             vectors=result.vectors,
+            registry_hash=result.registry_hash,
+            state_digest=result.state_digest,
+            sample_budget=result.sample_budget,
+            statistical_weight=result.statistical_weight,
+            gradient_evaluations=result.gradient_evaluations,
+            gradient_seconds=result.gradient_seconds,
+            formula_seconds=result.formula_seconds,
+            wall_seconds=result.wall_seconds,
+            peak_memory_bytes=result.peak_memory_bytes,
+            weighting_assumptions=result.weighting_assumptions,
         )
 
     @property
@@ -719,6 +869,14 @@ class SufficientStatisticShard:
                         name: _vector_digest(value)
                         for name, value in sorted(self.vectors.items())
                     },
+                    "registry_hash": self.registry_hash,
+                    "state_digest": self.state_digest,
+                    "sample_budget": self.sample_budget,
+                    "statistical_weight": self.statistical_weight.hex(),
+                    "gradient_evaluations": self.gradient_evaluations,
+                    "weighting_assumptions": thaw_json_value(
+                        self.weighting_assumptions
+                    ),
                 }
             )
         ).hexdigest()
@@ -833,6 +991,17 @@ class ShardArtifactStore:
     @staticmethod
     def _state(shard: SufficientStatisticShard) -> dict[str, object]:
         return {
+            "schema_version": "stage2-sufficient-stat-shard-state-v1",
+            "registry_hash": shard.registry_hash,
+            "state_digest": shard.state_digest,
+            "sample_budget": shard.sample_budget,
+            "statistical_weight": shard.statistical_weight,
+            "gradient_evaluations": shard.gradient_evaluations,
+            "gradient_seconds": shard.gradient_seconds,
+            "formula_seconds": shard.formula_seconds,
+            "wall_seconds": shard.wall_seconds,
+            "peak_memory_bytes": shard.peak_memory_bytes,
+            "weighting_assumptions": thaw_json_value(shard.weighting_assumptions),
             "vectors": {
                 method: {
                     name: np.array(_to_numpy(tensor), copy=True)
@@ -850,8 +1019,16 @@ class ShardArtifactStore:
         attempt_id: str,
         input_hash: str,
     ) -> SufficientStatisticShard:
-        if not isinstance(state, dict) or set(state) != {"vectors"}:
+        required = {
+            "schema_version", "registry_hash", "state_digest", "sample_budget",
+            "statistical_weight", "gradient_evaluations", "gradient_seconds",
+            "formula_seconds", "wall_seconds", "peak_memory_bytes",
+            "weighting_assumptions", "vectors",
+        }
+        if not isinstance(state, dict) or set(state) != required:
             raise ValueError("SHARD_BUNDLE_STATE_FIELDS_MISMATCH")
+        if state.get("schema_version") != "stage2-sufficient-stat-shard-state-v1":
+            raise ValueError("SHARD_BUNDLE_SCHEMA_MISMATCH")
         vectors = state["vectors"]
         if not isinstance(vectors, dict) or not vectors:
             raise ValueError("SHARD_BUNDLE_VECTORS_INVALID")
@@ -867,6 +1044,16 @@ class ShardArtifactStore:
             attempt_id=attempt_id,
             input_hash=input_hash,
             vectors=normalized,
+            registry_hash=str(state["registry_hash"]),
+            state_digest=str(state["state_digest"]),
+            sample_budget=state["sample_budget"],  # type: ignore[arg-type]
+            statistical_weight=state["statistical_weight"],  # type: ignore[arg-type]
+            gradient_evaluations=state["gradient_evaluations"],  # type: ignore[arg-type]
+            gradient_seconds=state["gradient_seconds"],  # type: ignore[arg-type]
+            formula_seconds=state["formula_seconds"],  # type: ignore[arg-type]
+            wall_seconds=state["wall_seconds"],  # type: ignore[arg-type]
+            peak_memory_bytes=state["peak_memory_bytes"],  # type: ignore[arg-type]
+            weighting_assumptions=state["weighting_assumptions"],  # type: ignore[arg-type]
         )
 
     @staticmethod
@@ -1048,12 +1235,25 @@ class ReducedSufficientStatistics:
     unit_ids: tuple[str, ...]
     methods: Mapping[str, ReducedMoments]
     digest: str
+    sample_budget: int = 0
+    statistical_weight: float = 0.0
+    gradient_evaluations: int = 0
+    gradient_seconds: float = 0.0
+    formula_seconds: float = 0.0
+    peak_memory_bytes: int | None = None
 
     def __post_init__(self) -> None:
         if not self.unit_ids or not self.methods:
             raise ValueError("ReducedSufficientStatistics 不能为空")
         if len(self.digest) != 64:
             raise ValueError("reducer digest 必须是 SHA-256")
+        if self.sample_budget < 0 or self.gradient_evaluations < 0:
+            raise ValueError("reducer cost counts 不能为负")
+        if not math.isfinite(self.statistical_weight) or self.statistical_weight < 0:
+            raise ValueError("reducer statistical_weight 必须有限且非负")
+        for value in (self.gradient_seconds, self.formula_seconds):
+            if not math.isfinite(value) or value < 0:
+                raise ValueError("reducer timing 必须有限且非负")
         object.__setattr__(self, "methods", MappingProxyType(dict(self.methods)))
 
 
@@ -1137,7 +1337,38 @@ class DeterministicShardReducer:
                 raise ValueError("不同 shard 的 method 集合不一致")
 
         methods: dict[str, ReducedMoments] = {}
-        digest_payload: dict[str, object] = {"unit_ids": list(unit_ids), "methods": {}}
+        registry_hashes = {shard.registry_hash for shard in self._shards.values()}
+        weighting_hashes = {
+            canonical_json_hash(thaw_json_value(shard.weighting_assumptions))
+            for shard in self._shards.values()
+        }
+        if len(registry_hashes) > 1:
+            raise ValueError("SHARD_REGISTRY_HASH_DRIFT")
+        if len(weighting_hashes) > 1:
+            raise ValueError("SHARD_WEIGHTING_CONTRACT_DRIFT")
+        sample_budget = sum(shard.sample_budget for shard in self._shards.values())
+        statistical_weight = sum(
+            shard.statistical_weight for shard in self._shards.values()
+        )
+        gradient_evaluations = sum(
+            shard.gradient_evaluations for shard in self._shards.values()
+        )
+        gradient_seconds = sum(
+            shard.gradient_seconds for shard in self._shards.values()
+        )
+        formula_seconds = sum(shard.formula_seconds for shard in self._shards.values())
+        peak_values = [
+            shard.peak_memory_bytes
+            for shard in self._shards.values()
+            if shard.peak_memory_bytes is not None
+        ]
+        digest_payload: dict[str, object] = {
+            "unit_ids": list(unit_ids),
+            "sample_budget": sample_budget,
+            "statistical_weight": statistical_weight.hex(),
+            "gradient_evaluations": gradient_evaluations,
+            "methods": {},
+        }
         for method in method_names:
             first_items = dict(_tensor_items(self._shards[unit_ids[0]].vectors[method]))
             names = tuple(sorted(first_items))
@@ -1171,6 +1402,12 @@ class DeterministicShardReducer:
             unit_ids=unit_ids,
             methods=MappingProxyType(methods),
             digest=digest,
+            sample_budget=sample_budget,
+            statistical_weight=statistical_weight,
+            gradient_evaluations=gradient_evaluations,
+            gradient_seconds=gradient_seconds,
+            formula_seconds=formula_seconds,
+            peak_memory_bytes=(max(peak_values) if peak_values else None),
         )
 
 

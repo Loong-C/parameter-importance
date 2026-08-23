@@ -1738,6 +1738,7 @@ class _WaveUnitStore:
             raise ValueError("WAVE_STATE_VECTORS_NOT_MAPPING")
         return canonical_json_hash(
             {
+                "schema_version": state.get("schema_version"),
                 "unit_id": state.get("unit_id"),
                 "input_hash": state.get("input_hash"),
                 "registry_hash": state.get("registry_hash"),
@@ -1747,6 +1748,11 @@ class _WaveUnitStore:
                     for name, value in sorted(vectors.items())
                 },
                 "weighting_assumptions": state.get("weighting_assumptions"),
+                "sample_budget": state.get("sample_budget"),
+                "statistical_weight": state.get("statistical_weight"),
+                "gradient_evaluations": state.get("gradient_evaluations"),
+                "sample_collision_count": state.get("sample_collision_count"),
+                "m2_double_max_abs_error": state.get("m2_double_max_abs_error"),
             }
         )
 
@@ -1794,6 +1800,22 @@ class _WaveUnitStore:
                 raise ValueError("WAVE_OBJECT_MANIFEST_HASH_MISMATCH")
             if not isinstance(state, Mapping):
                 raise ValueError("WAVE_STATE_NOT_OBJECT")
+            required_state = {
+                "schema_version", "unit_id", "input_hash", "registry_hash",
+                "state_digest", "vectors", "metrics", "gradient_evaluations",
+                "gradient_seconds", "formula_seconds", "wall_seconds", "sample_budget",
+                "statistical_weight", "sample_collision_count",
+                "m2_double_max_abs_error", "peak_memory_bytes", "weighting_assumptions",
+            }
+            if set(state) != required_state or state.get(
+                "schema_version"
+            ) != "stage2-wave-unit-state-v1":
+                raise ValueError("WAVE_STATE_FIELDS_MISMATCH")
+            if str(state.get("unit_id")) != str(commit.get("unit_id")):
+                raise ValueError("WAVE_UNIT_ID_MISMATCH")
+            metrics = state.get("metrics")
+            if not isinstance(metrics, Mapping):
+                raise ValueError("WAVE_STATE_METRICS_NOT_MAPPING")
             if self._scientific_digest(state) != commit["scientific_digest"]:
                 raise ValueError("WAVE_SCIENTIFIC_DIGEST_MISMATCH")
             unit_id = str(commit["unit_id"])
@@ -1846,6 +1868,10 @@ def _aggregate_wave(
     gradient_evaluations = 0
     formula_seconds = 0.0
     wall_seconds = 0.0
+    gradient_seconds = 0.0
+    peak_memory_values: list[int] = []
+    sample_budget = 0
+    statistical_weight = 0.0
     for state in states:
         vectors = state["vectors"]
         if not isinstance(vectors, Mapping):
@@ -1855,6 +1881,11 @@ def _aggregate_wave(
         gradient_evaluations += int(state["gradient_evaluations"])
         formula_seconds += float(state["formula_seconds"])
         wall_seconds += float(state["wall_seconds"])
+        gradient_seconds += float(state["gradient_seconds"])
+        if state["peak_memory_bytes"] is not None:
+            peak_memory_values.append(int(state["peak_memory_bytes"]))
+        sample_budget += int(state["sample_budget"])
+        statistical_weight += float(state["statistical_weight"])
     expected = _flatten(reference)
     summaries: dict[str, dict[str, float | int]] = {}
     for method, values in sorted(by_method.items()):
@@ -1883,9 +1914,15 @@ def _aggregate_wave(
     costs = {
         "scientific_equal_sample_cost": {
             "defined": True,
+            "sample_budget": sample_budget,
+            "statistical_weight": statistical_weight,
             "gradient_evaluations": gradient_evaluations,
+            "gradient_seconds": gradient_seconds,
             "formula_seconds": formula_seconds,
             "wall_seconds": wall_seconds,
+            "peak_memory_bytes": (
+                max(peak_memory_values) if peak_memory_values else None
+            ),
             "reason": None,
         },
         "isolated_estimator_cost": {
@@ -2068,7 +2105,33 @@ class RecoverablePairedWaveRunner:
                 if max_new_units is not None and new_count >= max_new_units:
                     break
                 started = time.perf_counter()
-                result = self.runner.run(mapping)
+                try:
+                    result = self.runner.run(mapping)
+                except BaseException as error:
+                    # A failed unit is durable diagnostic evidence, never a
+                    # replacement for the last authoritative commit.  The
+                    # next invocation reuses the same mapping hash and can
+                    # safely recompute this unit.
+                    failures = root / "failures"
+                    failures.mkdir(parents=True, exist_ok=True)
+                    attempt_id = f"attempt-{time.time_ns()}"
+                    failure_path = failures / (
+                        f"{mapping.repetition_id}-{attempt_id}.json"
+                    )
+                    if not failure_path.exists():
+                        write_canonical_json(
+                            failure_path,
+                            {
+                                "schema_version": "stage2-wave-unit-failure-v1",
+                                "unit_id": mapping.repetition_id,
+                                "attempt_id": attempt_id,
+                                "input_hash": mapping.digest,
+                                "last_committed_unit_ids": sorted(existing),
+                                "error_type": type(error).__name__,
+                                "error": str(error),
+                            },
+                        )
+                    raise
                 elapsed = time.perf_counter() - started
                 vectors = {
                     name: _as_vector(value, field_name=f"wave.{name}")
@@ -2083,8 +2146,12 @@ class RecoverablePairedWaveRunner:
                     "vectors": vectors,
                     "metrics": _unit_metrics(vectors, reference),
                     "gradient_evaluations": result.gradient_evaluations,
+                    "gradient_seconds": result.gradient_seconds,
                     "formula_seconds": result.formula_seconds,
                     "wall_seconds": elapsed,
+                    "peak_memory_bytes": result.peak_memory_bytes,
+                    "sample_budget": result.sample_budget,
+                    "statistical_weight": result.statistical_weight,
                     "sample_collision_count": result.sample_collision_count,
                     "m2_double_max_abs_error": result.m2_double_max_abs_error,
                     "weighting_assumptions": thaw_json_value(
@@ -2092,6 +2159,7 @@ class RecoverablePairedWaveRunner:
                     ),
                 }
                 store.publish(state)
+                existing[mapping.repetition_id] = state
                 new_count += 1
             states_by_id = store.load_all()
             selected_states = [states_by_id[unit] for unit in expected if unit in states_by_id]

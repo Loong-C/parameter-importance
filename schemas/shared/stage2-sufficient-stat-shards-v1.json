@@ -1,0 +1,20 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://parameter-importance.invalid/schemas/shared/stage2-sufficient-stat-shards-v1.json",
+  "title": "Stage 2 sufficient-stat shard progress manifest",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "sampling_plan_hash", "experiment_plan_hash", "mapping_hashes", "committed_units", "expected_unit_count", "complete", "recovery_semantics", "formal_eligible"],
+  "properties": {
+    "schema_version": {"const": "stage2-task-sufficient-stat-shards-v1"},
+    "sampling_plan_hash": {"$ref": "#/$defs/hash"},
+    "experiment_plan_hash": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/hash"}]},
+    "mapping_hashes": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"$ref": "#/$defs/hash"}},
+    "committed_units": {"type": "array", "uniqueItems": true, "items": {"type": "string", "minLength": 1}},
+    "expected_unit_count": {"type": "integer", "minimum": 1},
+    "complete": {"type": "boolean"},
+    "recovery_semantics": {"const": "immutable_tensor_bundle_plus_authoritative_commit"},
+    "formal_eligible": {"const": false}
+  },
+  "$defs": {"hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"}}
+}

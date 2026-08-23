@@ -1,0 +1,41 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://parameter-importance.invalid/schemas/shared/stage2-wave-unit-state-v1.json",
+  "title": "Stage 2 immutable paired wave unit state",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "unit_id", "input_hash", "registry_hash", "state_digest", "vectors", "metrics", "gradient_evaluations", "gradient_seconds", "formula_seconds", "wall_seconds", "sample_budget", "statistical_weight", "sample_collision_count", "m2_double_max_abs_error", "peak_memory_bytes", "weighting_assumptions"],
+  "properties": {
+    "schema_version": {"const": "stage2-wave-unit-state-v1"},
+    "unit_id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,159}$"},
+    "input_hash": {"$ref": "#/$defs/hash"},
+    "registry_hash": {"$ref": "#/$defs/hash"},
+    "state_digest": {"$ref": "#/$defs/hash"},
+    "vectors": {"type": "object", "minProperties": 1},
+    "metrics": {"type": "object"},
+    "gradient_evaluations": {"type": "integer", "minimum": 1},
+    "gradient_seconds": {"type": "number", "minimum": 0},
+    "formula_seconds": {"type": "number", "minimum": 0},
+    "wall_seconds": {"type": "number", "minimum": 0},
+    "sample_budget": {"type": "integer", "minimum": 1},
+    "statistical_weight": {"type": "number", "exclusiveMinimum": 0},
+    "sample_collision_count": {"type": "integer", "minimum": 0},
+    "m2_double_max_abs_error": {"type": "number", "minimum": 0},
+    "peak_memory_bytes": {"oneOf": [{"type": "null"}, {"type": "integer", "minimum": 0}]},
+    "weighting_assumptions": {"$ref": "#/$defs/weighting"}
+  },
+  "$defs": {
+    "hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "weighting": {
+      "type": "object", "additionalProperties": false,
+      "required": ["statistical_unit", "weight_unit", "sampling_design", "weights_exogenous", "common_mean_assumption"],
+      "properties": {
+        "statistical_unit": {"type": "string", "minLength": 1},
+        "weight_unit": {"type": "string", "minLength": 1},
+        "sampling_design": {"type": "string", "minLength": 1},
+        "weights_exogenous": {"type": "boolean"},
+        "common_mean_assumption": {"type": "boolean"}
+      }
+    }
+  }
+}

@@ -221,6 +221,46 @@ def test_paired_runner_reuses_one_base_gradient_pool_and_m2_equals_double() -> N
     assert len(result.digest) == 64
 
 
+def test_paired_runner_adds_m2_invariant_for_primary_only_mapping() -> None:
+    """A formal primary M>2 still gets the mandatory M=2/double check."""
+
+    plan = _plan()
+    mapping = RepetitionMapping.create(
+        repetition_id="rep-primary-only",
+        draws=plan.draws("pilot", 32),
+        m_values=(4, 8, 16, 32),
+    )
+    result = PairedEstimatorRunner(_provider(), m2_tolerance=1e-12).run(mapping)
+    assert tuple(result.u_by_m) == (2, 4, 8, 16, 32)
+    assert result.sample_budget == result.sample_count == 32
+    assert result.gradient_evaluations == 32
+    assert result.statistical_weight == pytest.approx(32.0)
+    assert result.gradient_seconds >= 0
+    assert result.formula_seconds >= 0
+
+
+def test_shard_clones_vectors_as_read_only_and_reducer_exposes_budget() -> None:
+    plan = _plan()
+    result = PairedEstimatorRunner(_provider(), m2_tolerance=1e-12).run(
+        RepetitionMapping.create(
+            repetition_id="immutable-budget",
+            draws=plan.draws("pilot", 32),
+            m_values=(2, 4),
+        )
+    )
+    shard = SufficientStatisticShard.from_result(result, attempt_id="attempt-immutable")
+    assert all(
+        not array.flags.writeable
+        for vector in shard.vectors.values()
+        for array in vector.values()
+    )
+    reduced = DeterministicShardReducer()
+    reduced.add(shard)
+    summary = reduced.reduce()
+    assert summary.sample_budget == 32
+    assert summary.gradient_evaluations == result.gradient_evaluations
+
+
 def test_reference_runner_is_one_shot_fixture_and_uses_three_named_views() -> None:
     plan = _plan()
     result = ReferenceRunner(_provider()).run(

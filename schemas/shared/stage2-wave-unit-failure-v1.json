@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://parameter-importance.invalid/schemas/shared/stage2-wave-unit-failure-v1.json",
+  "title": "Stage 2 paired wave recoverable failure record",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "unit_id", "attempt_id", "input_hash", "last_committed_unit_ids", "error_type", "error"],
+  "properties": {
+    "schema_version": {"const": "stage2-wave-unit-failure-v1"},
+    "unit_id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,159}$"},
+    "attempt_id": {"type": "string", "pattern": "^attempt-[0-9]{1,32}$"},
+    "input_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "last_committed_unit_ids": {"type": "array", "uniqueItems": true, "items": {"type": "string"}},
+    "error_type": {"type": "string", "minLength": 1},
+    "error": {"type": "string"}
+  }
+}
