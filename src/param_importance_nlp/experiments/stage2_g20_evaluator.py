@@ -538,6 +538,24 @@ def _repository_identity(repository_root: Path) -> _RepositoryIdentity:
         except G20Blocked as error:
             errors.append(str(error))
 
+    # The code executing this function must be the same source family that the
+    # trusted repository identity describes.  This closes the otherwise subtle
+    # case where a caller points ``repository_root`` at a clean clone while an
+    # older/newer installed evaluator module is actually running.
+    runtime_sources = {
+        EVALUATOR_SOURCE_PATH: Path(__file__).resolve(),
+        PREREGISTRATION_SOURCE_PATH: Path(__file__).resolve().with_name("preregistration.py"),
+        RUNNER_SOURCE_PATH: Path(__file__).resolve().with_name("stage23_task_runners.py"),
+    }
+    for relative, runtime_path in runtime_sources.items():
+        try:
+            repository_path = _resolve(root, relative, f"repository_source:{relative}")
+            runtime_bytes = runtime_path.read_bytes()
+            if runtime_bytes.replace(b"\r\n", b"\n") != repository_path.read_bytes().replace(b"\r\n", b"\n"):
+                errors.append(f"runtime_source:{relative}:EXECUTED_BYTES_MISMATCH")
+        except (OSError, G20Blocked) as error:
+            errors.append(f"runtime_source:{relative}:UNREADABLE:{type(error).__name__}")
+
     if hashes.get(PLAN_PATH) != FROZEN_PLAN_SHA256:
         errors.append("plan:CONTENT_MISMATCH")
     try:
