@@ -106,7 +106,11 @@ from ..providers import (
     SyntheticGradientProvider,
     TorchFixedStateGradientProvider,
 )
-from ..runtime.task_artifacts import TaskArtifactStore, load_committed_task_artifact
+from ..runtime.task_artifacts import (
+    LoadedTaskArtifact,
+    TaskArtifactStore,
+    load_committed_task_artifact,
+)
 from ..runtime.task_runtime import (
     BlockerCode,
     TaskBlockedError,
@@ -126,6 +130,7 @@ from ..runtime.training_factory import build_optimizer
 from .sampling import (
     CANDIDATE_BATCH_SIZES,
     CANDIDATE_MICROBATCH_COUNTS,
+    DrawStreamManifest,
     MICROBATCH_SELECTION_ORDER,
     PrimaryPairDecision,
     RepetitionMapping,
@@ -980,6 +985,99 @@ def _predecessor_context(
     return _PredecessorContext(expected_tasks, tuple(ordered), tuple(auxiliaries))
 
 
+def validate_formal_s203_payloads(
+    payloads: Mapping[str, Mapping[str, object]],
+    *,
+    expected_preregistration_hash: str | None = None,
+    expected_upstream_binding_hash: str | None = None,
+) -> None:
+    """Shared canonical validation for the four S2.3 formal payloads.
+
+    The producer calls this before returning its payloads and the G2.2 adapter
+    calls it after commit discovery.  Keeping the aggregate replay checks here
+    prevents the consumer from inventing a second S2.3 wire contract.
+    """
+    kinds = ("sampling_plan", "draw_manifest", "asset_resolution", "gate_record")
+    if tuple(payloads) != kinds:
+        raise ValueError("STAGE23_S203_PAYLOAD_KIND_ORDER_MISMATCH")
+    asset = payloads["asset_resolution"]
+    if set(asset) != {
+        "schema_version", "provider", "stage2_asset_manifest",
+        "preregistration_contract_hash", "upstream_binding_hash", "formal_eligible",
+    } or asset.get("schema_version") != "stage2-task-asset-resolution-v1" or asset.get("formal_eligible") is not False:
+        raise ValueError("STAGE23_S203_ASSET_PAYLOAD_INVALID")
+    manifest_value = asset.get("stage2_asset_manifest")
+    if not isinstance(manifest_value, Mapping):
+        raise ValueError("STAGE23_S203_ASSET_MANIFEST_NOT_OBJECT")
+    manifest = AssetResolutionManifest.from_mapping(manifest_value)
+    validate_formal_asset_identity(manifest)
+    provider = asset.get("provider")
+    if not isinstance(provider, Mapping) or provider.get("provider_kind") != "offline_hf_stage2_asset_manifest" or provider.get("asset_resolution_hash") != manifest.digest or provider.get("data_range_hash") != manifest.data_range.digest:
+        raise ValueError("STAGE23_S203_PROVIDER_BINDING_INVALID")
+    if expected_preregistration_hash is not None and asset.get("preregistration_contract_hash") != expected_preregistration_hash:
+        raise ValueError("STAGE23_S203_PREREGISTRATION_HASH_MISMATCH")
+    if expected_upstream_binding_hash is not None and asset.get("upstream_binding_hash") != expected_upstream_binding_hash:
+        raise ValueError("STAGE23_S203_UPSTREAM_BINDING_HASH_MISMATCH")
+    plan = SamplingPlan.from_mapping(payloads["sampling_plan"])
+    if tuple(plan.universe.sample_ids) != tuple(range(manifest.data_range.sample_id_min, manifest.data_range.sample_id_max_exclusive)):
+        raise ValueError("STAGE23_S203_SAMPLING_UNIVERSE_MISMATCH")
+    draw = payloads["draw_manifest"]
+    required = {"schema_version", "sampling_plan_hash", "draws", "draw_count_by_stream", "stream_manifests", "draw_id_unique", "sample_id_collisions_allowed", "replay_hash", "nested_mapping", "nested_mapping_hash"}
+    if set(draw) != required or draw.get("schema_version") != "stage2-task-draw-manifest-v1" or draw.get("sampling_plan_hash") != plan.digest:
+        raise ValueError("STAGE23_S203_DRAW_PAYLOAD_INVALID")
+    streams = draw.get("stream_manifests")
+    if not isinstance(streams, Mapping) or set(streams) != set(STREAM_NAMES):
+        raise ValueError("STAGE23_S203_STREAM_SET_INVALID")
+    parsed = {name: DrawStreamManifest.from_manifest(value) for name, value in streams.items() if isinstance(value, Mapping)}
+    if set(parsed) != set(STREAM_NAMES) or any(item.sampling_plan_hash != plan.digest for item in parsed.values()) or any(len(item.draws) != 4 for item in parsed.values()):
+        raise ValueError("STAGE23_S203_STREAM_INVALID")
+    rows = draw.get("draws")
+    expected_rows = [item.to_manifest() for name in STREAM_NAMES for item in parsed[name].draws]
+    if rows != expected_rows or draw.get("draw_count_by_stream") != {name: 4 for name in STREAM_NAMES} or draw.get("replay_hash") != canonical_json_hash(rows):
+        raise ValueError("STAGE23_S203_DRAW_REPLAY_INVALID")
+    mapping_value = draw.get("nested_mapping")
+    if not isinstance(mapping_value, Mapping):
+        raise ValueError("STAGE23_S203_MAPPING_NOT_OBJECT")
+    mapping = RepetitionMapping.from_manifest(mapping_value)
+    if mapping.digest != draw.get("nested_mapping_hash") or mapping.repetition_id != "stage2-formal-sampling-nested-fixture" or mapping.m_values != (2, 4, 8) or tuple(item.to_manifest() for item in mapping.draws) != tuple(item.to_manifest() for item in plan.draws("pilot", 8)):
+        raise ValueError("STAGE23_S203_MAPPING_REPLAY_INVALID")
+    candidate = payloads["gate_record"]
+    if candidate != {
+        "schema_version": "stage23-task-gate-candidate-v1",
+        "task_id": "stage2.03_assets_checkpoints_and_sampling",
+        "gate_ids": ["stage2.G2.1"],
+        "gate_status": "NOT_RUN",
+        "local_validation_status": "NOT_RUN",
+        "formal_eligible": False,
+        "reason": "formal_gate_requires_independent_review",
+    }:
+        raise ValueError("STAGE23_S203_GATE_CANDIDATE_INVALID")
+
+
+def validate_formal_s203_task_artifacts(
+    workspace_root: str | Path,
+    refs: Mapping[str, str],
+) -> tuple[dict[str, LoadedTaskArtifact], str]:
+    """Discover the complete S2.3 formal envelope through the shared loader."""
+    kinds = ("sampling_plan", "draw_manifest", "asset_resolution", "gate_record")
+    if tuple(refs) != kinds:
+        raise ValueError("STAGE23_S203_FORMAL_ARTIFACTS_INCOMPLETE")
+    loaded = {
+        kind: load_committed_task_artifact(workspace_root, refs[kind], require_formal=True)
+        for kind in kinds
+    }
+    if any(item.identity.task_id != "stage2.03_assets_checkpoints_and_sampling" or item.identity.artifact_kind != kind for kind, item in loaded.items()):
+        raise ValueError("STAGE23_S203_FORMAL_ARTIFACT_IDENTITY_INVALID")
+    hashes = {item.identity.config_hash for item in loaded.values()}
+    if len(hashes) != 1:
+        raise ValueError("STAGE23_S203_FORMAL_CONFIG_HASH_MISMATCH")
+    sources = {item.source_refs for item in loaded.values()}
+    if len(sources) != 1 or not next(iter(sources), ()):
+        raise ValueError("STAGE23_S203_FORMAL_SOURCE_REFS_INVALID")
+    validate_formal_s203_payloads({kind: item.payload for kind, item in loaded.items()})
+    return loaded, next(iter(hashes))
+
+
 def _formal_execution_evidence(
     request: TaskExecutionRequest,
     root: Path,
@@ -1423,7 +1521,7 @@ def _run_formal_stage2_assets_and_sampling(
 ) -> tuple[Mapping[str, Mapping[str, JSONValue]], tuple[str, ...]]:
     """Publish the formal S2.3 candidate from the independent asset evidence."""
 
-    assets, asset_reference = _formal_stage2_asset_manifest(request, root)
+    assets, _asset_reference = _formal_stage2_asset_manifest(request, root)
     data_range = assets.data_range
     sample_ids = tuple(range(data_range.sample_id_min, data_range.sample_id_max_exclusive))
     sampling = _sampling_plan_for_ids(
@@ -1472,8 +1570,7 @@ def _run_formal_stage2_assets_and_sampling(
             for record in assets.checkpoints
         ],
     }
-    return (
-        {
+    payloads: dict[str, Mapping[str, JSONValue]] = {
             "sampling_plan": sampling.to_dict(),  # type: ignore[dict-item]
             "draw_manifest": {
                 "schema_version": "stage2-task-draw-manifest-v1",
@@ -1498,9 +1595,18 @@ def _run_formal_stage2_assets_and_sampling(
                 "formal_eligible": False,
             },
             "gate_record": _gate_candidate(request),
-        },
-        tuple(dict.fromkeys((*inputs.references, asset_reference))),
+    }
+    validate_formal_s203_payloads(
+        payloads,
+        expected_preregistration_hash=canonical_json_hash(inputs.payload("preregistration")),
+        expected_upstream_binding_hash=inputs.binding_hash,
     )
+    # The resolved config's input_result_refs are the complete canonical
+    # predecessor lineage.  The environment-bound asset manifest is already
+    # embedded and hash-bound in ``asset_resolution``; it is evidence, not an
+    # implicit source_ref.  Keeping source_refs identical to the config avoids
+    # consumers silently deleting or adding references during Gate review.
+    return payloads, inputs.references
 
 
 def _stage2_source_identity() -> tuple[str, str | None, str | None]:
