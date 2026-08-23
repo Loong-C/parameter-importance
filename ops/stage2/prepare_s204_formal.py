@@ -151,6 +151,12 @@ def prepare_formal_s204(
         expected_refs=tuple(predecessor_refs["stage2.02_stage1_handoff_and_fixed_state_contract"].values()),
     )
     asset_ref = _source_ref(_required_ref(sources, "stage2_asset_resolution"), "stage2_asset_resolution")
+    if asset_ref != predecessor_refs["stage2.03_assets_checkpoints_and_sampling"]["asset_resolution"]:
+        raise _error("S204_ASSET_REF_PREDECESSOR_MISMATCH")
+    if _source_ref(_required_ref(sources, "g21_handoff"), "g21_handoff") != predecessor_refs[
+        "stage2.02_stage1_handoff_and_fixed_state_contract"
+    ]["handoff_manifest"]:
+        raise _error("S204_G21_HANDOFF_REF_PREDECESSOR_MISMATCH")
     g22_ref = _validate_adapter_gate(
         root,
         gate_id="stage2.G2.2",
