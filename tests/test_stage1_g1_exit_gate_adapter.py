@@ -71,6 +71,12 @@ def test_publish_stage1_exit_gate_validates_seven_commits_and_reuses(monkeypatch
     write_canonical_json(source, {"schema_version": "source-v1"})
     for task_id, output, kinds in adapter.S1_GROUPS:
         _group(tmp_path, task_id, output, kinds)
+    archived_files_before = {
+        path.relative_to(tmp_path).as_posix(): path.read_bytes()
+        for output in (adapter.S110_OUTPUT, adapter.S111_OUTPUT)
+        for path in (tmp_path / output).rglob("*")
+        if path.is_file()
+    }
     fake_exit = SimpleNamespace(
         index_sha256="a" * 64,
         index_artifact_hash="b" * 64,
@@ -82,8 +88,8 @@ def test_publish_stage1_exit_gate_validates_seven_commits_and_reuses(monkeypatch
     monkeypatch.setattr(adapter.canonical_stage1, "_emit_load_r4", lambda **_kwargs: calls.__setitem__("r4", calls["r4"] + 1) or {})
     monkeypatch.setattr(adapter.canonical_stage1, "_emit_load_s110", lambda **_kwargs: calls.__setitem__("s110", calls["s110"] + 1) or {})
 
-    first = adapter.publish_stage1_exit_gate(repository_root=tmp_path, data_root=tmp_path)
-    second = adapter.publish_stage1_exit_gate(repository_root=tmp_path, data_root=tmp_path)
+    first = adapter.publish_stage1_exit_gate(repository_root=Path.cwd(), data_root=tmp_path)
+    second = adapter.publish_stage1_exit_gate(repository_root=Path.cwd(), data_root=tmp_path)
     assert first["commit_ref"] == second["commit_ref"]
     assert second["reused"] is True
     gate = first["gate_record"]
@@ -92,4 +98,16 @@ def test_publish_stage1_exit_gate_validates_seven_commits_and_reuses(monkeypatch
     assert gate["status"] == "PASS"
     assert len(gate["evidence_refs"]) == 8
     assert gate["measured"]["commit_count"] == 7
+    assert gate["measured"]["adapter_repository_head"]
+    assert gate["measured"]["adapter_source_ref"] == adapter.ADAPTER_SOURCE_REF
+    assert len(gate["measured"]["adapter_source_sha256"]) == 64
+    assert len(gate["measured"]["adapter_source_git_object"]) == 40
+    assert first["commit_ref"].startswith(adapter.DEFAULT_OUTPUT_DIR)
+    archived_files_after = {
+        path.relative_to(tmp_path).as_posix(): path.read_bytes()
+        for output in (adapter.S110_OUTPUT, adapter.S111_OUTPUT)
+        for path in (tmp_path / output).rglob("*")
+        if path.is_file()
+    }
+    assert archived_files_after == archived_files_before
     assert calls == {"validate": 2, "r4": 2, "s110": 2}

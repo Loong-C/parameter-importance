@@ -11,6 +11,7 @@ import argparse
 from collections.abc import Mapping, Sequence
 import hashlib
 from pathlib import Path, PurePosixPath
+import subprocess
 import sys
 from typing import Any
 
@@ -41,6 +42,8 @@ GATE_ID = "stage1.G1-EXIT"
 ARTIFACT_KIND = "gate_record"
 S111_OUTPUT = "evidence/stage1/tasks/11-s1-11-r4-20260821"
 S110_OUTPUT = "evidence/stage1/tasks/10-s1-10-r12-20260821"
+DEFAULT_OUTPUT_DIR = "evidence/stage2/adapters/stage1-g1-exit"
+ADAPTER_SOURCE_REF = "ops/stage1/publish_s1_g1_exit_gate.py"
 INDEX_REF = canonical_stage1.S111_R4_INDEX_REF
 S110_TASK_ID = "stage1.10_checkpoint_resume_and_artifacts"
 S110_KINDS = tuple(canonical_stage1.S110_TASK_ARTIFACT_KINDS)
@@ -99,6 +102,38 @@ def _self_hash(value: Mapping[str, object], *, field: str, hash_field: str = "ar
     if not isinstance(declared, str) or declared != canonical_json_hash(body):
         raise Stage1ExitGateAdapterError(f"{field}:SELF_HASH_INVALID")
     return declared
+
+
+def _git(repository: Path, *arguments: str) -> str:
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(repository), *arguments],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except (OSError, subprocess.CalledProcessError) as error:
+        raise Stage1ExitGateAdapterError("ADAPTER_GIT_IDENTITY_UNAVAILABLE") from error
+    value = result.stdout.strip()
+    if not value:
+        raise Stage1ExitGateAdapterError("ADAPTER_GIT_IDENTITY_EMPTY")
+    return value
+
+
+def _adapter_identity(repository: Path) -> dict[str, str]:
+    """Derive consumer HEAD, source bytes, and the source's Git blob identity."""
+
+    source = _path(repository, ADAPTER_SOURCE_REF, field="adapter.source")
+    if not source.is_file():
+        raise Stage1ExitGateAdapterError("ADAPTER_SOURCE_MISSING")
+    head = _git(repository, "rev-parse", "HEAD")
+    object_id = _git(repository, "rev-parse", f"HEAD:{ADAPTER_SOURCE_REF}")
+    return {
+        "repository_head": head,
+        "source_ref": ADAPTER_SOURCE_REF,
+        "source_sha256": _sha(source),
+        "source_git_object": object_id,
+    }
 
 
 def _load_group(
@@ -186,6 +221,7 @@ def _gate_payload(
     index_ref: str,
     exit_evidence: object,
     groups: Mapping[str, Mapping[str, object]],
+    adapter_identity: Mapping[str, str],
 ) -> dict[str, object]:
     evidence_refs = (index_ref, *[ref for group in groups.values() for ref in group["commit_refs"].values()])
     measured = {
@@ -195,6 +231,11 @@ def _gate_payload(
         "producer_commit": exit_evidence.producer_commit,
         "execution_commit": exit_evidence.execution_commit,
         "consumer_commit": STAGE1_G1_EXIT_PRODUCER_COMMIT,
+        "adapter_repository_head": adapter_identity["repository_head"],
+        "adapter_source_ref": adapter_identity["source_ref"],
+        "adapter_source_sha256": adapter_identity["source_sha256"],
+        "adapter_source_git_object": adapter_identity["source_git_object"],
+        "adapter_source": dict(adapter_identity),
         "task_groups": dict(groups),
         "commit_count": len(evidence_refs) - 1,
     }
@@ -219,7 +260,7 @@ def publish_stage1_exit_gate(
     *,
     repository_root: str | Path,
     data_root: str | Path,
-    output_dir: str = S111_OUTPUT,
+    output_dir: str = DEFAULT_OUTPUT_DIR,
 ) -> dict[str, object]:
     """Validate released Stage 1, then publish and strictly reread one Gate commit."""
 
@@ -227,6 +268,7 @@ def publish_stage1_exit_gate(
     root = Path(data_root).resolve()
     if not repository.is_dir() or not root.is_dir():
         raise Stage1ExitGateAdapterError("ROOT_INVALID")
+    adapter_identity = _adapter_identity(repository)
     # Both calls are intentionally mandatory: the generic consumer contract
     # and the released producer loaders protect different identity surfaces.
     exit_evidence = validate_stage1_exit_evidence(root, INDEX_REF)
@@ -240,7 +282,12 @@ def publish_stage1_exit_gate(
     for task_id, group_output, kinds in S1_GROUPS:
         _, metadata = _load_group(root, task_id=task_id, output_dir=group_output, kinds=kinds)
         loaded_groups[task_id] = metadata
-    payload = _gate_payload(index_ref=INDEX_REF, exit_evidence=exit_evidence, groups=loaded_groups)
+    payload = _gate_payload(
+        index_ref=INDEX_REF,
+        exit_evidence=exit_evidence,
+        groups=loaded_groups,
+        adapter_identity=adapter_identity,
+    )
     refs = tuple(payload["evidence_refs"])
     store = TaskArtifactStore(root, output_dir)
     commit_ref = f"{store.output_dir}/commits/{ARTIFACT_KIND}.json"
@@ -253,7 +300,7 @@ def publish_stage1_exit_gate(
     published = store.publish(
         task_id=STAGE1_G1_EXIT_TASK_ID,
         artifact_kind=ARTIFACT_KIND,
-        config_hash=canonical_json_hash({"index_ref": INDEX_REF, "index_artifact_hash": exit_evidence.index_artifact_hash, "commit_artifact_hashes": {task: data["commit_artifact_hashes"] for task, data in loaded_groups.items()}}),
+        config_hash=canonical_json_hash({"index_ref": INDEX_REF, "index_artifact_hash": exit_evidence.index_artifact_hash, "commit_artifact_hashes": {task: data["commit_artifact_hashes"] for task, data in loaded_groups.items()}, "adapter_identity": adapter_identity}),
         run_intent="formal",
         payload=payload,
         formal_eligible=True,
@@ -269,7 +316,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--repository", type=Path, required=True)
     parser.add_argument("--data-root", type=Path, required=True)
-    parser.add_argument("--output-dir", default=S111_OUTPUT)
+    parser.add_argument("--output-dir", default=DEFAULT_OUTPUT_DIR)
     args = parser.parse_args(argv)
     print(publish_stage1_exit_gate(repository_root=args.repository, data_root=args.data_root, output_dir=args.output_dir))
     return 0
