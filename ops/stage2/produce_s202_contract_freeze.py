@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import dataclass
-from datetime import datetime, timezone
 import hashlib
 from pathlib import Path, PurePosixPath
 import sys
