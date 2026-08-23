@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from ops.stage2.materialize_s204 import _load_formal_contract_freeze
 from ops.stage2.produce_s202_contract_freeze import (
     REQUIRED_GATE_IDS,
     produce_s202_contract_freeze,
@@ -77,6 +78,11 @@ def test_s202_producer_publishes_unique_freeze_and_append_only_evidence(tmp_path
     )
     loaded = load_committed_task_artifact(root, result.contract_commit_ref, require_formal=True)
     assert loaded.payload["schema_version"] == "contract-freeze-v1"
+    loaded_ref, loaded_freeze = _load_formal_contract_freeze(
+        root, result.contract_commit_ref, stage=2
+    )
+    assert loaded_ref == result.contract_commit_ref
+    assert loaded_freeze == result.freeze
     assert result.freeze.formal_eligible
     assert "stage2.G2.0" in REQUIRED_GATE_IDS
     amended = FormalExecutionEvidence.from_mapping(
