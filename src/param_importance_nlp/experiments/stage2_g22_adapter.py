@@ -14,12 +14,18 @@ import hashlib
 from pathlib import Path
 import re
 import subprocess
+from types import SimpleNamespace
 
 from ..contracts.config_v2 import ResolvedConfigV2
 from ..contracts.jsonio import JSONValue, canonical_json_hash, load_canonical_json
 from ..contracts.status import GateRecord, GateStatus
+from ..contracts.task_catalog import DEFAULT_TASK_CATALOG
 from ..runtime.task_artifacts import LoadedTaskArtifact, TaskArtifactStore, load_committed_task_artifact
-from .sampling import DrawStreamManifest, RepetitionMapping, SamplingPlan
+from .stage23_task_runners import (
+    _predecessor_context,
+    validate_formal_s203_payloads,
+    validate_formal_s203_task_artifacts,
+)
 from .stage2_assets import (
     FORMAL_CHECKPOINT_SELECTION,
     FORMAL_TOTAL_TRAINING_STEPS,
@@ -122,6 +128,13 @@ def _resolve(root: Path, ref: str) -> Path:
     return path
 
 
+def _validate_dual_roots(repository_root: Path, data_root: Path) -> None:
+    if repository_root == data_root or repository_root.is_relative_to(data_root) or data_root.is_relative_to(repository_root):
+        raise G22Blocked("G22_DUAL_ROOTS_NESTED")
+    _reject_symlink_chain(repository_root, repository_root.parent)
+    _reject_symlink_chain(data_root, data_root.parent)
+
+
 def _load_hashed(root: Path, ref: str, expected: str) -> dict[str, JSONValue]:
     path = _resolve(root, ref)
     if not path.is_file():
@@ -197,74 +210,42 @@ def _producer_identity(repository_root: Path, producer: str) -> dict[str, JSONVa
     return {"commit": producer, "mode": "same_commit" if producer == current else "ancestor", "source_git_blobs": source_objects}
 
 
-def _load_task(root: Path, ref: str, expected_kind: str) -> LoadedTaskArtifact:
-    commit_path = _resolve(root, ref)
-    try:
-        commit = load_canonical_json(commit_path)
-        if not isinstance(commit, Mapping) or not isinstance(commit.get("object_ref"), str):
-            raise ValueError("task commit object reference missing")
-        _resolve(root, commit["object_ref"])
-        loaded = load_committed_task_artifact(root, ref, require_formal=True)
-    except (FileNotFoundError, OSError, TypeError, ValueError) as error:
-        raise G22Blocked(f"G22_TASK_ARTIFACT_INVALID:{expected_kind}") from error
-    if loaded.identity.task_id != TASK_ID or loaded.identity.artifact_kind != expected_kind:
-        raise G22Blocked(f"G22_TASK_ARTIFACT_IDENTITY:{expected_kind}")
-    if loaded.run_intent != "formal" or loaded.identity.formal_eligible is not True:
-        raise G22Blocked("G22_TASK_ARTIFACT_NOT_FORMAL")
-    return loaded
-
-
 def _validate_task_inputs(root: Path, refs: Mapping[str, str]) -> tuple[dict[str, LoadedTaskArtifact], str]:
-    if set(refs) != set(ARTIFACT_KINDS):
-        raise G22Blocked("G22_S203_FORMAL_COMMITS_INCOMPLETE")
-    loaded = {kind: _load_task(root, str(refs[kind]), kind) for kind in ARTIFACT_KINDS}
-    config_hashes = {item.identity.config_hash for item in loaded.values()}
-    if len(config_hashes) != 1:
-        raise G22Blocked("G22_S203_CONFIG_HASH_MISMATCH")
-    sources = {item.source_refs for item in loaded.values()}
-    if any(not item for item in sources):
-        raise G22Blocked("G22_S203_SOURCE_REFS_MISSING")
-    if len(sources) != 1:
-        raise G22Blocked("G22_S203_SOURCE_REFS_NOT_SHARED")
-    shared_sources = next(iter(sources))
-    if ASSET_REF not in shared_sources or not any("stage2.01" in ref for ref in shared_sources):
-        raise G22Blocked("G22_S203_FORMAL_LINEAGE_NOT_PROVEN")
-    candidate = loaded["gate_record"].payload
-    if set(candidate) != {"schema_version", "task_id", "gate_ids", "gate_status", "local_validation_status", "formal_eligible", "reason"} or candidate.get("schema_version") != "stage23-task-gate-candidate-v1" or candidate.get("task_id") != TASK_ID or candidate.get("gate_status") != "NOT_RUN" or candidate.get("local_validation_status") != "NOT_RUN" or candidate.get("formal_eligible") is not False or candidate.get("gate_ids") != [GATE_ID] or candidate.get("reason") != "formal_gate_requires_independent_review":
-        raise G22Blocked("G22_CANDIDATE_GATE_NOT_ACCEPTED")
-    asset_payload = loaded["asset_resolution"].payload
-    if set(asset_payload) != {"schema_version", "provider", "stage2_asset_manifest", "preregistration_contract_hash", "upstream_binding_hash", "formal_eligible"} or asset_payload["schema_version"] != "stage2-task-asset-resolution-v1" or asset_payload["formal_eligible"] is not False:
-        raise G22Blocked("G22_TASK_ASSET_PAYLOAD_SCHEMA_INVALID")
-    if not isinstance(asset_payload["provider"], Mapping) or asset_payload["provider"].get("provider_kind") != "offline_hf_stage2_asset_manifest" or asset_payload["provider"].get("asset_resolution_hash") != ASSET_DIGEST or asset_payload["provider"].get("data_range_hash") != DATA_DIGEST:
-        raise G22Blocked("G22_TASK_ASSET_PAYLOAD_PROVENANCE_INVALID")
-    if not isinstance(asset_payload["stage2_asset_manifest"], Mapping):
-        raise G22Blocked("G22_TASK_ASSET_PAYLOAD_NOT_MANIFEST")
-    task_manifest = AssetResolutionManifest.from_mapping(asset_payload["stage2_asset_manifest"])
-    validate_formal_asset_identity(task_manifest)
-    if task_manifest.digest != ASSET_DIGEST or task_manifest.data_range.digest != DATA_DIGEST:
-        raise G22Blocked("G22_TASK_ASSET_PAYLOAD_DIGEST_INVALID")
-    plan = SamplingPlan.from_mapping(loaded["sampling_plan"].payload)
-    if tuple(plan.universe.sample_ids) != tuple(range(524288)):
-        raise G22Blocked("G22_SAMPLING_UNIVERSE_DRIFT")
-    draw = loaded["draw_manifest"].payload
-    required = {"schema_version", "sampling_plan_hash", "draws", "draw_count_by_stream", "stream_manifests", "draw_id_unique", "sample_id_collisions_allowed", "replay_hash", "nested_mapping", "nested_mapping_hash"}
-    if set(draw) != required or draw["schema_version"] != "stage2-task-draw-manifest-v1" or draw["sampling_plan_hash"] != plan.digest:
-        raise G22Blocked("G22_DRAW_MANIFEST_SCHEMA_OR_PLAN_MISMATCH")
-    if draw["draw_id_unique"] is not True or draw["sample_id_collisions_allowed"] is not True:
-        raise G22Blocked("G22_DRAW_MANIFEST_FLAGS_INVALID")
-    streams = draw["stream_manifests"]
-    if not isinstance(streams, Mapping) or set(streams) != {"reference_sizing", "reference_A", "reference_B", "pilot", "confirmatory"}:
-        raise G22Blocked("G22_DRAW_STREAM_SET_INVALID")
-    parsed = {name: DrawStreamManifest.from_manifest(value) for name, value in streams.items() if isinstance(value, Mapping)}
-    if set(parsed) != set(streams) or any(item.sampling_plan_hash != plan.digest or len(item.draws) != 4 for item in parsed.values()):
-        raise G22Blocked("G22_DRAW_STREAM_INVALID")
-    rows = draw["draws"]
-    if not isinstance(rows, list) or canonical_json_hash(rows) != draw["replay_hash"] or len(rows) != 20:
-        raise G22Blocked("G22_DRAW_ROWS_INVALID")
-    mapping = RepetitionMapping.from_manifest(draw["nested_mapping"]) if isinstance(draw["nested_mapping"], Mapping) else None
-    if mapping is None or mapping.digest != draw["nested_mapping_hash"] or mapping.repetition_id != "stage2-formal-sampling-nested-fixture" or mapping.m_values != (2, 4, 8) or mapping.batch_size != 8:
-        raise G22Blocked("G22_NESTED_MAPPING_INVALID")
-    return loaded, next(iter(config_hashes))
+    try:
+        return validate_formal_s203_task_artifacts(root, refs)
+    except (FileNotFoundError, OSError, TypeError, ValueError) as error:
+        raise G22Blocked(f"G22_S203_FORMAL_INPUT_INVALID:{type(error).__name__}") from error
+
+
+def _verify_s203_lineage(
+    root: Path,
+    loaded: Mapping[str, LoadedTaskArtifact],
+    config: ResolvedConfigV2,
+    output_dir: str,
+) -> tuple[str, str]:
+    """Reuse the producer's predecessor verifier for binding/prereg hashes."""
+    source_refs = next(iter({item.source_refs for item in loaded.values()}), ())
+    auxiliary = {ASSET_REF}
+    predecessor_refs = tuple(ref for ref in source_refs if ref not in auxiliary)
+    if not predecessor_refs:
+        raise G22Blocked("G22_S203_PREDECESSOR_REFS_MISSING")
+    orchestration = config.section("orchestration")
+    if not isinstance(orchestration, Mapping):
+        raise G22Blocked("G22_RESOLVED_CONFIG_ORCHESTRATION_INVALID")
+    view = dict(orchestration)
+    view["input_result_refs"] = list(predecessor_refs)
+    fake_config = SimpleNamespace(
+        section=lambda name: view if name == "orchestration" else config.section(name),
+        task_id=config.task_id,
+        run_intent=config.run_intent,
+    )
+    request = SimpleNamespace(
+        config=fake_config,
+        task=DEFAULT_TASK_CATALOG.get(TASK_ID),
+        environment=SimpleNamespace(),
+    )
+    context = _predecessor_context(request, root, TaskArtifactStore(root, output_dir))
+    return context.binding_hash, canonical_json_hash(context.payload("preregistration"))
 
 
 def _validate_offline(root: Path, manifest: AssetResolutionManifest) -> list[dict[str, JSONValue]]:
@@ -399,7 +380,7 @@ def evaluate_formal_g22(
     authority_evidence_ref: str = AUTHORITY_EVIDENCE_REF,
     offline_load_refs: Mapping[str, str] | None = None,
     manifest_refs: Mapping[str, str] | None = None,
-    output_dir: str = "task_outputs/stage2-g2.2",
+    output_dir: str | None = None,
 ) -> dict[str, JSONValue]:
     """Validate S2.3 and publish exactly one formal G2.2 GateRecord commit.
 
@@ -411,6 +392,7 @@ def evaluate_formal_g22(
     repository = Path(repository_root).absolute()
     data = Path(data_root).absolute()
     try:
+        _validate_dual_roots(repository, data)
         if authority_evidence_ref != AUTHORITY_EVIDENCE_REF:
             raise G22Blocked("G22_AUTHORITY_REF_NOT_CANONICAL")
         if offline_load_refs is not None:
@@ -424,13 +406,27 @@ def evaluate_formal_g22(
                 raise G22Blocked("G22_MANIFEST_REF_SET_NOT_CANONICAL")
         loaded, config_hash = _validate_task_inputs(data, s203_artifact_refs)
         config = _config(data, resolved_config_ref, config_hash)
+        artifacts = config.section("artifacts")
+        if not isinstance(artifacts, Mapping) or not isinstance(artifacts.get("output_dir"), str):
+            raise G22Blocked("G22_RESOLVED_CONFIG_OUTPUT_CONTRACT_INVALID")
+        configured_output_dir = str(artifacts["output_dir"])
+        if output_dir is not None and output_dir != configured_output_dir:
+            raise G22Blocked("G22_OUTPUT_DIR_OVERRIDE_REJECTED")
+        upstream_binding_hash, preregistration_hash = _verify_s203_lineage(
+            data, loaded, config, configured_output_dir
+        )
+        validate_formal_s203_payloads(
+            {kind: item.payload for kind, item in loaded.items()},
+            expected_preregistration_hash=preregistration_hash,
+            expected_upstream_binding_hash=upstream_binding_hash,
+        )
         repo_identity = _git_identity(repository)
         producer = _producer_identity(repository, PRODUCER_COMMIT)
         assets = _validate_real_assets(data)
         refs = tuple(s203_artifact_refs[k] for k in ARTIFACT_KINDS) + (AUTHORITY_EVIDENCE_REF, ASSET_REF, DATA_REF, SELECTION_REF) + tuple(item["ref"] for item in assets["offline_loads"])
-        measured: dict[str, JSONValue] = {"adapter_schema_version": ADAPTER_SCHEMA_VERSION, "task_id": TASK_ID, "config": {"ref": resolved_config_ref, "config_hash": config.config_hash, "full_hash": config.full_hash, "run_intent": config.run_intent, "formal_eligible": config.formal_eligible}, "roots": {"repository_root": str(repository), "data_root": str(data)}, "repository": repo_identity, "producer": producer, "authority": assets, "input_artifacts": {kind: {"commit_ref": loaded[kind].identity.commit_ref, "artifact_hash": loaded[kind].identity.artifact_hash} for kind in ARTIFACT_KINDS}}
+        measured: dict[str, JSONValue] = {"adapter_schema_version": ADAPTER_SCHEMA_VERSION, "task_id": TASK_ID, "config": {"ref": resolved_config_ref, "config_hash": config.config_hash, "full_hash": config.full_hash, "run_intent": config.run_intent, "formal_eligible": config.formal_eligible}, "roots": {"repository_root": str(repository), "data_root": str(data)}, "repository": repo_identity, "producer": producer, "authority": assets, "lineage": {"upstream_binding_hash": upstream_binding_hash, "preregistration_contract_hash": preregistration_hash}, "runtime": {"runtime": "TaskRuntime", "formal_envelope": "load_committed_task_artifact", "store": "TaskArtifactStore", "gate_schema": "gate-record-v1"}, "input_artifacts": {kind: {"commit_ref": loaded[kind].identity.commit_ref, "artifact_hash": loaded[kind].identity.artifact_hash} for kind in ARTIFACT_KINDS}}
         gate = _gate(status=GateStatus.PASS, checked_at=checked_at, measured=measured, refs=refs)
-        store = TaskArtifactStore(data, output_dir)
+        store = TaskArtifactStore(data, configured_output_dir)
         existing = store.discover_complete(task_id=TASK_ID, config_hash=config.config_hash, artifact_kinds=("gate_record",), formal_eligible=True)
         if existing:
             loaded_gate = load_committed_task_artifact(data, existing["gate_record"], require_formal=True)

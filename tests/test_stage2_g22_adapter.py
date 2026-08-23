@@ -59,7 +59,7 @@ def _formal_fixture(root: Path) -> dict[str, str]:
         "gate_record": {
             "schema_version": "stage23-task-gate-candidate-v1",
             "task_id": "stage2.03_assets_checkpoints_and_sampling",
-            "gate_ids": ["stage2.G2.2"],
+            "gate_ids": ["stage2.G2.1"],
             "gate_status": "NOT_RUN",
             "local_validation_status": "NOT_RUN",
             "formal_eligible": False,
