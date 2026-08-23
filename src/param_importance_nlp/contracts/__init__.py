@@ -92,6 +92,29 @@ from .stage23 import (
     require_accepted_gate,
     validate_stage23_artifact,
 )
+from .stage1_handoff import (
+    STAGE1_G1_EXIT_CANONICAL_ROOT,
+    STAGE1_G1_EXIT_GATE_ID,
+    STAGE1_G1_EXIT_INDEX_SCHEMA,
+    STAGE1_G1_EXIT_PRODUCER_COMMIT,
+    STAGE1_G1_EXIT_TASK_ID,
+    Stage1ExitEvidence,
+    Stage1HandoffError,
+    validate_stage1_exit_evidence,
+)
+from .stage0_handoff import (
+    STAGE0_G10_EVIDENCE_ROOT,
+    STAGE0_G10_GENERATOR_COMMIT,
+    STAGE0_HANDOFF_ROLES,
+    STAGE0_HANDOFF_SCHEMA,
+    STAGE0_ROLE_ARTIFACT_KINDS,
+    STAGE0_ROLE_PRODUCERS,
+    STAGE0_ROLE_RUN_IDENTITIES,
+    STAGE0_ROLE_TASK_IDS,
+    Stage0HandoffError,
+    Stage0HandoffEvidence,
+    validate_stage0_handoff,
+)
 from .task_catalog import (
     DEFAULT_TASK_CATALOG,
     RESOLVED_CONFIG_V2_SCHEMA_REF,
@@ -144,6 +167,8 @@ __all__ = [
     "ContractState",
     "FormalReadiness",
     "FormalExecutionEvidence",
+    "Stage1ExitEvidence",
+    "Stage1HandoffError",
     "FormalEligibilityPolicy",
     "ExistingOutputPolicy",
     "InputArtifactContract",
@@ -206,6 +231,12 @@ __all__ = [
     "validate_path_spec_artifact",
     "validate_reference_result_artifact",
     "validate_stage23_artifact",
+    "validate_stage1_exit_evidence",
+    "STAGE1_G1_EXIT_CANONICAL_ROOT",
+    "STAGE1_G1_EXIT_GATE_ID",
+    "STAGE1_G1_EXIT_INDEX_SCHEMA",
+    "STAGE1_G1_EXIT_PRODUCER_COMMIT",
+    "STAGE1_G1_EXIT_TASK_ID",
     "validate_gate_id",
     "write_canonical_json",
 ]

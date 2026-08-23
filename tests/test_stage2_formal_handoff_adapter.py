@@ -12,6 +12,9 @@ from param_importance_nlp.contracts import (
     FormalExecutionEvidence,
     GateRecord,
     GateStatus,
+    Stage1ExitEvidence,
+    Stage0HandoffEvidence,
+    STAGE0_HANDOFF_ROLES,
 )
 from param_importance_nlp.contracts.task_catalog import DEFAULT_TASK_CATALOG
 from param_importance_nlp.experiments import stage23_task_runners as stage23
@@ -104,7 +107,11 @@ def test_formal_handoff_runs_read_only_invariant_with_mocked_offline_provider(
                 1,
                 GateStatus.PASS,
                 "2026-07-22T00:00:00+00:00",
-                evidence_refs=("commits/stage1-exit.json",),
+                evidence_refs=(
+                    "evidence/stage1/s1-11-formal/"
+                    "3f18b04df8922be9894678ae4842bd999c7e8fd5/"
+                    "s1-11-r4-20260821/index.json",
+                ),
             ),
         ),
     )
@@ -115,6 +122,42 @@ def test_formal_handoff_runs_read_only_invariant_with_mocked_offline_provider(
         # 与真实 _formal_provider 的返回身份完全一致；仅模型/数据工厂替换为 tiny。
         provider_kind="offline_hf_torch_fixed_state",
         asset_manifest_hashes=asset_hashes,
+        stage1_exit=Stage1ExitEvidence(
+            index_ref=(
+                "evidence/stage1/s1-11-formal/"
+                "3f18b04df8922be9894678ae4842bd999c7e8fd5/"
+                "s1-11-r4-20260821/index.json"
+            ),
+            index_sha256=_hash("stage1-index"),
+            index_artifact_hash=_hash("stage1-index-artifact"),
+            producer_commit="3f18b04df8922be9894678ae4842bd999c7e8fd5",
+            execution_commit="3f18b04df8922be9894678ae4842bd999c7e8fd5",
+            formal_observation_ref="formal-observation.json",
+            formal_observation_sha256=_hash("stage1-observation"),
+            formal_observation_artifact_hash=_hash("stage1-observation-artifact"),
+            role_sha256=(("formal_observation", _hash("stage1-observation")),),
+        ),
+        stage0_handoff=Stage0HandoffEvidence(
+            manifest_ref="reports/stage2/s2.2/stage0-handoff-manifest.json",
+            manifest_sha256=_hash("stage0-manifest"),
+            artifact_hash=_hash("stage0-artifact"),
+            producer_commit="bff18458c02bfde8ee3610cede0addef3ad93782",
+            status="READY",
+            accepted_at="2026-08-23T00:00:00+00:00",
+            roles=tuple(
+                (
+                    role,
+                    f"evidence/stage0/fixture/{role}.json",
+                    _hash(f"{role}-sha"),
+                    "bff18458c02bfde8ee3610cede0addef3ad93782",
+                    "2026-08-23T00:00:00+00:00",
+                    "PASS",
+                )
+                for role in STAGE0_HANDOFF_ROLES
+            ),
+            hardware_validity="VALID",
+            persistence_validity="VALID",
+        ),
     )
     calls = {"formal": 0, "local": 0}
 
@@ -134,6 +177,16 @@ def test_formal_handoff_runs_read_only_invariant_with_mocked_offline_provider(
         config=SimpleNamespace(run_intent="formal", base_config=_BaseConfig()),
         task=DEFAULT_TASK_CATALOG.get(
             "stage2.02_stage1_handoff_and_fixed_state_contract"
+        ),
+        environment=SimpleNamespace(
+            evidence_refs={
+                "stage1_g1_exit": (
+                    "evidence/stage1/s1-11-formal/"
+                    "3f18b04df8922be9894678ae4842bd999c7e8fd5/"
+                    "s1-11-r4-20260821/index.json"
+                ),
+                "stage0_handoff": "reports/stage2/s2.2/stage0-handoff-manifest.json",
+            }
         ),
     )
     before = provider.state_digest()
@@ -156,5 +209,12 @@ def test_formal_handoff_runs_read_only_invariant_with_mocked_offline_provider(
     assert fixed_state["status"] == "FORMAL_CANDIDATE"
     assert fixed_state["validation_evidence"]["state_unchanged"] is True
     assert fixed_state["provider_state_digest"] == before
+    assert fixed_state["contract_version"] == "stage2-fixed-state-contract-v1"
+    assert fixed_state["formula_contract"]["signed_u_preserved"] is True
+    assert fixed_state["formula_contract"]["clamp_min_zero"] is False
+    assert fixed_state["provider_api_contract"]["state_digest_method"] == "state_digest()"
+    assert fixed_state["stage1_g1_exit"]["producer_commit"] == (
+        "3f18b04df8922be9894678ae4842bd999c7e8fd5"
+    )
     assert gate["gate_status"] == "NOT_RUN"
     assert gate["local_validation_status"] == "NOT_RUN"

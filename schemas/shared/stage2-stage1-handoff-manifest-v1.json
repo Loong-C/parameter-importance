@@ -1,0 +1,53 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://parameter-importance.invalid/schemas/shared/stage2-stage1-handoff-manifest-v1.json",
+  "title": "Stage 2 Stage 1 G1-EXIT handoff manifest",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version", "source_task_id", "source_artifact_hashes",
+    "upstream_binding_hash", "provider_state_digest", "registry_hash",
+    "scope", "status", "stage1_g1_exit", "formal_eligible"
+  ],
+  "properties": {
+    "schema_version": {"const": "stage2-task-handoff-manifest-v1"},
+    "source_task_id": {"type": "string", "minLength": 1},
+    "source_artifact_hashes": {
+      "type": "array", "items": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+    },
+    "upstream_binding_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "provider_state_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "registry_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "scope": {"enum": ["local_fixture", "formal"]},
+    "status": {"enum": ["FIXTURE_VALIDATED", "FORMAL_CANDIDATE"]},
+    "stage1_g1_exit": {"$ref": "#/$defs/stage1ExitEvidence"},
+    "formal_eligible": {"const": false}
+  },
+  "$defs": {
+    "stage1ExitEvidence": {
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "required": [
+        "index_ref", "index_sha256", "index_artifact_hash", "producer_commit",
+        "execution_commit", "formal_observation_ref", "formal_observation_sha256",
+        "formal_observation_artifact_hash", "role_sha256"
+      ],
+      "properties": {
+        "index_ref": {
+          "type": "string",
+          "pattern": "^evidence/stage1/s1-11-formal/3f18b04df8922be9894678ae4842bd999c7e8fd5/[^/]+/index\\.json$"
+        },
+        "index_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "index_artifact_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "producer_commit": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+        "execution_commit": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+        "formal_observation_ref": {"type": "string", "minLength": 1},
+        "formal_observation_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "formal_observation_artifact_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "role_sha256": {
+          "type": "object", "additionalProperties": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+        }
+      }
+    }
+  }
+}

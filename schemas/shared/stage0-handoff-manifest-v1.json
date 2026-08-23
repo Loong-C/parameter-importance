@@ -1,0 +1,102 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "stage0-handoff-manifest-v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version", "artifact_hash", "status", "producer_commit", "execution_commit", "consumer_commit", "accepted_at",
+    "authority", "roles", "storage_cache", "execution_semantics", "performance_fields",
+    "persistence", "hardware_validity", "blockers"
+  ],
+  "properties": {
+    "schema_version": {"const": "stage0-handoff-manifest-v1"},
+    "artifact_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "status": {"enum": ["READY", "BLOCKED"]},
+    "producer_commit": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+    "execution_commit": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+    "consumer_commit": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+    "accepted_at": {"type": "string", "format": "date-time"},
+    "authority": {
+      "type": "object", "additionalProperties": false,
+      "required": ["kind", "root", "generator_commit", "temporary_authority_forbidden", "forbidden_roots"],
+      "properties": {
+        "kind": {"const": "canonical_historical_role_index"},
+        "root": {"type": "string", "pattern": "^evidence/stage0/[^\\\\]+/[^\\\\]+/[^\\\\]+$"},
+        "generator_commit": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+        "temporary_authority_forbidden": {"const": true},
+        "forbidden_roots": {"type": "array", "items": {"type": "string"}, "minItems": 1}
+      }
+    },
+    "roles": {
+      "type": "object", "additionalProperties": false,
+      "required": ["environment_freeze", "storage_cache", "single_gpu", "four_gpu_ddp_no_sync", "logging_run", "checkpoint_recovery", "performance"],
+      "properties": {
+        "environment_freeze": {"$ref": "#/$defs/role"},
+        "storage_cache": {"$ref": "#/$defs/role"},
+        "single_gpu": {"$ref": "#/$defs/role"},
+        "four_gpu_ddp_no_sync": {"$ref": "#/$defs/role"},
+        "logging_run": {"$ref": "#/$defs/role"},
+        "checkpoint_recovery": {"$ref": "#/$defs/role"},
+        "performance": {"$ref": "#/$defs/role"}
+      }
+    },
+    "storage_cache": {
+      "type": "object", "additionalProperties": false,
+      "required": ["data_root", "cache_root", "tmp_root", "home_unchanged", "environment_variables"],
+      "properties": {
+        "data_root": {"type": "string", "minLength": 1},
+        "cache_root": {"type": "string", "pattern": "^\\$\\{DATA_ROOT\\}/cache"},
+        "tmp_root": {"type": "string", "pattern": "^\\$\\{DATA_ROOT\\}/tmp/stage2/<run-id>$"},
+        "home_unchanged": {"const": true},
+        "environment_variables": {
+          "type": "object", "additionalProperties": false,
+          "required": ["HF_HOME", "HF_DATASETS_CACHE", "TORCH_HOME", "XDG_CACHE_HOME", "TEMP", "TMP", "TMPDIR", "PYTHONPYCACHEPREFIX"],
+          "properties": {
+            "HF_HOME": {"type": "string", "pattern": "^\\$\\{DATA_ROOT\\}/cache/"},
+            "HF_DATASETS_CACHE": {"type": "string", "pattern": "^\\$\\{DATA_ROOT\\}/cache/"},
+            "TORCH_HOME": {"type": "string", "pattern": "^\\$\\{DATA_ROOT\\}/cache/"},
+            "XDG_CACHE_HOME": {"type": "string", "pattern": "^\\$\\{DATA_ROOT\\}/cache/"},
+            "TEMP": {"type": "string", "pattern": "^\\$\\{DATA_ROOT\\}/tmp/stage2/"},
+            "TMP": {"type": "string", "pattern": "^\\$\\{DATA_ROOT\\}/tmp/stage2/"},
+            "TMPDIR": {"type": "string", "pattern": "^\\$\\{DATA_ROOT\\}/tmp/stage2/"},
+            "PYTHONPYCACHEPREFIX": {"type": "string", "pattern": "^\\$\\{DATA_ROOT\\}/tmp/stage2/"}
+          }
+        }
+      }
+    },
+    "execution_semantics": {"type": "object", "minProperties": 1},
+    "performance_fields": {
+      "type": "object", "additionalProperties": false,
+      "required": ["required", "source_role", "historical_schema_status"],
+      "properties": {
+        "required": {"type": "array", "items": {"type": "string"}, "minItems": 5},
+        "source_role": {"const": "performance"},
+        "historical_schema_status": {"const": "VERIFIED"}
+      }
+    },
+    "persistence": {"type": "object", "required": ["status", "risk_acceptance_expires_at", "reauthorization"]},
+    "hardware_validity": {
+      "type": "object", "required": ["status", "observed_at", "excluded_devices", "healthy_four_card_smoke"],
+      "properties": {
+        "status": {"enum": ["VALID", "BLOCKED"]},
+        "observed_at": {"type": "string"},
+        "excluded_devices": {"type": "array", "minItems": 1},
+        "healthy_four_card_smoke": {"type": "string"}
+      }
+    },
+    "blockers": {"type": "array", "items": {"type": "string"}}
+  },
+  "$defs": {
+    "role": {
+      "type": "object", "additionalProperties": false,
+      "required": ["ref", "sha256", "producer_commit", "accepted_at", "status"],
+      "properties": {
+        "ref": {"type": "string", "pattern": "^evidence/stage0/"},
+        "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "producer_commit": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+        "accepted_at": {"type": "string", "format": "date-time"},
+        "status": {"enum": ["PASS", "STALE", "MISSING", "BLOCKED"]}
+      }
+    }
+  }
+}
