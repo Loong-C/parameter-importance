@@ -4,11 +4,12 @@
   "title": "Stage 2 paired wave immutable root plan",
   "type": "object",
   "additionalProperties": false,
-  "required": ["schema_version", "wave_id", "reference_hash", "registry_hash", "provider_state_digest", "execution_evidence_hash", "weighting_assumptions", "mappings", "artifact_hash"],
+  "required": ["schema_version", "wave_id", "reference_hash", "reference_hashes", "registry_hash", "provider_state_digest", "execution_evidence_hash", "weighting_assumptions", "mappings", "artifact_hash"],
   "properties": {
     "schema_version": {"const": "stage2-paired-wave-plan-v1"},
     "wave_id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,159}$"},
     "reference_hash": {"$ref": "#/$defs/hash"},
+    "reference_hashes": {"type": "object", "additionalProperties": false, "required": ["bias", "cross", "ranking"], "properties": {"bias": {"$ref": "#/$defs/hash"}, "cross": {"$ref": "#/$defs/hash"}, "ranking": {"$ref": "#/$defs/hash"}}},
     "registry_hash": {"$ref": "#/$defs/hash"},
     "provider_state_digest": {"$ref": "#/$defs/hash"},
     "execution_evidence_hash": {"$ref": "#/$defs/hash"},

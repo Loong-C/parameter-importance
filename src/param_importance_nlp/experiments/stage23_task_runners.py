@@ -290,6 +290,16 @@ _REQUIRED_PREDECESSORS = {
         if task_id.startswith("stage3.")
     },
 }
+
+# S2.5 is allowed to run against the development handoff in local fixtures,
+# but its formal route consumes the independently qualified G2.3 reference.
+# Keep this expansion formal-only so a fixture cannot masquerade as a formal
+# reference and the historical development DAG remains executable.
+_FORMAL_S25_PREDECESSORS = (
+    "stage2.02_stage1_handoff_and_fixed_state_contract",
+    "stage2.03_assets_checkpoints_and_sampling",
+    "stage2.04_reference_target",
+)
 # S2.3 is a DAG sibling of the S2.2 handoff: its only task predecessor is the
 # frozen S2.1 preregistration.  Stage 1/formal asset evidence is supplied by
 # the environment and is intentionally not smuggled in through S2.2.
@@ -851,6 +861,21 @@ class _PredecessorContext:
             )
         return matches[0]
 
+    def payload_for(self, task_id: str, artifact_kind: str) -> Mapping[str, object]:
+        """Return one payload bound to both its producer task and artifact kind."""
+
+        matches = [
+            item.payload
+            for item in self.artifacts
+            if item.task_id == task_id and item.artifact_kind == artifact_kind
+        ]
+        if len(matches) != 1:
+            raise RuntimeError(
+                "STAGE23_PREDECESSOR_PAYLOAD_NOT_UNIQUE:"
+                f"{task_id}:{artifact_kind}:{len(matches)}"
+            )
+        return matches[0]
+
 
 def _load_bound_task_input(
     store: TaskArtifactStore,
@@ -950,6 +975,11 @@ def _predecessor_context(
             "stage1.10_checkpoint_resume_and_artifacts",
             "stage1.11_reporting_and_exit_gate",
         )
+    elif (
+        request.config.run_intent == "formal"
+        and request.task.task_id == "stage2.05_paired_estimator_runner"
+    ):
+        expected_tasks = _FORMAL_S25_PREDECESSORS
 
     grouped: dict[str, dict[str, _BoundInputArtifact]] = {}
     auxiliaries: list[str] = []
@@ -3672,6 +3702,7 @@ def _stable_wave_payload(summary: object) -> dict[str, JSONValue]:
         "wave_id": str(getattr(summary, "wave_id")),
         "registry_hash": str(getattr(summary, "registry_hash")),
         "reference_hash": str(getattr(summary, "reference_hash")),
+        "reference_hashes": dict(getattr(summary, "reference_hashes")),
         "expected_unit_ids": list(getattr(summary, "expected_unit_ids")),
         "completed_unit_ids": list(getattr(summary, "completed_unit_ids")),
         "complete": bool(getattr(summary, "complete")),
@@ -3680,6 +3711,14 @@ def _stable_wave_payload(summary: object) -> dict[str, JSONValue]:
             name: dict(values)
             for name, values in sorted(getattr(summary, "method_statistics").items())
         },
+        "reference_statistics": {
+            name: {method: dict(values) for method, values in methods.items()}
+            for name, methods in sorted(getattr(summary, "reference_statistics").items())
+        },
+        "microbatch_diagnostics": [
+            dict(item) for item in getattr(summary, "microbatch_diagnostics")
+        ],
+        "replay_evidence": thaw_json_value(getattr(summary, "replay_evidence")),
         "cost_statistics": costs,
         "scope": str(getattr(summary, "scope")),
         "formal_eligible": False,
@@ -3744,6 +3783,63 @@ def _require_formal_experiment_plan(
     return plan, (reference,)
 
 
+def _formal_s204_reference_views(
+    inputs: _PredecessorContext,
+    root: Path,
+    context: _ProviderContext,
+) -> dict[str, Mapping[str, np.ndarray]]:
+    """Load exactly the qualified S2.4/G2.3 reference, never an auxiliary file."""
+
+    matches = [
+        item
+        for item in inputs.artifacts
+        if item.task_id == "stage2.04_reference_target"
+        and item.artifact_kind == "reference_result"
+    ]
+    if len(matches) != 1:
+        raise ValueError("S25_FORMAL_REFERENCE_RESULT_NOT_UNIQUE")
+    item = matches[0]
+    if item.run_intent != "formal" or item.formal_eligible is not True:
+        raise ValueError("S25_FORMAL_REFERENCE_COMMIT_NOT_FORMAL")
+    manifest = item.payload
+    validate_reference_result_artifact(manifest)
+    if manifest.get("scope") != "formal" or manifest.get("formal_eligible") is not False:
+        raise ValueError("S25_FORMAL_REFERENCE_SCOPE_INVALID")
+    if manifest.get("registry_hash") != context.provider.registry_hash:
+        raise ValueError("S25_FORMAL_REFERENCE_REGISTRY_MISMATCH")
+
+    try:
+        gate = inputs.payload_for("stage2.04_reference_target", "gate_record")
+    except RuntimeError as error:
+        raise ValueError("S25_FORMAL_REFERENCE_G23_GATE_NOT_UNIQUE") from error
+    if gate.get("gate_id") != "stage2.G2.3" or gate.get("gate_status") != "PASS":
+        raise ValueError("S25_FORMAL_REFERENCE_G23_NOT_PASS")
+    bundle_ref = str(manifest["tensor_bundle_ref"])
+    state, bundle = load_tensor_bundle(
+        _workspace_path(root, bundle_ref, field="reference_result.tensor_bundle_ref")
+    )
+    if bundle.manifest_sha256 != manifest.get("tensor_bundle_manifest_hash"):
+        raise ValueError("S25_FORMAL_REFERENCE_BUNDLE_HASH_MISMATCH")
+    if not isinstance(state, Mapping) or set(state) != {
+        "bias_reference", "cross_reference", "ranking_reference"
+    }:
+        raise ValueError("S25_FORMAL_REFERENCE_BUNDLE_VIEWS_INVALID")
+    views = {
+        "bias": _as_numpy_vector(state["bias_reference"]),  # type: ignore[arg-type]
+        "cross": _as_numpy_vector(state["cross_reference"]),  # type: ignore[arg-type]
+        "ranking": _as_numpy_vector(state["ranking_reference"]),  # type: ignore[arg-type]
+    }
+    expected_hashes = {
+        "bias": manifest.get("bias_reference_hash"),
+        "cross": manifest.get("cross_reference_hash"),
+        "ranking": manifest.get("ranking_reference_hash"),
+    }
+    for name, view in views.items():
+        if _vector_digest(view) != expected_hashes[name]:
+            raise ValueError(f"S25_FORMAL_REFERENCE_{name.upper()}_HASH_MISMATCH")
+    return views
+
+
 def _run_stage2_estimator(
     request: TaskExecutionRequest,
     root: Path,
@@ -3766,8 +3862,15 @@ def _run_stage2_estimator(
     )
     mappings = _paired_mappings(sampling, stream=stream, plan=experiment_plan)
     if request.task.task_id == "stage2.05_paired_estimator_runner":
+        reference_views: Mapping[str, Mapping[str, np.ndarray]]
         try:
-            reference_manifest = inputs.payload("reference_result")
+            if request.config.run_intent == "formal":
+                reference_views = _formal_s204_reference_views(inputs, root, context)
+                reference = reference_views["bias"]
+                reference_hash = _vector_digest(reference)
+            else:
+                reference_manifest = inputs.payload("reference_result")
+                raise RuntimeError("FIXTURE_REFERENCE_DIRECT_PATH")
         except RuntimeError as error:
             if request.config.run_intent != "local_fixture":
                 raise _blocked(
@@ -3781,31 +3884,16 @@ def _run_stage2_estimator(
             # provider can derive the exact fixture anchor directly; formal
             # execution remains fail-closed until S2.4 publishes its bundle.
             reference = _exact_importance_reference(context)
-        else:
-            try:
-                bundle_ref = str(reference_manifest["tensor_bundle_ref"])
-                reference_state, bundle = load_tensor_bundle(
-                    _workspace_path(root, bundle_ref, field="reference_tensor_bundle")
-                )
-                if bundle.manifest_sha256 != reference_manifest.get(
-                    "tensor_bundle_manifest_hash"
-                ):
-                    raise ValueError("REFERENCE_TENSOR_BUNDLE_HASH_MISMATCH")
-                if not isinstance(reference_state, Mapping):
-                    raise ValueError("REFERENCE_TENSOR_BUNDLE_ROOT_NOT_MAPPING")
-                reference = _as_numpy_vector(reference_state["bias_reference"])  # type: ignore[arg-type]
-                if _vector_digest(reference) != reference_manifest.get(
-                    "bias_reference_hash"
-                ):
-                    raise ValueError("REFERENCE_VECTOR_HASH_MISMATCH")
-            except (KeyError, TypeError, ValueError) as error:
-                raise _blocked(
-                    BlockerCode.ASSET_UNAVAILABLE,
-                    "stage2_reference_tensor_bundle",
-                    f"前序 reference_result 无法恢复：{error}",
-                    retryable=False,
-                    evidence_refs=inputs.references,
-                ) from error
+            reference_views = {name: reference for name in ("bias", "cross", "ranking")}
+            reference_hash = _vector_digest(reference)
+        except (KeyError, TypeError, ValueError) as error:
+            raise _blocked(
+                BlockerCode.ASSET_UNAVAILABLE,
+                "stage2_reference_tensor_bundle",
+                f"前序 formal reference_result 无法恢复：{error}",
+                retryable=False,
+                evidence_refs=inputs.references,
+            ) from error
     else:
         reference = _exact_importance_reference(context)
     summary = RecoverablePairedWaveRunner(
@@ -3819,7 +3907,16 @@ def _run_stage2_estimator(
         ),
         mappings=mappings,
         reference=reference,
-        reference_hash=_vector_digest(reference),
+        reference_hash=(
+            reference_hash
+            if request.task.task_id == "stage2.05_paired_estimator_runner"
+            else _vector_digest(reference)
+        ),
+        references=(
+            reference_views
+            if request.task.task_id == "stage2.05_paired_estimator_runner"
+            else None
+        ),
         artifact_root=store.root / "resume" / "paired-wave",
     )
     stable = _stable_wave_payload(summary)
@@ -3827,6 +3924,22 @@ def _run_stage2_estimator(
         path.name
         for path in (store.root / "resume" / "paired-wave" / "commits").glob("*.json")
     )
+    committed_shards: list[dict[str, JSONValue]] = []
+    for commit_name in commits:
+        commit = load_canonical_json(
+            store.root / "resume" / "paired-wave" / "commits" / commit_name
+        )
+        if not isinstance(commit, Mapping):
+            raise ValueError("S25_COMMIT_NOT_MAPPING")
+        committed_shards.append(
+            {
+                "unit_id": str(commit["unit_id"]),
+                "attempt_id": str(commit["attempt_id"]),
+                "input_hash": str(commit["input_hash"]),
+                "scientific_digest": str(commit["scientific_digest"]),
+                "object_manifest_hash": str(commit["object_manifest_hash"]),
+            }
+        )
     shard_payload: dict[str, JSONValue] = {
         "schema_version": "stage2-task-sufficient-stat-shards-v1",
         "sampling_plan_hash": sampling.digest,
@@ -3835,9 +3948,20 @@ def _run_stage2_estimator(
         ),
         "mapping_hashes": [mapping.digest for mapping in mappings],
         "committed_units": commits,
+        "committed_shards": committed_shards,
         "expected_unit_count": len(mappings),
         "complete": bool(summary.complete),
         "recovery_semantics": "immutable_tensor_bundle_plus_authoritative_commit",
+        "reference_hashes": dict(summary.reference_hashes),
+        "reference_statistics": {
+            name: {method: dict(values) for method, values in methods.items()}
+            for name, methods in summary.reference_statistics.items()
+        },
+        "microbatch_diagnostics": [
+            dict(item) for item in summary.microbatch_diagnostics
+        ],
+        "replay_evidence": thaw_json_value(summary.replay_evidence),
+        "failure_evidence_dir": "resume/paired-wave/failures",
         "formal_eligible": False,
     }
     if request.task.task_id == "stage2.05_paired_estimator_runner":

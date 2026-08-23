@@ -576,6 +576,12 @@ class PairedEstimatorResult:
     peak_memory_bytes: int | None = None
     scope: str = "local_fixture"
     formal_eligible: bool = False
+    # Per-base-microbatch diagnostics are audit evidence only; they never enter
+    # the signed estimator formula.  Keeping them on the result prevents the
+    # formal runner from re-evaluating gradients merely to reconstruct token,
+    # loss, and norm telemetry.
+    microbatch_diagnostics: tuple[Mapping[str, object], ...] = ()
+    state_digest_after: str = ""
 
     def __post_init__(self) -> None:
         if self.scope != "local_fixture" or self.formal_eligible:
@@ -617,6 +623,36 @@ class PairedEstimatorResult:
                 field="PairedEstimatorResult.weighting_assumptions",
             ),
         )
+        diagnostics: list[Mapping[str, object]] = []
+        for diagnostic in self.microbatch_diagnostics:
+            if not isinstance(diagnostic, Mapping):
+                raise TypeError("microbatch_diagnostics 必须是 object 序列")
+            required = {"microbatch_index", "token_count", "loss", "gradient_norm"}
+            if set(diagnostic) != required:
+                raise ValueError("microbatch_diagnostics 字段不完整")
+            index = diagnostic["microbatch_index"]
+            if isinstance(index, bool) or not isinstance(index, int) or index < 0:
+                raise ValueError("microbatch_index 必须是非负整数")
+            token_count = float(diagnostic["token_count"])
+            gradient_norm = float(diagnostic["gradient_norm"])
+            if not math.isfinite(token_count) or token_count <= 0:
+                raise ValueError("microbatch token_count 必须严格为正有限数")
+            if not math.isfinite(gradient_norm) or gradient_norm < 0:
+                raise ValueError("microbatch gradient_norm 必须是非负有限数")
+            loss = diagnostic["loss"]
+            if loss is not None and not math.isfinite(float(loss)):
+                raise ValueError("microbatch loss 必须是有限数或 null")
+            diagnostics.append(
+                MappingProxyType(
+                    {
+                        "microbatch_index": index,
+                        "token_count": token_count,
+                        "loss": None if loss is None else float(loss),
+                        "gradient_norm": gradient_norm,
+                    }
+                )
+            )
+        object.__setattr__(self, "microbatch_diagnostics", tuple(diagnostics))
 
     @property
     def vectors(self) -> Mapping[str, object]:
@@ -646,6 +682,9 @@ class PairedEstimatorResult:
                     "weighting_assumptions": thaw_json_value(
                         self.weighting_assumptions
                     ),
+                    "microbatch_diagnostics": [
+                        dict(diagnostic) for diagnostic in self.microbatch_diagnostics
+                    ],
                 }
             )
         ).hexdigest()
@@ -741,6 +780,23 @@ class PairedEstimatorRunner:
                 f"tolerance={self.m2_tolerance:.6g}"
             )
         self.provider.assert_unchanged(before)
+        after = self.provider.state_digest()
+        diagnostics = tuple(
+            {
+                "microbatch_index": index,
+                "token_count": float(batch.statistical_weight),
+                "loss": None if batch.loss is None else float(batch.loss),
+                "gradient_norm": float(
+                    math.sqrt(
+                        sum(
+                            float(np.square(_to_numpy(value), dtype=np.float64).sum())
+                            for value in batch.gradients.values()
+                        )
+                    )
+                ),
+            }
+            for index, batch in enumerate(base_batches)
+        )
         peak_memory_bytes: int | None = None
         try:
             import torch
@@ -768,6 +824,8 @@ class PairedEstimatorRunner:
             gradient_seconds=gradient_seconds,
             wall_seconds=gradient_seconds + formula_seconds,
             peak_memory_bytes=peak_memory_bytes,
+            microbatch_diagnostics=diagnostics,
+            state_digest_after=after,
         )
 
 

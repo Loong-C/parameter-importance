@@ -408,11 +408,15 @@ _STAGE23_ARTIFACT_FIELDS: dict[str, set[str]] = {
         "wave_id",
         "registry_hash",
         "reference_hash",
+        "reference_hashes",
         "expected_unit_ids",
         "completed_unit_ids",
         "complete",
         "status",
         "method_statistics",
+        "reference_statistics",
+        "microbatch_diagnostics",
+        "replay_evidence",
         "cost_statistics",
         "scope",
         "formal_eligible",
@@ -425,6 +429,7 @@ _STAGE23_ARTIFACT_FIELDS: dict[str, set[str]] = {
         "schema_version",
         "wave_id",
         "reference_hash",
+        "reference_hashes",
         "registry_hash",
         "provider_state_digest",
         "execution_evidence_hash",
@@ -826,6 +831,23 @@ def validate_stage23_artifact(value: Mapping[str, object]) -> object:
 
     if schema == "stage2-paired-wave-summary-v1":
         validate_weighting(value["weighting_assumptions"])
+        reference_hashes = value["reference_hashes"]
+        if not isinstance(reference_hashes, Mapping) or set(reference_hashes) != {
+            "bias", "cross", "ranking"
+        }:
+            raise ValueError("reference_hashes 必须完整包含 bias/cross/ranking")
+        for name, digest in reference_hashes.items():
+            _require_sha256(digest, field_name=f"reference_hashes.{name}")
+        if reference_hashes["bias"] != value["reference_hash"]:
+            raise ValueError("reference_hash 必须等于 reference_hashes.bias")
+        if not isinstance(value["reference_statistics"], Mapping):
+            raise ValueError("reference_statistics 必须是 object")
+        diagnostics = value["microbatch_diagnostics"]
+        if not isinstance(diagnostics, list):
+            raise ValueError("microbatch_diagnostics 必须是 array")
+        replay = value["replay_evidence"]
+        if not isinstance(replay, Mapping) or replay.get("schema_version") != "stage2-paired-replay-evidence-v1":
+            raise ValueError("replay_evidence contract missing")
         expected = set(string_array("expected_unit_ids", allow_empty=False))
         completed = set(string_array("completed_unit_ids"))
         if not completed.issubset(expected):
@@ -845,6 +867,15 @@ def validate_stage23_artifact(value: Mapping[str, object]) -> object:
 
     if schema == "stage2-paired-wave-plan-v1":
         validate_weighting(value["weighting_assumptions"])
+        reference_hashes = value["reference_hashes"]
+        if not isinstance(reference_hashes, Mapping) or set(reference_hashes) != {
+            "bias", "cross", "ranking"
+        }:
+            raise ValueError("paired wave plan reference_hashes 不完整")
+        for name, digest in reference_hashes.items():
+            _require_sha256(digest, field_name=f"reference_hashes.{name}")
+        if reference_hashes["bias"] != value["reference_hash"]:
+            raise ValueError("paired wave plan reference_hash 漂移")
         mappings = value["mappings"]
         if not isinstance(mappings, list) or not mappings:
             raise ValueError("paired wave mappings 不能为空")

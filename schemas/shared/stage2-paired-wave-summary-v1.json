@@ -4,17 +4,33 @@
   "title": "Stage 2 recoverable paired wave summary",
   "type": "object",
   "additionalProperties": false,
-  "required": ["schema_version", "wave_id", "registry_hash", "reference_hash", "expected_unit_ids", "completed_unit_ids", "complete", "status", "method_statistics", "cost_statistics", "scope", "formal_eligible", "qualification_gate_hash", "resumed_unit_count", "weighting_assumptions", "artifact_hash"],
+  "required": ["schema_version", "wave_id", "registry_hash", "reference_hash", "reference_hashes", "expected_unit_ids", "completed_unit_ids", "complete", "status", "method_statistics", "reference_statistics", "microbatch_diagnostics", "replay_evidence", "cost_statistics", "scope", "formal_eligible", "qualification_gate_hash", "resumed_unit_count", "weighting_assumptions", "artifact_hash"],
   "properties": {
     "schema_version": {"const": "stage2-paired-wave-summary-v1"},
     "wave_id": {"$ref": "#/$defs/id"},
     "registry_hash": {"$ref": "#/$defs/hash"},
     "reference_hash": {"$ref": "#/$defs/hash"},
+    "reference_hashes": {
+      "type": "object", "additionalProperties": false,
+      "required": ["bias", "cross", "ranking"],
+      "properties": {"bias": {"$ref": "#/$defs/hash"}, "cross": {"$ref": "#/$defs/hash"}, "ranking": {"$ref": "#/$defs/hash"}}
+    },
     "expected_unit_ids": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"$ref": "#/$defs/id"}},
     "completed_unit_ids": {"type": "array", "uniqueItems": true, "items": {"$ref": "#/$defs/id"}},
     "complete": {"type": "boolean"},
     "status": {"enum": ["INCOMPLETE", "FIXTURE_COMPLETE", "FORMAL_CANDIDATE"]},
     "method_statistics": {"type": "object", "additionalProperties": {"$ref": "#/$defs/methodStats"}},
+    "reference_statistics": {"type": "object", "additionalProperties": {"type": "object", "additionalProperties": {"$ref": "#/$defs/referenceStats"}}},
+    "microbatch_diagnostics": {
+      "type": "array", "items": {"type": "object", "additionalProperties": false,
+      "required": ["unit_id", "microbatch_index", "token_count", "loss", "gradient_norm"],
+      "properties": {"unit_id": {"$ref": "#/$defs/id"}, "microbatch_index": {"type": "integer", "minimum": 0}, "token_count": {"type": "number", "exclusiveMinimum": 0}, "loss": {"oneOf": [{"type": "null"}, {"type": "number"}]}, "gradient_norm": {"type": "number", "minimum": 0}}}
+    },
+    "replay_evidence": {
+      "type": "object", "additionalProperties": false,
+      "required": ["schema_version", "attempt_bound", "idempotent_reducer", "reducer_order", "input_hashes", "state_transitions"],
+      "properties": {"schema_version": {"const": "stage2-paired-replay-evidence-v1"}, "attempt_bound": {"const": true}, "idempotent_reducer": {"const": true}, "reducer_order": {"type": "array", "items": {"$ref": "#/$defs/id"}}, "input_hashes": {"type": "object", "additionalProperties": {"$ref": "#/$defs/hash"}}, "state_transitions": {"type": "object"}}
+    },
     "cost_statistics": {
       "type": "object",
       "additionalProperties": false,
@@ -62,6 +78,15 @@
         "negative_fraction": {"type": "number", "minimum": 0, "maximum": 1},
         "positive_mass": {"type": "number", "minimum": 0},
         "negative_mass": {"type": "number", "minimum": 0}
+      }
+    },
+    "referenceStats": {
+      "type": "object", "additionalProperties": false,
+      "required": ["repetitions", "coordinate_count", "bias", "absolute_bias", "variance", "mse", "mae"],
+      "properties": {
+        "repetitions": {"type": "integer", "minimum": 1}, "coordinate_count": {"type": "integer", "minimum": 1},
+        "bias": {"type": "number"}, "absolute_bias": {"type": "number", "minimum": 0}, "variance": {"type": "number", "minimum": 0}, "mse": {"type": "number", "minimum": 0}, "mae": {"type": "number", "minimum": 0},
+        "spearman": {"type": "number", "minimum": -1, "maximum": 1}, "top_k": {"type": "integer", "minimum": 1}, "top_k_overlap": {"type": "number", "minimum": 0, "maximum": 1}
       }
     },
     "cost": {

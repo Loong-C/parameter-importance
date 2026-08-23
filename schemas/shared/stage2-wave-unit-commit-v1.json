@@ -4,10 +4,11 @@
   "title": "Stage 2 authoritative paired wave unit commit",
   "type": "object",
   "additionalProperties": false,
-  "required": ["schema_version", "unit_id", "input_hash", "scientific_digest", "object_ref", "object_manifest_hash", "artifact_hash"],
+  "required": ["schema_version", "unit_id", "attempt_id", "input_hash", "scientific_digest", "object_ref", "object_manifest_hash", "artifact_hash"],
   "properties": {
     "schema_version": {"const": "stage2-wave-unit-commit-v1"},
     "unit_id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,159}$"},
+    "attempt_id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,159}$"},
     "input_hash": {"$ref": "#/$defs/hash"},
     "scientific_digest": {"$ref": "#/$defs/hash"},
     "object_ref": {"$ref": "#/$defs/ref"},
