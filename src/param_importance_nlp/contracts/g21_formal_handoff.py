@@ -14,7 +14,7 @@ from pathlib import Path
 import re
 from typing import Any
 
-from .jsonio import canonical_json_hash, load_canonical_json, write_canonical_json
+from .jsonio import canonical_json_hash, load_canonical_json, loads_strict_json, write_canonical_json
 
 SCHEMA = "stage2-s2.2-g2.1-formal-handoff-v1"
 AUTH_HASH = "51cb1ed87ff6ded4f4001f2a0b67dd469ebf048df2592b27707bc1f535b6db0c"
@@ -145,7 +145,9 @@ def _validate(value: Mapping[str, Any], root: Path | None) -> dict[str, Any]:
         ref, path = _relative(root, smoke["ref"], "current_gpu_smoke.ref")
         if _file_sha(root, ref, "current_gpu_smoke.ref") != smoke["sha256"]:
             raise G21FormalHandoffError("CURRENT_SMOKE_HASH_MISMATCH")
-        report = load_canonical_json(path)
+        report = loads_strict_json(path.read_bytes())
+        if not isinstance(report, Mapping):
+            raise G21FormalHandoffError("CURRENT_SMOKE_REPORT_ROOT_INVALID")
         if report.get("status") != "PASS" or report.get("schema_version") != "stage2-s202-current-gpu-smoke-v1":
             raise G21FormalHandoffError("CURRENT_SMOKE_REPORT_INVALID")
 
