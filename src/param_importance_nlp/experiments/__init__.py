@@ -126,7 +126,16 @@ from .preregistration import (
     build_stage2_amendment_template,
     build_stage2_hypothesis_contract,
     build_stage2_preregistration,
+    validate_stage2_hypothesis_contract,
     validate_stage2_preregistration,
+)
+from .stage2_g20_evaluator import (
+    ARTIFACT_KINDS as G20_ARTIFACT_KINDS,
+    EVALUATION_CONFIG_HASH as G20_EVALUATION_CONFIG_HASH,
+    G20Blocked,
+    G20Failed,
+    evaluate_formal_g20,
+    evaluate_g20,
 )
 from .stage3_formal import (
     CapturedEndpoint,
@@ -374,7 +383,14 @@ __all__ = [
     "build_stage2_amendment_template",
     "build_stage2_hypothesis_contract",
     "build_stage2_preregistration",
+    "validate_stage2_hypothesis_contract",
     "validate_stage2_preregistration",
+    "G20_ARTIFACT_KINDS",
+    "G20_EVALUATION_CONFIG_HASH",
+    "G20Blocked",
+    "G20Failed",
+    "evaluate_formal_g20",
+    "evaluate_g20",
     "assess_reference_convergence",
     "build_fixture_estimator_decision",
     "build_fixture_quadrature_decision",

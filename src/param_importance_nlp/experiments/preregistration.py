@@ -597,6 +597,53 @@ def validate_stage2_preregistration(value: Mapping[str, Any]) -> None:
         raise ValueError("STAGE2_PREREG_HASH_MISMATCH")
 
 
+def validate_stage2_hypothesis_contract(
+    value: Mapping[str, Any],
+    *,
+    preregistration: Mapping[str, Any] | None = None,
+) -> None:
+    """Fail-closed validation for the H1--H6 contract.
+
+    The original producer only needed to build this object, while formal G2.0
+    qualification is a consumer boundary.  Rebuilding the contract from its
+    declared parent is intentional: a caller cannot change a claim, decision
+    rule, or multiplicity policy and merely recompute ``hypothesis_contract_hash``.
+    """
+
+    if not isinstance(value, Mapping):
+        raise ValueError("STAGE2_HYPOTHESIS_CONTRACT_NOT_OBJECT")
+    if value.get("schema_version") != HYPOTHESIS_SCHEMA_VERSION:
+        raise ValueError("STAGE2_HYPOTHESIS_SCHEMA_UNSUPPORTED")
+    if value.get("contract_id") != "stage2-hypotheses-h1-h6-v1":
+        raise ValueError("STAGE2_HYPOTHESIS_CONTRACT_ID_MISMATCH")
+    parent_hash = value.get("preregistration_hash")
+    if not isinstance(parent_hash, str) or not _is_sha256(parent_hash):
+        raise ValueError("STAGE2_HYPOTHESIS_PREREGISTRATION_HASH_INVALID")
+    upstream = value.get("upstream_binding_hash")
+    if not isinstance(upstream, str) or not _is_sha256(upstream):
+        raise ValueError("STAGE2_HYPOTHESIS_UPSTREAM_BINDING_HASH_INVALID")
+    if preregistration is None:
+        raise ValueError("STAGE2_HYPOTHESIS_PREREGISTRATION_REQUIRED")
+    validate_stage2_preregistration(preregistration)
+    if parent_hash != preregistration.get("preregistration_hash"):
+        raise ValueError("STAGE2_HYPOTHESIS_PARENT_HASH_MISMATCH")
+    provenance = preregistration.get("provenance")
+    if not isinstance(provenance, Mapping):
+        raise ValueError("STAGE2_HYPOTHESIS_PREREGISTRATION_PROVENANCE_MISSING")
+    if upstream != provenance.get("upstream_binding_hash"):
+        raise ValueError("STAGE2_HYPOTHESIS_UPSTREAM_BINDING_MISMATCH")
+    expected = build_stage2_hypothesis_contract(
+        preregistration,
+        upstream_binding_hash=upstream,
+    )
+    if dict(value) != expected:
+        raise ValueError("STAGE2_HYPOTHESIS_CONTRACT_CONTENT_MISMATCH")
+
+
+def _is_sha256(value: str) -> bool:
+    return len(value) == 64 and all(character in "0123456789abcdef" for character in value)
+
+
 __all__ = [
     "ABSOLUTE_FLOORS",
     "AMENDMENT_SCHEMA_VERSION",
@@ -614,5 +661,6 @@ __all__ = [
     "build_stage2_amendment_template",
     "build_stage2_hypothesis_contract",
     "build_stage2_preregistration",
+    "validate_stage2_hypothesis_contract",
     "validate_stage2_preregistration",
 ]
