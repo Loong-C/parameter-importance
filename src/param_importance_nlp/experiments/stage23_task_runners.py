@@ -144,6 +144,11 @@ from .preregistration import (
     validate_stage2_preregistration,
 )
 from .stage2_formal import (
+    ANCHOR_IDS,
+    AnchorPilotResult,
+    CostSemantics,
+    freeze_fixture_matrix,
+    run_artificial_distribution_calibration,
     FormalExperimentPlan,
     OneShotReferencePlan,
     OneShotReferenceRunner,
@@ -2619,6 +2624,33 @@ def _run_stage2_pilot(
         thresholds=thresholds,
         execution=context.evidence,
     )
+    # S2.6 contract layer is deliberately kept separate from the existing
+    # fixture recommendation.  A local synthetic provider is one anchor only;
+    # therefore the blind six-anchor scan remains BLOCKED/UNFROZEN and cannot
+    # be mistaken for a formal matrix.  The calibration itself is useful local
+    # evidence and does not consume confirmatory draws.
+    calibration_rng = np.random.default_rng(206)
+    calibration = run_artificial_distribution_calibration(
+        calibration_rng.normal(size=(64, 2)),
+        batch_size=32,
+        m_values=(2, 4, 8, 16, 32),
+    )
+    matrix_contract = freeze_fixture_matrix(
+        (),
+        required_anchor_ids=ANCHOR_IDS,
+        r_max=1000,
+        cost_semantics=CostSemantics(
+            **{
+                name: {"defined": False, "reason": "local_fixture_timing_not_formal"}
+                for name in (
+                    "scientific_equal_sample_cost",
+                    "isolated_estimator_cost",
+                    "online_training_incremental_cost",
+                )
+            },
+            cost_io_quiescent=False,
+        ),
+    )
     payloads: dict[str, Mapping[str, JSONValue]] = {
         "pilot_report": {
             "schema_version": "stage2-task-pilot-report-v1",
@@ -2647,6 +2679,11 @@ def _run_stage2_pilot(
             ),
             "development_wave_hash": canonical_json_hash(paired_report),
             "upstream_binding_hash": inputs.binding_hash,
+            "artificial_calibration": calibration.to_dict(),
+            "matrix_freeze_contract": matrix_contract.to_dict(),
+            "matrix_freeze_status": matrix_contract.status,
+            "formal_matrix_generated": False,
+            "formal_block_reason": "G2.3_PENDING_EXTERNAL_AUTHORIZATION",
         },
         "frozen_experiment_matrix": {
             "schema_version": (
@@ -2669,6 +2706,9 @@ def _run_stage2_pilot(
                 if experiment_plan is None
                 else "FROZEN_CANDIDATE"
             ),
+            "matrix_freeze_contract": matrix_contract.to_dict(),
+            "confirmatory_mapping_status": "NOT_GENERATED",
+            "formal_block_reason": "G2.3_PENDING_EXTERNAL_AUTHORIZATION",
         },
         "gate_record": _gate_candidate(request),
     }

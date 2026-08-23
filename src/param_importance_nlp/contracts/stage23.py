@@ -450,6 +450,19 @@ _STAGE23_ARTIFACT_FIELDS: dict[str, set[str]] = {
         "reasons",
         "artifact_hash",
     },
+    "stage2-pilot-matrix-freeze-v1": {
+        "schema_version", "freeze_id", "scope", "status", "anchor_ids",
+        "candidate_evaluations", "b_primary", "m_primary", "r_primary",
+        "completion_denominator", "cost_semantics", "cost_observations", "cost_io_quiescent",
+        "confirmatory_draw_stream", "pilot_draw_stream", "formal_eligible",
+        "qualification_gate_hash", "artifact_hash",
+    },
+    "stage2-confirmatory-mapping-v1": {
+        "schema_version", "mapping_id", "scope", "stream", "freeze_hash",
+        "sampling_plan_hash", "pilot_draw_ids", "confirmatory_draw_ids",
+        "mappings", "draw_id_unique", "sample_id_collision_count", "complete",
+        "formal_eligible", "qualification_gate_hash", "artifact_hash",
+    },
     "stage3-endpoint-capture-v1": {
         "schema_version",
         "record",
@@ -683,6 +696,41 @@ def validate_stage23_artifact(value: Mapping[str, object]) -> object:
             if not isinstance(value[field_name], str):
                 raise TypeError(f"{field_name} 必须是字符串")
             _require_sha256(value[field_name], field_name=field_name)
+
+    if schema == "stage2-pilot-matrix-freeze-v1":
+        if value["scope"] != "local_fixture" or value["formal_eligible"] is not False:
+            raise FormalRunRejected("S2.6_MATRIX_FORMAL_SCOPE_BLOCKED")
+        if value["qualification_gate_hash"] is not None:
+            raise FormalRunRejected("S2.6_MATRIX_GATE_HASH_FORBIDDEN_BEFORE_G2.4B")
+        if value["pilot_draw_stream"] != "pilot" or value["confirmatory_draw_stream"] != "confirmatory":
+            raise ValueError("S2.6 matrix draw stream mismatch")
+        if set(value["cost_semantics"]) != {
+            "scientific_equal_sample_cost", "isolated_estimator_cost", "online_training_incremental_cost"
+        }:
+            raise ValueError("S2.6 matrix cost semantics incomplete")
+        if not isinstance(value["anchor_ids"], list) or not value["anchor_ids"]:
+            raise ValueError("S2.6 matrix anchor_ids cannot be empty")
+        if not isinstance(value["candidate_evaluations"], list) or not value["candidate_evaluations"]:
+            raise ValueError("S2.6 matrix candidate table cannot be empty")
+        if value["status"] in {"FIXTURE_FROZEN", "FORMAL_FROZEN"} and (
+            value["b_primary"] is None or value["m_primary"] is None or value["r_primary"] is None
+        ):
+            raise ValueError("S2.6 frozen matrix requires B/M/R")
+
+    if schema == "stage2-confirmatory-mapping-v1":
+        if value["scope"] != "local_fixture" or value["formal_eligible"] is not False:
+            raise FormalRunRejected("S2.6_CONFIRMATORY_MAPPING_FORMAL_SCOPE_BLOCKED")
+        if value["stream"] != "confirmatory" or value["draw_id_unique"] is not True:
+            raise ValueError("S2.6 confirmatory mapping stream/uniqueness invalid")
+        for field_name in ("freeze_hash", "sampling_plan_hash"):
+            _require_sha256(value[field_name], field_name=field_name)
+        pilot_ids = string_array("pilot_draw_ids")
+        confirmatory_ids = string_array("confirmatory_draw_ids", allow_empty=False)
+        if set(pilot_ids).intersection(confirmatory_ids):
+            raise ValueError("pilot and confirmatory draw IDs overlap")
+        mappings = value["mappings"]
+        if not isinstance(mappings, list) or not mappings:
+            raise ValueError("confirmatory mappings cannot be empty")
 
     if schema == "stage2-reference-sizing-plan-v1":
         counts = value["candidate_sample_counts"]

@@ -2494,3 +2494,42 @@ __all__ = [
     "Stage2RecommendationEngine",
     "StreamingReferenceSizer",
 ]
+
+# S2.6 contracts live in a dependency-light module so task orchestration can
+# import them without importing the estimator/provider implementation.  Re-export
+# them here for the stable Stage 2 public surface used by existing callers.
+from .stage2_pilot import (  # noqa: E402  (intentional late import avoids cycles)
+    ANCHOR_IDS,
+    CONFIRMATORY_MAPPING_SCHEMA,
+    PILOT_MATRIX_SCHEMA,
+    AnchorPilotResult,
+    ArtificialCalibrationReport,
+    CandidateEvaluation,
+    ConfirmatoryMappingManifest,
+    CostSemantics,
+    MatrixFreeze,
+    build_confirmatory_mapping,
+    freeze_fixture_matrix,
+    freeze_formal_matrix,
+    required_repetitions,
+    run_artificial_distribution_calibration,
+    scan_candidates,
+)
+
+__all__ += [
+    "ANCHOR_IDS",
+    "CONFIRMATORY_MAPPING_SCHEMA",
+    "PILOT_MATRIX_SCHEMA",
+    "AnchorPilotResult",
+    "ArtificialCalibrationReport",
+    "CandidateEvaluation",
+    "ConfirmatoryMappingManifest",
+    "CostSemantics",
+    "MatrixFreeze",
+    "build_confirmatory_mapping",
+    "freeze_fixture_matrix",
+    "freeze_formal_matrix",
+    "required_repetitions",
+    "run_artificial_distribution_calibration",
+    "scan_candidates",
+]
