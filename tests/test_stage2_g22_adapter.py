@@ -19,11 +19,13 @@ from param_importance_nlp.experiments.stage2_g22_adapter import (
     _cross_bind_offline_registry_hash,
     PRODUCER_COMMIT,
     _producer_identity,
+    _validate_checkpoint_manifest_files,
     _validate_sampling_replay,
     _validate_task_inputs,
     evaluate_formal_g22,
 )
 from param_importance_nlp.experiments import stage2_g22_adapter as adapter
+from param_importance_nlp.experiments.stage2_assets import CheckpointFile
 from param_importance_nlp.runtime.task_artifacts import TaskArtifactStore
 from param_importance_nlp.runtime.task_artifacts import load_committed_task_artifact
 
@@ -164,6 +166,50 @@ def test_offline_registry_binding_keeps_provider_and_materialized_hashes_distinc
         _cross_bind_offline_registry_hash("checkpoint", "b" * 64, "b" * 64, bindings)
     with pytest.raises(G22Blocked, match="G22_OFFLINE_REGISTRY_MATERIALIZED_HASH_INVALID"):
         _cross_bind_offline_registry_hash("checkpoint", "a" * 64, "a" * 64, bindings)
+
+
+def test_model_manifest_allows_canonical_null_lfs_for_small_files() -> None:
+    expected = (
+        CheckpointFile("config.json", 1, "a" * 64, "config"),
+        CheckpointFile("tokenizer.json", 2, "b" * 64, "tokenizer"),
+    )
+    files = [
+        {
+            "name": item.path,
+            "official_lfs_sha256": None,
+            "sha256": item.sha256,
+            "size_bytes": item.size_bytes,
+        }
+        for item in expected
+    ]
+    assert _validate_checkpoint_manifest_files(files, expected) == [
+        "config.json",
+        "tokenizer.json",
+    ]
+
+
+def test_model_manifest_rejects_null_lfs_for_weight_file() -> None:
+    expected = (CheckpointFile("model.safetensors", 3, "c" * 64, "weights"),)
+    files = [{
+        "name": "model.safetensors",
+        "official_lfs_sha256": None,
+        "sha256": "c" * 64,
+        "size_bytes": 3,
+    }]
+    with pytest.raises(G22Blocked, match="G22_CHECKPOINT_FILE_MISMATCH"):
+        _validate_checkpoint_manifest_files(files, expected)
+
+
+def test_model_manifest_rejects_nonhex_lfs_declaration() -> None:
+    expected = (CheckpointFile("model.safetensors", 3, "c" * 64, "weights"),)
+    files = [{
+        "name": "model.safetensors",
+        "official_lfs_sha256": "not-a-sha256",
+        "sha256": "c" * 64,
+        "size_bytes": 3,
+    }]
+    with pytest.raises(G22Blocked, match="G22_CHECKPOINT_FILE_MISMATCH"):
+        _validate_checkpoint_manifest_files(files, expected)
 
 
 def test_current_task_producer_uses_clean_head_not_parent_authority_commit() -> None:
