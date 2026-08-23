@@ -576,7 +576,7 @@ def test_s111_formalizer_preflight_never_publishes_from_missing_upstream(tmp_pat
     write_canonical_json(configs / "test-binding.json", {"ref": "missing-test-summary.json", "sha256": "0" * 64})
     write_canonical_json(configs / "sync-binding.json", {"ref": "missing-sync-audit.json", "sha256": "0" * 64})
     attempt_root = tmp_path / "attempts"
-    with pytest.raises(formalizer.Stage1S111FormalError, match="TEST_SUMMARY_HASH_MISMATCH"):
+    with pytest.raises(formalizer.Stage1S111FormalError, match="TEST_SUMMARY_BINDING_INVALID"):
         formalizer.execute(
             repository=Path.cwd(), evidence_root=tmp_path, attempt_root=attempt_root,
             dependencies_path=configs / "dependencies.json", matrix_path=configs / "matrix.json",
@@ -721,13 +721,22 @@ def test_s111_test_summary_rejects_nested_type_and_key_cardinality_drift(tmp_pat
         "groups": [{"name": "cpu", "collected": 1, "passed": 1, "failed": 0, "errors": 0, "skipped": 0, "duration_seconds": "wrong-type", "junit_ref": junit.name, "junit_sha256": _sha(junit)}],
     })
     path = tmp_path / "test-summary.json"; write_canonical_json(path, summary)
+    binding = {"ref": path.name, "sha256": _sha(path), "artifact_hash": summary["artifact_hash"]}
+    with pytest.raises(formalizer.Stage1S111FormalError, match="TEST_SUMMARY_BINDING_INVALID"):
+        formalizer._validate_test_summary(tmp_path, {key: binding[key] for key in ("ref", "sha256")})
+    with pytest.raises(formalizer.Stage1S111FormalError, match="TEST_SUMMARY_BINDING_INVALID"):
+        formalizer._validate_test_summary(tmp_path, {**binding, "unexpected": True})
+    with pytest.raises(formalizer.Stage1S111FormalError, match="TEST_SUMMARY_BINDING_INVALID"):
+        formalizer._validate_test_summary(tmp_path, {**binding, "artifact_hash": "0" * 64})
     with pytest.raises(formalizer.Stage1S111FormalError, match="TEST_SUMMARY_GROUP_COUNTS_INVALID"):
-        formalizer._validate_test_summary(tmp_path, {"ref": path.name, "sha256": _sha(path)})
+        formalizer._validate_test_summary(tmp_path, binding)
     summary["groups"][0]["unexpected"] = "extra"
     body = {key: value for key, value in summary.items() if key != "artifact_hash"}
-    write_canonical_json(path, _with_hash(body))
+    summary = _with_hash(body)
+    write_canonical_json(path, summary)
+    binding = {"ref": path.name, "sha256": _sha(path), "artifact_hash": summary["artifact_hash"]}
     with pytest.raises(formalizer.Stage1S111FormalError, match="TEST_SUMMARY_GROUP_INVALID"):
-        formalizer._validate_test_summary(tmp_path, {"ref": path.name, "sha256": _sha(path)})
+        formalizer._validate_test_summary(tmp_path, binding)
 
 
 def test_s111_historical_failure_requires_a_bound_pass_resolution(tmp_path: Path) -> None:

@@ -225,7 +225,7 @@ def _validate_failure_history(root: Path, value: object) -> list[dict[str, str]]
 
 
 def _validate_test_summary(root: Path, value: object) -> dict[str, object]:
-    if not isinstance(value, Mapping) or set(value) != {"ref", "sha256"}:
+    if not isinstance(value, Mapping) or set(value) != {"ref", "sha256", "artifact_hash"}:
         raise Stage1S111FormalError("S1_11_TEST_SUMMARY_BINDING_INVALID")
     path = _relative(root, value["ref"], field="test_summary")
     if not path.is_file() or not _digest(value["sha256"]) or _sha(path) != value["sha256"]:
@@ -235,7 +235,12 @@ def _validate_test_summary(root: Path, value: object) -> dict[str, object]:
     if set(report) != expected or report.get("schema_version") != "stage1-s1-11-test-summary-v1" or report.get("status") != "PASS":
         raise Stage1S111FormalError("S1_11_TEST_SUMMARY_SCHEMA_INVALID")
     body = dict(report); declared = body.pop("artifact_hash")
-    if declared != canonical_json_hash(body) or not isinstance(report.get("groups"), list) or not report["groups"]:
+    if (
+        not _digest(value["artifact_hash"])
+        or value["artifact_hash"] != declared
+    ):
+        raise Stage1S111FormalError("S1_11_TEST_SUMMARY_BINDING_INVALID")
+    if not _digest(declared) or declared != canonical_json_hash(body) or not isinstance(report.get("groups"), list) or not report["groups"]:
         raise Stage1S111FormalError("S1_11_TEST_SUMMARY_SELF_HASH_INVALID")
     names: set[str] = set()
     for group in report["groups"]:
