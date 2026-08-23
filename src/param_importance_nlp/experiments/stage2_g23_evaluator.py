@@ -41,7 +41,12 @@ from param_importance_nlp.runtime.task_artifacts import (
 from param_importance_nlp.runtime.task_runtime import TaskRunResult, TaskRunStatus
 from param_importance_nlp.runtime.tensor_bundle import load_tensor_bundle
 
-from .stage2_formal import _ReferenceShardStore, _ReferenceSnapshotStore, _vector_digest
+from .stage2_formal import (
+    _ReferenceShardStore,
+    _ReferenceSnapshotStore,
+    _moments_from_shards,
+    _vector_digest,
+)
 from .sampling import DrawStreamManifest, SamplingPlan
 
 
