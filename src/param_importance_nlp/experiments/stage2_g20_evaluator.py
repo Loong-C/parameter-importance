@@ -30,6 +30,7 @@ from typing import Any
 
 from ..contracts.config_v2 import ResolvedConfigV2
 from ..contracts.jsonio import JSONValue, canonical_json_hash, load_canonical_json
+from ..contracts.seed import SeedPlan
 from ..contracts.status import GateRecord, GateStatus
 from ..runtime.task_artifacts import (
     LoadedTaskArtifact,
@@ -567,6 +568,7 @@ def _validate_document_bindings(
     *,
     repository: _RepositoryIdentity,
     stage1_binding: _Stage1SourceSet,
+    config: _ResolvedConfigBinding,
 ) -> None:
     provenance = preregistration.get("provenance")
     if not isinstance(provenance, Mapping):
@@ -574,7 +576,14 @@ def _validate_document_bindings(
     producer = _commit(provenance.get("producer_commit"), "provenance.producer_commit")
     if producer != repository.head:
         raise G20Blocked("provenance.producer_commit:TRUSTED_HEAD_MISMATCH")
-    _sha(provenance.get("seed_plan_hash"), "provenance.seed_plan_hash")
+    seed_hash = _sha(provenance.get("seed_plan_hash"), "provenance.seed_plan_hash")
+    try:
+        identity = config.config.base_config.section("identity")
+        expected_seed_hash = SeedPlan.from_master_seed(int(identity["master_seed"])).artifact_hash  # type: ignore[index]
+    except (KeyError, TypeError, ValueError) as error:
+        raise G20Blocked("resolved_config_ref:MASTER_SEED_INVALID") from error
+    if seed_hash != expected_seed_hash:
+        raise G20Blocked("provenance.seed_plan_hash:RESOLVED_CONFIG_MISMATCH")
     upstream = _sha(provenance.get("upstream_binding_hash"), "provenance.upstream_binding_hash")
     if upstream != stage1_binding.binding_hash:
         raise G20Blocked("provenance.upstream_binding_hash:SOURCE_BINDING_MISMATCH")
@@ -595,6 +604,7 @@ def _validate_preregistration(
     *,
     repository: _RepositoryIdentity,
     stage1_binding: _Stage1SourceSet,
+    config: _ResolvedConfigBinding,
 ) -> None:
     try:
         validate_stage2_preregistration(value)
@@ -602,7 +612,12 @@ def _validate_preregistration(
         raise G20Failed(f"preregistration:VALIDATOR_REJECTED:{error}") from error
     if value.get("scope") != "formal" or value.get("formal_eligible") is not False:
         raise G20Failed("preregistration:FORMAL_SCOPE_REQUIRED")
-    _validate_document_bindings(value, repository=repository, stage1_binding=stage1_binding)
+    _validate_document_bindings(
+        value,
+        repository=repository,
+        stage1_binding=stage1_binding,
+        config=config,
+    )
     provenance = value["provenance"]
     assert isinstance(provenance, Mapping)
     try:
@@ -937,7 +952,12 @@ def evaluate_formal_g20(
                     prereg = loaded.artifacts_by_kind["preregistration"].payload
                     hypothesis = loaded.artifacts_by_kind["hypothesis_contract"].payload
                     candidate = loaded.artifacts_by_kind["gate_record"].payload
-                    _validate_preregistration(prereg, repository=repository, stage1_binding=loaded.stage1)
+                    _validate_preregistration(
+                        prereg,
+                        repository=repository,
+                        stage1_binding=loaded.stage1,
+                        config=config,
+                    )
                     _validate_hypothesis(hypothesis, prereg)
                     _validate_runner_candidate(candidate, prereg, hypothesis)
                     status = GateStatus.PASS
