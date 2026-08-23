@@ -42,6 +42,12 @@ def _require_sha256(value: str, *, field_name: str) -> str:
     return value
 
 
+def _require_int(value: object, field_name: str, *, minimum: int) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
+        raise ValueError(f"{field_name} 必须是不小于 {minimum} 的整数")
+    return value
+
+
 def _require_unique_hashes(values: Sequence[str], *, field_name: str) -> tuple[str, ...]:
     normalized = tuple(
         _require_sha256(value, field_name=f"{field_name}[{index}]")
@@ -351,6 +357,50 @@ _STAGE23_ARTIFACT_FIELDS: dict[str, set[str]] = {
         "formal_eligible",
         "qualification_gate_hash",
         "weighting_assumptions",
+        "artifact_hash",
+    },
+    "stage2-reference-uncertainty-v1": {
+        "schema_version",
+        "estimator",
+        "confidence_level",
+        "block_count_a",
+        "block_count_b",
+        "bias_variance_hash",
+        "cross_variance_hash",
+        "ranking_variance_hash",
+        "trace_bias_variance",
+        "bias_half_width_l2",
+        "artifact_hash",
+    },
+    "stage2-reference-one-shot-plan-v1": {
+        "schema_version",
+        "reference_id",
+        "sizing_result_hash",
+        "sample_count_per_stream",
+        "block_size",
+        "sizing_stream",
+        "stream_a",
+        "stream_b",
+        "one_shot",
+        "artifact_hash",
+    },
+    "stage2-reference-one-shot-result-v1": {
+        "schema_version",
+        "plan_hash",
+        "sizing_result_hash",
+        "provider_state_digest",
+        "registry_hash",
+        "processed_sample_count_per_stream",
+        "bias_reference_hash",
+        "cross_reference_hash",
+        "ranking_reference_hash",
+        "uncertainty",
+        "stream_a_draw_hash",
+        "stream_b_draw_hash",
+        "status",
+        "one_shot",
+        "weighting_assumptions",
+        "sequence_variance_hash",
         "artifact_hash",
     },
     "stage2-paired-wave-summary-v1": {
@@ -670,6 +720,61 @@ def validate_stage23_artifact(value: Mapping[str, object]) -> object:
             if not isinstance(value[field_name], str):
                 raise TypeError(f"{field_name} 必须是字符串")
             _require_sha256(value[field_name], field_name=field_name)
+
+    if schema == "stage2-reference-uncertainty-v1":
+        if value["estimator"] != "block_u_delete_one_jackknife":
+            raise ValueError("REFERENCE_UNCERTAINTY_ESTIMATOR_UNSUPPORTED")
+        confidence = value["confidence_level"]
+        if not isinstance(confidence, (int, float)) or isinstance(confidence, bool) or not 0 < float(confidence) < 1:
+            raise ValueError("REFERENCE_UNCERTAINTY_CONFIDENCE_INVALID")
+        for field_name in ("block_count_a", "block_count_b"):
+            _require_int(value[field_name], field_name, minimum=3)
+        for field_name in (
+            "bias_variance_hash",
+            "cross_variance_hash",
+            "ranking_variance_hash",
+        ):
+            _require_sha256(value[field_name], field_name=field_name)
+        for field_name in ("trace_bias_variance", "bias_half_width_l2"):
+            item = value[field_name]
+            if not isinstance(item, (int, float)) or isinstance(item, bool) or not math.isfinite(float(item)) or float(item) < 0:
+                raise ValueError(f"{field_name} 必须是有限非负数")
+
+    if schema == "stage2-reference-one-shot-plan-v1":
+        for field_name in ("reference_id", "sizing_stream", "stream_a", "stream_b"):
+            if not isinstance(value[field_name], str) or not value[field_name]:
+                raise TypeError(f"{field_name} 必须是非空字符串")
+        for field_name in ("sizing_result_hash",):
+            _require_sha256(value[field_name], field_name=field_name)
+        _require_int(value["sample_count_per_stream"], "sample_count_per_stream", minimum=1)
+        _require_int(value["block_size"], "block_size", minimum=1)
+        if value["sample_count_per_stream"] % value["block_size"]:
+            raise ValueError("one-shot sample_count_per_stream 必须可被 block_size 整除")
+        if (value["sizing_stream"], value["stream_a"], value["stream_b"]) != (
+            "reference_sizing", "reference_A", "reference_B"
+        ) or value["one_shot"] is not True:
+            raise ValueError("one-shot reference stream contract drift")
+
+    if schema == "stage2-reference-one-shot-result-v1":
+        for field_name in (
+            "plan_hash", "sizing_result_hash", "provider_state_digest", "registry_hash",
+            "bias_reference_hash", "cross_reference_hash", "ranking_reference_hash",
+            "stream_a_draw_hash", "stream_b_draw_hash",
+            "sequence_variance_hash",
+        ):
+            _require_sha256(value[field_name], field_name=field_name)
+        _require_int(value["processed_sample_count_per_stream"], "processed_sample_count_per_stream", minimum=1)
+        if value["status"] not in {"IN_PROGRESS", "COMPLETE", "FAILED"}:
+            raise ValueError("one-shot reference status invalid")
+        if value["one_shot"] is not True:
+            raise ValueError("one-shot reference must be true")
+        validate_weighting(value["weighting_assumptions"])
+        uncertainty = value["uncertainty"]
+        if not isinstance(uncertainty, Mapping) or uncertainty.get("schema_version") != "stage2-reference-uncertainty-v1":
+            raise ValueError("one-shot uncertainty contract missing")
+        uncertainty_payload = {key: item for key, item in uncertainty.items() if key != "artifact_hash"}
+        if uncertainty.get("artifact_hash") != canonical_json_hash(uncertainty_payload):
+            raise ValueError("one-shot uncertainty artifact_hash mismatch")
 
     if schema == "stage2-paired-wave-summary-v1":
         validate_weighting(value["weighting_assumptions"])

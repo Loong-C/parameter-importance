@@ -1,0 +1,22 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://parameter-importance.invalid/schemas/shared/stage2-reference-uncertainty-v1.json",
+  "title": "Stage 2 block reference uncertainty",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "estimator", "confidence_level", "block_count_a", "block_count_b", "bias_variance_hash", "cross_variance_hash", "ranking_variance_hash", "trace_bias_variance", "bias_half_width_l2", "artifact_hash"],
+  "properties": {
+    "schema_version": {"const": "stage2-reference-uncertainty-v1"},
+    "estimator": {"const": "block_u_delete_one_jackknife"},
+    "confidence_level": {"type": "number", "exclusiveMinimum": 0, "exclusiveMaximum": 1},
+    "block_count_a": {"type": "integer", "minimum": 3},
+    "block_count_b": {"type": "integer", "minimum": 3},
+    "bias_variance_hash": {"$ref": "#/defs/hash"},
+    "cross_variance_hash": {"$ref": "#/defs/hash"},
+    "ranking_variance_hash": {"$ref": "#/defs/hash"},
+    "trace_bias_variance": {"type": "number", "minimum": 0},
+    "bias_half_width_l2": {"type": "number", "minimum": 0},
+    "artifact_hash": {"$ref": "#/defs/hash"}
+  },
+  "$defs": {"hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"}}
+}
