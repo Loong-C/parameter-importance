@@ -830,6 +830,27 @@ def _validate_six_cell_manifest(value: object) -> tuple[Mapping[str, object], ..
     rows = value.get("checkpoints")
     if not isinstance(rows, list) or len(rows) != REQUIRED_CELL_COUNT:
         raise G23Blocked("six_cell_manifest:EXACTLY_SIX_ROWS_REQUIRED")
+
+    # S2.3 materialization now publishes the authoritative registry identity
+    # per cell.  Keep the mapping's insertion order part of the wire contract:
+    # this catches a producer that silently reorders or drops a cell before a
+    # consumer can bind an artifact to the wrong checkpoint.
+    has_registry_map = "registry_hashes_by_cell" in value
+    raw_registry_map = value.get("registry_hashes_by_cell")
+    registry_hashes_by_cell: dict[str, str] | None = None
+    if has_registry_map:
+        if not isinstance(raw_registry_map, Mapping):
+            raise G23Blocked("six_cell_manifest.registry_hashes_by_cell:OBJECT_REQUIRED")
+        if tuple(raw_registry_map) != EXPECTED_CELL_IDS:
+            raise G23Blocked("six_cell_manifest.registry_hashes_by_cell:CELL_ORDER_INVALID")
+        registry_hashes_by_cell = {
+            cell_id: _sha(
+                raw_registry_map[cell_id],
+                f"six_cell_manifest.registry_hashes_by_cell.{cell_id}",
+            )
+            for cell_id in EXPECTED_CELL_IDS
+        }
+
     by_id: dict[str, Mapping[str, object]] = {}
     checkpoint_ids: set[object] = set()
     for row in rows:
@@ -852,9 +873,33 @@ def _validate_six_cell_manifest(value: object) -> tuple[Mapping[str, object], ..
         by_id[str(cell_id)] = row
     if tuple(by_id) != EXPECTED_CELL_IDS:
         raise G23Blocked("six_cell_manifest:CELL_ORDER_INVALID")
+    row_registry_hashes = {
+        cell_id: _sha(
+            by_id[cell_id].get("registry_hash"),
+            f"six_cell_manifest.{cell_id}.registry_hash",
+        )
+        for cell_id in EXPECTED_CELL_IDS
+    }
     registry_hash = _sha(value.get("registry_hash"), "six_cell_manifest.registry_hash")
-    if any(row.get("registry_hash") != registry_hash for row in by_id.values()):
-        raise G23Blocked("six_cell_manifest:REGISTRY_DRIFT")
+    if registry_hashes_by_cell is not None:
+        if any(
+            row_registry_hashes[cell_id] != registry_hashes_by_cell[cell_id]
+            for cell_id in EXPECTED_CELL_IDS
+        ):
+            raise G23Blocked("six_cell_manifest:REGISTRY_ROW_MAP_MISMATCH")
+        distinct_registry_hashes = set(registry_hashes_by_cell.values())
+        expected_registry_hash = (
+            next(iter(distinct_registry_hashes))
+            if len(distinct_registry_hashes) == 1
+            else canonical_json_hash(registry_hashes_by_cell)
+        )
+        if registry_hash != expected_registry_hash:
+            raise G23Blocked("six_cell_manifest:REGISTRY_DIGEST_MISMATCH")
+    # Before the per-cell map was materialized, the only safe legacy form was
+    # a genuinely common registry hash.  Do not infer or force a common hash
+    # when old rows already carry model-specific identities.
+    elif any(row_registry_hashes[cell_id] != registry_hash for cell_id in EXPECTED_CELL_IDS):
+        raise G23Blocked("six_cell_manifest:LEGACY_COMMON_REGISTRY_REQUIRED")
     data = value.get("data")
     if not isinstance(data, Mapping) or data.get("data_range_hash") != value.get("data_range_hash"):
         raise G23Blocked("six_cell_manifest:DATA_RANGE_DRIFT")
@@ -1231,10 +1276,11 @@ def _prepare_cell(root: Path, source: CellInput, *, repo_root: Path | None = Non
         if tokenizer_identity.get("checkpoint_id") != checkpoint_identity.get("checkpoint_id"):
             raise G23Blocked("tokenizer_identity:CHECKPOINT_MISMATCH")
         registry_identity = _identity_object(cp.get("registry_identity"), "registry_identity", required=("registry_hash", "parameter_registry_artifact_hash"))
+        row_registry_hash = _sha(row.get("registry_hash"), f"six_cell_manifest.{cell_id}.registry_hash")
         registry_hash = _sha(registry_identity.get("registry_hash"), "registry_identity.registry_hash")
-        if registry_hash != row.get("registry_hash") or registry_hash != rp.get("registry_hash"):
+        if registry_hash != row_registry_hash or registry_hash != rp.get("registry_hash"):
             raise G23Blocked("registry_identity:DRIFT")
-        registry_artifact = _validate_registry_artifact(cp.get("parameter_registry_artifact"), registry_hash)
+        registry_artifact = _validate_registry_artifact(cp.get("parameter_registry_artifact"), row_registry_hash)
         if registry_artifact.get("artifact_hash") != registry_identity.get("parameter_registry_artifact_hash"):
             raise G23Blocked("parameter_registry_artifact:IDENTITY_HASH_MISMATCH")
         external_registry = external_payloads.get("parameter_registry")
