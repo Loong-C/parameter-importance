@@ -852,28 +852,9 @@ def _validate_six_cell_manifest(value: object) -> tuple[Mapping[str, object], ..
         by_id[str(cell_id)] = row
     if tuple(by_id) != EXPECTED_CELL_IDS:
         raise G23Blocked("six_cell_manifest:CELL_ORDER_INVALID")
-    registry_hashes_by_cell = value.get("registry_hashes_by_cell")
-    if registry_hashes_by_cell is not None:
-        if not isinstance(registry_hashes_by_cell, Mapping) or tuple(registry_hashes_by_cell) != EXPECTED_CELL_IDS:
-            raise G23Blocked("six_cell_manifest:REGISTRY_HASH_MAP_INVALID")
-        checked_hashes = {
-            cell_id: _sha(registry_hashes_by_cell.get(cell_id), f"six_cell_manifest.registry_hashes_by_cell.{cell_id}")
-            for cell_id in EXPECTED_CELL_IDS
-        }
-        declared_registry_hash = _sha(value.get("registry_hash"), "six_cell_manifest.registry_hash")
-        expected_registry_hash = (
-            next(iter(set(checked_hashes.values())))
-            if len(set(checked_hashes.values())) == 1
-            else canonical_json_hash(checked_hashes)
-        )
-        if declared_registry_hash != expected_registry_hash:
-            raise G23Blocked("six_cell_manifest:REGISTRY_HASH_MAP_MISMATCH")
-        if any(row.get("registry_hash") != checked_hashes[cell_id] for cell_id, row in by_id.items()):
-            raise G23Blocked("six_cell_manifest:REGISTRY_DRIFT")
-    else:
-        registry_hash = _sha(value.get("registry_hash"), "six_cell_manifest.registry_hash")
-        if any(row.get("registry_hash") != registry_hash for row in by_id.values()):
-            raise G23Blocked("six_cell_manifest:REGISTRY_DRIFT")
+    registry_hash = _sha(value.get("registry_hash"), "six_cell_manifest.registry_hash")
+    if any(row.get("registry_hash") != registry_hash for row in by_id.values()):
+        raise G23Blocked("six_cell_manifest:REGISTRY_DRIFT")
     data = value.get("data")
     if not isinstance(data, Mapping) or data.get("data_range_hash") != value.get("data_range_hash"):
         raise G23Blocked("six_cell_manifest:DATA_RANGE_DRIFT")
