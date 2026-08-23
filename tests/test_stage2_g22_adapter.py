@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 from pathlib import Path
+import subprocess
 
 import pytest
 
@@ -12,6 +13,9 @@ from param_importance_nlp.experiments.stage2_g22_adapter import (
     ARTIFACT_KINDS,
     G22Blocked,
     _gate,
+    _cross_bind_offline_registry_hash,
+    PRODUCER_COMMIT,
+    _producer_identity,
     _validate_sampling_replay,
     _validate_task_inputs,
     evaluate_formal_g22,
@@ -139,3 +143,31 @@ def test_sampling_replay_rejects_self_consistent_but_wrong_draw(tmp_path: Path) 
     )
     with pytest.raises(G22Blocked, match="G22_SAMPLING_REPLAY_MISMATCH:pilot"):
         _validate_sampling_replay(tampered)
+
+
+def test_offline_registry_binding_keeps_provider_and_materialized_hashes_distinct() -> None:
+    bindings = {
+        "checkpoint": {
+            "provider_derived_registry_hash": "a" * 64,
+            "registry_hash": "b" * 64,
+        }
+    }
+    assert _cross_bind_offline_registry_hash(
+        "checkpoint", "b" * 64, "a" * 64, bindings
+    ) == ("a" * 64, "b" * 64)
+    with pytest.raises(G22Blocked, match="G22_OFFLINE_PROVIDER_REGISTRY_HASH_CROSS_BIND_INVALID"):
+        _cross_bind_offline_registry_hash("checkpoint", "b" * 64, "b" * 64, bindings)
+    with pytest.raises(G22Blocked, match="G22_OFFLINE_REGISTRY_MATERIALIZED_HASH_INVALID"):
+        _cross_bind_offline_registry_hash("checkpoint", "a" * 64, "a" * 64, bindings)
+
+
+def test_current_task_producer_uses_clean_head_not_parent_authority_commit() -> None:
+    repository = Path(__file__).parents[1]
+    head = subprocess.run(
+        ["git", "-C", str(repository), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    assert head != PRODUCER_COMMIT
+    assert _producer_identity(repository, head)["commit"] == head

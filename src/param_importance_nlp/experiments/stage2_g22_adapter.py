@@ -20,8 +20,11 @@ from ..contracts.config_v2 import ResolvedConfigV2
 from ..contracts.jsonio import JSONValue, canonical_json_hash, load_canonical_json
 from ..contracts.status import GateRecord, GateStatus
 from ..contracts.task_catalog import DEFAULT_TASK_CATALOG
+from ..core.errors import RegistryError
+from ..core.registry import ParameterRegistry
 from ..runtime.task_artifacts import LoadedTaskArtifact, TaskArtifactStore, load_committed_task_artifact
 from .sampling import DrawStreamManifest, SamplingPlan, STREAM_NAMES
+from .stage2_registry_qualification import RegistryQualificationError, load_asset_resolution_input
 from .stage23_task_runners import (
     _predecessor_context,
     validate_formal_s203_payloads,
@@ -43,6 +46,9 @@ ADAPTER_SCHEMA_VERSION = "stage2-g2.2-gate-adapter-v1"
 
 AUTHORITY_EVIDENCE_REF = "evidence/stage2/s203/g2.2-assets.json"
 AUTHORITY_EVIDENCE_SHA256 = "b6805b6744374e7d05f193db4d72162176b930fa1db250bc00797b3ad30528a8"
+# The original authority evidence and v1 asset manifest are immutable parent
+# evidence.  The r7 amendment is the only asset-resolution input consumed by
+# this adapter; it materializes the coordinate-registry hashes append-only.
 ASSET_REF = "manifests/stage2/s203-asset-resolution.json"
 ASSET_SHA256 = "1b1609ea97974a560b4da98707eecdbbbd97010e067e9899234079ab7b6cfb20"
 DATA_REF = "manifests/stage2/s203-data-range.json"
@@ -50,6 +56,13 @@ DATA_SHA256 = "a6a633d30e55351679368ded522d4b697fc676e8f4ca7f63108406524459fb14"
 SELECTION_REF = "manifests/stage2/s203-selection.json"
 SELECTION_SHA256 = "1035e831f63862c0d15549fe24738ffd1432e8e165628ba64b40248461dea9bd"
 ASSET_DIGEST = "f57decd5cf00e69e45ab2f02c994abb202f5c614e1441acb8aebcb1807ff76ee"
+AMENDMENT_REF = "manifests/stage2/s203-registry-amendment-r3.json"
+AMENDMENT_SHA256 = "71c0509b092b42a461ce9a1e7397fc74279329954f11dd7c17c512020cef6d7a"
+AMENDMENT_ASSET_DIGEST = "8ae41ec8ed3ee8f16eee15cce06a6b082c21bcbef6565f099fe44c2e94fcb852"
+REGISTRY_INDEX_REF = "evidence/stage2/s203/formal-registry-r6/registry-index.json"
+REGISTRY_INDEX_SHA256 = "d309e7b4c93b66da53eb6eb0447cb22209cd9872f0d7f0459c52f34fb7cb5c29"
+REGISTRY_INDEX_HASH = "67664a376379926b5d7eb5cae52251cec30ede2c9e24b9cade1d7c21a9bcad8c"
+REGISTRY_INDEX_CONFIG_REF = "evidence/stage2/s204/materialized-task-inputs-r6/configs/stage2-01/resolved-config-v2.json"
 DATA_DIGEST = "df8eeac5178305d409cf6128ac5d5648567aae895592c79fa21542e84a28e0f1"
 PRODUCER_COMMIT = "676ab436422b1a514bddfc1181d0645fed4de7be"
 
@@ -300,7 +313,220 @@ def _validate_sampling_replay(payloads: Mapping[str, Mapping[str, object]]) -> d
     return {"sampling_plan_hash": plan.digest, "streams": replayed}
 
 
-def _validate_offline(root: Path, manifest: AssetResolutionManifest) -> list[dict[str, JSONValue]]:
+def _validate_amendment(
+    root: Path,
+    parent_asset: AssetResolutionManifest,
+) -> tuple[AssetResolutionManifest, dict[str, dict[str, str]], dict[str, JSONValue]]:
+    """Load the r7 amendment and expose its old->new registry bindings.
+
+    ``load_asset_resolution_input`` is the canonical amendment validator.  The
+    extra checks here intentionally retain the amendment envelope and its
+    qualification refs for the Gate evidence instead of flattening the old
+    provider hash into the materialized manifest.
+    """
+    amendment = _load_hashed(root, AMENDMENT_REF, AMENDMENT_SHA256)
+    if parent_asset.digest != ASSET_DIGEST:
+        raise G22Blocked("G22_ASSET_AMENDMENT_PARENT_DIGEST_INVALID")
+    try:
+        materialized_value = load_asset_resolution_input(
+            _resolve(root, AMENDMENT_REF), root=root, data_root=root
+        )
+    except (RegistryQualificationError, FileNotFoundError, OSError, TypeError, ValueError) as error:
+        raise G22Blocked(f"G22_ASSET_AMENDMENT_INVALID:{type(error).__name__}") from error
+    if dict(materialized_value) != amendment.get("materialized_asset_resolution"):
+        raise G22Blocked("G22_ASSET_AMENDMENT_MATERIALIZED_DRIFT")
+    parent = amendment.get("parent")
+    expected_parent = {
+        "asset_resolution_ref": ASSET_REF,
+        "asset_resolution_sha256": ASSET_SHA256,
+        "asset_resolution_size_bytes": 14248,
+        "asset_resolution_hash": ASSET_DIGEST,
+    }
+    if parent != expected_parent:
+        raise G22Blocked("G22_ASSET_AMENDMENT_PARENT_NOT_APPEND_ONLY")
+    if amendment.get("qualification_index") is None or not isinstance(
+        amendment["qualification_index"], Mapping
+    ):
+        raise G22Blocked("G22_ASSET_AMENDMENT_QUALIFICATION_INDEX_INVALID")
+    index_meta = amendment["qualification_index"]
+    if set(index_meta) != {"ref", "sha256", "size_bytes", "index_hash"}:
+        raise G22Blocked("G22_ASSET_AMENDMENT_QUALIFICATION_INDEX_FIELDS_INVALID")
+    index_ref = index_meta.get("ref")
+    index_sha = index_meta.get("sha256")
+    if not isinstance(index_ref, str) or not isinstance(index_sha, str):
+        raise G22Blocked("G22_ASSET_AMENDMENT_QUALIFICATION_INDEX_REF_INVALID")
+    index_value = _load_hashed(root, index_ref, index_sha)
+    if index_value.get("index_hash") != index_meta.get("index_hash"):
+        raise G22Blocked("G22_ASSET_AMENDMENT_QUALIFICATION_INDEX_HASH_INVALID")
+    raw_cells = amendment.get("qualification_cells")
+    if not isinstance(raw_cells, list) or len(raw_cells) != 6:
+        raise G22Blocked("G22_ASSET_AMENDMENT_QUALIFICATION_CELLS_INVALID")
+    asset = AssetResolutionManifest.from_mapping(materialized_value)
+    if asset.digest != AMENDMENT_ASSET_DIGEST:
+        raise G22Blocked("G22_ASSET_AMENDMENT_ASSET_DIGEST_INVALID")
+    by_checkpoint = {item.checkpoint_id: item for item in asset.checkpoints}
+    bindings: dict[str, dict[str, str]] = {}
+    qualification_refs: list[str] = []
+    for row in raw_cells:
+        if not isinstance(row, Mapping) or set(row) != {
+            "cell_id", "checkpoint_id", "qualification_ref", "qualification_sha256",
+            "qualification_size_bytes", "qualification_hash",
+            "provider_derived_registry_hash", "registry_hash", "parameter_count",
+            "parameter_numel",
+        }:
+            raise G22Blocked("G22_ASSET_AMENDMENT_QUALIFICATION_CELL_FIELDS_INVALID")
+        checkpoint_id = row.get("checkpoint_id")
+        cell_id = row.get("cell_id")
+        qualification_ref = row.get("qualification_ref")
+        qualification_sha = row.get("qualification_sha256")
+        provider_hash = row.get("provider_derived_registry_hash")
+        registry_hash = row.get("registry_hash")
+        if not all(isinstance(value, str) for value in (checkpoint_id, cell_id, qualification_ref, qualification_sha, provider_hash, registry_hash)):
+            raise G22Blocked("G22_ASSET_AMENDMENT_QUALIFICATION_CELL_TYPES_INVALID")
+        checkpoint = by_checkpoint.get(checkpoint_id)
+        if checkpoint is None or cell_id != f"{checkpoint.model_id}:{checkpoint.training_stage}":
+            raise G22Blocked("G22_ASSET_AMENDMENT_QUALIFICATION_CELL_ID_INVALID")
+        if registry_hash != checkpoint.parameter_registry_hash:
+            raise G22Blocked("G22_ASSET_AMENDMENT_REGISTRY_HASH_NOT_MATERIALIZED")
+        if checkpoint_id in bindings:
+            raise G22Blocked("G22_ASSET_AMENDMENT_QUALIFICATION_CELL_DUPLICATE")
+        _load_hashed(root, qualification_ref, qualification_sha)
+        bindings[checkpoint_id] = {
+            "cell_id": cell_id,
+            "provider_derived_registry_hash": provider_hash,
+            "registry_hash": registry_hash,
+            "qualification_ref": qualification_ref,
+            "qualification_sha256": qualification_sha,
+        }
+        qualification_refs.append(qualification_ref)
+    if set(bindings) != set(by_checkpoint):
+        raise G22Blocked("G22_ASSET_AMENDMENT_QUALIFICATION_CELL_SET_INVALID")
+    return asset, bindings, {
+        "ref": AMENDMENT_REF,
+        "sha256": AMENDMENT_SHA256,
+        "asset_resolution_hash": asset.digest,
+        "qualification_index": dict(index_meta),
+        "qualification_refs": qualification_refs,
+    }
+
+
+def _validate_formal_registry_index(
+    root: Path,
+    manifest: AssetResolutionManifest,
+    bindings: Mapping[str, Mapping[str, str]],
+) -> list[dict[str, JSONValue]]:
+    """Validate the formal r6 registry index and all six source manifests."""
+    index = _load_hashed(root, REGISTRY_INDEX_REF, REGISTRY_INDEX_SHA256)
+    required_index = {
+        "allowed_s203_artifact_kinds", "asset_resolution_artifact_kind", "asset_resolution_hash",
+        "cells", "index_hash", "producer", "registry_manifests_are_source_artifacts",
+        "resolved_config", "schema_version", "scope", "source_artifact_refs", "task_id",
+    }
+    if set(index) != required_index or index.get("schema_version") != "stage2-parameter-registry-index-v1" or index.get("task_id") != TASK_ID or index.get("scope") != "formal" or index.get("asset_resolution_artifact_kind") != "asset_resolution" or index.get("asset_resolution_hash") != manifest.digest or index.get("allowed_s203_artifact_kinds") != list(ARTIFACT_KINDS) or index.get("registry_manifests_are_source_artifacts") is not True or index.get("index_hash") != REGISTRY_INDEX_HASH:
+        raise G22Blocked("G22_FORMAL_REGISTRY_INDEX_IDENTITY_INVALID")
+    index_body = dict(index)
+    index_body.pop("index_hash", None)
+    if canonical_json_hash(index_body) != REGISTRY_INDEX_HASH:
+        raise G22Blocked("G22_FORMAL_REGISTRY_INDEX_HASH_INVALID")
+    resolved_config = index.get("resolved_config")
+    if not isinstance(resolved_config, Mapping) or set(resolved_config) != {
+        "config_hash", "file_sha256", "file_size_bytes", "full_hash", "path", "payload_sha256"
+    }:
+        raise G22Blocked("G22_FORMAL_REGISTRY_RESOLVED_CONFIG_FIELDS_INVALID")
+    config_path = resolved_config.get("path")
+    if not isinstance(config_path, str) or not config_path.endswith("/" + REGISTRY_INDEX_CONFIG_REF):
+        raise G22Blocked("G22_FORMAL_REGISTRY_RESOLVED_CONFIG_PATH_INVALID")
+    config_sha = resolved_config.get("file_sha256")
+    if not isinstance(config_sha, str) or resolved_config.get("payload_sha256") != config_sha or not isinstance(resolved_config.get("file_size_bytes"), int):
+        raise G22Blocked("G22_FORMAL_REGISTRY_RESOLVED_CONFIG_DIGEST_INVALID")
+    config_file = _resolve(root, REGISTRY_INDEX_CONFIG_REF)
+    config_size, config_observed_sha = _sha256(config_file)
+    if config_size != resolved_config["file_size_bytes"] or config_observed_sha != config_sha:
+        raise G22Blocked("G22_FORMAL_REGISTRY_RESOLVED_CONFIG_FILE_INVALID")
+    try:
+        indexed_config = ResolvedConfigV2.from_mapping(load_canonical_json(config_file))
+    except (TypeError, ValueError, KeyError) as error:
+        raise G22Blocked("G22_FORMAL_REGISTRY_RESOLVED_CONFIG_INVALID") from error
+    if resolved_config.get("config_hash") != indexed_config.config_hash or resolved_config.get("full_hash") != indexed_config.full_hash:
+        raise G22Blocked("G22_FORMAL_REGISTRY_RESOLVED_CONFIG_HASH_INVALID")
+    rows = index.get("cells")
+    if not isinstance(rows, list) or len(rows) != 6 or not isinstance(index.get("source_artifact_refs"), list):
+        raise G22Blocked("G22_FORMAL_REGISTRY_INDEX_CELLS_INVALID")
+    expected_checkpoints = list(manifest.checkpoints)
+    expected_refs: list[str] = []
+    result: list[dict[str, JSONValue]] = []
+    for checkpoint, raw in zip(expected_checkpoints, rows, strict=True):
+        if not isinstance(raw, Mapping) or set(raw) != {"cell_id", "manifest_ref", "manifest_sha256", "manifest_size_bytes", "registry_hash"}:
+            raise G22Blocked("G22_FORMAL_REGISTRY_CELL_FIELDS_INVALID")
+        cell_id = f"{checkpoint.model_id}:{checkpoint.training_stage}"
+        if raw.get("cell_id") != cell_id or raw.get("registry_hash") != checkpoint.parameter_registry_hash:
+            raise G22Blocked("G22_FORMAL_REGISTRY_CELL_BINDING_INVALID")
+        binding = bindings.get(checkpoint.checkpoint_id)
+        if binding is None or binding.get("cell_id") != cell_id or binding.get("registry_hash") != raw.get("registry_hash"):
+            raise G22Blocked("G22_FORMAL_REGISTRY_AMENDMENT_CROSS_BIND_INVALID")
+        ref = raw.get("manifest_ref")
+        sha = raw.get("manifest_sha256")
+        if not isinstance(ref, str) or not isinstance(sha, str) or not isinstance(raw.get("manifest_size_bytes"), int):
+            raise G22Blocked("G22_FORMAL_REGISTRY_MANIFEST_REF_INVALID")
+        value = _load_hashed(root, ref, sha)
+        manifest_path = _resolve(root, ref)
+        manifest_size, _ = _sha256(manifest_path)
+        if manifest_size != raw["manifest_size_bytes"]:
+            raise G22Blocked("G22_FORMAL_REGISTRY_MANIFEST_SIZE_INVALID")
+        required_manifest = {
+            "actual_files", "actual_manifest", "asset_resolution_hash", "cell", "checkpoint",
+            "eligible_parameter_count", "eligible_parameter_numel", "manifest_hash", "model",
+            "parameter_count", "parameter_mapping", "parameter_names", "parameter_numel",
+            "parameter_order", "producer", "registry", "registry_hash", "resolved_config",
+            "schema_version", "scope", "task_id",
+        }
+        if set(value) != required_manifest or value.get("schema_version") != "stage2-parameter-registry-manifest-v1" or value.get("task_id") != TASK_ID or value.get("scope") != "formal" or value.get("asset_resolution_hash") != manifest.digest:
+            raise G22Blocked("G22_FORMAL_REGISTRY_MANIFEST_SCHEMA_INVALID")
+        manifest_body = dict(value)
+        declared_manifest_hash = manifest_body.pop("manifest_hash")
+        if not isinstance(declared_manifest_hash, str) or canonical_json_hash(manifest_body) != declared_manifest_hash:
+            raise G22Blocked("G22_FORMAL_REGISTRY_MANIFEST_HASH_INVALID")
+        cell = value.get("cell")
+        model = value.get("model")
+        checkpoint_value = value.get("checkpoint")
+        if cell != {"cell_id": cell_id, "model_id": checkpoint.model_id, "training_stage": checkpoint.training_stage, "training_step": checkpoint.training_step} or model != {"model_id": checkpoint.model_id, "repository": checkpoint.repository} or checkpoint_value != {"checkpoint_id": checkpoint.checkpoint_id, "revision": checkpoint.revision, "root_ref": checkpoint.root_ref, "training_step": checkpoint.training_step}:
+            raise G22Blocked("G22_FORMAL_REGISTRY_MANIFEST_CHECKPOINT_BINDING_INVALID")
+        if value.get("registry_hash") != raw.get("registry_hash"):
+            raise G22Blocked("G22_FORMAL_REGISTRY_MANIFEST_REGISTRY_HASH_INVALID")
+        try:
+            registry = ParameterRegistry.from_manifest(value["registry"])
+        except (RegistryError, TypeError, ValueError) as error:
+            raise G22Blocked("G22_FORMAL_REGISTRY_MANIFEST_REGISTRY_INVALID") from error
+        if registry.coordinate_registry_hash != raw.get("registry_hash") or value.get("parameter_count") != len(registry) or value.get("parameter_numel") != sum(item.numel for item in registry):
+            raise G22Blocked("G22_FORMAL_REGISTRY_MANIFEST_REGISTRY_CROSS_BIND_INVALID")
+        expected_refs.append(ref)
+        result.append({"ref": ref, "sha256": sha, "size_bytes": raw["manifest_size_bytes"], "cell_id": cell_id, "registry_hash": str(raw["registry_hash"])})
+    if index["source_artifact_refs"] != expected_refs:
+        raise G22Blocked("G22_FORMAL_REGISTRY_SOURCE_REFS_INVALID")
+    return result
+
+
+def _cross_bind_offline_registry_hash(
+    checkpoint_id: str,
+    materialized_registry_hash: str | None,
+    offline_provider_hash: object,
+    bindings: Mapping[str, Mapping[str, str]],
+) -> tuple[str, str]:
+    """Return the explicit provider-derived -> materialized hash binding."""
+    binding = bindings.get(checkpoint_id)
+    if binding is None or binding.get("registry_hash") != materialized_registry_hash:
+        raise G22Blocked("G22_OFFLINE_REGISTRY_MATERIALIZED_HASH_INVALID")
+    provider_hash = binding.get("provider_derived_registry_hash")
+    if not isinstance(provider_hash, str) or offline_provider_hash != provider_hash:
+        raise G22Blocked("G22_OFFLINE_PROVIDER_REGISTRY_HASH_CROSS_BIND_INVALID")
+    return provider_hash, str(binding["registry_hash"])
+
+
+def _validate_offline(
+    root: Path,
+    manifest: AssetResolutionManifest,
+    registry_bindings: Mapping[str, Mapping[str, str]],
+) -> list[dict[str, JSONValue]]:
     result: list[dict[str, JSONValue]] = []
     expected_pairs = {(model, stage): pair for (model, stage), pair in FORMAL_CHECKPOINT_SELECTION.items()}
     for item in manifest.checkpoints:
@@ -325,8 +551,12 @@ def _validate_offline(root: Path, manifest: AssetResolutionManifest) -> list[dic
             or value["tokenizer_sha256"] != tokenizer_file.sha256
         ):
             raise G22Blocked("G22_OFFLINE_CONFIG_TOKENIZER_CROSS_BIND_INVALID")
-        if item.parameter_registry_hash != value["parameter_registry_hash"]:
-            raise G22Blocked("G22_OFFLINE_REGISTRY_CROSS_BIND_INVALID")
+        provider_hash, materialized_hash = _cross_bind_offline_registry_hash(
+            item.checkpoint_id,
+            item.parameter_registry_hash,
+            value["parameter_registry_hash"],
+            registry_bindings,
+        )
         for field in ("model_state_hash", "parameter_registry_hash", "config_sha256", "tokenizer_sha256"):
             if not isinstance(value[field], str) or not _HEX64.fullmatch(value[field]):
                 raise G22Blocked(f"G22_OFFLINE_LOAD_DIGEST_INVALID:{field}")
@@ -337,7 +567,7 @@ def _validate_offline(root: Path, manifest: AssetResolutionManifest) -> list[dic
         backward = value["backward_smoke"]
         if not isinstance(forward, Mapping) or not isinstance(backward, Mapping) or forward.get("finite") is not True or backward.get("finite") is not True or forward.get("logits_shape") != [1, 8, 50304] or forward.get("sample_id") != 0:
             raise G22Blocked("G22_OFFLINE_LOAD_SMOKE_INVALID")
-        result.append({"ref": item.load_evidence_ref, "sha256": item.load_evidence_sha256, "model": item.model_id, "stage": item.training_stage, "step": item.training_step, "registry_hash": value["parameter_registry_hash"]})
+        result.append({"ref": item.load_evidence_ref, "sha256": item.load_evidence_sha256, "model": item.model_id, "stage": item.training_stage, "step": item.training_step, "provider_derived_registry_hash": provider_hash, "registry_hash": materialized_hash})
     if len(result) != 6 or len({item["ref"] for item in result}) != 6:
         raise G22Blocked("G22_OFFLINE_LOAD_COUNT_INVALID")
     by_model: dict[str, set[str]] = {}
@@ -348,7 +578,11 @@ def _validate_offline(root: Path, manifest: AssetResolutionManifest) -> list[dic
     return result
 
 
-def _validate_real_assets(root: Path) -> dict[str, JSONValue]:
+def _validate_real_assets(
+    root: Path,
+    *,
+    asset_payload: Mapping[str, object] | None = None,
+) -> dict[str, JSONValue]:
     evidence = _load_hashed(root, AUTHORITY_EVIDENCE_REF, AUTHORITY_EVIDENCE_SHA256)
     expected_evidence = {"active_partial_objects_untouched", "asset_resolution_hash", "asset_resolution_ref", "checkpoint_count", "combination_smoke", "consumer_commit", "cuda_device_excluded", "data_range_hash", "data_range_ref", "execution_commit", "failed_attempts", "gate_id", "offline_load_count", "producer_commit", "schema_version", "status"}
     attempts = evidence["failed_attempts"]
@@ -376,9 +610,15 @@ def _validate_real_assets(root: Path) -> dict[str, JSONValue]:
     observed_rows = [(row.get("model_id"), row.get("training_stage"), row.get("training_step"), row.get("revision")) for row in rows if isinstance(row, Mapping)]
     if observed_rows != expected_rows:
         raise G22Blocked("G22_SELECTION_IDENTITY_DRIFT")
-    offline = _validate_offline(root, asset)
+    materialized, registry_bindings, amendment = _validate_amendment(root, asset)
+    if asset_payload is None or asset_payload.get("stage2_asset_manifest") != materialized.to_dict():
+        raise G22Blocked("G22_S203_ASSET_PAYLOAD_NOT_AMENDMENT_MATERIALIZED")
+    if materialized.data_range != data or materialized.data_range.digest != DATA_DIGEST:
+        raise G22Blocked("G22_AMENDMENT_DATA_RANGE_CROSS_BIND_INVALID")
+    registry_manifests = _validate_formal_registry_index(root, materialized, registry_bindings)
+    offline = _validate_offline(root, materialized, registry_bindings)
     model_manifests: list[dict[str, JSONValue]] = []
-    for checkpoint in asset.checkpoints:
+    for checkpoint in materialized.checkpoints:
         if checkpoint.manifest_ref is None or checkpoint.manifest_sha256 is None or checkpoint.revision is None or checkpoint.state != "ready":
             raise G22Blocked("G22_CHECKPOINT_MANIFEST_INCOMPLETE")
         manifest_path = _resolve(root, checkpoint.manifest_ref)
@@ -427,16 +667,36 @@ def _validate_real_assets(root: Path) -> dict[str, JSONValue]:
                 raise G22Blocked("G22_CHECKPOINT_FILE_BYTES_MISMATCH")
         model_manifests.append({"ref": checkpoint.manifest_ref, "sha256": checkpoint.manifest_sha256, "size_bytes": size})
     data_root = root / "datasets" / "pile-deduped-pythia-preshuffled"
-    for item in data.files:
+    for item in materialized.data_range.files:
         actual = _resolve(data_root, item.path)
         observed_size, observed_sha = _sha256(actual)
         if (observed_size, observed_sha) != (item.size_bytes, item.sha256):
             raise G22Blocked("G22_DATA_FILE_BYTES_MISMATCH")
-    prefix = _resolve(root, data.manifest_ref)
+    prefix = _resolve(root, materialized.data_range.manifest_ref)
     psize, psha = _sha256(prefix)
     if psha != data.manifest_sha256:
         raise G22Blocked("G22_DATA_PREFIX_MANIFEST_MISMATCH")
-    return {"evidence_ref": AUTHORITY_EVIDENCE_REF, "evidence_sha256": AUTHORITY_EVIDENCE_SHA256, "asset_ref": ASSET_REF, "asset_sha256": ASSET_SHA256, "asset_digest": asset.digest, "data_ref": DATA_REF, "data_sha256": DATA_SHA256, "data_digest": data.digest, "selection_ref": SELECTION_REF, "selection_sha256": SELECTION_SHA256, "offline_loads": offline, "model_manifests": model_manifests}
+    return {
+        "evidence_ref": AUTHORITY_EVIDENCE_REF,
+        "evidence_sha256": AUTHORITY_EVIDENCE_SHA256,
+        "parent_asset_ref": ASSET_REF,
+        "parent_asset_sha256": ASSET_SHA256,
+        "parent_asset_digest": asset.digest,
+        "asset_ref": AMENDMENT_REF,
+        "asset_sha256": AMENDMENT_SHA256,
+        "asset_digest": materialized.digest,
+        "data_ref": DATA_REF,
+        "data_sha256": DATA_SHA256,
+        "data_digest": data.digest,
+        "selection_ref": SELECTION_REF,
+        "selection_sha256": SELECTION_SHA256,
+        "amendment": amendment,
+        "registry_index_ref": REGISTRY_INDEX_REF,
+        "registry_index_sha256": REGISTRY_INDEX_SHA256,
+        "registry_manifests": registry_manifests,
+        "offline_loads": offline,
+        "model_manifests": model_manifests,
+    }
 
 
 def _config(root: Path, ref: str, expected_hash: str) -> ResolvedConfigV2:
@@ -457,7 +717,7 @@ def _gate(
     refs: Sequence[str],
     reasons: Sequence[str] = (),
 ) -> GateRecord:
-    return GateRecord(gate_id=GATE_ID, stage=2, status=status, checked_at=checked_at, measured=dict(measured), threshold={"authority_status": "PASS", "asset_resolution_hash": ASSET_DIGEST, "data_range_hash": DATA_DIGEST, "checkpoint_count": 6, "offline_load_count": 6, "formal_task_artifacts": list(ARTIFACT_KINDS)}, evidence_refs=tuple(refs), reasons=tuple(reasons))
+    return GateRecord(gate_id=GATE_ID, stage=2, status=status, checked_at=checked_at, measured=dict(measured), threshold={"authority_status": "PASS", "asset_resolution_hash": AMENDMENT_ASSET_DIGEST, "data_range_hash": DATA_DIGEST, "checkpoint_count": 6, "offline_load_count": 6, "formal_task_artifacts": list(ARTIFACT_KINDS)}, evidence_refs=tuple(refs), reasons=tuple(reasons))
 
 
 def evaluate_formal_g22(
@@ -490,7 +750,7 @@ def evaluate_formal_g22(
             if any(offline_load_refs[key] != key for key in OFFLINE_SHA256):
                 raise G22Blocked("G22_OFFLINE_REF_ALIAS_REJECTED")
         if manifest_refs is not None:
-            expected_refs = {"asset_resolution": ASSET_REF, "data_range": DATA_REF, "selection": SELECTION_REF}
+            expected_refs = {"asset_resolution": AMENDMENT_REF, "data_range": DATA_REF, "selection": SELECTION_REF}
             if dict(manifest_refs) != expected_refs:
                 raise G22Blocked("G22_MANIFEST_REF_SET_NOT_CANONICAL")
         loaded, config_hash = _validate_task_inputs(data, s203_artifact_refs)
@@ -513,12 +773,38 @@ def evaluate_formal_g22(
             {kind: item.payload for kind, item in loaded.items()}
         )
         repo_identity = _git_identity(repository)
-        producer = _producer_identity(repository, PRODUCER_COMMIT)
-        assets = _validate_real_assets(data)
+        # The old G2.2 authority remains bound to its historical 676ab
+        # producer, but the current TaskRuntime consumer must identify the
+        # clean repository HEAD that produced these task artifacts.
+        producer = _producer_identity(repository, str(repo_identity["head"]))
+        assets = _validate_real_assets(
+            data,
+            asset_payload=loaded["asset_resolution"].payload,
+        )
         orchestration = config.section("orchestration")
         assert isinstance(orchestration, Mapping)
         source_refs = tuple(str(ref) for ref in orchestration["input_result_refs"])
-        evidence_refs = tuple(s203_artifact_refs[k] for k in ARTIFACT_KINDS) + (AUTHORITY_EVIDENCE_REF, ASSET_REF, DATA_REF, SELECTION_REF) + tuple(item["ref"] for item in assets["offline_loads"])
+        qualification_index = assets["amendment"]["qualification_index"]
+        assert isinstance(qualification_index, Mapping)
+        qualification_refs = assets["amendment"]["qualification_refs"]
+        assert isinstance(qualification_refs, list)
+        registry_manifests = assets["registry_manifests"]
+        assert isinstance(registry_manifests, list)
+        evidence_refs = tuple(dict.fromkeys(
+            tuple(s203_artifact_refs[k] for k in ARTIFACT_KINDS)
+            + (
+                AUTHORITY_EVIDENCE_REF,
+                ASSET_REF,
+                AMENDMENT_REF,
+                str(qualification_index["ref"]),
+                *(str(ref) for ref in qualification_refs),
+                REGISTRY_INDEX_REF,
+                *(str(item["ref"]) for item in registry_manifests),
+                DATA_REF,
+                SELECTION_REF,
+            )
+            + tuple(str(item["ref"]) for item in assets["offline_loads"])
+        ))
         measured: dict[str, JSONValue] = {"adapter_schema_version": ADAPTER_SCHEMA_VERSION, "task_id": TASK_ID, "config": {"ref": resolved_config_ref, "config_hash": config.config_hash, "full_hash": config.full_hash, "run_intent": config.run_intent, "formal_eligible": config.formal_eligible}, "roots": {"repository_root": str(repository), "data_root": str(data)}, "repository": repo_identity, "producer": producer, "authority": assets, "lineage": {"upstream_binding_hash": upstream_binding_hash, "preregistration_contract_hash": preregistration_hash, "source_refs": list(source_refs)}, "sampling_replay": replay, "runtime": {"runtime": "TaskRuntime", "formal_envelope": "load_committed_task_artifact", "store": "TaskArtifactStore", "gate_schema": "gate-record-v1"}, "input_artifacts": {kind: {"commit_ref": loaded[kind].identity.commit_ref, "artifact_hash": loaded[kind].identity.artifact_hash} for kind in ARTIFACT_KINDS}}
         gate = _gate(status=GateStatus.PASS, checked_at=checked_at, measured=measured, refs=evidence_refs)
         store = TaskArtifactStore(data, configured_output_dir)
