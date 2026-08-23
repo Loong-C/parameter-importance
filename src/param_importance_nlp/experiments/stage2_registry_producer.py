@@ -668,7 +668,17 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--output-root", required=True, type=Path)
     parser.add_argument("--source-root", type=Path)
     args = parser.parse_args(argv)
-    asset = load_canonical_json(args.asset_resolution)
+    # An amendment is an append-only envelope; validate its parent, evidence,
+    # and materialized v1 manifest before the existing formal producer sees it.
+    # Import lazily so the qualification module can reuse this module's exact
+    # provider construction path without creating an import cycle.
+    from .stage2_registry_qualification import load_asset_resolution_input
+
+    asset = load_asset_resolution_input(
+        args.asset_resolution,
+        root=args.manifest_root or args.data_root,
+        data_root=args.data_root,
+    )
     config = load_canonical_json(args.resolved_config)
     if not isinstance(asset, Mapping) or not isinstance(config, Mapping):
         raise RegistryProducerError("S203_REGISTRY_CLI_INPUT_NOT_OBJECT")
