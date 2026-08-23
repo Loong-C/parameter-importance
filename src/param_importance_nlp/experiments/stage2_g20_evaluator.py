@@ -816,7 +816,10 @@ def _output_logical_dir(data_root: Path, output_dir: str | Path) -> str:
             raise G20Blocked("output_dir:PATH_ESCAPE")
         value = logical.as_posix()
     else:
-        value = _logical_path(str(output_dir), "output_dir")
+        if isinstance(output_dir, Path):
+            value = _logical_path(PurePosixPath(*candidate.parts).as_posix(), "output_dir")
+        else:
+            value = _logical_path(str(output_dir), "output_dir")
     _reject_symlink_chain(data_root, value, "output_dir")
     return value
 
