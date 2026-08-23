@@ -86,6 +86,14 @@ _LEGACY_31M_MANIFEST_REFS: Final = (
     "manifests/pythia-31m-deduped-step0.json",
 )
 _FORMAL_31M_MANIFEST_REF: Final = "manifests/model/pythia-31m.json"
+_REPAIR_31M_FIELDS: Final = frozenset(
+    {
+        "repair_evidence_ref",
+        "repair_evidence_sha256",
+        "canonical_sha256",
+        "canonical_size_bytes",
+    }
+)
 _EXPECTED_GATE_MATRIX: Final = {
     "stage0.G3-S1": {
         "model_names": ["pythia-14m-step0"],
@@ -252,10 +260,15 @@ def _validate_model(value: Any, *, index: int) -> dict[str, Any]:
             "condition",
             "replacement_manifest_ref",
         }
-        if set(legacy) != required_legacy_fields:
+        legacy_fields = set(legacy)
+        if legacy_fields not in (
+            required_legacy_fields,
+            required_legacy_fields | _REPAIR_31M_FIELDS,
+        ):
             raise AssetRequirementsError(
                 f"models[{index}].legacy_manifest_diagnostic fields must be "
-                f"{sorted(required_legacy_fields)}"
+                f"{sorted(required_legacy_fields)} or "
+                f"{sorted(required_legacy_fields | _REPAIR_31M_FIELDS)}"
             )
         refs = _list(
             legacy["refs"],
@@ -295,6 +308,42 @@ def _validate_model(value: Any, *, index: int) -> dict[str, Any]:
         )
         if replacement_ref != _FORMAL_31M_MANIFEST_REF or replacement_ref in refs:
             raise AssetRequirementsError("31M replacement manifest reference drifted")
+        if legacy_fields == required_legacy_fields | _REPAIR_31M_FIELDS:
+            repair_ref = validate_asset_path(
+                _text(
+                    legacy["repair_evidence_ref"],
+                    field=(
+                        f"models[{index}].legacy_manifest_diagnostic"
+                        ".repair_evidence_ref"
+                    ),
+                )
+            )
+            if not repair_ref.startswith("manifests/"):
+                raise AssetRequirementsError(
+                    "31M repair evidence must be a manifest reference"
+                )
+            _digest(
+                legacy["repair_evidence_sha256"],
+                field=(
+                    f"models[{index}].legacy_manifest_diagnostic"
+                    ".repair_evidence_sha256"
+                ),
+            )
+            _digest(
+                legacy["canonical_sha256"],
+                field=(
+                    f"models[{index}].legacy_manifest_diagnostic"
+                    ".canonical_sha256"
+                ),
+            )
+            _integer(
+                legacy["canonical_size_bytes"],
+                field=(
+                    f"models[{index}].legacy_manifest_diagnostic"
+                    ".canonical_size_bytes"
+                ),
+                minimum=1,
+            )
     elif "legacy_manifest_diagnostic" in model:
         raise AssetRequirementsError(
             "legacy manifest diagnostic is only valid for the 31M model"

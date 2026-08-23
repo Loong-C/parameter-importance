@@ -320,7 +320,13 @@ def load_legacy_model_manifest_diagnostic(
     data_root: str | Path,
     requirement: Mapping[str, Any],
 ) -> dict[str, Any]:
-    """Verify the two immutable BOM-prefixed 31M legacy manifest copies."""
+    """Verify the 31M legacy manifest identity and any append-only repair.
+
+    The original v1 diagnostic intentionally remains a BOM rejection check.
+    A repaired v2 diagnostic is a separate, fail-closed branch: both old
+    references must now contain the exact canonical payload and an external
+    repair evidence artifact must account for the atomic replacement.
+    """
 
     root = _approved_data_root(data_root)
     diagnostic = requirement.get("legacy_manifest_diagnostic")
@@ -338,6 +344,27 @@ def load_legacy_model_manifest_diagnostic(
         ) from error
     if not isinstance(refs, list) or len(refs) != 2:
         raise G3GateAggregationError("LEGACY_MODEL_MANIFEST_REFS_INVALID")
+    if condition != "utf8_bom_strict_json_rejected" or replacement_ref in refs:
+        raise G3GateAggregationError("LEGACY_MODEL_MANIFEST_CONDITION_INVALID")
+
+    repair_fields = {
+        "repair_evidence_ref",
+        "repair_evidence_sha256",
+        "canonical_sha256",
+        "canonical_size_bytes",
+    }
+    if repair_fields.issubset(diagnostic):
+        return _load_repaired_legacy_model_manifest_diagnostic(
+            root,
+            refs=refs,
+            original_size_bytes=size_bytes,
+            original_sha256=digest,
+            replacement_ref=replacement_ref,
+            diagnostic=diagnostic,
+        )
+    if any(field in diagnostic for field in repair_fields):
+        raise G3GateAggregationError("LEGACY_MODEL_MANIFEST_REPAIR_INCOMPLETE")
+
     payloads: list[bytes] = []
     for reference in refs:
         path = _resolve_data_root_ref(root, reference, directory=False)
@@ -358,20 +385,178 @@ def load_legacy_model_manifest_diagnostic(
         raise G3GateAggregationError(
             "LEGACY_MODEL_MANIFEST_STRICT_JSON_NOT_REJECTED"
         )
-    # Prove the diagnostic is a valid legacy JSON document whose only accepted
-    # compatibility exception is the already-observed UTF-8 BOM.
     ensure_json_object(
         loads_strict_json(raw, allow_bom=True),
         field="31M legacy model manifest",
     )
-    if condition != "utf8_bom_strict_json_rejected" or replacement_ref in refs:
-        raise G3GateAggregationError("LEGACY_MODEL_MANIFEST_CONDITION_INVALID")
     return {
         "refs": list(refs),
         "size_bytes": size_bytes,
         "sha256": digest,
         "condition": condition,
         "replacement_manifest_ref": replacement_ref,
+    }
+
+
+def _load_repaired_legacy_model_manifest_diagnostic(
+    root: Path,
+    *,
+    refs: list[Any],
+    original_size_bytes: int,
+    original_sha256: str,
+    replacement_ref: str,
+    diagnostic: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Validate canonicalized legacy refs and their S2.3 repair evidence."""
+
+    canonical_sha256 = diagnostic["canonical_sha256"]
+    canonical_size_bytes = diagnostic["canonical_size_bytes"]
+    repair_ref = validate_asset_path(diagnostic["repair_evidence_ref"])
+    repair_sha256 = diagnostic["repair_evidence_sha256"]
+    if (
+        not isinstance(canonical_sha256, str)
+        or not isinstance(repair_sha256, str)
+        or not isinstance(canonical_size_bytes, int)
+        or isinstance(canonical_size_bytes, bool)
+        or canonical_size_bytes < 1
+    ):
+        raise G3GateAggregationError("LEGACY_MODEL_MANIFEST_REPAIR_REQUIREMENT_INVALID")
+
+    canonical_values: list[dict[str, Any]] = []
+    for reference in refs:
+        path = _resolve_data_root_ref(root, reference, directory=False)
+        raw = path.read_bytes()
+        if raw.startswith(b"\xef\xbb\xbf"):
+            raise G3GateAggregationError("LEGACY_MODEL_MANIFEST_BOM_PRESENT_AFTER_REPAIR")
+        if (
+            len(raw) != canonical_size_bytes
+            or hashlib.sha256(raw).hexdigest() != canonical_sha256
+        ):
+            raise G3GateAggregationError("LEGACY_MODEL_MANIFEST_CANONICAL_HASH_MISMATCH")
+        try:
+            value = dict(
+                ensure_json_object(
+                    loads_strict_json(raw),
+                    field="canonical 31M model manifest",
+                )
+            )
+        except (CanonicalJSONError, TypeError, ValueError) as error:
+            raise G3GateAggregationError(
+                "LEGACY_MODEL_MANIFEST_CANONICAL_JSON_INVALID"
+            ) from error
+        if raw != canonical_json_bytes(value):
+            raise G3GateAggregationError(
+                "LEGACY_MODEL_MANIFEST_CANONICAL_JSON_NOT_CANONICAL"
+            )
+        if value.get("schema_version") != "parameter-importance-model-manifest-v1":
+            raise G3GateAggregationError(
+                "LEGACY_MODEL_MANIFEST_CANONICAL_SCHEMA_INVALID"
+            )
+        canonical_values.append(value)
+    if canonical_values[0] != canonical_values[1]:
+        raise G3GateAggregationError("LEGACY_MODEL_MANIFEST_COPIES_DIFFER")
+
+    try:
+        evidence_path = _resolve_data_root_ref(root, repair_ref, directory=False)
+    except FileNotFoundError as error:
+        raise G3GateAggregationError(
+            "LEGACY_MODEL_MANIFEST_REPAIR_EVIDENCE_MISSING"
+        ) from error
+    evidence_raw = evidence_path.read_bytes()
+    if evidence_raw.startswith(b"\xef\xbb\xbf"):
+        raise G3GateAggregationError("LEGACY_MODEL_MANIFEST_REPAIR_EVIDENCE_BOM")
+    if hashlib.sha256(evidence_raw).hexdigest() != repair_sha256:
+        raise G3GateAggregationError("LEGACY_MODEL_MANIFEST_REPAIR_EVIDENCE_HASH_MISMATCH")
+    try:
+        evidence = dict(
+            ensure_json_object(
+                loads_strict_json(evidence_raw),
+                field="31M manifest repair evidence",
+            )
+        )
+    except (CanonicalJSONError, TypeError, ValueError) as error:
+        raise G3GateAggregationError(
+            "LEGACY_MODEL_MANIFEST_REPAIR_EVIDENCE_INVALID"
+        ) from error
+    if evidence_raw != canonical_json_bytes(evidence):
+        raise G3GateAggregationError(
+            "LEGACY_MODEL_MANIFEST_REPAIR_EVIDENCE_NOT_CANONICAL"
+        )
+
+    required = {
+        "targets",
+        "original_sha256",
+        "canonical_sha256",
+        "original_size_bytes",
+        "canonical_size_bytes",
+        "replaced_atomically",
+        "weights_touched",
+        "active_part_or_lock_touched",
+        "pile_objects_touched",
+    }
+    if not required.issubset(evidence):
+        raise G3GateAggregationError("LEGACY_MODEL_MANIFEST_REPAIR_EVIDENCE_INCOMPLETE")
+    if (
+        not isinstance(evidence["targets"], list)
+        or len(evidence["targets"]) != 2
+        or any(not isinstance(item, str) for item in evidence["targets"])
+        or any(
+            not isinstance(evidence[field], str)
+            or len(evidence[field]) != 64
+            or any(character not in "0123456789abcdef" for character in evidence[field])
+            for field in ("original_sha256", "canonical_sha256")
+        )
+        or any(
+            isinstance(evidence[field], bool)
+            or not isinstance(evidence[field], int)
+            or evidence[field] < 1
+            for field in ("original_size_bytes", "canonical_size_bytes")
+        )
+        or any(
+            not isinstance(evidence[field], bool)
+            for field in (
+                "replaced_atomically",
+                "weights_touched",
+                "active_part_or_lock_touched",
+                "pile_objects_touched",
+            )
+        )
+    ):
+        raise G3GateAggregationError("LEGACY_MODEL_MANIFEST_REPAIR_EVIDENCE_INVALID")
+    if evidence["targets"] != list(refs):
+        raise G3GateAggregationError("LEGACY_MODEL_MANIFEST_REPAIR_TARGETS_MISMATCH")
+    if (
+        evidence["original_sha256"] != original_sha256
+        or evidence["original_size_bytes"] != original_size_bytes
+        or evidence["canonical_sha256"] != canonical_sha256
+        or evidence["canonical_size_bytes"] != canonical_size_bytes
+    ):
+        raise G3GateAggregationError("LEGACY_MODEL_MANIFEST_REPAIR_IDENTITY_MISMATCH")
+    if (
+        evidence["replaced_atomically"] is not True
+        or evidence["weights_touched"] is not False
+        or evidence["active_part_or_lock_touched"] is not False
+        or evidence["pile_objects_touched"] is not False
+    ):
+        raise G3GateAggregationError("LEGACY_MODEL_MANIFEST_REPAIR_SAFETY_FLAGS_INVALID")
+    if evidence.get("original_encoding", "utf-8-bom") != "utf-8-bom":
+        raise G3GateAggregationError("LEGACY_MODEL_MANIFEST_REPAIR_ENCODING_INVALID")
+    if evidence.get("canonical_encoding", "utf-8") != "utf-8":
+        raise G3GateAggregationError("LEGACY_MODEL_MANIFEST_REPAIR_ENCODING_INVALID")
+    if "artifact_hash" in evidence and evidence["artifact_hash"] != canonical_json_hash(
+        {key: value for key, value in evidence.items() if key != "artifact_hash"}
+    ):
+        raise G3GateAggregationError("LEGACY_MODEL_MANIFEST_REPAIR_EVIDENCE_ARTIFACT_HASH_MISMATCH")
+    return {
+        "refs": list(refs),
+        "size_bytes": original_size_bytes,
+        "sha256": original_sha256,
+        "condition": "utf8_bom_strict_json_rejected",
+        "replacement_manifest_ref": replacement_ref,
+        "repair_evidence_ref": repair_ref,
+        "repair_evidence_sha256": repair_sha256,
+        "canonical_sha256": canonical_sha256,
+        "canonical_size_bytes": canonical_size_bytes,
     }
 
 
@@ -672,7 +857,12 @@ def _requirement_control_evidence_refs(
     if kind == "pile":
         return (requirement["reference_reader_oracle"]["artifact_ref"],)
     if kind == "model" and "legacy_manifest_diagnostic" in requirement:
-        return tuple(requirement["legacy_manifest_diagnostic"]["refs"])
+        diagnostic = requirement["legacy_manifest_diagnostic"]
+        refs = list(diagnostic["refs"])
+        repair_ref = diagnostic.get("repair_evidence_ref")
+        if repair_ref is not None:
+            refs.append(repair_ref)
+        return tuple(refs)
     return ()
 
 

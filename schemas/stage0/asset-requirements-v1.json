@@ -177,7 +177,11 @@
             "size_bytes": {"type": "integer", "minimum": 1},
             "sha256": {"$ref": "#/$defs/sha256"},
             "condition": {"const": "utf8_bom_strict_json_rejected"},
-            "replacement_manifest_ref": {"const": "manifests/model/pythia-31m.json"}
+            "replacement_manifest_ref": {"const": "manifests/model/pythia-31m.json"},
+            "repair_evidence_ref": {"$ref": "#/$defs/relativePath"},
+            "repair_evidence_sha256": {"$ref": "#/$defs/sha256"},
+            "canonical_sha256": {"$ref": "#/$defs/sha256"},
+            "canonical_size_bytes": {"type": "integer", "minimum": 1}
           }
         }
       }
