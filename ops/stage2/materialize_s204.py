@@ -2663,7 +2663,16 @@ def _load_authoritative_g21(
     smoke_ref = _source_ref(smoke.get("ref"), "g21_handoff.current_gpu_smoke.ref")
     report_sha = _sha(smoke.get("sha256"), "g21_current_gpu_smoke.sha256")
     _assert_source_file(root, smoke_ref, "g21_current_gpu_smoke", sha256=report_sha)
-    report = _load_mapping(root, smoke_ref, "g21_current_gpu_smoke")
+    # The dated external G2.1 handoff is a custom adapter envelope.  Its raw
+    # smoke report is hash-bound above, but historical reports are valid JSON
+    # that is not emitted by the repository canonical serializer.  Keep the
+    # canonical loader strict everywhere else and parse only this already
+    # hash-verified external report directly.
+    report_path = _safe_relative(root, smoke_ref, "g21_current_gpu_smoke")
+    try:
+        report = _mapping(json.loads(report_path.read_text(encoding="utf-8")), "g21_current_gpu_smoke")
+    except (OSError, UnicodeError, TypeError, ValueError) as error:
+        raise _error("SOURCE_UNREADABLE", f"g21_current_gpu_smoke:{smoke_ref}") from error
     if report.get("schema_version") != "stage2-s202-current-gpu-smoke-v1" or report.get("status") != "PASS":
         raise _error("GPU_SMOKE_REPORT_INVALID", smoke_ref)
     if report.get("excluded_pci_bus_ids") != [EXCLUDED_PCI]:

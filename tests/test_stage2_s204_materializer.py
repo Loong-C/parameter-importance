@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 import hashlib
 from types import SimpleNamespace
@@ -21,6 +22,7 @@ from ops.stage2.materialize_s204 import (
     write_six_cell_configs,
     _load_gpu_health_identity,
     _gpu_health_binding_payload,
+    EXCLUDED_UUID,
     _load_parameter_registry_artifact,
     _publish_authoritative_asset_manifest,
     publish_per_cell_delta_sci,
@@ -423,6 +425,108 @@ def test_gpu_identity_reloads_raw_smoke_and_rejects_mapping_drift(tmp_path: Path
     write_canonical_json(report_path, report)
     with pytest.raises(S204MaterializationError, match="S204_GPU_HEALTH_EVIDENCE_INVALID"):
         _load_gpu_health_identity(tmp_path, handoff_ref)
+
+
+def _write_custom_g21_handoff_with_raw_report(
+    root: Path,
+    *,
+    report: dict[str, object],
+) -> tuple[str, str, str]:
+    report_ref = "evidence/g21/current-gpu-smoke/report.json"
+    report_path = root / report_ref
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    report_path.write_text(
+        json.dumps(report, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    stage1_ref = "evidence/stage1/g1-index.json"
+    handoff = {
+        "schema_version": "stage2-s2.2-g2.1-handoff-evidence-v1",
+        "status": "PASS",
+        "task_id": "stage2.02_stage1_handoff_and_fixed_state_contract",
+        "stage1_g1_exit": {
+            "ref": stage1_ref,
+            "index_ref": stage1_ref,
+            "index_artifact_hash": "a" * 64,
+        },
+        "current_gpu_smoke": {
+            "ref": report_ref,
+            "sha256": hashlib.sha256(report_path.read_bytes()).hexdigest(),
+            "schema_version": "stage2-s202-current-gpu-smoke-v1",
+            "status": "PASS",
+            "excluded_pci_bus_ids": [EXCLUDED_PCI],
+            "excluded_scheduled": False,
+            "allowed_devices": [
+                {"pci_bus_id": pci, "uuid": uuid} for pci, uuid in ALLOWED_DEVICES
+            ],
+        },
+    }
+    handoff_ref = "evidence/g21/handoff.json"
+    write_canonical_json(root / handoff_ref, handoff)
+    return handoff_ref, report_ref, stage1_ref
+
+
+def _raw_gpu_smoke_report() -> dict[str, object]:
+    return {
+        "schema_version": "stage2-s202-current-gpu-smoke-v1",
+        "status": "PASS",
+        "excluded_pci_bus_ids": [EXCLUDED_PCI],
+        "excluded_device": {
+            "index": 0,
+            "pci_bus_id": EXCLUDED_PCI,
+            "uuid": EXCLUDED_UUID,
+            "scheduled": False,
+        },
+        "allowed_devices": [
+            {"pci_bus_id": pci, "uuid": uuid} for pci, uuid in ALLOWED_DEVICES
+        ],
+    }
+
+
+def test_gpu_identity_accepts_hash_bound_noncanonical_smoke_report(tmp_path: Path) -> None:
+    handoff_ref, report_ref, stage1_ref = _write_custom_g21_handoff_with_raw_report(
+        tmp_path,
+        report=_raw_gpu_smoke_report(),
+    )
+    report_path = tmp_path / report_ref
+    assert report_path.read_text(encoding="utf-8").endswith("\n")
+    _, allowed = _load_gpu_health_identity(
+        tmp_path,
+        handoff_ref,
+        expected_stage1_ref=stage1_ref,
+    )
+    assert allowed == ALLOWED_DEVICES
+
+
+def test_gpu_identity_rejects_hash_drift_for_noncanonical_smoke_report(tmp_path: Path) -> None:
+    handoff_ref, report_ref, stage1_ref = _write_custom_g21_handoff_with_raw_report(
+        tmp_path,
+        report=_raw_gpu_smoke_report(),
+    )
+    report_path = tmp_path / report_ref
+    report_path.write_text(report_path.read_text(encoding="utf-8") + "\n", encoding="utf-8")
+    with pytest.raises(S204MaterializationError, match="S204_SOURCE_HASH_MISMATCH"):
+        _load_gpu_health_identity(tmp_path, handoff_ref, expected_stage1_ref=stage1_ref)
+
+
+def test_gpu_identity_rejects_field_drift_after_hash_update(tmp_path: Path) -> None:
+    handoff_ref, report_ref, stage1_ref = _write_custom_g21_handoff_with_raw_report(
+        tmp_path,
+        report=_raw_gpu_smoke_report(),
+    )
+    report_path = tmp_path / report_ref
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    report["excluded_device"]["uuid"] = "GPU-wrong"  # type: ignore[index]
+    report_path.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+    handoff_path = tmp_path / handoff_ref
+    handoff = load_canonical_json(handoff_path)
+    handoff["current_gpu_smoke"]["sha256"] = hashlib.sha256(report_path.read_bytes()).hexdigest()  # type: ignore[index]
+    write_canonical_json(handoff_path, handoff)
+    with pytest.raises(
+        S204MaterializationError,
+        match="S204_GPU_SMOKE_REPORT_EXCLUDED_IDENTITY_INVALID",
+    ):
+        _load_gpu_health_identity(tmp_path, handoff_ref, expected_stage1_ref=stage1_ref)
 
 
 def test_gpu_binding_materialization_contains_only_stable_identity() -> None:
