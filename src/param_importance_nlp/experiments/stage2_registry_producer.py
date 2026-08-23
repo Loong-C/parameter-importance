@@ -599,7 +599,12 @@ def produce_registry_manifests(
         if provider.parameter_names != registry.eligible_names:
             raise RegistryProducerError("S203_REGISTRY_PARAMETER_ORDER_DRIFT")
         if checkpoint.parameter_registry_hash is not None and checkpoint.parameter_registry_hash != registry.coordinate_registry_hash:
-            raise RegistryProducerError("S203_REGISTRY_CHECKPOINT_REGISTRY_HASH_MISMATCH")
+            raise RegistryProducerError(
+                "S203_REGISTRY_CHECKPOINT_REGISTRY_HASH_MISMATCH:"
+                f"checkpoint_id={checkpoint.checkpoint_id}:"
+                f"expected={checkpoint.parameter_registry_hash}:"
+                f"observed={registry.coordinate_registry_hash}"
+            )
         payload = _registry_manifest(
             checkpoint=checkpoint,
             registry=registry,
