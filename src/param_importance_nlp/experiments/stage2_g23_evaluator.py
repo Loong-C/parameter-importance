@@ -1769,7 +1769,9 @@ def _bootstrap_interval(
         raise G23Blocked(f"{field}:EMPTY_OR_WEIGHT_MISMATCH")
     parsed = [_finite(value, f"{field}.weight") for value in weights]
     rng = np.random.default_rng(2_304_230)
-    reps = max(512, min(2048, 64 * len(blocks)))
+    # A fixed lower bound keeps the quantile deterministic while avoiding an
+    # unbounded shard reread multiplier for the smallest formal cell.
+    reps = max(128, min(2048, 32 * len(blocks)))
     sampled: list[np.ndarray] = []
     for _ in range(reps):
         indices = rng.integers(0, len(blocks), size=len(blocks))
@@ -1801,7 +1803,7 @@ def _bootstrap_u_diagnostics(
     parsed_b = [_finite(value, "h_ref.weight_b") for value in weights_b]
     rng_a = np.random.default_rng(2_304_231)
     rng_b = np.random.default_rng(2_304_232)
-    reps = max(512, min(2048, 64 * max(len(blocks_a), len(blocks_b))))
+    reps = max(128, min(2048, 32 * max(len(blocks_a), len(blocks_b))))
     model_totals: list[float] = []
     layer_l1: list[float] = []
     module_l1: list[float] = []
@@ -1849,7 +1851,7 @@ def _bootstrap_u_interval(
     if not blocks:
         raise G23Blocked(f"{field}:EMPTY")
     rng = np.random.default_rng(2_304_232)
-    reps = max(512, min(2048, 64 * len(blocks)))
+    reps = max(128, min(2048, 32 * len(blocks)))
     sampled: list[np.ndarray] = []
     for _ in range(reps):
         indices = rng.integers(0, len(blocks), size=len(blocks))
@@ -1877,7 +1879,7 @@ def _bootstrap_independent_cross_interval(
         raise G23Blocked(f"{field}:WEIGHT_MISMATCH")
     rng_a = np.random.default_rng(2_304_240)
     rng_b = np.random.default_rng(2_304_241)
-    reps = max(512, min(2048, 64 * max(len(blocks_a), len(blocks_b))))
+    reps = max(128, min(2048, 32 * max(len(blocks_a), len(blocks_b))))
     rows: list[np.ndarray] = []
     for _ in range(reps):
         ia = rng_a.integers(0, len(blocks_a), size=len(blocks_a))
@@ -1910,7 +1912,7 @@ def _bootstrap_independent_bias_interval(
         raise G23Blocked(f"{field}:WEIGHT_MISMATCH")
     rng_a = np.random.default_rng(2_304_250)
     rng_b = np.random.default_rng(2_304_251)
-    reps = max(512, min(2048, 64 * max(len(blocks_a), len(blocks_b))))
+    reps = max(128, min(2048, 32 * max(len(blocks_a), len(blocks_b))))
     rows: list[np.ndarray] = []
     for _ in range(reps):
         ia = rng_a.integers(0, len(blocks_a), size=len(blocks_a))
