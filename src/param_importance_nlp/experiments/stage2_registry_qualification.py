@@ -137,6 +137,23 @@ def _root(path: str | Path, *, field: str) -> Path:
         raise RegistryQualificationError(str(error)) from error
 
 
+def _resolve_source_root(source_root: str | Path | None) -> Path:
+    """Use the producer's exact source-root contract for Git identity.
+
+    In particular, a detached worktree is an ordinary directory and is
+    accepted; a symlink/reparse root, missing path, or non-directory remains
+    rejected by the shared ``_real_root`` helper.  Keeping this as a separate
+    boundary prevents qualification-only path policy from changing the
+    producer's source identity semantics.
+    """
+
+    candidate = source_root or Path(__file__).resolve().parents[2]
+    try:
+        return _real_root(candidate, field="source_root")
+    except RegistryProducerError as error:
+        raise RegistryQualificationError(str(error)) from error
+
+
 def _read_canonical_ref(
     root: Path,
     reference: object,
@@ -436,7 +453,7 @@ def qualify_registry_assets(
         _fail("S203_REGISTRY_QUALIFICATION_PARENT_OVERWRITE")
     _reject_link_like_ancestors(amendment_path, field="amendment_output")
     _output_ref(amendment_path, manifest_root_path, field="amendment_output")
-    source_root_path = _root(source_root or Path(__file__).resolve().parents[2], field="source_root")
+    source_root_path = _resolve_source_root(source_root)
     source_file_path = Path(source_file or __file__).resolve(strict=True)
     producer_identity = _git_identity(source_root_path, source_file_path)
     constructor_file = Path(__file__).with_name("stage2_registry_producer.py").resolve(strict=True)
