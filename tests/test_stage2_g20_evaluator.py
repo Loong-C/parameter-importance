@@ -464,7 +464,7 @@ def _resign_existing_gate(data_root: Path, commit_ref: str, mutate) -> None:
 
 @pytest.mark.parametrize("mutation", [
     lambda value: value.update({"gate_id": "stage2.G2.0-tampered"}),
-    lambda value: value.update({"status": "FAIL"}),
+    lambda value: value.update({"status": "FAIL", "reasons": ["tampered status"]}),
     lambda value: value["reasons"].append("tampered reason"),
     lambda value: value["measured"]["evaluator"].update({"source_sha256": "0" * 64}),
 ])
