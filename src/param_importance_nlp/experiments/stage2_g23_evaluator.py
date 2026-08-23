@@ -1708,7 +1708,10 @@ def _state_replay_verified(evidence: _CellEvidence) -> bool:
             raise G23Blocked(f"state_replay.draw_artifacts.{stream}:GENERATOR_REPLAY_FAILED") from error
         if replay_after != state_after_obj:
             raise G23Blocked(f"state_replay.draw_artifacts.{stream}:GENERATOR_STATE_DRIFT")
-        if canonical_json_hash({"algorithm_version": plan.algorithm_version, "state": state_before_obj}) != raw_actual.get("state_before_sha256") or canonical_json_hash({"algorithm_version": plan.algorithm_version, "state": state_after_obj}) != raw_actual.get("state_after_sha256"):
+        # ``random.setstate`` consumes tuples, while the published artifact
+        # deliberately stores the JSON-safe list form.  Hash the exact
+        # published representation and only tupleify for generator replay.
+        if canonical_json_hash({"algorithm_version": plan.algorithm_version, "state": raw_actual.get("state_before")}) != raw_actual.get("state_before_sha256") or canonical_json_hash({"algorithm_version": plan.algorithm_version, "state": raw_actual.get("state_after")}) != raw_actual.get("state_after_sha256"):
             raise G23Blocked(f"state_replay.draw_artifacts.{stream}:GENERATOR_STATE_HASH_MISMATCH")
         if before_state.get("streams", {}).get(stream) != raw_actual.get("state_before") or after_state.get("streams", {}).get(stream) != raw_actual.get("state_after"):
             raise G23Blocked(f"state_replay.draw_artifacts.{stream}:INVARIANCE_BINDING_MISMATCH")
