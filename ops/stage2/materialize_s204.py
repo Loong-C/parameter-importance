@@ -1800,6 +1800,7 @@ def _build_narrow_formal_environment(
         "contract_stage_0": normalized_contracts[0],
         "contract_stage_1": normalized_contracts[1],
         "contract_stage_2": normalized_contracts[2],
+        "contract_freeze": normalized_contracts[2],
         "stage2_asset_resolution": _source_ref(asset_ref, "stage2_asset_resolution"),
     }
     evidence_refs.update({f"stage1_10_{kind}": _source_ref(ref, f"stage1_10.{kind}") for kind, ref in stage1_10_refs.items()})

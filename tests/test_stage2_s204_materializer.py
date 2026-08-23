@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 import hashlib
+from types import SimpleNamespace
 
 import pytest
 
@@ -61,6 +62,7 @@ from param_importance_nlp.runtime import (
     load_committed_task_artifact,
 )
 from param_importance_nlp.contracts.task_catalog import DEFAULT_TASK_CATALOG
+from param_importance_nlp.experiments import stage23_task_runners as stage23
 from param_importance_nlp.experiments.stage23_task_runners import _REQUIRED_PREDECESSORS
 
 
@@ -231,6 +233,100 @@ def test_s23_narrow_environment_binds_verified_capability_refs(
         environment.evidence_refs[f"capability_{name}"] for name in capability_refs
     } == set(capability_refs.values())
     assert {name for _, name in capability_calls} == set(capability_refs)
+
+
+def test_s21_narrow_environment_binds_contract_freeze_alias(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    freezes = {
+        stage: ContractFreeze(
+            contract_id=f"stage{stage}.contract.test",
+            stage=stage,
+            scope="formal",
+            state=ContractState.FROZEN,
+            formula_version="test-v1",
+            config_hash="a" * 64,
+            schema_hashes={"schema": "b" * 64},
+            source_hashes={"source": "c" * 64},
+            required_gate_ids=(f"stage{stage}.G1",),
+            frozen_at="2026-08-23T00:00:00+00:00",
+        )
+        for stage in (0, 1, 2)
+    }
+    execution_ref = "evidence/formal-execution.json"
+    execution = FormalExecutionEvidence(
+        run_intent="formal",
+        contract_freeze_hash=freezes[2].artifact_hash,
+        asset_manifest_hashes=("d" * 64,),
+        prerequisite_gates=(
+            GateRecord(
+                gate_id="stage1.G1-EXIT",
+                stage=1,
+                status=GateStatus.PASS,
+                checked_at="2026-08-23T00:00:00+00:00",
+                evidence_refs=("evidence/stage1/index.json",),
+            ),
+        ),
+    )
+    write_canonical_json(tmp_path / execution_ref, execution.to_dict())
+    write_canonical_json(
+        tmp_path / "evidence/contracts/2.json", freezes[2].to_dict()
+    )
+    asset_ref = "manifests/stage2/assets.json"
+    write_canonical_json(tmp_path / asset_ref, _formal_asset_manifest().to_dict())
+
+    monkeypatch.setattr(
+        "ops.stage2.materialize_s204.validate_stage0_handoff",
+        lambda root, ref, require_ready=True: None,
+    )
+    monkeypatch.setattr(
+        "ops.stage2.materialize_s204.validate_stage1_exit_evidence",
+        lambda root, ref: None,
+    )
+    monkeypatch.setattr(
+        "ops.stage2.materialize_s204._load_formal_contract_freeze",
+        lambda root, ref, *, stage: (
+            f"evidence/contracts/{stage}.json",
+            freezes[stage],
+        ),
+    )
+    monkeypatch.setattr(
+        "ops.stage2.materialize_s204._load_formal_gate_refs",
+        lambda root, refs, *, required, **kwargs: {
+            gate_id: refs[gate_id] for gate_id in required
+        },
+    )
+    environment = _build_narrow_formal_environment(
+        tmp_path,
+        formal_execution_ref=execution_ref,
+        stage0_ref="evidence/stage0/handoff.json",
+        stage1_ref="evidence/stage1/index.json",
+        contract_refs={stage: f"evidence/contracts/{stage}.json" for stage in (0, 1, 2)},
+        stage1_10_refs={},
+        stage1_11_refs={},
+        asset_ref=asset_ref,
+        g1_ref="evidence/gates/g1.json",
+        gate_refs={},
+        required_gate_ids=("stage1.G1-EXIT",),
+        output_ref="evidence/stage2/s204/environment.json",
+    )
+
+    assert environment.evidence_refs["contract_stage_2"] == (
+        environment.evidence_refs["contract_freeze"]
+    )
+    request = SimpleNamespace(
+        task=DEFAULT_TASK_CATALOG.get(
+            "stage2.01_scope_hypotheses_and_preregistration"
+        ),
+        environment=environment,
+    )
+    monkeypatch.setattr(stage23, "validate_stage0_handoff", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        stage23, "validate_stage1_exit_evidence", lambda *args, **kwargs: None
+    )
+    loaded, loaded_ref = stage23._formal_execution_evidence(request, tmp_path)
+    assert loaded.artifact_hash == execution.artifact_hash
+    assert loaded_ref == execution_ref
 
 
 def test_raw_bootstrap_is_rejected_and_cannot_unlock_formal(tmp_path: Path) -> None:
