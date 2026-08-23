@@ -29,6 +29,7 @@ from param_importance_nlp.experiments.stage23_task_runners import (
     _formal_stage1_report_artifact_hash,
     _formal_stage2_asset_manifest,
     _predecessor_context,
+    _reference_tokenizer_identity,
     _run_stage2_contract,
     _run_formal_stage2_assets_and_sampling,
     _stage1_formal_bridge_identity,
@@ -105,6 +106,51 @@ def _payload(root: Path, commit_ref: str) -> dict[str, object]:
     payload = body["payload"]
     assert isinstance(payload, dict)
     return payload
+
+
+def test_formal_reference_tokenizer_manifest_missing_fails_closed() -> None:
+    with pytest.raises(TaskBlockedError, match="hash-bound tokenizer manifest") as error:
+        _reference_tokenizer_identity(
+            None,
+            formal=True,
+            expected_asset_id="pythia-tokenizer",
+            expected_checkpoint_id="checkpoint-14m-initialization",
+        )
+    assert error.value.blockers[0].requirement == "stage2_tokenizer_manifest"
+
+
+def test_formal_reference_tokenizer_manifest_wrong_checkpoint_fails_closed() -> None:
+    with pytest.raises(TaskBlockedError, match="checkpoint_id does not match"):
+        _reference_tokenizer_identity(
+            {
+                "schema_version": "tokenizer-manifest-v1",
+                "asset_id": "b" * 64,
+                "revision": "tokenizer-revision",
+                "checkpoint_id": "wrong-checkpoint",
+            },
+            formal=True,
+            expected_asset_id="pythia-tokenizer",
+            expected_checkpoint_id="checkpoint-14m-initialization",
+        )
+
+
+def test_formal_reference_tokenizer_manifest_valid_identity_is_hash_bound() -> None:
+    identity = _reference_tokenizer_identity(
+        {
+            "schema_version": "tokenizer-manifest-v1",
+            "asset_id": "a" * 64,
+            "revision": "tokenizer-revision",
+            "checkpoint_id": "checkpoint-14m-initialization",
+        },
+        formal=True,
+        expected_asset_id="pythia-tokenizer",
+        expected_checkpoint_id="checkpoint-14m-initialization",
+    )
+    assert identity["asset_id"] == "a" * 64
+    assert identity["checkpoint_id"] == "checkpoint-14m-initialization"
+    assert identity["identity_hash"] == canonical_json_hash(
+        {key: value for key, value in identity.items() if key != "identity_hash"}
+    )
 
 
 def _formal_stage2_01_request(
