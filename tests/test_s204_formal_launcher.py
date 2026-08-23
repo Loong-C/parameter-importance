@@ -12,6 +12,7 @@ from ops.stage2.run_s204_formal import (
     EXCLUDED_PCI,
     EXCLUDED_UUID,
     _Heartbeat,
+    _canonical_hash,
     _g23_gate,
     _bind_gpu,
     _file_sha256,
@@ -176,3 +177,56 @@ def test_g23_qualification_is_fail_closed_without_complete_metrics(tmp_path: Pat
     preflight = json.loads(preflights[0].read_text(encoding="utf-8"))
     assert preflight["status"] == "BLOCKED"
     assert preflight["formal_eligible"] is False
+
+
+def test_g23_numeric_candidate_never_becomes_gate_without_output_evaluator(tmp_path: Path) -> None:
+    plan = {"cells": [{"cell_id": f"cell-{index}"} for index in range(6)]}
+    task_hashes = {f"cell-{index}": f"{index + 1:064x}" for index in range(6)}
+    bundle_hashes = {f"cell-{index}": f"{index + 10:064x}" for index in range(6)}
+    metrics = {
+        "schema_version": "stage2-g23-reference-evaluation-v1",
+        "calculator": {"producer_commit": "a" * 40, "source_sha256": "b" * 64},
+        "cells": [],
+    }
+    for index in range(6):
+        metrics["cells"].append(  # type: ignore[union-attr]
+            {
+                "cell_id": f"cell-{index}",
+                "metrics": {
+                    "task_result_hash": task_hashes[f"cell-{index}"],
+                    "bundle_manifest_sha256": bundle_hashes[f"cell-{index}"],
+                    "normalized_l1": 0.001,
+                    "pearson": 0.999,
+                    "signal_eligible_spearman": 0.999,
+                    "layer_module_spearman": 0.999,
+                    "topk_overlap_0_001": 0.999,
+                    "topk_overlap_0_01": 0.999,
+                    "topk_overlap_0_05": 0.999,
+                    "layer_module_delta": 0.001,
+                    "h_ref": 0.01,
+                    "min_delta_sci": 1.0,
+                    "epsilon_num": 0.01,
+                    "a_b_interval_covered": True,
+                    "bias_cross_interval_covered": True,
+                    "ranking_bias_direction": True,
+                    "variance_scaling_verified": True,
+                    "state_replay_verified": True,
+                    "one_shot_complete": True,
+                },
+            }
+        )
+    metrics["artifact_hash"] = _canonical_hash(
+        {key: value for key, value in metrics.items() if key != "artifact_hash"}
+    )
+    metrics_path = tmp_path / "metrics.json"
+    metrics_path.write_text(json.dumps(metrics, sort_keys=True) + "\n", encoding="utf-8")
+    status, gate_hash = _g23_gate(
+        plan=plan,
+        metrics_path=metrics_path,
+        task_result_refs=tuple(f"runs/cell-{index}/result.json" for index in range(6)),
+        task_result_hashes=task_hashes,
+        bundle_hashes=bundle_hashes,
+        output_root=tmp_path,
+    )
+    assert status == "BLOCKED"
+    assert len(gate_hash) == 64
