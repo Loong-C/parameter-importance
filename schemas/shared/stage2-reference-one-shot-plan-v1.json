@@ -1,0 +1,21 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://parameter-importance.invalid/schemas/shared/stage2-reference-one-shot-plan-v1.json",
+  "title": "Stage 2 final reference one-shot plan",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "reference_id", "sizing_result_hash", "sample_count_per_stream", "block_size", "sizing_stream", "stream_a", "stream_b", "one_shot", "artifact_hash"],
+  "properties": {
+    "schema_version": {"const": "stage2-reference-one-shot-plan-v1"},
+    "reference_id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,159}$"},
+    "sizing_result_hash": {"$ref": "#/defs/hash"},
+    "sample_count_per_stream": {"type": "integer", "minimum": 1},
+    "block_size": {"type": "integer", "minimum": 1},
+    "sizing_stream": {"const": "reference_sizing"},
+    "stream_a": {"const": "reference_A"},
+    "stream_b": {"const": "reference_B"},
+    "one_shot": {"const": true},
+    "artifact_hash": {"$ref": "#/defs/hash"}
+  },
+  "$defs": {"hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"}}
+}

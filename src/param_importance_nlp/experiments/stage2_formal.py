@@ -27,7 +27,7 @@ from pathlib import Path, PurePosixPath
 import re
 import time
 from types import MappingProxyType
-from typing import Hashable, Mapping, Sequence
+from typing import Callable, Hashable, Mapping, Sequence
 
 import numpy as np
 
@@ -561,6 +561,22 @@ def _reference_vectors(
     return bias, cross, ranking
 
 
+def _reference_vectors_single(
+    moments: _GradientMoments,
+    assumptions: Mapping[str, object],
+) -> tuple[dict[str, np.ndarray], dict[str, np.ndarray], dict[str, np.ndarray]]:
+    """Sizing-only diagnostics from one independent block stream.
+
+    The sizing stream is never used as the final A/B reference.  Its cross and
+    ranking values are therefore deliberately labelled square diagnostics,
+    while the block-U value remains a valid finite-sample target estimate.
+    """
+
+    mean = moments.mean()
+    square = {name: np.square(value) for name, value in mean.items()}
+    return moments.u(assumptions=assumptions), square, square
+
+
 @dataclass(frozen=True, slots=True)
 class ReferenceSizingPlan:
     """冻结 reference sizing ladder 与停止规则。"""
@@ -789,6 +805,14 @@ class ReferenceSizingResult:
     def artifact_hash(self) -> str:
         return canonical_json_hash(self.payload_dict())
 
+    @property
+    def scientific_artifact_hash(self) -> str:
+        """Hash sizing evidence without resume-only execution diagnostics."""
+
+        payload = self.payload_dict()
+        payload.pop("resumed_from_block_pairs", None)
+        return canonical_json_hash(payload)
+
     def to_dict(self) -> dict[str, object]:
         return self.payload_dict() | {"artifact_hash": self.artifact_hash}
 
@@ -844,6 +868,343 @@ class ReferenceSizingResult:
         return payload
 
 
+@dataclass(frozen=True, slots=True)
+class ReferenceUncertainty:
+    """Block-level uncertainty for the three reference estimands.
+
+    The reference blocks, rather than parameter coordinates, are the sampling
+    units.  ``bias_variance`` is the delete-one-block jackknife variance of the
+    block-U reference.  ``cross_variance`` and ``ranking_variance`` use the
+    same independent-block jackknife construction.  Keeping this object
+    separate from the vector bundle prevents a consumer from silently treating
+    a finite reference as the theoretical target.
+    """
+
+    bias_variance: Mapping[str, np.ndarray]
+    cross_variance: Mapping[str, np.ndarray]
+    ranking_variance: Mapping[str, np.ndarray]
+    block_count_a: int
+    block_count_b: int
+    confidence_level: float = 0.95
+    estimator: str = "block_u_delete_one_jackknife"
+    schema_version: str = "stage2-reference-uncertainty-v1"
+
+    def __post_init__(self) -> None:
+        if self.block_count_a < 2 or self.block_count_b < 2:
+            raise ValueError("REFERENCE_UNCERTAINTY_REQUIRES_TWO_BLOCKS_PER_STREAM")
+        if not math.isfinite(self.confidence_level) or not 0 < self.confidence_level < 1:
+            raise ValueError("confidence_level 必须位于 (0,1)")
+        _assert_compatible(self.bias_variance, self.cross_variance, field_name="reference_uncertainty")
+        _assert_compatible(self.bias_variance, self.ranking_variance, field_name="reference_uncertainty")
+        for name, vector in (
+            ("bias_variance", self.bias_variance),
+            ("cross_variance", self.cross_variance),
+            ("ranking_variance", self.ranking_variance),
+        ):
+            copied: dict[str, np.ndarray] = {}
+            for parameter, value in _as_vector(vector, field_name=name).items():
+                if np.any(value < 0) or not np.all(np.isfinite(value)):
+                    raise ValueError(f"{name}.{parameter} 必须是有限非负数组")
+                array = np.array(value, dtype=np.float64, copy=True)
+                array.setflags(write=False)
+                copied[parameter] = array
+            object.__setattr__(self, name, MappingProxyType(copied))
+
+    @property
+    def bias_half_width(self) -> Mapping[str, np.ndarray]:
+        # The normal quantile is intentionally not imported from scipy.  The
+        # pre-registered local/GPU environments do not require scipy; 1.96 is
+        # the fixed two-sided 95% normal approximation used for diagnostics.
+        return {name: 1.96 * np.sqrt(value) for name, value in self.bias_variance.items()}
+
+    @property
+    def trace_bias_variance(self) -> float:
+        return float(sum(np.sum(value) for value in self.bias_variance.values()))
+
+    def payload_dict(self) -> dict[str, object]:
+        return {
+            "schema_version": self.schema_version,
+            "estimator": self.estimator,
+            "confidence_level": self.confidence_level,
+            "block_count_a": self.block_count_a,
+            "block_count_b": self.block_count_b,
+            "bias_variance_hash": _vector_digest(self.bias_variance),
+            "cross_variance_hash": _vector_digest(self.cross_variance),
+            "ranking_variance_hash": _vector_digest(self.ranking_variance),
+            "trace_bias_variance": self.trace_bias_variance,
+            "bias_half_width_l2": float(
+                1.96 * math.sqrt(max(0.0, self.trace_bias_variance))
+            ),
+        }
+
+    @property
+    def artifact_hash(self) -> str:
+        return canonical_json_hash(self.payload_dict())
+
+    def to_dict(self) -> dict[str, object]:
+        return self.payload_dict() | {"artifact_hash": self.artifact_hash}
+
+
+def _delete_one_jackknife(
+    values: Sequence[Mapping[str, object]],
+    statistic: Callable[[Sequence[Mapping[str, object]]], Mapping[str, object]],
+) -> Mapping[str, np.ndarray]:
+    """Return a vector delete-one jackknife variance.
+
+    This helper is used only after a final one-shot run has completed.  The
+    runner may retain block means in its resumable tensor bundle; it never
+    retains per-sequence gradients.
+    """
+
+    if len(values) < 3:
+        raise ValueError("REFERENCE_JACKKNIFE_REQUIRES_THREE_BLOCKS")
+    estimates = [statistic(values[:index] + values[index + 1 :]) for index in range(len(values))]
+    center = statistic(values)
+    result: dict[str, np.ndarray] = {}
+    factor = (len(values) - 1) / len(values)
+    for name, reference in _as_vector(center).items():
+        stacked = np.stack([_as_vector(item)[name] for item in estimates], axis=0)
+        result[name] = factor * np.sum(np.square(stacked - reference), axis=0)
+    return result
+
+
+def _mean_vector(values: Sequence[Mapping[str, object]]) -> dict[str, np.ndarray]:
+    if not values:
+        raise ValueError("REFERENCE_MEAN_EMPTY")
+    first = _as_vector(values[0])
+    total = {name: np.zeros_like(array, dtype=np.float64) for name, array in first.items()}
+    for value in values:
+        current = _as_vector(value)
+        _assert_compatible(first, current, field_name="reference_mean")
+        for name in total:
+            total[name] += current[name]
+    count = float(len(values))
+    return {name: value / count for name, value in total.items()}
+
+
+def _u_vector(values: Sequence[Mapping[str, object]]) -> dict[str, np.ndarray]:
+    if len(values) < 2:
+        raise ValueError("REFERENCE_U_REQUIRES_TWO_BLOCKS")
+    mean = _mean_vector(values)
+    second = {name: np.zeros_like(array, dtype=np.float64) for name, array in mean.items()}
+    for value in values:
+        current = _as_vector(value)
+        for name in second:
+            second[name] += np.square(current[name])
+    count = float(len(values))
+    return {
+        name: (count * count * np.square(mean[name]) - second[name]) / (count * (count - 1.0))
+        for name in mean
+    }
+
+
+def estimate_sequence_variance(
+    block_means: Sequence[Mapping[str, object]],
+    *,
+    block_size: int,
+) -> Mapping[str, np.ndarray]:
+    """Recover the sequence-level variance from independent block means.
+
+    For equal-size blocks ``Var(block_mean)=Var(sequence)/block_size``.  The
+    explicit factor is part of the S2.4 contract and is reported separately
+    from reference sampling uncertainty so a consumer cannot confuse the two.
+    """
+
+    if block_size <= 0 or len(block_means) < 2:
+        raise ValueError("SEQUENCE_VARIANCE_REQUIRES_TWO_BLOCKS")
+    mean = _mean_vector(block_means)
+    total = {name: np.zeros_like(value, dtype=np.float64) for name, value in mean.items()}
+    for block in block_means:
+        current = _as_vector(block)
+        for name in total:
+            total[name] += np.square(current[name] - mean[name])
+    factor = float(block_size) / float(len(block_means) - 1)
+    return {name: value * factor for name, value in total.items()}
+
+
+def estimate_reference_uncertainty(
+    blocks_a: Sequence[Mapping[str, object]],
+    blocks_b: Sequence[Mapping[str, object]],
+) -> ReferenceUncertainty:
+    """Estimate uncertainty using independent A/B block units.
+
+    ``bias`` uses the combined block-U.  For ``cross`` and ``ranking`` the
+    leave-one-out statistic is evaluated independently in each stream and the
+    two variance contributions are added.  This is conservative for the
+    ranking square and, importantly, does not treat millions of coordinates as
+    independent observations.
+    """
+
+    a = tuple(_as_vector(item) for item in blocks_a)
+    b = tuple(_as_vector(item) for item in blocks_b)
+    if len(a) < 3 or len(b) < 3:
+        raise ValueError("REFERENCE_UNCERTAINTY_REQUIRES_THREE_BLOCKS_PER_STREAM")
+    combined = a + b
+    bias_variance = _delete_one_jackknife(combined, _u_vector)
+
+    def cross(values: Sequence[Mapping[str, object]]) -> dict[str, np.ndarray]:
+        # A/B are independent, so this local statistic is only called with a
+        # tagged pair below; the implementation is kept explicit in the loop.
+        raise AssertionError("cross statistic requires paired streams")
+
+    mean_a = _mean_vector(a)
+    mean_b = _mean_vector(b)
+    base_cross = {name: mean_a[name] * mean_b[name] for name in mean_a}
+    cross_a = []
+    cross_b = []
+    for index in range(len(a)):
+        left = _mean_vector(a[:index] + a[index + 1 :])
+        cross_a.append({name: left[name] * mean_b[name] for name in left})
+    for index in range(len(b)):
+        right = _mean_vector(b[:index] + b[index + 1 :])
+        cross_b.append({name: mean_a[name] * right[name] for name in right})
+    cross_variance: dict[str, np.ndarray] = {}
+    for name, reference in base_cross.items():
+        va = (len(a) - 1) / len(a) * np.sum(
+            np.square(np.stack([item[name] for item in cross_a]) - reference), axis=0
+        )
+        vb = (len(b) - 1) / len(b) * np.sum(
+            np.square(np.stack([item[name] for item in cross_b]) - reference), axis=0
+        )
+        cross_variance[name] = va + vb
+
+    merged = a + b
+    base_ranking = {name: np.square(value) for name, value in _mean_vector(merged).items()}
+    ranking_variance = _delete_one_jackknife(
+        merged,
+        lambda values: {name: np.square(value) for name, value in _mean_vector(values).items()},
+    )
+    return ReferenceUncertainty(
+        bias_variance=bias_variance,
+        cross_variance=cross_variance,
+        ranking_variance=ranking_variance,
+        block_count_a=len(a),
+        block_count_b=len(b),
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class OneShotReferencePlan:
+    """Frozen final A/B run created only after sizing has selected B_ref."""
+
+    reference_id: str
+    sizing_result_hash: str
+    sample_count_per_stream: int
+    block_size: int
+    sizing_stream: str = "reference_sizing"
+    stream_a: str = "reference_A"
+    stream_b: str = "reference_B"
+    one_shot: bool = True
+    schema_version: str = "stage2-reference-one-shot-plan-v1"
+
+    def __post_init__(self) -> None:
+        _require_identifier(self.reference_id, field_name="reference_id")
+        _require_sha256(self.sizing_result_hash, field_name="sizing_result_hash")
+        if self.sample_count_per_stream <= 0 or self.block_size <= 0:
+            raise ValueError("ONE_SHOT_REFERENCE_SAMPLE_COUNTS_INVALID")
+        if self.sample_count_per_stream % self.block_size:
+            raise ValueError("ONE_SHOT_REFERENCE_SAMPLE_COUNT_NOT_BLOCK_ALIGNED")
+        if (self.sizing_stream, self.stream_a, self.stream_b) != (
+            "reference_sizing", "reference_A", "reference_B"
+        ):
+            raise ValueError("ONE_SHOT_REFERENCE_STREAM_NAMES_FROZEN")
+        if self.one_shot is not True:
+            raise ValueError("ONE_SHOT_REFERENCE_MUST_BE_TRUE")
+
+    def payload_dict(self) -> dict[str, object]:
+        return {
+            "schema_version": self.schema_version,
+            "reference_id": self.reference_id,
+            "sizing_result_hash": self.sizing_result_hash,
+            "sample_count_per_stream": self.sample_count_per_stream,
+            "block_size": self.block_size,
+            "sizing_stream": self.sizing_stream,
+            "stream_a": self.stream_a,
+            "stream_b": self.stream_b,
+            "one_shot": True,
+        }
+
+    @property
+    def artifact_hash(self) -> str:
+        return canonical_json_hash(self.payload_dict())
+
+    def to_dict(self) -> dict[str, object]:
+        return self.payload_dict() | {"artifact_hash": self.artifact_hash}
+
+
+@dataclass(frozen=True, slots=True)
+class OneShotReferenceResult:
+    """Final A/B reference result; no optional stopping or replacement."""
+
+    plan_hash: str
+    sizing_result_hash: str
+    provider_state_digest: str
+    registry_hash: str
+    processed_sample_count_per_stream: int
+    bias_reference: Mapping[str, object]
+    cross_reference: Mapping[str, object]
+    ranking_reference: Mapping[str, object]
+    uncertainty: ReferenceUncertainty
+    weighting_assumptions: Mapping[str, object]
+    stream_a_draw_hash: str
+    stream_b_draw_hash: str
+    status: str = "COMPLETE"
+    one_shot: bool = True
+    schema_version: str = "stage2-reference-one-shot-result-v1"
+    sequence_variance: Mapping[str, np.ndarray] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        for name in ("plan_hash", "sizing_result_hash", "provider_state_digest", "registry_hash", "stream_a_draw_hash", "stream_b_draw_hash"):
+            _require_sha256(getattr(self, name), field_name=name)
+        if self.processed_sample_count_per_stream <= 0:
+            raise ValueError("ONE_SHOT_REFERENCE_SAMPLE_COUNT_INVALID")
+        if self.status not in {"IN_PROGRESS", "COMPLETE", "FAILED"}:
+            raise ValueError("ONE_SHOT_REFERENCE_STATUS_INVALID")
+        if self.one_shot is not True:
+            raise ValueError("ONE_SHOT_REFERENCE_RESULT_MUST_BE_TRUE")
+        if set(self.weighting_assumptions) != {
+            "statistical_unit", "weight_unit", "sampling_design",
+            "weights_exogenous", "common_mean_assumption",
+        }:
+            raise ValueError("ONE_SHOT_REFERENCE_WEIGHTING_CONTRACT_INCOMPLETE")
+        if self.sequence_variance:
+            _assert_compatible(self.bias_reference, self.sequence_variance, field_name="sequence_variance")
+            for name, value in _as_vector(self.sequence_variance, field_name="sequence_variance").items():
+                if np.any(value < 0) or not np.all(np.isfinite(value)):
+                    raise ValueError("sequence_variance 必须是有限非负数组")
+        _assert_compatible(self.bias_reference, self.cross_reference, field_name="one_shot_reference")
+        _assert_compatible(self.bias_reference, self.ranking_reference, field_name="one_shot_reference")
+
+    def payload_dict(self) -> dict[str, object]:
+        return {
+            "schema_version": self.schema_version,
+            "plan_hash": self.plan_hash,
+            "sizing_result_hash": self.sizing_result_hash,
+            "provider_state_digest": self.provider_state_digest,
+            "registry_hash": self.registry_hash,
+            "processed_sample_count_per_stream": self.processed_sample_count_per_stream,
+            "bias_reference_hash": _vector_digest(self.bias_reference),
+            "cross_reference_hash": _vector_digest(self.cross_reference),
+            "ranking_reference_hash": _vector_digest(self.ranking_reference),
+            "uncertainty": self.uncertainty.to_dict(),
+            "stream_a_draw_hash": self.stream_a_draw_hash,
+            "stream_b_draw_hash": self.stream_b_draw_hash,
+            "status": self.status,
+            "one_shot": True,
+            "weighting_assumptions": dict(self.weighting_assumptions),
+            "sequence_variance_hash": (
+                None if not self.sequence_variance else _vector_digest(self.sequence_variance)
+            ),
+        }
+
+    @property
+    def artifact_hash(self) -> str:
+        return canonical_json_hash(self.payload_dict())
+
+    def to_dict(self) -> dict[str, object]:
+        return self.payload_dict() | {"artifact_hash": self.artifact_hash}
+
+
 class _ReferenceSnapshotStore:
     """每个 block pair 发布一个不可变状态对象和独立权威 commit。"""
 
@@ -880,14 +1241,21 @@ class _ReferenceSnapshotStore:
         payload = {
             key: value
             for key, value in state.items()
-            if key not in {"a", "b", "last_bias"}
+            if key not in {"a", "b", "last_bias", "blocks_a", "blocks_b"}
         }
         payload["a_g1_hash"] = _vector_digest(a["g1"]) if a["g1"] else None
         payload["a_g2_hash"] = _vector_digest(a["g2"]) if a["g2"] else None
         payload["b_g1_hash"] = _vector_digest(b["g1"]) if b["g1"] else None
         payload["b_g2_hash"] = _vector_digest(b["g2"]) if b["g2"] else None
-        last = state["last_bias"]
+        last = state.get("last_bias", {})
         payload["last_bias_hash"] = _vector_digest(last) if last else None
+        for key in ("blocks_a", "blocks_b"):
+            blocks = state.get(key, [])
+            if not isinstance(blocks, list):
+                raise ValueError("REFERENCE_BLOCKS_STATE_NOT_ARRAY")
+            payload[f"{key}_hash"] = canonical_json_hash(
+                [_vector_digest(item) for item in blocks]
+            )
         return canonical_json_hash(payload)
 
     def publish(self, sequence: int, state: Mapping[str, object]) -> None:
@@ -946,6 +1314,215 @@ class _ReferenceSnapshotStore:
         return state
 
 
+def _draw_digest(draws: Sequence[object]) -> str:
+    """Stable identity for a frozen draw prefix without serialising provider data."""
+
+    rows: list[dict[str, object]] = []
+    for draw in draws:
+        row: dict[str, object] = {}
+        for field_name in ("draw_id", "sample_id", "stream", "position"):
+            if hasattr(draw, field_name):
+                value = getattr(draw, field_name)
+                if isinstance(value, (str, int, float, bool)) or value is None:
+                    row[field_name] = value
+                else:
+                    row[field_name] = str(value)
+        if not row:
+            row["draw"] = str(draw)
+        rows.append(row)
+    return canonical_json_hash(rows)
+
+
+def _validate_draw_stream(
+    draws: Sequence[object],
+    *,
+    expected_stream: str,
+    expected_count: int,
+) -> None:
+    if len(draws) != expected_count:
+        raise ValueError(
+            f"REFERENCE_DRAW_COUNT_MISMATCH:{expected_stream}:{len(draws)}:{expected_count}"
+        )
+    observed = {getattr(draw, "stream") for draw in draws if hasattr(draw, "stream")}
+    if observed and observed != {expected_stream}:
+        raise ValueError(f"REFERENCE_DRAW_STREAM_MISMATCH:{expected_stream}:{observed}")
+    positions = [getattr(draw, "position") for draw in draws if hasattr(draw, "position")]
+    if positions and positions != list(range(positions[0], positions[0] + len(positions))):
+        raise ValueError(f"REFERENCE_DRAW_ORDER_MISMATCH:{expected_stream}")
+
+
+class OneShotReferenceRunner:
+    """Run the fixed-length final A/B reference with resumable block commits.
+
+    The runner deliberately has no stopping criterion.  ``max_new_block_pairs``
+    exists only for local interruption/recovery tests; a partial call returns
+    ``IN_PROGRESS`` and the same frozen draws/plan must be supplied to resume.
+    Supplying a different draw identity or sizing hash fails closed.
+    """
+
+    def __init__(self, provider: FixedStateGradientProvider) -> None:
+        self.provider = provider
+
+    def run(
+        self,
+        plan: OneShotReferencePlan,
+        *,
+        draws_a: Sequence[object],
+        draws_b: Sequence[object],
+        artifact_root: str | Path,
+        sizing_draws: Sequence[object] | None = None,
+        max_new_block_pairs: int | None = None,
+    ) -> OneShotReferenceResult:
+        if max_new_block_pairs is not None and max_new_block_pairs <= 0:
+            raise ValueError("max_new_block_pairs 必须为正整数或 null")
+        _validate_draw_stream(
+            draws_a,
+            expected_stream=plan.stream_a,
+            expected_count=plan.sample_count_per_stream,
+        )
+        _validate_draw_stream(
+            draws_b,
+            expected_stream=plan.stream_b,
+            expected_count=plan.sample_count_per_stream,
+        )
+        ids_a = _draw_ids(draws_a)
+        ids_b = _draw_ids(draws_b)
+        if ids_a and ids_b and ids_a.intersection(ids_b):
+            raise ValueError("REFERENCE_FINAL_A_B_DRAW_IDS_REUSED")
+        if sizing_draws is not None:
+            observed = {
+                getattr(draw, "stream") for draw in sizing_draws if hasattr(draw, "stream")
+            }
+            if observed and observed != {plan.sizing_stream}:
+                raise ValueError("REFERENCE_SIZING_DRAW_STREAM_MISMATCH")
+            sizing_ids = _draw_ids(sizing_draws)
+            if sizing_ids and (sizing_ids.intersection(ids_a) or sizing_ids.intersection(ids_b)):
+                raise ValueError("REFERENCE_SIZING_FINAL_DRAW_IDS_REUSED")
+
+        provider_state = self.provider.state_digest()
+        assumptions = _weighting_contract(self.provider)
+        total_pairs = plan.sample_count_per_stream // plan.block_size
+        processed_pairs = 0
+        moments_a, moments_b = _GradientMoments(), _GradientMoments()
+        blocks_a: list[dict[str, np.ndarray]] = []
+        blocks_b: list[dict[str, np.ndarray]] = []
+        root = Path(artifact_root)
+        with _ReferenceSnapshotStore(root) as store:
+            restored = store.latest()
+            if restored is not None:
+                if restored.get("plan_hash") != plan.artifact_hash:
+                    raise ValueError("ONE_SHOT_REFERENCE_RESUME_PLAN_HASH_MISMATCH")
+                if restored.get("provider_state_digest") != provider_state:
+                    raise ValueError("ONE_SHOT_REFERENCE_RESUME_PROVIDER_STATE_MISMATCH")
+                if restored.get("registry_hash") != self.provider.registry_hash:
+                    raise ValueError("ONE_SHOT_REFERENCE_RESUME_REGISTRY_HASH_MISMATCH")
+                if restored.get("weighting_assumptions") != assumptions:
+                    raise ValueError("ONE_SHOT_REFERENCE_RESUME_WEIGHTING_DRIFT")
+                if restored.get("stream_a_draw_hash") != _draw_digest(draws_a):
+                    raise ValueError("ONE_SHOT_REFERENCE_RESUME_DRAW_A_HASH_MISMATCH")
+                if restored.get("stream_b_draw_hash") != _draw_digest(draws_b):
+                    raise ValueError("ONE_SHOT_REFERENCE_RESUME_DRAW_B_HASH_MISMATCH")
+                processed_pairs = int(restored["processed_block_pairs"])
+                moments_a = _GradientMoments.from_state(restored["a"])  # type: ignore[arg-type]
+                moments_b = _GradientMoments.from_state(restored["b"])  # type: ignore[arg-type]
+                raw_a, raw_b = restored.get("blocks_a", []), restored.get("blocks_b", [])
+                if not isinstance(raw_a, list) or not isinstance(raw_b, list):
+                    raise ValueError("ONE_SHOT_REFERENCE_RESUME_BLOCKS_NOT_ARRAY")
+                blocks_a = [_as_vector(item, field_name="blocks_a") for item in raw_a]  # type: ignore[arg-type]
+                blocks_b = [_as_vector(item, field_name="blocks_b") for item in raw_b]  # type: ignore[arg-type]
+                if len(blocks_a) != processed_pairs or len(blocks_b) != processed_pairs:
+                    raise ValueError("ONE_SHOT_REFERENCE_RESUME_BLOCK_COUNT_MISMATCH")
+
+            new_pairs = 0
+            while processed_pairs < total_pairs:
+                if max_new_block_pairs is not None and new_pairs >= max_new_block_pairs:
+                    break
+                start = processed_pairs * plan.block_size
+                stop = start + plan.block_size
+                batch_a = self.provider.gradient(draws_a[start:stop])
+                batch_b = self.provider.gradient(draws_b[start:stop])
+                vector_a = _as_vector(batch_a.gradients, field_name="reference_A.block")
+                vector_b = _as_vector(batch_b.gradients, field_name="reference_B.block")
+                moments_a.update(batch_a, assumptions)
+                moments_b.update(batch_b, assumptions)
+                blocks_a.append(vector_a)
+                blocks_b.append(vector_b)
+                self.provider.assert_unchanged(provider_state)
+                processed_pairs += 1
+                new_pairs += 1
+                state: dict[str, object] = {
+                    "schema_version": "stage2-reference-one-shot-progress-v1",
+                    "plan_hash": plan.artifact_hash,
+                    "sizing_result_hash": plan.sizing_result_hash,
+                    "provider_state_digest": provider_state,
+                    "registry_hash": self.provider.registry_hash,
+                    "weighting_assumptions": assumptions,
+                    "stream_a_draw_hash": _draw_digest(draws_a),
+                    "stream_b_draw_hash": _draw_digest(draws_b),
+                    "processed_block_pairs": processed_pairs,
+                    "a": moments_a.to_state(),
+                    "b": moments_b.to_state(),
+                    "blocks_a": blocks_a,
+                    "blocks_b": blocks_b,
+                    "final_length_required": True,
+                }
+                store.publish(processed_pairs, state)
+            # A partial state is itself a valid recoverable boundary, but it is
+            # never emitted as a final reference manifest.
+            if processed_pairs < total_pairs:
+                empty = blocks_a[0] if blocks_a else {"_empty": np.zeros(1, dtype=np.float64)}
+                return OneShotReferenceResult(
+                    plan_hash=plan.artifact_hash,
+                    sizing_result_hash=plan.sizing_result_hash,
+                    provider_state_digest=provider_state,
+                    registry_hash=self.provider.registry_hash,
+                    processed_sample_count_per_stream=processed_pairs * plan.block_size,
+                    bias_reference=empty,
+                    cross_reference=empty,
+                    ranking_reference=empty,
+                    uncertainty=ReferenceUncertainty(
+                        {"_empty": np.zeros(1)}, {"_empty": np.zeros(1)}, {"_empty": np.zeros(1)},
+                        max(3, processed_pairs), max(3, processed_pairs),
+                    ) if processed_pairs >= 3 else _placeholder_uncertainty(),
+                    weighting_assumptions=assumptions,
+                    stream_a_draw_hash=_draw_digest(draws_a),
+                    stream_b_draw_hash=_draw_digest(draws_b),
+                    status="IN_PROGRESS",
+                )
+
+        bias = _u_vector(blocks_a + blocks_b)
+        mean_a, mean_b = _mean_vector(blocks_a), _mean_vector(blocks_b)
+        cross = {name: mean_a[name] * mean_b[name] for name in mean_a}
+        merged_mean = _mean_vector(blocks_a + blocks_b)
+        ranking = {name: np.square(value) for name, value in merged_mean.items()}
+        uncertainty = estimate_reference_uncertainty(blocks_a, blocks_b)
+        return OneShotReferenceResult(
+            plan_hash=plan.artifact_hash,
+            sizing_result_hash=plan.sizing_result_hash,
+            provider_state_digest=provider_state,
+            registry_hash=self.provider.registry_hash,
+            processed_sample_count_per_stream=plan.sample_count_per_stream,
+            bias_reference=bias,
+            cross_reference=cross,
+            ranking_reference=ranking,
+            uncertainty=uncertainty,
+            weighting_assumptions=assumptions,
+            sequence_variance=estimate_sequence_variance(
+                blocks_a + blocks_b, block_size=plan.block_size
+            ),
+            stream_a_draw_hash=_draw_digest(draws_a),
+            stream_b_draw_hash=_draw_digest(draws_b),
+            status="COMPLETE",
+        )
+
+
+def _placeholder_uncertainty() -> ReferenceUncertainty:
+    """Keep partial progress inspectable without pretending it is a final estimate."""
+
+    zeros = {"_partial": np.zeros(1, dtype=np.float64)}
+    return ReferenceUncertainty(zeros, zeros, zeros, 2, 2)
+
+
 class StreamingReferenceSizer:
     """按 A/B block pair 流式累计 reference，并可在任意 commit 边界恢复。"""
 
@@ -960,17 +1537,24 @@ class StreamingReferenceSizer:
         draws_b: Sequence[object],
         artifact_root: str | Path,
         max_new_block_pairs: int | None = None,
+        draws_sizing: Sequence[object] | None = None,
     ) -> ReferenceSizingResult:
         if plan.scope == "formal":
             plan.execution.require_for_stage(2)
         if max_new_block_pairs is not None and max_new_block_pairs <= 0:
             raise ValueError("max_new_block_pairs 必须为正整数或 null")
         maximum = plan.candidate_sample_counts[-1]
-        if len(draws_a) < maximum or len(draws_b) < maximum:
-            raise ValueError("冻结 A/B draws 少于 reference sizing 最大候选")
-        if _draw_ids(draws_a[:maximum]).intersection(_draw_ids(draws_b[:maximum])):
-            raise ValueError("reference A/B draw IDs 必须互不重用")
-        for expected_stream, draws in (("reference_A", draws_a), ("reference_B", draws_b)):
+        if draws_sizing is None:
+            if len(draws_a) < maximum or len(draws_b) < maximum:
+                raise ValueError("冻结 A/B draws 少于 reference sizing 最大候选")
+            if _draw_ids(draws_a[:maximum]).intersection(_draw_ids(draws_b[:maximum])):
+                raise ValueError("reference A/B draw IDs 必须互不重用")
+            stream_inputs = (("reference_A", draws_a), ("reference_B", draws_b))
+        else:
+            if len(draws_sizing) < maximum:
+                raise ValueError("冻结 reference_sizing draws 少于 sizing 最大候选")
+            stream_inputs = (("reference_sizing", draws_sizing),)
+        for expected_stream, draws in stream_inputs:
             observed = {
                 getattr(draw, "stream")
                 for draw in draws[:maximum]
@@ -1023,18 +1607,26 @@ class StreamingReferenceSizer:
                     break
                 start = processed_pairs * plan.block_size
                 stop = start + plan.block_size
-                batch_a = self.provider.gradient(draws_a[start:stop])
-                batch_b = self.provider.gradient(draws_b[start:stop])
+                batch_a = self.provider.gradient(
+                    (draws_sizing if draws_sizing is not None else draws_a)[start:stop]
+                )
                 moments_a.update(batch_a, assumptions)
-                moments_b.update(batch_b, assumptions)
+                if draws_sizing is None:
+                    batch_b = self.provider.gradient(draws_b[start:stop])
+                    moments_b.update(batch_b, assumptions)
                 self.provider.assert_unchanged(provider_state)
                 processed_pairs += 1
                 new_pairs += 1
                 sample_count = processed_pairs * plan.block_size
                 if sample_count in plan.candidate_sample_counts:
-                    bias, cross, ranking = _reference_vectors(
-                        moments_a, moments_b, assumptions
-                    )
+                    if draws_sizing is None:
+                        bias, cross, ranking = _reference_vectors(
+                            moments_a, moments_b, assumptions
+                        )
+                    else:
+                        bias, cross, ranking = _reference_vectors_single(
+                            moments_a, assumptions
+                        )
                     difference: float | None = None
                     comparison_defined = False
                     comparison_reason: str | None = "no_previous_reference"
@@ -1084,12 +1676,16 @@ class StreamingReferenceSizer:
                     "last_bias": {} if last_bias is None else last_bias,
                     "a": moments_a.to_state(),
                     "b": moments_b.to_state(),
+                    "sizing_stream": draws_sizing is not None,
                 }
                 store.publish(processed_pairs, state)
 
         if processed_pairs <= 0:
             raise RuntimeError("REFERENCE_SIZING_NO_COMMITTED_BLOCKS")
-        bias, cross, ranking = _reference_vectors(moments_a, moments_b, assumptions)
+        if draws_sizing is None:
+            bias, cross, ranking = _reference_vectors(moments_a, moments_b, assumptions)
+        else:
+            bias, cross, ranking = _reference_vectors_single(moments_a, assumptions)
         return ReferenceSizingResult(
             plan_hash=plan.artifact_hash,
             registry_hash=self.provider.registry_hash,
@@ -1820,6 +2416,12 @@ __all__ = [
     "ReferenceSizingPlan",
     "ReferenceSizingPoint",
     "ReferenceSizingResult",
+    "ReferenceUncertainty",
+    "OneShotReferencePlan",
+    "OneShotReferenceResult",
+    "OneShotReferenceRunner",
+    "estimate_reference_uncertainty",
+    "estimate_sequence_variance",
     "Stage2EstimatorRecommendation",
     "Stage2RecommendationEngine",
     "StreamingReferenceSizer",

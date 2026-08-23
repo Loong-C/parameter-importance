@@ -1,0 +1,41 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://parameter-importance.invalid/schemas/shared/stage2-reference-one-shot-result-v1.json",
+  "title": "Stage 2 final reference one-shot result",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "plan_hash", "sizing_result_hash", "provider_state_digest", "registry_hash", "processed_sample_count_per_stream", "bias_reference_hash", "cross_reference_hash", "ranking_reference_hash", "uncertainty", "stream_a_draw_hash", "stream_b_draw_hash", "status", "one_shot", "weighting_assumptions", "sequence_variance_hash", "artifact_hash"],
+  "properties": {
+    "schema_version": {"const": "stage2-reference-one-shot-result-v1"},
+    "plan_hash": {"$ref": "#/defs/hash"},
+    "sizing_result_hash": {"$ref": "#/defs/hash"},
+    "provider_state_digest": {"$ref": "#/defs/hash"},
+    "registry_hash": {"$ref": "#/defs/hash"},
+    "processed_sample_count_per_stream": {"type": "integer", "minimum": 1},
+    "bias_reference_hash": {"$ref": "#/defs/hash"},
+    "cross_reference_hash": {"$ref": "#/defs/hash"},
+    "ranking_reference_hash": {"$ref": "#/defs/hash"},
+    "uncertainty": {"type": "object"},
+    "stream_a_draw_hash": {"$ref": "#/defs/hash"},
+    "stream_b_draw_hash": {"$ref": "#/defs/hash"},
+    "status": {"enum": ["IN_PROGRESS", "COMPLETE", "FAILED"]},
+    "one_shot": {"const": true},
+    "weighting_assumptions": {"$ref": "#/defs/weighting"},
+    "sequence_variance_hash": {"$ref": "#/defs/hash"},
+    "artifact_hash": {"$ref": "#/defs/hash"}
+  },
+  "$defs": {
+    "hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "weighting": {
+      "type": "object", "additionalProperties": false,
+      "required": ["statistical_unit", "weight_unit", "sampling_design", "weights_exogenous", "common_mean_assumption"],
+      "properties": {
+        "statistical_unit": {"type": "string", "minLength": 1},
+        "weight_unit": {"type": "string", "minLength": 1},
+        "sampling_design": {"type": "string", "minLength": 1},
+        "weights_exogenous": {"type": "boolean"},
+        "common_mean_assumption": {"type": "boolean"}
+      }
+    }
+  }
+}

@@ -145,6 +145,8 @@ from .preregistration import (
 )
 from .stage2_formal import (
     FormalExperimentPlan,
+    OneShotReferencePlan,
+    OneShotReferenceRunner,
     PilotCellObservation,
     PilotThresholds,
     RecoverablePairedWaveRunner,
@@ -1952,6 +1954,7 @@ def _stable_reference_artifact(
     block_size: int,
     bundle_ref: str,
     bundle_hash: str,
+    metadata_extra: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
     """发布与恢复路径无关的 ``reference-result-v1``。
 
@@ -1962,9 +1965,17 @@ def _stable_reference_artifact(
     bias = getattr(result, "bias_reference")
     cross = getattr(result, "cross_reference")
     ranking = getattr(result, "ranking_reference")
-    selected = getattr(result, "selected_sample_count_per_stream")
+    selected = getattr(result, "selected_sample_count_per_stream", None)
     processed = getattr(result, "processed_sample_count_per_stream")
-    scope = str(getattr(result, "scope"))
+    scope = str(getattr(result, "scope", "local_fixture"))
+    metadata: dict[str, object] = {
+        "candidate_status": str(getattr(result, "status")),
+        "converged": bool(getattr(result, "converged", True)),
+        "weighting_assumptions": dict(getattr(result, "weighting_assumptions", {})),
+        "qualification_gate_hash": None,
+    }
+    if metadata_extra:
+        metadata.update(dict(metadata_extra))
     payload: dict[str, object] = {
         "schema_version": "reference-result-v1",
         "reference_id": reference_id,
@@ -1977,12 +1988,7 @@ def _stable_reference_artifact(
         "registry_hash": str(getattr(result, "registry_hash")),
         "scope": scope,
         "formal_eligible": False,
-        "metadata": {
-            "candidate_status": str(getattr(result, "status")),
-            "converged": bool(getattr(result, "converged")),
-            "weighting_assumptions": dict(getattr(result, "weighting_assumptions")),
-            "qualification_gate_hash": None,
-        },
+        "metadata": metadata,
         "tensor_bundle_ref": bundle_ref,
         "tensor_bundle_manifest_hash": bundle_hash,
     }
@@ -2019,28 +2025,80 @@ def _run_stage2_reference(
     plan, plan_refs = _stage2_reference_plan(request, root, context)
     sampling = upstream_sampling
     maximum = plan.candidate_sample_counts[-1]
+    sizing_draws = sampling.draws("reference_sizing", maximum)
     result = StreamingReferenceSizer(context.provider).run(
         plan,
-        draws_a=sampling.draws("reference_A", maximum),
-        draws_b=sampling.draws("reference_B", maximum),
+        # Keep the old positional API available for direct callers, while the
+        # task runner always uses the independent sizing stream.
+        draws_a=(),
+        draws_b=(),
+        draws_sizing=sizing_draws,
         artifact_root=store.root / "resume" / "reference-sizing",
     )
+    if not result.converged or result.selected_sample_count_per_stream is None:
+        raise _blocked(
+            BlockerCode.CONTRACT_UNFROZEN,
+            "stage2_reference_sizing",
+            "reference sizing 未达到预注册收敛条件，禁止创建 one-shot A/B",
+            retryable=False,
+            evidence_refs=inputs.references,
+        )
+    final_count = result.selected_sample_count_per_stream
+    one_shot_plan = OneShotReferencePlan(
+        reference_id=plan.reference_id,
+        sizing_result_hash=result.scientific_artifact_hash,
+        sample_count_per_stream=final_count,
+        block_size=plan.block_size,
+    )
+    final_a = sampling.draws("reference_A", final_count)
+    final_b = sampling.draws("reference_B", final_count)
+    one_shot = OneShotReferenceRunner(context.provider).run(
+        one_shot_plan,
+        draws_a=final_a,
+        draws_b=final_b,
+        sizing_draws=sizing_draws,
+        artifact_root=store.root / "resume" / "reference-final",
+    )
+    if one_shot.status != "COMPLETE":
+        raise _blocked(
+            BlockerCode.CONTRACT_UNFROZEN,
+            "stage2_reference_one_shot",
+            f"one-shot A/B 未完成：{one_shot.status}",
+            retryable=False,
+            evidence_refs=inputs.references,
+        )
     bundle_path = store.root / "tensor-bundles" / "reference-final"
     bundle = _publish_or_load_bundle(
         bundle_path,
         {
-            "bias_reference": result.bias_reference,
-            "cross_reference": result.cross_reference,
-            "ranking_reference": result.ranking_reference,
+            "bias_reference": one_shot.bias_reference,
+            "cross_reference": one_shot.cross_reference,
+            "ranking_reference": one_shot.ranking_reference,
+            "uncertainty": {
+                "bias_variance": one_shot.uncertainty.bias_variance,
+                "cross_variance": one_shot.uncertainty.cross_variance,
+                "ranking_variance": one_shot.uncertainty.ranking_variance,
+            },
+            "sequence_variance": one_shot.sequence_variance,
         },
     )
     bundle_ref = bundle_path.relative_to(root).as_posix()
     reference = _stable_reference_artifact(
         reference_id=plan.reference_id,
-        result=result,
+        result=one_shot,
         block_size=plan.block_size,
         bundle_ref=bundle_ref,
         bundle_hash=bundle.manifest_sha256,
+        metadata_extra={
+            "one_shot": True,
+            "sizing_result_hash": result.scientific_artifact_hash,
+            "sizing_stream": "reference_sizing",
+            "final_streams": ["reference_A", "reference_B"],
+            "sizing_sample_count_per_stream": result.processed_sample_count_per_stream,
+            "final_sample_count_per_stream": one_shot.processed_sample_count_per_stream,
+            "uncertainty": one_shot.uncertainty.to_dict(),
+            "sequence_variance_hash": _vector_digest(one_shot.sequence_variance),
+        },
     )
     convergence: dict[str, JSONValue] = {
         "schema_version": "stage2-reference-convergence-report-v1",
@@ -2050,9 +2108,17 @@ def _run_stage2_reference(
         "selected_sample_count_per_stream": result.selected_sample_count_per_stream,
         "processed_sample_count_per_stream": result.processed_sample_count_per_stream,
         "points": [point.to_dict() for point in result.points],  # type: ignore[list-item]
+        "sizing_result_hash": result.scientific_artifact_hash,
+        "one_shot_plan": one_shot_plan.to_dict(),
+        "one_shot_result": one_shot.to_dict(),
+        "sizing_stream": "reference_sizing",
+        "final_streams": ["reference_A", "reference_B"],
+        "final_sample_count_per_stream": one_shot.processed_sample_count_per_stream,
+        "reference_uncertainty": one_shot.uncertainty.to_dict(),
         "provider": context.to_payload(),
         "sampling_plan_hash": sampling.digest,
         "recovery_semantics": "authoritative_block_pair_commits",
+        "reference_protocol": "authoritative_sizing_and_one_shot_block_pair_commits",
         "formal_eligible": False,
     }
     payload_by_kind: dict[str, Mapping[str, JSONValue]] = {
