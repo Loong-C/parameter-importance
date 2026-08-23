@@ -524,7 +524,10 @@ def _repository_identity(repository_root: Path) -> _RepositoryIdentity:
             path = _resolve(root, relative, f"repository_source:{relative}")
             hashes[relative] = _file_sha256(path, f"repository_source:{relative}")
             committed = _git_bytes(root, "show", f"{head}:{relative}")
-            if hashlib.sha256(committed).hexdigest() != hashes[relative]:
+            # Git's Windows checkout may normalize LF blobs to CRLF.  Compare
+            # canonical line endings for the byte identity check; the separate
+            # ``git diff --quiet`` below still catches every content change.
+            if committed.replace(b"\r\n", b"\n") != path.read_bytes().replace(b"\r\n", b"\n"):
                 errors.append(f"repository_source:{relative}:WORKTREE_DRIFT")
             _git_text(root, "ls-files", "--error-unmatch", "--", relative)
         except G20Blocked as error:
