@@ -1,0 +1,26 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://parameter-importance.invalid/schemas/shared/stage2-hypothesis-contract-v1.json",
+  "title": "Stage 2.1 H1-H6 hypothesis contract",
+  "type": "object",
+  "additionalProperties": true,
+  "required": [
+    "schema_version", "contract_id", "preregistration_hash", "upstream_binding_hash",
+    "statistical_unit", "hypotheses", "decision_states", "initial_decisions",
+    "quality_gate_dependency", "multiplicity_policy", "hypothesis_contract_hash"
+  ],
+  "properties": {
+    "schema_version": {"const": "stage2-hypothesis-contract-v1"},
+    "contract_id": {"type": "string", "minLength": 1},
+    "preregistration_hash": {"$ref": "#/$defs/sha256"},
+    "upstream_binding_hash": {"$ref": "#/$defs/sha256"},
+    "statistical_unit": {"const": "independent_repetition"},
+    "hypotheses": {"type": "array", "minItems": 6, "maxItems": 6},
+    "decision_states": {"type": "array", "const": ["supported", "not_supported", "inconclusive"]},
+    "initial_decisions": {"type": "object", "minProperties": 6},
+    "quality_gate_dependency": {"type": "string", "minLength": 1},
+    "multiplicity_policy": {"type": "string", "minLength": 1},
+    "hypothesis_contract_hash": {"$ref": "#/$defs/sha256"}
+  },
+  "$defs": {"sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}}
+}

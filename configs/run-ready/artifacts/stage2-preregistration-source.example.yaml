@@ -1,0 +1,47 @@
+# S2.1 source fields. The task runner resolves the seed/provenance hashes and publishes
+# the canonical, content-addressed stage2-preregistration-v1 JSON before any draw.
+schema_version: stage2-preregistration-source-v1
+registration_id: stage2-s2.1-fixed-state-estimator-v1
+gate_id: stage2.G2.0
+formula_version: stage2-fixed-state-local-gradient-square-v1
+state: FROZEN
+estimand:
+  name: fixed_state_local_gradient_space_mean_square
+  theoretical_target: C_star=mu_k^2
+  eta_eval: 1.0
+  checkpoint_policy: immutable_within_reference_and_repetition
+  optimizer_step: forbidden
+  scheduler_step: forbidden
+  gradient_clipping: disabled
+  weight_decay: disabled
+estimators:
+  raw: local_gradient_space_importance_raw
+  double: double_sample_gradient_importance
+  u: microbatch_u_statistic
+  independent_probe_loss: prohibited_from_stage2_estimator_comparison
+models: [pythia-14m, pythia-31m-deduped]
+training_stages: [initialization, early, mid_late]
+candidate_batch_sizes: [32, 64, 128, 256]
+candidate_microbatch_counts: [2, 4, 8, 16, 32]
+microbatch_selection_order: [32, 16, 8, 4]
+sampling_streams: [reference_sizing, reference_A, reference_B, pilot, confirmatory]
+top_fractions: [0.0001, 0.001, 0.01, 0.05]
+primary_cells: 6
+selection:
+  raw_bias_slope_interval: [0.8, 1.2]
+  corrected_nmse_noninferiority_ratio: 1.10
+  spearman_difference_lower: -0.02
+  overlap_1pct_difference_lower: -0.03
+  online_cost_ratio_upper: 1.25
+  max_repetitions: 64
+  m_scan_is_result_blind: true
+  b_scan_is_result_blind: true
+signed_policy:
+  clamp_min_zero: false
+  absolute_value_before_bias: false
+  negative_u_values_preserved: true
+quality_gates: [fixed_state, sample_independence, reference_convergence, result_completeness, finite_numeric_values, fair_total_draw_budget, replayability]
+amendment:
+  schema_version: stage2-preregistration-amendment-v1
+  append_only: true
+  generated_before_confirmatory_draws: true

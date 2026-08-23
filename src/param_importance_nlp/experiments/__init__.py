@@ -78,6 +78,12 @@ from .stage2_formal import (
     Stage2RecommendationEngine,
     StreamingReferenceSizer,
 )
+from .preregistration import (
+    build_stage2_amendment_template,
+    build_stage2_hypothesis_contract,
+    build_stage2_preregistration,
+    validate_stage2_preregistration,
+)
 from .stage3_formal import (
     CapturedEndpoint,
     EndpointCaptureAdapter,
@@ -282,6 +288,10 @@ __all__ = [
     "RecoverablePairedWaveRunner",
     "SafeTensorTreeCodec",
     "StreamingReferenceSizer",
+    "build_stage2_amendment_template",
+    "build_stage2_hypothesis_contract",
+    "build_stage2_preregistration",
+    "validate_stage2_preregistration",
     "assess_reference_convergence",
     "build_fixture_estimator_decision",
     "build_fixture_quadrature_decision",

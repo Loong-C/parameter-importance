@@ -1,0 +1,47 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://parameter-importance.invalid/schemas/shared/stage2-preregistration-v1.json",
+  "title": "Stage 2.1 fixed-state estimator preregistration",
+  "type": "object",
+  "additionalProperties": true,
+  "required": [
+    "schema_version", "registration_id", "scope", "state", "gate_id", "stage",
+    "formula_version", "estimand", "estimators", "signed_analysis_policy",
+    "factors", "sampling", "statistics", "equivalence_and_precision",
+    "selection_algorithm", "resource_limits", "endpoints", "primary",
+    "thresholds", "quality_gates", "hypothesis_decision_states", "decision_tree",
+    "provenance", "preregistration_hash"
+  ],
+  "properties": {
+    "schema_version": {"const": "stage2-preregistration-v1"},
+    "registration_id": {"type": "string", "minLength": 1},
+    "scope": {"enum": ["local_fixture", "formal"]},
+    "state": {"const": "FROZEN"},
+    "gate_id": {"const": "stage2.G2.0"},
+    "stage": {"const": 2},
+    "formula_version": {"const": "stage2-fixed-state-local-gradient-square-v1"},
+    "estimand": {"$ref": "#/$defs/object"},
+    "estimators": {"type": "object", "required": ["raw", "double", "u", "independent_probe_loss"]},
+    "signed_analysis_policy": {"$ref": "#/$defs/object"},
+    "factors": {"$ref": "#/$defs/object"},
+    "sampling": {"$ref": "#/$defs/object"},
+    "statistics": {"$ref": "#/$defs/object"},
+    "equivalence_and_precision": {"$ref": "#/$defs/object"},
+    "selection_algorithm": {"$ref": "#/$defs/object"},
+    "resource_limits": {"$ref": "#/$defs/object"},
+    "endpoints": {"type": "array", "minItems": 1},
+    "primary": {"$ref": "#/$defs/object"},
+    "thresholds": {"$ref": "#/$defs/object"},
+    "quality_gates": {"type": "array", "minItems": 1},
+    "hypothesis_decision_states": {
+      "type": "array", "const": ["supported", "not_supported", "inconclusive"]
+    },
+    "decision_tree": {"$ref": "#/$defs/object"},
+    "provenance": {"$ref": "#/$defs/object"},
+    "preregistration_hash": {"$ref": "#/$defs/sha256"}
+  },
+  "$defs": {
+    "object": {"type": "object"},
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+  }
+}
