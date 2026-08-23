@@ -938,7 +938,11 @@ def _runtime_cell_configs(
             output_section = resolved.section("artifacts")
             output_dir = str(output_section["output_dir"])
             output_parts = PurePosixPath(output_dir).parts
-            if not output_parts or output_parts[-1] != str(expected["cell_id"]):
+            planned_cell_ids = {str(item["cell_id"]) for item in plan["cells"]}
+            if (
+                str(expected["cell_id"]) not in output_parts
+                or any(item != str(expected["cell_id"]) and item in output_parts for item in planned_cell_ids)
+            ):
                 mismatches.append("artifacts.output_dir.cell_id")
         except (KeyError, TypeError, ValueError):
             mismatches.append("artifacts.output_dir")
