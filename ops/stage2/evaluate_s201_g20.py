@@ -42,11 +42,31 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _data_index_path(data_root: Path, value: Path) -> Path:
+    """Read an optional input index only from DATA_ROOT, without symlinks."""
+
+    root = data_root.absolute()
+    candidate = value if value.is_absolute() else root / value
+    candidate = candidate.absolute()
+    current = Path(candidate.anchor)
+    for part in candidate.parts[1:] if candidate.anchor else candidate.parts:
+        current = current / part
+        if current.is_symlink():
+            raise ValueError("--input-index may not traverse a symlink")
+    resolved = candidate.resolve(strict=False)
+    try:
+        resolved.relative_to(root.resolve(strict=False))
+    except ValueError as error:
+        raise ValueError("--input-index must be below --data-root") from error
+    return resolved
+
+
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     try:
         if args.input_index is not None:
-            value = json.loads(args.input_index.read_text(encoding="utf-8"))
+            index_path = _data_index_path(args.data_root, args.input_index)
+            value = json.loads(index_path.read_text(encoding="utf-8"))
             if not isinstance(value, dict):
                 raise ValueError("--input-index must contain a JSON object")
             refs = {kind: value[kind] for kind in ARTIFACT_KINDS}
