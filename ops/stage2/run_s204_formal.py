@@ -1187,6 +1187,7 @@ def execute_with_task_runtime(
                 event_path,
                 {
                     "event": "STARTED",
+                    "status": "IN_PROGRESS",
                     "cell_id": current_cell_id,
                     "attempt_id": attempt_id,
                     "run_kind": run_kind,
