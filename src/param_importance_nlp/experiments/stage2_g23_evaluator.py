@@ -20,6 +20,9 @@ import math
 import os
 from pathlib import Path, PurePosixPath
 import re
+import random
+import shutil
+import subprocess
 import tempfile
 import time
 from typing import Mapping, Sequence
@@ -38,7 +41,8 @@ from param_importance_nlp.runtime.task_artifacts import (
 from param_importance_nlp.runtime.task_runtime import TaskRunResult, TaskRunStatus
 from param_importance_nlp.runtime.tensor_bundle import load_tensor_bundle
 
-from .stage2_formal import _ReferenceSnapshotStore, _vector_digest
+from .stage2_formal import _ReferenceShardStore, _ReferenceSnapshotStore, _vector_digest
+from .sampling import DrawStreamManifest, SamplingPlan
 
 
 SCHEMA_VERSION = "stage2-g23-reference-evaluation-v1"
@@ -92,6 +96,10 @@ def _finite(value: object, field: str) -> float:
 def _path(value: object, field: str) -> str:
     if not isinstance(value, str) or not value or "\\" in value:
         raise G23Blocked(f"{field}:LOGICAL_PATH_REQUIRED")
+    if value.startswith("/") or value.endswith("/") or "//" in value or re.match(r"^[A-Za-z]:", value):
+        raise G23Blocked(f"{field}:PATH_ESCAPE")
+    if any(part == "" for part in value.split("/")):
+        raise G23Blocked(f"{field}:PATH_ESCAPE")
     parsed = PurePosixPath(value)
     if parsed.is_absolute() or any(part in {"", ".", ".."} for part in parsed.parts):
         raise G23Blocked(f"{field}:PATH_ESCAPE")
@@ -102,6 +110,11 @@ def _reject_symlink_chain(root: Path, logical: str, field: str) -> None:
     """Reject symlink indirection even when its resolved target stays in root."""
 
     current = root
+    try:
+        if current.is_symlink():
+            raise G23Blocked(f"{field}:SYMLINK_FORBIDDEN")
+    except OSError as error:
+        raise G23Blocked(f"{field}:UNREADABLE") from error
     for part in PurePosixPath(logical).parts:
         current = current / part
         try:
@@ -250,6 +263,16 @@ def _u_from_moments(moment: Mapping[str, object], field: str) -> dict[str, np.nd
     return {name: (g1[name] * g1[name] - g2[name]) / denominator for name in g1}
 
 
+def _weighted_mean_from_moments(moment: Mapping[str, object], field: str) -> dict[str, np.ndarray]:
+    if not isinstance(moment, Mapping):
+        raise G23Blocked(f"{field}:MOMENTS_REQUIRED")
+    n1 = _finite(moment.get("n1"), f"{field}.n1")
+    if n1 <= 0.0:
+        raise G23Blocked(f"{field}:WEIGHT_DENOMINATOR_INVALID")
+    g1 = _vector(moment.get("g1"), f"{field}.g1")
+    return {name: value / n1 for name, value in g1.items()}
+
+
 def _merge_moments(left: Mapping[str, object], right: Mapping[str, object], field: str) -> dict[str, object]:
     a = _vector(left["g1"], f"{field}.left.g1")
     b = _vector(right["g1"], f"{field}.right.g1")
@@ -324,13 +347,24 @@ def _digest_bytes(path: Path) -> str:
 def _append_attempt_index(index: Path, artifact_hash: str) -> None:
     """Append an attempt hash under an exclusive lock and atomic replace."""
 
+    index.parent.mkdir(parents=True, exist_ok=True)
     lock = index.with_name(index.name + ".lock")
     descriptor = -1
     for _ in range(200):
         try:
-            descriptor = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            if lock.is_symlink():
+                raise RuntimeError("G23_ATTEMPT_INDEX_LOCK_SYMLINK")
+            flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
+            nofollow = getattr(os, "O_NOFOLLOW", 0)
+            descriptor = os.open(lock, flags | nofollow, 0o600)
             break
         except FileExistsError:
+            try:
+                if lock.is_symlink() or time.time() - lock.stat().st_mtime > 300.0:
+                    lock.unlink(missing_ok=True)
+                    continue
+            except OSError:
+                pass
             time.sleep(0.005)
     if descriptor < 0:
         raise RuntimeError("G23_ATTEMPT_INDEX_LOCK_TIMEOUT")
@@ -349,6 +383,16 @@ def _append_attempt_index(index: Path, artifact_hash: str) -> None:
                 handle.flush()
                 os.fsync(handle.fileno())
             os.replace(temporary, index)
+            try:
+                parent_fd = os.open(index.parent, os.O_RDONLY)
+                try:
+                    os.fsync(parent_fd)
+                finally:
+                    os.close(parent_fd)
+            except OSError:
+                # Windows does not expose directory fsync; the atomic replace
+                # remains the commit point there.
+                pass
         finally:
             if os.path.exists(temporary):
                 os.unlink(temporary)
@@ -387,6 +431,7 @@ class CellInput:
 @dataclass(slots=True)
 class _CellEvidence:
     source: CellInput
+    workspace_root: Path | None = None
     result: TaskRunResult | None = None
     result_payload: Mapping[str, object] | None = None
     reference: LoadedTaskArtifact | None = None
@@ -395,8 +440,10 @@ class _CellEvidence:
     bundle_state: Mapping[str, object] | None = None
     bundle_manifest_hash: str | None = None
     sizing_states: list[Mapping[str, object]] | None = None
+    sizing_root: Path | None = None
     final_state: Mapping[str, object] | None = None
     final_root: Path | None = None
+    external_payloads: Mapping[str, Mapping[str, object]] | None = None
     identities: dict[str, str] = None  # type: ignore[assignment]
     reasons: list[str] = None  # type: ignore[assignment]
 
@@ -474,6 +521,79 @@ def _artifact(root: Path, result: TaskRunResult, kind: str) -> LoadedTaskArtifac
     return loaded
 
 
+class _ShardSequence(Sequence[dict[str, np.ndarray]]):
+    """Lazy view over content-addressed block shards.
+
+    Validation walks every reference once, but vectors are opened again only
+    when a statistic/replicate needs that block.  A snapshot therefore never
+    creates a second in-memory copy of the complete evidence array.
+    """
+
+    def __init__(self, store: _ReferenceShardStore, refs: Sequence[Mapping[str, object]], field: str) -> None:
+        self.store = store
+        self.refs = tuple(dict(ref) for ref in refs)
+        self.field = field
+
+    def __len__(self) -> int:
+        return len(self.refs)
+
+    def __getitem__(self, index: int | slice) -> dict[str, np.ndarray] | list[dict[str, np.ndarray]]:
+        if isinstance(index, slice):
+            return [self[index_value] for index_value in range(*index.indices(len(self)))]
+        if index < 0:
+            index += len(self.refs)
+        if index < 0 or index >= len(self.refs):
+            raise IndexError(index)
+        try:
+            vector, _, _ = self.store.load(self.refs[index])
+        except (OSError, TypeError, ValueError) as error:
+            raise G23Blocked(f"{self.field}[{index}]:SHARD_INVALID") from error
+        return vector
+
+
+class _CombinedSequence(Sequence[Mapping[str, np.ndarray]]):
+    """Lazy concatenation used for diagnostics spanning A and B."""
+
+    def __init__(self, left: Sequence[Mapping[str, np.ndarray]], right: Sequence[Mapping[str, np.ndarray]]) -> None:
+        self.left, self.right = left, right
+
+    def __len__(self) -> int:
+        return len(self.left) + len(self.right)
+
+    def __getitem__(self, index: int | slice) -> Mapping[str, np.ndarray] | list[Mapping[str, np.ndarray]]:
+        if isinstance(index, slice):
+            return [self[item] for item in range(*index.indices(len(self)))]
+        if index < 0:
+            index += len(self)
+        if index < 0 or index >= len(self):
+            raise IndexError(index)
+        return self.left[index] if index < len(self.left) else self.right[index - len(self.left)]
+
+
+def _load_shard_records(
+    resume_root: Path,
+    raw_refs: object,
+    field: str,
+) -> tuple[_ShardSequence, list[float], list[Mapping[str, object]]]:
+    if not isinstance(raw_refs, list) or not raw_refs:
+        raise G23Blocked(f"{field}:SHARD_REFS_REQUIRED")
+    store = _ReferenceShardStore(resume_root)
+    weights: list[float] = []
+    refs: list[Mapping[str, object]] = []
+    for index, raw in enumerate(raw_refs):
+        if not isinstance(raw, Mapping):
+            raise G23Blocked(f"{field}[{index}]:SHARD_REF_INVALID")
+        try:
+            vector, weight, digest = store.load(raw)
+        except (OSError, TypeError, ValueError) as error:
+            raise G23Blocked(f"{field}[{index}]:SHARD_INVALID") from error
+        if digest != raw.get("shard_hash"):
+            raise G23Blocked(f"{field}[{index}]:SHARD_HASH_MISMATCH")
+        weights.append(_finite(weight, f"{field}[{index}].weight"))
+        refs.append(dict(raw))
+    return _ShardSequence(store, refs, field), weights, refs
+
+
 def _load_resume_commits(
     root: Path,
     resume_root: Path,
@@ -523,6 +643,33 @@ def _load_resume_commits(
             raise G23Blocked(f"resume:{schema}:MANIFEST_HASH")
         if not isinstance(state, Mapping) or state.get("schema_version") != schema:
             raise G23Blocked(f"resume:{schema}:STATE_SCHEMA")
+        if "blocks_a" in state or "blocks_b" in state or "block_weights_a" in state or "block_weights_b" in state:
+            raise G23Blocked(f"resume:{schema}:RAW_BLOCKS_FORBIDDEN_USE_SHARDS")
+        raw_refs_a, raw_refs_b = state.get("shard_refs_a"), state.get("shard_refs_b")
+        if not isinstance(raw_refs_a, list) or not isinstance(raw_refs_b, list):
+            raise G23Blocked(f"resume:{schema}:SHARD_REFS_MISSING")
+        expected_pairs = int(state.get("processed_block_pairs", 0))
+        if expected_pairs <= 0 or len(raw_refs_a) != expected_pairs:
+            raise G23Blocked(f"resume:{schema}:SHARD_PREFIX_COUNT_MISMATCH")
+        if schema == "stage2-reference-one-shot-progress-v1" and len(raw_refs_b) != expected_pairs:
+            raise G23Blocked(f"resume:{schema}:SHARD_PREFIX_COUNT_MISMATCH")
+        if schema == "stage2-reference-progress-state-v1" and state.get("sizing_stream") is True and raw_refs_b:
+            raise G23Blocked(f"resume:{schema}:SIZING_B_SHARDS_FORBIDDEN")
+        try:
+            vectors_a, weights_a, _ = _load_shard_records(resume_root, raw_refs_a, f"resume.{schema}.shard_refs_a")
+            vectors_b, weights_b, _ = (
+                _load_shard_records(resume_root, raw_refs_b, f"resume.{schema}.shard_refs_b")
+                if raw_refs_b else ([], [], [])
+            )
+        except G23Blocked:
+            raise
+        rebuilt_a = _moments_from_blocks(vectors_a, weights_a, f"resume.{schema}.moments_a")
+        _moments_equal(rebuilt_a, state.get("a"), f"resume.{schema}.moments_a")
+        if vectors_b:
+            rebuilt_b = _moments_from_blocks(vectors_b, weights_b, f"resume.{schema}.moments_b")
+            _moments_equal(rebuilt_b, state.get("b"), f"resume.{schema}.moments_b")
+        if int(state.get("shard_count", -1)) != len(raw_refs_a) + len(raw_refs_b):
+            raise G23Blocked(f"resume:{schema}:SHARD_COUNT_DIGEST_MISMATCH")
         try:
             state_digest = _ReferenceSnapshotStore._state_digest(state)
         except (KeyError, TypeError, ValueError) as error:
@@ -650,8 +797,212 @@ def _validate_registry_artifact(value: object, registry_hash: str, vector_names:
     return value
 
 
-def _prepare_cell(root: Path, source: CellInput) -> _CellEvidence:
-    evidence = _CellEvidence(source)
+def _validate_producer_provenance(
+    convergence: Mapping[str, object],
+    *,
+    repo_root: Path | None,
+) -> str:
+    provenance = convergence.get("producer_provenance")
+    if not isinstance(provenance, Mapping) or provenance.get("schema_version") != "stage2-reference-producer-provenance-v2":
+        raise G23Blocked("producer_provenance:TRUSTED_REPOSITORY_BINDING_REQUIRED")
+    head = _commit(provenance.get("head_commit"), "producer_provenance.head_commit")
+    tree = provenance.get("head_tree")
+    if not isinstance(tree, str) or _COMMIT.fullmatch(tree) is None:
+        raise G23Blocked("producer_provenance.head_tree:GIT_OBJECT_REQUIRED")
+    if provenance.get("tracked_clean") is not True:
+        raise G23Blocked("producer_provenance:TRACKED_FILES_NOT_CLEAN")
+    sources = provenance.get("source_bytes")
+    if not isinstance(sources, list) or not sources:
+        raise G23Blocked("producer_provenance.source_bytes:REQUIRED")
+    source_payload: list[Mapping[str, object]] = []
+    for index, item in enumerate(sources):
+        if not isinstance(item, Mapping) or set(item) != {"path", "sha256", "git_blob"}:
+            raise G23Blocked(f"producer_provenance.source_bytes[{index}]:FIELDS")
+        relative = _path(item.get("path"), f"producer_provenance.source_bytes[{index}].path")
+        source_payload.append(item)
+        _sha(item.get("sha256"), f"producer_provenance.source_bytes[{index}].sha256")
+        blob = item.get("git_blob")
+        if not isinstance(blob, str) or _COMMIT.fullmatch(blob) is None:
+            raise G23Blocked(f"producer_provenance.source_bytes[{index}].git_blob:GIT_OBJECT_REQUIRED")
+        if repo_root is not None:
+            path = _resolve(repo_root, relative)
+            if not path.is_file() or _digest_bytes(path) != item.get("sha256"):
+                raise G23Blocked(f"producer_provenance.source_bytes[{index}]:SOURCE_DRIFT")
+            try:
+                blob = subprocess.run(
+                    ["git", "-C", str(repo_root), "hash-object", relative],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                ).stdout.strip()
+            except (OSError, subprocess.SubprocessError) as error:
+                raise G23Blocked("producer_provenance:GIT_UNAVAILABLE") from error
+            if blob != item.get("git_blob"):
+                raise G23Blocked(f"producer_provenance.source_bytes[{index}]:GIT_BLOB_DRIFT")
+    if canonical_json_hash(
+        {
+            "head_commit": head,
+            "head_tree": tree,
+            "tracked_clean": True,
+            "source_bytes": source_payload,
+        }
+    ) != provenance.get("provenance_hash"):
+        raise G23Blocked("producer_provenance:HASH_MISMATCH")
+    if repo_root is not None:
+        try:
+            actual_head = subprocess.run(
+                ["git", "-C", str(repo_root), "rev-parse", "HEAD"],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            actual_tree = subprocess.run(
+                ["git", "-C", str(repo_root), "rev-parse", "HEAD^{tree}"],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            status = subprocess.run(
+                ["git", "-C", str(repo_root), "status", "--porcelain", "--untracked-files=no"],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+        except (OSError, subprocess.SubprocessError) as error:
+            raise G23Blocked("producer_provenance:GIT_UNAVAILABLE") from error
+        if actual_head != head or actual_tree != tree or status:
+            raise G23Blocked("producer_provenance:REPOSITORY_HEAD_OR_CLEAN_STATE_DRIFT")
+    if convergence.get("stage2_reference_producer_commit") != head:
+        raise G23Blocked("producer_commit:PROVENANCE_MISMATCH")
+    return head
+
+
+def _validate_external_lineage(
+    root: Path,
+    convergence: Mapping[str, object],
+    result: TaskRunResult,
+    *,
+    cell_id: str,
+) -> Mapping[str, Mapping[str, object]]:
+    raw = convergence.get("external_lineage")
+    if not isinstance(raw, Mapping):
+        raise G23Blocked("external_lineage:ALL_AUTHORITATIVE_REFS_REQUIRED")
+    expected = {
+        "s23_asset_resolution": "asset_resolution",
+        "s23_six_cell_manifest": "six_cell_manifest",
+        "resolved_config": "resolved_config",
+        "checkpoint_manifest": "checkpoint_manifest",
+        "model_manifest": "model_manifest",
+        "data_manifest": "data_manifest",
+        "tokenizer_manifest": "tokenizer_manifest",
+        "parameter_registry": "parameter_registry",
+        "preregistration": "preregistration",
+        "sizing_plan": "reference_sizing_plan",
+    }
+    loaded: dict[str, Mapping[str, object]] = {}
+    for name, kind in expected.items():
+        item = raw.get(name)
+        if not isinstance(item, Mapping):
+            raise G23Blocked(f"external_lineage.{name}:MISSING")
+        ref = item.get("commit_ref")
+        if not isinstance(ref, str):
+            raise G23Blocked(f"external_lineage.{name}.commit_ref:MISSING")
+        _reject_symlink_chain(root, _path(ref, f"external_lineage.{name}.commit_ref"), f"external_lineage.{name}.commit_ref")
+        try:
+            artifact = load_committed_task_artifact(root, ref, require_formal=True)
+        except (OSError, ValueError, TypeError) as error:
+            raise G23Blocked(f"external_lineage.{name}:INVALID") from error
+        if artifact.identity.artifact_kind != kind:
+            raise G23Blocked(f"external_lineage.{name}:KIND_MISMATCH")
+        if item.get("artifact_hash") != artifact.identity.artifact_hash or item.get("config_hash") != artifact.identity.config_hash or item.get("task_id") != artifact.identity.task_id or item.get("payload_hash") != canonical_json_hash(artifact.payload):
+            raise G23Blocked(f"external_lineage.{name}:IDENTITY_MISMATCH")
+        loaded[name] = artifact.payload
+    config = loaded["resolved_config"]
+    if config.get("config_hash") != result.config_hash and config.get("resolved_config_hash") != result.config_hash:
+        raise G23Blocked("external_lineage.resolved_config:CONFIG_MISMATCH")
+    preregistration = loaded["preregistration"]
+    if preregistration.get("schema_version") != "stage2-preregistration-v1" or preregistration.get("scope") != "formal":
+        raise G23Blocked("external_lineage.preregistration:FORMAL_SCOPE_REQUIRED")
+    supplied_prereg_hash = preregistration.get("preregistration_hash")
+    if not isinstance(supplied_prereg_hash, str) or canonical_json_hash({key: item for key, item in preregistration.items() if key != "preregistration_hash"}) != supplied_prereg_hash:
+        raise G23Blocked("external_lineage.preregistration:HASH_MISMATCH")
+    precision = preregistration.get("equivalence_and_precision")
+    if not isinstance(precision, Mapping) or not isinstance(precision.get("absolute_floors"), Mapping):
+        raise G23Blocked("external_lineage.preregistration:FORMULA_CONTRACT_MISSING")
+    manifest = loaded["s23_six_cell_manifest"]
+    if manifest.get("schema_version") != "stage2-s204-six-cell-manifest-v1" or manifest.get("status") != "READY" or manifest.get("scope") != "formal":
+        raise G23Blocked("external_lineage.s23_six_cell_manifest:FORMAL_READY_REQUIRED")
+    rows = manifest.get("checkpoints")
+    if not isinstance(rows, list) or tuple(item.get("cell_id") for item in rows if isinstance(item, Mapping)) != EXPECTED_CELL_IDS:
+        raise G23Blocked("external_lineage.s23_six_cell_manifest:CELL_SET_INVALID")
+    if not any(isinstance(item, Mapping) and item.get("cell_id") == cell_id for item in rows):
+        raise G23Blocked("external_lineage.s23_six_cell_manifest:CELL_MISSING")
+    return loaded
+
+
+def _validate_capacity_preflight(
+    root: Path,
+    convergence: Mapping[str, object],
+    external_payloads: Mapping[str, Mapping[str, object]],
+) -> Mapping[str, object]:
+    value = convergence.get("capacity_preflight")
+    if not isinstance(value, Mapping) or value.get("schema_version") != "stage2-reference-capacity-preflight-v1":
+        raise G23Blocked("capacity_preflight:REQUIRED")
+    declared = _sha(value.get("artifact_hash"), "capacity_preflight.artifact_hash")
+    if canonical_json_hash({key: item for key, item in value.items() if key != "artifact_hash"}) != declared:
+        raise G23Blocked("capacity_preflight:HASH_MISMATCH")
+    model = external_payloads.get("model_manifest", {})
+    parameter_count = value.get("parameter_count")
+    external_count = model.get("parameter_count") if isinstance(model, Mapping) else None
+    if isinstance(external_count, int) and not isinstance(external_count, bool) and parameter_count != external_count:
+        raise G23Blocked("capacity_preflight:PARAMETER_COUNT_DRIFT")
+    try:
+        count = int(parameter_count)
+        block_size = int(value.get("block_size"))
+        max_sample = int(value.get("candidate_max_sample_count_per_stream"))
+        max_blocks = int(value.get("max_block_count_per_stream"))
+    except (TypeError, ValueError) as error:
+        raise G23Blocked("capacity_preflight:FIELDS_INVALID") from error
+    if count <= 0 or block_size <= 0 or max_sample <= 0 or max_blocks != max_sample // block_size:
+        raise G23Blocked("capacity_preflight:FORMULA_FIELDS_INVALID")
+    expected_shards = max_blocks * 2 * count * 8
+    expected_moments = max_blocks * 4 * count * 8
+    expected_disk = int((expected_shards + expected_moments) * 1.20 + 64 * 1024**2)
+    if value.get("single_copy_shard_bytes") != expected_shards or value.get("snapshot_moment_bytes") != expected_moments or value.get("estimated_disk_bytes") != expected_disk:
+        raise G23Blocked("capacity_preflight:FORMULA_MISMATCH")
+    if value.get("disk_ok") is not True or value.get("ram_ok") is not True:
+        raise G23Blocked("capacity_preflight:FAIL_CLOSED_NOT_READY")
+    if shutil.disk_usage(root).free < expected_disk:
+        raise G23Blocked("capacity_preflight:CURRENT_FREE_DISK_INSUFFICIENT")
+    available_ram: int | None = None
+    try:
+        import ctypes
+
+        class _MemoryStatus(ctypes.Structure):
+            _fields_ = [("dwLength", ctypes.c_uint32), ("dwMemoryLoad", ctypes.c_uint32), ("ullTotalPhys", ctypes.c_uint64), ("ullAvailPhys", ctypes.c_uint64), ("ullTotalPageFile", ctypes.c_uint64), ("ullAvailPageFile", ctypes.c_uint64), ("ullTotalVirtual", ctypes.c_uint64), ("ullAvailVirtual", ctypes.c_uint64), ("sullAvailExtendedVirtual", ctypes.c_uint64)]
+
+        status = _MemoryStatus()
+        status.dwLength = ctypes.sizeof(_MemoryStatus)
+        if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
+            available_ram = int(status.ullAvailPhys)
+    except (AttributeError, OSError, TypeError):
+        pass
+    if available_ram is None:
+        try:
+            for line in Path("/proc/meminfo").read_text(encoding="ascii").splitlines():
+                if line.startswith("MemAvailable:"):
+                    available_ram = int(line.split()[1]) * 1024
+                    break
+        except (OSError, ValueError, IndexError):
+            pass
+    peak_ram = int(value.get("peak_ram_bytes", 0))
+    if available_ram is None or peak_ram <= 0 or available_ram < peak_ram:
+        raise G23Blocked("capacity_preflight:CURRENT_AVAILABLE_RAM_INSUFFICIENT_OR_UNKNOWN")
+    return value
+
+
+def _prepare_cell(root: Path, source: CellInput, *, repo_root: Path | None = None) -> _CellEvidence:
+    evidence = _CellEvidence(source, workspace_root=root)
     try:
         result, result_payload = _task_result(root, source)
         evidence.result, evidence.result_payload = result, result_payload
@@ -671,7 +1022,7 @@ def _prepare_cell(root: Path, source: CellInput) -> _CellEvidence:
             raise G23Blocked("convergence:FORMAL_SCOPE_REQUIRED")
         if cp.get("diagnostics_schema_version") != "stage2-reference-producer-diagnostics-v1":
             raise G23Blocked("convergence:DIAGNOSTICS_SCHEMA_REQUIRED")
-        producer_commit = _commit(cp.get("stage2_reference_producer_commit"), "stage2_reference_producer_commit")
+        producer_commit = _validate_producer_provenance(cp, repo_root=repo_root)
         six_rows = _validate_six_cell_manifest(cp.get("six_cell_manifest"))
         six_hash = _sha(cp.get("six_cell_manifest_hash"), "six_cell_manifest_hash")
         if six_hash != _sha(cp.get("six_cell_manifest", {}).get("manifest_hash"), "six_cell_manifest.manifest_hash"):  # type: ignore[union-attr]
@@ -682,10 +1033,46 @@ def _prepare_cell(root: Path, source: CellInput) -> _CellEvidence:
         row = next(item for item in six_rows if item.get("cell_id") == cell_id)
         if source.cell_id != cell_id:
             raise G23Blocked("cell_id:CALLER_REFERENCE_MISMATCH")
+        external_payloads = _validate_external_lineage(root, cp, result, cell_id=str(cell_id))
+        evidence.external_payloads = external_payloads
+        _validate_capacity_preflight(root, cp, external_payloads)
+        if canonical_json_hash(external_payloads["s23_six_cell_manifest"]) != canonical_json_hash(cp.get("six_cell_manifest")):
+            raise G23Blocked("six_cell_manifest:EXTERNAL_TASK_ARTIFACT_MISMATCH")
+        for identity_name, external_name in (
+            ("model_identity", "model_manifest"),
+            ("data_identity", "data_manifest"),
+            ("checkpoint_identity", "checkpoint_manifest"),
+        ):
+            identity = cp.get(identity_name)
+            external = external_payloads.get(external_name)
+            if not isinstance(identity, Mapping) or not isinstance(external, Mapping):
+                raise G23Blocked(f"{identity_name}:EXTERNAL_MANIFEST_MISSING")
+            for field_name in (
+                "asset_id", "revision", "model_id", "training_stage",
+                "checkpoint_id", "checkpoint_hash", "config_hash", "registry_hash",
+                "data_range_hash",
+            ):
+                if field_name in external and field_name in identity and external.get(field_name) != identity.get(field_name):
+                    raise G23Blocked(f"{identity_name}:{field_name}:EXTERNAL_MANIFEST_DRIFT")
+        metadata_bindings = result.metadata.get("identity_bindings") if isinstance(result.metadata, Mapping) else None
+        if not isinstance(metadata_bindings, Mapping):
+            raise G23Blocked("task_result.metadata.identity_bindings:MISSING")
+        for binding_key in (
+            "stage2_reference_producer_commit",
+            "producer_provenance",
+            "config_identity",
+            "checkpoint_identity",
+            "registry_identity",
+            "model_identity",
+            "data_identity",
+            "external_lineage",
+        ):
+            if metadata_bindings.get(binding_key) != cp.get(binding_key):
+                raise G23Blocked(f"task_result.identity_bindings.{binding_key}:DRIFT")
         config_identity = _identity_object(
             cp.get("config_identity"),
             "config_identity",
-            required=("config_hash", "full_hash", "task_id", "checkpoint_config_hash"),
+            required=("config_hash", "task_id", "checkpoint_config_hash"),
         )
         if config_identity.get("config_hash") != result.config_hash or config_identity.get("task_id") != result.task_id:
             raise G23Blocked("config_identity:RESULT_MISMATCH")
@@ -716,6 +1103,9 @@ def _prepare_cell(root: Path, source: CellInput) -> _CellEvidence:
         registry_artifact = _validate_registry_artifact(cp.get("parameter_registry_artifact"), registry_hash)
         if registry_artifact.get("artifact_hash") != registry_identity.get("parameter_registry_artifact_hash"):
             raise G23Blocked("parameter_registry_artifact:IDENTITY_HASH_MISMATCH")
+        external_registry = external_payloads.get("parameter_registry")
+        if external_registry is None or canonical_json_hash(external_registry) != canonical_json_hash(registry_artifact):
+            raise G23Blocked("parameter_registry_artifact:EXTERNAL_REF_MISMATCH")
         evidence.identities.update({
             "registry_hash": registry_hash,
             "checkpoint_hash": _sha(checkpoint_identity.get("checkpoint_hash"), "checkpoint_hash"),
@@ -731,6 +1121,9 @@ def _prepare_cell(root: Path, source: CellInput) -> _CellEvidence:
             raise G23Blocked("sizing_plan:HASH_MISMATCH")
         if canonical_json_hash({key: item for key, item in plan.items() if key != "artifact_hash"}) != evidence.identities["sizing_plan_hash"]:
             raise G23Blocked("sizing_plan:CONTENT_HASH_MISMATCH")
+        external_plan = external_payloads.get("sizing_plan")
+        if not isinstance(external_plan, Mapping) or canonical_json_hash(external_plan) != canonical_json_hash(plan):
+            raise G23Blocked("sizing_plan:EXTERNAL_TASK_ARTIFACT_MISMATCH")
         one_shot = cp.get("one_shot_result")
         if not isinstance(one_shot, Mapping):
             raise G23Blocked("one_shot_result:RAW_DIAGNOSTIC_MISSING")
@@ -743,15 +1136,28 @@ def _prepare_cell(root: Path, source: CellInput) -> _CellEvidence:
         if evidence.identities["stream_a_draw_hash"] == evidence.identities["stream_b_draw_hash"]:
             raise G23Blocked("draw_hash:STREAMS_NOT_INDEPENDENT")
         delta = cp.get("candidate_delta_sci")
-        if not isinstance(delta, Mapping) or delta.get("schema_version") != "stage2-reference-delta-sci-v1":
-            raise G23Blocked("delta_sci:EXPLICIT_SOURCE_REQUIRED")
+        if not isinstance(delta, Mapping) or delta.get("schema_version") != "stage2-reference-delta-sci-v2":
+            raise G23Blocked("delta_sci:SIZING_DERIVED_ARTIFACT_REQUIRED")
         delta_ref = _path(delta.get("source_ref"), "candidate_delta_sci.source_ref")
         delta_hash = _sha(delta.get("source_hash"), "candidate_delta_sci.source_hash")
         if cp.get("candidate_delta_sci_source") != delta_ref or cp.get("candidate_delta_sci_source_hash") != delta_hash:
             raise G23Blocked("delta_sci:SOURCE_BINDING_MISMATCH")
-        source_value = _load_json(root, delta_ref, "candidate_delta_sci.source")
-        if canonical_json_hash(source_value) != delta_hash:
-            raise G23Blocked("delta_sci:SOURCE_HASH_MISMATCH")
+        source_value = _load_json(root, delta_ref, "candidate_delta_sci")
+        source_artifact_hash = _sha(source_value.get("artifact_hash"), "candidate_delta_sci.artifact_hash")
+        if source_artifact_hash != delta_hash or source_value != {
+            key: item for key, item in delta.items()
+            if key not in {"source_ref", "source_hash", "source_artifact_hash"}
+        }:
+            raise G23Blocked("delta_sci:SIZING_DERIVED_SOURCE_DRIFT")
+        lineage_formula = cp.get("external_lineage", {}).get("preregistration") if isinstance(cp.get("external_lineage"), Mapping) else None
+        if not isinstance(lineage_formula, Mapping) or lineage_formula.get("artifact_hash") != cp.get("formula_contract_hash"):
+            raise G23Blocked("delta_sci:FORMULA_CONTRACT_BINDING_REQUIRED")
+        formula_payload = external_payloads.get("preregistration")
+        if not isinstance(formula_payload, Mapping) or cp.get("formula_contract") != formula_payload:
+            raise G23Blocked("delta_sci:FORMULA_CONTRACT_DRIFT")
+        if delta.get("formula_contract_hash") != cp.get("formula_contract_hash"):
+            raise G23Blocked("delta_sci:FORMULA_HASH_MISMATCH")
+        evidence.identities["sizing_delta_sci_hash"] = delta_hash
         one_shot_plan = cp.get("one_shot_plan")
         if not isinstance(one_shot_plan, Mapping) or one_shot_plan.get("schema_version") != "stage2-reference-one-shot-plan-v1":
             raise G23Blocked("one_shot_plan:SCHEMA_REQUIRED")
@@ -860,6 +1266,7 @@ def _prepare_cell(root: Path, source: CellInput) -> _CellEvidence:
             "stage2-reference-progress-state-v1",
             identities=sizing_expected,
         )
+        evidence.sizing_root = sizing_root
         final_states = _load_resume_commits(
             root,
             final_root,
@@ -882,6 +1289,8 @@ def _prepare_cell(root: Path, source: CellInput) -> _CellEvidence:
 def _sizing_vectors(evidence: _CellEvidence) -> tuple[list[int], list[dict[str, np.ndarray]], Mapping[str, object]]:
     if not evidence.sizing_states:
         raise G23Blocked("sizing:RAW_DIAGNOSTICS_MISSING")
+    if evidence.sizing_root is None:
+        raise G23Blocked("sizing:SHARD_ROOT_MISSING")
     plan = None
     if evidence.convergence is not None:
         plan = evidence.convergence.payload.get("sizing_plan")
@@ -901,53 +1310,45 @@ def _sizing_vectors(evidence: _CellEvidence) -> tuple[list[int], list[dict[str, 
     vectors: list[dict[str, np.ndarray]] = []
     for count in counts[-2:]:
         state = states_by_count[count]
-        raw_a, raw_b = state.get("blocks_a"), state.get("blocks_b")
-        raw_wa, raw_wb = state.get("block_weights_a"), state.get("block_weights_b")
-        if not isinstance(raw_a, list) or not isinstance(raw_b, list) or not isinstance(raw_wa, list) or not isinstance(raw_wb, list):
-            raise G23Blocked("sizing.blocks_and_weights:RAW_DIAGNOSTIC_MISSING")
-        blocks_a = [_vector(item, "sizing.blocks_a") for item in raw_a]
-        blocks_b = [_vector(item, "sizing.blocks_b") for item in raw_b]
-        weights_a = [_finite(item, "sizing.block_weights_a") for item in raw_wa]
-        weights_b = [_finite(item, "sizing.block_weights_b") for item in raw_wb]
-        moments_a = _moments_from_blocks(blocks_a, weights_a, "sizing.moments_a")
-        if all(weight == 0.0 for weight in weights_b):
-            moments = moments_a
-        else:
-            moments_b = _moments_from_blocks(blocks_b, weights_b, "sizing.moments_b")
-            moments = _merge_moments(moments_a, moments_b, "sizing.moments")
+        refs_a = state.get("shard_refs_a")
+        if not isinstance(refs_a, list) or not refs_a:
+            raise G23Blocked("sizing.shard_refs_a:SHARDS_REQUIRED")
+        store = _ReferenceShardStore(evidence.sizing_root)
+        assumptions = state.get("weighting_assumptions")
+        if not isinstance(assumptions, Mapping):
+            raise G23Blocked("sizing.weighting_assumptions:MISSING")
+        moments_a = _moments_from_shards(store, refs_a, assumptions)
+        moments = moments_a
         if not isinstance(state.get("a"), Mapping) or not isinstance(state.get("b"), Mapping):
             raise G23Blocked("sizing.moments:STATE_MISSING")
-        _moments_equal(moments_a, state["a"], "sizing.moments_a")
-        if not all(weight == 0.0 for weight in weights_b):
-            _moments_equal(moments_b, state["b"], "sizing.moments_b")  # type: ignore[possibly-undefined]
+        rebuilt_a = moments_a.to_state()
+        _moments_equal(rebuilt_a, state["a"], "sizing.moments_a")
         vectors.append(_u_from_moments(moments, "sizing.u"))
     return counts[-2:], vectors, plan
 
 
-def _final_vectors(evidence: _CellEvidence) -> tuple[dict[str, np.ndarray], dict[str, np.ndarray], dict[str, np.ndarray], list[dict[str, np.ndarray]], list[dict[str, np.ndarray]], Mapping[str, np.ndarray]]:
+def _final_vectors(evidence: _CellEvidence) -> tuple[dict[str, np.ndarray], dict[str, np.ndarray], dict[str, np.ndarray], Sequence[Mapping[str, np.ndarray]], Sequence[Mapping[str, np.ndarray]], Mapping[str, np.ndarray]]:
     if evidence.final_state is None or evidence.bundle_state is None:
         raise G23Blocked("final:RAW_DIAGNOSTICS_MISSING")
     state = evidence.final_state
-    raw_a, raw_b = state.get("blocks_a"), state.get("blocks_b")
-    if not isinstance(raw_a, list) or not isinstance(raw_b, list) or not raw_a or len(raw_a) != len(raw_b):
-        raise G23Blocked("final.blocks_a_b:RAW_DIAGNOSTICS_MISSING")
-    blocks_a = [_vector(item, "final.blocks_a") for item in raw_a]
-    blocks_b = [_vector(item, "final.blocks_b") for item in raw_b]
-    raw_wa, raw_wb = state.get("block_weights_a"), state.get("block_weights_b")
-    if not isinstance(raw_wa, list) or not isinstance(raw_wb, list):
-        raise G23Blocked("final.block_weights:RAW_DIAGNOSTIC_MISSING")
-    weights_a = [_finite(item, "final.block_weights_a") for item in raw_wa]
-    weights_b = [_finite(item, "final.block_weights_b") for item in raw_wb]
-    if len(weights_a) != len(blocks_a) or len(weights_b) != len(blocks_b):
-        raise G23Blocked("final.block_weights:COUNT_MISMATCH")
+    if evidence.final_root is None:
+        raise G23Blocked("final:SHARD_ROOT_MISSING")
+    blocks_a, weights_a, _ = _load_shard_records(
+        evidence.final_root, state.get("shard_refs_a"), "final.shard_refs_a"
+    )
+    blocks_b, weights_b, _ = _load_shard_records(
+        evidence.final_root, state.get("shard_refs_b"), "final.shard_refs_b"
+    )
+    if len(blocks_a) != len(blocks_b):
+        raise G23Blocked("final.shard_prefix:COUNT_MISMATCH")
     for left, right in zip(blocks_a, blocks_b):
         _compatible(left, right, "final.blocks")
-    all_blocks = blocks_a + blocks_b
-    mean_a, mean_b, mean_all = _mean(blocks_a, "final.mean_a"), _mean(blocks_b, "final.mean_b"), _mean(all_blocks, "final.mean_all")
-    if not isinstance(state.get("a"), Mapping) or not isinstance(state.get("b"), Mapping):
-        raise G23Blocked("final.moments:STATE_MISSING")
     moments_a = _moments_from_blocks(blocks_a, weights_a, "final.moments_a")
     moments_b = _moments_from_blocks(blocks_b, weights_b, "final.moments_b")
+    mean_a, mean_b = _weighted_mean_from_moments(moments_a, "final.mean_a"), _weighted_mean_from_moments(moments_b, "final.mean_b")
+    mean_all = _weighted_mean_from_moments(_merge_moments(moments_a, moments_b, "final.moments"), "final.mean_all")
+    if not isinstance(state.get("a"), Mapping) or not isinstance(state.get("b"), Mapping):
+        raise G23Blocked("final.moments:STATE_MISSING")
     _moments_equal(moments_a, state["a"], "final.moments_a")
     _moments_equal(moments_b, state["b"], "final.moments_b")
     bias = _u_from_moments(_merge_moments(moments_a, moments_b, "final.moments"), "final.bias")
@@ -1006,24 +1407,132 @@ def _aggregate(vector: Mapping[str, np.ndarray], groups: Mapping[str, Sequence[s
     return np.asarray(totals, dtype=np.float64), np.asarray(means, dtype=np.float64)
 
 
-def _delta_sci(evidence: _CellEvidence, counts: Sequence[int]) -> tuple[dict[int, float], float]:
-    if evidence.convergence is None:
-        raise G23Blocked("delta_sci:CONVERGENCE_MISSING")
-    source = evidence.convergence.payload.get("candidate_delta_sci")
-    if not isinstance(source, Mapping) or source.get("schema_version") != "stage2-reference-delta-sci-v1":
-        raise G23Blocked("delta_sci:EXPLICIT_SOURCE_REQUIRED")
-    values_source = source.get("delta_sci_by_B")
-    if not isinstance(values_source, Mapping):
-        raise G23Blocked("delta_sci:RAW_DIAGNOSTIC_MISSING")
-    values: dict[int, float] = {}
+def _sizing_sequence_variance(
+    store: _ReferenceShardStore,
+    refs: Sequence[Mapping[str, object]],
+    assumptions: Mapping[str, object],
+    block_size: int,
+) -> tuple[dict[str, np.ndarray], dict[str, np.ndarray]]:
+    """Recompute weighted sizing mean/sequence variance with two shard passes."""
+
+    if block_size <= 0 or len(refs) < 2:
+        raise G23Blocked("delta_sci:SIZING_SHARDS_TOO_SHORT")
+    moments = _moments_from_shards(store, refs, assumptions)
+    mean = moments.mean()
+    variance = {name: np.zeros_like(value, dtype=np.float64) for name, value in mean.items()}
+    for ref in refs:
+        try:
+            vector, weight, _ = store.load(ref)
+        except (OSError, TypeError, ValueError) as error:
+            raise G23Blocked("delta_sci:SIZING_SHARD_INVALID") from error
+        for name in variance:
+            variance[name] += float(weight) * np.square(vector[name] - mean[name])
+    sigma2 = {name: value * float(block_size) / float(moments.n1) for name, value in variance.items()}
+    return mean, sigma2
+
+
+def _delta_sci(
+    evidence: _CellEvidence,
+    counts: Sequence[int],
+) -> tuple[dict[str, dict[int, float]], dict[str, float]]:
+    """Recompute sizing-derived S/Delta/delta and compare the frozen artifact."""
+
+    if evidence.convergence is None or evidence.sizing_root is None or not evidence.sizing_states:
+        raise G23Blocked("delta_sci:SIZING_RAW_DIAGNOSTICS_MISSING")
+    cp = evidence.convergence.payload
+    source = cp.get("candidate_delta_sci")
+    if not isinstance(source, Mapping) or source.get("schema_version") != "stage2-reference-delta-sci-v2":
+        raise G23Blocked("delta_sci:SIZING_DERIVED_ARTIFACT_REQUIRED")
+    source_ref = _path(source.get("source_ref"), "candidate_delta_sci.source_ref")
+    source_hash = _sha(source.get("source_hash"), "candidate_delta_sci.source_hash")
+    if evidence.workspace_root is None:
+        raise G23Blocked("delta_sci:WORKSPACE_ROOT_MISSING")
+    source_value = _load_json(evidence.workspace_root, source_ref, "candidate_delta_sci")
+    if _sha(source_value.get("artifact_hash"), "candidate_delta_sci.artifact_hash") != source_hash:
+        raise G23Blocked("delta_sci:SIZING_SOURCE_HASH_MISMATCH")
+    expected_source = {key: item for key, item in source.items() if key not in {"source_ref", "source_hash", "source_artifact_hash"}}
+    if source_value != expected_source:
+        raise G23Blocked("delta_sci:SIZING_SOURCE_CONTENT_MISMATCH")
+    plan = cp.get("sizing_plan")
+    if not isinstance(plan, Mapping):
+        raise G23Blocked("delta_sci:SIZING_PLAN_MISSING")
+    block_size = int(plan.get("block_size", 0))
+    if block_size <= 0:
+        raise G23Blocked("delta_sci:BLOCK_SIZE_INVALID")
+    external = evidence.external_payloads or {}
+    prereg = external.get("preregistration")
+    if not isinstance(prereg, Mapping):
+        raise G23Blocked("delta_sci:FORMULA_CONTRACT_MISSING")
+    precision = prereg.get("equivalence_and_precision")
+    if not isinstance(precision, Mapping):
+        raise G23Blocked("delta_sci:FORMULA_CONTRACT_MISSING")
+    floors = precision.get("absolute_floors")
+    if not isinstance(floors, Mapping) or set(floors) != {"tau_model", "tau_layer", "tau_module", "tau_coord", "tau_nmse"}:
+        raise G23Blocked("delta_sci:ABSOLUTE_FLOORS_MISSING")
+    floors_f = {name: _finite(floors.get(name), f"delta_sci.{name}") for name in ("tau_model", "tau_layer", "tau_module", "tau_coord", "tau_nmse")}
+    state_by_count: dict[int, Mapping[str, object]] = {}
+    for state in evidence.sizing_states:
+        count = int(state.get("processed_block_pairs", 0)) * block_size
+        if count in counts:
+            state_by_count[count] = state
+    if any(count not in state_by_count for count in counts):
+        raise G23Blocked("delta_sci:SIZING_CANDIDATE_STATE_MISSING")
+    latest = state_by_count[counts[-1]]
+    refs_latest = latest.get("shard_refs_a")
+    if not isinstance(refs_latest, list) or not refs_latest:
+        raise G23Blocked("delta_sci:SIZING_SHARDS_MISSING")
+    store = _ReferenceShardStore(evidence.sizing_root)
+    try:
+        first_vector, _, _ = store.load(refs_latest[0])
+    except (OSError, TypeError, ValueError) as error:
+        raise G23Blocked("delta_sci:SIZING_SHARD_INVALID") from error
+    layer_groups, module_groups = _group_map(first_vector, evidence)
+    computed: dict[str, dict[int, float]] = {endpoint: {} for endpoint in ("model_total", "layer", "module")}
+    computed_signal: dict[str, dict[int, float]] = {endpoint: {} for endpoint in computed}
+    computed_noise: dict[str, dict[int, float]] = {endpoint: {} for endpoint in computed}
+    computed_nodes: list[Mapping[str, object]] = []
     for count in counts:
-        raw = values_source.get(str(count))
-        if raw is None:
-            raise G23Blocked(f"delta_sci:{count}:MISSING")
-        values[count] = _finite(raw, f"delta_sci[{count}]")
-        if values[count] <= 0:
-            raise G23Blocked(f"delta_sci[{count}]:POSITIVE_REQUIRED")
-    return values, min(values.values())
+        state = state_by_count[count]
+        refs = state.get("shard_refs_a")
+        if not isinstance(refs, list) or len(refs) != int(state.get("processed_block_pairs", 0)):
+            raise G23Blocked("delta_sci:SIZING_SHARD_PREFIX_INVALID")
+        assumptions = state.get("weighting_assumptions")
+        if not isinstance(assumptions, Mapping):
+            raise G23Blocked("delta_sci:WEIGHTING_ASSUMPTIONS_MISSING")
+        mean, sigma2 = _sizing_sequence_variance(store, refs, assumptions, block_size)
+        a = {name: np.square(mean[name]) for name in mean}
+        model_signal = max(abs(float(sum(np.sum(value) for value in a.values()))), floors_f["tau_model"])
+        model_noise = abs(float(sum(np.sum(value) for value in sigma2.values()))) / float(count)
+        layer_signal_values = [float(sum(np.sum(a[name]) for name in names)) for names in layer_groups.values()]
+        layer_noise_values = [float(sum(np.sum(sigma2[name]) for name in names)) / float(count) for names in layer_groups.values()]
+        module_signal_values = [float(sum(np.sum(a[name]) for name in names)) for names in module_groups.values()]
+        module_noise_values = [float(sum(np.sum(sigma2[name]) for name in names)) / float(count) for names in module_groups.values()]
+        endpoint_values = {
+            "model_total": (max(abs(model_signal), floors_f["tau_model"]), abs(model_noise)),
+            "layer": (max(float(sum(abs(value) for value in layer_signal_values)), floors_f["tau_layer"]), float(sum(abs(value) for value in layer_noise_values))),
+            "module": (max(float(sum(abs(value) for value in module_signal_values)), floors_f["tau_module"]), float(sum(abs(value) for value in module_noise_values))),
+        }
+        for endpoint, (signal, noise) in endpoint_values.items():
+            delta = max(0.10 * noise, 0.01 * signal)
+            if not all(math.isfinite(value) and value > 0 for value in (signal, noise, delta)):
+                raise G23Blocked(f"delta_sci:{endpoint}:{count}:NON_FINITE")
+            computed[endpoint][count] = delta
+            computed_signal[endpoint][count] = signal
+            computed_noise[endpoint][count] = noise
+        state_digest = _ReferenceSnapshotStore._state_digest(state)
+        shard_refs_hash = canonical_json_hash([
+            {"shard_hash": ref.get("shard_hash"), "manifest_hash": ref.get("manifest_hash"), "weight": ref.get("weight")}
+            for ref in refs if isinstance(ref, Mapping)
+        ])
+        computed_nodes.append({"sample_count": count, "state_digest": state_digest, "shard_refs_hash": shard_refs_hash, "mean_hash": _vector_digest(mean), "sequence_variance_hash": _vector_digest(sigma2)})
+    expected_endpoint_source = source_value.get("delta_sci_by_endpoint")
+    if expected_endpoint_source != {endpoint: {str(count): value for count, value in mapping.items()} for endpoint, mapping in computed.items()}:
+        raise G23Blocked("delta_sci:FORMULA_RECOMPUTE_MISMATCH")
+    if source_value.get("signal_scale_by_endpoint") != {endpoint: {str(count): value for count, value in mapping.items()} for endpoint, mapping in computed_signal.items()} or source_value.get("noise_scale_by_endpoint") != {endpoint: {str(count): value for count, value in mapping.items()} for endpoint, mapping in computed_noise.items()}:
+        raise G23Blocked("delta_sci:SCALE_RECOMPUTE_MISMATCH")
+    if source_value.get("sizing_nodes") != computed_nodes:
+        raise G23Blocked("delta_sci:SIZING_NODE_BINDING_MISMATCH")
+    return computed, {endpoint: min(mapping.values()) for endpoint, mapping in computed.items()}
 
 
 def _u_from_blocks_longdouble(
@@ -1069,15 +1578,20 @@ def _numerical_error(evidence: _CellEvidence, reference: Mapping[str, np.ndarray
     if not isinstance(source, Mapping) or not isinstance(metadata, Mapping) or source.get("schema_version") != "stage2-reference-numerical-diagnostics-v1":
         raise G23Blocked("epsilon_num:EXPLICIT_DIAGNOSTIC_REQUIRED")
     _canonical_payload_hash(metadata, "epsilon_num.metadata")
-    raw_a, raw_b = evidence.final_state.get("blocks_a"), evidence.final_state.get("blocks_b")
-    raw_wa, raw_wb = evidence.final_state.get("block_weights_a"), evidence.final_state.get("block_weights_b")
-    if not isinstance(raw_a, list) or not isinstance(raw_b, list) or not isinstance(raw_wa, list) or not isinstance(raw_wb, list):
-        raise G23Blocked("epsilon_num:RAW_BLOCKS_REQUIRED")
-    blocks = [_vector(item, "epsilon_num.blocks") for item in raw_a + raw_b]
-    weights = list(raw_wa) + list(raw_wb)
-    if len(blocks) != len(weights):
-        raise G23Blocked("epsilon_num:BLOCK_WEIGHT_COUNT_MISMATCH")
-    raw_digest = canonical_json_hash([_vector_digest(item) for item in blocks])
+    if evidence.final_root is None:
+        raise G23Blocked("epsilon_num:SHARD_ROOT_REQUIRED")
+    blocks_a, weights_a, _ = _load_shard_records(
+        evidence.final_root, evidence.final_state.get("shard_refs_a"), "epsilon_num.shard_refs_a"
+    )
+    blocks_b, weights_b, _ = _load_shard_records(
+        evidence.final_root, evidence.final_state.get("shard_refs_b"), "epsilon_num.shard_refs_b"
+    )
+    blocks = _CombinedSequence(blocks_a, blocks_b)
+    weights = weights_a + weights_b
+    raw_rows: list[Mapping[str, object]] = []
+    for block, weight in zip(blocks, weights):
+        raw_rows.append({"vector_hash": _vector_digest(block), "weight": float(weight)})
+    raw_digest = canonical_json_hash(raw_rows)
     if source.get("raw_block_digest") != raw_digest or metadata.get("raw_block_digest") != raw_digest:
         raise G23Blocked("epsilon_num:RAW_BLOCK_BINDING_MISMATCH")
     high = source.get("high_precision")
@@ -1143,15 +1657,56 @@ def _state_replay_verified(evidence: _CellEvidence) -> bool:
     rng_after = _sha(invariance.get("rng_state_after_hash"), "state_replay.rng_after")
     if model_before != model_after:
         return False
-    expected_rng_after = canonical_json_hash(
-        {
-            "sizing_draw_hash": evidence.convergence.payload.get("sizing_draw_hash"),
-            "stream_a_draw_hash": evidence.identities.get("stream_a_draw_hash"),
-            "stream_b_draw_hash": evidence.identities.get("stream_b_draw_hash"),
-        }
-    )
-    if rng_after != expected_rng_after or rng_before == rng_after:
-        return False
+    before_state = invariance.get("rng_state_before")
+    after_state = invariance.get("rng_state_after")
+    draw_artifacts = evidence.convergence.payload.get("draw_artifacts")
+    if not isinstance(before_state, Mapping) or not isinstance(after_state, Mapping) or not isinstance(draw_artifacts, Mapping):
+        raise G23Blocked("state_replay:ACTUAL_RNG_AND_DRAW_ARTIFACTS_REQUIRED")
+    if canonical_json_hash(before_state) != rng_before or canonical_json_hash(after_state) != rng_after:
+        raise G23Blocked("state_replay:RNG_STATE_HASH_MISMATCH")
+
+    def tupleify(value: object) -> object:
+        if isinstance(value, list):
+            return tuple(tupleify(item) for item in value)
+        if isinstance(value, Mapping):
+            return {str(key): tupleify(item) for key, item in value.items()}
+        return value
+
+    for stream in ("reference_sizing", "reference_A", "reference_B"):
+        item = draw_artifacts.get(stream)
+        if not isinstance(item, Mapping):
+            raise G23Blocked(f"state_replay.draw_artifacts.{stream}:MISSING")
+        raw_plan, raw_manifest, raw_actual = item.get("sampling_plan"), item.get("manifest"), item.get("actual_state")
+        if not isinstance(raw_plan, Mapping) or not isinstance(raw_manifest, Mapping) or not isinstance(raw_actual, Mapping):
+            raise G23Blocked(f"state_replay.draw_artifacts.{stream}:FIELDS")
+        try:
+            plan = SamplingPlan.from_mapping(raw_plan)
+            manifest = DrawStreamManifest.from_manifest(raw_manifest)
+        except (TypeError, ValueError) as error:
+            raise G23Blocked(f"state_replay.draw_artifacts.{stream}:INVALID") from error
+        if manifest.stream_state.stream != stream or manifest.sampling_plan_hash != plan.digest:
+            raise G23Blocked(f"state_replay.draw_artifacts.{stream}:IDENTITY_MISMATCH")
+        expected_manifest = plan.draw_manifest(stream, len(manifest.draws)).to_manifest()
+        if expected_manifest != dict(raw_manifest):
+            raise G23Blocked(f"state_replay.draw_artifacts.{stream}:DRAW_REPLAY_MISMATCH")
+        if raw_actual.get("stream") != stream or int(raw_actual.get("count", -1)) != len(manifest.draws):
+            raise G23Blocked(f"state_replay.draw_artifacts.{stream}:STATE_BOUNDARY_MISMATCH")
+        state_before_obj = tupleify(raw_actual.get("state_before"))
+        state_after_obj = tupleify(raw_actual.get("state_after"))
+        rng = random.Random()
+        try:
+            rng.setstate(state_before_obj)  # type: ignore[arg-type]
+            for _ in manifest.draws:
+                rng.randrange(len(plan.universe.sample_ids))
+            replay_after = rng.getstate()
+        except (TypeError, ValueError, IndexError) as error:
+            raise G23Blocked(f"state_replay.draw_artifacts.{stream}:GENERATOR_REPLAY_FAILED") from error
+        if replay_after != state_after_obj:
+            raise G23Blocked(f"state_replay.draw_artifacts.{stream}:GENERATOR_STATE_DRIFT")
+        if canonical_json_hash({"algorithm_version": plan.algorithm_version, "state": state_before_obj}) != raw_actual.get("state_before_sha256") or canonical_json_hash({"algorithm_version": plan.algorithm_version, "state": state_after_obj}) != raw_actual.get("state_after_sha256"):
+            raise G23Blocked(f"state_replay.draw_artifacts.{stream}:GENERATOR_STATE_HASH_MISMATCH")
+        if before_state.get("streams", {}).get(stream) != raw_actual.get("state_before") or after_state.get("streams", {}).get(stream) != raw_actual.get("state_after"):
+            raise G23Blocked(f"state_replay.draw_artifacts.{stream}:INVARIANCE_BINDING_MISMATCH")
     replay = evidence.convergence.payload.get("resume_replay")
     if not isinstance(replay, Mapping):
         raise G23Blocked("state_replay:RESUME_REPLAY_REQUIRED")
@@ -1196,28 +1751,32 @@ def _state_replay_verified(evidence: _CellEvidence) -> bool:
     return True
 
 
-def _bootstrap_interval(blocks: Sequence[Mapping[str, np.ndarray]], field: str, *, square: bool = False, product: Sequence[Mapping[str, np.ndarray]] | None = None) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Deterministic block bootstrap of endpoint means."""
+def _bootstrap_interval(
+    blocks: Sequence[Mapping[str, np.ndarray]],
+    weights: Sequence[object],
+    field: str,
+    *,
+    square: bool = False,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Weighted endpoint bootstrap; weights are resampled with their blocks."""
 
-    if not blocks:
-        raise G23Blocked(f"{field}:EMPTY")
-    names = tuple(sorted(blocks[0]))
-    rows: list[np.ndarray] = []
-    for index, block in enumerate(blocks):
-        _compatible(blocks[0], block, field)
-        value = {name: block[name] for name in names}
-        if square:
-            value = {name: np.square(item) for name, item in value.items()}
-        if product is not None:
-            _compatible(block, product[index], field)
-            value = {name: item * product[index][name] for name, item in value.items()}
-        rows.append(np.concatenate([value[name].reshape(-1) for name in names]))
-    matrix = np.stack(rows, axis=0)
+    if not blocks or len(blocks) != len(weights):
+        raise G23Blocked(f"{field}:EMPTY_OR_WEIGHT_MISMATCH")
+    parsed = [_finite(value, f"{field}.weight") for value in weights]
     rng = np.random.default_rng(2_304_230)
-    reps = max(512, min(2048, 64 * matrix.shape[0]))
-    indices = rng.integers(0, matrix.shape[0], size=(reps, matrix.shape[0]))
-    sampled = matrix[indices].mean(axis=1)
-    return np.quantile(sampled, 0.025, axis=0), np.quantile(sampled, 0.975, axis=0), sampled.mean(axis=0)
+    reps = max(512, min(2048, 64 * len(blocks)))
+    sampled: list[np.ndarray] = []
+    for _ in range(reps):
+        indices = rng.integers(0, len(blocks), size=len(blocks))
+        selected = [blocks[int(index)] for index in indices]
+        selected_weights = [parsed[int(index)] for index in indices]
+        mean = _weighted_mean_from_moments(
+            _moments_from_blocks(selected, selected_weights, field), f"{field}.mean"
+        )
+        value = {name: np.square(item) for name, item in mean.items()} if square else mean
+        sampled.append(_flat(value))
+    matrix = np.stack(sampled, axis=0)
+    return np.quantile(matrix, 0.025, axis=0), np.quantile(matrix, 0.975, axis=0), matrix.mean(axis=0)
 
 
 def _bootstrap_u_diagnostics(
@@ -1228,16 +1787,16 @@ def _bootstrap_u_diagnostics(
     center: Mapping[str, np.ndarray],
     layer_groups: Mapping[str, Sequence[str]],
     module_groups: Mapping[str, Sequence[str]],
-) -> tuple[float, float, float]:
+) -> tuple[float, float, float, float]:
     """Bootstrap the U reference, then aggregate model/layer/module totals."""
 
-    blocks = list(blocks_a) + list(blocks_b)
-    weights = list(weights_a) + list(weights_b)
-    if not blocks:
+    if not blocks_a or not blocks_b or len(blocks_a) != len(weights_a) or len(blocks_b) != len(weights_b):
         raise G23Blocked("h_ref:RAW_BLOCKS_EMPTY")
-    names = tuple(sorted(blocks[0]))
-    rng = np.random.default_rng(2_304_231)
-    reps = max(512, min(2048, 64 * len(blocks)))
+    parsed_a = [_finite(value, "h_ref.weight_a") for value in weights_a]
+    parsed_b = [_finite(value, "h_ref.weight_b") for value in weights_b]
+    rng_a = np.random.default_rng(2_304_231)
+    rng_b = np.random.default_rng(2_304_232)
+    reps = max(512, min(2048, 64 * max(len(blocks_a), len(blocks_b))))
     model_totals: list[float] = []
     layer_l1: list[float] = []
     module_l1: list[float] = []
@@ -1245,10 +1804,18 @@ def _bootstrap_u_diagnostics(
     center_layer_total, center_layer_mean = center_layer
     center_module_total, center_module_mean = center_module
     for _ in range(reps):
-        indices = rng.integers(0, len(blocks), size=len(blocks))
-        selected_blocks = [blocks[int(index)] for index in indices]
-        selected_weights = [weights[int(index)] for index in indices]
-        u = _u_from_moments(_moments_from_blocks(selected_blocks, selected_weights, "h_ref.bootstrap"), "h_ref.bootstrap.u")
+        indices_a = rng_a.integers(0, len(blocks_a), size=len(blocks_a))
+        indices_b = rng_b.integers(0, len(blocks_b), size=len(blocks_b))
+        selected_a = [blocks_a[int(index)] for index in indices_a]
+        selected_b = [blocks_b[int(index)] for index in indices_b]
+        selected_wa = [parsed_a[int(index)] for index in indices_a]
+        selected_wb = [parsed_b[int(index)] for index in indices_b]
+        moments = _merge_moments(
+            _moments_from_blocks(selected_a, selected_wa, "h_ref.bootstrap.a"),
+            _moments_from_blocks(selected_b, selected_wb, "h_ref.bootstrap.b"),
+            "h_ref.bootstrap",
+        )
+        u = _u_from_moments(moments, "h_ref.bootstrap.u")
         model_totals.append(float(np.abs(_flat(u)).sum()))
         layer_total, layer_mean = _aggregate(u, layer_groups)
         module_total, module_mean = _aggregate(u, module_groups)
@@ -1263,8 +1830,10 @@ def _bootstrap_u_diagnostics(
         layer_l1.append(layer_ratio)
         module_l1.append(module_ratio)
     model_array = np.asarray(model_totals, dtype=np.float64)
-    h_ref = float((np.quantile(model_array, 0.975) - np.quantile(model_array, 0.025)) / 2.0)
-    return h_ref, float(np.quantile(np.asarray(layer_l1), 0.95)), float(np.quantile(np.asarray(module_l1), 0.95))
+    model_half_width = float((np.quantile(model_array, 0.975) - np.quantile(model_array, 0.025)) / 2.0)
+    layer_q95 = float(np.quantile(np.asarray(layer_l1), 0.95))
+    module_q95 = float(np.quantile(np.asarray(module_l1), 0.95))
+    return max(model_half_width, layer_q95, module_q95), model_half_width, layer_q95, module_q95
 
 
 def _bootstrap_u_interval(
@@ -1286,19 +1855,103 @@ def _bootstrap_u_interval(
     return np.quantile(matrix, 0.025, axis=0), np.quantile(matrix, 0.975, axis=0)
 
 
-def _sequence_scaling(evidence: _CellEvidence, blocks: Sequence[Mapping[str, np.ndarray]], block_size: int) -> bool:
+def _bootstrap_independent_cross_interval(
+    blocks_a: Sequence[Mapping[str, np.ndarray]],
+    weights_a: Sequence[object],
+    blocks_b: Sequence[Mapping[str, np.ndarray]],
+    weights_b: Sequence[object],
+    field: str,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Bootstrap two independent streams, then form the endpoint product."""
+
+    if not blocks_a or not blocks_b:
+        raise G23Blocked(f"{field}:EMPTY")
+    wa = [_finite(item, f"{field}.weight_a") for item in weights_a]
+    wb = [_finite(item, f"{field}.weight_b") for item in weights_b]
+    if len(wa) != len(blocks_a) or len(wb) != len(blocks_b):
+        raise G23Blocked(f"{field}:WEIGHT_MISMATCH")
+    rng_a = np.random.default_rng(2_304_240)
+    rng_b = np.random.default_rng(2_304_241)
+    reps = max(512, min(2048, 64 * max(len(blocks_a), len(blocks_b))))
+    rows: list[np.ndarray] = []
+    for _ in range(reps):
+        ia = rng_a.integers(0, len(blocks_a), size=len(blocks_a))
+        ib = rng_b.integers(0, len(blocks_b), size=len(blocks_b))
+        ma = _weighted_mean_from_moments(
+            _moments_from_blocks([blocks_a[int(i)] for i in ia], [wa[int(i)] for i in ia], field),
+            f"{field}.mean_a",
+        )
+        mb = _weighted_mean_from_moments(
+            _moments_from_blocks([blocks_b[int(i)] for i in ib], [wb[int(i)] for i in ib], field),
+            f"{field}.mean_b",
+        )
+        rows.append(_flat({name: ma[name] * mb[name] for name in ma}))
+    matrix = np.stack(rows, axis=0)
+    return np.quantile(matrix, 0.025, axis=0), np.quantile(matrix, 0.975, axis=0)
+
+
+def _bootstrap_independent_bias_interval(
+    blocks_a: Sequence[Mapping[str, np.ndarray]],
+    weights_a: Sequence[object],
+    blocks_b: Sequence[Mapping[str, np.ndarray]],
+    weights_b: Sequence[object],
+    field: str,
+) -> tuple[np.ndarray, np.ndarray]:
+    if not blocks_a or not blocks_b:
+        raise G23Blocked(f"{field}:EMPTY")
+    wa = [_finite(item, f"{field}.weight_a") for item in weights_a]
+    wb = [_finite(item, f"{field}.weight_b") for item in weights_b]
+    if len(wa) != len(blocks_a) or len(wb) != len(blocks_b):
+        raise G23Blocked(f"{field}:WEIGHT_MISMATCH")
+    rng_a = np.random.default_rng(2_304_250)
+    rng_b = np.random.default_rng(2_304_251)
+    reps = max(512, min(2048, 64 * max(len(blocks_a), len(blocks_b))))
+    rows: list[np.ndarray] = []
+    for _ in range(reps):
+        ia = rng_a.integers(0, len(blocks_a), size=len(blocks_a))
+        ib = rng_b.integers(0, len(blocks_b), size=len(blocks_b))
+        ma = _moments_from_blocks([blocks_a[int(i)] for i in ia], [wa[int(i)] for i in ia], f"{field}.a")
+        mb = _moments_from_blocks([blocks_b[int(i)] for i in ib], [wb[int(i)] for i in ib], f"{field}.b")
+        rows.append(_flat(_u_from_moments(_merge_moments(ma, mb, field), f"{field}.u")))
+    matrix = np.stack(rows, axis=0)
+    return np.quantile(matrix, 0.025, axis=0), np.quantile(matrix, 0.975, axis=0)
+
+
+def _sequence_scaling(
+    evidence: _CellEvidence,
+    blocks: Sequence[Mapping[str, np.ndarray]],
+    block_size: int,
+    weights: Sequence[object] | None = None,
+    extra_blocks: Sequence[Mapping[str, np.ndarray]] | None = None,
+    extra_weights: Sequence[object] | None = None,
+) -> bool:
     if evidence.bundle_state is None:
         raise G23Blocked("variance_scaling:bundle_missing")
     stored = evidence.bundle_state.get("sequence_variance")
     if stored is None:
         raise G23Blocked("variance_scaling:SEQUENCE_VARIANCE_MISSING")
     sequence = _vector(stored, "bundle.sequence_variance")
-    mean = _mean(blocks, "variance_scaling.blocks")
+    parsed_weights = [1.0] * len(blocks) if weights is None else [_finite(item, "variance_scaling.weight") for item in weights]
+    extra = () if extra_blocks is None else extra_blocks
+    parsed_extra = [] if extra_weights is None else [_finite(item, "variance_scaling.extra_weight") for item in extra_weights]
+    if len(parsed_weights) != len(blocks) or (extra_blocks is not None and len(parsed_extra) != len(extra)) or not blocks:
+        raise G23Blocked("variance_scaling:WEIGHT_MISMATCH")
+    moments = _moments_from_blocks(blocks, parsed_weights, "variance_scaling.blocks")
+    if extra:
+        moments = _merge_moments(
+            moments,
+            _moments_from_blocks(extra, parsed_extra, "variance_scaling.extra_blocks"),
+            "variance_scaling.combined",
+        )
+    mean = _weighted_mean_from_moments(moments, "variance_scaling.mean")
     expected = {name: np.zeros_like(value) for name, value in mean.items()}
-    factor = float(block_size) / float(len(blocks) - 1)
-    for block in blocks:
+    factor = float(block_size) / max(float(moments.n1), 1e-300)
+    for block, weight in zip(blocks, parsed_weights):
         for name in expected:
-            expected[name] += np.square(block[name] - mean[name]) * factor
+            expected[name] += float(weight) * np.square(block[name] - mean[name]) * factor
+    for block, weight in zip(extra, parsed_extra):
+        for name in expected:
+            expected[name] += float(weight) * np.square(block[name] - mean[name]) * factor
     _compatible(expected, sequence, "variance_scaling")
     return all(np.allclose(expected[name], sequence[name], rtol=1e-9, atol=1e-12) for name in expected)
 
@@ -1312,7 +1965,7 @@ def _evaluate_cell(evidence: _CellEvidence) -> dict[str, object]:
         bias, cross, ranking, blocks_a, blocks_b, bias_variance = _final_vectors(evidence)
         previous_bias, latest_bias = previous
         flat_prev, flat_latest = _flat(previous_bias), _flat(latest_bias)
-        delta_sci, min_delta = _delta_sci(evidence, [int(item) for item in plan["candidate_sample_counts"]])
+        delta_sci, min_delta_by_endpoint = _delta_sci(evidence, [int(item) for item in plan["candidate_sample_counts"]])
         epsilon_num = _numerical_error(evidence, bias)
         block_size = int(plan.get("block_size", 0))
         if block_size <= 0:
@@ -1329,6 +1982,18 @@ def _evaluate_cell(evidence: _CellEvidence) -> dict[str, object]:
         module_delta = max(float(np.max(np.abs(module_latest_total - module_prev_total) / np.maximum(np.abs(module_latest_total), 1e-300))), float(np.max(np.abs(module_latest_mean - module_prev_mean) / np.maximum(np.abs(module_latest_mean), 1e-300))))
         layer_spearman = _spearman(layer_prev_total, layer_latest_total)
         module_spearman = _spearman(module_prev_total, module_latest_total)
+        numeric_bundle = evidence.bundle_state.get("numerical_diagnostics") if evidence.bundle_state is not None else None
+        if not isinstance(numeric_bundle, Mapping):
+            raise G23Blocked("epsilon_num:NUMERICAL_BUNDLE_MISSING")
+        high_numeric = _vector(numeric_bundle.get("high_precision"), "epsilon_num.high_precision")
+        accumulated_numeric = _vector(numeric_bundle.get("accumulated"), "epsilon_num.accumulated")
+        _compatible(high_numeric, accumulated_numeric, "epsilon_num")
+        error_vector = {name: np.abs(high_numeric[name] - accumulated_numeric[name]) for name in high_numeric}
+        epsilon_by_endpoint = {
+            "model_total": float(sum(np.sum(value) for value in error_vector.values())),
+            "layer": float(sum(np.sum(error_vector[name]) for names in layer.values() for name in names)),
+            "module": float(sum(np.sum(error_vector[name]) for names in module.values() for name in names)),
+        }
         uncertainty = evidence.bundle_state["uncertainty"]  # type: ignore[index]
         cross_variance = _vector(uncertainty["cross_variance"], "bundle.cross_variance")
         ranking_variance = _vector(uncertainty["ranking_variance"], "bundle.ranking_variance")
@@ -1336,28 +2001,37 @@ def _evaluate_cell(evidence: _CellEvidence) -> dict[str, object]:
         _compatible(bias_variance, ranking_variance, "variance")
         if evidence.final_state is None:
             raise G23Blocked("final:STATE_MISSING")
-        raw_wa, raw_wb = evidence.final_state.get("block_weights_a"), evidence.final_state.get("block_weights_b")
-        if not isinstance(raw_wa, list) or not isinstance(raw_wb, list):
-            raise G23Blocked("final.block_weights:RAW_DIAGNOSTIC_MISSING")
-        h_ref, layer_l1_q95, module_l1_q95 = _bootstrap_u_diagnostics(
+        if evidence.final_root is None:
+            raise G23Blocked("final:SHARD_ROOT_MISSING")
+        _, weights_a, _ = _load_shard_records(
+            evidence.final_root,
+            evidence.final_state.get("shard_refs_a"),
+            "final.shard_refs_a",
+        )
+        _, weights_b, _ = _load_shard_records(
+            evidence.final_root,
+            evidence.final_state.get("shard_refs_b"),
+            "final.shard_refs_b",
+        )
+        h_ref, model_half_width, layer_l1_q95, module_l1_q95 = _bootstrap_u_diagnostics(
             blocks_a,
             blocks_b,
-            raw_wa,
-            raw_wb,
+            weights_a,
+            weights_b,
             latest_bias,
             layer,
             module,
         )
-        bias_low, bias_high = _bootstrap_u_interval(
-            blocks_a + blocks_b,
-            list(raw_wa) + list(raw_wb),
-            "bias.bootstrap",
+        bias_low, bias_high = _bootstrap_independent_bias_interval(
+            blocks_a, weights_a, blocks_b, weights_b, "bias.bootstrap"
         )
-        a_mean, b_mean = _mean(blocks_a, "a_mean"), _mean(blocks_b, "b_mean")
+        a_mean, b_mean = _weighted_mean_from_moments(_moments_from_blocks(blocks_a, weights_a, "a_mean"), "a_mean"), _weighted_mean_from_moments(_moments_from_blocks(blocks_b, weights_b, "b_mean"), "b_mean")
         a_rank, b_rank = np.square(_flat(a_mean)), np.square(_flat(b_mean))
-        a_low, a_high, _ = _bootstrap_interval(blocks_a, "a.square.bootstrap", square=True)
-        b_low, b_high, _ = _bootstrap_interval(blocks_b, "b.square.bootstrap", square=True)
-        cross_low, cross_high, _ = _bootstrap_interval(blocks_a, "cross.bootstrap", product=blocks_b)
+        a_low, a_high, _ = _bootstrap_interval(blocks_a, weights_a, "a.square.bootstrap", square=True)
+        b_low, b_high, _ = _bootstrap_interval(blocks_b, weights_b, "b.square.bootstrap", square=True)
+        cross_low, cross_high = _bootstrap_independent_cross_interval(
+            blocks_a, weights_a, blocks_b, weights_b, "cross.bootstrap"
+        )
         a_half = (a_high - a_low) / 2.0
         b_half = (b_high - b_low) / 2.0
         signal_floor = evidence.convergence.payload.get("numerical_floor") if evidence.convergence is not None else None
@@ -1380,8 +2054,13 @@ def _evaluate_cell(evidence: _CellEvidence) -> dict[str, object]:
             "h_ref": h_ref,
             "layer_l1_bootstrap_q95": layer_l1_q95,
             "module_l1_bootstrap_q95": module_l1_q95,
-            "min_delta_sci": min_delta,
+            "min_delta_sci": min(min_delta_by_endpoint.values()),
+            "min_delta_sci_by_endpoint": min_delta_by_endpoint,
             "epsilon_num": epsilon_num,
+            "epsilon_num_by_endpoint": epsilon_by_endpoint,
+            "h_ref_model_total": model_half_width,
+            "h_ref_layer": layer_l1_q95,
+            "h_ref_module": module_l1_q95,
             "a_b_spearman": _spearman(a_rank, b_rank),
             "a_b_top_overlap_0_001": _top_overlap(a_rank, b_rank, 0.001),
             "a_b_top_overlap_0_01": _top_overlap(a_rank, b_rank, 0.01),
@@ -1395,7 +2074,7 @@ def _evaluate_cell(evidence: _CellEvidence) -> dict[str, object]:
             "a_square_interval_halfwidth_max": float(np.max(a_half)),
             "b_square_interval_halfwidth_max": float(np.max(b_half)),
             "ranking_bias_direction_sum": float(np.sum(_flat(ranking) - _flat(bias))),
-            "sizing_min_delta_sci": min_delta,
+            "sizing_min_delta_sci": min(min_delta_by_endpoint.values()),
             "sizing_node_previous": int(counts[0]),
             "sizing_node_latest": int(counts[1]),
         }
@@ -1410,8 +2089,14 @@ def _evaluate_cell(evidence: _CellEvidence) -> dict[str, object]:
             "layer_module_delta": metrics["layer_module_delta"] <= THRESHOLDS["layer_module_delta"],
             "layer_l1_bootstrap_q95": metrics["layer_l1_bootstrap_q95"] <= THRESHOLDS["layer_module_l1_q95"],
             "module_l1_bootstrap_q95": metrics["module_l1_bootstrap_q95"] <= THRESHOLDS["layer_module_l1_q95"],
-            "h_ref": metrics["h_ref"] <= min_delta / THRESHOLDS["h_ref_divisor"],
-            "epsilon_num": metrics["epsilon_num"] <= min_delta / THRESHOLDS["epsilon_num_divisor"],
+            "h_ref_model_total": metrics["h_ref_model_total"] <= min_delta_by_endpoint["model_total"] / THRESHOLDS["h_ref_divisor"],
+            "h_ref_layer": metrics["h_ref_layer"] <= min_delta_by_endpoint["layer"] / THRESHOLDS["h_ref_divisor"],
+            "h_ref_module": metrics["h_ref_module"] <= min_delta_by_endpoint["module"] / THRESHOLDS["h_ref_divisor"],
+            "h_ref": metrics["h_ref"] <= min(min_delta_by_endpoint.values()) / THRESHOLDS["h_ref_divisor"],
+            "epsilon_num_model_total": metrics["epsilon_num_by_endpoint"]["model_total"] <= min_delta_by_endpoint["model_total"] / THRESHOLDS["epsilon_num_divisor"],
+            "epsilon_num_layer": metrics["epsilon_num_by_endpoint"]["layer"] <= min_delta_by_endpoint["layer"] / THRESHOLDS["epsilon_num_divisor"],
+            "epsilon_num_module": metrics["epsilon_num_by_endpoint"]["module"] <= min_delta_by_endpoint["module"] / THRESHOLDS["epsilon_num_divisor"],
+            "epsilon_num": metrics["epsilon_num"] <= min(min_delta_by_endpoint.values()) / THRESHOLDS["epsilon_num_divisor"],
             "a_b_spearman": metrics["a_b_spearman"] >= THRESHOLDS["pearson"],
             "a_b_top_overlap_0_001": metrics["a_b_top_overlap_0_001"] >= THRESHOLDS["topk_overlap"],
             "a_b_top_overlap_0_01": metrics["a_b_top_overlap_0_01"] >= THRESHOLDS["topk_overlap"],
@@ -1420,7 +2105,10 @@ def _evaluate_cell(evidence: _CellEvidence) -> dict[str, object]:
                 np.all(np.abs(_flat(cross) - _flat(bias)) <= (bias_high - bias_low + cross_high - cross_low) / 2.0)
             ),
             "ranking_bias_direction": metrics["ranking_bias_direction_sum"] >= 0.0,
-            "variance_scaling_verified": _sequence_scaling(evidence, blocks_a + blocks_b, block_size),
+            "variance_scaling_verified": _sequence_scaling(
+                evidence, blocks_a, block_size, weights_a,
+                extra_blocks=blocks_b, extra_weights=weights_b,
+            ),
             "state_replay_verified": _state_replay_verified(evidence),
         }
         one_shot = evidence.convergence.payload.get("one_shot_result") if evidence.convergence else None
@@ -1523,6 +2211,7 @@ def evaluate_formal_g23(
     *,
     expected_cell_ids: Sequence[str] | None = None,
     output_root: str | Path | None = None,
+    repo_root: str | Path | None = None,
 ) -> dict[str, object]:
     """Evaluate exactly six formal Stage2.04 outputs and publish one attempt.
 
@@ -1532,6 +2221,11 @@ def evaluate_formal_g23(
     """
 
     root = Path(workspace_root).resolve()
+    trusted_repo = (
+        Path(__file__).resolve().parents[3]
+        if repo_root is None
+        else Path(repo_root).resolve()
+    )
     normalized_items: list[CellInput] = []
     for index, item in enumerate(cells):
         if isinstance(item, CellInput):
@@ -1548,7 +2242,7 @@ def evaluate_formal_g23(
     prepared: list[_CellEvidence] = []
     structure_reason: str | None = None
     if len(normalized) == REQUIRED_CELL_COUNT and len(set(item.cell_id for item in normalized)) == REQUIRED_CELL_COUNT:
-        prepared = [_prepare_cell(root, item) for item in normalized]
+        prepared = [_prepare_cell(root, item, repo_root=trusted_repo) for item in normalized]
     elif normalized:
         structure_reason = "DUPLICATE_OR_INVALID_CELL_IDENTITIES"
     if prepared:
@@ -1629,6 +2323,7 @@ class G23ReferenceEvaluator:
     workspace_root: str | Path
     output_root: str | Path | None = None
     expected_cell_ids: tuple[str, ...] | None = None
+    repo_root: str | Path | None = None
 
     def evaluate(self, cells: Sequence[CellInput | Mapping[str, object] | str]) -> dict[str, object]:
         return evaluate_formal_g23(
@@ -1636,6 +2331,7 @@ class G23ReferenceEvaluator:
             cells,
             expected_cell_ids=self.expected_cell_ids,
             output_root=self.output_root,
+            repo_root=self.repo_root,
         )
 
 

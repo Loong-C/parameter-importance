@@ -28,6 +28,8 @@ from dataclasses import dataclass
 import hashlib
 import math
 from pathlib import Path, PurePosixPath
+import random
+import shutil
 import subprocess
 from time import perf_counter
 
@@ -45,6 +47,7 @@ from ..contracts.jsonio import (
     JSONValue,
     canonical_json_hash,
     load_canonical_json,
+    write_canonical_json,
 )
 from ..contracts.stage1_handoff import (
     Stage1ExitEvidence,
@@ -102,7 +105,7 @@ from ..providers import (
     SyntheticGradientProvider,
     TorchFixedStateGradientProvider,
 )
-from ..runtime.task_artifacts import TaskArtifactStore
+from ..runtime.task_artifacts import TaskArtifactStore, load_committed_task_artifact
 from ..runtime.task_runtime import (
     BlockerCode,
     TaskBlockedError,
@@ -139,6 +142,8 @@ from .stage2_assets import (
 )
 from .stage2 import PairedEstimatorRunner, build_fixture_estimator_decision
 from .preregistration import (
+    ABSOLUTE_FLOORS,
+    PREREGISTRATION_SCHEMA_VERSION,
     build_stage2_hypothesis_contract,
     build_stage2_preregistration,
     validate_stage2_preregistration,
@@ -159,6 +164,8 @@ from .stage2_formal import (
     Stage2RecommendationEngine,
     StreamingReferenceSizer,
     _ReferenceSnapshotStore,
+    _ReferenceShardStore,
+    _moments_from_shards,
     _draw_digest,
 )
 from .stage3 import (
@@ -1908,6 +1915,7 @@ def _stage2_reference_plan(
     request: TaskExecutionRequest,
     root: Path,
     context: _ProviderContext,
+    authoritative: Mapping[str, object] | None = None,
 ) -> tuple[ReferenceSizingPlan, tuple[str, ...]]:
     if request.config.run_intent == "local_fixture":
         return (
@@ -1921,12 +1929,16 @@ def _stage2_reference_plan(
             ),
             (),
         )
-    value, reference = _formal_input_document(
-        request,
-        root,
-        schema_version="stage2-reference-sizing-plan-v1",
-        requirement="formal_reference_sizing_plan",
-    )
+    if authoritative is not None:
+        value = authoritative
+        reference = str(request.environment.evidence_refs.get("stage2_reference_sizing_plan"))
+    else:
+        value, reference = _formal_input_document(
+            request,
+            root,
+            schema_version="stage2-reference-sizing-plan-v1",
+            requirement="formal_reference_sizing_plan",
+        )
     if value.get("execution_evidence_hash") != context.evidence.artifact_hash:
         raise _blocked(
             BlockerCode.CONTRACT_UNFROZEN,
@@ -2014,6 +2026,7 @@ def _reference_parameter_registry(
     request: TaskExecutionRequest,
     root: Path,
     context: _ProviderContext,
+    authoritative: Mapping[str, object] | None = None,
 ) -> Mapping[str, object] | None:
     """Load the canonical parameter grouping used by every G2.3 endpoint.
 
@@ -2023,6 +2036,20 @@ def _reference_parameter_registry(
     mapping; the evaluator never guesses groups from parameter names.
     """
 
+    if authoritative is not None:
+        value = authoritative
+        reference = str(request.environment.evidence_refs.get("stage2_parameter_registry"))
+        groups = value.get("parameter_groups") if isinstance(value, Mapping) else None
+        if (
+            not isinstance(value, Mapping)
+            or value.get("schema_version") != "stage2-parameter-registry-artifact-v1"
+            or value.get("registry_hash") != context.provider.registry_hash
+            or not isinstance(groups, Mapping)
+            or not isinstance(value.get("artifact_hash"), str)
+            or value.get("artifact_hash") != canonical_json_hash({k: v for k, v in value.items() if k != "artifact_hash"})
+        ):
+            return None
+        return value
     reference = request.environment.evidence_refs.get("stage2_parameter_registry")
     if reference is not None:
         try:
@@ -2064,81 +2091,252 @@ def _reference_parameter_registry(
     return body
 
 
-def _reference_delta_sci(
+def _reference_formula_contract(
     request: TaskExecutionRequest,
-    root: Path,
-    plan: ReferenceSizingPlan,
-) -> Mapping[str, object]:
-    """Return the frozen candidate-B precision source, never an inferred value."""
+    authoritative: Mapping[str, object] | None,
+) -> tuple[Mapping[str, object], str]:
+    """Validate the S2.1 formula/floor contract without consuming numbers."""
 
-    reference = request.environment.evidence_refs.get("stage2_reference_delta_sci")
-    if reference is not None:
-        try:
-            value = load_canonical_json(_workspace_path(root, reference, field="stage2_reference_delta_sci"))
-        except (OSError, TypeError, ValueError) as error:
+    if authoritative is None:
+        if request.config.run_intent != "local_fixture":
             raise _blocked(
                 BlockerCode.CONTRACT_UNFROZEN,
-                "stage2_reference_delta_sci",
-                f"delta_sci artifact unreadable: {type(error).__name__}: {error}",
+                "stage2_preregistration",
+                "formal reference requires the hash-bound S2.1 formula contract",
                 retryable=False,
-                evidence_refs=(reference,),
-            ) from error
-        if not isinstance(value, Mapping) or value.get("schema_version") != "stage2-reference-delta-sci-v1":
-            raise _blocked(
-                BlockerCode.CONTRACT_UNFROZEN,
-                "stage2_reference_delta_sci",
-                "delta_sci artifact schema is not frozen",
-                retryable=False,
-                evidence_refs=(reference,),
             )
-        values = value.get("delta_sci_by_B")
-        if not isinstance(values, Mapping) or any(str(count) not in values for count in plan.candidate_sample_counts):
-            raise _blocked(
-                BlockerCode.CONTRACT_UNFROZEN,
-                "stage2_reference_delta_sci",
-                "delta_sci artifact does not cover every candidate B",
-                retryable=False,
-                evidence_refs=(reference,),
-            )
-        source = dict(value)
-        source["source_ref"] = reference
-        source["source_hash"] = canonical_json_hash(value)
-        return source
-    if request.config.run_intent != "local_fixture":
-        raise _blocked(
-            BlockerCode.CONTRACT_UNFROZEN,
-            "stage2_reference_delta_sci",
-            "formal reference requires an environment-bound delta_sci artifact",
-            retryable=False,
-        )
-    # Fixture-only deterministic calibration.  It is intentionally huge so
-    # the fixture can exercise all precision paths without representing a
-    # scientific margin for a real model.
-    values = {str(count): 1.0e6 for count in plan.candidate_sample_counts}
-    source: dict[str, object] = {
-        "schema_version": "stage2-reference-delta-sci-v1",
-        "scope": "local_fixture",
-        "delta_sci_by_B": values,
-        "source_ref": "local_fixture/frozen-delta-sci.json",
+        body: dict[str, object] = {
+            "schema_version": PREREGISTRATION_SCHEMA_VERSION,
+            "scope": "local_fixture",
+            "equivalence_and_precision": {
+                "scientific_margin_formula": "max(0.10*Delta_c_e(B),0.01*S_c_e)",
+                "signal_definition": "S_model=max(abs(sum(a_k)),tau_model); S_q=max(sum_g(abs(sum_g(a_k))),tau_q)",
+                "noise_definition": "Delta_model=abs(sum_k(d_k(B))); Delta_q=sum_g(abs(sum_g(d_k(B))))",
+                "sizing_vectors": {"a": "mu_sizing^2", "d": "sigma_squared_over_B"},
+                "group_registry": "canonical_non_overlapping_layer_and_module_registry",
+                "absolute_floors": dict(ABSOLUTE_FLOORS),
+            },
+        }
+        return dict(body, preregistration_hash=canonical_json_hash(body)), canonical_json_hash(body)
+
+    value = authoritative
+    if value.get("schema_version") != PREREGISTRATION_SCHEMA_VERSION or value.get("scope") != "formal":
+        raise _blocked(BlockerCode.CONTRACT_UNFROZEN, "stage2_preregistration", "S2.1 formula contract must be formal", retryable=False)
+    supplied = value.get("preregistration_hash")
+    if not isinstance(supplied, str) or supplied != canonical_json_hash({key: item for key, item in value.items() if key != "preregistration_hash"}):
+        raise _blocked(BlockerCode.CONTRACT_UNFROZEN, "stage2_preregistration", "S2.1 preregistration hash is not content-bound", retryable=False)
+    precision = value.get("equivalence_and_precision")
+    if not isinstance(precision, Mapping):
+        raise _blocked(BlockerCode.CONTRACT_UNFROZEN, "stage2_preregistration", "S2.1 equivalence_and_precision contract is missing", retryable=False)
+    expected_formulas = {
+        "scientific_margin_formula": "max(0.10*Delta_c_e(B),0.01*S_c_e)",
+        "signal_definition": "S_model=max(abs(sum(a_k)),tau_model); S_q=max(sum_g(abs(sum_g(a_k))),tau_q)",
+        "noise_definition": "Delta_model=abs(sum_k(d_k(B))); Delta_q=sum_g(abs(sum_g(d_k(B))))",
+        "sizing_vectors": {"a": "mu_sizing^2", "d": "sigma_squared_over_B"},
+        "group_registry": "canonical_non_overlapping_layer_and_module_registry",
     }
-    source["source_hash"] = canonical_json_hash(source)
-    return source
+    if any(precision.get(key) != expected for key, expected in expected_formulas.items()):
+        raise _blocked(BlockerCode.CONTRACT_UNFROZEN, "stage2_preregistration", "S2.1 formula contract drifted", retryable=False)
+    floors = precision.get("absolute_floors")
+    if not isinstance(floors, Mapping) or set(floors) != set(ABSOLUTE_FLOORS):
+        raise _blocked(BlockerCode.CONTRACT_UNFROZEN, "stage2_preregistration", "S2.1 absolute floors are missing or changed", retryable=False)
+    for name, expected in ABSOLUTE_FLOORS.items():
+        actual = floors.get(name)
+        if isinstance(actual, bool) or not isinstance(actual, (int, float)) or not math.isfinite(float(actual)) or float(actual) != float(expected) or float(actual) <= 0:
+            raise _blocked(BlockerCode.CONTRACT_UNFROZEN, "stage2_preregistration", f"S2.1 absolute floor invalid: {name}", retryable=False)
+    return value, supplied
+
+
+def _weighted_sequence_variance_from_shards(
+    store: _ReferenceShardStore,
+    refs: Sequence[Mapping[str, object]],
+    assumptions: Mapping[str, object],
+    block_size: int,
+) -> Mapping[str, np.ndarray]:
+    """Compute sequence variance in two streaming passes over immutable shards."""
+
+    if block_size <= 0 or len(refs) < 2:
+        raise ValueError("STAGE2_SIZING_VARIANCE_REQUIRES_TWO_BLOCKS")
+    moments = _moments_from_shards(store, refs, assumptions)
+    mean = moments.mean()
+    variance = {name: np.zeros_like(value, dtype=np.float64) for name, value in mean.items()}
+    for ref in refs:
+        vector, weight, _ = store.load(ref)
+        for name in variance:
+            variance[name] += float(weight) * np.square(vector[name] - mean[name])
+    return {name: value * float(block_size) / float(moments.n1) for name, value in variance.items()}
+
+
+def _sizing_groups(
+    parameter_registry: Mapping[str, object],
+    names: Sequence[str],
+) -> tuple[dict[str, tuple[str, ...]], dict[str, tuple[str, ...]]]:
+    groups = parameter_registry.get("parameter_groups")
+    if not isinstance(groups, Mapping) or set(str(name) for name in groups) != set(names):
+        raise ValueError("STAGE2_SIZING_PARAMETER_REGISTRY_SET_MISMATCH")
+    layer: dict[str, list[str]] = {}
+    module: dict[str, list[str]] = {}
+    for name in names:
+        entry = groups.get(name)
+        if not isinstance(entry, Mapping):
+            raise ValueError(f"STAGE2_SIZING_PARAMETER_GROUP_MISSING:{name}")
+        layer_name, module_name = entry.get("layer"), entry.get("module")
+        if not isinstance(layer_name, str) or not layer_name or not isinstance(module_name, str) or not module_name:
+            raise ValueError(f"STAGE2_SIZING_PARAMETER_GROUP_INVALID:{name}")
+        layer.setdefault(layer_name, []).append(name)
+        module.setdefault(module_name, []).append(name)
+    return {key: tuple(value) for key, value in sorted(layer.items())}, {key: tuple(value) for key, value in sorted(module.items())}
+
+
+def _derive_sizing_delta_sci(
+    *,
+    root: Path,
+    sizing_root: Path,
+    plan: ReferenceSizingPlan,
+    parameter_registry: Mapping[str, object],
+    formula_contract: Mapping[str, object],
+    formula_contract_hash: str,
+    provider: FixedStateGradientProvider,
+    sizing_result_hash: str,
+) -> Mapping[str, object]:
+    """Derive and freeze all candidate margins from sizing shards before A/B."""
+
+    commits = sorted((sizing_root / "commits").glob("*.json"))
+    if not commits:
+        raise _blocked(BlockerCode.CONTRACT_UNFROZEN, "stage2_reference_sizing", "sizing commits missing", retryable=False)
+    assumptions = {
+        "statistical_unit": provider.statistical_unit,
+        "weight_unit": provider.weight_unit,
+        "sampling_design": provider.sampling_design,
+        "weights_exogenous": provider.weights_exogenous,
+        "common_mean_assumption": provider.common_mean_assumption,
+    }
+    shard_store = _ReferenceShardStore(sizing_root)
+    state_by_count: dict[int, tuple[Mapping[str, object], Mapping[str, object]]] = {}
+    for commit_path in commits:
+        commit = load_canonical_json(commit_path)
+        if not isinstance(commit, Mapping):
+            raise _blocked(BlockerCode.CONTRACT_UNFROZEN, "stage2_reference_sizing", "sizing commit invalid", retryable=False)
+        object_ref = commit.get("object_ref")
+        if not isinstance(object_ref, str):
+            raise _blocked(BlockerCode.CONTRACT_UNFROZEN, "stage2_reference_sizing", "sizing object ref missing", retryable=False)
+        state, bundle = load_tensor_bundle(sizing_root / object_ref)
+        if not isinstance(state, Mapping) or state.get("schema_version") != "stage2-reference-progress-state-v1" or bundle.manifest_sha256 != commit.get("object_manifest_hash"):
+            raise _blocked(BlockerCode.CONTRACT_UNFROZEN, "stage2_reference_sizing", "sizing state invalid", retryable=False)
+        count = int(state.get("processed_block_pairs", 0)) * plan.block_size
+        refs = state.get("shard_refs_a")
+        if count <= 0 or not isinstance(refs, list) or len(refs) != int(state.get("processed_block_pairs", 0)) or state.get("shard_refs_b") not in ([], None):
+            raise _blocked(BlockerCode.CONTRACT_UNFROZEN, "stage2_reference_sizing", "sizing shard prefix invalid", retryable=False)
+        for ref in refs:
+            if not isinstance(ref, Mapping):
+                raise _blocked(BlockerCode.CONTRACT_UNFROZEN, "stage2_reference_sizing", "sizing shard ref invalid", retryable=False)
+            shard_store.load(ref)
+        state_by_count[count] = (state, {"commit": commit, "refs": refs})
+    if any(count not in state_by_count for count in plan.candidate_sample_counts):
+        raise _blocked(BlockerCode.CONTRACT_UNFROZEN, "stage2_reference_sizing", "sizing shards do not cover every candidate B", retryable=False)
+    latest_refs = state_by_count[plan.candidate_sample_counts[-1]][1]["refs"]
+    assert isinstance(latest_refs, list) and latest_refs
+    first_vector, _, _ = shard_store.load(latest_refs[0])
+    names = tuple(sorted(first_vector))
+    layer_groups, module_groups = _sizing_groups(parameter_registry, names)
+    precision = formula_contract.get("equivalence_and_precision")
+    if not isinstance(precision, Mapping) or not isinstance(precision.get("absolute_floors"), Mapping):
+        raise _blocked(BlockerCode.CONTRACT_UNFROZEN, "stage2_preregistration", "absolute floors missing", retryable=False)
+    floors = precision["absolute_floors"]
+    endpoints = ("model_total", "layer", "module")
+    delta_by_endpoint: dict[str, dict[str, float]] = {endpoint: {} for endpoint in endpoints}
+    signal_by_endpoint: dict[str, dict[str, float]] = {endpoint: {} for endpoint in endpoints}
+    noise_by_endpoint: dict[str, dict[str, float]] = {endpoint: {} for endpoint in endpoints}
+    nodes: list[dict[str, object]] = []
+    for count in plan.candidate_sample_counts:
+        state, raw = state_by_count[count]
+        refs = raw["refs"]
+        assert isinstance(refs, list)
+        moments = _moments_from_shards(shard_store, refs, assumptions)
+        mean = moments.mean()
+        sigma2 = _weighted_sequence_variance_from_shards(shard_store, refs, assumptions, plan.block_size)
+        a = {name: np.square(mean[name]) for name in names}
+        model_s = max(abs(float(sum(np.sum(value) for value in a.values()))), float(floors["tau_model"]))
+        model_d = abs(float(sum(np.sum(value) for value in sigma2.values()))) / float(count)
+        layer_a = [float(sum(np.sum(a[name]) for name in group)) for group in layer_groups.values()]
+        layer_d = [float(sum(np.sum(sigma2[name]) for name in group)) / float(count) for group in layer_groups.values()]
+        module_a = [float(sum(np.sum(a[name]) for name in group)) for group in module_groups.values()]
+        module_d = [float(sum(np.sum(sigma2[name]) for name in group)) / float(count) for group in module_groups.values()]
+        endpoint_values = {
+            "model_total": (max(abs(model_s), float(floors["tau_model"])), abs(model_d)),
+            "layer": (max(float(sum(abs(value) for value in layer_a)), float(floors["tau_layer"])), float(sum(abs(value) for value in layer_d))),
+            "module": (max(float(sum(abs(value) for value in module_a)), float(floors["tau_module"])), float(sum(abs(value) for value in module_d))),
+        }
+        for endpoint, (signal, noise) in endpoint_values.items():
+            delta = max(0.10 * noise, 0.01 * signal)
+            if not all(math.isfinite(value) and value > 0.0 for value in (signal, noise, delta)):
+                raise _blocked(BlockerCode.CONTRACT_UNFROZEN, "stage2_reference_delta_sci", f"invalid sizing margin: {endpoint}/{count}", retryable=False)
+            signal_by_endpoint[endpoint][str(count)] = signal
+            noise_by_endpoint[endpoint][str(count)] = noise
+            delta_by_endpoint[endpoint][str(count)] = delta
+        commit = raw["commit"]
+        assert isinstance(commit, Mapping)
+        nodes.append({
+            "sample_count": count,
+            "state_digest": commit.get("state_digest"),
+            "shard_refs_hash": canonical_json_hash([
+                {"shard_hash": ref.get("shard_hash"), "manifest_hash": ref.get("manifest_hash"), "weight": ref.get("weight")}
+                for ref in refs if isinstance(ref, Mapping)
+            ]),
+            "mean_hash": _vector_digest(mean),
+            "sequence_variance_hash": _vector_digest(sigma2),
+        })
+    body: dict[str, object] = {
+        "schema_version": "stage2-reference-delta-sci-v2",
+        "source_kind": "reference_sizing_raw_shards",
+        "formula_contract_hash": formula_contract_hash,
+        "formula_version": "stage2-reference-sizing-margin-v1",
+        "formula": "delta_sci=max(0.10*Delta,0.01*S); a=mu_sizing^2; d=sigma_squared_over_B",
+        "absolute_floors": dict(floors),
+        "reference_id": plan.reference_id,
+        "sizing_result_hash": sizing_result_hash,
+        "sizing_plan_hash": plan.artifact_hash,
+        "candidate_sample_counts": list(plan.candidate_sample_counts),
+        "delta_sci_by_endpoint": delta_by_endpoint,
+        "signal_scale_by_endpoint": signal_by_endpoint,
+        "noise_scale_by_endpoint": noise_by_endpoint,
+        "sizing_nodes": nodes,
+        "registry_hash": provider.registry_hash,
+    }
+    body["artifact_hash"] = canonical_json_hash(body)
+    derived_dir = sizing_root / "derived"
+    derived_dir.mkdir(parents=True, exist_ok=True)
+    derived_path = derived_dir / f"{body['artifact_hash']}.json"
+    if derived_path.exists():
+        if load_canonical_json(derived_path) != body:
+            raise _blocked(BlockerCode.CONTRACT_UNFROZEN, "stage2_reference_delta_sci", "sizing-derived artifact drift", retryable=False)
+    else:
+        write_canonical_json(derived_path, body)
+    source_ref = derived_path.relative_to(root).as_posix()
+    published = dict(body)
+    published["source_ref"] = source_ref
+    published["source_hash"] = body["artifact_hash"]
+    published["source_artifact_hash"] = body["artifact_hash"]
+    return published
 
 
 def _reference_six_cell_manifest(
     inputs: _PredecessorContext,
     context: _ProviderContext,
+    authoritative: Mapping[str, object] | None = None,
 ) -> Mapping[str, object]:
     """Project the validated S2.3 six-cell asset matrix into S2.4 output."""
 
     try:
-        asset_resolution = inputs.payload("asset_resolution")
+        asset_resolution = authoritative if authoritative is not None else inputs.payload("asset_resolution")
     except (KeyError, ValueError, TypeError):
         return {
             "schema_version": "stage2-s204-six-cell-manifest-v1",
             "status": "MISSING",
             "checkpoints": [],
         }
+    if isinstance(asset_resolution, Mapping) and asset_resolution.get("schema_version") == "stage2-s204-six-cell-manifest-v1":
+        return dict(asset_resolution)
     manifest = asset_resolution.get("stage2_asset_manifest") if isinstance(asset_resolution, Mapping) else None
     if not isinstance(manifest, Mapping):
         return {
@@ -2193,6 +2391,282 @@ def _reference_six_cell_manifest(
     return body
 
 
+def _trusted_stage2_provenance(*, require_clean: bool) -> Mapping[str, object]:
+    """Bind producer output to an actual repository object and source bytes."""
+
+    repository_root = Path(__file__).resolve().parents[3]
+    try:
+        def git(*arguments: str) -> str:
+            return subprocess.run(
+                ["git", "-C", str(repository_root), *arguments],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+
+        head = git("rev-parse", "HEAD")
+        tree = git("rev-parse", "HEAD^{tree}")
+        git("cat-file", "-e", f"{head}^{{commit}}")
+        status = git("status", "--porcelain", "--untracked-files=no")
+        tracked_clean = status == ""
+        source_paths = (
+            "src/param_importance_nlp/experiments/stage2_formal.py",
+            "src/param_importance_nlp/experiments/stage23_task_runners.py",
+            "src/param_importance_nlp/experiments/stage2_g23_evaluator.py",
+            "ops/stage2/evaluate_s204_g23.py",
+        )
+        source_bytes: list[dict[str, object]] = []
+        for relative in source_paths:
+            path = repository_root / Path(relative)
+            if not path.is_file():
+                raise RuntimeError(f"STAGE2_SOURCE_MISSING:{relative}")
+            source_bytes.append(
+                {
+                    "path": relative,
+                    "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+                    "git_blob": git("hash-object", relative),
+                }
+            )
+    except (OSError, subprocess.SubprocessError) as error:
+        raise RuntimeError("STAGE2_TRUSTED_REPOSITORY_UNAVAILABLE") from error
+    if require_clean and not tracked_clean:
+        raise RuntimeError("STAGE2_PRODUCER_REPOSITORY_DIRTY")
+    return {
+        "schema_version": "stage2-reference-producer-provenance-v2",
+        "repository_root_name": repository_root.name,
+        "head_commit": head,
+        "head_tree": tree,
+        "tracked_clean": tracked_clean,
+        "source_bytes": source_bytes,
+        "provenance_hash": canonical_json_hash(
+            {
+                "head_commit": head,
+                "head_tree": tree,
+                "tracked_clean": tracked_clean,
+                "source_bytes": source_bytes,
+            }
+        ),
+    }
+
+
+def _actual_sampling_state(
+    sampling: SamplingPlan,
+    stream: str,
+    count: int,
+) -> Mapping[str, object]:
+    """Capture real Python generator states and verify the frozen draws."""
+
+    if stream not in STREAM_NAMES or count < 0:
+        raise ValueError("STAGE2_SAMPLING_STATE_ARGUMENT_INVALID")
+    rng = random.Random(sampling._stream_seed(stream))  # type: ignore[attr-defined]
+    before = rng.getstate()
+    for _ in range(count):
+        rng.randrange(len(sampling.universe.sample_ids))
+    after = rng.getstate()
+    def jsonable(value: object) -> object:
+        if isinstance(value, tuple):
+            return [jsonable(item) for item in value]
+        if isinstance(value, list):
+            return [jsonable(item) for item in value]
+        if isinstance(value, Mapping):
+            return {str(key): jsonable(item) for key, item in value.items()}
+        return value
+    before_json = jsonable(before)
+    after_json = jsonable(after)
+    return {
+        "algorithm_version": sampling.algorithm_version,
+        "stream": stream,
+        "count": count,
+        "state_before": before_json,
+        "state_after": after_json,
+        "state_before_sha256": canonical_json_hash(
+            {"algorithm_version": sampling.algorithm_version, "state": before_json}
+        ),
+        "state_after_sha256": canonical_json_hash(
+            {"algorithm_version": sampling.algorithm_version, "state": after_json}
+        ),
+    }
+
+
+def _available_ram_bytes() -> int | None:
+    try:
+        import ctypes
+
+        class _MemoryStatus(ctypes.Structure):
+            _fields_ = [
+                ("dwLength", ctypes.c_uint32),
+                ("dwMemoryLoad", ctypes.c_uint32),
+                ("ullTotalPhys", ctypes.c_uint64),
+                ("ullAvailPhys", ctypes.c_uint64),
+                ("ullTotalPageFile", ctypes.c_uint64),
+                ("ullAvailPageFile", ctypes.c_uint64),
+                ("ullTotalVirtual", ctypes.c_uint64),
+                ("ullAvailVirtual", ctypes.c_uint64),
+                ("sullAvailExtendedVirtual", ctypes.c_uint64),
+            ]
+
+        status = _MemoryStatus()
+        status.dwLength = ctypes.sizeof(_MemoryStatus)
+        if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
+            return int(status.ullAvailPhys)
+    except (AttributeError, OSError, TypeError):
+        pass
+    try:
+        values = {}
+        for line in Path("/proc/meminfo").read_text(encoding="ascii").splitlines():
+            key, raw = line.split(":", 1)
+            values[key] = int(raw.strip().split()[0]) * 1024
+        if "MemAvailable" in values:
+            return values["MemAvailable"]
+    except (OSError, ValueError, IndexError):
+        pass
+    return None
+
+
+def _reference_capacity_preflight(
+    provider: FixedStateGradientProvider,
+    plan: ReferenceSizingPlan,
+    output_root: Path,
+    *,
+    model_manifest: Mapping[str, object] | None = None,
+    stable_identity: bool = False,
+) -> Mapping[str, object]:
+    """Fail closed on actual model-size, RAM, and single-copy shard capacity."""
+
+    parameter_count: int | None = None
+    parameters = getattr(provider, "_parameters", None)
+    if isinstance(parameters, Mapping):
+        values = list(parameters.values())
+        if values and all(hasattr(value, "numel") for value in values):
+            parameter_count = sum(int(value.numel()) for value in values)
+    if parameter_count is None and isinstance(model_manifest, Mapping):
+        candidate = model_manifest.get("parameter_count")
+        if isinstance(candidate, int) and not isinstance(candidate, bool) and candidate > 0:
+            parameter_count = candidate
+    if parameter_count is None:
+        table = getattr(provider, "_table", None)
+        if isinstance(table, Mapping) and table:
+            first = next(iter(table.values()))
+            if isinstance(first, Mapping):
+                parameter_count = sum(int(np.asarray(value).size) for value in first.values())
+    if parameter_count is None:
+        raise _blocked(
+            BlockerCode.CONTRACT_UNFROZEN,
+            "stage2_capacity_preflight",
+            "formal capacity preflight requires actual parameter_count from model/provider",
+            retryable=False,
+        )
+    max_blocks = int(plan.candidate_sample_counts[-1] // plan.block_size)
+    # Sizing and one-shot are retained until the task result is published.  A
+    # block is one FP64 vector plus a small manifest; moments are two FP64
+    # vectors per stream per commit.  No B/parameter/sample reduction is used.
+    shard_bytes = max_blocks * 2 * parameter_count * 8
+    snapshot_moment_bytes = max_blocks * 4 * parameter_count * 8
+    estimated_disk = int((shard_bytes + snapshot_moment_bytes) * 1.20 + 64 * 1024**2)
+    free_disk = shutil.disk_usage(output_root).free
+    available_ram = _available_ram_bytes()
+    peak_ram = int(3 * parameter_count * 8 + 64 * 1024**2)
+    capacity = {
+        "schema_version": "stage2-reference-capacity-preflight-v1",
+        "parameter_count": parameter_count,
+        "candidate_max_sample_count_per_stream": int(plan.candidate_sample_counts[-1]),
+        "block_size": plan.block_size,
+        "max_block_count_per_stream": max_blocks,
+        "single_copy_shard_bytes": shard_bytes,
+        "snapshot_moment_bytes": snapshot_moment_bytes,
+        "estimated_disk_bytes": estimated_disk,
+        "free_disk_bytes": None if stable_identity else int(free_disk),
+        "peak_ram_bytes": peak_ram,
+        "available_ram_bytes": None if stable_identity else available_ram,
+        "disk_ok": free_disk >= estimated_disk,
+        "ram_ok": available_ram is not None and available_ram >= peak_ram,
+        "fail_closed_if_unknown": True,
+    }
+    capacity["artifact_hash"] = canonical_json_hash(capacity)
+    if not capacity["disk_ok"] or not capacity["ram_ok"]:
+        raise _blocked(
+            BlockerCode.CONTRACT_UNFROZEN,
+            "stage2_capacity_preflight",
+            f"reference capacity insufficient: disk_ok={capacity['disk_ok']} ram_ok={capacity['ram_ok']}",
+            retryable=True,
+        )
+    return capacity
+
+
+def _load_reference_external_lineage(
+    request: TaskExecutionRequest,
+    root: Path,
+) -> tuple[Mapping[str, object], Mapping[str, Mapping[str, object]]]:
+    """Load all formal S2.3/materializer refs as authoritative TaskArtifacts.
+
+    The keys are intentionally explicit.  This prevents a producer from
+    recursively searching arbitrary predecessor JSON and accidentally binding
+    to a similarly named plan, delta, or manifest.
+    """
+
+    if request.config.run_intent != "formal":
+        return {}, {}
+    key_to_kind = {
+        "s23_asset_resolution": ("stage2_s23_asset_resolution", "asset_resolution"),
+        "s23_six_cell_manifest": ("stage2_s23_six_cell_manifest", "six_cell_manifest"),
+        "resolved_config": ("stage2_resolved_config", "resolved_config"),
+        "checkpoint_manifest": ("stage2_checkpoint_manifest", "checkpoint_manifest"),
+        "model_manifest": ("stage2_model_manifest", "model_manifest"),
+        "data_manifest": ("stage2_data_manifest", "data_manifest"),
+        "tokenizer_manifest": ("stage2_tokenizer_manifest", "tokenizer_manifest"),
+        "parameter_registry": ("stage2_parameter_registry", "parameter_registry"),
+        # S2.1 freezes the formula and native-unit floors.  Numeric
+        # ``delta_sci_by_B`` is deliberately *not* an external input: S2.4
+        # derives it from the immutable sizing shards before creating A/B.
+        "preregistration": ("stage2_preregistration", "preregistration"),
+        "sizing_plan": ("stage2_reference_sizing_plan", "reference_sizing_plan"),
+    }
+    lineage: dict[str, object] = {}
+    payloads: dict[str, Mapping[str, object]] = {}
+    for name, (environment_key, expected_kind) in key_to_kind.items():
+        reference = request.environment.evidence_refs.get(environment_key)
+        if not isinstance(reference, str) or not reference:
+            raise _blocked(
+                BlockerCode.CONTRACT_UNFROZEN,
+                environment_key,
+                f"formal S2.4 requires explicit TaskArtifact ref: {environment_key}",
+                retryable=False,
+            )
+        try:
+            loaded = load_committed_task_artifact(root, reference, require_formal=True)
+        except (OSError, ValueError, TypeError) as error:
+            raise _blocked(
+                BlockerCode.CONTRACT_UNFROZEN,
+                environment_key,
+                f"external TaskArtifact invalid: {type(error).__name__}",
+                retryable=False,
+                evidence_refs=(reference,),
+            ) from error
+        if loaded.identity.artifact_kind != expected_kind:
+            raise _blocked(
+                BlockerCode.CONTRACT_UNFROZEN,
+                environment_key,
+                f"external artifact kind mismatch: expected {expected_kind}",
+                retryable=False,
+                evidence_refs=(reference,),
+            )
+        if not isinstance(loaded.payload, Mapping):
+            raise _blocked(BlockerCode.CONTRACT_UNFROZEN, environment_key, "external payload object required", retryable=False, evidence_refs=(reference,))
+        payload = dict(loaded.payload)
+        payloads[name] = payload
+        lineage[name] = {
+            "commit_ref": reference,
+            "artifact_kind": loaded.identity.artifact_kind,
+            "artifact_hash": loaded.identity.artifact_hash,
+            "config_hash": loaded.identity.config_hash,
+            "task_id": loaded.identity.task_id,
+            "formal_eligible": loaded.identity.formal_eligible,
+            "payload_hash": canonical_json_hash(payload),
+            "source_refs": list(loaded.source_refs),
+        }
+    return lineage, payloads
+
+
 def _reference_numeric_diagnostics(
     *,
     final_root: Path,
@@ -2213,55 +2687,58 @@ def _reference_numeric_diagnostics(
     state, bundle = load_tensor_bundle(final_root / str(latest["object_ref"]))
     if not isinstance(state, Mapping):
         raise RuntimeError("STAGE2_REFERENCE_NUMERIC_BLOCK_STATE_INVALID")
-    raw_a, raw_b = state.get("blocks_a"), state.get("blocks_b")
-    raw_wa, raw_wb = state.get("block_weights_a"), state.get("block_weights_b")
-    if (
-        not isinstance(raw_a, list)
-        or not isinstance(raw_b, list)
-        or not isinstance(raw_wa, list)
-        or not isinstance(raw_wb, list)
-        or len(raw_a) != len(raw_b)
-        or len(raw_a) != len(raw_wa)
-        or len(raw_b) != len(raw_wb)
-        or not raw_a
-    ):
-        raise RuntimeError("STAGE2_REFERENCE_NUMERIC_RAW_BLOCKS_MISSING")
-    arrays_a = [_as_numpy_vector(item) for item in raw_a]
-    arrays_b = [_as_numpy_vector(item) for item in raw_b]
-    names = tuple(arrays_a[0])
-    if any(tuple(item) != names for item in arrays_a + arrays_b):
-        raise RuntimeError("STAGE2_REFERENCE_NUMERIC_PARAMETER_SET_DRIFT")
-    all_blocks = arrays_a + arrays_b
-    all_weights = [np.longdouble(float(item)) for item in list(raw_wa) + list(raw_wb)]
-    if any(not np.isfinite(item) or item <= 0 for item in all_weights):
-        raise RuntimeError("STAGE2_REFERENCE_NUMERIC_BLOCK_WEIGHTS_INVALID")
-    n1 = sum(all_weights, np.longdouble(0))
-    n2 = sum((weight * weight for weight in all_weights), np.longdouble(0))
+    raw_a, raw_b = state.get("shard_refs_a"), state.get("shard_refs_b")
+    if not isinstance(raw_a, list) or not isinstance(raw_b, list) or not raw_a or len(raw_a) != len(raw_b):
+        raise RuntimeError("STAGE2_REFERENCE_NUMERIC_SHARD_REFS_MISSING")
+    shard_store = _ReferenceShardStore(final_root)
+    raw_digest_rows: list[Mapping[str, object]] = []
+    names: tuple[str, ...] | None = None
+    first_sums: dict[str, np.ndarray] = {}
+    second_sums: dict[str, np.ndarray] = {}
+    n1 = np.longdouble(0)
+    n2 = np.longdouble(0)
+    for ref in list(raw_a) + list(raw_b):
+        if not isinstance(ref, Mapping):
+            raise RuntimeError("STAGE2_REFERENCE_NUMERIC_SHARD_REF_INVALID")
+        vector, weight, _ = shard_store.load(ref)
+        current_names = tuple(vector)
+        if names is None:
+            names = current_names
+            first_sums = {name: np.zeros_like(vector[name], dtype=np.longdouble) for name in names}
+            second_sums = {name: np.zeros_like(vector[name], dtype=np.longdouble) for name in names}
+        if current_names != names:
+            raise RuntimeError("STAGE2_REFERENCE_NUMERIC_PARAMETER_SET_DRIFT")
+        long_weight = np.longdouble(weight)
+        if not np.isfinite(long_weight) or long_weight <= 0:
+            raise RuntimeError("STAGE2_REFERENCE_NUMERIC_BLOCK_WEIGHTS_INVALID")
+        n1 += long_weight
+        n2 += long_weight * long_weight
+        raw_digest_rows.append({"vector_hash": _vector_digest(vector), "weight": float(weight)})
+        for name in names:
+            value = np.asarray(vector[name], dtype=np.longdouble)
+            first_sums[name] += long_weight * value
+            second_sums[name] += long_weight * long_weight * value * value
+    if names is None:
+        raise RuntimeError("STAGE2_REFERENCE_NUMERIC_SHARDS_EMPTY")
     denominator = n1 * n1 - n2
     if denominator <= 0:
         raise RuntimeError("STAGE2_REFERENCE_NUMERIC_U_DENOMINATOR_INVALID")
     high: dict[str, np.ndarray] = {}
     accumulated: dict[str, np.ndarray] = {}
     for name in names:
-        values = [np.asarray(item[name], dtype=np.longdouble) for item in all_blocks]
-        first = np.zeros_like(values[0], dtype=np.longdouble)
-        second = np.zeros_like(values[0], dtype=np.longdouble)
-        for value, weight in zip(values, all_weights):
-            first += weight * value
-            second += weight * weight * value * value
-        high[name] = np.asarray((first * first - second) / denominator, dtype=np.float64)
+        high[name] = np.asarray((first_sums[name] * first_sums[name] - second_sums[name]) / denominator, dtype=np.float64)
         accumulated[name] = np.asarray(result.bias_reference[name], dtype=np.float64)
-    raw_block_digest = canonical_json_hash([_vector_digest(item) for item in arrays_a + arrays_b])
+    raw_block_digest = canonical_json_hash(raw_digest_rows)
     numeric_vectors = {
         "high_precision": high,
         "accumulated": accumulated,
     }
     metadata: dict[str, object] = {
         "schema_version": "stage2-reference-numerical-diagnostics-v1",
-        "recompute_method": "longdouble_pairwise_u_from_committed_blocks",
+        "recompute_method": "longdouble_pairwise_u_from_content_addressed_shards",
         "raw_block_digest": raw_block_digest,
-        "raw_block_count_a": len(arrays_a),
-        "raw_block_count_b": len(arrays_b),
+        "raw_block_count_a": len(raw_a),
+        "raw_block_count_b": len(raw_b),
         "high_precision_hash": _vector_digest(high),
         "accumulated_hash": _vector_digest(accumulated),
         "max_abs_error": max(float(np.max(np.abs(high[name] - accumulated[name]))) for name in names),
@@ -2298,10 +2775,30 @@ def _run_stage2_reference(
             retryable=False,
             evidence_refs=inputs.references,
         )
-    plan, plan_refs = _stage2_reference_plan(request, root, context)
+    external_lineage: Mapping[str, object] = {}
+    external_payloads: Mapping[str, Mapping[str, object]] = {}
+    if request.config.run_intent == "formal":
+        external_lineage, external_payloads = _load_reference_external_lineage(request, root)
+    plan, plan_refs = _stage2_reference_plan(
+        request,
+        root,
+        context,
+        external_payloads.get("sizing_plan"),
+    )
+    capacity_preflight = _reference_capacity_preflight(
+        context.provider,
+        plan,
+        store.root,
+        model_manifest=external_payloads.get("model_manifest"),
+        stable_identity=request.config.run_intent == "local_fixture",
+    )
     sampling = upstream_sampling
     provider_state_before = context.provider.state_digest()
-    six_cell_manifest = _reference_six_cell_manifest(inputs, context)
+    six_cell_manifest = _reference_six_cell_manifest(
+        inputs,
+        context,
+        external_payloads.get("s23_six_cell_manifest"),
+    )
     if request.config.run_intent == "formal" and (
         six_cell_manifest.get("status") != "READY"
         or six_cell_manifest.get("scope") != "formal"
@@ -2313,8 +2810,21 @@ def _run_stage2_reference(
             retryable=False,
             evidence_refs=inputs.references,
         )
-    delta_sci = _reference_delta_sci(request, root, plan)
-    parameter_registry = _reference_parameter_registry(request, root, context)
+    formula_contract, formula_contract_hash = _reference_formula_contract(
+        request,
+        external_payloads.get("preregistration"),
+    )
+    if request.config.run_intent == "formal":
+        lineage_formula = external_lineage.get("preregistration")
+        if not isinstance(lineage_formula, Mapping) or not isinstance(lineage_formula.get("artifact_hash"), str):
+            raise _blocked(BlockerCode.CONTRACT_UNFROZEN, "stage2_preregistration", "formula contract TaskArtifact lineage missing", retryable=False)
+        formula_contract_hash = str(lineage_formula["artifact_hash"])
+    parameter_registry = _reference_parameter_registry(
+        request,
+        root,
+        context,
+        external_payloads.get("parameter_registry"),
+    )
     if request.config.run_intent == "formal" and parameter_registry is None:
         raise _blocked(
             BlockerCode.CONTRACT_UNFROZEN,
@@ -2329,6 +2839,7 @@ def _run_stage2_reference(
         )
     maximum = plan.candidate_sample_counts[-1]
     sizing_draws = sampling.draws("reference_sizing", maximum)
+    sizing_rng_state = _actual_sampling_state(sampling, "reference_sizing", maximum)
     result = StreamingReferenceSizer(context.provider).run(
         plan,
         # Keep the old positional API available for direct callers, while the
@@ -2357,14 +2868,35 @@ def _run_stage2_reference(
             "sizing_stream": "reference_sizing",
         }
     )
+    # Freeze the sizing-derived numeric margin before *any* final A/B draw is
+    # materialized.  This source is built only from the sizing shard prefix;
+    # it is never included in the final A/B estimand.
+    delta_sci = _derive_sizing_delta_sci(
+        root=root,
+        sizing_root=store.root / "resume" / "reference-sizing",
+        plan=plan,
+        parameter_registry=parameter_registry,
+        formula_contract=formula_contract,
+        formula_contract_hash=(
+            str(external_lineage.get("preregistration", {}).get("artifact_hash"))
+            if isinstance(external_lineage.get("preregistration"), Mapping)
+            else formula_contract_hash
+        ),
+        provider=context.provider,
+        sizing_result_hash=result.scientific_artifact_hash,
+    )
     one_shot_plan = OneShotReferencePlan(
         reference_id=plan.reference_id,
         sizing_result_hash=result.scientific_artifact_hash,
         sample_count_per_stream=final_count,
         block_size=plan.block_size,
     )
+    # The final draw manifests are created only after the sizing-derived
+    # margin has been atomically published.
     final_a = sampling.draws("reference_A", final_count)
     final_b = sampling.draws("reference_B", final_count)
+    final_a_rng_state = _actual_sampling_state(sampling, "reference_A", final_count)
+    final_b_rng_state = _actual_sampling_state(sampling, "reference_B", final_count)
     one_shot = OneShotReferenceRunner(context.provider).run(
         one_shot_plan,
         draws_a=final_a,
@@ -2409,7 +2941,6 @@ def _run_stage2_reference(
         }
     config_identity = {
         "config_hash": request.config.config_hash,
-        "full_hash": request.config.full_hash,
         "task_id": request.task.task_id,
     }
     # Scientific identity belongs to the immutable v1 base config.  The v2
@@ -2501,17 +3032,28 @@ def _run_stage2_reference(
         ),
     }
     replay_diagnostic["replay_hash"] = canonical_json_hash(replay_diagnostic)
-    rng_before = canonical_json_hash(
-        {"sampling_plan_hash": sampling.digest, "streams": ["reference_sizing", "reference_A", "reference_B"]}
+    rng_before_state = {
+        "sampling_plan_hash": sampling.digest,
+        "streams": {
+            "reference_sizing": sizing_rng_state["state_before"],
+            "reference_A": final_a_rng_state["state_before"],
+            "reference_B": final_b_rng_state["state_before"],
+        },
+    }
+    rng_after_state = {
+        "sampling_plan_hash": sampling.digest,
+        "streams": {
+            "reference_sizing": sizing_rng_state["state_after"],
+            "reference_A": final_a_rng_state["state_after"],
+            "reference_B": final_b_rng_state["state_after"],
+        },
+    }
+    rng_before = canonical_json_hash(rng_before_state)
+    rng_after = canonical_json_hash(rng_after_state)
+    producer_provenance = _trusted_stage2_provenance(
+        require_clean=request.config.run_intent == "formal"
     )
-    rng_after = canonical_json_hash(
-        {
-            "sizing_draw_hash": sizing_draw_hash,
-            "stream_a_draw_hash": one_shot.stream_a_draw_hash,
-            "stream_b_draw_hash": one_shot.stream_b_draw_hash,
-        }
-    )
-    producer_commit, _, _ = _stage2_source_identity()
+    producer_commit = str(producer_provenance["head_commit"])
     bundle_path = store.root / "tensor-bundles" / "reference-final"
     bundle = _publish_or_load_bundle(
         bundle_path,
@@ -2574,6 +3116,8 @@ def _run_stage2_reference(
         "reference_protocol": "authoritative_sizing_and_one_shot_block_pair_commits",
         "diagnostics_schema_version": "stage2-reference-producer-diagnostics-v1",
         "stage2_reference_producer_commit": producer_commit,
+        "producer_provenance": producer_provenance,
+        "external_lineage": external_lineage,
         "formal_scope": request.config.run_intent,
         "cell_id": checkpoint_identity.get("cell_id"),
         "six_cell_manifest": six_cell_manifest,
@@ -2582,6 +3126,8 @@ def _run_stage2_reference(
         "sizing_plan_artifact_hash": sizing_plan_hash,
         "sizing_draw_hash": sizing_draw_hash,
         "sizing_identity_hash": sizing_identity_hash,
+        "formula_contract": formula_contract,
+        "formula_contract_hash": formula_contract_hash,
         "candidate_delta_sci": delta_sci,
         "candidate_delta_sci_source": delta_sci.get("source_ref"),
         "candidate_delta_sci_source_hash": delta_sci.get("source_hash"),
@@ -2597,10 +3143,30 @@ def _run_stage2_reference(
             "model_state_after_hash": provider_state_after,
             "rng_state_before_hash": rng_before,
             "rng_state_after_hash": rng_after,
+            "rng_state_before": rng_before_state,
+            "rng_state_after": rng_after_state,
+        },
+        "draw_artifacts": {
+            "reference_sizing": {
+                "sampling_plan": sampling.to_dict(),
+                "manifest": sampling.draw_manifest("reference_sizing", maximum).to_manifest(),
+                "actual_state": sizing_rng_state,
+            },
+            "reference_A": {
+                "sampling_plan": sampling.to_dict(),
+                "manifest": sampling.draw_manifest("reference_A", final_count).to_manifest(),
+                "actual_state": final_a_rng_state,
+            },
+            "reference_B": {
+                "sampling_plan": sampling.to_dict(),
+                "manifest": sampling.draw_manifest("reference_B", final_count).to_manifest(),
+                "actual_state": final_b_rng_state,
+            },
         },
         "resume_replay": replay_diagnostic,
         "sizing_result_identity_hash": replay_diagnostic["sizing_result_identity_hash"],
         "numerical_floor": 1.0e-12,
+        "capacity_preflight": capacity_preflight,
         "formal_eligible": False,
     }
     convergence["reference_producer_diagnostics_hash"] = canonical_json_hash(
@@ -2611,7 +3177,12 @@ def _run_stage2_reference(
         "reference_convergence_report": convergence,
         "gate_record": _gate_candidate(request),
     }
-    return payload_by_kind, _source_refs(request, plan_refs)
+    external_refs = tuple(
+        str(item.get("commit_ref"))
+        for item in external_lineage.values()
+        if isinstance(item, Mapping) and isinstance(item.get("commit_ref"), str)
+    )
+    return payload_by_kind, tuple(dict.fromkeys((*_source_refs(request, plan_refs), *external_refs)))
 
 
 def _exact_importance_reference(context: _ProviderContext) -> Mapping[str, np.ndarray]:
@@ -5876,11 +6447,32 @@ class _Stage23Runner(TaskRunner):
             payloads,
             source_refs=source_refs,
         )
+        metadata: dict[str, JSONValue] = {
+            "execution_contract": "stage23-specialized-v1"
+        }
+        if request.task.task_id == _STAGE2_REFERENCE_TASK and request.config.run_intent == "formal":
+            convergence = payloads.get("reference_convergence_report", {})
+            if isinstance(convergence, Mapping):
+                bindings = {
+                    key: convergence.get(key)
+                    for key in (
+                        "stage2_reference_producer_commit",
+                        "producer_provenance",
+                        "config_identity",
+                        "checkpoint_identity",
+                        "registry_identity",
+                        "model_identity",
+                        "data_identity",
+                        "external_lineage",
+                    )
+                    if convergence.get(key) is not None
+                }
+                metadata["identity_bindings"] = bindings  # type: ignore[assignment]
         return TaskRunResult.passed(
             request,
             artifact_refs=references,
             message="stage2/3 specialized task completed",
-            metadata={"execution_contract": "stage23-specialized-v1"},
+            metadata=metadata,
         )
 
 

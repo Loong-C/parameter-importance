@@ -28,6 +28,7 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Evaluate formal Stage 2 G2.3 reference evidence")
     parser.add_argument("--workspace-root", type=Path, required=True)
     parser.add_argument("--output-root", type=Path, required=True)
+    parser.add_argument("--repo-root", type=Path, help="trusted repository checkout for producer/source verification")
     parser.add_argument(
         "--task-result",
         action="append",
@@ -57,8 +58,28 @@ def _parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     try:
+        workspace_root = args.workspace_root.resolve()
         if args.input_index is not None:
-            value = json.loads(args.input_index.read_text(encoding="utf-8"))
+            index_path = args.input_index.resolve()
+            if args.input_index.is_symlink():
+                raise ValueError("--input-index symlink is forbidden")
+            try:
+                index_path.relative_to(workspace_root)
+            except ValueError as error:
+                raise ValueError("--input-index must be under --workspace-root") from error
+
+            def _no_duplicate_pairs(pairs: list[tuple[str, object]]) -> dict[str, object]:
+                result: dict[str, object] = {}
+                for key, item in pairs:
+                    if key in result:
+                        raise ValueError(f"duplicate JSON key: {key}")
+                    result[key] = item
+                return result
+
+            value = json.loads(
+                index_path.read_text(encoding="utf-8"),
+                object_pairs_hook=_no_duplicate_pairs,
+            )
             if not isinstance(value, list):
                 raise ValueError("--input-index must contain a JSON array")
             cells = [CellInput.from_mapping(item) for item in value]
@@ -71,14 +92,15 @@ def main(argv: list[str] | None = None) -> int:
             configs = args.config or [None] * len(args.task_result)
             cells = [CellInput(ids[index], str(ref), configs[index]) for index, ref in enumerate(args.task_result)]
         result = evaluate_formal_g23(
-            args.workspace_root,
+            workspace_root,
             cells,
             expected_cell_ids=tuple(item.cell_id for item in cells),
             output_root=args.output_root,
+            repo_root=args.repo_root,
         )
         print(json.dumps(result, ensure_ascii=False, sort_keys=True, indent=2))
         return 0 if result.get("status") == "PASS" and result.get("formal_eligible") is True else 3
-    except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
+    except (OSError, KeyError, IndexError, TypeError, ValueError, json.JSONDecodeError) as error:
         print(f"G2.3 evaluation blocked: {error}", file=sys.stderr)
         return 3
 
