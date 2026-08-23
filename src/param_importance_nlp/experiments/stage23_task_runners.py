@@ -2392,6 +2392,92 @@ def _reference_identity_hash(value: Mapping[str, object]) -> str:
     return canonical_json_hash(dict(value))
 
 
+def _reference_tokenizer_identity(
+    external_tokenizer: object,
+    *,
+    formal: bool,
+    expected_asset_id: object,
+    expected_checkpoint_id: object,
+    evidence_refs: tuple[str, ...] = (),
+) -> dict[str, object]:
+    """Build the tokenizer identity from the v1/v2 boundary contract.
+
+    ``tokenizer`` is not a v1 config section: its selector is
+    ``model.tokenizer_asset_id``.  A formal S2.4 run additionally consumes the
+    hash-bound tokenizer manifest published by S2.3; it must carry the selected
+    checkpoint identity before the reference artifact is published.  The
+    manifest's ``asset_id`` is a content identity and is therefore not compared
+    directly with the logical selector name.
+    """
+
+    if not formal:
+        identity = (
+            {"asset_id": expected_asset_id}
+            if isinstance(expected_asset_id, str) and expected_asset_id
+            else {}
+        )
+        return {**identity, "identity_hash": _reference_identity_hash(identity)}
+
+    requirement = "stage2_tokenizer_manifest"
+    if not isinstance(expected_asset_id, str) or not expected_asset_id:
+        raise _blocked(
+            BlockerCode.CONTRACT_UNFROZEN,
+            requirement,
+            "formal reference config must bind model.tokenizer_asset_id",
+            retryable=False,
+            evidence_refs=evidence_refs,
+        )
+    if not isinstance(expected_checkpoint_id, str) or not expected_checkpoint_id:
+        raise _blocked(
+            BlockerCode.CONTRACT_UNFROZEN,
+            requirement,
+            "formal reference checkpoint identity is required before tokenizer binding",
+            retryable=False,
+            evidence_refs=evidence_refs,
+        )
+    if not isinstance(external_tokenizer, Mapping):
+        raise _blocked(
+            BlockerCode.CONTRACT_UNFROZEN,
+            requirement,
+            "formal reference requires the hash-bound tokenizer manifest",
+            retryable=False,
+            evidence_refs=evidence_refs,
+        )
+    if external_tokenizer.get("schema_version") != "tokenizer-manifest-v1":
+        raise _blocked(
+            BlockerCode.CONTRACT_UNFROZEN,
+            requirement,
+            "formal tokenizer manifest schema is invalid",
+            retryable=False,
+            evidence_refs=evidence_refs,
+        )
+    fields = ("asset_id", "revision", "checkpoint_id")
+    identity = {key: external_tokenizer.get(key) for key in fields}
+    missing = [
+        key
+        for key, value in identity.items()
+        if not isinstance(value, str) or not value.strip()
+    ]
+    if missing:
+        raise _blocked(
+            BlockerCode.CONTRACT_UNFROZEN,
+            requirement,
+            "formal tokenizer manifest identity fields are missing or invalid: "
+            + ",".join(missing),
+            retryable=False,
+            evidence_refs=evidence_refs,
+        )
+    if identity["checkpoint_id"] != expected_checkpoint_id:
+        raise _blocked(
+            BlockerCode.CONTRACT_UNFROZEN,
+            requirement,
+            "formal tokenizer manifest checkpoint_id does not match the selected checkpoint",
+            retryable=False,
+            evidence_refs=evidence_refs,
+        )
+    return {**identity, "identity_hash": _reference_identity_hash(identity)}
+
+
 def _reference_parameter_registry(
     request: TaskExecutionRequest,
     root: Path,
@@ -3374,11 +3460,9 @@ def _run_stage2_reference(
     model_section = request.config.base_config.section("model")
     data_section = request.config.base_config.section("data")
     checkpoint_section = request.config.base_config.section("identity")
-    tokenizer_section = request.config.base_config.section("tokenizer")
     model_identity = dict(model_section) if isinstance(model_section, Mapping) else {}
     data_identity = dict(data_section) if isinstance(data_section, Mapping) else {}
     identity_section = dict(checkpoint_section) if isinstance(checkpoint_section, Mapping) else {}
-    tokenizer_identity = dict(tokenizer_section) if isinstance(tokenizer_section, Mapping) else {}
     data_identity["data_range_hash"] = six_cell_manifest.get("data_range_hash")
     manifest_rows = six_cell_manifest.get("checkpoints")
     current_checkpoint_id = identity_section.get("input_checkpoint_id")
@@ -3423,21 +3507,13 @@ def _run_stage2_reference(
     config_identity["identity_hash"] = _reference_identity_hash(config_identity)
     model_identity["identity_hash"] = _reference_identity_hash(model_identity)
     data_identity["identity_hash"] = _reference_identity_hash(data_identity)
-    external_tokenizer = external_payloads.get("tokenizer_manifest")
-    if request.config.run_intent == "formal":
-        if not isinstance(external_tokenizer, Mapping):
-            raise _blocked(
-                BlockerCode.CONTRACT_UNFROZEN,
-                "stage2_tokenizer_manifest",
-                "formal reference requires the hash-bound tokenizer manifest",
-                retryable=False,
-                evidence_refs=inputs.references,
-            )
-        tokenizer_identity = {
-            key: external_tokenizer.get(key)
-            for key in ("asset_id", "revision", "checkpoint_id")
-        }
-    tokenizer_identity["identity_hash"] = _reference_identity_hash(tokenizer_identity)
+    tokenizer_identity = _reference_tokenizer_identity(
+        external_payloads.get("tokenizer_manifest"),
+        formal=request.config.run_intent == "formal",
+        expected_asset_id=model_identity.get("tokenizer_asset_id"),
+        expected_checkpoint_id=checkpoint_identity.get("checkpoint_id"),
+        evidence_refs=inputs.references,
+    )
     registry_identity = {
         "registry_hash": context.provider.registry_hash,
         "parameter_registry_artifact_hash": parameter_registry.get("artifact_hash"),
