@@ -62,6 +62,7 @@ from .sampling import (
     RepetitionMapping,
 )
 from .stage2 import EstimatorDecision, PairedEstimatorRunner
+from .stage2_g23_contracts import boundary_digest, validate_sizing_plan_contract, validate_weighting_contract
 
 
 _SAFE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,159}$")
@@ -422,7 +423,7 @@ def _weighting_contract(provider: FixedStateGradientProvider) -> dict[str, objec
     for name in fields[3:]:
         if type(contract[name]) is not bool:
             raise TypeError(f"GRADIENT_PROVIDER_{name.upper()}_MUST_BE_BOOL")
-    return contract
+    return validate_weighting_contract(contract)
 
 
 class _GradientMoments:
@@ -650,6 +651,18 @@ class ReferenceSizingPlan:
             raise ValueError("required_consecutive 必须是正整数")
         if self.execution.run_intent == "formal":
             self.execution.require_for_stage(2)
+        # The fixed doubling/one-consecutive ladder is the formal S2.4
+        # entrance contract.  Local/generic Stage-2 recovery tests may still
+        # use exploratory ladders; they never become formal evidence.
+        if self.execution.run_intent == "formal":
+            validate_sizing_plan_contract(
+                {
+                    "schema_version": self.schema_version,
+                    "candidate_sample_counts": list(counts),
+                    "block_size": self.block_size,
+                    "required_consecutive": self.required_consecutive,
+                }
+            )
 
     @property
     def scope(self) -> str:
@@ -1629,6 +1642,9 @@ class OneShotReferenceRunner:
         artifact_root: str | Path,
         sizing_draws: Sequence[object] | None = None,
         max_new_block_pairs: int | None = None,
+        rng_boundaries_a: Sequence[Mapping[str, object]] | None = None,
+        rng_boundaries_b: Sequence[Mapping[str, object]] | None = None,
+        require_rng_boundaries: bool = False,
     ) -> OneShotReferenceResult:
         if max_new_block_pairs is not None and max_new_block_pairs <= 0:
             raise ValueError("max_new_block_pairs 必须为正整数或 null")
@@ -1668,6 +1684,12 @@ class OneShotReferenceRunner:
             }
         )
         total_pairs = plan.sample_count_per_stream // plan.block_size
+        if require_rng_boundaries and (rng_boundaries_a is None or rng_boundaries_b is None):
+            raise ValueError("ONE_SHOT_REFERENCE_FORMAL_RNG_BOUNDARIES_REQUIRED")
+        if rng_boundaries_a is not None and len(rng_boundaries_a) < total_pairs + 1:
+            raise ValueError("ONE_SHOT_REFERENCE_RNG_BOUNDARIES_A_INCOMPLETE")
+        if rng_boundaries_b is not None and len(rng_boundaries_b) < total_pairs + 1:
+            raise ValueError("ONE_SHOT_REFERENCE_RNG_BOUNDARIES_B_INCOMPLETE")
         processed_pairs = 0
         moments_a, moments_b = _GradientMoments(), _GradientMoments()
         root = Path(artifact_root)
@@ -1692,6 +1714,13 @@ class OneShotReferenceRunner:
                 if restored.get("sizing_result_identity_hash") != sizing_result_identity_hash:
                     raise ValueError("ONE_SHOT_REFERENCE_RESUME_SIZING_IDENTITY_MISMATCH")
                 processed_pairs = int(restored["processed_block_pairs"])
+                if rng_boundaries_a is not None and rng_boundaries_b is not None:
+                    expected_rng = {
+                        "a": dict(rng_boundaries_a[processed_pairs]),
+                        "b": dict(rng_boundaries_b[processed_pairs]),
+                    }
+                    if restored.get("rng_state") != expected_rng or restored.get("rng_state_digest") != boundary_digest(expected_rng):
+                        raise ValueError("ONE_SHOT_REFERENCE_RESUME_RNG_STATE_MISMATCH")
                 moments_a = _GradientMoments.from_state(restored["a"])  # type: ignore[arg-type]
                 moments_b = _GradientMoments.from_state(restored["b"])  # type: ignore[arg-type]
                 raw_a, raw_b = restored.get("shard_refs_a"), restored.get("shard_refs_b")
@@ -1749,12 +1778,23 @@ class OneShotReferenceRunner:
                     "shard_count": processed_pairs * 2,
                     "final_length_required": True,
                     "sizing_result_identity_hash": sizing_result_identity_hash,
-                    "rng_state_digest": canonical_json_hash(
+                    "rng_state": (
                         {
-                            "stream_a_draw_hash": _draw_digest(draws_a),
-                            "stream_b_draw_hash": _draw_digest(draws_b),
-                            "sizing_result_hash": plan.sizing_result_hash,
+                            "a": dict(rng_boundaries_a[processed_pairs]),
+                            "b": dict(rng_boundaries_b[processed_pairs]),
                         }
+                        if rng_boundaries_a is not None and rng_boundaries_b is not None
+                        else None
+                    ),
+                    "rng_state_digest": (
+                        boundary_digest(
+                            {
+                                "a": dict(rng_boundaries_a[processed_pairs]),
+                                "b": dict(rng_boundaries_b[processed_pairs]),
+                            }
+                        )
+                        if rng_boundaries_a is not None and rng_boundaries_b is not None
+                        else ""
                     ),
                 }
                 store.publish(processed_pairs, state)
@@ -1831,12 +1871,19 @@ class StreamingReferenceSizer:
         artifact_root: str | Path,
         max_new_block_pairs: int | None = None,
         draws_sizing: Sequence[object] | None = None,
+        rng_boundaries: Sequence[Mapping[str, object]] | None = None,
+        require_rng_boundaries: bool = False,
     ) -> ReferenceSizingResult:
         if plan.scope == "formal":
             plan.execution.require_for_stage(2)
         if max_new_block_pairs is not None and max_new_block_pairs <= 0:
             raise ValueError("max_new_block_pairs 必须为正整数或 null")
         maximum = plan.candidate_sample_counts[-1]
+        total_pairs = maximum // plan.block_size
+        if require_rng_boundaries and rng_boundaries is None:
+            raise ValueError("REFERENCE_SIZING_FORMAL_RNG_BOUNDARIES_REQUIRED")
+        if rng_boundaries is not None and len(rng_boundaries) < total_pairs + 1:
+            raise ValueError("REFERENCE_SIZING_RNG_BOUNDARIES_INCOMPLETE")
         if draws_sizing is None:
             if len(draws_a) < maximum or len(draws_b) < maximum:
                 raise ValueError("冻结 A/B draws 少于 reference sizing 最大候选")
@@ -1896,6 +1943,10 @@ class StreamingReferenceSizer:
                 if restored.get("sizing_identity_hash") != sizing_identity_hash:
                     raise ValueError("REFERENCE_RESUME_SIZING_IDENTITY_MISMATCH")
                 processed_pairs = int(restored["processed_block_pairs"])
+                if rng_boundaries is not None:
+                    expected_rng = dict(rng_boundaries[processed_pairs])
+                    if restored.get("rng_state") != expected_rng or restored.get("rng_state_digest") != boundary_digest(expected_rng):
+                        raise ValueError("REFERENCE_RESUME_RNG_STATE_MISMATCH")
                 streak = int(restored["convergence_streak"])
                 selected_value = restored["selected_sample_count_per_stream"]
                 selected = None if selected_value is None else int(selected_value)
@@ -2029,7 +2080,16 @@ class StreamingReferenceSizer:
                     "sizing_stream": draws_sizing is not None,
                     "sizing_draw_hash": sizing_draw_hash,
                     "sizing_identity_hash": sizing_identity_hash,
-                    "rng_state_digest": sizing_draw_hash,
+                    "rng_state": (
+                        dict(rng_boundaries[processed_pairs])
+                        if rng_boundaries is not None
+                        else None
+                    ),
+                    "rng_state_digest": (
+                        boundary_digest(rng_boundaries[processed_pairs])
+                        if rng_boundaries is not None
+                        else ""
+                    ),
                 }
                 store.publish(processed_pairs, state)
 

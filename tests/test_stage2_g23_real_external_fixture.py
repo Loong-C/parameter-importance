@@ -32,6 +32,11 @@ from param_importance_nlp.experiments.stage2_formal import (
     estimate_sequence_variance_shards,
 )
 from param_importance_nlp.experiments.stage2_g23_evaluator import CellInput, EXPECTED_CELL_IDS, evaluate_formal_g23
+from param_importance_nlp.experiments.stage2_g23_contracts import (
+    boundary_digest,
+    generator_boundary,
+    source_manifest_for_refs,
+)
 from param_importance_nlp.experiments.stage23_task_runners import (
     _actual_sampling_state,
     _derive_sizing_delta_sci,
@@ -189,6 +194,18 @@ def _build_cell(root: Path, index: int, cell: str, head: str, prereg: dict[str, 
     draws_b = sampling.draws("reference_B", 4)
     sizing_draw_hash = _draw_digest(sizing_draws)
     draw_a_hash, draw_b_hash = _draw_digest(draws_a), _draw_digest(draws_b)
+    sizing_rng_boundaries = tuple(
+        generator_boundary(sampling, "reference_sizing", sequence)
+        for sequence in range(5)
+    )
+    final_a_rng_boundaries = tuple(
+        generator_boundary(sampling, "reference_A", sequence)
+        for sequence in range(5)
+    )
+    final_b_rng_boundaries = tuple(
+        generator_boundary(sampling, "reference_B", sequence)
+        for sequence in range(5)
+    )
     evidence_hash = canonical_json_hash({"cell_id": cell, "scope": "formal", "gates": ["stage2.G2.2"]})
     plan_obj = ReferenceSizingPlan(
         reference_id=f"real-reference-{index}",
@@ -232,8 +249,11 @@ def _build_cell(root: Path, index: int, cell: str, head: str, prereg: dict[str, 
     lineage: dict[str, object] = {}
     for name, payload in external_payloads.items():
         kind = {"s23_asset_resolution": "asset_resolution", "s23_six_cell_manifest": "six_cell_manifest", "resolved_config": "resolved_config", "checkpoint_manifest": "checkpoint_manifest", "model_manifest": "model_manifest", "data_manifest": "data_manifest", "tokenizer_manifest": "tokenizer_manifest", "parameter_registry": "parameter_registry", "preregistration": "preregistration", "sizing_plan": "reference_sizing_plan"}[name]
-        published = external_store.publish(task_id="stage2.03_assets_checkpoints_and_sampling" if name.startswith("s23_") else "stage2.01_scope_hypotheses_and_preregistration", artifact_kind=kind, config_hash=config_hash, run_intent="formal", payload=payload, formal_eligible=True)
-        lineage[name] = {"commit_ref": published.commit_ref, "artifact_kind": kind, "artifact_hash": published.artifact_hash, "config_hash": published.config_hash, "task_id": published.task_id, "formal_eligible": True, "payload_hash": canonical_json_hash(payload), "source_refs": []}
+        source_ref = f"external/source-manifests/real-cell-{index}/{name}.json"
+        write_canonical_json(root / source_ref, {"schema_version": "stage2-source-input-v1", "cell_id": cell, "artifact_name": name, "payload_hash": canonical_json_hash(payload)})
+        source_manifest = source_manifest_for_refs(root, [source_ref])
+        published = external_store.publish(task_id="stage2.03_assets_checkpoints_and_sampling" if name.startswith("s23_") else "stage2.01_scope_hypotheses_and_preregistration", artifact_kind=kind, config_hash=config_hash, run_intent="formal", payload=payload, formal_eligible=True, source_refs=(source_ref,))
+        lineage[name] = {"commit_ref": published.commit_ref, "artifact_kind": kind, "artifact_hash": published.artifact_hash, "config_hash": published.config_hash, "task_id": published.task_id, "formal_eligible": True, "payload_hash": canonical_json_hash(payload), "source_refs": [source_ref], "source_manifest": source_manifest}
 
     output_dir = f"runs/g23-real-cell-{index}"
     output_root = root / output_dir
@@ -278,7 +298,8 @@ def _build_cell(root: Path, index: int, cell: str, head: str, prereg: dict[str, 
             "sizing_stream": True,
             "sizing_draw_hash": sizing_draw_hash,
             "sizing_identity_hash": sizing_identity_hash,
-            "rng_state_digest": sizing_draw_hash,
+            "rng_state": sizing_rng_boundaries[sequence],
+            "rng_state_digest": boundary_digest(sizing_rng_boundaries[sequence]),
         }
         _publish_state(output_root / "resume" / "reference-sizing", sequence, state)
     sizing_moments = _moments_from_shards(sizing_store, sizing_refs, assumptions)
@@ -334,7 +355,14 @@ def _build_cell(root: Path, index: int, cell: str, head: str, prereg: dict[str, 
             "shard_count": sequence * 2,
             "final_length_required": True,
             "sizing_result_identity_hash": sizing_result_identity_hash,
-            "rng_state_digest": canonical_json_hash({"stream_a_draw_hash": draw_a_hash, "stream_b_draw_hash": draw_b_hash, "sizing_result_hash": sizing_result_hash}),
+            "rng_state": {
+                "a": final_a_rng_boundaries[sequence],
+                "b": final_b_rng_boundaries[sequence],
+            },
+            "rng_state_digest": boundary_digest({
+                "a": final_a_rng_boundaries[sequence],
+                "b": final_b_rng_boundaries[sequence],
+            }),
         }
         latest_final_commit = _publish_state(output_root / "resume" / "reference-final", sequence, state)
     moments_a = _moments_from_shards(final_store, final_refs_a, assumptions)

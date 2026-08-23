@@ -26,6 +26,13 @@ from param_importance_nlp.experiments.stage2_formal import (
     _moments_from_shards,
     estimate_reference_uncertainty_shards,
 )
+from param_importance_nlp.experiments.stage2_g23_contracts import (
+    generator_boundary,
+    validate_generator_boundary,
+    validate_resume_prefix,
+    validate_sizing_plan_contract,
+    validate_weighting_contract,
+)
 from param_importance_nlp.experiments.stage23_task_runners import _actual_sampling_state, _reference_capacity_preflight, _sizing_delta_sci
 
 
@@ -71,6 +78,19 @@ def test_weighted_u_hand_calculation_is_recomputed_from_raw_blocks() -> None:
     from param_importance_nlp.experiments.stage2_g23_evaluator import _u_from_moments
 
     assert np.array_equal(_u_from_moments(moments, "hand.u")["p"], np.asarray([3.0]))
+    assumptions = validate_weighting_contract({
+        "statistical_unit": "sequence",
+        "weight_unit": "tokens",
+        "sampling_design": "with_replacement",
+        "weights_exogenous": True,
+        "common_mean_assumption": True,
+    })
+    assert assumptions["weights_exogenous"] is True
+    with pytest.raises(ValueError, match="WEIGHTED_U_ASSUMPTIONS_NOT_DECLARED"):
+        validate_weighting_contract({
+            **assumptions,
+            "common_mean_assumption": False,
+        })
 
 
 def test_content_addressed_shard_dedup_and_weighted_jackknife(tmp_path: Path) -> None:
@@ -80,9 +100,16 @@ def test_content_addressed_shard_dedup_and_weighted_jackknife(tmp_path: Path) ->
     duplicate = store.publish(vector, 1.0)
     assert first == duplicate
     refs = [first, store.publish({"p": np.asarray([2.0, 4.0])}, 2.0), store.publish({"p": np.asarray([3.0, 6.0])}, 3.0)]
-    moments = _moments_from_shards(store, refs, {"weights_exogenous": True, "common_mean_assumption": True})
+    assumptions = {
+        "statistical_unit": "sequence",
+        "weight_unit": "tokens",
+        "sampling_design": "with_replacement",
+        "weights_exogenous": True,
+        "common_mean_assumption": True,
+    }
+    moments = _moments_from_shards(store, refs, assumptions)
     assert moments.count == 3 and moments.n1 == 6.0
-    uncertainty = estimate_reference_uncertainty_shards(store, refs, refs, {"weights_exogenous": True, "common_mean_assumption": True})
+    uncertainty = estimate_reference_uncertainty_shards(store, refs, refs, assumptions)
     assert uncertainty.block_count_a == 3 and uncertainty.block_count_b == 3
     assert all(np.all(np.isfinite(value)) for value in uncertainty.bias_variance.values())
 
@@ -115,6 +142,25 @@ def test_sampling_rng_state_is_replayable_from_frozen_manifest() -> None:
     state = _actual_sampling_state(sampling, "reference_A", 3)
     assert state["stream"] == "reference_A" and state["count"] == 3
     assert state["state_before_sha256"] != state["state_after_sha256"]
+    assert state == generator_boundary(sampling, "reference_A", 3)
+    validate_generator_boundary(state, sampling=sampling, stream="reference_A", count=3, field="hand.rng")
+
+
+def test_canonical_sizing_and_resume_validators_are_strict() -> None:
+    plan = {
+        "schema_version": "stage2-reference-sizing-plan-v1",
+        "candidate_sample_counts": [2, 4, 8],
+        "block_size": 2,
+        "required_consecutive": 1,
+    }
+    assert validate_sizing_plan_contract(plan, selected_sample_count=4) == (2, 4, 8)
+    with pytest.raises(ValueError, match="ADJACENT_DOUBLING_REQUIRED"):
+        validate_sizing_plan_contract({**plan, "candidate_sample_counts": [2, 6]})
+    first = [{"shard_hash": "a"}]
+    second = [{"shard_hash": "a"}, {"shard_hash": "b"}]
+    validate_resume_prefix(first, [], second, [], field="hand.resume")
+    with pytest.raises(ValueError, match="PREFIX_DRIFT_A"):
+        validate_resume_prefix(first, [], [{"shard_hash": "x"}], [], field="hand.resume")
 
 
 def test_sizing_delta_formula_uses_noise_or_signal_floor_at_boundary() -> None:

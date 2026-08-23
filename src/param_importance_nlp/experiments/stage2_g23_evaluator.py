@@ -42,10 +42,21 @@ from param_importance_nlp.runtime.task_runtime import TaskRunResult, TaskRunStat
 from param_importance_nlp.runtime.tensor_bundle import load_tensor_bundle
 
 from .stage2_formal import (
+    ReferenceUncertainty,
     _ReferenceShardStore,
     _ReferenceSnapshotStore,
     _moments_from_shards,
     _vector_digest,
+    estimate_reference_uncertainty_shards,
+)
+from .stage2_g23_contracts import (
+    boundary_digest,
+    unique_identity_values,
+    validate_external_manifest,
+    validate_generator_boundary,
+    validate_resume_prefix,
+    validate_sizing_plan_contract,
+    validate_weighting_contract,
 )
 from .sampling import DrawStreamManifest, SamplingPlan
 
@@ -470,6 +481,7 @@ class _CellEvidence:
     sizing_states: list[Mapping[str, object]] | None = None
     sizing_root: Path | None = None
     final_state: Mapping[str, object] | None = None
+    final_states: list[Mapping[str, object]] | None = None
     final_root: Path | None = None
     external_payloads: Mapping[str, Mapping[str, object]] | None = None
     identities: dict[str, str] = None  # type: ignore[assignment]
@@ -502,6 +514,19 @@ def _load_json(root: Path, reference: str, field: str) -> Mapping[str, object]:
     return value
 
 
+def _load_task_artifact_strict(root: Path, reference: str, field: str) -> LoadedTaskArtifact:
+    """Inspect the commit's object_ref before any resolver can follow it."""
+
+    commit = _load_json(root, reference, f"{field}.commit")
+    object_ref = _path(commit.get("object_ref"), f"{field}.object_ref")
+    _reject_symlink_chain(root, object_ref, f"{field}.object_ref")
+    _reject_symlinks_under(_resolve(root, object_ref), f"{field}.object_ref")
+    try:
+        return load_committed_task_artifact(root, reference, require_formal=True)
+    except (OSError, ValueError, TypeError) as error:
+        raise G23Blocked(f"{field}:INVALID") from error
+
+
 def _task_result(root: Path, source: CellInput) -> tuple[TaskRunResult, Mapping[str, object]]:
     value = _load_json(root, source.task_result_ref, "task_result")
     if value.get("schema_version") != "task-run-result-v2":
@@ -522,10 +547,7 @@ def _artifact(root: Path, result: TaskRunResult, kind: str) -> LoadedTaskArtifac
     if ref is None:
         raise G23Blocked(f"artifact:{kind}:MISSING")
     _reject_symlink_chain(root, _path(ref, f"artifact.{kind}.commit_ref"), f"artifact.{kind}.commit_ref")
-    try:
-        loaded = load_committed_task_artifact(root, ref, require_formal=True)
-    except (OSError, ValueError, TypeError) as error:
-        raise G23Blocked(f"artifact:{kind}:INVALID") from error
+    loaded = _load_task_artifact_strict(root, ref, f"artifact.{kind}")
     expected_schema = {
         "reference_result": "reference-result-v1",
         "reference_convergence_report": "stage2-reference-convergence-report-v1",
@@ -663,6 +685,8 @@ def _load_resume_commits(
     if not paths:
         raise G23Blocked(f"resume:{schema}:COMMITS_EMPTY")
     states: list[Mapping[str, object]] = []
+    previous_refs_a: list[Mapping[str, object]] | None = None
+    previous_refs_b: list[Mapping[str, object]] | None = None
     for index, commit_path in enumerate(paths, start=1):
         try:
             _reject_symlink_chain(root, commit_path.relative_to(root).as_posix(), f"resume.{schema}.commit")
@@ -698,6 +722,18 @@ def _load_resume_commits(
         raw_refs_a, raw_refs_b = state.get("shard_refs_a"), state.get("shard_refs_b")
         if not isinstance(raw_refs_a, list) or not isinstance(raw_refs_b, list):
             raise G23Blocked(f"resume:{schema}:SHARD_REFS_MISSING")
+        if not all(isinstance(item, Mapping) for item in raw_refs_a + raw_refs_b):
+            raise G23Blocked(f"resume:{schema}:SHARD_REFS_INVALID")
+        try:
+            validate_resume_prefix(
+                previous_refs_a,
+                previous_refs_b,
+                raw_refs_a,
+                raw_refs_b,
+                field=f"resume.{schema}",
+            )
+        except ValueError as error:
+            raise G23Blocked(str(error)) from error
         expected_pairs = int(state.get("processed_block_pairs", 0))
         if expected_pairs <= 0 or len(raw_refs_a) != expected_pairs:
             raise G23Blocked(f"resume:{schema}:SHARD_PREFIX_COUNT_MISMATCH")
@@ -732,6 +768,7 @@ def _load_resume_commits(
             "registry_hash",
             "weighting_assumptions",
             "rng_state_digest",
+            "rng_state",
         }
         if schema == "stage2-reference-progress-state-v1":
             required_identity |= {"sizing_draw_hash", "sizing_identity_hash", "sizing_stream"}
@@ -745,10 +782,18 @@ def _load_resume_commits(
             }
         if not required_identity.issubset(state):
             raise G23Blocked(f"resume:{schema}:IDENTITY_FIELDS_MISSING")
+        try:
+            if state.get("rng_state_digest") != boundary_digest(state.get("rng_state"), field=f"resume.{schema}.rng_state"):
+                raise G23Blocked(f"resume:{schema}:RNG_STATE_DIGEST_MISMATCH")
+            validate_weighting_contract(state.get("weighting_assumptions"), field=f"resume.{schema}.weighting_assumptions")
+        except ValueError as error:
+            raise G23Blocked(str(error)) from error
         for key, expected in identities.items():
             if key in state and state.get(key) != expected:
                 raise G23Blocked(f"resume:{schema}:{key}:IDENTITY_DRIFT")
         states.append(state)
+        previous_refs_a = [dict(item) for item in raw_refs_a]
+        previous_refs_b = [dict(item) for item in raw_refs_b]
     return states
 
 
@@ -958,16 +1003,20 @@ def _validate_external_lineage(
         if not isinstance(ref, str):
             raise G23Blocked(f"external_lineage.{name}.commit_ref:MISSING")
         _reject_symlink_chain(root, _path(ref, f"external_lineage.{name}.commit_ref"), f"external_lineage.{name}.commit_ref")
+        artifact = _load_task_artifact_strict(root, ref, f"external_lineage.{name}")
         try:
-            artifact = load_committed_task_artifact(root, ref, require_formal=True)
-        except (OSError, ValueError, TypeError) as error:
-            raise G23Blocked(f"external_lineage.{name}:INVALID") from error
-        _reject_symlink_chain(root, artifact.identity.object_ref, f"external_lineage.{name}.object_ref")
-        _reject_symlinks_under(_resolve(root, artifact.identity.object_ref), f"external_lineage.{name}.object_ref")
-        if artifact.identity.artifact_kind != kind:
-            raise G23Blocked(f"external_lineage.{name}:KIND_MISMATCH")
+            source_manifest = validate_external_manifest(
+                artifact,
+                root,
+                expected_kind=kind,
+                declared_sources=item.get("source_manifest"),
+            )
+        except (OSError, TypeError, ValueError) as error:
+            raise G23Blocked(f"external_lineage.{name}:SOURCE_MANIFEST_INVALID") from error
         if item.get("artifact_hash") != artifact.identity.artifact_hash or item.get("config_hash") != artifact.identity.config_hash or item.get("task_id") != artifact.identity.task_id or item.get("payload_hash") != canonical_json_hash(artifact.payload):
             raise G23Blocked(f"external_lineage.{name}:IDENTITY_MISMATCH")
+        if item.get("source_refs") != list(artifact.source_refs) or item.get("source_manifest") != source_manifest:
+            raise G23Blocked(f"external_lineage.{name}:SOURCE_BINDING_MISMATCH")
         loaded[name] = artifact.payload
     config = loaded["resolved_config"]
     if config.get("config_hash") != result.config_hash and config.get("resolved_config_hash") != result.config_hash:
@@ -1200,12 +1249,29 @@ def _prepare_cell(root: Path, source: CellInput, *, repo_root: Path | None = Non
             "sizing_plan_hash": _sha(cp.get("sizing_plan_artifact_hash"), "sizing_plan_artifact_hash"),
         })
         plan = cp.get("sizing_plan")
-        if not isinstance(plan, Mapping) or plan.get("schema_version") != "stage2-reference-sizing-plan-v1":
+        if not isinstance(plan, Mapping):
             raise G23Blocked("sizing_plan:SCHEMA_REQUIRED")
+        try:
+            selected_candidate = cp.get("selected_sample_count_per_stream")
+            if selected_candidate is not None and (
+                isinstance(selected_candidate, bool) or not isinstance(selected_candidate, int)
+            ):
+                raise ValueError("sizing_plan:SELECTED_NODE_INVALID")
+            validate_sizing_plan_contract(
+                plan,
+                selected_sample_count=selected_candidate,
+                field="sizing_plan",
+            )
+        except ValueError as error:
+            raise G23Blocked(str(error)) from error
         if _sha(plan.get("artifact_hash"), "sizing_plan.artifact_hash") != evidence.identities["sizing_plan_hash"]:
             raise G23Blocked("sizing_plan:HASH_MISMATCH")
         if canonical_json_hash({key: item for key, item in plan.items() if key != "artifact_hash"}) != evidence.identities["sizing_plan_hash"]:
             raise G23Blocked("sizing_plan:CONTENT_HASH_MISMATCH")
+        reference_id = plan.get("reference_id")
+        if not isinstance(reference_id, str) or not reference_id:
+            raise G23Blocked("sizing_plan.reference_id:IDENTITY_REQUIRED")
+        evidence.identities["reference_id"] = reference_id
         external_plan = external_payloads.get("sizing_plan")
         if not isinstance(external_plan, Mapping) or canonical_json_hash(external_plan) != canonical_json_hash(plan):
             raise G23Blocked("sizing_plan:EXTERNAL_TASK_ARTIFACT_MISMATCH")
@@ -1246,7 +1312,26 @@ def _prepare_cell(root: Path, source: CellInput, *, repo_root: Path | None = Non
         one_shot_plan = cp.get("one_shot_plan")
         if not isinstance(one_shot_plan, Mapping) or one_shot_plan.get("schema_version") != "stage2-reference-one-shot-plan-v1":
             raise G23Blocked("one_shot_plan:SCHEMA_REQUIRED")
+        selected_candidate = cp.get("selected_sample_count_per_stream")
+        selected_one_shot = one_shot_plan.get("sample_count_per_stream")
+        if (
+            isinstance(selected_candidate, bool)
+            or not isinstance(selected_candidate, int)
+            or isinstance(selected_one_shot, bool)
+            or not isinstance(selected_one_shot, int)
+            or selected_one_shot != selected_candidate
+        ):
+            raise G23Blocked("one_shot_plan:SELECTED_SIZING_NODE_MISMATCH")
+        try:
+            validate_sizing_plan_contract(
+                plan,
+                selected_sample_count=selected_one_shot,
+                field="one_shot_plan.sizing_plan",
+            )
+        except ValueError as error:
+            raise G23Blocked(str(error)) from error
         one_shot_plan_hash = _canonical_payload_hash(one_shot_plan, "one_shot_plan")
+        evidence.identities["one_shot_plan_hash"] = one_shot_plan_hash
         if one_shot_plan.get("sizing_result_hash") != evidence.identities["sizing_result_hash"] or one_shot.get("plan_hash") != one_shot_plan_hash:
             raise G23Blocked("one_shot_identity:PLAN_RESULT_MISMATCH")
         if one_shot.get("provider_state_digest") != evidence.identities["provider_state_digest"] or one_shot.get("registry_hash") != evidence.identities["registry_hash"]:
@@ -1281,15 +1366,7 @@ def _prepare_cell(root: Path, source: CellInput, *, repo_root: Path | None = Non
             "sizing_draw_hash": sizing_draw_hash,
             "sizing_identity_hash": sizing_identity_hash,
             "sizing_stream": True,
-            "rng_state_digest": sizing_draw_hash,
         }
-        final_rng_digest = canonical_json_hash(
-            {
-                "stream_a_draw_hash": evidence.identities["stream_a_draw_hash"],
-                "stream_b_draw_hash": evidence.identities["stream_b_draw_hash"],
-                "sizing_result_hash": evidence.identities["sizing_result_hash"],
-            }
-        )
         final_sizing_identity = _sha(cp.get("sizing_result_identity_hash"), "sizing_result_identity_hash")
         expected_final_sizing_identity = canonical_json_hash(
             {
@@ -1311,7 +1388,6 @@ def _prepare_cell(root: Path, source: CellInput, *, repo_root: Path | None = Non
             "stream_a_draw_hash": evidence.identities["stream_a_draw_hash"],
             "stream_b_draw_hash": evidence.identities["stream_b_draw_hash"],
             "sizing_result_identity_hash": final_sizing_identity,
-            "rng_state_digest": final_rng_digest,
             "final_length_required": True,
         }
         bundle_ref = _path(rp.get("tensor_bundle_ref"), "tensor_bundle_ref")
@@ -1359,6 +1435,7 @@ def _prepare_cell(root: Path, source: CellInput, *, repo_root: Path | None = Non
             identities=final_expected,
         )
         evidence.final_state = final_states[-1]
+        evidence.final_states = final_states
         evidence.final_root = final_root
         if int(evidence.final_state.get("processed_block_pairs", 0)) != len(final_states):
             raise G23Blocked("final_resume:COMMITTED_LENGTH_MISMATCH")
@@ -1385,14 +1462,16 @@ def _sizing_vectors(evidence: _CellEvidence) -> tuple[list[int], list[dict[str, 
     if not isinstance(raw_counts, list) or len(raw_counts) < 2:
         raise G23Blocked("sizing.candidate_counts:RAW_DIAGNOSTIC_MISSING")
     try:
-        counts = [int(item) for item in raw_counts]
-        block_size = int(plan.get("block_size", 0))
+        counts = list(
+            validate_sizing_plan_contract(
+                plan,
+                selected_sample_count=plan.get("selected_sample_count_per_stream"),
+                field="sizing_plan",
+            )
+        )
+        block_size = int(plan["block_size"])
     except (TypeError, ValueError, OverflowError) as error:
-        raise G23Blocked("sizing.candidate_counts:INVALID") from error
-    if block_size <= 0 or any(count <= 0 or count % block_size for count in counts):
-        raise G23Blocked("sizing.candidate_counts:BLOCK_ALIGNMENT_INVALID")
-    if any(right != 2 * left for left, right in zip(counts, counts[1:])):
-        raise G23Blocked("sizing.candidate_counts:ADJACENT_DOUBLING_REQUIRED")
+        raise G23Blocked(str(error)) from error
     states_by_count: dict[int, Mapping[str, object]] = {}
     for state in evidence.sizing_states:
         sample_count = int(state.get("processed_block_pairs", 0)) * int(plan.get("block_size", 0))
@@ -1400,6 +1479,16 @@ def _sizing_vectors(evidence: _CellEvidence) -> tuple[list[int], list[dict[str, 
             states_by_count[sample_count] = state
     if any(count not in states_by_count for count in counts[-2:]):
         raise G23Blocked("sizing:ADJACENT_FINAL_NODES_MISSING")
+    selected_declared = evidence.convergence.payload.get("selected_sample_count_per_stream") if evidence.convergence is not None else None
+    if isinstance(selected_declared, bool) or not isinstance(selected_declared, int):
+        raise G23Blocked("sizing:selected_sample_count_per_stream:RAW_DIAGNOSTIC_MISSING")
+    selected_states = {
+        state.get("selected_sample_count_per_stream")
+        for state in evidence.sizing_states
+        if state.get("selected_sample_count_per_stream") is not None
+    }
+    if selected_states != {selected_declared} or selected_declared not in counts:
+        raise G23Blocked("sizing:SELECTED_NODE_NOT_INDEPENDENTLY_COMMITTED")
     vectors: list[dict[str, np.ndarray]] = []
     for count in counts[-2:]:
         state = states_by_count[count]
@@ -1420,16 +1509,25 @@ def _sizing_vectors(evidence: _CellEvidence) -> tuple[list[int], list[dict[str, 
     return counts[-2:], vectors, plan
 
 
-def _final_vectors(evidence: _CellEvidence) -> tuple[dict[str, np.ndarray], dict[str, np.ndarray], dict[str, np.ndarray], Sequence[Mapping[str, np.ndarray]], Sequence[Mapping[str, np.ndarray]], Mapping[str, np.ndarray]]:
+def _final_vectors(
+    evidence: _CellEvidence,
+) -> tuple[
+    dict[str, np.ndarray],
+    dict[str, np.ndarray],
+    dict[str, np.ndarray],
+    Sequence[Mapping[str, np.ndarray]],
+    Sequence[Mapping[str, np.ndarray]],
+    ReferenceUncertainty,
+]:
     if evidence.final_state is None or evidence.bundle_state is None:
         raise G23Blocked("final:RAW_DIAGNOSTICS_MISSING")
     state = evidence.final_state
     if evidence.final_root is None:
         raise G23Blocked("final:SHARD_ROOT_MISSING")
-    blocks_a, weights_a, _ = _load_shard_records(
+    blocks_a, weights_a, refs_a = _load_shard_records(
         evidence.final_root, state.get("shard_refs_a"), "final.shard_refs_a"
     )
-    blocks_b, weights_b, _ = _load_shard_records(
+    blocks_b, weights_b, refs_b = _load_shard_records(
         evidence.final_root, state.get("shard_refs_b"), "final.shard_refs_b"
     )
     if len(blocks_a) != len(blocks_b):
@@ -1459,11 +1557,37 @@ def _final_vectors(evidence: _CellEvidence) -> tuple[dict[str, np.ndarray], dict
             manifest_hash = evidence.reference.payload.get(f"{key}_hash")
             if _sha(manifest_hash, f"reference.{key}_hash") != _vector_digest(value):
                 raise G23Blocked(f"reference.{key}_hash:VALUE_MISMATCH")
+    try:
+        assumptions = validate_weighting_contract(
+            state.get("weighting_assumptions"), field="final.weighting_assumptions"
+        )
+        recomputed = estimate_reference_uncertainty_shards(
+            _ReferenceShardStore(evidence.final_root), refs_a, refs_b, assumptions
+        )
+    except (TypeError, ValueError, OSError) as error:
+        raise G23Blocked(f"final.uncertainty:RAW_JACKKNIFE_RECOMPUTE_FAILED:{type(error).__name__}") from error
     uncertainty = bstate.get("uncertainty")
     if not isinstance(uncertainty, Mapping):
         raise G23Blocked("bundle.uncertainty:MISSING")
-    variance = _vector(uncertainty.get("bias_variance"), "bundle.bias_variance")
-    return bias, cross, ranking, blocks_a, blocks_b, variance
+    for name, expected in (
+        ("bias_variance", recomputed.bias_variance),
+        ("cross_variance", recomputed.cross_variance),
+        ("ranking_variance", recomputed.ranking_variance),
+    ):
+        loaded = _vector(uncertainty.get(name), f"bundle.{name}")
+        _compatible(expected, loaded, f"bundle.{name}")
+        if not all(np.array_equal(expected[key], loaded[key]) for key in expected):
+            raise G23Blocked(f"bundle.{name}:RAW_JACKKNIFE_VALUE_MISMATCH")
+    # A producer may publish the complete uncertainty payload as well as the
+    # tensor maps.  If it does, every self-reported scalar/hash is checked
+    # against the object independently rebuilt above; none is an authority.
+    reported_payload = recomputed.to_dict()
+    for key, reported in uncertainty.items():
+        if key in {"bias_variance", "cross_variance", "ranking_variance"}:
+            continue
+        if key in reported_payload and reported != reported_payload[key]:
+            raise G23Blocked(f"bundle.uncertainty.{key}:RAW_JACKKNIFE_METADATA_MISMATCH")
+    return bias, cross, ranking, blocks_a, blocks_b, recomputed
 
 
 def _group_map(vector: Mapping[str, np.ndarray], evidence: _CellEvidence) -> tuple[dict[str, list[str]], dict[str, list[str]]]:
@@ -1780,6 +1904,7 @@ def _state_replay_verified(evidence: _CellEvidence) -> bool:
             return {str(key): tupleify(item) for key, item in value.items()}
         return value
 
+    sampling_plans: dict[str, SamplingPlan] = {}
     for stream in ("reference_sizing", "reference_A", "reference_B"):
         item = draw_artifacts.get(stream)
         if not isinstance(item, Mapping):
@@ -1799,6 +1924,21 @@ def _state_replay_verified(evidence: _CellEvidence) -> bool:
             raise G23Blocked(f"state_replay.draw_artifacts.{stream}:DRAW_REPLAY_MISMATCH")
         if raw_actual.get("stream") != stream or int(raw_actual.get("count", -1)) != len(manifest.draws):
             raise G23Blocked(f"state_replay.draw_artifacts.{stream}:STATE_BOUNDARY_MISMATCH")
+        try:
+            validate_generator_boundary(
+                raw_actual,
+                sampling=plan,
+                stream=stream,
+                count=len(manifest.draws),
+                field=f"state_replay.draw_artifacts.{stream}",
+            )
+        except ValueError as error:
+            raise G23Blocked(str(error)) from error
+        if (
+            raw_actual.get("state_before_sha256") != manifest.stream_state.state_before_sha256
+            or raw_actual.get("state_after_sha256") != manifest.stream_state.state_after_sha256
+        ):
+            raise G23Blocked(f"state_replay.draw_artifacts.{stream}:MANIFEST_STATE_DIGEST_MISMATCH")
         state_before_obj = tupleify(raw_actual.get("state_before"))
         state_after_obj = tupleify(raw_actual.get("state_after"))
         rng = random.Random()
@@ -1818,6 +1958,82 @@ def _state_replay_verified(evidence: _CellEvidence) -> bool:
             raise G23Blocked(f"state_replay.draw_artifacts.{stream}:GENERATOR_STATE_HASH_MISMATCH")
         if before_state.get("streams", {}).get(stream) != raw_actual.get("state_before") or after_state.get("streams", {}).get(stream) != raw_actual.get("state_after"):
             raise G23Blocked(f"state_replay.draw_artifacts.{stream}:INVARIANCE_BINDING_MISMATCH")
+        sampling_plans[stream] = plan
+
+    sizing_plan_payload = evidence.convergence.payload.get("sizing_plan")
+    one_shot_plan_payload = evidence.convergence.payload.get("one_shot_plan")
+    if not isinstance(sizing_plan_payload, Mapping) or not isinstance(one_shot_plan_payload, Mapping):
+        raise G23Blocked("state_replay:RESUME_PLAN_MISSING")
+    try:
+        sizing_block_size = int(sizing_plan_payload["block_size"])
+        final_block_size = int(one_shot_plan_payload["block_size"])
+    except (KeyError, TypeError, ValueError, OverflowError) as error:
+        raise G23Blocked("state_replay:RESUME_BLOCK_SIZE_INVALID") from error
+    if sizing_block_size <= 0 or final_block_size <= 0:
+        raise G23Blocked("state_replay:RESUME_BLOCK_SIZE_INVALID")
+
+    def validate_resume_rng_state(
+        state: Mapping[str, object],
+        *,
+        schema: str,
+        index: int,
+        block_size: int,
+        streams: tuple[str, ...],
+    ) -> None:
+        raw_count = state.get("processed_block_pairs")
+        if isinstance(raw_count, bool) or not isinstance(raw_count, int) or raw_count <= 0:
+            raise G23Blocked(f"state_replay.{schema}[{index}]:COUNT_INVALID")
+        count = raw_count * block_size
+        raw_boundary = state.get("rng_state")
+        if len(streams) == 1:
+            if not isinstance(raw_boundary, Mapping):
+                raise G23Blocked(f"state_replay.{schema}[{index}]:RNG_STATE_MISSING")
+            try:
+                validate_generator_boundary(
+                    raw_boundary,
+                    sampling=sampling_plans[streams[0]],
+                    stream=streams[0],
+                    count=count,
+                    field=f"state_replay.{schema}[{index}].rng_state",
+                )
+            except ValueError as error:
+                raise G23Blocked(str(error)) from error
+            return
+        if not isinstance(raw_boundary, Mapping) or set(raw_boundary) != set(streams):
+            raise G23Blocked(f"state_replay.{schema}[{index}]:RNG_STATE_PAIR_REQUIRED")
+        for stream in streams:
+            boundary = raw_boundary.get(stream)
+            if not isinstance(boundary, Mapping):
+                raise G23Blocked(f"state_replay.{schema}[{index}].{stream}:RNG_STATE_MISSING")
+            try:
+                validate_generator_boundary(
+                    boundary,
+                    sampling=sampling_plans[stream],
+                    stream=stream,
+                    count=count,
+                    field=f"state_replay.{schema}[{index}].{stream}",
+                )
+            except ValueError as error:
+                raise G23Blocked(str(error)) from error
+
+    if not evidence.sizing_states or not evidence.final_states:
+        raise G23Blocked("state_replay:ALL_RESUME_STATES_REQUIRED")
+    for index, state in enumerate(evidence.sizing_states, start=1):
+        validate_resume_rng_state(
+            state,
+            schema="sizing",
+            index=index,
+            block_size=sizing_block_size,
+            streams=("reference_sizing",),
+        )
+    for index, state in enumerate(evidence.final_states, start=1):
+        validate_resume_rng_state(
+            state,
+            schema="final",
+            index=index,
+            block_size=final_block_size,
+            streams=("reference_A", "reference_B"),
+        )
     replay = evidence.convergence.payload.get("resume_replay")
     if not isinstance(replay, Mapping):
         raise G23Blocked("state_replay:RESUME_REPLAY_REQUIRED")
@@ -2075,7 +2291,7 @@ def _evaluate_cell(evidence: _CellEvidence) -> dict[str, object]:
         return cell
     try:
         counts, previous, plan = _sizing_vectors(evidence)
-        bias, cross, ranking, blocks_a, blocks_b, bias_variance = _final_vectors(evidence)
+        bias, cross, ranking, blocks_a, blocks_b, uncertainty = _final_vectors(evidence)
         previous_bias, latest_bias = previous
         flat_prev, flat_latest = _flat(previous_bias), _flat(latest_bias)
         delta_sci, min_delta_by_endpoint = _delta_sci(evidence, [int(item) for item in plan["candidate_sample_counts"]])
@@ -2107,9 +2323,9 @@ def _evaluate_cell(evidence: _CellEvidence) -> dict[str, object]:
             "layer": float(sum(np.sum(error_vector[name]) for names in layer.values() for name in names)),
             "module": float(sum(np.sum(error_vector[name]) for names in module.values() for name in names)),
         }
-        uncertainty = evidence.bundle_state["uncertainty"]  # type: ignore[index]
-        cross_variance = _vector(uncertainty["cross_variance"], "bundle.cross_variance")
-        ranking_variance = _vector(uncertainty["ranking_variance"], "bundle.ranking_variance")
+        bias_variance = uncertainty.bias_variance
+        cross_variance = uncertainty.cross_variance
+        ranking_variance = uncertainty.ranking_variance
         _compatible(bias_variance, cross_variance, "variance")
         _compatible(bias_variance, ranking_variance, "variance")
         if evidence.final_state is None:
@@ -2187,6 +2403,9 @@ def _evaluate_cell(evidence: _CellEvidence) -> dict[str, object]:
             "a_square_interval_halfwidth_max": float(np.max(a_half)),
             "b_square_interval_halfwidth_max": float(np.max(b_half)),
             "ranking_bias_direction_sum": float(np.sum(_flat(ranking) - _flat(bias))),
+            "jackknife_bias_variance_trace": uncertainty.trace_bias_variance,
+            "jackknife_cross_variance_trace": float(sum(np.sum(value) for value in cross_variance.values())),
+            "jackknife_ranking_variance_trace": float(sum(np.sum(value) for value in ranking_variance.values())),
             "sizing_min_delta_sci": min(min_delta_by_endpoint.values()),
             "sizing_node_previous": int(counts[0]),
             "sizing_node_latest": int(counts[1]),
@@ -2218,6 +2437,11 @@ def _evaluate_cell(evidence: _CellEvidence) -> dict[str, object]:
                 np.all(np.abs(_flat(cross) - _flat(bias)) <= (bias_high - bias_low + cross_high - cross_low) / 2.0)
             ),
             "ranking_bias_direction": metrics["ranking_bias_direction_sum"] >= 0.0,
+            "jackknife_uncertainty_verified": all(
+                np.all(np.isfinite(value)) and np.all(value >= 0.0)
+                for vector in (bias_variance, cross_variance, ranking_variance)
+                for value in vector.values()
+            ),
             "variance_scaling_verified": _sequence_scaling(
                 evidence, blocks_a, block_size, weights_a,
                 extra_blocks=blocks_b, extra_weights=weights_b,
@@ -2362,18 +2586,25 @@ def evaluate_formal_g23(
         derived_ids = [item.identities.get("cell_id", "") for item in prepared]
         if tuple(sorted(derived_ids, key=lambda value: EXPECTED_CELL_IDS.index(value) if value in EXPECTED_CELL_IDS else 99)) != EXPECTED_CELL_IDS:
             structure_reason = "SIX_CELL_MANIFEST_DERIVATION_MISMATCH"
-        for identity_name in (
-            "result_hash",
-            "config_hash",
-            "checkpoint_hash",
-            "one_shot_result_hash",
-            "stream_a_draw_hash",
-            "stream_b_draw_hash",
-            "bundle_manifest_hash",
-        ):
-            values = [item.identities.get(identity_name, "") for item in prepared]
-            if len(values) != len(set(values)) or "" in values:
-                structure_reason = f"DUPLICATE_{identity_name.upper()}_IDENTITY"
+        try:
+            unique_identity_values(
+                [item.identities for item in prepared],
+                (
+                    "result_hash",
+                    "config_hash",
+                    "checkpoint_hash",
+                    "one_shot_result_hash",
+                    "stream_a_draw_hash",
+                    "stream_b_draw_hash",
+                    "bundle_manifest_hash",
+                    "sizing_plan_hash",
+                    "reference_id",
+                    "one_shot_plan_hash",
+                ),
+                field="six_cell.identities",
+            )
+        except ValueError as error:
+            structure_reason = str(error)
         manifest_hashes = {item.identities.get("six_cell_manifest_hash", "") for item in prepared}
         if len(manifest_hashes) != 1 or "" in manifest_hashes:
             structure_reason = "SIX_CELL_MANIFEST_NOT_COMMON"

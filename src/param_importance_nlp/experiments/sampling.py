@@ -16,6 +16,8 @@ import re
 from dataclasses import dataclass, field
 from typing import Hashable, Iterable, Literal, Mapping, Sequence
 
+from ..contracts.jsonio import canonical_json_hash
+
 from ..contracts.immutable import freeze_json_mapping, thaw_json_value
 
 
@@ -181,7 +183,7 @@ class Draw:
 def _generator_state_digest(state: object) -> str:
     """Hash a Python generator state without serializing it as a run identity."""
 
-    return _sha256_json(
+    return canonical_json_hash(
         {
             "algorithm_version": "stage2-draws-python-randrange-v1",
             "state": state,

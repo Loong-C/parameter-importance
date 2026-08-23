@@ -40,6 +40,18 @@ def _logical_path(value: str, *, field: str) -> PurePosixPath:
     return path
 
 
+def _reject_symlink_components(root: Path, logical: PurePosixPath, *, field: str) -> None:
+    """Reject links before resolving a commit or content-addressed object."""
+
+    if root.is_symlink():
+        raise ValueError(f"TASK_ARTIFACT_SYMLINK_FORBIDDEN:{field}")
+    current = root
+    for part in logical.parts:
+        current = current / part
+        if current.is_symlink():
+            raise ValueError(f"TASK_ARTIFACT_SYMLINK_FORBIDDEN:{field}")
+
+
 def _safe_component(value: str, *, field: str) -> str:
     if not isinstance(value, str) or not value or not re.fullmatch(
         r"[A-Za-z0-9][A-Za-z0-9._-]{0,191}", value
@@ -164,6 +176,7 @@ def load_committed_task_artifact(
     if not isinstance(object_ref, str):
         raise TypeError("TASK_ARTIFACT_COMMIT_OBJECT_REF_NOT_STRING")
     object_logical = _logical_path(object_ref, field="object_ref")
+    _reject_symlink_components(root, object_logical, field="object_ref")
     object_path = root.joinpath(*object_logical.parts).resolve()
     try:
         object_path.relative_to(root)
@@ -367,6 +380,7 @@ class TaskArtifactStore:
         if commit["schema_version"] != "task-output-commit-v1":
             raise ValueError("TASK_ARTIFACT_COMMIT_VERSION_INVALID")
         object_logical = _logical_path(str(commit["object_ref"]), field="object_ref")
+        _reject_symlink_components(self.workspace_root, object_logical, field="object_ref")
         object_path = self.workspace_root.joinpath(*object_logical.parts).resolve()
         try:
             object_path.relative_to(self.workspace_root)

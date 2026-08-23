@@ -168,6 +168,14 @@ from .stage2_formal import (
     _moments_from_shards,
     _draw_digest,
 )
+from .stage2_g23_contracts import (
+    boundary_digest,
+    generator_boundary,
+    source_manifest_for_refs,
+    validate_external_manifest,
+    validate_sizing_plan_contract,
+    validate_weighting_contract,
+)
 from .stage3 import (
     EndpointState,
     NodeCacheKey,
@@ -1970,14 +1978,6 @@ def _stage2_reference_plan(
             retryable=False,
             evidence_refs=(reference,),
         )
-    if any(right != 2 * left for left, right in zip(plan.candidate_sample_counts, plan.candidate_sample_counts[1:])):
-        raise _blocked(
-            BlockerCode.CONTRACT_UNFROZEN,
-            "formal_reference_sizing_plan",
-            "candidate sizing nodes must be an adjacent doubling ladder",
-            retryable=False,
-            evidence_refs=(reference,),
-        )
     return plan, (reference,)
 
 
@@ -2492,34 +2492,7 @@ def _actual_sampling_state(
 
     if stream not in STREAM_NAMES or count < 0:
         raise ValueError("STAGE2_SAMPLING_STATE_ARGUMENT_INVALID")
-    rng = random.Random(sampling._stream_seed(stream))  # type: ignore[attr-defined]
-    before = rng.getstate()
-    for _ in range(count):
-        rng.randrange(len(sampling.universe.sample_ids))
-    after = rng.getstate()
-    def jsonable(value: object) -> object:
-        if isinstance(value, tuple):
-            return [jsonable(item) for item in value]
-        if isinstance(value, list):
-            return [jsonable(item) for item in value]
-        if isinstance(value, Mapping):
-            return {str(key): jsonable(item) for key, item in value.items()}
-        return value
-    before_json = jsonable(before)
-    after_json = jsonable(after)
-    return {
-        "algorithm_version": sampling.algorithm_version,
-        "stream": stream,
-        "count": count,
-        "state_before": before_json,
-        "state_after": after_json,
-        "state_before_sha256": canonical_json_hash(
-            {"algorithm_version": sampling.algorithm_version, "state": before_json}
-        ),
-        "state_after_sha256": canonical_json_hash(
-            {"algorithm_version": sampling.algorithm_version, "state": after_json}
-        ),
-    }
+    return generator_boundary(sampling, stream, count)
 
 
 def _available_ram_bytes() -> int | None:
@@ -2688,6 +2661,20 @@ def _load_reference_external_lineage(
             )
         if not isinstance(loaded.payload, Mapping):
             raise _blocked(BlockerCode.CONTRACT_UNFROZEN, environment_key, "external payload object required", retryable=False, evidence_refs=(reference,))
+        try:
+            source_manifest = validate_external_manifest(
+                loaded,
+                root,
+                expected_kind=expected_kind,
+            )
+        except (OSError, TypeError, ValueError) as error:
+            raise _blocked(
+                BlockerCode.CONTRACT_UNFROZEN,
+                environment_key,
+                f"external source manifest invalid: {type(error).__name__}",
+                retryable=False,
+                evidence_refs=(reference,),
+            ) from error
         payload = dict(loaded.payload)
         payloads[name] = payload
         lineage[name] = {
@@ -2699,6 +2686,7 @@ def _load_reference_external_lineage(
             "formal_eligible": loaded.identity.formal_eligible,
             "payload_hash": canonical_json_hash(payload),
             "source_refs": list(loaded.source_refs),
+            "source_manifest": source_manifest,
         }
     resolved = payloads.get("resolved_config")
     resolved_lineage = lineage.get("resolved_config")
@@ -2896,6 +2884,10 @@ def _run_stage2_reference(
     maximum = plan.candidate_sample_counts[-1]
     sizing_draws = sampling.draws("reference_sizing", maximum)
     sizing_rng_state = _actual_sampling_state(sampling, "reference_sizing", maximum)
+    sizing_rng_boundaries = tuple(
+        generator_boundary(sampling, "reference_sizing", index * plan.block_size)
+        for index in range(maximum // plan.block_size + 1)
+    )
     result = StreamingReferenceSizer(context.provider).run(
         plan,
         # Keep the old positional API available for direct callers, while the
@@ -2904,6 +2896,8 @@ def _run_stage2_reference(
         draws_b=(),
         draws_sizing=sizing_draws,
         artifact_root=store.root / "resume" / "reference-sizing",
+        rng_boundaries=sizing_rng_boundaries,
+        require_rng_boundaries=request.config.run_intent == "formal",
     )
     if not result.converged or result.selected_sample_count_per_stream is None:
         raise _blocked(
@@ -2914,6 +2908,11 @@ def _run_stage2_reference(
             evidence_refs=inputs.references,
         )
     final_count = result.selected_sample_count_per_stream
+    validate_sizing_plan_contract(
+        plan.to_dict(),
+        selected_sample_count=final_count,
+        field="formal_reference_sizing_plan",
+    )
     sizing_draw_hash = _draw_digest(sizing_draws)
     sizing_identity_hash = canonical_json_hash(
         {
@@ -2953,12 +2952,23 @@ def _run_stage2_reference(
     final_b = sampling.draws("reference_B", final_count)
     final_a_rng_state = _actual_sampling_state(sampling, "reference_A", final_count)
     final_b_rng_state = _actual_sampling_state(sampling, "reference_B", final_count)
+    final_a_rng_boundaries = tuple(
+        generator_boundary(sampling, "reference_A", index * plan.block_size)
+        for index in range(final_count // plan.block_size + 1)
+    )
+    final_b_rng_boundaries = tuple(
+        generator_boundary(sampling, "reference_B", index * plan.block_size)
+        for index in range(final_count // plan.block_size + 1)
+    )
     one_shot = OneShotReferenceRunner(context.provider).run(
         one_shot_plan,
         draws_a=final_a,
         draws_b=final_b,
         sizing_draws=sizing_draws,
         artifact_root=store.root / "resume" / "reference-final",
+        rng_boundaries_a=final_a_rng_boundaries,
+        rng_boundaries_b=final_b_rng_boundaries,
+        require_rng_boundaries=request.config.run_intent == "formal",
     )
     if one_shot.status != "COMPLETE":
         raise _blocked(
@@ -2975,6 +2985,9 @@ def _run_stage2_reference(
         draws_b=final_b,
         sizing_draws=sizing_draws,
         artifact_root=store.root / "resume" / "reference-final",
+        rng_boundaries_a=final_a_rng_boundaries,
+        rng_boundaries_b=final_b_rng_boundaries,
+        require_rng_boundaries=request.config.run_intent == "formal",
     )
     if replay.status != "COMPLETE" or replay.artifact_hash != one_shot.artifact_hash:
         raise _blocked(
