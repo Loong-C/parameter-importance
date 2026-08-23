@@ -1,16 +1,18 @@
 from __future__ import annotations
 
+import copy
 from pathlib import Path
 
 import pytest
 
 from param_importance_nlp.contracts.status import GateStatus
 from param_importance_nlp.contracts.jsonio import canonical_json_hash
-from param_importance_nlp.experiments.sampling import RepetitionMapping, SamplingPlan, SamplingUniverse, STREAM_NAMES
+from param_importance_nlp.experiments.sampling import RepetitionMapping, SamplingPlan, SamplingUniverse, STREAM_NAMES, _sha256_json
 from param_importance_nlp.experiments.stage2_g22_adapter import (
     ARTIFACT_KINDS,
     G22Blocked,
     _gate,
+    _validate_sampling_replay,
     _validate_task_inputs,
     evaluate_formal_g22,
 )
@@ -105,3 +107,35 @@ def test_candidate_or_tampered_formal_input_cannot_be_promoted(tmp_path: Path) -
         reasons=("formal evidence absent",),
     )
     assert blocked.status is GateStatus.BLOCKED
+
+
+def test_sampling_replay_rejects_self_consistent_but_wrong_draw(tmp_path: Path) -> None:
+    del tmp_path
+    plan = SamplingPlan(
+        universe=SamplingUniverse(
+            universe_id="replay-test-universe",
+            sample_ids=tuple(range(32)),
+            metadata={"test": True},
+        ),
+        stream_seeds={name: 201 + index for index, name in enumerate(STREAM_NAMES)},
+    )
+    payloads = {
+        "sampling_plan": plan.to_dict(),
+        "draw_manifest": {
+            "stream_manifests": {
+                name: plan.draw_manifest(name, 4).to_manifest() for name in STREAM_NAMES
+            }
+        },
+    }
+    replay = _validate_sampling_replay(payloads)
+    assert replay["sampling_plan_hash"] == payloads["sampling_plan"]["plan_hash"]
+    assert {item["stream"] for item in replay["streams"]} == set(STREAM_NAMES)
+
+    tampered = copy.deepcopy(payloads)
+    streams = tampered["draw_manifest"]["stream_manifests"]
+    streams["pilot"]["draws"][0]["sample_id"] = 523_999
+    streams["pilot"]["replay_hash"] = _sha256_json(
+        {key: value for key, value in streams["pilot"].items() if key != "replay_hash"}
+    )
+    with pytest.raises(G22Blocked, match="G22_SAMPLING_REPLAY_MISMATCH:pilot"):
+        _validate_sampling_replay(tampered)

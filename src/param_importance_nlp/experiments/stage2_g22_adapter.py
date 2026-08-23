@@ -21,6 +21,7 @@ from ..contracts.jsonio import JSONValue, canonical_json_hash, load_canonical_js
 from ..contracts.status import GateRecord, GateStatus
 from ..contracts.task_catalog import DEFAULT_TASK_CATALOG
 from ..runtime.task_artifacts import LoadedTaskArtifact, TaskArtifactStore, load_committed_task_artifact
+from .sampling import DrawStreamManifest, SamplingPlan, STREAM_NAMES
 from .stage23_task_runners import (
     _predecessor_context,
     validate_formal_s203_payloads,
@@ -223,29 +224,80 @@ def _verify_s203_lineage(
     config: ResolvedConfigV2,
     output_dir: str,
 ) -> tuple[str, str]:
-    """Reuse the producer's predecessor verifier for binding/prereg hashes."""
-    source_refs = next(iter({item.source_refs for item in loaded.values()}), ())
-    auxiliary = {ASSET_REF}
-    predecessor_refs = tuple(ref for ref in source_refs if ref not in auxiliary)
-    if not predecessor_refs:
-        raise G22Blocked("G22_S203_PREDECESSOR_REFS_MISSING")
+    """Verify producer lineage against the resolved config without rewriting it.
+
+    ``source_refs`` are the canonical task-output commits declared by the
+    resolved config.  In particular, an external asset manifest is payload
+    evidence, not an implicit predecessor.  The old adapter removed a known
+    manifest reference and then fed the edited list into ``_predecessor_context``;
+    that made a source-list mismatch invisible to the consumer.
+    """
     orchestration = config.section("orchestration")
     if not isinstance(orchestration, Mapping):
         raise G22Blocked("G22_RESOLVED_CONFIG_ORCHESTRATION_INVALID")
-    view = dict(orchestration)
-    view["input_result_refs"] = list(predecessor_refs)
-    fake_config = SimpleNamespace(
-        section=lambda name: view if name == "orchestration" else config.section(name),
-        task_id=config.task_id,
-        run_intent=config.run_intent,
-    )
+    configured = orchestration.get("input_result_refs")
+    if not isinstance(configured, list) or not configured or any(
+        not isinstance(ref, str) for ref in configured
+    ):
+        raise G22Blocked("G22_RESOLVED_CONFIG_INPUT_REFS_INVALID")
+    configured_refs = tuple(configured)
+    source_sets = {item.source_refs for item in loaded.values()}
+    if len(source_sets) != 1:
+        raise G22Blocked("G22_S203_SOURCE_REFS_NOT_SHARED")
+    source_refs = next(iter(source_sets))
+    if source_refs != configured_refs:
+        raise G22Blocked("G22_S203_SOURCE_REFS_CONFIG_MISMATCH")
+
+    # Construct the same request shape used by the producer, but keep the
+    # resolved config's input_result_refs untouched so the shared verifier
+    # validates those exact canonical commits.
     request = SimpleNamespace(
-        config=fake_config,
+        config=config,
         task=DEFAULT_TASK_CATALOG.get(TASK_ID),
         environment=SimpleNamespace(),
     )
     context = _predecessor_context(request, root, TaskArtifactStore(root, output_dir))
     return context.binding_hash, canonical_json_hash(context.payload("preregistration"))
+
+
+def _validate_sampling_replay(payloads: Mapping[str, Mapping[str, object]]) -> dict[str, JSONValue]:
+    """Replay every formal stream from the published plan.
+
+    Parsing a ``DrawStreamManifest`` only proves that its internal hashes are
+    self-consistent.  A malicious or stale manifest can still be internally
+    consistent while carrying different sample IDs or generator boundaries.
+    Recreate each interval from the frozen ``SamplingPlan`` and compare the
+    complete manifest, including state digests and generated draw IDs.
+    """
+    plan = SamplingPlan.from_mapping(payloads["sampling_plan"])
+    draw = payloads["draw_manifest"]
+    streams = draw.get("stream_manifests")
+    if not isinstance(streams, Mapping) or set(streams) != set(STREAM_NAMES):
+        raise G22Blocked("G22_SAMPLING_STREAM_SET_INVALID")
+    replayed: list[dict[str, JSONValue]] = []
+    for stream in STREAM_NAMES:
+        raw = streams.get(stream)
+        if not isinstance(raw, Mapping):
+            raise G22Blocked(f"G22_SAMPLING_STREAM_NOT_OBJECT:{stream}")
+        observed = DrawStreamManifest.from_manifest(raw)
+        if observed.sampling_plan_hash != plan.digest:
+            raise G22Blocked(f"G22_SAMPLING_PLAN_HASH_MISMATCH:{stream}")
+        start = observed.stream_state.start_position
+        count = observed.stream_state.end_position - start
+        expected = plan.draw_manifest(stream, count, start=start)
+        if observed.to_manifest() != expected.to_manifest():
+            raise G22Blocked(f"G22_SAMPLING_REPLAY_MISMATCH:{stream}")
+        replayed.append(
+            {
+                "stream": stream,
+                "start_position": start,
+                "end_position": observed.stream_state.end_position,
+                "draw_ids": [item.draw_id for item in expected.draws],
+                "state_before_sha256": expected.stream_state.state_before_sha256,
+                "state_after_sha256": expected.stream_state.state_after_sha256,
+            }
+        )
+    return {"sampling_plan_hash": plan.digest, "streams": replayed}
 
 
 def _validate_offline(root: Path, manifest: AssetResolutionManifest) -> list[dict[str, JSONValue]]:
@@ -261,6 +313,20 @@ def _validate_offline(root: Path, manifest: AssetResolutionManifest) -> list[dic
         pair = expected_pairs.get((item.model_id, item.training_stage))
         if pair is None or value["training_step"] != pair[0] or value["revision"] != pair[1] or value["model_id"] != item.model_id or value["repository"] != item.repository or value["training_stage"] != item.training_stage or value["root_ref"] != item.root_ref:
             raise G22Blocked("G22_OFFLINE_LOAD_IDENTITY_MISMATCH")
+        config_files = tuple(file for file in item.files if file.role == "config")
+        tokenizer_files = tuple(file for file in item.files if file.role == "tokenizer")
+        if len(config_files) != 1 or len(tokenizer_files) != 1:
+            raise G22Blocked("G22_CHECKPOINT_CONFIG_TOKENIZER_ROLE_INVALID")
+        config_file, tokenizer_file = config_files[0], tokenizer_files[0]
+        if (
+            item.config_sha256 != config_file.sha256
+            or item.tokenizer_sha256 != tokenizer_file.sha256
+            or value["config_sha256"] != config_file.sha256
+            or value["tokenizer_sha256"] != tokenizer_file.sha256
+        ):
+            raise G22Blocked("G22_OFFLINE_CONFIG_TOKENIZER_CROSS_BIND_INVALID")
+        if item.parameter_registry_hash != value["parameter_registry_hash"]:
+            raise G22Blocked("G22_OFFLINE_REGISTRY_CROSS_BIND_INVALID")
         for field in ("model_state_hash", "parameter_registry_hash", "config_sha256", "tokenizer_sha256"):
             if not isinstance(value[field], str) or not _HEX64.fullmatch(value[field]):
                 raise G22Blocked(f"G22_OFFLINE_LOAD_DIGEST_INVALID:{field}")
@@ -271,9 +337,14 @@ def _validate_offline(root: Path, manifest: AssetResolutionManifest) -> list[dic
         backward = value["backward_smoke"]
         if not isinstance(forward, Mapping) or not isinstance(backward, Mapping) or forward.get("finite") is not True or backward.get("finite") is not True or forward.get("logits_shape") != [1, 8, 50304] or forward.get("sample_id") != 0:
             raise G22Blocked("G22_OFFLINE_LOAD_SMOKE_INVALID")
-        result.append({"ref": item.load_evidence_ref, "sha256": item.load_evidence_sha256, "model": item.model_id, "stage": item.training_stage, "step": item.training_step})
+        result.append({"ref": item.load_evidence_ref, "sha256": item.load_evidence_sha256, "model": item.model_id, "stage": item.training_stage, "step": item.training_step, "registry_hash": value["parameter_registry_hash"]})
     if len(result) != 6 or len({item["ref"] for item in result}) != 6:
         raise G22Blocked("G22_OFFLINE_LOAD_COUNT_INVALID")
+    by_model: dict[str, set[str]] = {}
+    for item in result:
+        by_model.setdefault(str(item["model"]), set()).add(str(item["registry_hash"]))
+    if set(by_model) != {"pythia-14m", "pythia-31m-deduped"} or any(len(values) != 1 for values in by_model.values()):
+        raise G22Blocked("G22_OFFLINE_REGISTRY_MODEL_CROSS_BIND_INVALID")
     return result
 
 
@@ -326,12 +397,30 @@ def _validate_real_assets(root: Path) -> dict[str, JSONValue]:
         if not isinstance(files, list) or len(files) != len(checkpoint.files):
             raise G22Blocked("G22_MODEL_MANIFEST_FILES_INVALID")
         expected_files = {item.path: (item.size_bytes, item.sha256) for item in checkpoint.files}
+        listed_names: list[str] = []
         for file in files:
             if not isinstance(file, Mapping) or set(file) != {"name", "official_lfs_sha256", "sha256", "size_bytes"}:
                 raise G22Blocked("G22_MODEL_MANIFEST_FILE_SCHEMA_INVALID")
             name = file["name"]
-            if name not in expected_files or file["size_bytes"] != expected_files[name][0] or file["sha256"] != expected_files[name][1]:
+            if not isinstance(name, str) or name in listed_names or name not in expected_files or file["size_bytes"] != expected_files[name][0] or file["sha256"] != expected_files[name][1] or not isinstance(file["official_lfs_sha256"], str) or not _HEX64.fullmatch(file["official_lfs_sha256"]):
                 raise G22Blocked("G22_CHECKPOINT_FILE_MISMATCH")
+            listed_names.append(name)
+        if set(listed_names) != set(expected_files):
+            raise G22Blocked("G22_MODEL_MANIFEST_FILE_SET_MISMATCH")
+        model_root = _resolve(root, checkpoint.root_ref)
+        if not model_root.is_dir():
+            raise G22Blocked("G22_CHECKPOINT_ROOT_MISSING")
+        actual_names: list[str] = []
+        for candidate in model_root.rglob("*"):
+            if candidate.is_symlink():
+                raise G22Blocked(f"G22_CHECKPOINT_SYMLINK_REJECTED:{candidate}")
+            if candidate.is_file():
+                actual_names.append(candidate.relative_to(model_root).as_posix())
+            elif not candidate.is_dir():
+                raise G22Blocked(f"G22_CHECKPOINT_NONREGULAR_FILE:{candidate}")
+        if set(actual_names) != set(expected_files) or len(actual_names) != len(expected_files):
+            raise G22Blocked("G22_MODEL_DIRECTORY_FILE_SET_MISMATCH")
+        for name in expected_files:
             actual = _resolve(root, checkpoint.root_ref + "/" + name)
             observed_size, observed_sha = _sha256(actual)
             if (observed_size, observed_sha) != expected_files[name]:
@@ -420,16 +509,24 @@ def evaluate_formal_g22(
             expected_preregistration_hash=preregistration_hash,
             expected_upstream_binding_hash=upstream_binding_hash,
         )
+        replay = _validate_sampling_replay(
+            {kind: item.payload for kind, item in loaded.items()}
+        )
         repo_identity = _git_identity(repository)
         producer = _producer_identity(repository, PRODUCER_COMMIT)
         assets = _validate_real_assets(data)
-        refs = tuple(s203_artifact_refs[k] for k in ARTIFACT_KINDS) + (AUTHORITY_EVIDENCE_REF, ASSET_REF, DATA_REF, SELECTION_REF) + tuple(item["ref"] for item in assets["offline_loads"])
-        measured: dict[str, JSONValue] = {"adapter_schema_version": ADAPTER_SCHEMA_VERSION, "task_id": TASK_ID, "config": {"ref": resolved_config_ref, "config_hash": config.config_hash, "full_hash": config.full_hash, "run_intent": config.run_intent, "formal_eligible": config.formal_eligible}, "roots": {"repository_root": str(repository), "data_root": str(data)}, "repository": repo_identity, "producer": producer, "authority": assets, "lineage": {"upstream_binding_hash": upstream_binding_hash, "preregistration_contract_hash": preregistration_hash}, "runtime": {"runtime": "TaskRuntime", "formal_envelope": "load_committed_task_artifact", "store": "TaskArtifactStore", "gate_schema": "gate-record-v1"}, "input_artifacts": {kind: {"commit_ref": loaded[kind].identity.commit_ref, "artifact_hash": loaded[kind].identity.artifact_hash} for kind in ARTIFACT_KINDS}}
-        gate = _gate(status=GateStatus.PASS, checked_at=checked_at, measured=measured, refs=refs)
+        orchestration = config.section("orchestration")
+        assert isinstance(orchestration, Mapping)
+        source_refs = tuple(str(ref) for ref in orchestration["input_result_refs"])
+        evidence_refs = tuple(s203_artifact_refs[k] for k in ARTIFACT_KINDS) + (AUTHORITY_EVIDENCE_REF, ASSET_REF, DATA_REF, SELECTION_REF) + tuple(item["ref"] for item in assets["offline_loads"])
+        measured: dict[str, JSONValue] = {"adapter_schema_version": ADAPTER_SCHEMA_VERSION, "task_id": TASK_ID, "config": {"ref": resolved_config_ref, "config_hash": config.config_hash, "full_hash": config.full_hash, "run_intent": config.run_intent, "formal_eligible": config.formal_eligible}, "roots": {"repository_root": str(repository), "data_root": str(data)}, "repository": repo_identity, "producer": producer, "authority": assets, "lineage": {"upstream_binding_hash": upstream_binding_hash, "preregistration_contract_hash": preregistration_hash, "source_refs": list(source_refs)}, "sampling_replay": replay, "runtime": {"runtime": "TaskRuntime", "formal_envelope": "load_committed_task_artifact", "store": "TaskArtifactStore", "gate_schema": "gate-record-v1"}, "input_artifacts": {kind: {"commit_ref": loaded[kind].identity.commit_ref, "artifact_hash": loaded[kind].identity.artifact_hash} for kind in ARTIFACT_KINDS}}
+        gate = _gate(status=GateStatus.PASS, checked_at=checked_at, measured=measured, refs=evidence_refs)
         store = TaskArtifactStore(data, configured_output_dir)
         existing = store.discover_complete(task_id=TASK_ID, config_hash=config.config_hash, artifact_kinds=("gate_record",), formal_eligible=True)
         if existing:
             loaded_gate = load_committed_task_artifact(data, existing["gate_record"], require_formal=True)
+            if loaded_gate.source_refs != source_refs:
+                raise G22Blocked("G22_EXISTING_GATE_SOURCE_REFS_DRIFT")
             previous = GateRecord.from_mapping(dict(loaded_gate.payload))
             previous_semantic = previous.to_dict()
             current_semantic = gate.to_dict()
@@ -440,7 +537,7 @@ def evaluate_formal_g22(
             if previous_semantic != current_semantic:
                 raise G22Blocked("G22_EXISTING_GATE_SEMANTIC_DRIFT")
             return {"schema_version": ADAPTER_SCHEMA_VERSION, "gate_record": previous.to_dict(), "status": previous.status.value, "formal_eligible": True, "commit_ref": existing["gate_record"], "reused": True}
-        published = store.publish(task_id=TASK_ID, artifact_kind="gate_record", config_hash=config.config_hash, run_intent="formal", payload=gate.to_dict(), formal_eligible=True, source_refs=refs)
+        published = store.publish(task_id=TASK_ID, artifact_kind="gate_record", config_hash=config.config_hash, run_intent="formal", payload=gate.to_dict(), formal_eligible=True, source_refs=source_refs)
         return {"schema_version": ADAPTER_SCHEMA_VERSION, "gate_record": gate.to_dict(), "status": "PASS", "formal_eligible": True, "commit_ref": published.commit_ref, "reused": False}
     except (G22Blocked, FileNotFoundError, OSError, TypeError, ValueError, KeyError) as error:
         reason = str(error) or type(error).__name__

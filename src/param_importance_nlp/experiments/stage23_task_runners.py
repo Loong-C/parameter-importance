@@ -1433,7 +1433,7 @@ def _run_formal_stage2_assets_and_sampling(
 ) -> tuple[Mapping[str, Mapping[str, JSONValue]], tuple[str, ...]]:
     """Publish the formal S2.3 candidate from the independent asset evidence."""
 
-    assets, asset_reference = _formal_stage2_asset_manifest(request, root)
+    assets, _asset_reference = _formal_stage2_asset_manifest(request, root)
     data_range = assets.data_range
     sample_ids = tuple(range(data_range.sample_id_min, data_range.sample_id_max_exclusive))
     sampling = _sampling_plan_for_ids(
@@ -1513,7 +1513,12 @@ def _run_formal_stage2_assets_and_sampling(
         expected_preregistration_hash=canonical_json_hash(inputs.payload("preregistration")),
         expected_upstream_binding_hash=inputs.binding_hash,
     )
-    return payloads, tuple(dict.fromkeys((*inputs.references, asset_reference)))
+    # The resolved config's input_result_refs are the complete canonical
+    # predecessor lineage.  The environment-bound asset manifest is already
+    # embedded and hash-bound in ``asset_resolution``; it is evidence, not an
+    # implicit source_ref.  Keeping source_refs identical to the config avoids
+    # consumers silently deleting or adding references during Gate review.
+    return payloads, inputs.references
 
 
 def _stage2_source_identity() -> tuple[str, str | None, str | None]:
