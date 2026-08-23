@@ -697,6 +697,9 @@ def _validate_real_assets(
         if "transport_endpoint" in value and value["transport_endpoint"] not in {"https://huggingface.co", "https://hf-mirror.com"}:
             raise G22Blocked("G22_MODEL_MANIFEST_ENDPOINT_INVALID")
         _validate_checkpoint_manifest_files(value.get("files"), checkpoint.files)
+        expected_file_bytes = {
+            item.path: (item.size_bytes, item.sha256) for item in checkpoint.files
+        }
         model_root = _resolve(root, checkpoint.root_ref)
         if not model_root.is_dir():
             raise G22Blocked("G22_CHECKPOINT_ROOT_MISSING")
@@ -708,12 +711,12 @@ def _validate_real_assets(
                 actual_names.append(candidate.relative_to(model_root).as_posix())
             elif not candidate.is_dir():
                 raise G22Blocked(f"G22_CHECKPOINT_NONREGULAR_FILE:{candidate}")
-        if set(actual_names) != set(expected_files) or len(actual_names) != len(expected_files):
+        if set(actual_names) != set(expected_file_bytes) or len(actual_names) != len(expected_file_bytes):
             raise G22Blocked("G22_MODEL_DIRECTORY_FILE_SET_MISMATCH")
-        for name in expected_files:
+        for name in expected_file_bytes:
             actual = _resolve(root, checkpoint.root_ref + "/" + name)
             observed_size, observed_sha = _sha256(actual)
-            if (observed_size, observed_sha) != expected_files[name]:
+            if (observed_size, observed_sha) != expected_file_bytes[name]:
                 raise G22Blocked("G22_CHECKPOINT_FILE_BYTES_MISMATCH")
         model_manifests.append({"ref": checkpoint.manifest_ref, "sha256": checkpoint.manifest_sha256, "size_bytes": size})
     data_root = root / "datasets" / "pile-deduped-pythia-preshuffled"
