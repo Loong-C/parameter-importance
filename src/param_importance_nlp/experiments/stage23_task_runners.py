@@ -1536,26 +1536,93 @@ def _stage1_formal_bridge_identity(
     root: Path,
     inputs: _PredecessorContext,
 ) -> Mapping[str, JSONValue] | None:
-    """Load the immutable S1.11 bridge carried by formal predecessor commits.
+    """Load and verify the canonical S1.11 manifest from formal predecessor commits.
 
-    The bridge is DATA_ROOT evidence, not the tracked Stage1 report fixture.
-    Local drafts may omit it; a formal G2.0 evaluator will then fail closed.
+    Formal S1.11 TaskArtifact envelopes carry the complete source closure but do
+    not carry the historical ``stage1-11-bridge-evidence.json`` compatibility
+    ref.  The manifest is therefore discovered from the common output root of
+    the four already-verified commit refs and returned byte-for-byte as the
+    evaluator's ``bridge_payload``.
     """
 
-    references = {
-        reference
-        for item in inputs.artifacts
-        for reference in item.source_refs
-        if isinstance(reference, str)
-        and reference.endswith("/stage1-11-bridge-evidence.json")
-    }
-    if not references:
-        return None
-    if len(references) != 1:
-        raise ValueError("STAGE2_STAGE1_BRIDGE_REF_NOT_UNIQUE")
-    value = load_canonical_json(_workspace_path(root, next(iter(references)), field="stage1_bridge"))
+    expected_kinds = (
+        "stage_report",
+        "requirements_matrix",
+        "gate_summary",
+        "delivery_manifest",
+    )
+    if tuple(item.artifact_kind for item in inputs.artifacts) != expected_kinds:
+        raise ValueError("STAGE2_STAGE1_MANIFEST_ARTIFACT_SET_INVALID")
+    output_roots: set[str] = set()
+    for item in inputs.artifacts:
+        commit_path = PurePosixPath(item.commit_ref)
+        if len(commit_path.parts) < 3 or commit_path.parent.name != "commits":
+            raise ValueError("STAGE2_STAGE1_MANIFEST_OUTPUT_ROOT_INVALID")
+        output_roots.add(commit_path.parent.parent.as_posix())
+    if len(output_roots) != 1:
+        raise ValueError("STAGE2_STAGE1_MANIFEST_OUTPUT_ROOT_NOT_COMMON")
+    output_root = next(iter(output_roots))
+    manifest_ref = f"{output_root}/manifest.json"
+    value = load_canonical_json(
+        _workspace_path(root, manifest_ref, field="stage1_manifest")
+    )
     if not isinstance(value, Mapping):
-        raise ValueError("STAGE2_STAGE1_BRIDGE_NOT_OBJECT")
+        raise ValueError("STAGE2_STAGE1_MANIFEST_NOT_OBJECT")
+
+    def is_sha256(candidate: object) -> bool:
+        return (
+            isinstance(candidate, str)
+            and len(candidate) == 64
+            and all(character in "0123456789abcdef" for character in candidate)
+        )
+
+    manifest_hash = value.get("artifact_hash")
+    if not is_sha256(manifest_hash) or canonical_json_hash(
+        {key: item for key, item in value.items() if key != "artifact_hash"}
+    ) != manifest_hash:
+        raise ValueError("STAGE2_STAGE1_MANIFEST_SELF_HASH_INVALID")
+    if (
+        value.get("schema_version") != "stage1-s1-11-task-artifact-manifest-v2"
+        or value.get("status") != "PASS"
+        or value.get("run_intent") != "formal"
+        or value.get("formal_eligible") is not True
+        or value.get("task_id") != "stage1.11_reporting_and_exit_gate"
+        or value.get("gate_id") != "G1-EXIT"
+    ):
+        raise ValueError("STAGE2_STAGE1_MANIFEST_IDENTITY_INVALID")
+
+    config_hashes = {item.config_hash for item in inputs.artifacts}
+    if len(config_hashes) != 1:
+        raise ValueError("STAGE2_STAGE1_MANIFEST_CONFIG_IDENTITY_INVALID")
+    config_hash = next(iter(config_hashes))
+    config_ref = value.get("config_ref")
+    if config_ref != f"{output_root}/producer-config.json" or value.get(
+        "config_hash"
+    ) != config_hash:
+        raise ValueError("STAGE2_STAGE1_MANIFEST_CONFIG_INVALID")
+    config = load_canonical_json(
+        _workspace_path(root, str(config_ref), field="stage1_manifest_config")
+    )
+    if (
+        not isinstance(config, Mapping)
+        or config.get("config_hash") != config_hash
+        or canonical_json_hash(
+            {key: item for key, item in config.items() if key != "config_hash"}
+        )
+        != config_hash
+    ):
+        raise ValueError("STAGE2_STAGE1_MANIFEST_CONFIG_SELF_HASH_INVALID")
+
+    expected_commit_refs = {
+        item.artifact_kind: item.commit_ref for item in inputs.artifacts
+    }
+    expected_envelope_hashes = {
+        item.artifact_kind: item.artifact_hash for item in inputs.artifacts
+    }
+    if value.get("commit_refs") != expected_commit_refs:
+        raise ValueError("STAGE2_STAGE1_MANIFEST_COMMIT_REFS_INVALID")
+    if value.get("commit_artifact_hashes") != expected_envelope_hashes:
+        raise ValueError("STAGE2_STAGE1_MANIFEST_ENVELOPE_HASHES_INVALID")
     return dict(value)
 
 
@@ -1613,7 +1680,7 @@ def _run_stage2_contract(
     )
     formal_stage1_report_hash = (
         _formal_stage1_report_artifact_hash(inputs)
-        if stage1_handoff is not None
+        if request.config.run_intent == "formal"
         else None
     )
     preregistration = build_stage2_preregistration(
@@ -1624,7 +1691,7 @@ def _run_stage2_contract(
         # the tracked report remains local-draft compatibility only.
         stage1_report_hash=(
             formal_stage1_report_hash
-            if formal_stage1_report_hash is not None
+            if request.config.run_intent == "formal"
             else stage1_report_hash
         ),
         upstream_binding_hash=inputs.binding_hash,

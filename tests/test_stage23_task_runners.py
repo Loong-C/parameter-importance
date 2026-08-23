@@ -5,7 +5,11 @@ from pathlib import Path
 
 import pytest
 
-from param_importance_nlp.contracts import load_canonical_json, write_canonical_json
+from param_importance_nlp.contracts import (
+    canonical_json_hash,
+    load_canonical_json,
+    write_canonical_json,
+)
 from param_importance_nlp.contracts.config_v2 import load_resolved_config_compatible
 from param_importance_nlp.contracts.task_catalog import DEFAULT_TASK_CATALOG, RunnerKind
 from param_importance_nlp.experiments import (
@@ -25,7 +29,9 @@ from param_importance_nlp.experiments.stage23_task_runners import (
     _formal_stage1_report_artifact_hash,
     _formal_stage2_asset_manifest,
     _predecessor_context,
+    _run_stage2_contract,
     _run_formal_stage2_assets_and_sampling,
+    _stage1_formal_bridge_identity,
     _REQUIRED_PREDECESSORS,
     build_stage23_runner_overrides,
     register_stage23_runners,
@@ -137,12 +143,33 @@ def _publish_formal_stage1_predecessor(
     root: Path,
 ) -> tuple[TaskArtifactStore, tuple[str, ...], str]:
     store = TaskArtifactStore(root, "runs/stage1-11")
-    config_hash = "c" * 64
-    refs: list[str] = []
-    report_hash = ""
-    for kind in DEFAULT_TASK_CATALOG.get(
+    output_root = "runs/stage1-11"
+    artifact_kinds = DEFAULT_TASK_CATALOG.get(
         "stage1.11_reporting_and_exit_gate"
-    ).artifact_kinds:
+    ).artifact_kinds
+    commit_refs = {
+        kind: f"{output_root}/commits/{kind}.json" for kind in artifact_kinds
+    }
+    config_body: dict[str, object] = {
+        "schema_version": "stage1-s1-11-producer-config-v2",
+        "config_kind": "s1_11_reporting_producer",
+        "task_id": "stage1.11_reporting_and_exit_gate",
+        "gate_id": "G1-EXIT",
+        "run_intent": "formal",
+        "formal_eligible": True,
+        "artifact_kinds": list(artifact_kinds),
+        "commit_refs": commit_refs,
+    }
+    config_hash = canonical_json_hash(config_body)
+    config_ref = f"{output_root}/producer-config.json"
+    source_refs = (config_ref, *commit_refs.values(), f"{output_root}/manifest.json")
+    write_canonical_json(
+        root / Path(config_ref), {**config_body, "config_hash": config_hash}
+    )
+    refs: list[str] = []
+    envelope_hashes: dict[str, str] = {}
+    report_hash = ""
+    for kind in artifact_kinds:
         payload: dict[str, object] = {"schema_version": f"stage1-{kind}-v1"}
         if kind == "stage_report":
             # Deliberately differ from the TaskArtifact envelope hash.  The
@@ -154,12 +181,29 @@ def _publish_formal_stage1_predecessor(
             config_hash=config_hash,
             run_intent="formal",
             formal_eligible=True,
-            source_refs=("evidence/stage1-11-bridge-evidence.json",),
+            source_refs=source_refs,
             payload=payload,
         )
         refs.append(published.commit_ref)
+        envelope_hashes[kind] = published.artifact_hash
         if kind == "stage_report":
             report_hash = published.artifact_hash
+    manifest_body: dict[str, object] = {
+        "schema_version": "stage1-s1-11-task-artifact-manifest-v2",
+        "status": "PASS",
+        "task_id": "stage1.11_reporting_and_exit_gate",
+        "gate_id": "G1-EXIT",
+        "run_intent": "formal",
+        "formal_eligible": True,
+        "commit_refs": commit_refs,
+        "commit_artifact_hashes": envelope_hashes,
+        "config_ref": config_ref,
+        "config_hash": config_hash,
+    }
+    write_canonical_json(
+        root / Path(f"{output_root}/manifest.json"),
+        {**manifest_body, "artifact_hash": canonical_json_hash(manifest_body)},
+    )
     assert report_hash
     return store, tuple(refs), report_hash
 
@@ -741,9 +785,37 @@ def test_formal_stage1_predecessor_binds_verified_envelope_hash(
     request = _formal_stage2_01_request(refs)
 
     inputs = _predecessor_context(request, tmp_path, store)
+    handoff = _stage1_formal_bridge_identity(tmp_path, inputs)
+    assert handoff is not None
+    manifest = load_canonical_json(tmp_path / "runs/stage1-11/manifest.json")
+    assert handoff == manifest
+
+    outputs, _ = _run_stage2_contract(request, tmp_path, store)
+    provenance = outputs["preregistration"]["provenance"]
+    assert isinstance(provenance, dict)
+    assert provenance["stage1_handoff"] == manifest
+    assert provenance["stage1_report_hash"] == envelope_hash
 
     assert _formal_stage1_report_artifact_hash(inputs) == envelope_hash
     assert _formal_stage1_report_artifact_hash(inputs) != "p" * 64
+
+
+def test_formal_stage1_predecessor_bad_manifest_fails_closed(tmp_path: Path) -> None:
+    store, refs, _envelope_hash = _publish_formal_stage1_predecessor(tmp_path)
+    manifest_path = tmp_path / "runs/stage1-11/manifest.json"
+    manifest = load_canonical_json(manifest_path)
+    assert isinstance(manifest, dict)
+    hashes = manifest["commit_artifact_hashes"]
+    assert isinstance(hashes, dict)
+    hashes["stage_report"] = "d" * 64
+    body = {key: item for key, item in manifest.items() if key != "artifact_hash"}
+    manifest["artifact_hash"] = canonical_json_hash(body)
+    write_canonical_json(manifest_path, manifest)
+
+    request = _formal_stage2_01_request(refs)
+    inputs = _predecessor_context(request, tmp_path, store)
+    with pytest.raises(ValueError, match="MANIFEST_ENVELOPE_HASHES_INVALID"):
+        _stage1_formal_bridge_identity(tmp_path, inputs)
 
 
 def test_formal_stage1_predecessor_wrong_hash_fails_closed(tmp_path: Path) -> None:
