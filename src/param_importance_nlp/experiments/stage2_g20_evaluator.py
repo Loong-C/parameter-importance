@@ -507,6 +507,8 @@ def _validate_stage1_bridge(
     bridge_role_hashes = bridge.get("role_sha256")
     if not isinstance(bridge_role_refs, Mapping) or not isinstance(bridge_role_hashes, Mapping):
         raise G20Blocked("stage1_source:BRIDGE_ROLE_REFS_AND_HASHES_REQUIRED")
+    if dict(bridge_role_hashes) != dict(handoff.role_sha256):
+        raise G20Blocked("stage1_source:BRIDGE_ROLE_HASHES_MISMATCH")
     required_bridge_roles = (
         "formal_observation", "stage_report", "delivery_manifest",
         "gate_summary", "requirements_matrix",

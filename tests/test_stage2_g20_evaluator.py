@@ -429,7 +429,7 @@ def test_fake_producer_commit_is_rejected(tmp_path: Path) -> None:
     data_root, refs, config_ref, _ = _fixture(tmp_path, producer_commit="f" * 40)
     result = _evaluate(data_root, refs, config_ref)
     assert result["status"] == "BLOCKED"
-    assert "TRUSTED_HEAD" in " ".join(result["gate_record"]["reasons"])  # type: ignore[index]
+    assert "GIT_OBJECT_MISSING" in " ".join(result["gate_record"]["reasons"])  # type: ignore[index]
 
 
 def test_dual_root_and_output_root_symlink_fail_closed(tmp_path: Path) -> None:
