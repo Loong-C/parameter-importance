@@ -905,10 +905,11 @@ def _result(
 def evaluate_formal_g20(
     data_root: str | Path,
     artifact_refs: Sequence[str] | Mapping[str, str],
+    output_dir: str | Path = "runs/stage2-g20-evaluation",
     *,
     repository_root: str | Path,
-    resolved_config_ref: str,
-    output_dir: str | Path = "runs/stage2-g20-evaluation",
+    resolved_config_ref: str | None = None,
+    evaluation_config_ref: str | None = None,
 ) -> dict[str, JSONValue]:
     """Evaluate and publish G2.0 from three formal S2.1 task commits.
 
@@ -918,6 +919,10 @@ def evaluate_formal_g20(
     set with a valid output boundary receives an immutable envelope.
     """
 
+    if resolved_config_ref is None:
+        resolved_config_ref = evaluation_config_ref
+    elif evaluation_config_ref is not None and evaluation_config_ref != resolved_config_ref:
+        resolved_config_ref = None
     loaded: _LoadedSet | None = None
     repository: _RepositoryIdentity | None = None
     config: _ResolvedConfigBinding | None = None
@@ -1050,11 +1055,12 @@ def evaluate_formal_g20(
 def evaluate_g20(
     data_root: str | Path,
     artifact_refs: Sequence[str] | Mapping[str, str],
+    output_dir: str | Path = "runs/stage2-g20-evaluation",
     **kwargs: object,
 ) -> dict[str, JSONValue]:
     """Narrow compatibility alias used by materializers."""
 
-    return evaluate_formal_g20(data_root, artifact_refs, **kwargs)  # type: ignore[arg-type]
+    return evaluate_formal_g20(data_root, artifact_refs, output_dir, **kwargs)  # type: ignore[arg-type]
 
 
 __all__ = [
