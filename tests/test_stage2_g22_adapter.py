@@ -14,6 +14,7 @@ from param_importance_nlp.experiments.stage2_g22_adapter import (
     ARTIFACT_KINDS,
     FORMAL_ADAPTER_OUTPUT_DIR,
     G22Blocked,
+    _canonical_registry_manifest_ref,
     _gate,
     _cross_bind_offline_registry_hash,
     PRODUCER_COMMIT,
@@ -303,3 +304,21 @@ def test_formal_gate_rejects_s203_output_override(
     )
     assert result["status"] == "BLOCKED"
     assert "G22_ADAPTER_OUTPUT_DIR_OVERRIDE_REJECTED" in str(result["reason"])
+
+
+def test_registry_index_manifest_refs_join_from_index_parent() -> None:
+    assert _canonical_registry_manifest_ref("manifests/pythia-14m-early.json") == (
+        "evidence/stage2/s203/formal-registry-r6/manifests/pythia-14m-early.json"
+    )
+
+
+@pytest.mark.parametrize("declared_ref", [
+    "/absolute/manifest.json",
+    "../escape.json",
+    "manifests/../../escape.json",
+    "C:/absolute/manifest.json",
+    "manifests\\windows.json",
+])
+def test_registry_index_manifest_refs_reject_escape(declared_ref: str) -> None:
+    with pytest.raises(G22Blocked, match="G22_FORMAL_REGISTRY_MANIFEST_REF"):
+        _canonical_registry_manifest_ref(declared_ref)
