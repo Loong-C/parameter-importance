@@ -1,0 +1,41 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://parameter-importance.invalid/schemas/shared/stage2-registry-qualification-v1.json",
+  "title": "Stage 2 coordinate registry qualification evidence",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "task_id", "scope", "cell", "parent", "registry", "registry_hash", "parameter_count", "eligible_parameter_count", "parameter_numel", "eligible_parameter_numel", "parameter_names", "parameter_order", "parameter_mapping", "resolved_config", "producer", "qualification_hash"],
+  "properties": {
+    "schema_version": {"const": "stage2-registry-qualification-v1"},
+    "task_id": {"const": "stage2.03_assets_checkpoints_and_sampling"},
+    "scope": {"enum": ["local_fixture", "formal"]},
+    "cell": {"$ref": "#/$defs/cell"},
+    "parent": {"type": "object"},
+    "registry": {"$ref": "../stage1/parameter-registry-v1.json"},
+    "registry_hash": {"$ref": "#/$defs/hash"},
+    "parameter_count": {"type": "integer", "minimum": 1},
+    "eligible_parameter_count": {"type": "integer", "minimum": 0},
+    "parameter_numel": {"type": "integer", "minimum": 1},
+    "eligible_parameter_numel": {"type": "integer", "minimum": 0},
+    "parameter_names": {"type": "array", "items": {"type": "string", "minLength": 1}},
+    "parameter_order": {"type": "array", "items": {"type": "string", "minLength": 1}},
+    "parameter_mapping": {"type": "array", "items": {"type": "object"}},
+    "resolved_config": {"type": "object"},
+    "producer": {"type": "object"},
+    "qualification_hash": {"$ref": "#/$defs/hash"}
+  },
+  "$defs": {
+    "hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "cell": {
+      "type": "object", "additionalProperties": false,
+      "required": ["cell_id", "model_id", "training_stage", "training_step", "checkpoint_id"],
+      "properties": {
+        "cell_id": {"type": "string", "minLength": 1},
+        "model_id": {"enum": ["pythia-14m", "pythia-31m-deduped"]},
+        "training_stage": {"enum": ["initialization", "early", "mid_late"]},
+        "training_step": {"type": "integer", "minimum": 0},
+        "checkpoint_id": {"type": "string", "minLength": 1}
+      }
+    }
+  }
+}

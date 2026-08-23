@@ -1,0 +1,47 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://parameter-importance.invalid/schemas/shared/stage2-registry-qualification-index-v1.json",
+  "title": "Stage 2 coordinate registry qualification index",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "task_id", "scope", "parent", "cells", "producer", "resolved_config", "index_hash"],
+  "properties": {
+    "schema_version": {"const": "stage2-registry-qualification-index-v1"},
+    "task_id": {"const": "stage2.03_assets_checkpoints_and_sampling"},
+    "scope": {"enum": ["local_fixture", "formal"]},
+    "parent": {"$ref": "#/$defs/parent"},
+    "cells": {"type": "array", "minItems": 6, "maxItems": 6, "items": {"$ref": "#/$defs/cell"}},
+    "producer": {"type": "object"},
+    "resolved_config": {"type": "object"},
+    "index_hash": {"$ref": "#/$defs/hash"}
+  },
+  "$defs": {
+    "hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "parent": {
+      "type": "object", "additionalProperties": false,
+      "required": ["asset_resolution_ref", "asset_resolution_sha256", "asset_resolution_size_bytes", "asset_resolution_hash"],
+      "properties": {
+        "asset_resolution_ref": {"type": "string", "minLength": 1},
+        "asset_resolution_sha256": {"$ref": "#/$defs/hash"},
+        "asset_resolution_size_bytes": {"type": "integer", "minimum": 1},
+        "asset_resolution_hash": {"$ref": "#/$defs/hash"}
+      }
+    },
+    "cell": {
+      "type": "object", "additionalProperties": false,
+      "required": ["cell_id", "checkpoint_id", "qualification_ref", "qualification_sha256", "qualification_size_bytes", "qualification_hash", "provider_derived_registry_hash", "registry_hash", "parameter_count", "parameter_numel"],
+      "properties": {
+        "cell_id": {"type": "string", "minLength": 1},
+        "checkpoint_id": {"type": "string", "minLength": 1},
+        "qualification_ref": {"type": "string", "minLength": 1},
+        "qualification_sha256": {"$ref": "#/$defs/hash"},
+        "qualification_size_bytes": {"type": "integer", "minimum": 1},
+        "qualification_hash": {"$ref": "#/$defs/hash"},
+        "provider_derived_registry_hash": {"$ref": "#/$defs/hash"},
+        "registry_hash": {"$ref": "#/$defs/hash"},
+        "parameter_count": {"type": "integer", "minimum": 1},
+        "parameter_numel": {"type": "integer", "minimum": 1}
+      }
+    }
+  }
+}

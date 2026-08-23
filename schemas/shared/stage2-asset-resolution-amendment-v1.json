@@ -1,0 +1,44 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://parameter-importance.invalid/schemas/shared/stage2-asset-resolution-amendment-v1.json",
+  "title": "Stage 2 append-only coordinate registry asset amendment",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "task_id", "scope", "amendment_kind", "parent", "qualification_index", "qualification_cells", "materialized_asset_resolution", "producer", "resolved_config", "amendment_hash"],
+  "properties": {
+    "schema_version": {"const": "stage2-asset-resolution-amendment-v1"},
+    "task_id": {"const": "stage2.03_assets_checkpoints_and_sampling"},
+    "scope": {"enum": ["local_fixture", "formal"]},
+    "amendment_kind": {"const": "parameter_registry_coordinate_hash_qualification"},
+    "parent": {"$ref": "#/$defs/parent"},
+    "qualification_index": {"$ref": "#/$defs/indexRef"},
+    "qualification_cells": {"type": "array", "minItems": 6, "maxItems": 6, "items": {"type": "object"}},
+    "materialized_asset_resolution": {"$ref": "stage2-asset-resolution-v1.json"},
+    "producer": {"type": "object"},
+    "resolved_config": {"type": "object"},
+    "amendment_hash": {"$ref": "#/$defs/hash"}
+  },
+  "$defs": {
+    "hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "parent": {
+      "type": "object", "additionalProperties": false,
+      "required": ["asset_resolution_ref", "asset_resolution_sha256", "asset_resolution_size_bytes", "asset_resolution_hash"],
+      "properties": {
+        "asset_resolution_ref": {"type": "string", "minLength": 1},
+        "asset_resolution_sha256": {"$ref": "#/$defs/hash"},
+        "asset_resolution_size_bytes": {"type": "integer", "minimum": 1},
+        "asset_resolution_hash": {"$ref": "#/$defs/hash"}
+      }
+    },
+    "indexRef": {
+      "type": "object", "additionalProperties": false,
+      "required": ["ref", "sha256", "size_bytes", "index_hash"],
+      "properties": {
+        "ref": {"type": "string", "minLength": 1},
+        "sha256": {"$ref": "#/$defs/hash"},
+        "size_bytes": {"type": "integer", "minimum": 1},
+        "index_hash": {"$ref": "#/$defs/hash"}
+      }
+    }
+  }
+}
