@@ -165,12 +165,18 @@ def _run_chain(
     configs: dict[str, object] = {}
     results: dict[str, object] = {}
     for task_id in STAGE23_TASK_IDS:
+        # The fixture chain intentionally exercises S2.1 in isolation.  Its
+        # formal path consumes the four Stage1.11 commits; the fixture path is
+        # the explicit exception implemented by the runner preflight.
+        predecessors = _REQUIRED_PREDECESSORS[task_id]
+        if task_id == "stage2.01_scope_hypotheses_and_preregistration":
+            predecessors = ()
         config = _config(
             task_id,
             f"runs/{task_id.replace('.', '-')}",
             tuple(
                 ref
-                for predecessor in _REQUIRED_PREDECESSORS[task_id]
+                for predecessor in predecessors
                 for ref in refs_by_task[predecessor]
             ),
         )
@@ -445,9 +451,12 @@ def test_all_stage23_task_ids_are_specialized_and_hash_bound_to_full_predecessor
             task_id
         ).artifact_kinds
         assert result.metadata == {"execution_contract": "stage23-specialized-v1"}
+        predecessors = _REQUIRED_PREDECESSORS[task_id]
+        if task_id == "stage2.01_scope_hypotheses_and_preregistration":
+            predecessors = ()
         expected_sources = [
             ref
-            for predecessor in _REQUIRED_PREDECESSORS[task_id]
+            for predecessor in predecessors
             for ref in results[predecessor].artifact_refs.values()
         ]
         for commit_ref in result.artifact_refs.values():
@@ -459,6 +468,9 @@ def test_all_stage23_task_ids_are_specialized_and_hash_bound_to_full_predecessor
 
 
 def test_stage2_direct_predecessors_match_plan_dag() -> None:
+    assert _REQUIRED_PREDECESSORS["stage2.01_scope_hypotheses_and_preregistration"] == (
+        "stage1.11_reporting_and_exit_gate",
+    )
     assert _REQUIRED_PREDECESSORS["stage2.02_stage1_handoff_and_fixed_state_contract"] == (
         "stage2.01_scope_hypotheses_and_preregistration",
     )

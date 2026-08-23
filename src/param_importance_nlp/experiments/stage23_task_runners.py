@@ -221,7 +221,13 @@ _STAGE23_TASK_ORDER = (
 # independent consumers of 2.01; later tasks consume only the listed direct
 # predecessors, rather than accidentally serializing the whole experiment.
 _REQUIRED_PREDECESSORS: Mapping[str, tuple[str, ...]] = {
-    "stage2.01_scope_hypotheses_and_preregistration": (),
+    # Stage 2 enters only from the completed formal Stage 1.11 delivery set.
+    # Local fixture callers may still use the isolated S2.1 contract helper;
+    # ``_predecessor_context`` keeps that explicit test-only exception while
+    # formal execution always consumes all four Stage 1.11 commits.
+    "stage2.01_scope_hypotheses_and_preregistration": (
+        "stage1.11_reporting_and_exit_gate",
+    ),
     "stage2.02_stage1_handoff_and_fixed_state_contract": (
         "stage2.01_scope_hypotheses_and_preregistration",
     ),
@@ -837,6 +843,14 @@ def _predecessor_context(
             retryable=False,
         )
 
+    if (
+        request.config.run_intent == "local_fixture"
+        and request.task.task_id == "stage2.01_scope_hypotheses_and_preregistration"
+        and not raw_refs
+        and expected_tasks == ("stage1.11_reporting_and_exit_gate",)
+    ):
+        expected_tasks = ()
+
     grouped: dict[str, dict[str, _BoundInputArtifact]] = {}
     auxiliaries: list[str] = []
     for reference in raw_refs:
@@ -897,7 +911,6 @@ def _predecessor_context(
             )
         ordered.extend(observed[kind] for kind in definition.artifact_kinds)
 
-    # Stage2.01 是本链入口；它可以绑定额外预注册附件，但不能伪造前驱 task。
     return _PredecessorContext(expected_tasks, tuple(ordered), tuple(auxiliaries))
 
 
