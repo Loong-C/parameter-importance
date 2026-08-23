@@ -49,6 +49,7 @@ from ..contracts.jsonio import (
     load_canonical_json,
     write_canonical_json,
 )
+from ..contracts.immutable import thaw_json_value
 from ..contracts.stage1_handoff import (
     Stage1ExitEvidence,
     Stage1HandoffError,

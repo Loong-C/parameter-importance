@@ -18,6 +18,7 @@ from param_importance_nlp.experiments.stage2_formal import (
 from param_importance_nlp.experiments.stage23_task_runners import (
     _BoundInputArtifact,
     _PredecessorContext,
+    _stable_wave_payload,
 )
 from param_importance_nlp.providers import SyntheticGradientProvider
 
@@ -126,6 +127,8 @@ def test_s25_runner_emits_three_reference_views_and_replay_evidence(tmp_path: Pa
     assert "gradient_norm" in summary.microbatch_diagnostics[0]
     assert summary.replay_evidence["attempt_bound"] is True
     assert summary.replay_evidence["idempotent_reducer"] is True
+    stable = _stable_wave_payload(summary)
+    assert stable["replay_evidence"]["schema_version"] == "stage2-paired-replay-evidence-v1"
     validate_stage23_artifact(summary.to_dict())
 
     resumed = RecoverablePairedWaveRunner(_provider()).run(
