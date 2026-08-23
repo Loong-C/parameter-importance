@@ -61,6 +61,7 @@ from ..contracts.stage0_handoff import (
 )
 from ..contracts.seed import SeedPlan
 from ..contracts.stage23 import FormalExecutionEvidence
+from ..contracts.freeze import ContractFreeze
 from ..contracts.task_catalog import DEFAULT_TASK_CATALOG, RecoveryMode, RunnerKind
 from ..analysis import (
     AnalysisReportBuilder,
@@ -713,6 +714,47 @@ def _document_hash(path: Path) -> str:
     return canonical_json_hash(value)
 
 
+def _formal_contract_freeze_hash(
+    root: Path,
+    reference: str,
+    *,
+    stage: int,
+) -> str:
+    """读取 formal contract freeze，严格区分 TaskArtifact 与旧裸文档。"""
+
+    path = _workspace_path(root, reference, field="contract_freeze")
+    value = load_canonical_json(path)
+    if not isinstance(value, Mapping) or value.get("schema_version") != (
+        "task-output-commit-v1"
+    ):
+        # Historical handoff documents predate the TaskArtifact envelope and remain
+        # readable only through the narrowly scoped legacy hash path.
+        return _document_hash(path)
+
+    # Once the root advertises a TaskArtifact commit, every validation below is
+    # mandatory.  In particular, never fall back to hashing the commit envelope
+    # when its object, kind, or payload is malformed.
+    loaded = load_committed_task_artifact(root, reference, require_formal=True)
+    if loaded.identity.artifact_kind != "contract_freeze":
+        raise ValueError(
+            "CONTRACT_FREEZE_COMMIT_ARTIFACT_KIND_INVALID:"
+            f"{loaded.identity.artifact_kind}"
+        )
+    payload = loaded.payload
+    if payload.get("schema_version") != "contract-freeze-v1":
+        raise ValueError("CONTRACT_FREEZE_COMMIT_PAYLOAD_SCHEMA_INVALID")
+    freeze = ContractFreeze.from_mapping(dict(payload))
+    if freeze.stage != stage or not freeze.formal_eligible:
+        raise ValueError("CONTRACT_FREEZE_COMMIT_NOT_FORMAL_FOR_STAGE")
+    payload_hash = payload.get("artifact_hash")
+    if not isinstance(payload_hash, str):
+        raise ValueError("CONTRACT_FREEZE_COMMIT_PAYLOAD_HASH_MISSING")
+    # ContractFreeze.from_mapping already binds this field to the payload; return
+    # the payload hash (rather than the enclosing TaskArtifact hash) to compare
+    # against FormalExecutionEvidence.contract_freeze_hash.
+    return payload_hash
+
+
 def _blocked(
     code: BlockerCode,
     requirement: str,
@@ -1045,10 +1087,12 @@ def _formal_execution_evidence(
             evidence_refs=(reference,),
         )
     try:
-        observed = _document_hash(
-            _workspace_path(root, freeze_ref, field="contract_freeze")
+        observed = _formal_contract_freeze_hash(
+            root,
+            freeze_ref,
+            stage=request.task.stage,
         )
-    except (FileNotFoundError, ValueError) as error:
+    except Exception as error:
         raise _blocked(
             BlockerCode.CONTRACT_UNFROZEN,
             "contract_freeze",
