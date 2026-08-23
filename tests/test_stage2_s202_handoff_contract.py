@@ -323,6 +323,40 @@ def test_formal_stage1_exit_closure_binds_exact_producer_and_all_roles(tmp_path:
     }
 
 
+def test_stage1_exit_accepts_r4_top_level_validation_and_requires_hash(tmp_path: Path) -> None:
+    """Released r4 binds validation via index fields, never an unbound file."""
+
+    ref = _stage1_fixture(tmp_path)
+    index_path = tmp_path / ref
+    index = load_canonical_json(index_path)
+    assert isinstance(index, dict)
+    validation_path = index_path.parent / "validation.json"
+    validation = load_canonical_json(validation_path)
+    assert isinstance(validation, dict)
+    validation.pop("gate_id", None)
+    validation = _with_hash({key: value for key, value in validation.items() if key != "artifact_hash"})
+    write_canonical_json(validation_path, validation)
+    role_refs = dict(index["role_refs"])
+    role_hashes = dict(index["role_sha256"])
+    role_refs.pop("validation")
+    role_hashes.pop("validation")
+    index["role_refs"] = role_refs
+    index["role_sha256"] = role_hashes
+    index["validation_ref"] = "validation.json"
+    index["validation_sha256"] = hashlib.sha256(validation_path.read_bytes()).hexdigest()
+    index = _with_hash({key: value for key, value in index.items() if key != "artifact_hash"})
+    write_canonical_json(index_path, index)
+
+    evidence = validate_stage1_exit_evidence(tmp_path, ref)
+    assert dict(evidence.role_sha256)["validation"] == index["validation_sha256"]
+
+    index.pop("validation_sha256")
+    index = _with_hash({key: value for key, value in index.items() if key != "artifact_hash"})
+    write_canonical_json(index_path, index)
+    with pytest.raises(Stage1HandoffError, match="ROLE_VALIDATION_HASH_MISSING"):
+        validate_stage1_exit_evidence(tmp_path, ref)
+
+
 @pytest.mark.parametrize("ref", [
     "reports/stage1/cpu-evidence/stage_report.json",
     "fixtures/stage1/stage1-s111-exit.json",

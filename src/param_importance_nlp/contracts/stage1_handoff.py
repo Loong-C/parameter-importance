@@ -223,15 +223,38 @@ def validate_stage1_exit_evidence(
 
     role_refs = _object(index.get("role_refs"), field="index.role_refs")
     role_hashes = _object(index.get("role_sha256"), field="index.role_sha256")
+    # Released r4 keeps validation outside ``role_refs``: its dedicated
+    # validation_ref/validation_sha256 fields are part of the producer index
+    # wire.  Older local/compatibility fixtures put validation in role_refs;
+    # retain that path, but never accept an unbound or unhashed validation file.
+    validation_in_roles = "validation" in role_refs or "validation" in role_hashes
+    if validation_in_roles and not (
+        "validation" in role_refs and "validation" in role_hashes
+    ):
+        raise Stage1HandoffError("STAGE1_HANDOFF_ROLE_VALIDATION_MISSING")
+    validation_from_index = not validation_in_roles
+    if validation_from_index:
+        if index.get("validation_ref") != "validation.json":
+            raise Stage1HandoffError("STAGE1_HANDOFF_ROLE_VALIDATION_REF_INVALID")
+        if "validation_sha256" not in index:
+            raise Stage1HandoffError("STAGE1_HANDOFF_ROLE_VALIDATION_HASH_MISSING")
     for role in _REQUIRED_ROLES:
+        if role == "validation" and validation_from_index:
+            continue
         if role not in role_refs or role not in role_hashes:
             raise Stage1HandoffError(f"STAGE1_HANDOFF_ROLE_{role.upper()}_MISSING")
     loaded: dict[str, Mapping[str, object]] = {}
     normalized_hashes: dict[str, str] = {}
     for role in _REQUIRED_ROLES:
-        role_path = _role_path(index_path, role_refs[role], field=f"role.{role}")
+        if role == "validation" and validation_from_index:
+            role_ref = index["validation_ref"]
+            expected_hash = index["validation_sha256"]
+        else:
+            role_ref = role_refs[role]
+            expected_hash = role_hashes[role]
+        role_path = _role_path(index_path, role_ref, field=f"role.{role}")
         try:
-            digest = _file_hash(role_path, expected=role_hashes[role], field=f"role.{role}")
+            digest = _file_hash(role_path, expected=expected_hash, field=f"role.{role}")
         except OSError as error:
             raise Stage1HandoffError(f"STAGE1_HANDOFF_ROLE_{role.upper()}_MISSING") from error
         loaded[role] = _read(role_path, field=f"role.{role}")
@@ -283,7 +306,16 @@ def validate_stage1_exit_evidence(
     if tuple(observed_requirements) != _REQUIRED_REQUIREMENTS:
         raise Stage1HandoffError("STAGE1_HANDOFF_REQUIREMENTS_ORDER_INVALID")
 
-    _identity(loaded["validation"], field="validation", schema="stage1-s1-11-validation-v1")
+    validation = loaded["validation"]
+    if validation_from_index:
+        if (
+            validation.get("schema_version") != "stage1-s1-11-validation-v1"
+            or validation.get("status") != "PASS"
+            or validation.get("task_id") != STAGE1_G1_EXIT_TASK_ID
+        ):
+            raise Stage1HandoffError("STAGE1_HANDOFF_VALIDATION_IDENTITY_INVALID")
+    else:
+        _identity(validation, field="validation", schema="stage1-s1-11-validation-v1")
     replay = loaded["replay_validation"]
     if replay.get("schema_version") != "stage1-s1-11-replay-validation-v1" or replay.get("status") != "PASS":
         raise Stage1HandoffError("STAGE1_HANDOFF_REPLAY_INVALID")
