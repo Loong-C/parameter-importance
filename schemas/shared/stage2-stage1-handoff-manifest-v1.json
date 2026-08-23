@@ -33,7 +33,10 @@
         "formal_observation_artifact_hash", "role_sha256"
       ],
       "properties": {
-        "index_ref": {"type": "string", "minLength": 1},
+        "index_ref": {
+          "type": "string",
+          "pattern": "^evidence/stage1/s1-11-formal/3f18b04df8922be9894678ae4842bd999c7e8fd5/[^/]+/index\\.json$"
+        },
         "index_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
         "index_artifact_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
         "producer_commit": {"type": "string", "pattern": "^[0-9a-f]{40}$"},

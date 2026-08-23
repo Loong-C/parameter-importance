@@ -19,6 +19,7 @@ STAGE1_G1_EXIT_PRODUCER_COMMIT = "3f18b04df8922be9894678ae4842bd999c7e8fd5"
 STAGE1_G1_EXIT_TASK_ID = "stage1.11_reporting_and_exit_gate"
 STAGE1_G1_EXIT_GATE_ID = "G1-EXIT"
 STAGE1_G1_EXIT_INDEX_SCHEMA = "stage1-s1-11-formalization-index-v1"
+STAGE1_G1_EXIT_CANONICAL_ROOT = "evidence/stage1/s1-11-formal"
 _REQUIRED_ROLES = (
     "formal_observation",
     "stage_report",
@@ -162,13 +163,16 @@ def validate_stage1_exit_evidence(
     index_ref: str,
     *,
     expected_producer: str = STAGE1_G1_EXIT_PRODUCER_COMMIT,
+    evidence_root: Path | None = None,
 ) -> Stage1ExitEvidence:
     """Validate and return the exact Stage 1 G1-EXIT handoff identity.
 
-    ``index_ref`` is workspace-relative and must point to an immutable final
-    S1.11 index.  The validator checks every role hash before inspecting role
-    semantics, rejects tracked fixture paths, and binds both generator and
-    consumer/execution commit to the released producer.
+    ``index_ref`` is workspace-relative and must point below the canonical
+    ``evidence/stage1/s1-11-formal/<producer>/<attempt>/`` root.  The validator
+    checks every role hash before inspecting role semantics, rejects tracked or
+    temporary fixture paths, and binds both generator and consumer/execution
+    commit to the released producer.  A caller using ``DATA_ROOT`` therefore
+    passes ``evidence/...``; it must not pass a ``tmp/...`` attempt path.
     """
 
     if expected_producer != STAGE1_G1_EXIT_PRODUCER_COMMIT:
@@ -178,10 +182,29 @@ def validate_stage1_exit_evidence(
         path_parts[index : index + 2] in (("reports", "stage1"), ("fixtures", "stage1"))
         for index in range(max(0, len(path_parts) - 1))
     ):
-        # The tracked Stage 1 reports/fixtures are deliberately not formal
-        # evidence.  A separately staged formal index may live under evidence/.
+        # Tracked Stage 1 reports/fixtures may be NOT_RUN and are never formal
+        # authority, even if a caller places a PASS-looking object there.
         raise Stage1HandoffError("STAGE1_HANDOFF_TRACKED_FIXTURE_REF_FORBIDDEN")
-    index_path = _safe_relative(root, index_ref, field="index")
+    canonical_root_parts = PurePosixPath(STAGE1_G1_EXIT_CANONICAL_ROOT).parts
+    if path_parts[: len(canonical_root_parts)] != canonical_root_parts:
+        if (
+            path_parts
+            and path_parts[0] == "tmp"
+            and len(path_parts) > 1
+            and path_parts[1].startswith("stage1")
+        ):
+            raise Stage1HandoffError("STAGE1_HANDOFF_TEMP_REF_FORBIDDEN")
+        raise Stage1HandoffError("STAGE1_HANDOFF_CANONICAL_ROOT_REQUIRED")
+    if len(path_parts) < 6 or path_parts[3] != expected_producer:
+        raise Stage1HandoffError("STAGE1_HANDOFF_CANONICAL_PRODUCER_PATH_INVALID")
+    # Formal callers pass the explicitly approved DATA_ROOT as ``evidence_root``;
+    # workspace/result references remain rooted at ``root``.  Keeping the two
+    # roots separate prevents a mutable repo/tmp copy from becoming authority.
+    index_path = _safe_relative(
+        evidence_root if evidence_root is not None else root,
+        index_ref,
+        field="index",
+    )
     try:
         index = _read(index_path, field="index")
         index_sha256 = hashlib.sha256(index_path.read_bytes()).hexdigest()
@@ -282,6 +305,7 @@ def validate_stage1_exit_evidence(
 
 
 __all__ = [
+    "STAGE1_G1_EXIT_CANONICAL_ROOT",
     "STAGE1_G1_EXIT_GATE_ID",
     "STAGE1_G1_EXIT_INDEX_SCHEMA",
     "STAGE1_G1_EXIT_PRODUCER_COMMIT",

@@ -1039,13 +1039,51 @@ _LATE_STAGE_PREDECESSORS: Final[dict[str, tuple[str, ...]]] = {
     "stage9.replay": ("stage9.bundle",),
 }
 
+# Stage 2 follows the explicit plan DAG; Stage 0/1 and Stage 3 retain their
+# existing numbered-chain construction.  Keeping this table beside catalog
+# input contracts prevents the runtime adapter from accepting edges that the
+# formal preflight would later reject.
+_STAGE2_DIRECT_PREDECESSORS: Final[dict[str, tuple[str, ...]]] = {
+    "stage2.01_scope_hypotheses_and_preregistration": (
+        "stage1.11_reporting_and_exit_gate",
+    ),
+    "stage2.02_stage1_handoff_and_fixed_state_contract": (
+        "stage2.01_scope_hypotheses_and_preregistration",
+    ),
+    "stage2.03_assets_checkpoints_and_sampling": (
+        "stage2.01_scope_hypotheses_and_preregistration",
+    ),
+    "stage2.04_reference_target": (
+        "stage2.02_stage1_handoff_and_fixed_state_contract",
+        "stage2.03_assets_checkpoints_and_sampling",
+    ),
+    "stage2.05_paired_estimator_runner": (
+        "stage2.02_stage1_handoff_and_fixed_state_contract",
+        "stage2.03_assets_checkpoints_and_sampling",
+    ),
+    "stage2.06_pilot_and_matrix_freeze": (
+        "stage2.04_reference_target",
+        "stage2.05_paired_estimator_runner",
+    ),
+    "stage2.07_main_sweep": ("stage2.06_pilot_and_matrix_freeze",),
+    "stage2.08_statistics_and_robustness": ("stage2.07_main_sweep",),
+    "stage2.09_cost_and_system_validation": ("stage2.07_main_sweep",),
+    "stage2.10_visualization_reporting_and_decision": (
+        "stage2.08_statistics_and_robustness",
+        "stage2.09_cost_and_system_validation",
+    ),
+    "stage2.11_delivery_and_exit_gate": (
+        "stage2.10_visualization_reporting_and_decision",
+    ),
+}
+
 
 def _freeze_dependency_contracts(
     raw_tasks: Sequence[TaskDefinition],
 ) -> tuple[TaskDefinition, ...]:
     """补全 predecessor 与 input artifact 合同并返回新的不可变任务元组。
 
-    Stage 0--3 的编号计划天然形成线性审计链：同 Stage 的 ``NN`` 消费 ``NN-1``，
+    Stage 0/1 与 Stage 3 使用编号链，Stage 2 使用计划中显式冻结的直接 DAG；
     新 Stage 的 ``01`` 消费前一 Stage 的退出任务。Stage 4--9 则使用上面的显式
     DAG。输入合同绑定上游 ``task-output-commit-v1``，这与运行时只从权威 commit
     发现对象的两阶段发布协议一致。
@@ -1087,11 +1125,12 @@ def _freeze_dependency_contracts(
     frozen: list[TaskDefinition] = []
     raw_by_id = {task.task_id: task for task in raw_tasks}
     for task in raw_tasks:
-        predecessors = (
-            numbered_predecessors[task.task_id]
-            if task.stage <= 3
-            else _LATE_STAGE_PREDECESSORS[task.task_id]
-        )
+        if task.task_id in _STAGE2_DIRECT_PREDECESSORS:
+            predecessors = _STAGE2_DIRECT_PREDECESSORS[task.task_id]
+        elif task.stage <= 3:
+            predecessors = numbered_predecessors[task.task_id]
+        else:
+            predecessors = _LATE_STAGE_PREDECESSORS[task.task_id]
         inputs = tuple(
             InputArtifactContract(
                 input_id=f"upstream_{index:02d}",

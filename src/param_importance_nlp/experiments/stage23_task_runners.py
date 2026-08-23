@@ -51,6 +51,11 @@ from ..contracts.stage1_handoff import (
     Stage1HandoffError,
     validate_stage1_exit_evidence,
 )
+from ..contracts.stage0_handoff import (
+    Stage0HandoffError,
+    Stage0HandoffEvidence,
+    validate_stage0_handoff,
+)
 from ..contracts.seed import SeedPlan
 from ..contracts.stage23 import FormalExecutionEvidence
 from ..contracts.task_catalog import DEFAULT_TASK_CATALOG, RecoveryMode, RunnerKind
@@ -197,11 +202,49 @@ _STAGE23_TASK_ORDER = (
     "stage3.10_reports_visualizations_and_handoff",
 )
 
-# 线性链并不意味着未来不能增加 DAG 分支；这里冻结的是当前计划中每个任务必须
-# 完整消费的直接前驱。值采用 tuple，后续扩展为多前驱时无需改变验证器协议。
+# Freeze the Stage 2 plan's direct DAG edges.  Stage 2.02 and 2.03 are
+# independent consumers of 2.01; later tasks consume only the listed direct
+# predecessors, rather than accidentally serializing the whole experiment.
 _REQUIRED_PREDECESSORS: Mapping[str, tuple[str, ...]] = {
-    task_id: (() if index == 0 else (_STAGE23_TASK_ORDER[index - 1],))
-    for index, task_id in enumerate(_STAGE23_TASK_ORDER)
+    "stage2.01_scope_hypotheses_and_preregistration": (),
+    "stage2.02_stage1_handoff_and_fixed_state_contract": (
+        "stage2.01_scope_hypotheses_and_preregistration",
+    ),
+    "stage2.03_assets_checkpoints_and_sampling": (
+        "stage2.01_scope_hypotheses_and_preregistration",
+    ),
+    "stage2.04_reference_target": (
+        "stage2.02_stage1_handoff_and_fixed_state_contract",
+        "stage2.03_assets_checkpoints_and_sampling",
+    ),
+    "stage2.05_paired_estimator_runner": (
+        "stage2.02_stage1_handoff_and_fixed_state_contract",
+        "stage2.03_assets_checkpoints_and_sampling",
+    ),
+    "stage2.06_pilot_and_matrix_freeze": (
+        "stage2.04_reference_target",
+        "stage2.05_paired_estimator_runner",
+    ),
+    "stage2.07_main_sweep": ("stage2.06_pilot_and_matrix_freeze",),
+    "stage2.08_statistics_and_robustness": ("stage2.07_main_sweep",),
+    "stage2.09_cost_and_system_validation": ("stage2.07_main_sweep",),
+    "stage2.10_visualization_reporting_and_decision": (
+        "stage2.08_statistics_and_robustness",
+        "stage2.09_cost_and_system_validation",
+    ),
+    "stage2.11_delivery_and_exit_gate": (
+        "stage2.10_visualization_reporting_and_decision",
+    ),
+}
+# Stage 3 edges are intentionally left on their existing order; this task only
+# corrects the Stage 2 mapping required by plan/stage2/README.md.
+_REQUIRED_PREDECESSORS = {
+    **_REQUIRED_PREDECESSORS,
+    **{
+        task_id: (_STAGE23_TASK_ORDER[index - 1],)
+        for index, task_id in enumerate(_STAGE23_TASK_ORDER)
+        if task_id.startswith("stage3.")
+    },
 }
 
 
@@ -521,6 +564,10 @@ class _ProviderContext:
     # Formal contexts must carry the validated immutable S1.11 closure.  The
     # local fixture deliberately leaves this empty and can never be promoted.
     stage1_exit: Stage1ExitEvidence | None = None
+    # Formal contexts must also carry the current Stage 0 infrastructure
+    # binding.  A historical/blocked manifest is retained for diagnostics but
+    # can never unlock a formal provider.
+    stage0_handoff: Stage0HandoffEvidence | None = None
     # Test/in-memory adapters predate G3 provenance projection.  The formal
     # provider still supplies the full tuple explicitly; a missing value here
     # means "no external asset provenance", never an inferred formal claim.
@@ -537,6 +584,11 @@ class _ProviderContext:
             "execution_evidence_hash": self.evidence.artifact_hash,
             "stage1_g1_exit": (
                 self.stage1_exit.to_dict() if self.stage1_exit is not None else None
+            ),
+            "stage0_handoff": (
+                self.stage0_handoff.to_dict()
+                if self.stage0_handoff is not None
+                else None
             ),
             "asset_manifest_hashes": list(self.asset_manifest_hashes),
             "asset_provenance": [dict(item) for item in self.asset_provenance],
@@ -864,6 +916,27 @@ def _formal_execution_evidence(
             evidence_refs=(stage1_ref, reference),
         ) from error
 
+    stage0_ref = request.environment.evidence_refs.get("stage0_handoff")
+    if not isinstance(stage0_ref, str) or not stage0_ref:
+        raise _blocked(
+            BlockerCode.CONTRACT_UNFROZEN,
+            "stage0_handoff",
+            "formal Stage 2/3 必须绑定 Stage 0 handoff manifest",
+            evidence_refs=(reference, stage1_ref),
+        )
+    try:
+        # ``require_ready`` is deliberate: a complete historical role/hash
+        # index is not a current hardware or persistence authorization.
+        validate_stage0_handoff(root, stage0_ref, require_ready=True)
+    except (Stage0HandoffError, FileNotFoundError, OSError, TypeError, ValueError) as error:
+        raise _blocked(
+            BlockerCode.CONTRACT_UNFROZEN,
+            "stage0_handoff",
+            f"Stage 0 handoff 不可作为当前 formal authority：{type(error).__name__}: {error}",
+            retryable=False,
+            evidence_refs=(stage0_ref, stage1_ref, reference),
+        ) from error
+
     required_gates = set(request.task.formal_eligibility.required_gate_ids)
     evidence_gates = {gate.gate_id for gate in evidence.prerequisite_gates}
     missing = sorted(required_gates - evidence_gates)
@@ -936,6 +1009,7 @@ def _formal_provider(request: TaskExecutionRequest, root: Path) -> _ProviderCont
         raise RuntimeError("FORMAL_PROVIDER_REQUIRES_FORMAL_INTENT")
     evidence, evidence_ref = _formal_execution_evidence(request, root)
     stage1_ref = request.environment.evidence_refs["stage1_g1_exit"]
+    stage0_ref = request.environment.evidence_refs["stage0_handoff"]
     try:
         stage1_exit = validate_stage1_exit_evidence(root, stage1_ref)
     except (Stage1HandoffError, FileNotFoundError, OSError, TypeError, ValueError) as error:
@@ -948,6 +1022,16 @@ def _formal_provider(request: TaskExecutionRequest, root: Path) -> _ProviderCont
             f"Stage 1 G1-EXIT 正式 handoff 不可接受：{type(error).__name__}: {error}",
             retryable=False,
             evidence_refs=(stage1_ref, evidence_ref),
+        ) from error
+    try:
+        stage0_handoff = validate_stage0_handoff(root, stage0_ref, require_ready=True)
+    except (Stage0HandoffError, FileNotFoundError, OSError, TypeError, ValueError) as error:
+        raise _blocked(
+            BlockerCode.CONTRACT_UNFROZEN,
+            "stage0_handoff",
+            f"Stage 0 handoff 不可作为当前 formal authority：{type(error).__name__}: {error}",
+            retryable=False,
+            evidence_refs=(stage0_ref, stage1_ref, evidence_ref),
         ) from error
     providers = request.config.section("providers")
     if not isinstance(providers, dict) or providers.get("kind") != "offline_hf":
@@ -1117,6 +1201,7 @@ def _formal_provider(request: TaskExecutionRequest, root: Path) -> _ProviderCont
         asset_manifest_hashes=tuple(manifest_hashes),
         asset_provenance=tuple(item.provenance() for item in qualified_assets),
         stage1_exit=stage1_exit,
+        stage0_handoff=stage0_handoff,
     )
 
 
@@ -1275,6 +1360,14 @@ def _run_stage2_handoff_audit(
                 retryable=False,
                 evidence_refs=inputs.references,
             )
+        if context.stage0_handoff is None:
+            raise _blocked(
+                BlockerCode.CONTRACT_UNFROZEN,
+                "stage0_handoff",
+                "formal fixed-state context 缺少已验证的 Stage 0 handoff",
+                retryable=False,
+                evidence_refs=inputs.references,
+            )
         # ``_formal_provider`` 已完成 offline_hf 类型、三类资产 manifest、
         # FormalExecutionEvidence 与模型状态装载验证。这里再次核对返回上下文，既
         # 防止未来 adapter 漂移，也保证测试替身不能偷偷换成 synthetic provider。
@@ -1355,6 +1448,11 @@ def _run_stage2_handoff_audit(
         "stage1_g1_exit": (
             context.stage1_exit.to_dict() if context.stage1_exit is not None else None
         ),
+        "stage0_handoff": (
+            context.stage0_handoff.to_dict()
+            if context.stage0_handoff is not None
+            else None
+        ),
         # handoff invariant 成功不等于本阶段 Gate 已通过；任务 envelope 会保留 formal
         # 执行身份，而科学 artifact 仍等待独立审核。
         "formal_eligible": False,
@@ -1402,6 +1500,11 @@ def _run_stage2_handoff_audit(
         },
         "stage1_g1_exit": (
             context.stage1_exit.to_dict() if context.stage1_exit is not None else None
+        ),
+        "stage0_handoff": (
+            context.stage0_handoff.to_dict()
+            if context.stage0_handoff is not None
+            else None
         ),
         "status": candidate_status,
         "validation_evidence": {

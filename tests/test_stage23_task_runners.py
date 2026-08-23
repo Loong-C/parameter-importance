@@ -9,6 +9,7 @@ from param_importance_nlp.contracts import load_canonical_json
 from param_importance_nlp.contracts.config_v2 import load_resolved_config_compatible
 from param_importance_nlp.contracts.task_catalog import DEFAULT_TASK_CATALOG, RunnerKind
 from param_importance_nlp.experiments.stage23_task_runners import (
+    _REQUIRED_PREDECESSORS,
     build_stage23_runner_overrides,
     register_stage23_runners,
 )
@@ -94,21 +95,25 @@ def _run_chain(
     stop_after: str | None = None,
 ) -> tuple[TaskRuntime, dict[str, object], dict[str, object]]:
     runtime = _runtime(root)
-    previous_refs: tuple[str, ...] = ()
+    refs_by_task: dict[str, tuple[str, ...]] = {}
     configs: dict[str, object] = {}
     results: dict[str, object] = {}
     for task_id in STAGE23_TASK_IDS:
         config = _config(
             task_id,
             f"runs/{task_id.replace('.', '-')}",
-            previous_refs,
+            tuple(
+                ref
+                for predecessor in _REQUIRED_PREDECESSORS[task_id]
+                for ref in refs_by_task[predecessor]
+            ),
         )
         result = runtime.execute(config)
         assert result.status is TaskRunStatus.PASS, (task_id, result.to_dict())
         assert result.metadata["execution_contract"] == "stage23-specialized-v1"
         configs[task_id] = config
         results[task_id] = result
-        previous_refs = tuple(result.artifact_refs.values())
+        refs_by_task[task_id] = tuple(result.artifact_refs.values())
         if task_id == stop_after:
             break
     return runtime, configs, results
@@ -368,23 +373,54 @@ def test_all_stage23_task_ids_are_specialized_and_hash_bound_to_full_predecessor
 ) -> None:
     root, _runtime_value, _configs, results = completed_chain
     assert tuple(results) == STAGE23_TASK_IDS
-    for index, task_id in enumerate(STAGE23_TASK_IDS):
+    for task_id in STAGE23_TASK_IDS:
         result = results[task_id]
         assert tuple(result.artifact_refs) == DEFAULT_TASK_CATALOG.get(
             task_id
         ).artifact_kinds
         assert result.metadata == {"execution_contract": "stage23-specialized-v1"}
-        expected_sources = (
-            []
-            if index == 0
-            else list(results[STAGE23_TASK_IDS[index - 1]].artifact_refs.values())
-        )
+        expected_sources = [
+            ref
+            for predecessor in _REQUIRED_PREDECESSORS[task_id]
+            for ref in results[predecessor].artifact_refs.values()
+        ]
         for commit_ref in result.artifact_refs.values():
             commit = load_canonical_json(root / Path(commit_ref))
             assert isinstance(commit, dict)
             body = load_canonical_json(root / Path(str(commit["object_ref"])))
             assert isinstance(body, dict)
             assert body["source_refs"] == expected_sources
+
+
+def test_stage2_direct_predecessors_match_plan_dag() -> None:
+    assert _REQUIRED_PREDECESSORS["stage2.02_stage1_handoff_and_fixed_state_contract"] == (
+        "stage2.01_scope_hypotheses_and_preregistration",
+    )
+    assert _REQUIRED_PREDECESSORS["stage2.03_assets_checkpoints_and_sampling"] == (
+        "stage2.01_scope_hypotheses_and_preregistration",
+    )
+    assert set(_REQUIRED_PREDECESSORS["stage2.04_reference_target"]) == {
+        "stage2.02_stage1_handoff_and_fixed_state_contract",
+        "stage2.03_assets_checkpoints_and_sampling",
+    }
+    assert set(_REQUIRED_PREDECESSORS["stage2.05_paired_estimator_runner"]) == {
+        "stage2.02_stage1_handoff_and_fixed_state_contract",
+        "stage2.03_assets_checkpoints_and_sampling",
+    }
+    assert _REQUIRED_PREDECESSORS["stage2.06_pilot_and_matrix_freeze"] == (
+        "stage2.04_reference_target",
+        "stage2.05_paired_estimator_runner",
+    )
+    assert _REQUIRED_PREDECESSORS["stage2.08_statistics_and_robustness"] == (
+        "stage2.07_main_sweep",
+    )
+    assert _REQUIRED_PREDECESSORS["stage2.09_cost_and_system_validation"] == (
+        "stage2.07_main_sweep",
+    )
+    assert _REQUIRED_PREDECESSORS["stage2.10_visualization_reporting_and_decision"] == (
+        "stage2.08_statistics_and_robustness",
+        "stage2.09_cost_and_system_validation",
+    )
 
 
 def test_stage2_and_stage3_derived_outputs_use_frozen_sources_without_gate_pass(
