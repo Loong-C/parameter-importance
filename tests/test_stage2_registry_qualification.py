@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-import copy
 import hashlib
 from pathlib import Path
 import shutil
+import subprocess
 
 import pytest
 
@@ -17,6 +17,7 @@ from param_importance_nlp.experiments.stage2_assets import (
 from param_importance_nlp.experiments.stage2_registry_producer import construct_registry_provider
 from param_importance_nlp.experiments.stage2_registry_qualification import (
     RegistryQualificationError,
+    _resolve_source_root,
     load_asset_resolution_input,
     qualify_registry_assets,
 )
@@ -25,6 +26,42 @@ from param_importance_nlp.providers import InMemoryFrozenSampleResolver, build_t
 
 def _sha(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def test_clean_detached_source_root_uses_producer_path_contract() -> None:
+    tmp_path = Path(__file__).resolve().parent / ".tmp-s203-source-root"
+    shutil.rmtree(tmp_path, ignore_errors=True)
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    try:
+        repo = tmp_path / "parameter-importance"
+        repo.mkdir(parents=True, exist_ok=True)
+        subprocess.run(["git", "init", "--quiet", str(repo)], check=True)
+        source_file = repo / "src" / "producer.py"
+        source_file.parent.mkdir()
+        source_file.write_text("# detached fixture\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(repo), "add", "src/producer.py"], check=True)
+        subprocess.run(
+            [
+                "git", "-c", "user.name=fixture", "-c", "user.email=fixture@example.invalid",
+                "-C", str(repo), "commit", "--quiet", "-m", "fixture",
+            ],
+            check=True,
+        )
+        subprocess.run(["git", "-C", str(repo), "checkout", "--quiet", "--detach", "HEAD"], check=True)
+
+        assert _resolve_source_root(repo) == repo.resolve()
+        with pytest.raises(RegistryQualificationError, match="ROOT_INVALID|LINK_LIKE_ROOT"):
+            _resolve_source_root(tmp_path / "missing-repository")
+        linked = tmp_path / "repository-link"
+        try:
+            linked.symlink_to(repo, target_is_directory=True)
+        except OSError:
+            linked = None
+        if linked is not None:
+            with pytest.raises(RegistryQualificationError, match="ROOT_INVALID|LINK_LIKE_ROOT"):
+                _resolve_source_root(linked)
+    finally:
+        shutil.rmtree(tmp_path, ignore_errors=True)
 
 
 def test_append_only_registry_qualification_materializes_six_cells_and_rejects_hash_tamper() -> None:
