@@ -127,6 +127,10 @@ def _load_group(
     if not isinstance(source_refs, list) or any(not isinstance(ref, str) for ref in source_refs) or len(source_refs) != len(set(source_refs)):
         raise Stage1ExitGateAdapterError(f"{task_id}:CONFIG_SOURCE_CLOSURE_INVALID")
     source_tuple = tuple(_logical(ref, field=f"{task_id}.source_ref") for ref in source_refs)
+    for source_ref in source_tuple:
+        source_path = _path(root, source_ref, field=f"{task_id}.source_ref")
+        if not source_path.is_file():
+            raise Stage1ExitGateAdapterError(f"{task_id}:SOURCE_MISSING:{source_ref}")
     if config.get("artifact_kinds") != expected_kinds or config.get("commit_refs") != commit_refs:
         raise Stage1ExitGateAdapterError(f"{task_id}:CONFIG_COMMIT_WIRE_INVALID")
     if manifest.get("schema_version") != "stage1-task-artifact-group-manifest-v1" or manifest.get("status") != "PUBLISHING":
@@ -272,4 +276,3 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

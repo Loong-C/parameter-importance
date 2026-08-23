@@ -66,6 +66,9 @@ def _group(root: Path, task_id: str, output: str, kinds: tuple[str, ...]) -> dic
 
 
 def test_publish_stage1_exit_gate_validates_seven_commits_and_reuses(monkeypatch, tmp_path: Path) -> None:
+    source = tmp_path / "evidence/stage1/source.json"
+    source.parent.mkdir(parents=True)
+    write_canonical_json(source, {"schema_version": "source-v1"})
     for task_id, output, kinds in adapter.S1_GROUPS:
         _group(tmp_path, task_id, output, kinds)
     fake_exit = SimpleNamespace(
@@ -90,4 +93,3 @@ def test_publish_stage1_exit_gate_validates_seven_commits_and_reuses(monkeypatch
     assert len(gate["evidence_refs"]) == 8
     assert gate["measured"]["commit_count"] == 7
     assert calls == {"validate": 2, "r4": 2, "s110": 2}
-
