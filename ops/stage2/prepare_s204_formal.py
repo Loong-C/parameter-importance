@@ -27,9 +27,17 @@ from param_importance_nlp.runtime import load_committed_task_artifact, publish_c
 try:  # noqa: E402
     from ops.stage2.materialize_s204 import (
         EXPECTED_CELL_IDS,
+        S204_S22_CANONICAL_OUTPUT_DIR,
+        S204_S22_CONTROL_OUTPUT_DIR,
+        S204_S22_CONFIG_REF,
         TASK_INPUTS,
         _error,
         _load_formal_source,
+        _load_gpu_health_identity,
+        _mapping,
+        _stage1_10_task_refs,
+        _stage1_task_refs,
+        _validate_formal_s22_task_group,
         _safe_relative,
         _source_ref,
         build_formal_runtime_environment,
@@ -41,13 +49,23 @@ try:  # noqa: E402
         publish_six_cell_manifest,
         publish_six_cell_materialization_index,
         write_six_cell_configs,
+        produce_formal_s22_task_outputs,
+        ensure_formal_s22_task_outputs,
     )
 except ModuleNotFoundError:  # direct ``python ops/stage2/prepare...`` launch
     from materialize_s204 import (
         EXPECTED_CELL_IDS,
+        S204_S22_CANONICAL_OUTPUT_DIR,
+        S204_S22_CONTROL_OUTPUT_DIR,
+        S204_S22_CONFIG_REF,
         TASK_INPUTS,
         _error,
         _load_formal_source,
+        _load_gpu_health_identity,
+        _mapping,
+        _stage1_10_task_refs,
+        _stage1_task_refs,
+        _validate_formal_s22_task_group,
         _safe_relative,
         _source_ref,
         build_formal_runtime_environment,
@@ -59,6 +77,8 @@ except ModuleNotFoundError:  # direct ``python ops/stage2/prepare...`` launch
         publish_six_cell_manifest,
         publish_six_cell_materialization_index,
         write_six_cell_configs,
+        produce_formal_s22_task_outputs,
+        ensure_formal_s22_task_outputs,
     )
 
 
@@ -90,6 +110,7 @@ def _validate_adapter_gate(
     gate_id: str,
     gate_ref: str,
     expected_refs: tuple[str, ...],
+    forbidden_task_ids: tuple[str, ...] = (),
 ) -> str:
     task_id, _ = _ADAPTER_TASKS[gate_id]
     ref = _source_ref(gate_ref, f"{gate_id}.gate_ref")
@@ -103,6 +124,16 @@ def _validate_adapter_gate(
     if gate.gate_id != gate_id or gate.status is not GateStatus.PASS:
         raise _error("S204_FORMAL_ADAPTER_NOT_PASS", gate_id)
     observed = set(loaded.source_refs) | set(gate.evidence_refs)
+    # A gate can carry arbitrary stable evidence refs, so explicitly inspect
+    # formal task commits when rejecting a downstream edge.  Non-task reports
+    # remain valid evidence and are handled by their own validators.
+    for observed_ref in observed:
+        try:
+            upstream = load_committed_task_artifact(root, observed_ref, require_formal=True)
+        except Exception:
+            continue
+        if upstream.identity.task_id in forbidden_task_ids:
+            raise _error("S204_FORMAL_ADAPTER_DOWNSTREAM_BINDING", gate_id)
     if not set(expected_refs).issubset(observed):
         raise _error("S204_FORMAL_ADAPTER_UPSTREAM_MISMATCH", gate_id)
     return ref
@@ -128,7 +159,11 @@ def prepare_formal_s204(
     if not isinstance(predecessor_raw, Mapping):
         raise _error("S204_PREDECESSOR_REFS_REQUIRED")
     predecessor_refs: dict[str, dict[str, str]] = {}
-    for task_id, kinds in TASK_INPUTS.items():
+    s21_task = "stage2.01_scope_hypotheses_and_preregistration"
+    s22_task = "stage2.02_stage1_handoff_and_fixed_state_contract"
+    s23_task = "stage2.03_assets_checkpoints_and_sampling"
+    for task_id in (s21_task, s23_task):
+        kinds = TASK_INPUTS[task_id]
         raw = predecessor_raw.get(task_id)
         if not isinstance(raw, Mapping) or set(raw) != set(kinds):
             raise _error("S204_PREDECESSOR_ARTIFACT_SET_INVALID", task_id)
@@ -137,31 +172,82 @@ def prepare_formal_s204(
             ref = _source_ref(raw[kind], f"predecessor.{task_id}.{kind}")
             _load_formal_source(root, ref, task_id=task_id, artifact_kind=kind)
             predecessor_refs[task_id][kind] = ref
+    raw_s22 = predecessor_raw.get(s22_task)
+    if raw_s22 is not None:
+        if not isinstance(raw_s22, Mapping) or set(raw_s22) != set(TASK_INPUTS[s22_task]):
+            raise _error("S204_PREDECESSOR_ARTIFACT_SET_INVALID", s22_task)
+        predecessor_refs[s22_task] = {
+            kind: _source_ref(raw_s22[kind], f"predecessor.{s22_task}.{kind}")
+            for kind in TASK_INPUTS[s22_task]
+        }
+        for kind, ref in predecessor_refs[s22_task].items():
+            _load_formal_source(root, ref, task_id=s22_task, artifact_kind=kind)
 
     g20_ref = _validate_adapter_gate(
         root,
         gate_id="stage2.G2.0",
         gate_ref=_required_ref(sources, "g20_adapter_output"),
-        expected_refs=tuple(predecessor_refs["stage2.01_scope_hypotheses_and_preregistration"].values()),
+        expected_refs=tuple(predecessor_refs[s21_task].values()),
     )
+    stage1_10_refs = dict(_stage1_10_task_refs(sources))
+    stage1_11_refs = dict(_stage1_task_refs(sources))
     g21_ref = _validate_adapter_gate(
         root,
         gate_id="stage2.G2.1",
         gate_ref=_required_ref(sources, "g21_adapter_output"),
-        expected_refs=tuple(predecessor_refs["stage2.02_stage1_handoff_and_fixed_state_contract"].values()),
+        expected_refs=tuple((*predecessor_refs[s21_task].values(), *stage1_10_refs.values(), *stage1_11_refs.values())),
+        forbidden_task_ids=(s22_task,),
     )
     asset_ref = _source_ref(_required_ref(sources, "stage2_asset_resolution"), "stage2_asset_resolution")
-    if asset_ref != predecessor_refs["stage2.03_assets_checkpoints_and_sampling"]["asset_resolution"]:
+    if asset_ref != predecessor_refs[s23_task]["asset_resolution"]:
         raise _error("S204_ASSET_REF_PREDECESSOR_MISMATCH")
-    if _source_ref(_required_ref(sources, "g21_handoff"), "g21_handoff") != predecessor_refs[
-        "stage2.02_stage1_handoff_and_fixed_state_contract"
-    ]["handoff_manifest"]:
-        raise _error("S204_G21_HANDOFF_REF_PREDECESSOR_MISMATCH")
     g22_ref = _validate_adapter_gate(
         root,
         gate_id="stage2.G2.2",
         gate_ref=_required_ref(sources, "g22_adapter_output"),
         expected_refs=(asset_ref, *tuple(load_committed_task_artifact(root, asset_ref, require_formal=True).source_refs)),
+    )
+
+    # The external G2.1 handoff report is a hardware authority; it is not the
+    # S2.2 TaskArtifact handoff_manifest.  Keep the two refs independent.
+    g21_handoff_ref = _required_ref(sources, "g21_handoff")
+    _load_gpu_health_identity(
+        root,
+        _source_ref(g21_handoff_ref, "g21_handoff"),
+        expected_stage1_ref=_required_ref(sources, "stage1_g1_exit"),
+    )
+    supplied_predecessor_dir = PurePosixPath(
+        str(sources.get("formal_predecessor_output_dir", S204_S22_CONTROL_OUTPUT_DIR))
+    ).as_posix()
+    if supplied_predecessor_dir != S204_S22_CONTROL_OUTPUT_DIR:
+        raise _error("S204_S22_OUTPUT_DIR_NOT_CANONICAL")
+    formal_predecessor_dir = S204_S22_CONTROL_OUTPUT_DIR
+    formal_evidence_ref = formal_execution_ref
+    _, evidence, formal_evidence_ref, _s22_config_ref, _s22_environment_ref = ensure_formal_s22_task_outputs(
+        root,
+        predecessor_refs=predecessor_refs,
+        output_dir=formal_predecessor_dir,
+        producer_kwargs={
+            "source": sources,
+            "s21_refs": predecessor_refs[s21_task],
+            "g20_ref": g20_ref,
+            "g20_gate": GateRecord.from_mapping(dict(load_committed_task_artifact(root, g20_ref, require_formal=True).payload)),
+            "g21_ref": g21_ref,
+            "g21_gate": GateRecord.from_mapping(dict(load_committed_task_artifact(root, g21_ref, require_formal=True).payload)),
+            "g21_resolved_config_ref": _required_ref(sources, "g21_resolved_config"),
+            "formal_execution_ref": formal_execution_ref,
+            "base_config_ref": str(sources.get("base_config_ref", "configs/run-ready/layers/formal-stage2-estimator.yaml")),
+            "stage0_ref": _required_ref(sources, "stage0_handoff"),
+            "stage1_ref": _required_ref(sources, "stage1_g1_exit"),
+            "contract_refs": {
+                0: _required_ref(sources, "contract_stage_0"),
+                1: _required_ref(sources, "contract_stage_1"),
+                2: _required_ref(sources, "contract_stage_2"),
+            },
+            "stage1_10_refs": stage1_10_refs,
+            "stage1_11_refs": stage1_11_refs,
+            "g1_ref": _required_ref(_mapping(sources.get("gate_refs"), "gate_refs"), "stage1.G1-EXIT"),
+        },
     )
 
     s21_refs = predecessor_refs["stage2.01_scope_hypotheses_and_preregistration"]
@@ -207,7 +293,7 @@ def prepare_formal_s204(
         raise _error("S204_CAPABILITY_REFS_REQUIRED")
     base_env, base_env_ref = build_formal_runtime_environment(
         root,
-        formal_execution_ref=formal_execution_ref,
+        formal_execution_ref=formal_evidence_ref,
         stage0_handoff_ref=_required_ref(sources, "stage0_handoff"),
         stage1_g1_exit_ref=_required_ref(sources, "stage1_g1_exit"),
         contract_freeze_ref=_required_ref(sources, "contract_freeze"),
@@ -217,7 +303,7 @@ def prepare_formal_s204(
         g3_resolution_ref=g3_ref,
         stage2_asset_resolution_ref=asset_ref,
         g21_handoff_ref=_required_ref(sources, "g21_handoff"),
-        gate_refs={"stage2.G2.2": g22_ref},
+        gate_refs={"stage2.G2.0": g20_ref, "stage2.G2.1": g21_ref, "stage2.G2.2": g22_ref},
         capability_refs={str(key): str(value) for key, value in capability_refs.items()},
         reference_sizing_plan_ref=sizing_refs[EXPECTED_CELL_IDS[0]],
         g22_asset_evidence_ref=sources.get("g22_asset_evidence"),
@@ -254,9 +340,10 @@ def prepare_formal_s204(
         "status": "READY_FOR_FORMAL_EXECUTION",
         "formal_eligible": True,
         "phase": "pre_sizing",
-        "formal_execution_ref": formal_execution_ref,
+        "formal_execution_ref": formal_evidence_ref,
         "adapter_gate_refs": {"stage2.G2.0": g20_ref, "stage2.G2.1": g21_ref, "stage2.G2.2": g22_ref},
         "predecessor_refs": predecessor_refs,
+        "s22_producer_output_dir": formal_predecessor_dir,
         "config_refs": config_refs,
         "environment_refs": environment_refs,
         "sizing_refs": sizing_refs,
@@ -276,7 +363,7 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Prepare formal S2.4 six-cell control-plane artifacts")
     parser.add_argument("--data-root", type=Path, required=True)
     parser.add_argument("--sources", type=Path, required=True, help="JSON source-ref manifest under DATA_ROOT")
-    parser.add_argument("--output-dir", default="evidence/stage2/s204/prepared-r7")
+    parser.add_argument("--output-dir", default="evidence/stage2/s204/prepared-r8")
     return parser
 
 

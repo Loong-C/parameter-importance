@@ -907,6 +907,21 @@ class TaskRuntime:
                 and identity.artifact_kind in contract.artifact_kinds
                 for contract in contracts
             )
+            # The reviewed formal S2.2 config intentionally carries the full
+            # Stage 1 handoff (S1.10/S1.11) in addition to catalog predecessor
+            # S2.1.  These are bound audit inputs, not a replacement for the
+            # required S2.1 set; accept only these two task identities and only
+            # for this one formal task.
+            if (
+                not matched
+                and config.task_id == "stage2.02_stage1_handoff_and_fixed_state_contract"
+                and config.run_intent == "formal"
+                and identity.task_id in {
+                    "stage1.10_checkpoint_resume_and_artifacts",
+                    "stage1.11_reporting_and_exit_gate",
+                }
+            ):
+                matched = True
             if not matched:
                 blockers.append(
                     TaskBlocker(

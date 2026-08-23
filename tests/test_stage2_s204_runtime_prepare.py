@@ -6,13 +6,26 @@ import pytest
 
 from ops.stage2.materialize_s204 import (
     EXPECTED_CELL_IDS,
+    S204_S22_CANONICAL_OUTPUT_DIR,
+    S204_S22_COMMIT_OUTPUT_DIR,
+    S204_S22_CONFIG_REF,
+    S204_S22_CONTROL_OUTPUT_DIR,
     S204MaterializationError,
+    _formal_dag_config,
+    _publish_resolved_config,
+    _validate_formal_s22_task_group,
     _validate_delta_sci_artifact,
+    ensure_formal_s22_task_outputs,
     publish_per_cell_delta_sci_plans,
 )
 from ops.stage2.prepare_s204_formal import _validate_adapter_gate
-from param_importance_nlp.contracts import load_canonical_json
-from param_importance_nlp.runtime import TaskArtifactStore
+from param_importance_nlp.contracts import load_canonical_json, write_canonical_json
+from param_importance_nlp.contracts.status import GateRecord, GateStatus
+from param_importance_nlp.runtime import (
+    TaskArtifactStore,
+    TaskRuntimeEnvironment,
+    load_committed_task_artifact,
+)
 
 
 def _s21_formula_refs(root: Path) -> dict[str, str]:
@@ -72,4 +85,189 @@ def test_missing_formal_g22_commit_blocks_prepare(tmp_path: Path) -> None:
             gate_id="stage2.G2.2",
             gate_ref="evidence/stage2/s204/formal-adapters/g2-2-r7/commits/gate_record.json",
             expected_refs=("evidence/stage2/s204/asset-resolution.json",),
+        )
+
+
+def _valid_s22_group(root: Path) -> tuple[dict[str, str], dict[str, object], str, str, tuple[str, ...]]:
+    """Build only control-plane S2.2 commits for postcondition tests."""
+
+    config = _formal_dag_config(
+        root,
+        base_config_ref="configs/run-ready/layers/formal-stage2-estimator.yaml",
+        task_id="stage2.02_stage1_handoff_and_fixed_state_contract",
+        input_refs=(),
+        output_dir=S204_S22_COMMIT_OUTPUT_DIR,
+    )
+    config_ref = S204_S22_CONFIG_REF
+    _publish_resolved_config(root, config, output_ref=config_ref)
+    adapter_gate_refs: dict[str, str] = {}
+    for gate_id, adapter_name in (("stage2.G2.0", "g2-0"), ("stage2.G2.1", "g2-1")):
+        gate = GateRecord(
+            gate_id=gate_id,
+            stage=2,
+            status=GateStatus.PASS,
+            checked_at="2026-08-24T00:00:00+00:00",
+            evidence_refs=("evidence/stage2/s201/commits/gate_record.json",),
+        )
+        adapter_gate_refs[gate_id] = TaskArtifactStore(
+            root, f"evidence/stage2/formal-adapters/{adapter_name}"
+        ).publish(
+            task_id="stage2.02_stage1_handoff_and_fixed_state_contract",
+            artifact_kind="gate_record",
+            config_hash=config.config_hash,
+            run_intent="formal",
+            payload=gate.to_dict(),
+            formal_eligible=True,
+            source_refs=("evidence/stage2/s201/commits/gate_record.json",),
+        ).commit_ref
+    evidence_refs = {
+        "formal_execution": f"{S204_S22_CONTROL_OUTPUT_DIR}/formal-execution-g21.json",
+        "stage0_handoff": "evidence/stage0/handoff.json",
+        "stage1_g1_exit": "evidence/stage1/index.json",
+        "gate_stage2_g2_0": adapter_gate_refs["stage2.G2.0"],
+        "gate_stage2_g2_1": adapter_gate_refs["stage2.G2.1"],
+    }
+    environment = TaskRuntimeEnvironment(
+        capabilities=frozenset(),
+        frozen_contract_stages=frozenset({0, 1, 2}),
+        passed_gate_ids=frozenset({"stage1.G1-EXIT", "stage2.G2.0", "stage2.G2.1"}),
+        evidence_refs=evidence_refs,
+    )
+    environment_ref = f"{S204_S22_CONTROL_OUTPUT_DIR}/environments/stage2-02.json"
+    write_canonical_json(root / environment_ref, environment.to_dict())
+    lineage = tuple(dict.fromkeys((
+        "evidence/stage2/s201/commits/preregistration.json",
+        "evidence/stage2/s201/commits/hypothesis_contract.json",
+        "evidence/stage2/s201/commits/gate_record.json",
+        adapter_gate_refs["stage2.G2.0"],
+        adapter_gate_refs["stage2.G2.1"],
+        *evidence_refs.values(),
+    )))
+    store = TaskArtifactStore(root, S204_S22_COMMIT_OUTPUT_DIR)
+    payloads = {
+        "handoff_manifest": {
+            "schema_version": "stage2-task-handoff-manifest-v1",
+            "scope": "formal",
+            "status": "FORMAL_CANDIDATE",
+            "formal_eligible": False,
+        },
+        "fixed_state_contract": {
+            "schema_version": "stage2-task-fixed-state-contract-v1",
+            "scope": "formal",
+            "status": "FORMAL_CANDIDATE",
+            "formal_eligible": False,
+        },
+        "gate_record": {
+            "schema_version": "stage23-task-gate-candidate-v1",
+            "formal_eligible": False,
+        },
+    }
+    refs: dict[str, str] = {}
+    for kind, payload in payloads.items():
+        refs[kind] = store.publish(
+            task_id="stage2.02_stage1_handoff_and_fixed_state_contract",
+            artifact_kind=kind,
+            config_hash=config.config_hash,
+            run_intent="formal",
+            payload=payload,
+            formal_eligible=True,
+            source_refs=lineage,
+        ).commit_ref
+    return refs, evidence_refs, config_ref, environment_ref, lineage
+
+
+def test_s22_absent_produces_and_complete_rerun_is_idempotent(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import ops.stage2.materialize_s204 as materializer
+
+    calls: list[str] = []
+    refs, evidence_refs, config_ref, environment_ref, lineage = _valid_s22_group(tmp_path)
+
+    def fake_producer(root: Path, **kwargs: object):
+        calls.append(str(kwargs["output_dir"]))
+        evidence = materializer.FormalExecutionEvidence(
+            run_intent="formal",
+            contract_freeze_hash="a" * 64,
+            asset_manifest_hashes=("b" * 64,),
+            prerequisite_gates=(GateRecord(
+                gate_id="stage2.G2.1",
+                stage=2,
+                status=GateStatus.PASS,
+                checked_at="2026-08-24T00:00:00+00:00",
+                evidence_refs=("evidence/stage2/g2-1.json",),
+            ),),
+        )
+        evidence_ref = f"{S204_S22_CONTROL_OUTPUT_DIR}/formal-execution-g21.json"
+        write_canonical_json(root / evidence_ref, evidence.to_dict())
+        return refs, evidence, evidence_ref, config_ref, environment_ref
+
+    monkeypatch.setattr(materializer, "produce_formal_s22_task_outputs", fake_producer)
+    predecessor: dict[str, dict[str, str]] = {}
+    producer_kwargs = {"s21_refs": {kind: ref for kind, ref in zip(("preregistration", "hypothesis_contract", "gate_record"), lineage[:3])}, "g20_ref": lineage[3], "g21_ref": lineage[4]}
+    producer_kwargs["g21_resolved_config_ref"] = S204_S22_CONFIG_REF
+    first = ensure_formal_s22_task_outputs(tmp_path, predecessor_refs=predecessor, output_dir=S204_S22_CONTROL_OUTPUT_DIR, producer_kwargs=producer_kwargs)
+    assert first[0] == refs and calls == [S204_S22_CONTROL_OUTPUT_DIR]
+    second = ensure_formal_s22_task_outputs(tmp_path, predecessor_refs=predecessor, output_dir=S204_S22_CONTROL_OUTPUT_DIR, producer_kwargs=producer_kwargs)
+    assert second[0] == refs and calls == [S204_S22_CONTROL_OUTPUT_DIR]
+
+
+def test_s22_alternate_namespace_and_tampered_environment_or_lineage_fail_closed(tmp_path: Path) -> None:
+    refs, evidence_refs, config_ref, environment_ref, lineage = _valid_s22_group(tmp_path)
+    forbidden_markers = ("g2.2", "stage2.03", "stage2-03", "s2.3", "capability", "model_assets", "data_assets", "g3")
+    for ref in refs.values():
+        loaded = load_committed_task_artifact(tmp_path, ref, require_formal=True)
+        assert not any(
+            any(marker in source.casefold() for marker in forbidden_markers)
+            for source in loaded.source_refs
+        )
+    with pytest.raises(S204MaterializationError, match="S204_S22_FORMAL_COMMIT_NAMESPACE_INVALID"):
+        _validate_formal_s22_task_group(
+            tmp_path,
+            {**refs, "handoff_manifest": "alternate/commits/handoff_manifest.json"},
+            config_ref=config_ref,
+            environment_ref=environment_ref,
+            required_lineage=lineage[:5],
+        )
+    tampered = load_canonical_json(tmp_path / environment_ref)
+    assert isinstance(tampered, dict)
+    tampered["passed_gate_ids"] = ["stage2.G2.0"]
+    write_canonical_json(tmp_path / environment_ref, tampered)
+    with pytest.raises(S204MaterializationError, match="S204_S22_ENVIRONMENT_INVALID"):
+        _validate_formal_s22_task_group(
+            tmp_path, refs, config_ref=config_ref, environment_ref=environment_ref, required_lineage=lineage[:5]
+        )
+    # The narrow S2.2 environment must not smuggle downstream assets or the
+    # independent Stage 0 G3 resolution into this audit's lineage.
+    forbidden_refs = {
+        **evidence_refs,
+        "g3_resolution": "evidence/stage0/g3.json",
+    }
+    forbidden_environment = TaskRuntimeEnvironment(
+        frozen_contract_stages=frozenset({0, 1, 2}),
+        passed_gate_ids=frozenset({"stage1.G1-EXIT", "stage2.G2.0", "stage2.G2.1"}),
+        evidence_refs=forbidden_refs,
+    )
+    write_canonical_json(tmp_path / environment_ref, forbidden_environment.to_dict())
+    with pytest.raises(S204MaterializationError, match="S204_S22_ENVIRONMENT_DOWNSTREAM_LINEAGE_FORBIDDEN"):
+        _validate_formal_s22_task_group(
+            tmp_path, refs, config_ref=config_ref, environment_ref=environment_ref, required_lineage=lineage[:5]
+        )
+    # Restore the immutable environment and prove that missing G2.1 lineage
+    # is rejected even when all three filenames are present.
+    environment = TaskRuntimeEnvironment(
+        frozen_contract_stages=frozenset({0, 1, 2}),
+        passed_gate_ids=frozenset({"stage1.G1-EXIT", "stage2.G2.0", "stage2.G2.1"}),
+        evidence_refs=evidence_refs,
+    )
+    write_canonical_json(tmp_path / environment_ref, environment.to_dict())
+    with pytest.raises(S204MaterializationError, match="S204_S22_LINEAGE_BINDING_MISMATCH"):
+        _validate_formal_s22_task_group(
+            tmp_path, refs, config_ref=config_ref, environment_ref=environment_ref, required_lineage=(*lineage[:4], "tampered/g21.json")
+        )
+    config = load_canonical_json(tmp_path / config_ref)
+    assert isinstance(config, dict)
+    config["task_id"] = "stage2.03_assets_checkpoints_and_sampling"
+    write_canonical_json(tmp_path / config_ref, config)
+    with pytest.raises(S204MaterializationError, match="S204_S22_RESOLVED_CONFIG_INVALID"):
+        _validate_formal_s22_task_group(
+            tmp_path, refs, config_ref=config_ref, environment_ref=environment_ref, required_lineage=lineage[:5]
         )
