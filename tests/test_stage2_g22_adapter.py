@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 from pathlib import Path
 import subprocess
 from types import SimpleNamespace
@@ -8,7 +9,7 @@ from types import SimpleNamespace
 import pytest
 
 from param_importance_nlp.contracts.status import GateStatus
-from param_importance_nlp.contracts.jsonio import canonical_json_hash
+from param_importance_nlp.contracts.jsonio import canonical_json_bytes, canonical_json_hash
 from param_importance_nlp.experiments.sampling import RepetitionMapping, SamplingPlan, SamplingUniverse, STREAM_NAMES, _sha256_json
 from param_importance_nlp.experiments.stage2_g22_adapter import (
     ARTIFACT_KINDS,
@@ -20,6 +21,7 @@ from param_importance_nlp.experiments.stage2_g22_adapter import (
     PRODUCER_COMMIT,
     _producer_identity,
     _validate_checkpoint_manifest_files,
+    _validate_real_assets,
     _validate_sampling_replay,
     _validate_task_inputs,
     evaluate_formal_g22,
@@ -210,6 +212,200 @@ def test_model_manifest_rejects_nonhex_lfs_declaration() -> None:
     }]
     with pytest.raises(G22Blocked, match="G22_CHECKPOINT_FILE_MISMATCH"):
         _validate_checkpoint_manifest_files(files, expected)
+
+
+def _real_asset_validation_fixture(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> tuple[Path, dict[str, object]]:
+    """Build one real model directory to exercise the post-manifest checks."""
+    model_root = tmp_path / "models" / "checkpoint"
+    model_root.mkdir(parents=True)
+    file_specs = (
+        ("config.json", b"{}", "config", None),
+        ("model.safetensors", b"weights", "weights", "f" * 64),
+        ("tokenizer.json", b"tokenizer", "tokenizer", None),
+    )
+    checkpoint_files = tuple(
+        CheckpointFile(
+            name,
+            len(content),
+            hashlib.sha256(content).hexdigest(),
+            role,
+        )
+        for name, content, role, _official_lfs in file_specs
+    )
+    manifest_files = []
+    for (name, content, _role, official_lfs), checkpoint_file in zip(
+        file_specs, checkpoint_files
+    ):
+        (model_root / name).write_bytes(content)
+        manifest_files.append(
+            {
+                "name": name,
+                "official_lfs_sha256": official_lfs,
+                "sha256": checkpoint_file.sha256,
+                "size_bytes": checkpoint_file.size_bytes,
+            }
+        )
+
+    manifest = {
+        "schema": "parameter-importance-model-manifest-v1",
+        "requested_revision": "step0",
+        "repo": "fixture/model",
+        "revision": "fixture-revision",
+        "files": manifest_files,
+        "repair_scope": "test",
+    }
+    manifest_path = tmp_path / "manifests" / "model.json"
+    manifest_path.parent.mkdir()
+    manifest_bytes = canonical_json_bytes(manifest)
+    manifest_path.write_bytes(manifest_bytes)
+    manifest_sha256 = hashlib.sha256(manifest_bytes).hexdigest()
+
+    prefix_path = tmp_path / "data-prefix.json"
+    prefix_bytes = b"data-prefix"
+    prefix_path.write_bytes(prefix_bytes)
+    prefix_sha256 = hashlib.sha256(prefix_bytes).hexdigest()
+    data_range = SimpleNamespace(
+        digest=adapter.DATA_DIGEST,
+        files=(),
+        manifest_ref="data-prefix.json",
+        manifest_sha256=prefix_sha256,
+    )
+    checkpoint = SimpleNamespace(
+        files=checkpoint_files,
+        manifest_ref="manifests/model.json",
+        manifest_sha256=manifest_sha256,
+        repository="fixture/model",
+        revision="fixture-revision",
+        root_ref="models/checkpoint",
+        state="ready",
+        training_stage="initialization",
+    )
+
+    class _FakeManifest:
+        def __init__(self, digest: str) -> None:
+            self.checkpoints = (checkpoint,)
+            self.data_range = data_range
+            self.digest = digest
+            self.producer_commit = adapter.PRODUCER_COMMIT
+            self.execution_commit = adapter.PRODUCER_COMMIT
+            self.consumer_commit = None
+
+        def to_dict(self) -> dict[str, object]:
+            return {"asset_resolution_hash": self.digest}
+
+    asset = _FakeManifest(adapter.ASSET_DIGEST)
+    materialized = _FakeManifest(adapter.AMENDMENT_ASSET_DIGEST)
+    materialized_payload = materialized.to_dict()
+
+    authority = {
+        "active_partial_objects_untouched": True,
+        "asset_resolution_hash": adapter.ASSET_DIGEST,
+        "asset_resolution_ref": adapter.ASSET_REF,
+        "checkpoint_count": 6,
+        "combination_smoke": {
+            "all_registry_hashes_present": True,
+            "cell_count": 6,
+            "registry_hash_count": 2,
+            "status": "PASS",
+        },
+        "consumer_commit": None,
+        "cuda_device_excluded": True,
+        "data_range_hash": adapter.DATA_DIGEST,
+        "data_range_ref": adapter.DATA_REF,
+        "execution_commit": adapter.PRODUCER_COMMIT,
+        "failed_attempts": [
+            {"ref": ref, "sha256": sha} for ref, sha in adapter.FAILED_ATTEMPTS
+        ],
+        "gate_id": adapter.GATE_ID,
+        "offline_load_count": 6,
+        "producer_commit": adapter.PRODUCER_COMMIT,
+        "schema_version": "stage2-g2.2-asset-gate-evidence-v1",
+        "status": "PASS",
+    }
+    selection = {
+        "schema_version": "stage2-checkpoint-selection-v1",
+        "total_training_steps": adapter.FORMAL_TOTAL_TRAINING_STEPS,
+        "selection_rule": "nearest checkpoint to target fraction; ties choose earlier step",
+        "rows": [
+            {
+                "model_id": model,
+                "training_stage": stage,
+                "training_step": step,
+                "revision": revision,
+            }
+            for (model, stage), (step, revision) in adapter.FORMAL_CHECKPOINT_SELECTION.items()
+        ],
+    }
+
+    def fake_load_hashed(_root: Path, ref: str, _expected: str) -> dict[str, object]:
+        if ref == adapter.AUTHORITY_EVIDENCE_REF:
+            return authority
+        if ref == adapter.SELECTION_REF:
+            return selection
+        return {}
+
+    monkeypatch.setattr(adapter, "_load_hashed", fake_load_hashed)
+    monkeypatch.setattr(
+        adapter.AssetResolutionManifest,
+        "from_mapping",
+        staticmethod(lambda _value: asset),
+    )
+    monkeypatch.setattr(
+        adapter.DataRangeManifest,
+        "from_mapping",
+        staticmethod(lambda _value: data_range),
+    )
+    monkeypatch.setattr(adapter, "validate_formal_asset_identity", lambda _asset: None)
+    monkeypatch.setattr(
+        adapter,
+        "_validate_amendment",
+        lambda _root, _asset: (
+            materialized,
+            {},
+            {"qualification_index": {"ref": "qualification-index.json"}, "qualification_refs": []},
+        ),
+    )
+    monkeypatch.setattr(adapter, "_validate_formal_registry_index", lambda *_args: [])
+    monkeypatch.setattr(adapter, "_validate_offline", lambda *_args: [])
+    return tmp_path, {"stage2_asset_manifest": materialized_payload}
+
+
+def test_real_asset_directory_accepts_small_null_lfs_and_weight_lfs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root, asset_payload = _real_asset_validation_fixture(tmp_path, monkeypatch)
+
+    result = _validate_real_assets(root, asset_payload=asset_payload)
+
+    assert result["model_manifests"] == [
+        {
+            "ref": "manifests/model.json",
+            "sha256": result["model_manifests"][0]["sha256"],
+            "size_bytes": result["model_manifests"][0]["size_bytes"],
+        }
+    ]
+
+
+def test_real_asset_directory_rejects_checkpoint_bytes_mismatch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root, asset_payload = _real_asset_validation_fixture(tmp_path, monkeypatch)
+    (root / "models" / "checkpoint" / "model.safetensors").write_bytes(b"tampered")
+
+    with pytest.raises(G22Blocked, match="G22_CHECKPOINT_FILE_BYTES_MISMATCH"):
+        _validate_real_assets(root, asset_payload=asset_payload)
+
+
+def test_real_asset_directory_rejects_checkpoint_file_set_mismatch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root, asset_payload = _real_asset_validation_fixture(tmp_path, monkeypatch)
+    (root / "models" / "checkpoint" / "unexpected.bin").write_bytes(b"extra")
+
+    with pytest.raises(G22Blocked, match="G22_MODEL_DIRECTORY_FILE_SET_MISMATCH"):
+        _validate_real_assets(root, asset_payload=asset_payload)
 
 
 def test_current_task_producer_uses_clean_head_not_parent_authority_commit() -> None:
