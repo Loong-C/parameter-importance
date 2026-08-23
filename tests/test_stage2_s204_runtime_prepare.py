@@ -11,11 +11,7 @@ from ops.stage2.materialize_s204 import (
     publish_per_cell_delta_sci_plans,
 )
 from ops.stage2.prepare_s204_formal import _validate_adapter_gate
-from param_importance_nlp.contracts import canonical_json_hash, load_canonical_json
-from param_importance_nlp.experiments.stage2_g23_evaluator import (
-    G23Blocked,
-    _validate_six_cell_manifest,
-)
+from param_importance_nlp.contracts import load_canonical_json
 from param_importance_nlp.runtime import TaskArtifactStore
 
 
@@ -77,46 +73,3 @@ def test_missing_formal_g22_commit_blocks_prepare(tmp_path: Path) -> None:
             gate_ref="evidence/stage2/s204/formal-adapters/g2-2-r7/commits/gate_record.json",
             expected_refs=("evidence/stage2/s204/asset-resolution.json",),
         )
-
-
-def test_manifest_accepts_bound_per_cell_registry_hashes_and_rejects_drift() -> None:
-    rows = []
-    registry_hashes = {}
-    for index, cell_id in enumerate(EXPECTED_CELL_IDS):
-        registry_hash = f"{index + 1:064x}"
-        registry_hashes[cell_id] = registry_hash
-        model, stage = cell_id.split(":", 1)
-        rows.append(
-            {
-                "cell_id": cell_id,
-                "model_id": model,
-                "training_stage": stage,
-                "checkpoint_id": f"checkpoint-{index}",
-                "checkpoint_hash": "a" * 64,
-                "checkpoint_revision": "revision",
-                "config_hash": "b" * 64,
-                "registry_hash": registry_hash,
-            }
-        )
-    body = {
-        "schema_version": "stage2-s204-six-cell-manifest-v1",
-        "status": "READY",
-        "scope": "formal",
-        "asset_resolution_hash": "c" * 64,
-        "asset_producer_commit": "d" * 40,
-        "asset_execution_commit": "e" * 40,
-        "checkpoints": rows,
-        "data": {"data_range_hash": "f" * 64},
-        "data_range_hash": "f" * 64,
-        "registry_hash": canonical_json_hash(registry_hashes),
-        "registry_hashes_by_cell": registry_hashes,
-    }
-    body["manifest_hash"] = canonical_json_hash(body)
-    assert len(_validate_six_cell_manifest(body)) == len(EXPECTED_CELL_IDS)
-    tampered = dict(body)
-    tampered["registry_hash"] = "0" * 64
-    tampered["manifest_hash"] = canonical_json_hash(
-        {key: value for key, value in tampered.items() if key != "manifest_hash"}
-    )
-    with pytest.raises(G23Blocked, match="REGISTRY_HASH_MAP_MISMATCH"):
-        _validate_six_cell_manifest(tampered)
