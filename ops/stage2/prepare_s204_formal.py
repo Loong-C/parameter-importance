@@ -239,6 +239,7 @@ def prepare_formal_s204(
             "base_config_ref": str(sources.get("base_config_ref", "configs/run-ready/layers/formal-stage2-estimator.yaml")),
             "stage0_ref": _required_ref(sources, "stage0_handoff"),
             "stage1_ref": _required_ref(sources, "stage1_g1_exit"),
+            "g3_ref": _required_ref(sources, "g3_resolution"),
             "contract_refs": {
                 0: _required_ref(sources, "contract_stage_0"),
                 1: _required_ref(sources, "contract_stage_1"),

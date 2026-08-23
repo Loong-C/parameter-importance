@@ -1344,6 +1344,24 @@ def _build_phase_environment(
     return reread
 
 
+def _validate_s22_g3_resolution(root: Path, g3_ref: str) -> LoadedTaskArtifact:
+    """Validate the one Stage 0 G3 resolution consumed by formal S2.2."""
+
+    normalized = _source_ref(g3_ref, "g3_resolution")
+    try:
+        loaded = load_committed_task_artifact(root, normalized, require_formal=True)
+        if (
+            loaded.identity.task_id != "stage0.04_assets_and_manifests"
+            or loaded.identity.artifact_kind != "asset_resolution"
+            or loaded.identity.formal_eligible is not True
+        ):
+            raise ValueError("S22_G3_RESOLUTION_IDENTITY_INVALID")
+        FormalG3RuntimeAssets.load(root, normalized)
+    except Exception as error:
+        raise _error("S22_G3_RESOLUTION_INVALID", normalized) from error
+    return loaded
+
+
 def _build_s22_formal_environment(
     root: Path,
     *,
@@ -1351,12 +1369,18 @@ def _build_s22_formal_environment(
     stage0_ref: str,
     stage1_ref: str,
     contract_stage_refs: Mapping[int, str],
+    g3_ref: str,
     gate_refs: Mapping[str, str],
     g1_ref: str,
     g21_handoff_ref: str,
     output_ref: str,
 ) -> TaskRuntimeEnvironment:
-    """Narrow S2.2 audit environment; no S2.3/G2.2 asset inputs."""
+    """Narrow S2.2 audit environment with the independent Stage 0 G3 input.
+
+    G3 is the real upstream provider asset authority for the S2.2 fixed-state
+    audit.  It is intentionally kept separate from S2.3/G2.2 assets and
+    runtime capability evidence.
+    """
 
     evidence = FormalExecutionEvidence.from_mapping(
         _load_mapping(root, _source_ref(formal_execution_ref, "formal_execution"), "formal_execution")
@@ -1374,6 +1398,7 @@ def _build_s22_formal_environment(
         )
     if freezes[2].artifact_hash != evidence.contract_freeze_hash:
         raise _error("CONTRACT_FREEZE_IDENTITY_MISMATCH", contracts[2])
+    _validate_s22_g3_resolution(root, g3_ref)
     external_g21 = _source_ref(g21_handoff_ref, "g21_handoff")
     gpu_ref, allowed_devices = _load_gpu_health_identity(root, external_g21, expected_stage1_ref=stage1)
     binding_ref = PurePosixPath(output_ref).with_name("gpu-health-binding.json").as_posix()
@@ -1400,6 +1425,7 @@ def _build_s22_formal_environment(
         "contract_freeze": _publish_contract_document(
             root, freezes[2], output_ref=PurePosixPath(output_ref).with_name("contract-freeze-stage2.json").as_posix()
         ),
+        "g3_resolution": _source_ref(g3_ref, "g3_resolution"),
         "gpu_health": gpu_ref,
         "gpu_health_binding": binding_ref,
     }
@@ -1573,6 +1599,16 @@ def _validate_formal_s22_task_group(
     required_gates = {"stage1.G1-EXIT", "stage2.G2.0", "stage2.G2.1"}
     if set(environment.passed_gate_ids) != required_gates:
         raise _error("S22_ENVIRONMENT_GATE_SET_INVALID")
+    if set(environment.capabilities):
+        raise _error("S22_ENVIRONMENT_CAPABILITIES_FORBIDDEN")
+    g3_entries = [
+        (key, str(ref))
+        for key, ref in environment.evidence_refs.items()
+        if key == "g3_resolution"
+    ]
+    if len(g3_entries) != 1:
+        raise _error("S22_G3_RESOLUTION_REQUIRED")
+    _validate_s22_g3_resolution(root, g3_entries[0][1])
     forbidden_tokens = (
         "g2.2",
         "stage2.03",
@@ -1582,10 +1618,13 @@ def _validate_formal_s22_task_group(
         "model_assets",
         "data_assets",
         "stage0.04",
-        "g3",
     )
     if any(
-        any(token in f"{key}={ref}".casefold() for token in forbidden_tokens)
+        key != "g3_resolution"
+        and (
+            "g3" in str(ref).casefold()
+            or any(token in f"{key}={ref}".casefold() for token in forbidden_tokens)
+        )
         for key, ref in environment.evidence_refs.items()
     ):
         raise _error("S22_ENVIRONMENT_DOWNSTREAM_LINEAGE_FORBIDDEN")
@@ -1646,6 +1685,7 @@ def produce_formal_s22_task_outputs(
     stage0_ref: str,
     stage1_ref: str,
     contract_refs: Mapping[int, str],
+    g3_ref: str,
     stage1_10_refs: Mapping[str, str],
     stage1_11_refs: Mapping[str, str],
     g1_ref: str,
@@ -1724,6 +1764,7 @@ def produce_formal_s22_task_outputs(
         stage0_ref=stage0_ref,
         stage1_ref=stage1_ref,
         contract_stage_refs=contract_refs,
+        g3_ref=g3_ref,
         gate_refs={"stage2.G2.0": g20_ref, "stage2.G2.1": g21_ref},
         g1_ref=g1_ref,
         g21_handoff_ref=external_g21,
@@ -2424,6 +2465,7 @@ def execute_formal_predecessor_dag(
         stage0_ref=stage0_ref,
         stage1_ref=stage1_ref,
         contract_refs=contract_refs,
+        g3_ref=_source_ref(source.get("g3_resolution"), "g3_resolution"),
         stage1_10_refs=stage1_10,
         stage1_11_refs=stage1_11,
         g1_ref=g1_ref,

@@ -88,6 +88,16 @@ def test_missing_formal_g22_commit_blocks_prepare(tmp_path: Path) -> None:
         )
 
 
+def test_s22_g3_resolution_must_be_a_formal_task_artifact(tmp_path: Path) -> None:
+    import ops.stage2.materialize_s204 as materializer
+
+    with pytest.raises(S204MaterializationError, match="S204_S22_G3_RESOLUTION_INVALID"):
+        materializer._validate_s22_g3_resolution(
+            tmp_path,
+            "evidence/stage0/tasks/04-missing/commits/asset_resolution.json",
+        )
+
+
 def _valid_s22_group(root: Path) -> tuple[dict[str, str], dict[str, object], str, str, tuple[str, ...]]:
     """Build only control-plane S2.2 commits for postcondition tests."""
 
@@ -124,6 +134,7 @@ def _valid_s22_group(root: Path) -> tuple[dict[str, str], dict[str, object], str
         "formal_execution": f"{S204_S22_CONTROL_OUTPUT_DIR}/formal-execution-g21.json",
         "stage0_handoff": "evidence/stage0/handoff.json",
         "stage1_g1_exit": "evidence/stage1/index.json",
+        "g3_resolution": "evidence/stage0/g3.json",
         "gate_stage2_g2_0": adapter_gate_refs["stage2.G2.0"],
         "gate_stage2_g2_1": adapter_gate_refs["stage2.G2.1"],
     }
@@ -179,6 +190,7 @@ def _valid_s22_group(root: Path) -> tuple[dict[str, str], dict[str, object], str
 def test_s22_absent_produces_and_complete_rerun_is_idempotent(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     import ops.stage2.materialize_s204 as materializer
 
+    monkeypatch.setattr(materializer, "_validate_s22_g3_resolution", lambda *_args: None)
     calls: list[str] = []
     refs, evidence_refs, config_ref, environment_ref, lineage = _valid_s22_group(tmp_path)
 
@@ -210,9 +222,13 @@ def test_s22_absent_produces_and_complete_rerun_is_idempotent(tmp_path: Path, mo
     assert second[0] == refs and calls == [S204_S22_CONTROL_OUTPUT_DIR]
 
 
-def test_s22_alternate_namespace_and_tampered_environment_or_lineage_fail_closed(tmp_path: Path) -> None:
+def test_s22_alternate_namespace_and_tampered_environment_or_lineage_fail_closed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import ops.stage2.materialize_s204 as materializer
+
+    monkeypatch.setattr(materializer, "_validate_s22_g3_resolution", lambda *_args: None)
     refs, evidence_refs, config_ref, environment_ref, lineage = _valid_s22_group(tmp_path)
-    forbidden_markers = ("g2.2", "stage2.03", "stage2-03", "s2.3", "capability", "model_assets", "data_assets", "g3")
+    assert "g3_resolution" in evidence_refs
+    forbidden_markers = ("g2.2", "stage2.03", "stage2-03", "s2.3", "capability", "model_assets", "data_assets")
     for ref in refs.values():
         loaded = load_committed_task_artifact(tmp_path, ref, require_formal=True)
         assert not any(
@@ -235,19 +251,29 @@ def test_s22_alternate_namespace_and_tampered_environment_or_lineage_fail_closed
         _validate_formal_s22_task_group(
             tmp_path, refs, config_ref=config_ref, environment_ref=environment_ref, required_lineage=lineage[:5]
         )
-    # The narrow S2.2 environment must not smuggle downstream assets or the
-    # independent Stage 0 G3 resolution into this audit's lineage.
+    # G3 is an allowed Stage 0 provider input; runtime capabilities are not.
     forbidden_refs = {
         **evidence_refs,
         "g3_resolution": "evidence/stage0/g3.json",
     }
     forbidden_environment = TaskRuntimeEnvironment(
+        capabilities=frozenset({"model_assets"}),
         frozen_contract_stages=frozenset({0, 1, 2}),
         passed_gate_ids=frozenset({"stage1.G1-EXIT", "stage2.G2.0", "stage2.G2.1"}),
         evidence_refs=forbidden_refs,
     )
     write_canonical_json(tmp_path / environment_ref, forbidden_environment.to_dict())
-    with pytest.raises(S204MaterializationError, match="S204_S22_ENVIRONMENT_DOWNSTREAM_LINEAGE_FORBIDDEN"):
+    with pytest.raises(S204MaterializationError, match="S204_S22_ENVIRONMENT_CAPABILITIES_FORBIDDEN"):
+        _validate_formal_s22_task_group(
+            tmp_path, refs, config_ref=config_ref, environment_ref=environment_ref, required_lineage=lineage[:5]
+        )
+    missing_g3_environment = TaskRuntimeEnvironment(
+        frozen_contract_stages=frozenset({0, 1, 2}),
+        passed_gate_ids=frozenset({"stage1.G1-EXIT", "stage2.G2.0", "stage2.G2.1"}),
+        evidence_refs={key: value for key, value in evidence_refs.items() if key != "g3_resolution"},
+    )
+    write_canonical_json(tmp_path / environment_ref, missing_g3_environment.to_dict())
+    with pytest.raises(S204MaterializationError, match="S204_S22_G3_RESOLUTION_REQUIRED"):
         _validate_formal_s22_task_group(
             tmp_path, refs, config_ref=config_ref, environment_ref=environment_ref, required_lineage=lineage[:5]
         )
