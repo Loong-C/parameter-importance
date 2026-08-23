@@ -221,8 +221,19 @@ def _gpu_compute_apps() -> list[dict[str, str]]:
 
 
 def _validate_live_gpu_health(
-    inventory: list[dict[str, Any]], apps: list[dict[str, str]]
+    inventory: list[dict[str, Any]],
+    apps: list[dict[str, str]],
+    *,
+    selected: Mapping[str, Any],
 ) -> None:
+    """Validate the complete identity set and health of one bound GPU.
+
+    The excluded device is intentionally part of the identity audit, but it is
+    not a candidate device and therefore must not be subjected to the healthy
+    / idle checks below.  Likewise, processes on another GPU must not make a
+    concurrently launched cell fail its selected-device preflight.
+    """
+
     expected = {pci.casefold(): uuid.casefold() for pci, uuid in APPROVED_GPU_BINDINGS.items()}
     expected[EXCLUDED_PCI.casefold()] = EXCLUDED_UUID.casefold()
     observed: dict[str, str] = {}
@@ -242,27 +253,50 @@ def _validate_live_gpu_health(
         raise ValueError("live GPU inventory contains duplicate PCI identities")
     if len({str(row.get("uuid", "")).casefold() for row in inventory}) != len(inventory):
         raise ValueError("live GPU inventory contains duplicate UUIDs")
-    if apps:
-        raise ValueError(f"approved GPU inventory is not idle; compute apps present: {apps}")
-    for row in inventory:
-        pci = str(row.get("pci_bus_id", "")).casefold()
-        if pci not in expected:
-            continue
-        try:
-            memory_used = float(row["memory_used_mib"])
-            memory_total = float(row["memory_total_mib"])
-            utilization = float(row["utilization_gpu_percent"])
-            ecc_volatile = float(row["ecc_uncorrected_volatile"])
-            ecc_aggregate = float(row["ecc_uncorrected_aggregate"])
-        except (KeyError, TypeError, ValueError) as error:
-            raise ValueError(f"live GPU health fields missing: {row}") from error
-        if memory_total <= 0.0 or memory_used != 0.0 or utilization != 0.0:
-            raise ValueError(f"GPU is not idle: {row}")
-        if ecc_volatile != 0.0 or ecc_aggregate != 0.0:
-            raise ValueError(f"GPU ECC health is not clean: {row}")
-        recovery = str(row.get("gpu_recovery_action", "")).strip().casefold()
-        if recovery not in {"none", "0", "n/a", "na"}:
-            raise ValueError(f"GPU recovery/health state is not clean: {row}")
+    selected_pci = str(selected.get("pci_bus_id", "")).casefold()
+    selected_uuid = str(selected.get("uuid", "")).casefold()
+    if (
+        not selected_pci
+        or not selected_uuid
+        or selected_pci == EXCLUDED_PCI.casefold()
+        or selected_uuid == EXCLUDED_UUID.casefold()
+    ):
+        raise ValueError(f"excluded GPU selected: {selected}")
+    if selected_pci not in expected or expected[selected_pci] != selected_uuid:
+        raise ValueError(f"selected GPU PCI/UUID mapping is not smoke-approved: {selected}")
+    selected_rows = [
+        row
+        for row in inventory
+        if str(row.get("pci_bus_id", "")).casefold() == selected_pci
+        and str(row.get("uuid", "")).casefold() == selected_uuid
+    ]
+    if len(selected_rows) != 1:
+        raise ValueError(f"selected GPU identity is not unique in live inventory: {selected}")
+    selected_apps = [
+        app
+        for app in apps
+        if str(app.get("gpu_uuid", "")).strip().casefold() == selected_uuid
+    ]
+    if selected_apps:
+        raise ValueError(
+            f"selected GPU inventory is not idle; compute apps present: {selected_apps}"
+        )
+    row = selected_rows[0]
+    try:
+        memory_used = float(row["memory_used_mib"])
+        memory_total = float(row["memory_total_mib"])
+        utilization = float(row["utilization_gpu_percent"])
+        ecc_volatile = float(row["ecc_uncorrected_volatile"])
+        ecc_aggregate = float(row["ecc_uncorrected_aggregate"])
+    except (KeyError, TypeError, ValueError) as error:
+        raise ValueError(f"live GPU health fields missing: {row}") from error
+    if memory_total <= 0.0 or memory_used != 0.0 or utilization != 0.0:
+        raise ValueError(f"GPU is not idle: {row}")
+    if ecc_volatile != 0.0 or ecc_aggregate != 0.0:
+        raise ValueError(f"GPU ECC health is not clean: {row}")
+    recovery = str(row.get("gpu_recovery_action", "")).strip().casefold()
+    if recovery not in {"none", "0", "n/a", "na"}:
+        raise ValueError(f"GPU recovery/health state is not clean: {row}")
 
 
 def _bind_gpu(token: str) -> tuple[str, list[dict[str, Any]], str]:
@@ -283,7 +317,7 @@ def _bind_gpu(token: str) -> tuple[str, list[dict[str, Any]], str]:
     if expected_uuid is None or expected_uuid.casefold() != selected["uuid"].casefold():
         raise ValueError(f"GPU PCI/UUID mapping is not in the approved smoke set: {selected}")
     apps = _gpu_compute_apps()
-    _validate_live_gpu_health(inventory, apps)
+    _validate_live_gpu_health(inventory, apps, selected=selected)
     for row in inventory:
         row["compute_apps"] = [dict(item) for item in apps]
     inventory_hash = _canonical_hash(

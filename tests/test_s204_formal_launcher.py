@@ -183,6 +183,38 @@ def _healthy_inventory() -> list[dict[str, object]]:
     return rows
 
 
+def _eight_card_inventory() -> list[dict[str, object]]:
+    """Shape of the live host inventory: four approved, one excluded, three other."""
+
+    rows = _healthy_inventory()
+    rows[0].update(
+        {
+            "ecc_uncorrected_volatile": "113",
+            "ecc_uncorrected_aggregate": "179",
+            "gpu_recovery_action": "Drain and Reset",
+        }
+    )
+    rows.extend(
+        [
+            {"index": "5", "pci_bus_id": "0000:51:00.0", "uuid": "GPU-other-1"},
+            {"index": "6", "pci_bus_id": "0000:52:00.0", "uuid": "GPU-other-2"},
+            {"index": "7", "pci_bus_id": "0000:54:00.0", "uuid": "GPU-other-3"},
+        ]
+    )
+    for row in rows[5:]:
+        row.update(
+            {
+                "memory_used_mib": "4096",
+                "memory_total_mib": "40960",
+                "utilization_gpu_percent": "100",
+                "ecc_uncorrected_volatile": "7",
+                "ecc_uncorrected_aggregate": "8",
+                "gpu_recovery_action": "Drain and Reset",
+            }
+        )
+    return rows
+
+
 def test_gpu_live_inventory_requires_idle_clean_health_and_complete_set(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -209,6 +241,58 @@ def test_gpu_live_inventory_requires_idle_clean_health_and_complete_set(
     monkeypatch.setattr(
         "ops.stage2.run_s204_formal._gpu_compute_apps",
         lambda: [{"pid": "123", "process_name": "other", "gpu_uuid": APPROVED_GPU_BINDINGS["0000:53:00.0"]}],
+    )
+    with pytest.raises(ValueError, match="compute apps"):
+        _bind_gpu("2")
+
+
+def test_gpu_live_inventory_scopes_health_to_selected_card_on_eight_card_host(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    inventory = _eight_card_inventory()
+    monkeypatch.setattr("ops.stage2.run_s204_formal._gpu_inventory", lambda: inventory)
+    monkeypatch.setattr(
+        "ops.stage2.run_s204_formal._gpu_compute_apps",
+        lambda: [
+            {
+                "pid": "456",
+                "process_name": "other-approved",
+                "gpu_uuid": APPROVED_GPU_BINDINGS["0000:9C:00.0"],
+            },
+            {"pid": "789", "process_name": "other-unapproved", "gpu_uuid": "GPU-other-1"},
+        ],
+    )
+
+    selected, bound_inventory, digest = _bind_gpu("2")
+    assert selected == APPROVED_GPU_BINDINGS["0000:53:00.0"]
+    assert len(bound_inventory) == 8 and len(digest) == 64
+
+    with pytest.raises(ValueError, match="excluded GPU"):
+        _bind_gpu("0")
+
+    busy = _eight_card_inventory()
+    busy[1]["memory_used_mib"] = "1"
+    monkeypatch.setattr("ops.stage2.run_s204_formal._gpu_inventory", lambda: busy)
+    monkeypatch.setattr("ops.stage2.run_s204_formal._gpu_compute_apps", lambda: [])
+    with pytest.raises(ValueError, match="not idle"):
+        _bind_gpu("2")
+
+    ecc = _eight_card_inventory()
+    ecc[1]["ecc_uncorrected_volatile"] = "1"
+    monkeypatch.setattr("ops.stage2.run_s204_formal._gpu_inventory", lambda: ecc)
+    with pytest.raises(ValueError, match="ECC"):
+        _bind_gpu("2")
+
+    monkeypatch.setattr("ops.stage2.run_s204_formal._gpu_inventory", _eight_card_inventory)
+    monkeypatch.setattr(
+        "ops.stage2.run_s204_formal._gpu_compute_apps",
+        lambda: [
+            {
+                "pid": "123",
+                "process_name": "selected",
+                "gpu_uuid": APPROVED_GPU_BINDINGS["0000:53:00.0"],
+            }
+        ],
     )
     with pytest.raises(ValueError, match="compute apps"):
         _bind_gpu("2")
