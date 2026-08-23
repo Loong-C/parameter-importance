@@ -310,7 +310,7 @@ def test_source_refs_must_be_four_real_formal_task_commits(tmp_path: Path) -> No
     result = _evaluate(data_root, refs, config_ref)
     assert result["status"] == "BLOCKED"
     assert isinstance(result["commit_ref"], str)
-    assert "source_refs" in " ".join(result["gate_record"]["reasons"])  # type: ignore[index]
+    assert "artifact_commit_ref" in " ".join(result["gate_record"]["reasons"])  # type: ignore[index]
 
 
 def test_wrong_resolved_config_and_tampered_payload_are_blocked(tmp_path: Path) -> None:
