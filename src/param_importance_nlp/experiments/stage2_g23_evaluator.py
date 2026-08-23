@@ -1999,10 +1999,14 @@ def _state_replay_verified(evidence: _CellEvidence) -> bool:
             except ValueError as error:
                 raise G23Blocked(str(error)) from error
             return
-        if not isinstance(raw_boundary, Mapping) or set(raw_boundary) != set(streams):
+        # Resume state uses stable endpoint keys ``a``/``b``; the sampling
+        # manifests retain their semantic stream names.  Bind them by this
+        # fixed pair order rather than accepting caller-chosen keys.
+        endpoint_keys = ("a", "b")
+        if not isinstance(raw_boundary, Mapping) or set(raw_boundary) != set(endpoint_keys):
             raise G23Blocked(f"state_replay.{schema}[{index}]:RNG_STATE_PAIR_REQUIRED")
-        for stream in streams:
-            boundary = raw_boundary.get(stream)
+        for endpoint_key, stream in zip(endpoint_keys, streams):
+            boundary = raw_boundary.get(endpoint_key)
             if not isinstance(boundary, Mapping):
                 raise G23Blocked(f"state_replay.{schema}[{index}].{stream}:RNG_STATE_MISSING")
             try:
