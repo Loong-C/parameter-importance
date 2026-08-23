@@ -34,19 +34,40 @@
   },
   "stage0_handoff": {
     "manifest_ref": "reports/stage2/s2.2/stage0-handoff-manifest.json",
-    "manifest_sha256": "febc1864e4352dfbec5d74833c8efc0b212be3ad6c42c1264b95be0b95d3d2bb",
-    "manifest_artifact_hash": "df30e7e405fa2ee9101c1ad8385275c7458c584075899f10e250c072e757450b",
+    "manifest_sha256": "769f873d2ea7631dc422e84e3e944543c4bc725258b950f0bf9cb78f727aede8",
+    "manifest_artifact_hash": "3adece7fda805179f44eb7f13c792514b3d009b07caf2521054e6e1e3d2f5724",
     "historical_authority_root": "evidence/stage0/g10-final/a15f0e2970b7cae6951dd606ebd396a8df68255c/b4974a642168994eec7d62ba38a453fa3834ee50201da55d9549b1080a5b90f0",
     "historical_generator_commit": "a15f0e2970b7cae6951dd606ebd396a8df68255c",
     "role_status": "HISTORICAL_PASS_CURRENT_VALIDITY_BLOCKED",
     "role_refs_and_sha256": {
-      "environment_freeze": ["evidence/stage0/bootstrap/a15f0e2970b7cae6951dd606ebd396a8df68255c/commits/contract_freeze.json", "39efc1e666e1e74781095bdc45dbfe3335b5191029eeab17fac0ec3ca2953152"],
-      "storage_cache": ["evidence/stage0/tasks/10-d81a7ce0953a67da8b526ba552a235623401e935eecaea427df610fe854d8d3f/commits/capacity_envelope.json", "736dcd51819f271cb71f9afe01109d237499303ec0197b176a79945bd781009c"],
-      "single_gpu": ["evidence/stage0/tasks/06-d27346187922aba653aa87a92e55810abdae8d60b04290c55b0671ba7ba6f008/commits/training_smoke_result.json", "04765d694066e01aef0b7cde64760156c85d12de633bac0a61853a627d10fb37"],
-      "four_gpu_ddp_no_sync": ["evidence/stage0/tasks/07-d9370d54f4ca5ef249fb6e39b453138f1aac6f87d5c56f0bb454b10385cd8ad3/commits/distributed_validation.json", "5bd2e830df213c2a08e3bdb036c1985528dce7cc641d01c7380ba3d1ab456e77"],
-      "logging_run": ["evidence/stage0/tasks/08-9e0faf4150f2fceed5e28d5f45433c1f0c0eee1c0dfb689fe7a394755bbdcd5d/commits/lineage_manifest.json", "f2fcb004f65eda50587a203acaab15c58e41dbeae23e23d59be4b7f3750490b0"],
-      "checkpoint_recovery": ["evidence/stage0/tasks/09-99c57c3fbf9e2067f05e1cdfdea21c81fbac10500e7a2c8d597962227e3b4360/commits/resume_equivalence_report.json", "52e3c5a27e52f50e3347e8183356c28c5331b548015923a6692092c63d44753b"],
-      "performance": ["evidence/stage0/tasks/08-9e0faf4150f2fceed5e28d5f45433c1f0c0eee1c0dfb689fe7a394755bbdcd5d/commits/logging_overhead_report.json", "cb729dbbeffe0575c9e3f4aa968f380796f67e7df89c1825582bef0fbf7af189"]
+      "environment_freeze": [
+        "evidence/stage0/bootstrap/a15f0e2970b7cae6951dd606ebd396a8df68255c/commits/contract_freeze.json",
+        "39efc1e666e1e74781095bdc45dbfe3335b5191029eeab17fac0ec3ca2953152"
+      ],
+      "storage_cache": [
+        "evidence/stage0/tasks/10-d81a7ce0953a67da8b526ba552a235623401e935eecaea427df610fe854d8d3f/commits/capacity_envelope.json",
+        "736dcd51819f271cb71f9afe01109d237499303ec0197b176a79945bd781009c"
+      ],
+      "single_gpu": [
+        "evidence/stage0/tasks/06-d27346187922aba653aa87a92e55810abdae8d60b04290c55b0671ba7ba6f008/commits/training_smoke_result.json",
+        "04765d694066e01aef0b7cde64760156c85d12de633bac0a61853a627d10fb37"
+      ],
+      "four_gpu_ddp_no_sync": [
+        "evidence/stage0/tasks/07-d9370d54f4ca5ef249fb6e39b453138f1aac6f87d5c56f0bb454b10385cd8ad3/commits/distributed_validation.json",
+        "5bd2e830df213c2a08e3bdb036c1985528dce7cc641d01c7380ba3d1ab456e77"
+      ],
+      "logging_run": [
+        "evidence/stage0/tasks/08-9e0faf4150f2fceed5e28d5f45433c1f0c0eee1c0dfb689fe7a394755bbdcd5d/commits/lineage_manifest.json",
+        "f2fcb004f65eda50587a203acaab15c58e41dbeae23e23d59be4b7f3750490b0"
+      ],
+      "checkpoint_recovery": [
+        "evidence/stage0/tasks/09-99c57c3fbf9e2067f05e1cdfdea21c81fbac10500e7a2c8d597962227e3b4360/commits/resume_equivalence_report.json",
+        "52e3c5a27e52f50e3347e8183356c28c5331b548015923a6692092c63d44753b"
+      ],
+      "performance": [
+        "evidence/stage0/tasks/08-9e0faf4150f2fceed5e28d5f45433c1f0c0eee1c0dfb689fe7a394755bbdcd5d/commits/logging_overhead_report.json",
+        "cb729dbbeffe0575c9e3f4aa968f380796f67e7df89c1825582bef0fbf7af189"
+      ]
     },
     "persistence_risk_acceptance_expires_at": "2026-08-18T23:59:00+08:00",
     "current_hardware_validity": {
@@ -58,22 +79,69 @@
       "pending_remap": true,
       "current_single_and_healthy_four_gpu_smoke": "NOT_RUN",
       "required_action": "exclude_index1_by_PCI_and_rerun_current_single_and_healthy_four_gpu_smoke"
+    },
+    "role_producer_commits": {
+      "environment_freeze": "a15f0e2970b7cae6951dd606ebd396a8df68255c",
+      "storage_cache": "a15f0e2970b7cae6951dd606ebd396a8df68255c",
+      "single_gpu": "a15f0e2970b7cae6951dd606ebd396a8df68255c",
+      "four_gpu_ddp_no_sync": "a15f0e2970b7cae6951dd606ebd396a8df68255c",
+      "logging_run": "a15f0e2970b7cae6951dd606ebd396a8df68255c",
+      "checkpoint_recovery": "a15f0e2970b7cae6951dd606ebd396a8df68255c",
+      "performance": "a15f0e2970b7cae6951dd606ebd396a8df68255c"
+    },
+    "role_run_identities": {
+      "environment_freeze": "a15f0e2970b7cae6951dd606ebd396a8df68255c",
+      "storage_cache": "d81a7ce0953a67da8b526ba552a235623401e935eecaea427df610fe854d8d3f",
+      "single_gpu": "d27346187922aba653aa87a92e55810abdae8d60b04290c55b0671ba7ba6f008",
+      "four_gpu_ddp_no_sync": "d9370d54f4ca5ef249fb6e39b453138f1aac6f87d5c56f0bb454b10385cd8ad3",
+      "logging_run": "9e0faf4150f2fceed5e28d5f45433c1f0c0eee1c0dfb689fe7a394755bbdcd5d",
+      "checkpoint_recovery": "99c57c3fbf9e2067f05e1cdfdea21c81fbac10500e7a2c8d597962227e3b4360",
+      "performance": "9e0faf4150f2fceed5e28d5f45433c1f0c0eee1c0dfb689fe7a394755bbdcd5d"
     }
   },
   "local_revalidation": {
-    "stage1_handoff_contract_tests": {"command": "tests/test_stage2_s202_handoff_contract.py", "passed": 7, "failed": 0},
-    "formal_adapter_tests": {"command": "tests/test_stage2_formal_handoff_adapter.py", "passed": 1, "failed": 0},
-    "task_runner_tests": {"command": "tests/test_stage23_task_runners.py", "passed": 17, "failed": 0},
-    "formal_orchestration_tests": {"command": "tests/test_stage23_formal_orchestration.py", "passed": 18, "failed": 0},
-    "stage2_regression_suite": {"command": "tests/*stage2*.py", "passed": 61, "failed": 0},
+    "stage1_handoff_contract_tests": {
+      "command": "tests/test_stage2_s202_handoff_contract.py",
+      "passed": 16,
+      "failed": 0
+    },
+    "formal_adapter_tests": {
+      "command": "tests/test_stage2_formal_handoff_adapter.py",
+      "passed": 1,
+      "failed": 0
+    },
+    "task_runner_tests": {
+      "command": "tests/test_stage23_task_runners.py",
+      "status": "BLOCKED_S2.3_INTEGRATION",
+      "known_error": "STAGE23_PREDECESSOR_PAYLOAD_NOT_UNIQUE:fixed_state_contract:0",
+      "passed": 0,
+      "failed": "not_claimed"
+    },
+    "formal_orchestration_tests": {
+      "command": "tests/test_stage23_formal_orchestration.py",
+      "status": "NOT_RERUN_S2.3_INTEGRATION_BLOCKER",
+      "passed": 0,
+      "failed": "not_claimed"
+    },
+    "stage2_regression_suite": {
+      "command": "tests/*stage2*.py",
+      "status": "NOT_CLAIMED_S2.3_INTEGRATION_BLOCKER",
+      "passed": 0,
+      "failed": "not_claimed"
+    },
     "state_digest_unchanged": true,
     "signed_u_preserved": true,
-    "gpu_execution": "NOT_RUN"
+    "gpu_execution": "NOT_RUN",
+    "dag_contract_tests": {
+      "command": "tests/test_stage23_task_runners.py::test_stage2_direct_predecessors_match_plan_dag",
+      "passed": 1,
+      "failed": 0
+    }
   },
   "consumer_contract": {
-    "stage2_code_producer_commit": "15bf670e7900a21b9dcd2201e175fee24c292650",
+    "stage2_code_producer_commit": "3fa53781a1cf054ec4dc11492c22bff794a23a53",
     "stage2_execution_commit": null,
-    "stage2_consumer_commit": "15bf670e7900a21b9dcd2201e175fee24c292650",
+    "stage2_consumer_commit": "3fa53781a1cf054ec4dc11492c22bff794a23a53",
     "three_end_sync": "BLOCKED_UNTIL_STAGE0_CURRENT_VALIDITY_AND_FORMAL_GPU_SMOKE"
   }
 }
