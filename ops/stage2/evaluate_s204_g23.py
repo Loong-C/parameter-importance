@@ -20,6 +20,7 @@ if str(_REPOSITORY_ROOT / "src") not in sys.path:
 
 from param_importance_nlp.experiments.stage2_g23_evaluator import (
     CellInput,
+    _reject_symlink_chain,
     evaluate_formal_g23,
 )
 
@@ -67,6 +68,11 @@ def main(argv: list[str] | None = None) -> int:
                 index_path.relative_to(workspace_root)
             except ValueError as error:
                 raise ValueError("--input-index must be under --workspace-root") from error
+            _reject_symlink_chain(
+                workspace_root,
+                index_path.relative_to(workspace_root).as_posix(),
+                "--input-index",
+            )
 
             def _no_duplicate_pairs(pairs: list[tuple[str, object]]) -> dict[str, object]:
                 result: dict[str, object] = {}

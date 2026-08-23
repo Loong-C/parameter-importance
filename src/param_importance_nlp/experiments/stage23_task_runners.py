@@ -294,6 +294,13 @@ def _logical_path(value: str, *, field: str) -> PurePosixPath:
 
 def _workspace_path(root: Path, value: str, *, field: str) -> Path:
     logical = _logical_path(value, field=field)
+    if root.is_symlink():
+        raise ValueError(f"STAGE23_TASK_SYMLINK_FORBIDDEN:{field}")
+    current = root
+    for part in logical.parts:
+        current = current / part
+        if current.is_symlink():
+            raise ValueError(f"STAGE23_TASK_SYMLINK_FORBIDDEN:{field}")
     target = root.joinpath(*logical.parts).resolve()
     try:
         target.relative_to(root)
@@ -2632,6 +2639,7 @@ def _load_reference_external_lineage(
                 f"formal S2.4 requires explicit TaskArtifact ref: {environment_key}",
                 retryable=False,
             )
+        _workspace_path(root, reference, field=environment_key)
         try:
             loaded = load_committed_task_artifact(root, reference, require_formal=True)
         except (OSError, ValueError, TypeError) as error:
@@ -2642,6 +2650,7 @@ def _load_reference_external_lineage(
                 retryable=False,
                 evidence_refs=(reference,),
             ) from error
+        _workspace_path(root, loaded.identity.object_ref, field=f"{environment_key}.object_ref")
         if loaded.identity.artifact_kind != expected_kind:
             raise _blocked(
                 BlockerCode.CONTRACT_UNFROZEN,

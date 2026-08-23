@@ -352,7 +352,17 @@ def _digest_bytes(path: Path) -> str:
 def _append_attempt_index(index: Path, artifact_hash: str) -> None:
     """Append an attempt hash under an exclusive lock and atomic replace."""
 
+    # Validate every existing path component before mkdir/open.  Checking only
+    # the final index or lock permits a symlinked parent to redirect the
+    # append outside the evaluator's output root.
+    current = Path(index.anchor)
+    for part in index.relative_to(Path(index.anchor)).parts:
+        current = current / part
+        if current.is_symlink():
+            raise RuntimeError("G23_ATTEMPT_INDEX_PATH_SYMLINK")
     index.parent.mkdir(parents=True, exist_ok=True)
+    if index.is_symlink() or index.parent.is_symlink():
+        raise RuntimeError("G23_ATTEMPT_INDEX_PATH_SYMLINK")
     lock = index.with_name(index.name + ".lock")
     descriptor = -1
     for _ in range(200):
@@ -939,6 +949,8 @@ def _validate_external_lineage(
             artifact = load_committed_task_artifact(root, ref, require_formal=True)
         except (OSError, ValueError, TypeError) as error:
             raise G23Blocked(f"external_lineage.{name}:INVALID") from error
+        _reject_symlink_chain(root, artifact.identity.object_ref, f"external_lineage.{name}.object_ref")
+        _reject_symlinks_under(_resolve(root, artifact.identity.object_ref), f"external_lineage.{name}.object_ref")
         if artifact.identity.artifact_kind != kind:
             raise G23Blocked(f"external_lineage.{name}:KIND_MISMATCH")
         if item.get("artifact_hash") != artifact.identity.artifact_hash or item.get("config_hash") != artifact.identity.config_hash or item.get("task_id") != artifact.identity.task_id or item.get("payload_hash") != canonical_json_hash(artifact.payload):

@@ -11,10 +11,13 @@ import pytest
 from param_importance_nlp.experiments.stage2_g23_evaluator import (
     CellInput,
     _array,
+    _moments_from_blocks,
     _pearson,
     _top_overlap,
     evaluate_formal_g23,
 )
+from param_importance_nlp.experiments.stage2_formal import ReferenceSizingPlan
+from param_importance_nlp.experiments.stage23_task_runners import _reference_capacity_preflight
 
 
 def test_missing_cells_are_not_a_formal_decision(tmp_path: Path) -> None:
@@ -47,6 +50,40 @@ def test_boundary_metrics_use_inclusive_preregistered_comparisons() -> None:
     right = np.asarray([1.0, 2.0, 3.0, 4.0])
     assert _pearson(left, right) >= 0.995
     assert _top_overlap(left, right, 0.01) >= 0.98
+
+
+def test_weighted_u_hand_calculation_is_recomputed_from_raw_blocks() -> None:
+    blocks = [
+        {"p": np.asarray([1.0])},
+        {"p": np.asarray([3.0])},
+    ]
+    moments = _moments_from_blocks(blocks, [1.0, 2.0], "hand")
+    # n1=3, n2=5, g1=7, g2=38 => (49-38)/(9-5)=2.75.
+    from param_importance_nlp.experiments.stage2_g23_evaluator import _u_from_moments
+
+    assert np.array_equal(_u_from_moments(moments, "hand.u")["p"], np.asarray([2.75]))
+
+
+def test_capacity_preflight_uses_full_14m_and_31m_counts(tmp_path: Path) -> None:
+    class _Provider:
+        pass
+
+    plan = ReferenceSizingPlan(
+        reference_id="capacity-test",
+        candidate_sample_counts=(2, 4),
+        block_size=1,
+        convergence_tolerance=0.02,
+        required_consecutive=1,
+    )
+    reports = [
+        _reference_capacity_preflight(_Provider(), plan, tmp_path, model_manifest={"parameter_count": count})
+        for count in (14_000_000, 31_000_000)
+    ]
+    assert [item["parameter_count"] for item in reports] == [14_000_000, 31_000_000]
+    for item, count in zip(reports, (14_000_000, 31_000_000)):
+        assert item["single_copy_shard_bytes"] == 4 * 2 * count * 8
+        assert item["snapshot_moment_bytes"] == 4 * 4 * count * 8
+        assert item["disk_ok"] is True and item["ram_ok"] is True
 
 
 def test_attempt_json_is_hash_bound_and_tamper_detected(tmp_path: Path) -> None:
