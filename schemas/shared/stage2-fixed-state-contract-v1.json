@@ -1,0 +1,42 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://parameter-importance.invalid/schemas/shared/stage2-fixed-state-contract-v1.json",
+  "title": "Stage 2 fixed-state provider and formula contract",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version", "contract_version", "fixed_state_id", "provider_state_digest",
+    "registry_hash", "parameter_names", "weighting_assumptions", "mutation_policy",
+    "formula_contract", "provider_api_contract", "state_contract", "stage1_g1_exit",
+    "status", "validation_evidence", "formal_eligible"
+  ],
+  "properties": {
+    "schema_version": {"const": "stage2-task-fixed-state-contract-v1"},
+    "contract_version": {"const": "stage2-fixed-state-contract-v1"},
+    "fixed_state_id": {"type": "string", "minLength": 1},
+    "provider_state_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "registry_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "parameter_names": {"type": "array", "items": {"type": "string", "minLength": 1}},
+    "weighting_assumptions": {"type": "object", "additionalProperties": true},
+    "mutation_policy": {"const": "read_only_gradient_queries"},
+    "formula_contract": {
+      "type": "object", "additionalProperties": false,
+      "required": ["formula_version", "raw", "double", "equal_weight_u", "weighted_u", "signed_u_preserved", "clamp_min_zero"],
+      "properties": {
+        "formula_version": {"const": "stage2-fixed-state-local-gradient-square-v1"},
+        "raw": {"const": "mean_gradient**2"},
+        "double": {"const": "mean_gradient_A*mean_gradient_B"},
+        "equal_weight_u": {"const": "(S1**2-S2)/(M*(M-1))"},
+        "weighted_u": {"const": "(G1**2-G2)/(N1**2-N2)"},
+        "signed_u_preserved": {"const": true},
+        "clamp_min_zero": {"const": false}
+      }
+    },
+    "provider_api_contract": {"type": "object", "additionalProperties": false},
+    "state_contract": {"type": "object", "additionalProperties": false},
+    "stage1_g1_exit": {"$ref": "https://parameter-importance.invalid/schemas/shared/stage2-stage1-handoff-manifest-v1.json#/$defs/stage1ExitEvidence"},
+    "status": {"enum": ["FIXTURE_VALIDATED", "FORMAL_CANDIDATE"]},
+    "validation_evidence": {"type": "object", "additionalProperties": true},
+    "formal_eligible": {"const": false}
+  }
+}
