@@ -1744,6 +1744,7 @@ def _build_narrow_formal_environment(
     gate_refs: Mapping[str, str],
     required_gate_ids: Sequence[str],
     output_ref: str,
+    capability_refs: Mapping[str, Any] | None = None,
 ) -> TaskRuntimeEnvironment:
     """Build the S2.1/S2.3 preflight snapshot without G2.2/G2.3 work.
 
@@ -1804,8 +1805,24 @@ def _build_narrow_formal_environment(
     evidence_refs.update({f"stage1_10_{kind}": _source_ref(ref, f"stage1_10.{kind}") for kind, ref in stage1_10_refs.items()})
     evidence_refs.update({f"stage1_11_{kind}": _source_ref(ref, f"stage1_11.{kind}") for kind, ref in stage1_11_refs.items()})
     evidence_refs.update({f"gate_{key.replace('.', '_').replace('-', '_').lower()}": ref for key, ref in normalized_gates.items()})
+    normalized_capabilities: dict[str, str] = {}
+    if capability_refs is not None:
+        required_capabilities = {"server", "cuda", "model_assets", "data_assets"}
+        if set(capability_refs) != required_capabilities:
+            raise _error("CAPABILITY_REF_SET_INVALID", sorted(set(capability_refs) ^ required_capabilities))
+        loaded_capabilities = {
+            capability: _load_capability(root, capability_refs[capability], capability)
+            for capability in sorted(required_capabilities)
+        }
+        normalized_capabilities = {
+            capability: loaded[0]
+            for capability, loaded in loaded_capabilities.items()
+        }
+        evidence_refs.update(
+            {f"capability_{key}": ref for key, ref in normalized_capabilities.items()}
+        )
     environment = TaskRuntimeEnvironment(
-        capabilities=frozenset(),
+        capabilities=frozenset(normalized_capabilities),
         frozen_contract_stages=frozenset({0, 1, 2}),
         passed_gate_ids=frozenset(required_gate_ids),
         evidence_refs=evidence_refs,
@@ -1957,6 +1974,7 @@ def execute_formal_predecessor_dag(
         gate_refs={"stage2.G2.0": g20_ref, "stage2.G2.1": g21_ref},
         required_gate_ids=("stage2.G2.1",),
         output_ref=f"{output_dir}/environments/stage2-03.json",
+        capability_refs=_mapping(source.get("capability_refs"), "capability_refs"),
     )
     result = runtime.execute(s23_config, environment=env3)
     if result.status is not TaskRunStatus.PASS or not result.formal_eligible:
