@@ -2220,31 +2220,46 @@ def _run_stage2_estimator(
     )
     mappings = _paired_mappings(sampling, stream=stream, plan=experiment_plan)
     if request.task.task_id == "stage2.05_paired_estimator_runner":
-        reference_manifest = inputs.payload("reference_result")
         try:
-            bundle_ref = str(reference_manifest["tensor_bundle_ref"])
-            reference_state, bundle = load_tensor_bundle(
-                _workspace_path(root, bundle_ref, field="reference_tensor_bundle")
-            )
-            if bundle.manifest_sha256 != reference_manifest.get(
-                "tensor_bundle_manifest_hash"
-            ):
-                raise ValueError("REFERENCE_TENSOR_BUNDLE_HASH_MISMATCH")
-            if not isinstance(reference_state, Mapping):
-                raise ValueError("REFERENCE_TENSOR_BUNDLE_ROOT_NOT_MAPPING")
-            reference = _as_numpy_vector(reference_state["bias_reference"])  # type: ignore[arg-type]
-            if _vector_digest(reference) != reference_manifest.get(
-                "bias_reference_hash"
-            ):
-                raise ValueError("REFERENCE_VECTOR_HASH_MISMATCH")
-        except (KeyError, TypeError, ValueError) as error:
-            raise _blocked(
-                BlockerCode.ASSET_UNAVAILABLE,
-                "stage2_reference_tensor_bundle",
-                f"前序 reference_result 无法恢复：{error}",
-                retryable=False,
-                evidence_refs=inputs.references,
-            ) from error
+            reference_manifest = inputs.payload("reference_result")
+        except RuntimeError as error:
+            if request.config.run_intent != "local_fixture":
+                raise _blocked(
+                    BlockerCode.ASSET_UNAVAILABLE,
+                    "stage2_reference_tensor_bundle",
+                    "formal S2.5 requires an independently published reference_result",
+                    retryable=False,
+                    evidence_refs=inputs.references,
+                ) from error
+            # The plan DAG intentionally runs S2.5 from S2.2+S2.3.  The local
+            # provider can derive the exact fixture anchor directly; formal
+            # execution remains fail-closed until S2.4 publishes its bundle.
+            reference = _exact_importance_reference(context)
+        else:
+            try:
+                bundle_ref = str(reference_manifest["tensor_bundle_ref"])
+                reference_state, bundle = load_tensor_bundle(
+                    _workspace_path(root, bundle_ref, field="reference_tensor_bundle")
+                )
+                if bundle.manifest_sha256 != reference_manifest.get(
+                    "tensor_bundle_manifest_hash"
+                ):
+                    raise ValueError("REFERENCE_TENSOR_BUNDLE_HASH_MISMATCH")
+                if not isinstance(reference_state, Mapping):
+                    raise ValueError("REFERENCE_TENSOR_BUNDLE_ROOT_NOT_MAPPING")
+                reference = _as_numpy_vector(reference_state["bias_reference"])  # type: ignore[arg-type]
+                if _vector_digest(reference) != reference_manifest.get(
+                    "bias_reference_hash"
+                ):
+                    raise ValueError("REFERENCE_VECTOR_HASH_MISMATCH")
+            except (KeyError, TypeError, ValueError) as error:
+                raise _blocked(
+                    BlockerCode.ASSET_UNAVAILABLE,
+                    "stage2_reference_tensor_bundle",
+                    f"前序 reference_result 无法恢复：{error}",
+                    retryable=False,
+                    evidence_refs=inputs.references,
+                ) from error
     else:
         reference = _exact_importance_reference(context)
     summary = RecoverablePairedWaveRunner(
@@ -2729,18 +2744,26 @@ def _run_stage2_capacity(
     """核对三种成本语义，并保留本机未测 wall/system 能力的显式状态。"""
 
     inputs = _predecessor_context(request, root, store)
+    confirmatory = inputs.payload("confirmatory_results")
+    shards = inputs.payload("sufficient_stat_shards")
+    if confirmatory.get("complete") is not True or shards.get("complete") is not True:
+        raise _blocked(
+            BlockerCode.ASSET_UNAVAILABLE,
+            "complete_confirmatory_results",
+            "S2.9 requires complete S2.7 confirmatory results and sufficient-stat shards",
+            evidence_refs=inputs.references,
+        )
     try:
-        statistics = FrozenSourceTable.from_mapping(inputs.payload("frozen_source_table"))
+        statistics = _stage2_statistics_table(confirmatory)
     except (TypeError, ValueError) as error:
         raise _blocked(
             BlockerCode.CONTRACT_UNFROZEN,
-            "stage2_frozen_statistics_table",
-            f"冻结统计源表不可用：{error}",
+            "stage2_confirmatory_statistics_table",
+            f"S2.7 confirmatory statistics are invalid: {error}",
             retryable=False,
             evidence_refs=inputs.references,
         ) from error
-    quality = inputs.payload("quality_gates")
-    costs = quality.get("cost_statistics")
+    costs = confirmatory.get("cost_statistics")
     if not isinstance(costs, Mapping) or set(costs) != {
         "scientific_equal_sample_cost",
         "isolated_estimator_cost",
@@ -2800,7 +2823,7 @@ def _run_stage2_capacity(
         "stage2-local-fixture",
         experiment_bytes,
     )
-    recommendation = quality.get("pilot_recommendation")
+    recommendation = confirmatory.get("pilot_recommendation")
     if not isinstance(recommendation, Mapping):
         raise ValueError("STAGE2_CAPACITY_RECOMMENDATION_MISSING")
     system_report: dict[str, JSONValue] = {
