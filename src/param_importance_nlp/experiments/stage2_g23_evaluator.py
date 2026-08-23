@@ -534,10 +534,20 @@ class _ShardSequence(Sequence[dict[str, np.ndarray]]):
     creates a second in-memory copy of the complete evidence array.
     """
 
-    def __init__(self, store: _ReferenceShardStore, refs: Sequence[Mapping[str, object]], field: str) -> None:
+    def __init__(
+        self,
+        store: _ReferenceShardStore,
+        refs: Sequence[Mapping[str, object]],
+        field: str,
+        *,
+        cache: Sequence[Mapping[str, np.ndarray]] | None = None,
+    ) -> None:
         self.store = store
         self.refs = tuple(dict(ref) for ref in refs)
         self.field = field
+        # Only tiny local fixtures are cached.  Real 14M/31M cells remain
+        # streaming so the evaluator never retains a complete evidence set.
+        self._cache = None if cache is None else tuple(cache)
 
     def __len__(self) -> int:
         return len(self.refs)
@@ -549,6 +559,8 @@ class _ShardSequence(Sequence[dict[str, np.ndarray]]):
             index += len(self.refs)
         if index < 0 or index >= len(self.refs):
             raise IndexError(index)
+        if self._cache is not None:
+            return self._cache[index]
         try:
             vector, _, _ = self.store.load(self.refs[index])
         except (OSError, TypeError, ValueError) as error:
@@ -585,6 +597,9 @@ def _load_shard_records(
     store = _ReferenceShardStore(resume_root)
     weights: list[float] = []
     refs: list[Mapping[str, object]] = []
+    cached_vectors: list[Mapping[str, np.ndarray]] = []
+    cache_enabled = True
+    cache_elements = 0
     for index, raw in enumerate(raw_refs):
         if not isinstance(raw, Mapping):
             raise G23Blocked(f"{field}[{index}]:SHARD_REF_INVALID")
@@ -596,7 +611,14 @@ def _load_shard_records(
             raise G23Blocked(f"{field}[{index}]:SHARD_HASH_MISMATCH")
         weights.append(_finite(weight, f"{field}[{index}].weight"))
         refs.append(dict(raw))
-    return _ShardSequence(store, refs, field), weights, refs
+        if cache_enabled:
+            cache_elements += sum(int(value.size) for value in vector.values())
+            if cache_elements <= 8192:
+                cached_vectors.append(vector)
+            else:
+                cache_enabled = False
+                cached_vectors.clear()
+    return _ShardSequence(store, refs, field, cache=cached_vectors if cache_enabled else None), weights, refs
 
 
 def _load_resume_commits(
