@@ -27,5 +27,5 @@ def test_unbound_duplicate_cell_set_is_blocked(tmp_path: Path) -> None:
 def test_incomplete_cell_set_is_not_run(tmp_path: Path) -> None:
     cells = [CellInput(cell, f"missing/{index}.json") for index, cell in enumerate(EXPECTED_CELL_IDS[:-1])]
     result = evaluate_formal_g23(tmp_path, cells, output_root=tmp_path / "attempts")
-    assert result["status"] == "NOT_RUN"
+    assert result["status"] == "BLOCKED"
     assert result["formal_eligible"] is False

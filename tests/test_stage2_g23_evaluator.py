@@ -11,13 +11,22 @@ import pytest
 from param_importance_nlp.experiments.stage2_g23_evaluator import (
     CellInput,
     _array,
+    _bootstrap_independent_bias_interval,
+    _bootstrap_independent_cross_interval,
+    _bootstrap_u_diagnostics,
     _moments_from_blocks,
     _pearson,
     _top_overlap,
     evaluate_formal_g23,
 )
-from param_importance_nlp.experiments.stage2_formal import ReferenceSizingPlan
-from param_importance_nlp.experiments.stage23_task_runners import _reference_capacity_preflight
+from param_importance_nlp.experiments.sampling import SamplingPlan, SamplingUniverse
+from param_importance_nlp.experiments.stage2_formal import (
+    ReferenceSizingPlan,
+    _ReferenceShardStore,
+    _moments_from_shards,
+    estimate_reference_uncertainty_shards,
+)
+from param_importance_nlp.experiments.stage23_task_runners import _actual_sampling_state, _reference_capacity_preflight, _sizing_delta_sci
 
 
 def test_missing_cells_are_not_a_formal_decision(tmp_path: Path) -> None:
@@ -58,10 +67,61 @@ def test_weighted_u_hand_calculation_is_recomputed_from_raw_blocks() -> None:
         {"p": np.asarray([3.0])},
     ]
     moments = _moments_from_blocks(blocks, [1.0, 2.0], "hand")
-    # n1=3, n2=5, g1=7, g2=38 => (49-38)/(9-5)=2.75.
+    # n1=3, n2=5, g1=7, g2=37 => (49-37)/(9-5)=3.
     from param_importance_nlp.experiments.stage2_g23_evaluator import _u_from_moments
 
-    assert np.array_equal(_u_from_moments(moments, "hand.u")["p"], np.asarray([2.75]))
+    assert np.array_equal(_u_from_moments(moments, "hand.u")["p"], np.asarray([3.0]))
+
+
+def test_content_addressed_shard_dedup_and_weighted_jackknife(tmp_path: Path) -> None:
+    store = _ReferenceShardStore(tmp_path / "sizing")
+    vector = {"p": np.asarray([1.0, 2.0])}
+    first = store.publish(vector, 1.0)
+    duplicate = store.publish(vector, 1.0)
+    assert first == duplicate
+    refs = [first, store.publish({"p": np.asarray([2.0, 4.0])}, 2.0), store.publish({"p": np.asarray([3.0, 6.0])}, 3.0)]
+    moments = _moments_from_shards(store, refs, {"weights_exogenous": True, "common_mean_assumption": True})
+    assert moments.count == 3 and moments.n1 == 6.0
+    uncertainty = estimate_reference_uncertainty_shards(store, refs, refs, {"weights_exogenous": True, "common_mean_assumption": True})
+    assert uncertainty.block_count_a == 3 and uncertainty.block_count_b == 3
+    assert all(np.all(np.isfinite(value)) for value in uncertainty.bias_variance.values())
+
+
+def test_independent_ab_bootstrap_and_endpoint_h_ref_are_block_bootstrapped() -> None:
+    blocks_a = [{"p": np.asarray([value, value + 1.0])} for value in (1.0, 2.0, 3.0)]
+    blocks_b = [{"p": np.asarray([value, value + 1.0])} for value in (1.5, 2.5, 3.5)]
+    weights = [1.0, 2.0, 1.0]
+    cross_low, cross_high = _bootstrap_independent_cross_interval(blocks_a, weights, blocks_b, weights, "hand.cross")
+    bias_low, bias_high = _bootstrap_independent_bias_interval(blocks_a, weights, blocks_b, weights, "hand.bias")
+    center = {"p": np.asarray([2.0, 3.0])}
+    h_ref, model_half, layer_q95, module_q95 = _bootstrap_u_diagnostics(
+        blocks_a,
+        blocks_b,
+        weights,
+        weights,
+        center,
+        {"layer0": ["p"]},
+        {"module0": ["p"]},
+    )
+    assert np.all(cross_low <= cross_high) and np.all(bias_low <= bias_high)
+    assert np.isfinite(h_ref) and np.isfinite(model_half) and np.isfinite(layer_q95) and np.isfinite(module_q95)
+
+
+def test_sampling_rng_state_is_replayable_from_frozen_manifest() -> None:
+    sampling = SamplingPlan(
+        universe=SamplingUniverse("hand-universe", (0, 1, 2, 3)),
+        stream_seeds={"reference_sizing": 7, "reference_A": 11, "reference_B": 13, "pilot": 17, "confirmatory": 19},
+    )
+    state = _actual_sampling_state(sampling, "reference_A", 3)
+    assert state["stream"] == "reference_A" and state["count"] == 3
+    assert state["state_before_sha256"] != state["state_after_sha256"]
+
+
+def test_sizing_delta_formula_uses_noise_or_signal_floor_at_boundary() -> None:
+    assert _sizing_delta_sci(100.0, 2.0) == pytest.approx(1.0)
+    assert _sizing_delta_sci(100.0, 30.0) == pytest.approx(3.0)
+    with pytest.raises(ValueError):
+        _sizing_delta_sci(float("nan"), 1.0)
 
 
 def test_capacity_preflight_uses_full_14m_and_31m_counts(tmp_path: Path) -> None:

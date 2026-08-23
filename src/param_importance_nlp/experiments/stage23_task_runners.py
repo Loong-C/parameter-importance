@@ -1970,6 +1970,14 @@ def _stage2_reference_plan(
             retryable=False,
             evidence_refs=(reference,),
         )
+    if any(right != 2 * left for left, right in zip(plan.candidate_sample_counts, plan.candidate_sample_counts[1:])):
+        raise _blocked(
+            BlockerCode.CONTRACT_UNFROZEN,
+            "formal_reference_sizing_plan",
+            "candidate sizing nodes must be an adjacent doubling ladder",
+            retryable=False,
+            evidence_refs=(reference,),
+        )
     return plan, (reference,)
 
 
@@ -2195,6 +2203,24 @@ def _sizing_groups(
     return {key: tuple(value) for key, value in sorted(layer.items())}, {key: tuple(value) for key, value in sorted(module.items())}
 
 
+def _sizing_delta_sci(signal: float, noise: float) -> float:
+    """Apply the frozen sizing margin formula to one endpoint and one B.
+
+    Keeping this as a small pure operation makes the numeric contract
+    independently testable.  The caller still derives ``signal`` and
+    ``noise`` from raw sizing shards; this helper never accepts a caller
+    supplied margin.
+    """
+
+    signal_f, noise_f = float(signal), float(noise)
+    if not math.isfinite(signal_f) or not math.isfinite(noise_f) or signal_f <= 0.0 or noise_f <= 0.0:
+        raise ValueError("STAGE2_SIZING_MARGIN_SCALES_MUST_BE_FINITE_POSITIVE")
+    delta = max(0.10 * noise_f, 0.01 * signal_f)
+    if not math.isfinite(delta) or delta <= 0.0:
+        raise ValueError("STAGE2_SIZING_MARGIN_INVALID")
+    return delta
+
+
 def _derive_sizing_delta_sci(
     *,
     root: Path,
@@ -2275,8 +2301,9 @@ def _derive_sizing_delta_sci(
             "module": (max(float(sum(abs(value) for value in module_a)), float(floors["tau_module"])), float(sum(abs(value) for value in module_d))),
         }
         for endpoint, (signal, noise) in endpoint_values.items():
-            delta = max(0.10 * noise, 0.01 * signal)
-            if not all(math.isfinite(value) and value > 0.0 for value in (signal, noise, delta)):
+            try:
+                delta = _sizing_delta_sci(signal, noise)
+            except (TypeError, ValueError, OverflowError) as error:
                 raise _blocked(BlockerCode.CONTRACT_UNFROZEN, "stage2_reference_delta_sci", f"invalid sizing margin: {endpoint}/{count}", retryable=False)
             signal_by_endpoint[endpoint][str(count)] = signal
             noise_by_endpoint[endpoint][str(count)] = noise
@@ -2673,6 +2700,26 @@ def _load_reference_external_lineage(
             "payload_hash": canonical_json_hash(payload),
             "source_refs": list(loaded.source_refs),
         }
+    resolved = payloads.get("resolved_config")
+    resolved_lineage = lineage.get("resolved_config")
+    if not isinstance(resolved, Mapping) or not isinstance(resolved_lineage, Mapping):
+        raise _blocked(
+            BlockerCode.CONTRACT_UNFROZEN,
+            "stage2_resolved_config",
+            "resolved formal config lineage missing",
+            retryable=False,
+        )
+    if (
+        resolved.get("task_id") != request.task.task_id
+        or resolved.get("config_hash") != request.config.config_hash
+        or resolved_lineage.get("config_hash") != request.config.config_hash
+    ):
+        raise _blocked(
+            BlockerCode.CONTRACT_UNFROZEN,
+            "stage2_resolved_config",
+            "resolved formal config is not bound to the current TaskRuntime config",
+            retryable=False,
+        )
     return lineage, payloads
 
 
@@ -2959,9 +3006,11 @@ def _run_stage2_reference(
     model_section = request.config.base_config.section("model")
     data_section = request.config.base_config.section("data")
     checkpoint_section = request.config.base_config.section("identity")
+    tokenizer_section = request.config.base_config.section("tokenizer")
     model_identity = dict(model_section) if isinstance(model_section, Mapping) else {}
     data_identity = dict(data_section) if isinstance(data_section, Mapping) else {}
     identity_section = dict(checkpoint_section) if isinstance(checkpoint_section, Mapping) else {}
+    tokenizer_identity = dict(tokenizer_section) if isinstance(tokenizer_section, Mapping) else {}
     data_identity["data_range_hash"] = six_cell_manifest.get("data_range_hash")
     manifest_rows = six_cell_manifest.get("checkpoints")
     current_checkpoint_id = identity_section.get("input_checkpoint_id")
@@ -3006,6 +3055,21 @@ def _run_stage2_reference(
     config_identity["identity_hash"] = _reference_identity_hash(config_identity)
     model_identity["identity_hash"] = _reference_identity_hash(model_identity)
     data_identity["identity_hash"] = _reference_identity_hash(data_identity)
+    external_tokenizer = external_payloads.get("tokenizer_manifest")
+    if request.config.run_intent == "formal":
+        if not isinstance(external_tokenizer, Mapping):
+            raise _blocked(
+                BlockerCode.CONTRACT_UNFROZEN,
+                "stage2_tokenizer_manifest",
+                "formal reference requires the hash-bound tokenizer manifest",
+                retryable=False,
+                evidence_refs=inputs.references,
+            )
+        tokenizer_identity = {
+            key: external_tokenizer.get(key)
+            for key in ("asset_id", "revision", "checkpoint_id")
+        }
+    tokenizer_identity["identity_hash"] = _reference_identity_hash(tokenizer_identity)
     registry_identity = {
         "registry_hash": context.provider.registry_hash,
         "parameter_registry_artifact_hash": parameter_registry.get("artifact_hash"),
@@ -3143,6 +3207,7 @@ def _run_stage2_reference(
         "config_identity": config_identity,
         "model_identity": model_identity,
         "data_identity": data_identity,
+        "tokenizer_identity": tokenizer_identity,
         "checkpoint_identity": checkpoint_identity,
         "registry_identity": registry_identity,
         "parameter_registry_artifact": parameter_registry,
@@ -6472,14 +6537,23 @@ class _Stage23Runner(TaskRunner):
                         "registry_identity",
                         "model_identity",
                         "data_identity",
+                        "tokenizer_identity",
                         "external_lineage",
                     )
                     if convergence.get(key) is not None
                 }
                 metadata["identity_bindings"] = bindings  # type: ignore[assignment]
+        checkpoint_ref = None
+        if request.config.run_intent == "formal":
+            convergence = payloads.get("reference_convergence_report", {})
+            lineage = convergence.get("external_lineage") if isinstance(convergence, Mapping) else None
+            checkpoint = lineage.get("checkpoint_manifest") if isinstance(lineage, Mapping) else None
+            if isinstance(checkpoint, Mapping) and isinstance(checkpoint.get("commit_ref"), str):
+                checkpoint_ref = checkpoint["commit_ref"]
         return TaskRunResult.passed(
             request,
             artifact_refs=references,
+            checkpoint_ref=checkpoint_ref,
             message="stage2/3 specialized task completed",
             metadata=metadata,
         )

@@ -129,6 +129,19 @@ def _reject_symlink_chain(root: Path, logical: str, field: str) -> None:
             raise G23Blocked(f"{field}:UNREADABLE") from error
 
 
+def _reject_absolute_symlink_chain(path: Path, field: str) -> Path:
+    """Reject symlinks in an absolute path without resolving them first."""
+
+    absolute = path.absolute()
+    anchor = Path(absolute.anchor)
+    try:
+        logical = absolute.relative_to(anchor).as_posix()
+    except ValueError as error:
+        raise G23Blocked(f"{field}:PATH_ESCAPE") from error
+    _reject_symlink_chain(anchor, logical, field)
+    return absolute
+
+
 def _reject_symlinks_under(path: Path, field: str) -> None:
     try:
         if path.is_symlink():
@@ -976,6 +989,22 @@ def _validate_external_lineage(
         raise G23Blocked("external_lineage.s23_six_cell_manifest:CELL_SET_INVALID")
     if not any(isinstance(item, Mapping) and item.get("cell_id") == cell_id for item in rows):
         raise G23Blocked("external_lineage.s23_six_cell_manifest:CELL_MISSING")
+    asset_resolution = loaded["s23_asset_resolution"]
+    if asset_resolution.get("schema_version") != "stage2-task-asset-resolution-v1":
+        raise G23Blocked("external_lineage.s23_asset_resolution:SCHEMA_REQUIRED")
+    if asset_resolution.get("scope") != "formal":
+        raise G23Blocked("external_lineage.s23_asset_resolution:FORMAL_SCOPE_REQUIRED")
+    if asset_resolution.get("six_cell_manifest_hash") != manifest.get("manifest_hash"):
+        raise G23Blocked("external_lineage.s23_asset_resolution:MANIFEST_HASH_MISMATCH")
+    _commit(asset_resolution.get("producer_commit"), "external_lineage.s23_asset_resolution.producer_commit")
+    _commit(manifest.get("asset_producer_commit"), "external_lineage.s23_six_cell_manifest.asset_producer_commit")
+    _commit(manifest.get("asset_execution_commit"), "external_lineage.s23_six_cell_manifest.asset_execution_commit")
+    tokenizer = loaded["tokenizer_manifest"]
+    if tokenizer.get("schema_version") != "tokenizer-manifest-v1":
+        raise G23Blocked("external_lineage.tokenizer_manifest:SCHEMA_REQUIRED")
+    for field in ("asset_id", "revision", "checkpoint_id"):
+        if not isinstance(tokenizer.get(field), str) or not tokenizer.get(field):
+            raise G23Blocked(f"external_lineage.tokenizer_manifest.{field}:REQUIRED")
     return loaded
 
 
@@ -1104,6 +1133,7 @@ def _prepare_cell(root: Path, source: CellInput, *, repo_root: Path | None = Non
             "registry_identity",
             "model_identity",
             "data_identity",
+            "tokenizer_identity",
             "external_lineage",
         ):
             if metadata_bindings.get(binding_key) != cp.get(binding_key):
@@ -1135,6 +1165,22 @@ def _prepare_cell(root: Path, source: CellInput, *, repo_root: Path | None = Non
             raise G23Blocked("checkpoint_identity:MODEL_REVISION_MISMATCH")
         if config_identity.get("checkpoint_config_hash") != checkpoint_identity.get("config_hash"):
             raise G23Blocked("config_identity:CHECKPOINT_CONFIG_MISMATCH")
+        checkpoint_lineage = cp.get("external_lineage", {}).get("checkpoint_manifest") if isinstance(cp.get("external_lineage"), Mapping) else None
+        if not isinstance(checkpoint_lineage, Mapping) or not isinstance(result.checkpoint_ref, str) or result.checkpoint_ref != checkpoint_lineage.get("commit_ref"):
+            raise G23Blocked("task_result.checkpoint_ref:EXTERNAL_BINDING_MISMATCH")
+        tokenizer_identity = _identity_object(
+            cp.get("tokenizer_identity"),
+            "tokenizer_identity",
+            required=("asset_id", "revision", "checkpoint_id"),
+        )
+        tokenizer_manifest = external_payloads.get("tokenizer_manifest")
+        if not isinstance(tokenizer_manifest, Mapping) or any(
+            tokenizer_identity.get(key) != tokenizer_manifest.get(key)
+            for key in ("asset_id", "revision", "checkpoint_id")
+        ):
+            raise G23Blocked("tokenizer_identity:EXTERNAL_MANIFEST_MISMATCH")
+        if tokenizer_identity.get("checkpoint_id") != checkpoint_identity.get("checkpoint_id"):
+            raise G23Blocked("tokenizer_identity:CHECKPOINT_MISMATCH")
         registry_identity = _identity_object(cp.get("registry_identity"), "registry_identity", required=("registry_hash", "parameter_registry_artifact_hash"))
         registry_hash = _sha(registry_identity.get("registry_hash"), "registry_identity.registry_hash")
         if registry_hash != row.get("registry_hash") or registry_hash != rp.get("registry_hash"):
@@ -1338,7 +1384,15 @@ def _sizing_vectors(evidence: _CellEvidence) -> tuple[list[int], list[dict[str, 
     raw_counts = plan.get("candidate_sample_counts")
     if not isinstance(raw_counts, list) or len(raw_counts) < 2:
         raise G23Blocked("sizing.candidate_counts:RAW_DIAGNOSTIC_MISSING")
-    counts = [int(item) for item in raw_counts]
+    try:
+        counts = [int(item) for item in raw_counts]
+        block_size = int(plan.get("block_size", 0))
+    except (TypeError, ValueError, OverflowError) as error:
+        raise G23Blocked("sizing.candidate_counts:INVALID") from error
+    if block_size <= 0 or any(count <= 0 or count % block_size for count in counts):
+        raise G23Blocked("sizing.candidate_counts:BLOCK_ALIGNMENT_INVALID")
+    if any(right != 2 * left for left, right in zip(counts, counts[1:])):
+        raise G23Blocked("sizing.candidate_counts:ADJACENT_DOUBLING_REQUIRED")
     states_by_count: dict[int, Mapping[str, object]] = {}
     for state in evidence.sizing_states:
         sample_count = int(state.get("processed_block_pairs", 0)) * int(plan.get("block_size", 0))
@@ -1509,6 +1563,21 @@ def _delta_sci(
     if not isinstance(floors, Mapping) or set(floors) != {"tau_model", "tau_layer", "tau_module", "tau_coord", "tau_nmse"}:
         raise G23Blocked("delta_sci:ABSOLUTE_FLOORS_MISSING")
     floors_f = {name: _finite(floors.get(name), f"delta_sci.{name}") for name in ("tau_model", "tau_layer", "tau_module", "tau_coord", "tau_nmse")}
+    if any(value <= 0.0 for value in floors_f.values()):
+        raise G23Blocked("delta_sci:ABSOLUTE_FLOORS_INVALID")
+    if (
+        source.get("source_kind") != "reference_sizing_raw_shards"
+        or source.get("formula_version") != "stage2-reference-sizing-margin-v1"
+        or source.get("formula") != "delta_sci=max(0.10*Delta,0.01*S); a=mu_sizing^2; d=sigma_squared_over_B"
+        or source.get("formula_contract_hash") != cp.get("formula_contract_hash")
+        or source.get("reference_id") != plan.get("reference_id")
+        or source.get("sizing_plan_hash") != cp.get("sizing_plan_artifact_hash")
+        or source.get("sizing_result_hash") != cp.get("sizing_result_hash")
+        or source.get("registry_hash") != evidence.identities.get("registry_hash")
+        or source.get("candidate_sample_counts") != list(counts)
+        or source.get("absolute_floors") != dict(floors)
+    ):
+        raise G23Blocked("delta_sci:SOURCE_IDENTITY_MISMATCH")
     state_by_count: dict[int, Mapping[str, object]] = {}
     for state in evidence.sizing_states:
         count = int(state.get("processed_block_pairs", 0)) * block_size
@@ -2264,7 +2333,7 @@ def evaluate_formal_g23(
     qualify the study.
     """
 
-    root = Path(workspace_root).resolve()
+    root = _reject_absolute_symlink_chain(Path(workspace_root), "workspace_root")
     trusted_repo = (
         Path(__file__).resolve().parents[3]
         if repo_root is None
@@ -2336,10 +2405,13 @@ def evaluate_formal_g23(
     artifact_hash = canonical_json_hash(payload)
     payload["artifact_hash"] = artifact_hash
     if output_root is not None:
-        out = Path(output_root).resolve()
+        out = _reject_absolute_symlink_chain(Path(output_root), "output_root")
         attempt_dir = out / "g2.3-attempts" / artifact_hash
+        _reject_absolute_symlink_chain(attempt_dir, "attempt_dir")
         attempt_dir.mkdir(parents=True, exist_ok=True)
+        _reject_absolute_symlink_chain(attempt_dir, "attempt_dir")
         target = attempt_dir / "evaluation.json"
+        _reject_absolute_symlink_chain(target, "attempt_target")
         if target.exists():
             try:
                 existing = load_canonical_json(target)
