@@ -70,6 +70,8 @@
       "required": ["defined", "gradient_evaluations", "formula_seconds", "wall_seconds", "reason"],
       "properties": {
         "defined": {"type": "boolean"},
+        "sample_budget": {"oneOf": [{"type": "null"}, {"type": "integer", "minimum": 0}]},
+        "statistical_weight": {"oneOf": [{"type": "null"}, {"type": "number", "exclusiveMinimum": 0}]},
         "gradient_evaluations": {"oneOf": [{"type": "null"}, {"type": "integer", "minimum": 0}]},
         "formula_seconds": {"oneOf": [{"type": "null"}, {"type": "number", "minimum": 0}]},
         "wall_seconds": {"oneOf": [{"type": "null"}, {"type": "number", "minimum": 0}]},

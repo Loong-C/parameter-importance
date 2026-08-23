@@ -2108,13 +2108,22 @@ def _paired_mappings(
 
 
 def _stable_wave_payload(summary: object) -> dict[str, JSONValue]:
-    """保留科学统计和三类成本定义，排除不可复现的 wall/formula seconds。"""
+    """Return the canonical paired-wave schema with timing scrubbed.
+
+    Wall-clock values remain in the resumable unit state for diagnostics, but
+    are intentionally omitted from the task artifact identity.  The payload
+    itself is still a ``stage2-paired-wave-summary-v1`` artifact so downstream
+    consumers can validate it through the shared Stage 2 contract instead of
+    guessing fields from a task-specific JSON shape.
+    """
 
     costs: dict[str, JSONValue] = {}
     for name, raw in sorted(getattr(summary, "cost_statistics").items()):
         values = dict(raw)
         costs[name] = {
             "defined": bool(values["defined"]),
+            "sample_budget": values.get("sample_budget"),
+            "statistical_weight": values.get("statistical_weight"),
             "gradient_evaluations": values["gradient_evaluations"],
             "formula_seconds": None,
             "wall_seconds": None,
@@ -2124,8 +2133,8 @@ def _stable_wave_payload(summary: object) -> dict[str, JSONValue]:
                 else values["reason"]
             ),
         }
-    return {
-        "schema_version": "stage2-task-wave-summary-v1",
+    payload: dict[str, JSONValue] = {
+        "schema_version": "stage2-paired-wave-summary-v1",
         "wave_id": str(getattr(summary, "wave_id")),
         "registry_hash": str(getattr(summary, "registry_hash")),
         "reference_hash": str(getattr(summary, "reference_hash")),
@@ -2138,11 +2147,14 @@ def _stable_wave_payload(summary: object) -> dict[str, JSONValue]:
             for name, values in sorted(getattr(summary, "method_statistics").items())
         },
         "cost_statistics": costs,
-        "weighting_assumptions": dict(getattr(summary, "weighting_assumptions")),
         "scope": str(getattr(summary, "scope")),
         "formal_eligible": False,
-        "recovery_semantics": "authoritative_repetition_commits",
+        "qualification_gate_hash": None,
+        "resumed_unit_count": int(getattr(summary, "resumed_unit_count")),
+        "weighting_assumptions": dict(getattr(summary, "weighting_assumptions")),
     }
+    payload["artifact_hash"] = canonical_json_hash(payload)
+    return payload
 
 
 def _require_formal_experiment_plan(
