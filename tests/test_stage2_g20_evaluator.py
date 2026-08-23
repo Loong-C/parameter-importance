@@ -1,0 +1,616 @@
+"""Formal, independent G2.0 evaluator contract tests.
+
+These fixtures use the real TaskArtifactStore for every S2.1 and Stage1.11
+input.  There is no ordinary ``upstream.json`` stand-in: the evaluator must
+reload four formal Stage1.11 commits and the persisted S2.1 ResolvedConfigV2.
+"""
+
+from __future__ import annotations
+
+import copy
+import hashlib
+import os
+from pathlib import Path
+import shutil
+import subprocess
+
+import pytest
+
+from param_importance_nlp.contracts import SeedPlan
+from param_importance_nlp.contracts.config_v2 import load_resolved_config_compatible
+from param_importance_nlp.contracts.jsonio import canonical_json_hash, load_canonical_json, write_canonical_json
+from param_importance_nlp.contracts.status import GateRecord, GateStatus
+from param_importance_nlp.experiments.preregistration import (
+    build_stage2_hypothesis_contract,
+    build_stage2_preregistration,
+)
+from param_importance_nlp.experiments.stage2_g20_evaluator import (
+    ARTIFACT_KINDS,
+    EVALUATOR_SOURCE_PATH,
+    MATHEMATICS_PATH,
+    STAGE1_ARTIFACT_KINDS,
+    STAGE1_REPORT_PATH,
+    STAGE1_TASK_ID,
+    TASK_ID,
+    evaluate_formal_g20,
+)
+from param_importance_nlp.runtime.task_artifacts import (
+    TaskArtifactStore,
+    load_committed_task_artifact,
+)
+
+
+ROOT = Path(__file__).resolve().parents[1]
+BASE_CONFIG = ROOT / "configs" / "local-fixtures" / "resolved-config-v1.json"
+
+
+def _sha(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _head(repository: Path = ROOT) -> str:
+    return subprocess.run(
+        ["git", "-C", str(repository), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+
+def _stage1_binding(data_root: Path, refs: dict[str, str]) -> str:
+    artifacts = {
+        kind: load_committed_task_artifact(data_root, refs[kind], require_formal=True)
+        for kind in STAGE1_ARTIFACT_KINDS
+    }
+    return canonical_json_hash(
+        {
+            "predecessor_task_ids": [STAGE1_TASK_ID],
+            "artifacts": [
+                {
+                    "task_id": artifacts[kind].identity.task_id,
+                    "artifact_kind": artifacts[kind].identity.artifact_kind,
+                    "artifact_hash": artifacts[kind].identity.artifact_hash,
+                    "config_hash": artifacts[kind].identity.config_hash,
+                    "run_intent": artifacts[kind].run_intent,
+                    "formal_eligible": artifacts[kind].identity.formal_eligible,
+                    "commit_ref": refs[kind],
+                }
+                for kind in STAGE1_ARTIFACT_KINDS
+            ],
+            "auxiliary_refs": [],
+        }
+    )
+
+
+def _formal_stage1_sources(data_root: Path, *, config_ref: str, config) -> dict[str, str]:
+    store = TaskArtifactStore(data_root, "runs/stage1-11-formal")
+    config_hash = config.config_hash
+    producer = "3f18b04df8922be9894678ae4842bd999c7e8fd5"
+    evidence_root = data_root / "evidence/stage1/s1-11-formal" / producer / "fixture"
+    evidence_root.mkdir(parents=True)
+
+    def with_hash(value: dict[str, object]) -> dict[str, object]:
+        value["artifact_hash"] = canonical_json_hash(value)
+        return value
+
+    role_values: dict[str, dict[str, object]] = {
+        "formal_observation": with_hash({
+            "schema_version": "stage1-s1-11-formal-observation-v1",
+            "status": "PASS", "task_id": STAGE1_TASK_ID, "gate_id": "G1-EXIT",
+            "execution_commit": producer,
+        }),
+        "stage_report": with_hash({
+            "schema_version": "stage1-s1-11-stage-report-v1",
+            "status": "PASS", "task_id": STAGE1_TASK_ID, "gate_id": "G1-EXIT",
+        }),
+        "delivery_manifest": with_hash({
+            "schema_version": "stage1-s1-11-delivery-manifest-v1",
+            "task_id": STAGE1_TASK_ID, "gate_id": "G1-EXIT",
+        }),
+        "gate_summary": with_hash({
+            "schema_version": "stage1-s1-11-gate-summary-v1",
+            "status": "PASS", "task_id": STAGE1_TASK_ID, "gate_id": "G1-EXIT",
+            "unresolved_failure_count": 0,
+        }),
+        "requirements_matrix": with_hash({
+            "schema_version": "stage1-s1-11-requirements-matrix-v1",
+            "task_id": STAGE1_TASK_ID, "gate_id": "G1-EXIT",
+            "rows": [
+                {"requirement_id": f"S1.11-R{index:02d}", "status": "PASS"}
+                for index in range(1, 29)
+            ],
+        }),
+        "validation": with_hash({
+            "schema_version": "stage1-s1-11-validation-v1", "status": "PASS",
+            "task_id": STAGE1_TASK_ID, "gate_id": "G1-EXIT",
+        }),
+        "replay_validation": with_hash({
+            "schema_version": "stage1-s1-11-replay-validation-v1", "status": "PASS",
+        }),
+    }
+    role_filenames = {
+        "formal_observation": "formal-observation.json",
+        "stage_report": "stage-report.json",
+        "delivery_manifest": "delivery-manifest.json",
+        "gate_summary": "gate-summary.json",
+        "requirements_matrix": "requirements-matrix.json",
+        "validation": "validation.json",
+        "replay_validation": "replay-validation.json",
+    }
+    role_refs = {name: filename for name, filename in role_filenames.items()}
+    role_hashes: dict[str, str] = {}
+    for name, payload in role_values.items():
+        path = evidence_root / role_filenames[name]
+        write_canonical_json(path, payload)
+        role_hashes[name] = _sha(path)
+    index = with_hash({
+        "schema_version": "stage1-s1-11-formalization-index-v1",
+        "status": "PASS", "gate_id": "G1-EXIT", "task_id": STAGE1_TASK_ID,
+        "generator_git_commit": producer, "consumer_git_commit": producer,
+        "next_task_ids": ["stage2", "stage3"],
+        "role_refs": role_refs, "role_sha256": role_hashes,
+        "validation_ref": "validation.json", "validation_sha256": role_hashes["validation"],
+        "replay_ref": "replay-validation.json", "replay_sha256": role_hashes["replay_validation"],
+    })
+    index_ref = f"evidence/stage1/s1-11-formal/{producer}/fixture/index.json"
+    write_canonical_json(data_root / index_ref, index)
+    index_sha = _sha(data_root / index_ref)
+
+    bridge_role_kinds = ("stage_report", "requirements_matrix", "gate_summary", "delivery_manifest")
+    root_role_refs = {
+        name: f"evidence/stage1/s1-11-formal/{producer}/fixture/{role_filenames[name]}"
+        for name in role_filenames
+    }
+    bridge_ref = "runs/stage1-11-formal/stage1-11-bridge-evidence.json"
+    bridge = with_hash({
+        "schema_version": "stage2-s204-stage1-bridge-v1", "status": "PASS",
+        "formal_eligible": True, "task_id": STAGE1_TASK_ID, "gate_id": "stage1.G1-EXIT",
+        "index_ref": index_ref, "index_sha256": index_sha,
+        "index_artifact_hash": index["artifact_hash"], "execution_commit": producer,
+        "role_refs": {name: root_role_refs[name] for name in (
+            "formal_observation", "stage_report", "delivery_manifest", "gate_summary", "requirements_matrix"
+        )},
+        "role_sha256": role_hashes,
+        # S2.04 bridge payload_hashes bind the complete role payload bytes,
+        # including the role's own self-hash.  The role ``artifact_hash`` is
+        # the Stage1 handoff self-hash (without that field), whereas the bridge
+        # hash is the canonical hash of the full role object.
+        "payload_hashes": {kind: canonical_json_hash(role_values[kind]) for kind in bridge_role_kinds},
+        "bridge_config_ref": config_ref, "bridge_config_hash": config.config_hash,
+        "bridge_config_full_hash": config.full_hash,
+        "source_refs": [index_ref, *[root_role_refs[name] for name in (
+            "formal_observation", "stage_report", "delivery_manifest", "gate_summary", "requirements_matrix"
+        )]],
+    })
+    write_canonical_json(data_root / bridge_ref, bridge)
+    envelope_source_refs = tuple(dict.fromkeys((
+        index_ref,
+        *[root_role_refs[name] for name in (
+            "formal_observation", "stage_report", "delivery_manifest", "gate_summary", "requirements_matrix"
+        )],
+        config_ref,
+        bridge_ref,
+    )))
+    refs: dict[str, str] = {}
+    for kind in STAGE1_ARTIFACT_KINDS:
+        refs[kind] = store.publish(
+            task_id=STAGE1_TASK_ID,
+            artifact_kind=kind,
+            config_hash=config_hash,
+            run_intent="formal",
+            formal_eligible=True,
+            source_refs=envelope_source_refs,
+            payload=role_values[kind],  # type: ignore[arg-type]
+        ).commit_ref
+    return refs
+
+
+def _formal_config(
+    data_root: Path,
+    *,
+    output_dir: str = "runs/stage2-01",
+    name: str = "stage2-s21-resolved-config.json",
+    master_seed: int = 1337,
+):
+    value = load_canonical_json(BASE_CONFIG)
+    assert isinstance(value, dict)
+    value = copy.deepcopy(value)
+    identity = value["identity"]
+    assert isinstance(identity, dict)
+    identity.update(
+        {
+            "formal_eligible": True,
+            "run_intent": "formal",
+            "route": "formal",
+            "task": TASK_ID,
+            "stage": 2,
+            "master_seed": master_seed,
+        }
+    )
+    runtime = value["runtime"]
+    assert isinstance(runtime, dict)
+    runtime["allow_dirty_worktree"] = False
+    config = load_resolved_config_compatible(
+        value,
+        task_id=TASK_ID,
+        overrides={"artifacts": {"output_dir": output_dir}},
+    )
+    ref = f"configs/{name}"
+    write_canonical_json(data_root / ref, config.to_dict())
+    return ref, config
+
+
+def _publish_s21(
+    data_root: Path,
+    *,
+    stage1_refs: dict[str, str],
+    config,
+    candidate_status: str = "NOT_RUN",
+    source_refs: tuple[str, ...] | None = None,
+    producer_commit: str | None = None,
+) -> dict[str, str]:
+    source_refs = source_refs or tuple(stage1_refs[kind] for kind in STAGE1_ARTIFACT_KINDS)
+    binding = _stage1_binding(data_root, stage1_refs)
+    bridge_ref = next(
+        ref
+        for ref in load_committed_task_artifact(
+            data_root, stage1_refs["stage_report"], require_formal=True
+        ).source_refs
+        if ref.endswith("/stage1-11-bridge-evidence.json")
+    )
+    bridge = load_canonical_json(data_root / bridge_ref)
+    assert isinstance(bridge, dict)
+    prereg = build_stage2_preregistration(
+        seed_plan_hash=SeedPlan.from_master_seed(1337).artifact_hash,
+        producer_commit=producer_commit or _head(),
+        mathematics_hash=_sha(ROOT / MATHEMATICS_PATH),
+        stage1_report_hash=None,
+        upstream_binding_hash=binding,
+        stage1_handoff=bridge,
+        scope="formal",
+    )
+    hypothesis = build_stage2_hypothesis_contract(prereg, upstream_binding_hash=binding)
+    candidate = {
+        "schema_version": "stage23-task-gate-candidate-v1",
+        "task_id": TASK_ID,
+        "gate_ids": ["stage1.G1-EXIT"],
+        "gate_status": candidate_status,
+        "local_validation_status": "NOT_RUN",
+        "formal_eligible": False,
+        "reason": "formal_gate_requires_independent_review",
+        "gate_id": "stage2.G2.0",
+        "preregistration_hash": prereg["preregistration_hash"],
+        "hypothesis_contract_hash": hypothesis["hypothesis_contract_hash"],
+        "quality_gate_status": "NOT_RUN",
+        "sample_generation_status": "FORBIDDEN_UNTIL_COMMITTED",
+    }
+    store = TaskArtifactStore(data_root, "runs/stage2-01")
+    refs: dict[str, str] = {}
+    for kind, payload in (
+        ("preregistration", prereg),
+        ("hypothesis_contract", hypothesis),
+        ("gate_record", candidate),
+    ):
+        refs[kind] = store.publish(
+            task_id=TASK_ID,
+            artifact_kind=kind,
+            config_hash=config.config_hash,
+            run_intent="formal",
+            formal_eligible=True,
+            source_refs=source_refs,
+            payload=payload,
+        ).commit_ref
+    return refs
+
+
+def _fixture(
+    tmp_path: Path,
+    *,
+    candidate_status: str = "NOT_RUN",
+    source_refs: tuple[str, ...] | None = None,
+    producer_commit: str | None = None,
+):
+    data_root = tmp_path / "data-root"
+    data_root.mkdir(parents=True)
+    config_ref, config = _formal_config(data_root)
+    stage1_refs = _formal_stage1_sources(data_root, config_ref=config_ref, config=config)
+    refs = _publish_s21(
+        data_root,
+        stage1_refs=stage1_refs,
+        config=config,
+        candidate_status=candidate_status,
+        source_refs=source_refs,
+        producer_commit=producer_commit,
+    )
+    return data_root, refs, config_ref, stage1_refs
+
+
+def _evaluate(data_root: Path, refs: dict[str, str], config_ref: str, **kwargs: object):
+    repository_root = kwargs.pop("repository_root", ROOT)
+    return evaluate_formal_g20(
+        data_root,
+        refs,
+        repository_root=repository_root,
+        resolved_config_ref=config_ref,
+        output_dir="runs/evaluations",
+        **kwargs,
+    )
+
+
+def test_real_three_commit_formal_fixture_publishes_gate_record(tmp_path: Path) -> None:
+    data_root, refs, config_ref, stage1_refs = _fixture(tmp_path)
+    result = _evaluate(data_root, refs, config_ref)
+    assert result["status"] == "PASS"
+    assert result["formal_eligible"] is True
+    assert isinstance(result["commit_ref"], str)
+    loaded = load_committed_task_artifact(data_root, result["commit_ref"], require_formal=True)  # type: ignore[arg-type]
+    gate = GateRecord.from_mapping(dict(loaded.payload))
+    assert gate.status is GateStatus.PASS
+    assert loaded.source_refs == tuple(refs[kind] for kind in ARTIFACT_KINDS)
+    assert [item["commit_ref"] for item in gate.measured["stage1_source_artifacts"] if "artifact_kind" in item] == [  # type: ignore[index]
+        stage1_refs[kind] for kind in STAGE1_ARTIFACT_KINDS
+    ]
+    evaluator = gate.measured["evaluator"]  # type: ignore[index]
+    assert evaluator["producer_commit"] == _head()  # type: ignore[index]
+    assert evaluator["source_hashes"][EVALUATOR_SOURCE_PATH] == _sha(ROOT / EVALUATOR_SOURCE_PATH)  # type: ignore[index]
+    assert result["evaluation_config_hash"] == evaluator["evaluation_config_hash"]  # type: ignore[index]
+
+
+def test_same_input_reuses_identical_gate_without_checked_at_block(tmp_path: Path) -> None:
+    data_root, refs, config_ref, _ = _fixture(tmp_path)
+    first = _evaluate(data_root, refs, config_ref)
+    second = _evaluate(data_root, refs, config_ref)
+    assert first["status"] == second["status"] == "PASS"
+    assert first["commit_ref"] == second["commit_ref"]
+    assert first["envelope_artifact_hash"] == second["envelope_artifact_hash"]
+    assert first["gate_record"]["checked_at"] == second["gate_record"]["checked_at"]  # type: ignore[index]
+
+
+@pytest.mark.parametrize(
+    "mutator",
+    [
+        lambda refs: (refs["preregistration"], refs["preregistration"], refs["gate_record"]),
+        lambda refs: (refs["preregistration"], refs["hypothesis_contract"], "wrong/path.json"),
+    ],
+)
+def test_missing_duplicate_and_wrong_refs_fail_closed(tmp_path: Path, mutator) -> None:
+    data_root, refs, config_ref, _ = _fixture(tmp_path)
+    result = _evaluate(data_root, mutator(refs), config_ref)
+    assert result["status"] == "BLOCKED"
+    assert result["formal_eligible"] is False
+    assert result["commit_ref"] is None
+
+
+def test_runner_candidate_pass_is_not_a_numeric_gate(tmp_path: Path) -> None:
+    data_root, refs, config_ref, _ = _fixture(tmp_path, candidate_status="PASS")
+    result = _evaluate(data_root, refs, config_ref)
+    assert result["status"] == "FAIL"
+    assert result["formal_eligible"] is False
+    assert "SELF_SIGNED" in " ".join(result["gate_record"]["reasons"])  # type: ignore[index]
+    assert isinstance(result["commit_ref"], str)
+
+
+def test_source_refs_must_be_four_real_formal_task_commits(tmp_path: Path) -> None:
+    data_root, refs, config_ref, _ = _fixture(
+        tmp_path,
+        source_refs=("ordinary/a.json", "ordinary/b.json", "ordinary/c.json", "ordinary/d.json"),
+    )
+    for name in ("a", "b", "c", "d"):
+        write_canonical_json(data_root / f"ordinary/{name}.json", {"schema_version": "ordinary-v1"})
+    result = _evaluate(data_root, refs, config_ref)
+    assert result["status"] == "BLOCKED"
+    assert isinstance(result["commit_ref"], str)
+    assert "artifact_commit_ref" in " ".join(result["gate_record"]["reasons"])  # type: ignore[index]
+
+
+def test_wrong_resolved_config_and_tampered_payload_are_blocked(tmp_path: Path) -> None:
+    data_root, refs, config_ref, _ = _fixture(tmp_path)
+    wrong_ref, wrong_config = _formal_config(
+        data_root,
+        output_dir="runs/other",
+        name="wrong-resolved-config.json",
+        master_seed=7331,
+    )
+    write_canonical_json(data_root / wrong_ref, wrong_config.to_dict())
+    wrong = _evaluate(data_root, refs, wrong_ref)
+    assert wrong["status"] == "BLOCKED"
+
+    commit = TaskArtifactStore(data_root, "runs/stage2-01").load_commit(refs["hypothesis_contract"])
+    object_path = data_root / commit.object_ref
+    value = load_canonical_json(object_path)
+    assert isinstance(value, dict)
+    value["payload"]["hypotheses"][0]["claim"] = "tampered"  # type: ignore[index]
+    object_path.write_text(__import__("json").dumps(value), encoding="utf-8")
+    tampered = _evaluate(data_root, refs, config_ref)
+    assert tampered["status"] == "BLOCKED"
+    assert tampered["commit_ref"] is None
+
+
+def test_fake_producer_commit_is_rejected(tmp_path: Path) -> None:
+    data_root, refs, config_ref, _ = _fixture(tmp_path, producer_commit="f" * 40)
+    result = _evaluate(data_root, refs, config_ref)
+    assert result["status"] == "BLOCKED"
+    assert "GIT_OBJECT_MISSING" in " ".join(result["gate_record"]["reasons"])  # type: ignore[index]
+
+
+def _resign_existing_gate(data_root: Path, commit_ref: str, mutate) -> None:
+    """Rewrite a temporary gate object with valid outer and inner hashes."""
+
+    commit_path = data_root / Path(*commit_ref.split("/"))
+    commit = load_canonical_json(commit_path)
+    assert isinstance(commit, dict)
+    object_path = data_root / Path(*str(commit["object_ref"]).split("/"))
+    envelope = load_canonical_json(object_path)
+    assert isinstance(envelope, dict)
+    payload = dict(envelope["payload"])
+    mutate(payload)
+    payload["artifact_hash"] = canonical_json_hash(
+        {key: item for key, item in payload.items() if key != "artifact_hash"}
+    )
+    body = {key: item for key, item in envelope.items() if key != "artifact_hash"}
+    body["payload"] = payload
+    artifact_hash = canonical_json_hash(body)
+    body["artifact_hash"] = artifact_hash
+    object_dir = data_root / "runs/evaluations" / "g2.0-attempts" / commit_path.parent.parent.name / "objects/gate_record"
+    object_dir.mkdir(parents=True, exist_ok=True)
+    new_object_ref = (
+        f"runs/evaluations/g2.0-attempts/{commit_path.parent.parent.name}/objects/gate_record/{artifact_hash}.json"
+    )
+    write_canonical_json(data_root / Path(*new_object_ref.split("/")), body)
+    commit["artifact_hash"] = artifact_hash
+    commit["object_ref"] = new_object_ref
+    write_canonical_json(commit_path, commit)
+
+
+@pytest.mark.parametrize("mutation", [
+    lambda value: value.update({"gate_id": "stage2.G2.0-tampered"}),
+    lambda value: value.update({"status": "FAIL", "reasons": ["tampered status"]}),
+    lambda value: value["reasons"].append("tampered reason"),
+    lambda value: value["measured"]["evaluator"].update({"source_sha256": "0" * 64}),
+])
+def test_resigned_existing_gate_semantics_are_recomputed_and_blocked(tmp_path: Path, mutation) -> None:
+    data_root, refs, config_ref, _ = _fixture(tmp_path)
+    first = _evaluate(data_root, refs, config_ref)
+    assert first["status"] == "PASS"
+    _resign_existing_gate(data_root, str(first["commit_ref"]), mutation)
+    second = _evaluate(data_root, refs, config_ref)
+    assert second["status"] == "BLOCKED"
+    assert second["commit_ref"] is None
+    assert "SEMANTIC_GATE_DRIFT" in " ".join(second["gate_record"]["reasons"])  # type: ignore[index]
+
+
+def test_dual_root_and_output_root_symlink_fail_closed(tmp_path: Path) -> None:
+    data_root, refs, config_ref, _ = _fixture(tmp_path)
+    assert not (data_root / "docs").exists()
+    result = _evaluate(data_root, refs, config_ref)
+    assert result["status"] == "PASS"
+
+    symlink_target = tmp_path / "outside-output"
+    symlink_target.mkdir()
+    symlink_path = data_root / "runs" / "symlink-output"
+    symlink_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        os.symlink(symlink_target, symlink_path, target_is_directory=True)
+    except (OSError, NotImplementedError):
+        pytest.skip("symlink creation is unavailable")
+    blocked = evaluate_formal_g20(
+        data_root,
+        refs,
+        repository_root=ROOT,
+        resolved_config_ref=config_ref,
+        output_dir="runs/symlink-output",
+    )
+    assert blocked["status"] == "BLOCKED"
+    assert blocked["commit_ref"] is None
+
+
+def test_repository_dirty_and_source_drift_fail_closed(tmp_path: Path) -> None:
+    clone = tmp_path / "repository-clone"
+    subprocess.run(["git", "worktree", "add", "--detach", str(clone), _head()], check=True, capture_output=True)
+    data_root, refs, config_ref, _ = _fixture(tmp_path / "fixture")
+    try:
+        (clone / "src/param_importance_nlp/experiments/stage23_task_runners.py").write_text("\n# drift\n", encoding="utf-8")
+        result = evaluate_formal_g20(
+            data_root,
+            refs,
+            repository_root=clone,
+            resolved_config_ref=config_ref,
+            output_dir="runs/evaluations",
+        )
+        assert result["status"] == "BLOCKED"
+        assert "WORKTREE_DRIFT" in " ".join(result["gate_record"]["reasons"])  # type: ignore[index]
+    finally:
+        subprocess.run(["git", "worktree", "remove", "--force", str(clone)], check=False, capture_output=True)
+
+
+def test_repository_any_tracked_or_untracked_change_blocks(tmp_path: Path) -> None:
+    clone = tmp_path / "repository-clone-clean-check"
+    subprocess.run(["git", "worktree", "add", "--detach", str(clone), _head()], check=True, capture_output=True)
+    data_root, refs, config_ref, _ = _fixture(tmp_path / "fixture-clean-check")
+    try:
+        tracked = clone / "Readme.md"
+        tracked.write_text(tracked.read_text(encoding="utf-8") + "\ntracked drift\n", encoding="utf-8")
+        (clone / "untracked-review-file.txt").write_text("untracked drift\n", encoding="utf-8")
+        result = evaluate_formal_g20(
+            data_root,
+            refs,
+            repository_root=clone,
+            resolved_config_ref=config_ref,
+            output_dir="runs/evaluations",
+        )
+        assert result["status"] == "BLOCKED"
+        assert "repository:WORKTREE_DIRTY" in " ".join(result["gate_record"]["reasons"])  # type: ignore[index]
+    finally:
+        subprocess.run(["git", "worktree", "remove", "--force", str(clone)], check=False, capture_output=True)
+
+
+def test_ancestor_producer_with_critical_sources_equal_is_compatible(tmp_path: Path) -> None:
+    clone = tmp_path / "repository-clone-compatible-producer"
+    subprocess.run(["git", "worktree", "add", "--detach", str(clone), _head()], check=True, capture_output=True)
+    try:
+        producer_commit = _head(clone)
+        tracked = clone / "Readme.md"
+        tracked.write_text(tracked.read_text(encoding="utf-8") + "\ncompatible producer consumer change\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(clone), "add", "Readme.md"], check=True, capture_output=True)
+        subprocess.run(
+            ["git", "-C", str(clone), "-c", "user.name=G20 Test", "-c", "user.email=g20@example.invalid", "commit", "-m", "compatible consumer"],
+            check=True,
+            capture_output=True,
+        )
+        # The fixture is signed by the detached producer parent; the consumer
+        # repository is the clean child whose critical source bytes are equal.
+        data_root, refs, config_ref, _ = _fixture(
+            tmp_path / "fixture-compatible-producer", producer_commit=producer_commit
+        )
+        result = _evaluate(data_root, refs, config_ref, repository_root=clone)
+        assert result["status"] == "PASS"
+        evaluator = result["gate_record"]["measured"]["evaluator"]  # type: ignore[index]
+        assert evaluator["producer_compatibility"]["mode"] == "ancestor_critical_sources_equal"  # type: ignore[index]
+        assert evaluator["producer_compatibility"]["producer_commit"] == producer_commit  # type: ignore[index]
+    finally:
+        subprocess.run(["git", "worktree", "remove", "--force", str(clone)], check=False, capture_output=True)
+
+
+def test_ancestor_producer_with_critical_source_drift_is_rejected(tmp_path: Path) -> None:
+    # Find the nearest real ancestor whose evaluator source blob predates the
+    # trusted current source family; it is an ancestor but not compatible.
+    history = subprocess.run(
+        ["git", "-C", str(ROOT), "rev-list", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.splitlines()
+    current_blob = subprocess.run(
+        ["git", "-C", str(ROOT), "show", f"{history[0]}:{EVALUATOR_SOURCE_PATH}"],
+        check=True,
+        capture_output=True,
+    ).stdout
+    old_producer = next(
+        candidate
+        for candidate in history[1:]
+        if subprocess.run(
+            ["git", "-C", str(ROOT), "show", f"{candidate}:{EVALUATOR_SOURCE_PATH}"],
+            check=True,
+            capture_output=True,
+        ).stdout != current_blob
+    )
+    data_root, refs, config_ref, _ = _fixture(tmp_path, producer_commit=old_producer)
+    result = _evaluate(data_root, refs, config_ref)
+    assert result["status"] == "BLOCKED"
+    assert "CRITICAL_SOURCE_DRIFT" in " ".join(result["gate_record"]["reasons"])  # type: ignore[index]
+
+
+def test_input_object_symlink_is_rejected(tmp_path: Path) -> None:
+    data_root, refs, config_ref, _ = _fixture(tmp_path)
+    commit = TaskArtifactStore(data_root, "runs/stage2-01").load_commit(refs["preregistration"])
+    object_path = data_root / commit.object_ref
+    backup = tmp_path / "object-backup.json"
+    shutil.copy2(object_path, backup)
+    object_path.unlink()
+    try:
+        os.symlink(backup, object_path)
+    except (OSError, NotImplementedError):
+        pytest.skip("symlink creation is unavailable")
+    result = _evaluate(data_root, refs, config_ref)
+    assert result["status"] == "BLOCKED"
+    assert result["commit_ref"] is None

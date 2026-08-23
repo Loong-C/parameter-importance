@@ -707,6 +707,7 @@ class _BoundInputArtifact:
     run_intent: str
     formal_eligible: bool
     commit_ref: str
+    source_refs: tuple[str, ...]
     payload: Mapping[str, object]
 
 
@@ -787,6 +788,11 @@ def _load_bound_task_input(
     payload = body.get("payload")
     if not isinstance(payload, Mapping):
         raise ValueError("STAGE23_INPUT_PAYLOAD_NOT_MAPPING")
+    source_refs = body.get("source_refs")
+    if not isinstance(source_refs, (list, tuple)) or not all(
+        isinstance(value, str) and value for value in source_refs
+    ):
+        raise ValueError("STAGE23_INPUT_SOURCE_REFS_INVALID")
     run_intent = body.get("run_intent")
     if run_intent not in {"local_fixture", "formal"}:
         raise ValueError("STAGE23_INPUT_RUN_INTENT_INVALID")
@@ -798,6 +804,7 @@ def _load_bound_task_input(
         run_intent=str(run_intent),
         formal_eligible=published.formal_eligible,
         commit_ref=published.commit_ref,
+        source_refs=tuple(source_refs),
         payload=dict(payload),
     )
 
@@ -1420,8 +1427,8 @@ def _stage2_source_identity() -> tuple[str, str | None, str | None]:
 
     Local fixture tests execute with a temporary artifact root, so the repository
     identity comes from this source module's worktree rather than that output root.
-    Missing report files are represented as ``None`` for development; formal
-    preflight remains responsible for requiring the Stage 1 evidence.
+    Stage1 formal provenance is supplied by the immutable DATA_ROOT bridge; the
+    tracked ``reports/...local_fixture`` file is intentionally never used.
     """
 
     repository_root = Path(__file__).resolve().parents[3]
@@ -1441,14 +1448,34 @@ def _stage2_source_identity() -> tuple[str, str | None, str | None]:
             return None
         return hashlib.sha256(path.read_bytes()).hexdigest()
 
-    return (
-        producer_commit,
-        file_hash("docs/mathematics.md"),
-        file_hash(
-            "reports/stage1/cpu-evidence-20260814-s12-r2/"
-            "stage1.11_reporting_and_exit_gate/stage_report.json"
-        ),
-    )
+    return (producer_commit, file_hash("docs/mathematics.md"), None)
+
+
+def _stage1_formal_bridge_identity(
+    root: Path,
+    inputs: _PredecessorContext,
+) -> Mapping[str, JSONValue] | None:
+    """Load the immutable S1.11 bridge carried by formal predecessor commits.
+
+    The bridge is DATA_ROOT evidence, not the tracked Stage1 report fixture.
+    Local drafts may omit it; a formal G2.0 evaluator will then fail closed.
+    """
+
+    references = {
+        reference
+        for item in inputs.artifacts
+        for reference in item.source_refs
+        if isinstance(reference, str)
+        and reference.endswith("/stage1-11-bridge-evidence.json")
+    }
+    if not references:
+        return None
+    if len(references) != 1:
+        raise ValueError("STAGE2_STAGE1_BRIDGE_REF_NOT_UNIQUE")
+    value = load_canonical_json(_workspace_path(root, next(iter(references)), field="stage1_bridge"))
+    if not isinstance(value, Mapping):
+        raise ValueError("STAGE2_STAGE1_BRIDGE_NOT_OBJECT")
+    return dict(value)
 
 
 def _run_stage2_contract(
@@ -1476,12 +1503,20 @@ def _run_stage2_contract(
             )
     seed_plan = SeedPlan.from_master_seed(int(identity["master_seed"]))
     producer_commit, mathematics_hash, stage1_report_hash = _stage2_source_identity()
+    stage1_handoff = (
+        _stage1_formal_bridge_identity(root, inputs)
+        if request.config.run_intent == "formal"
+        else None
+    )
     preregistration = build_stage2_preregistration(
         seed_plan_hash=seed_plan.artifact_hash,
         producer_commit=producer_commit,
         mathematics_hash=mathematics_hash,
-        stage1_report_hash=stage1_report_hash,
+        # The repository report is retained only for local-draft compatibility;
+        # formal provenance is the immutable DATA_ROOT bridge below.
+        stage1_report_hash=(None if stage1_handoff is not None else stage1_report_hash),
         upstream_binding_hash=inputs.binding_hash,
+        stage1_handoff=stage1_handoff,
         scope=request.config.run_intent,
     )
     validate_stage2_preregistration(preregistration)
