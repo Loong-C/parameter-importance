@@ -463,6 +463,21 @@ def _source_refs(request: TaskExecutionRequest, extra: Sequence[str] = ()) -> tu
     return tuple(dict.fromkeys(ordered))
 
 
+def _formal_environment_source_refs(request: TaskExecutionRequest) -> tuple[str, ...]:
+    """Return immutable environment evidence refs for formal handoff lineage.
+
+    S2.2's direct predecessors remain the three S2.1 commits.  The formal
+    fixed-state handoff is additionally bound to the exact G2.1/environment
+    snapshot that authorized the provider; these refs are appended by the
+    specialized handler rather than smuggled into the predecessor set.
+    """
+
+    if request.config.run_intent != "formal":
+        return ()
+    evidence_refs = request.environment.evidence_refs
+    return tuple(dict.fromkeys(str(ref) for ref in evidence_refs.values()))
+
+
 def _publish_payloads(
     request: TaskExecutionRequest,
     store: TaskArtifactStore,
@@ -921,6 +936,20 @@ def _predecessor_context(
         and expected_tasks == ("stage1.11_reporting_and_exit_gate",)
     ):
         expected_tasks = ()
+    elif (
+        request.config.run_intent == "formal"
+        and request.task.task_id == "stage2.02_stage1_handoff_and_fixed_state_contract"
+    ):
+        # The reviewed G2.1 config carries the complete Stage 1 handoff (S1.10
+        # and S1.11) alongside the three S2.1 commits.  They are direct
+        # immutable inputs for this audit, while the catalog still names S2.1
+        # as the scientific predecessor.  Keep the expanded set formal-only;
+        # fixture chains retain the narrow legacy contract.
+        expected_tasks = (
+            "stage2.01_scope_hypotheses_and_preregistration",
+            "stage1.10_checkpoint_resume_and_artifacts",
+            "stage1.11_reporting_and_exit_gate",
+        )
 
     grouped: dict[str, dict[str, _BoundInputArtifact]] = {}
     auxiliaries: list[str] = []
@@ -2030,7 +2059,7 @@ def _run_stage2_handoff_audit(
             "fixed_state_contract": fixed_state,
             "gate_record": _gate_candidate(request),
         },
-        inputs.references,
+        tuple(dict.fromkeys((*inputs.references, *_formal_environment_source_refs(request)))),
     )
 
 

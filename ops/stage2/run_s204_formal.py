@@ -36,6 +36,10 @@ from param_importance_nlp.experiments import (
     DataRangeManifest,
     validate_formal_asset_identity,
 )
+from param_importance_nlp.experiments.stage2_s204_ids import (
+    canonical_cell_id,
+    cell_path_component,
+)
 
 
 G21_ARTIFACT = "259831e2a1b16afbbef34c9cea602e636756b0f6173d1a8f4c32ec554c653f79"
@@ -505,7 +509,7 @@ def build_plan(
     for checkpoint_record in rows:
         checkpoint = checkpoint_record.to_dict()
         identity = _formal_logical_identity(checkpoint)
-        cell_id = str(checkpoint_record.checkpoint_id)
+        cell_id = canonical_cell_id(checkpoint_record.model_id, checkpoint_record.training_stage)
         if (
             not cell_id
             or "\\" in cell_id
@@ -549,9 +553,15 @@ def build_plan(
                 "final_sample_count_per_stream": final_draws_per_stream,
                 "fixed_work_units_at_candidate_max": fixed_work_units,
                 "estimated_seconds_at_candidate_max": fixed_work_units * per_sequence_seconds,
-                "progress_path": (output_root / cell_id / "progress.jsonl").as_posix(),
+                "progress_path": (
+                    output_root / cell_path_component(cell_id) / "progress.jsonl"
+                ).as_posix(),
                 "progress_path_pattern": (
-                    output_root / cell_id / "attempts" / "{fresh-or-resume}-{config.full_hash}" / "progress.jsonl"
+                    output_root
+                    / cell_path_component(cell_id)
+                    / "attempts"
+                    / "{fresh-or-resume}-{config.full_hash}"
+                    / "progress.jsonl"
                 ).as_posix(),
             }
         )
@@ -986,10 +996,16 @@ def _runtime_cell_configs(
             output_section = resolved.section("artifacts")
             output_dir = str(output_section["output_dir"])
             output_parts = PurePosixPath(output_dir).parts
-            planned_cell_ids = {str(item["cell_id"]) for item in plan["cells"]}
+            planned_cell_components = {
+                cell_path_component(str(item["cell_id"])) for item in plan["cells"]
+            }
+            expected_component = cell_path_component(str(expected["cell_id"]))
             if (
-                str(expected["cell_id"]) not in output_parts
-                or any(item != str(expected["cell_id"]) and item in output_parts for item in planned_cell_ids)
+                expected_component not in output_parts
+                or any(
+                    item != expected_component and item in output_parts
+                    for item in planned_cell_components
+                )
             ):
                 mismatches.append("artifacts.output_dir.cell_id")
         except (KeyError, TypeError, ValueError):
@@ -1213,7 +1229,7 @@ def execute_with_task_runtime(
         if not isinstance(artifacts, Mapping) or not isinstance(recovery, Mapping):
             raise ValueError(f"{config_path}: malformed artifacts/recovery section")
         attempt_id, run_kind, resume_ref_text = _cell_attempt_id(config)
-        cell_root = output_root / current_cell_id / "attempts" / attempt_id
+        cell_root = output_root / cell_path_component(current_cell_id) / "attempts" / attempt_id
         event_path = cell_root / "attempt-events.jsonl"
         final_status_path = cell_root / "final-status.json"
         task_output_dir = _resolve_data_root_ref(
@@ -1366,8 +1382,8 @@ def aggregate_g23(
     for expected in plan["cells"]:
         current_cell_id = str(expected["cell_id"])
         status_paths = sorted(
-            (output_root / current_cell_id).rglob("final-status.json")
-            if (output_root / current_cell_id).exists()
+            (output_root / cell_path_component(current_cell_id)).rglob("final-status.json")
+            if (output_root / cell_path_component(current_cell_id)).exists()
             else []
         )
         complete_rows: list[dict[str, Any]] = []
