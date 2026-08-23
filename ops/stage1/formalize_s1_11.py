@@ -95,6 +95,19 @@ S110_TASK_ROLE_MAP = {
     "resume_equivalence_report": "resume_report",
     "gate_record": "gate_record",
 }
+S110_ROLE_HASH_FIELDS = {
+    "formal_observation": "artifact_hash",
+    "artifact_manifest": "manifest_hash",
+    "resume_report": "report_hash",
+    "gate_record": "artifact_hash",
+    "oracle_bundle": "oracle_hash",
+    "trace_bundle": "trace_hash",
+    "comparison_table": "table_hash",
+    "validation": "artifact_hash",
+    "replay": "replay_hash",
+    "success": "artifact_hash",
+    "index": "artifact_hash",
+}
 S110_R12_SOURCE_PATHS = (
     "fixtures/stage1/stage1-s110-checkpoint-fixture-v1.json",
     "ops/stage1/formalize_s1_10.py",
@@ -1142,21 +1155,18 @@ def _emit_load_r4(
 def _declared_role_hash(value: Mapping[str, object], *, role: str) -> str:
     """Return and verify the historical role's own canonical hash field."""
 
-    for field in (
-        "artifact_hash", "manifest_hash", "report_hash", "oracle_hash",
-        "trace_hash", "table_hash", "replay_hash",
-    ):
-        if field in value:
-            body = dict(value)
-            declared = body.pop(field)
-            if not _digest(declared) or declared != canonical_json_hash(body):
-                raise Stage1S111FormalError(
-                    f"S1_11_EMIT_S110_ROLE_SELF_HASH_INVALID:{role}"
-                )
-            return str(declared)
-    raise Stage1S111FormalError(
-        f"S1_11_EMIT_S110_ROLE_SELF_HASH_MISSING:{role}"
-    )
+    field = S110_ROLE_HASH_FIELDS.get(role)
+    if field is None or field not in value:
+        raise Stage1S111FormalError(
+            f"S1_11_EMIT_S110_ROLE_SELF_HASH_MISSING:{role}"
+        )
+    body = dict(value)
+    declared = body.pop(field)
+    if not _digest(declared) or declared != canonical_json_hash(body):
+        raise Stage1S111FormalError(
+            f"S1_11_EMIT_S110_ROLE_SELF_HASH_INVALID:{role}"
+        )
+    return str(declared)
 
 
 def _emit_load_s110(
@@ -1344,9 +1354,12 @@ def _emit_load_s110(
             "index": index,
         },
         producer_commit=S110_R12_PRODUCER_COMMIT,
-        frozen_source_sha256=source_map,
+        frozen_source_sha256={
+            **dict(source_map),
+            "ops/stage1/formalize_s1_6.py": S111_R4_VALIDATOR_SOURCE_SHA256,
+        },
         schema_prefix="s1-10",
-        validator_source_path="ops/stage1/formalize_s1_10.py",
+        validator_source_path="ops/stage1/formalize_s1_6.py",
     )
     source_refs = sorted(
         path.relative_to(evidence_root.resolve()).as_posix()

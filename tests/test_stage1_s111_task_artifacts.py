@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import importlib.util
+import os
 from pathlib import Path
 
 import pytest
 
 from param_importance_nlp.contracts.jsonio import canonical_json_hash, write_canonical_json
+from param_importance_nlp.runtime.task_artifacts import load_committed_task_artifact
 
 
 def _formalizer():
@@ -75,6 +77,38 @@ def test_emit_cli_does_not_require_execute_inputs_and_still_uses_real_loader(tmp
             "--approved-data-root", str(tmp_path),
             "--task-output-dir", "outputs/s111",
         ])
+
+
+def test_real_r12_to_s111_publication_uses_authority_bytes_when_mounted() -> None:
+    """Exercise the complete positive path when a real evidence copy is mounted.
+
+    CI/review machines provide ``S111_REAL_DATA_ROOT`` as a writable local copy
+    of the server DATA_ROOT.  The test refuses the live server path, so running
+    the suite can never turn a read-only evidence check into a server write.
+    """
+
+    formalizer = _formalizer()
+    root_value = os.environ.get("S111_REAL_DATA_ROOT")
+    if not root_value:
+        pytest.skip("real r4/r12 DATA_ROOT copy is not mounted")
+    root = Path(root_value).resolve()
+    if root.as_posix() == formalizer.S111_APPROVED_DATA_ROOT:
+        pytest.skip("refusing to write the live approved DATA_ROOT")
+    repository = Path(os.environ.get("S111_REAL_REPOSITORY", str(Path.cwd()))).resolve()
+    result = formalizer.emit_task_artifacts(
+        repository=repository,
+        evidence_root=root,
+        approved_data_root=root,
+        output_dir="evidence/stage1/tasks/11-s1-11-r4-20260821",
+        s110_output_dir="evidence/stage1/tasks/10-s1-10-r12-20260821",
+    )
+    assert set(result["commit_refs"]) == set(formalizer.S111_TASK_ARTIFACT_KINDS)
+    compat = result["s110_compatibility"]
+    assert set(compat["commit_refs"]) == set(formalizer.S110_TASK_ARTIFACT_KINDS)
+    for ref in (*result["commit_refs"].values(), *compat["commit_refs"].values()):
+        loaded = load_committed_task_artifact(root, ref, require_formal=True)
+        assert loaded.run_intent == "formal"
+        assert loaded.identity.formal_eligible is True
 
 
 def _payload(kind: str) -> dict[str, object]:
