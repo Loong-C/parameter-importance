@@ -43,6 +43,7 @@ GATE_ID = "stage2.G2.2"
 TASK_ID = "stage2.03_assets_checkpoints_and_sampling"
 ARTIFACT_KINDS = ("sampling_plan", "draw_manifest", "asset_resolution", "gate_record")
 ADAPTER_SCHEMA_VERSION = "stage2-g2.2-gate-adapter-v1"
+FORMAL_ADAPTER_OUTPUT_DIR = "evidence/stage2/s204/formal-adapters/g2-2-r7"
 
 AUTHORITY_EVIDENCE_REF = "evidence/stage2/s203/g2.2-assets.json"
 AUTHORITY_EVIDENCE_SHA256 = "b6805b6744374e7d05f193db4d72162176b930fa1db250bc00797b3ad30528a8"
@@ -709,6 +710,21 @@ def _config(root: Path, ref: str, expected_hash: str) -> ResolvedConfigV2:
     return config
 
 
+def _formal_adapter_output_path(data_root: Path, s203_output_dir: str) -> Path:
+    """Resolve the fixed, independent G2.2 publication root.
+
+    The S2.3 output is an input to lineage verification only.  Keeping this
+    path as a code-owned constant prevents a resolved-config candidate commit
+    from being mistaken for the adapter's formal GateRecord.
+    """
+    if s203_output_dir == FORMAL_ADAPTER_OUTPUT_DIR:
+        raise G22Blocked("G22_ADAPTER_OUTPUT_DIR_COLLIDES_WITH_S203")
+    path = _resolve(data_root, FORMAL_ADAPTER_OUTPUT_DIR)
+    if path == data_root or not path.is_relative_to(data_root):
+        raise G22Blocked("G22_ADAPTER_OUTPUT_DIR_INVALID")
+    return path
+
+
 def _gate(
     *,
     status: GateStatus,
@@ -759,8 +775,9 @@ def evaluate_formal_g22(
         if not isinstance(artifacts, Mapping) or not isinstance(artifacts.get("output_dir"), str):
             raise G22Blocked("G22_RESOLVED_CONFIG_OUTPUT_CONTRACT_INVALID")
         configured_output_dir = str(artifacts["output_dir"])
-        if output_dir is not None and output_dir != configured_output_dir:
-            raise G22Blocked("G22_OUTPUT_DIR_OVERRIDE_REJECTED")
+        if output_dir is not None and output_dir != FORMAL_ADAPTER_OUTPUT_DIR:
+            raise G22Blocked("G22_ADAPTER_OUTPUT_DIR_OVERRIDE_REJECTED")
+        _formal_adapter_output_path(data, configured_output_dir)
         upstream_binding_hash, preregistration_hash = _verify_s203_lineage(
             data, loaded, config, configured_output_dir
         )
@@ -805,9 +822,11 @@ def evaluate_formal_g22(
             )
             + tuple(str(item["ref"]) for item in assets["offline_loads"])
         ))
-        measured: dict[str, JSONValue] = {"adapter_schema_version": ADAPTER_SCHEMA_VERSION, "task_id": TASK_ID, "config": {"ref": resolved_config_ref, "config_hash": config.config_hash, "full_hash": config.full_hash, "run_intent": config.run_intent, "formal_eligible": config.formal_eligible}, "roots": {"repository_root": str(repository), "data_root": str(data)}, "repository": repo_identity, "producer": producer, "authority": assets, "lineage": {"upstream_binding_hash": upstream_binding_hash, "preregistration_contract_hash": preregistration_hash, "source_refs": list(source_refs)}, "sampling_replay": replay, "runtime": {"runtime": "TaskRuntime", "formal_envelope": "load_committed_task_artifact", "store": "TaskArtifactStore", "gate_schema": "gate-record-v1"}, "input_artifacts": {kind: {"commit_ref": loaded[kind].identity.commit_ref, "artifact_hash": loaded[kind].identity.artifact_hash} for kind in ARTIFACT_KINDS}}
+        measured: dict[str, JSONValue] = {"adapter_schema_version": ADAPTER_SCHEMA_VERSION, "task_id": TASK_ID, "config": {"ref": resolved_config_ref, "config_hash": config.config_hash, "full_hash": config.full_hash, "run_intent": config.run_intent, "formal_eligible": config.formal_eligible}, "roots": {"repository_root": str(repository), "data_root": str(data)}, "repository": repo_identity, "producer": producer, "authority": assets, "lineage": {"upstream_binding_hash": upstream_binding_hash, "preregistration_contract_hash": preregistration_hash, "source_refs": list(source_refs)}, "sampling_replay": replay, "runtime": {"runtime": "TaskRuntime", "formal_envelope": "load_committed_task_artifact", "store": "TaskArtifactStore", "gate_schema": "gate-record-v1", "adapter_output_dir": FORMAL_ADAPTER_OUTPUT_DIR}, "input_artifacts": {kind: {"commit_ref": loaded[kind].identity.commit_ref, "artifact_hash": loaded[kind].identity.artifact_hash} for kind in ARTIFACT_KINDS}}
         gate = _gate(status=GateStatus.PASS, checked_at=checked_at, measured=measured, refs=evidence_refs)
-        store = TaskArtifactStore(data, configured_output_dir)
+        # The fixed logical path has already passed the DATA_ROOT boundary;
+        # discovery/reuse cannot inspect the S2.3 candidate directory.
+        store = TaskArtifactStore(data, FORMAL_ADAPTER_OUTPUT_DIR)
         existing = store.discover_complete(task_id=TASK_ID, config_hash=config.config_hash, artifact_kinds=("gate_record",), formal_eligible=True)
         if existing:
             loaded_gate = load_committed_task_artifact(data, existing["gate_record"], require_formal=True)

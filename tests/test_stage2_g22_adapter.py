@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 from pathlib import Path
 import subprocess
+from types import SimpleNamespace
 
 import pytest
 
@@ -11,6 +12,7 @@ from param_importance_nlp.contracts.jsonio import canonical_json_hash
 from param_importance_nlp.experiments.sampling import RepetitionMapping, SamplingPlan, SamplingUniverse, STREAM_NAMES, _sha256_json
 from param_importance_nlp.experiments.stage2_g22_adapter import (
     ARTIFACT_KINDS,
+    FORMAL_ADAPTER_OUTPUT_DIR,
     G22Blocked,
     _gate,
     _cross_bind_offline_registry_hash,
@@ -20,7 +22,9 @@ from param_importance_nlp.experiments.stage2_g22_adapter import (
     _validate_task_inputs,
     evaluate_formal_g22,
 )
+from param_importance_nlp.experiments import stage2_g22_adapter as adapter
 from param_importance_nlp.runtime.task_artifacts import TaskArtifactStore
+from param_importance_nlp.runtime.task_artifacts import load_committed_task_artifact
 
 
 def _formal_fixture(root: Path) -> dict[str, str]:
@@ -171,3 +175,131 @@ def test_current_task_producer_uses_clean_head_not_parent_authority_commit() -> 
     ).stdout.strip()
     assert head != PRODUCER_COMMIT
     assert _producer_identity(repository, head)["commit"] == head
+
+
+def _stub_formal_adapter(monkeypatch: pytest.MonkeyPatch, s203_output_dir: str) -> dict[str, str]:
+    config_hash = "d" * 64
+    source_refs = ("commits/stage2.01.json",)
+
+    def section(name: str) -> object:
+        if name == "artifacts":
+            return {"output_dir": s203_output_dir}
+        if name == "orchestration":
+            return {"input_result_refs": list(source_refs)}
+        raise KeyError(name)
+
+    config = SimpleNamespace(
+        task_id="stage2.03_assets_checkpoints_and_sampling",
+        run_intent="formal",
+        formal_eligible=True,
+        config_hash=config_hash,
+        full_hash="e" * 64,
+        section=section,
+    )
+    loaded = {
+        kind: SimpleNamespace(
+            payload={},
+            identity=SimpleNamespace(
+                commit_ref=f"{s203_output_dir}/commits/{kind}.json",
+                artifact_hash=("f" * 63) + str(index),
+            ),
+        )
+        for index, kind in enumerate(ARTIFACT_KINDS)
+    }
+    monkeypatch.setattr(adapter, "_validate_task_inputs", lambda _root, _refs: (loaded, config_hash))
+    monkeypatch.setattr(adapter, "_config", lambda _root, _ref, _hash: config)
+    monkeypatch.setattr(adapter, "_verify_s203_lineage", lambda *_args: ("a" * 64, "b" * 64))
+    monkeypatch.setattr(adapter, "validate_formal_s203_payloads", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(adapter, "_validate_sampling_replay", lambda _payloads: {"streams": []})
+    monkeypatch.setattr(
+        adapter,
+        "_git_identity",
+        lambda _root: {"head": "1" * 40, "tree": "2" * 40, "sources": {}},
+    )
+    monkeypatch.setattr(
+        adapter,
+        "_producer_identity",
+        lambda _root, commit: {"commit": commit, "mode": "same_commit", "source_git_blobs": {}},
+    )
+    monkeypatch.setattr(
+        adapter,
+        "_validate_real_assets",
+        lambda _root, **_kwargs: {
+            "amendment": {
+                "qualification_index": {"ref": "qualification-index.json"},
+                "qualification_refs": [],
+            },
+            "registry_manifests": [],
+            "offline_loads": [],
+        },
+    )
+    return {kind: f"{s203_output_dir}/commits/{kind}.json" for kind in ARTIFACT_KINDS}
+
+
+def test_formal_gate_uses_independent_output_and_reloads_with_source_refs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    s203_output = "task_outputs/s203"
+    refs = _stub_formal_adapter(monkeypatch, s203_output)
+    TaskArtifactStore(tmp_path, s203_output).publish(
+        task_id="stage2.03_assets_checkpoints_and_sampling",
+        artifact_kind="gate_record",
+        config_hash="d" * 64,
+        run_intent="formal",
+        formal_eligible=True,
+        payload={"schema_version": "candidate-v1", "candidate": True},
+        source_refs=("commits/stage2.01.json",),
+    )
+
+    first = evaluate_formal_g22(
+        repository_root=tmp_path.parent / "repository",
+        data_root=tmp_path,
+        resolved_config_ref="inputs/resolved-config.json",
+        s203_artifact_refs=refs,
+    )
+    assert first["status"] == "PASS"
+    assert first["reused"] is False
+    assert str(first["commit_ref"]).startswith(f"{FORMAL_ADAPTER_OUTPUT_DIR}/")
+    assert not str(first["commit_ref"]).startswith(f"{s203_output}/")
+    loaded = load_committed_task_artifact(tmp_path, str(first["commit_ref"]), require_formal=True)
+    assert loaded.source_refs == ("commits/stage2.01.json",)
+
+    second = evaluate_formal_g22(
+        repository_root=tmp_path.parent / "repository",
+        data_root=tmp_path,
+        resolved_config_ref="inputs/resolved-config.json",
+        s203_artifact_refs=refs,
+    )
+    assert second["status"] == "PASS"
+    assert second["reused"] is True
+    assert second["commit_ref"] == first["commit_ref"]
+
+
+def test_formal_gate_rejects_s203_output_equal_to_adapter_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    refs = _stub_formal_adapter(monkeypatch, FORMAL_ADAPTER_OUTPUT_DIR)
+    result = evaluate_formal_g22(
+        repository_root=tmp_path.parent / "repository",
+        data_root=tmp_path,
+        resolved_config_ref="inputs/resolved-config.json",
+        s203_artifact_refs=refs,
+    )
+    assert result["status"] == "BLOCKED"
+    assert "G22_ADAPTER_OUTPUT_DIR_COLLIDES_WITH_S203" in str(result["reason"])
+
+
+def test_formal_gate_rejects_s203_output_override(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    s203_output = "task_outputs/s203"
+    refs = _stub_formal_adapter(monkeypatch, s203_output)
+    result = evaluate_formal_g22(
+        repository_root=tmp_path.parent / "repository",
+        data_root=tmp_path,
+        resolved_config_ref="inputs/resolved-config.json",
+        s203_artifact_refs=refs,
+        output_dir=s203_output,
+    )
+    assert result["status"] == "BLOCKED"
+    assert "G22_ADAPTER_OUTPUT_DIR_OVERRIDE_REJECTED" in str(result["reason"])
