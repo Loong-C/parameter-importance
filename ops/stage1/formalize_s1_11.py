@@ -26,6 +26,10 @@ if str(REPOSITORY / "src") not in sys.path:
     sys.path.insert(0, str(REPOSITORY / "src"))
 
 from param_importance_nlp.contracts.jsonio import canonical_json_hash, load_canonical_json, write_canonical_json
+from param_importance_nlp.runtime.task_artifacts import (
+    TaskArtifactStore,
+    load_committed_task_artifact,
+)
 from param_importance_nlp.stage1_exit_gate import (
     GATE_ID, REQUIRED_CHARTS, REQUIREMENT_IDS, TASK_ID, Stage1ExitGateError,
 )
@@ -33,6 +37,46 @@ from param_importance_nlp.stage1_exit_gate import (
 
 class Stage1S111FormalError(RuntimeError):
     """A failed preflight/publish is never a G1-EXIT result."""
+
+
+# This is the released authority selected by the Stage 2 handoff contract.
+# Emit mode deliberately cannot accept a caller-selected index, an r3 attempt,
+# or a tracked/local fixture that merely has PASS-looking JSON.
+S111_R4_PRODUCER_COMMIT = "3f18b04df8922be9894678ae4842bd999c7e8fd5"
+S111_R4_ATTEMPT_ID = "s1-11-r4-20260821"
+S111_R4_INDEX_REF = (
+    "evidence/stage1/s1-11-formal/"
+    f"{S111_R4_PRODUCER_COMMIT}/{S111_R4_ATTEMPT_ID}/index.json"
+)
+S111_TASK_OUTPUT_DEFAULT = (
+    "evidence/stage1/tasks/11-s1-11-r4-20260821"
+)
+S111_TASK_ARTIFACT_KINDS = (
+    "stage_report",
+    "requirements_matrix",
+    "gate_summary",
+    "delivery_manifest",
+)
+
+# The S1.11 index is an exact wire contract.  Keeping this map in the producer
+# (rather than accepting same-cardinality caller maps) prevents role
+# substitution while retaining the historical r4 filenames.
+S111_R4_ROLE_REFS: dict[str, str] = {
+    "formal_observation": "formal-observation.json",
+    "test_summary": "test-summary.json",
+    "requirements_matrix": "requirements-matrix.json",
+    "top_errors": "top-errors.json",
+    "gate_summary": "gate-summary.json",
+    "stage_report": "stage-report.json",
+    "stage_report_markdown": "stage-report.md",
+    "delivery_manifest": "delivery-manifest.json",
+    "replay_validation": "replay-validation.json",
+    **{
+        f"{chart.replace('-', '_')}_{suffix}": f"{chart}.{suffix}"
+        for chart in REQUIRED_CHARTS
+        for suffix in ("csv", "svg")
+    },
+}
 
 
 def _sha(path: Path) -> str:
@@ -551,6 +595,505 @@ def _top_errors(evidence_root: Path, dependencies: list[Mapping[str, object]]) -
     return rows[:20]
 
 
+def _emit_relative(root: Path, value: object, *, field: str) -> Path:
+    """Resolve a producer path without accepting absolute/parent/symlink refs."""
+
+    if not isinstance(value, str) or not value or "\\" in value:
+        raise Stage1S111FormalError(f"S1_11_EMIT_{field.upper()}_REF_INVALID")
+    logical = Path(value)
+    if logical.is_absolute() or any(part in {"", ".", ".."} for part in logical.parts):
+        raise Stage1S111FormalError(f"S1_11_EMIT_{field.upper()}_REF_INVALID")
+    candidate = root.joinpath(*logical.parts)
+    resolved = candidate.resolve()
+    try:
+        resolved.relative_to(root.resolve())
+    except ValueError as error:
+        raise Stage1S111FormalError(
+            f"S1_11_EMIT_{field.upper()}_REF_ESCAPES_ROOT"
+        ) from error
+    return candidate
+
+
+def _reject_symlink_tree(path: Path, *, field: str) -> None:
+    """Reject symlinks in an authority/output tree before any write occurs."""
+
+    if path.is_symlink():
+        raise Stage1S111FormalError(f"S1_11_EMIT_{field.upper()}_SYMLINK_FORBIDDEN")
+    if not path.exists():
+        return
+    if path.is_file():
+        return
+    for child in path.iterdir():
+        if child.is_symlink():
+            raise Stage1S111FormalError(
+                f"S1_11_EMIT_{field.upper()}_SYMLINK_FORBIDDEN"
+            )
+        if child.is_dir():
+            _reject_symlink_tree(child, field=field)
+
+
+def _reject_symlink_ancestors(path: Path, root: Path, *, field: str) -> None:
+    """Check only path ancestors, avoiding a recursive scan of DATA_ROOT."""
+
+    current = path
+    root = root.resolve()
+    while True:
+        if current.is_symlink():
+            raise Stage1S111FormalError(
+                f"S1_11_EMIT_{field.upper()}_SYMLINK_FORBIDDEN"
+            )
+        if current.resolve() == root:
+            return
+        if current.parent == current:
+            raise Stage1S111FormalError(
+                f"S1_11_EMIT_{field.upper()}_ROOT_INVALID"
+            )
+        current = current.parent
+
+
+def _emit_json(path: Path, value: Mapping[str, object], *, field: str) -> None:
+    """Write once, then make every retry compare the exact canonical object."""
+
+    if path.is_symlink():
+        raise Stage1S111FormalError(f"S1_11_EMIT_{field.upper()}_SYMLINK_FORBIDDEN")
+    if path.exists():
+        try:
+            existing = load_canonical_json(path)
+        except (OSError, TypeError, ValueError) as error:
+            raise Stage1S111FormalError(
+                f"S1_11_EMIT_{field.upper()}_EXISTING_INVALID"
+            ) from error
+        if existing != dict(value):
+            raise Stage1S111FormalError(
+                f"S1_11_EMIT_{field.upper()}_IDENTITY_DRIFT"
+            )
+        return
+    _write(path, value)
+    try:
+        if load_canonical_json(path) != dict(value):
+            raise Stage1S111FormalError(
+                f"S1_11_EMIT_{field.upper()}_READBACK_MISMATCH"
+            )
+    except (OSError, TypeError, ValueError) as error:
+        if isinstance(error, Stage1S111FormalError):
+            raise
+        raise Stage1S111FormalError(
+            f"S1_11_EMIT_{field.upper()}_READBACK_INVALID"
+        ) from error
+
+
+def _git_blob_sha256(repository: Path, commit: str, source: str) -> str:
+    """Hash the producer commit's bytes, not the current consumer worktree."""
+
+    completed = subprocess.run(
+        ["git", "-C", str(repository), "show", f"{commit}:{source}"],
+        capture_output=True,
+        check=False,
+    )
+    if completed.returncode != 0:
+        raise Stage1S111FormalError(
+            f"S1_11_EMIT_PRODUCER_SOURCE_MISSING:{source}"
+        )
+    return hashlib.sha256(completed.stdout).hexdigest()
+
+
+def _emit_load_r4(
+    *, repository: Path, evidence_root: Path, evidence_ref: str,
+) -> dict[str, object]:
+    """Read and fully validate the released r4 publication before publishing."""
+
+    if evidence_ref.replace("\\", "/") != S111_R4_INDEX_REF:
+        raise Stage1S111FormalError("S1_11_EMIT_R4_AUTHORITY_REF_REQUIRED")
+    index_path = _relative(evidence_root, evidence_ref, field="emit_r4_index")
+    index_dir = index_path.parent
+    if not index_path.is_file():
+        raise Stage1S111FormalError("S1_11_EMIT_R4_INDEX_MISSING")
+    _reject_symlink_tree(index_dir, field="r4_authority")
+    index = _object(index_path, field="emit_r4_index")
+    expected_index_fields = {
+        "schema_version", "status", "gate_id", "task_id",
+        "generator_git_commit", "consumer_git_commit",
+        "implementation_source_sha256", "role_refs", "role_sha256",
+        "chart_csv_sha256", "chart_svg_sha256", "reproduction_role_refs",
+        "reproduction_role_sha256", "validation_ref", "validation_sha256",
+        "replay_ref", "replay_sha256", "next_task_ids", "artifact_hash",
+    }
+    if set(index) != expected_index_fields:
+        raise Stage1S111FormalError("S1_11_EMIT_R4_INDEX_FIELDS_INVALID")
+    body = dict(index)
+    declared = body.pop("artifact_hash")
+    if declared != canonical_json_hash(body):
+        raise Stage1S111FormalError("S1_11_EMIT_R4_INDEX_SELF_HASH_INVALID")
+    if (
+        index.get("schema_version") != "stage1-s1-11-formalization-index-v1"
+        or index.get("status") != "PASS"
+        or index.get("gate_id") != GATE_ID
+        or index.get("task_id") != TASK_ID
+        or index.get("generator_git_commit") != S111_R4_PRODUCER_COMMIT
+        or index.get("consumer_git_commit") != S111_R4_PRODUCER_COMMIT
+        or index.get("next_task_ids") != ["stage2", "stage3"]
+    ):
+        raise Stage1S111FormalError("S1_11_EMIT_R4_INDEX_IDENTITY_INVALID")
+
+    source_map = index["implementation_source_sha256"]
+    if not isinstance(source_map, Mapping) or set(source_map) != set(_IMPLEMENTATION_PATHS):
+        raise Stage1S111FormalError("S1_11_EMIT_PRODUCER_SOURCE_KEYSET_INVALID")
+    for source, digest in source_map.items():
+        if not _digest(digest) or _git_blob_sha256(
+            repository, S111_R4_PRODUCER_COMMIT, str(source)
+        ) != digest:
+            raise Stage1S111FormalError(
+                f"S1_11_EMIT_PRODUCER_SOURCE_HASH_MISMATCH:{source}"
+            )
+
+    role_refs = index["role_refs"]
+    role_hashes = index["role_sha256"]
+    if role_refs != S111_R4_ROLE_REFS or not isinstance(role_hashes, Mapping):
+        raise Stage1S111FormalError("S1_11_EMIT_R4_ROLE_WIRE_INVALID")
+    if set(role_hashes) != set(S111_R4_ROLE_REFS):
+        raise Stage1S111FormalError("S1_11_EMIT_R4_ROLE_HASH_KEYSET_INVALID")
+    role_values: dict[str, dict[str, object]] = {}
+    role_file_hashes: dict[str, str] = {}
+    for role, filename in S111_R4_ROLE_REFS.items():
+        path = index_dir / filename
+        if not path.is_file() or not _digest(role_hashes[role]) or _sha(path) != role_hashes[role]:
+            raise Stage1S111FormalError(
+                f"S1_11_EMIT_R4_ROLE_HASH_MISMATCH:{role}"
+            )
+        role_file_hashes[role] = str(role_hashes[role])
+        if filename.endswith(".json"):
+            role_value = _object(path, field=f"emit_r4_role_{role}")
+            role_body = dict(role_value)
+            role_artifact_hash = role_body.pop("artifact_hash", None)
+            if role_artifact_hash != canonical_json_hash(role_body):
+                raise Stage1S111FormalError(
+                    f"S1_11_EMIT_R4_ROLE_SELF_HASH_INVALID:{role}"
+                )
+            role_values[role] = role_value
+
+    for ref_field, expected in (("validation_ref", "validation.json"), ("replay_ref", "replay-validation.json")):
+        if index.get(ref_field) != expected or not _digest(index.get(ref_field.replace("_ref", "_sha256"))):
+            raise Stage1S111FormalError("S1_11_EMIT_R4_VALIDATION_WIRE_INVALID")
+        path = index_dir / expected
+        if not path.is_file() or _sha(path) != index[ref_field.replace("_ref", "_sha256")]:
+            raise Stage1S111FormalError("S1_11_EMIT_R4_VALIDATION_HASH_MISMATCH")
+    validation = _object(index_dir / "validation.json", field="emit_r4_validation")
+    replay = _object(index_dir / "replay-validation.json", field="emit_r4_replay")
+    for value, schema, field in (
+        (validation, "stage1-s1-11-validation-v1", "validation"),
+        (replay, "stage1-s1-11-replay-validation-v1", "replay"),
+    ):
+        value_body = dict(value)
+        value_hash = value_body.pop("artifact_hash", None)
+        if value.get("schema_version") != schema or value.get("status") != "PASS" or value_hash != canonical_json_hash(value_body):
+            raise Stage1S111FormalError(f"S1_11_EMIT_R4_{field.upper()}_INVALID")
+    success_path = index_dir / "success.json"
+    if not success_path.is_file():
+        raise Stage1S111FormalError("S1_11_EMIT_R4_SUCCESS_MARKER_MISSING")
+    success = _object(success_path, field="emit_r4_success")
+    success_body = dict(success)
+    success_hash = success_body.pop("artifact_hash", None)
+    if (
+        success.get("schema_version") != "stage1-s1-11-attempt-success-v1"
+        or success.get("status") != "PASS"
+        or success.get("index_sha256") != _sha(index_path)
+        or success_hash != canonical_json_hash(success_body)
+    ):
+        raise Stage1S111FormalError("S1_11_EMIT_R4_SUCCESS_MARKER_INVALID")
+
+    observation = role_values["formal_observation"]
+    summary = role_values["gate_summary"]
+    matrix = role_values["requirements_matrix"]
+    report = role_values["stage_report"]
+    delivery = role_values["delivery_manifest"]
+    if (
+        observation.get("schema_version") != "stage1-s1-11-formal-observation-v1"
+        or observation.get("status") != "PASS"
+        or observation.get("task_id") != TASK_ID
+        or observation.get("gate_id") != GATE_ID
+        or report.get("schema_version") != "stage1-s1-11-stage-report-v1"
+        or report.get("status") != "PASS"
+        or report.get("task_id") != TASK_ID
+        or report.get("gate_id") != GATE_ID
+        or summary.get("schema_version") != "stage1-s1-11-gate-summary-v1"
+        or summary.get("task_id") != TASK_ID
+        or summary.get("gate_id") != GATE_ID
+        or matrix.get("schema_version") != "stage1-s1-11-requirements-matrix-v1"
+        or delivery.get("schema_version") != "stage1-s1-11-delivery-manifest-v1"
+        or delivery.get("task_id") != TASK_ID
+        or delivery.get("gate_id") != GATE_ID
+        or observation.get("execution_commit") != S111_R4_PRODUCER_COMMIT
+        or summary.get("status") != "PASS"
+        or summary.get("exit_verdict") != "STAGE1_COMPLETE"
+        or summary.get("unresolved_failure_count") != 0
+        or summary.get("formal_observation") != observation
+        or matrix.get("task_id") != TASK_ID
+        or matrix.get("gate_id") != GATE_ID
+        or report.get("summary_hash") != summary.get("artifact_hash")
+        or report.get("requirements_matrix_hash") != matrix.get("artifact_hash")
+        or delivery.get("summary_hash") != summary.get("artifact_hash")
+        or delivery.get("requirements_matrix_hash") != matrix.get("artifact_hash")
+        or delivery.get("stage_report_hash") != report.get("artifact_hash")
+        or delivery.get("dependency_index_hashes") != observation.get("dependency_index_sha256")
+        or delivery.get("chart_ids") != list(REQUIRED_CHARTS)
+        or summary.get("charts") != observation.get("charts")
+        or replay.get("summary_artifact_hash") != summary.get("artifact_hash")
+        or validation.get("role_sha256") != {
+            filename: role_hashes[role]
+            for role, filename in S111_R4_ROLE_REFS.items()
+        }
+    ):
+        raise Stage1S111FormalError("S1_11_EMIT_R4_MUTUAL_HASH_CLOSURE_INVALID")
+
+    from param_importance_nlp.stage1_exit_gate import (
+        _validate_verification_matrix,
+        audit_exit_dependencies,
+    )
+    audits = summary.get("dependency_audits")
+    if not isinstance(audits, list) or len(audits) != 11:
+        raise Stage1S111FormalError("S1_11_EMIT_R4_DEPENDENCY_CLOSURE_INVALID")
+    bindings: list[Mapping[str, object]] = []
+    for item in audits:
+        if not isinstance(item, Mapping) or not isinstance(item.get("binding"), Mapping):
+            raise Stage1S111FormalError("S1_11_EMIT_R4_DEPENDENCY_BINDING_INVALID")
+        bindings.append(dict(item["binding"]))
+    try:
+        rebuilt = audit_exit_dependencies(evidence_root, bindings)
+    except Exception as error:
+        raise Stage1S111FormalError("S1_11_EMIT_R4_DEPENDENCY_REPLAY_FAILED") from error
+    if rebuilt != audits:
+        raise Stage1S111FormalError("S1_11_EMIT_R4_DEPENDENCY_REPLAY_MISMATCH")
+    try:
+        matrix_rows = _validate_verification_matrix(
+            evidence_root, matrix.get("rows") if isinstance(matrix.get("rows"), list) else []
+        )
+    except Exception as error:
+        raise Stage1S111FormalError("S1_11_EMIT_R4_REQUIREMENTS_INVALID") from error
+    by_gate = {str(item["binding"]["gate_id"]): item["binding"] for item in audits}
+    for row in matrix_rows:
+        binding = by_gate.get(str(row["gate_id"]))
+        if binding is None or row["evidence"] != {
+            "ref": binding["index_ref"], "sha256": binding["index_sha256"]
+        }:
+            raise Stage1S111FormalError("S1_11_EMIT_R4_REQUIREMENTS_BINDING_INVALID")
+
+    # Re-check the formal observation's test/sync source roles and every chart
+    # file.  These calls also reject an internally self-consistent local copy.
+    _validate_test_summary(evidence_root, observation["test_summary"])
+    _validate_sync_audit(evidence_root, observation["sync_audit"])
+    charts = observation.get("charts")
+    if not isinstance(charts, list) or len(charts) != len(REQUIRED_CHARTS):
+        raise Stage1S111FormalError("S1_11_EMIT_R4_CHART_CLOSURE_INVALID")
+    observed_chart_ids: list[str] = []
+    for chart in charts:
+        if not isinstance(chart, Mapping) or chart.get("chart_id") not in REQUIRED_CHARTS:
+            raise Stage1S111FormalError("S1_11_EMIT_R4_CHART_WIRE_INVALID")
+        chart_id = str(chart["chart_id"])
+        observed_chart_ids.append(chart_id)
+        for suffix in ("csv", "svg"):
+            role = f"{chart_id.replace('-', '_')}_{suffix}"
+            if chart.get(f"{suffix}_ref") != S111_R4_ROLE_REFS[role] or chart.get(f"{suffix}_sha256") != role_hashes[role]:
+                raise Stage1S111FormalError("S1_11_EMIT_R4_CHART_HASH_INVALID")
+    if tuple(observed_chart_ids) != REQUIRED_CHARTS:
+        raise Stage1S111FormalError("S1_11_EMIT_R4_CHART_ORDER_INVALID")
+
+    # Schema validation is deliberately performed after the independent
+    # closure checks, so schema drift cannot be hidden by a caller payload.
+    _schema_validate(
+        repository,
+        {
+            "formal_observation": observation,
+            "requirements_matrix": matrix,
+            "gate_summary": summary,
+            "stage_report": report,
+            "delivery_manifest": delivery,
+            "replay": replay,
+            "validation": validation,
+            "index": index,
+        },
+    )
+    source_refs = sorted(
+        path.relative_to(evidence_root.resolve()).as_posix()
+        for path in index_dir.rglob("*")
+        if path.is_file()
+    )
+    if not source_refs or S111_R4_INDEX_REF not in source_refs:
+        raise Stage1S111FormalError("S1_11_EMIT_R4_SOURCE_REF_CLOSURE_INVALID")
+    artifact_hashes = {
+        role: str(role_values[role]["artifact_hash"])
+        for role in role_values
+    }
+    artifact_hashes.update({
+        "index": str(index["artifact_hash"]),
+        "validation": str(validation["artifact_hash"]),
+        "replay_validation": str(replay["artifact_hash"]),
+        "success": str(success["artifact_hash"]),
+    })
+    return {
+        "index": index,
+        "index_path": index_path,
+        "index_dir": index_dir,
+        "roles": role_values,
+        "role_file_sha256": role_file_hashes,
+        "validation": validation,
+        "replay": replay,
+        "source_refs": source_refs,
+        "artifact_hashes": artifact_hashes,
+        "producer_source_sha256": dict(source_map),
+        "dependency_index_sha256": dict(observation["dependency_index_sha256"]),
+    }
+
+
+def emit_task_artifacts(
+    *, repository: Path, evidence_root: Path, output_dir: str,
+    evidence_ref: str = S111_R4_INDEX_REF,
+) -> dict[str, object]:
+    """Emit the four formal S1.11 TaskArtifactStore commits from r4 only.
+
+    This is intentionally separate from the Stage 2 materializer and from the
+    local task runner.  It accepts one fixed authority index, performs a full
+    immutable replay, persists a producer-specific config, and then publishes
+    four role payloads whose original S1.11 JSON remains validator-readable.
+    """
+
+    repository = Path(repository).resolve()
+    evidence_root = Path(evidence_root).resolve()
+    if not repository.is_dir() or not evidence_root.is_dir():
+        raise Stage1S111FormalError("S1_11_EMIT_ROOT_INVALID")
+    authority = _emit_load_r4(
+        repository=repository, evidence_root=evidence_root, evidence_ref=evidence_ref,
+    )
+    output_path = _emit_relative(evidence_root, output_dir, field="task_output")
+    # Check existing ancestors before TaskArtifactStore creates anything.
+    parent = output_path
+    while parent != evidence_root and not parent.exists():
+        parent = parent.parent
+    _reject_symlink_ancestors(parent, evidence_root, field="task_output_parent")
+    if output_path.exists():
+        _reject_symlink_tree(output_path, field="task_output")
+
+    config_ref = output_path.relative_to(evidence_root).as_posix() + "/producer-config.json"
+    manifest_ref = output_path.relative_to(evidence_root).as_posix() + "/manifest.json"
+    config_body: dict[str, object] = {
+        "schema_version": "stage1-s1-11-producer-config-v1",
+        "config_kind": "s1_11_reporting_producer",
+        "task_id": TASK_ID,
+        "gate_id": GATE_ID,
+        "run_intent": "formal",
+        "formal_eligible": True,
+        "authority": {
+            "index_ref": evidence_ref,
+            "index_sha256": _sha(authority["index_path"]),
+            "index_artifact_hash": authority["index"]["artifact_hash"],
+            "attempt_id": S111_R4_ATTEMPT_ID,
+            "producer_commit": S111_R4_PRODUCER_COMMIT,
+            "execution_commit": S111_R4_PRODUCER_COMMIT,
+            "consumer_commit": S111_R4_PRODUCER_COMMIT,
+        },
+        "producer_source_sha256": authority["producer_source_sha256"],
+        "producer_source_hash": canonical_json_hash(
+            authority["producer_source_sha256"]
+        ),
+        "r4_artifact_hashes": authority["artifact_hashes"],
+        "r4_role_sha256": authority["role_file_sha256"],
+        "dependency_index_sha256": authority["dependency_index_sha256"],
+        "source_refs": authority["source_refs"],
+        "artifact_kinds": list(S111_TASK_ARTIFACT_KINDS),
+    }
+    config_hash = canonical_json_hash(config_body)
+    config = {**config_body, "config_hash": config_hash}
+    _emit_json(output_path / "producer-config.json", config, field="producer_config")
+    config_sha256 = _sha(output_path / "producer-config.json")
+    source_refs = tuple([*authority["source_refs"], config_ref])
+
+    store = TaskArtifactStore(evidence_root, output_dir)
+    commit_paths = [store.commits / f"{kind}.json" for kind in S111_TASK_ARTIFACT_KINDS]
+    existing = [path.is_symlink() or path.exists() for path in commit_paths]
+    if any(existing) and not all(existing):
+        raise Stage1S111FormalError("S1_11_EMIT_PARTIAL_PUBLICATION")
+
+    expected_payloads = {
+        kind: dict(authority["roles"][kind]) for kind in S111_TASK_ARTIFACT_KINDS
+    }
+    if all(existing):
+        refs = store.discover_complete(
+            task_id=TASK_ID, config_hash=config_hash,
+            artifact_kinds=S111_TASK_ARTIFACT_KINDS, formal_eligible=True,
+        )
+        if refs is None:
+            raise Stage1S111FormalError("S1_11_EMIT_EXISTING_PUBLICATION_INCOMPLETE")
+        for kind, ref in refs.items():
+            loaded = load_committed_task_artifact(
+                evidence_root, ref, require_formal=True,
+            )
+            if (
+                dict(loaded.payload) != expected_payloads[kind]
+                or loaded.source_refs != source_refs
+            ):
+                raise Stage1S111FormalError(
+                    f"S1_11_EMIT_EXISTING_PAYLOAD_DRIFT:{kind}"
+                )
+    else:
+        refs = {}
+        for kind in S111_TASK_ARTIFACT_KINDS:
+            published = store.publish(
+                task_id=TASK_ID,
+                artifact_kind=kind,
+                config_hash=config_hash,
+                run_intent="formal",
+                payload=expected_payloads[kind],
+                formal_eligible=True,
+                source_refs=source_refs,
+            )
+            refs[kind] = published.commit_ref
+
+    commit_artifact_hashes: dict[str, str] = {}
+    for kind, ref in refs.items():
+        loaded = load_committed_task_artifact(evidence_root, ref, require_formal=True)
+        commit_artifact_hashes[kind] = loaded.identity.artifact_hash
+        if loaded.identity.config_hash != config_hash or dict(loaded.payload) != expected_payloads[kind] or loaded.source_refs != source_refs:
+            raise Stage1S111FormalError(f"S1_11_EMIT_COMMIT_READBACK_INVALID:{kind}")
+
+    manifest_body: dict[str, object] = {
+        "schema_version": "stage1-s1-11-task-artifact-manifest-v1",
+        "status": "PASS",
+        "task_id": TASK_ID,
+        "gate_id": GATE_ID,
+        "run_intent": "formal",
+        "formal_eligible": True,
+        "commit_refs": dict(refs),
+        "commit_artifact_hashes": commit_artifact_hashes,
+        "config_ref": config_ref,
+        "config_hash": config_hash,
+        "config_sha256": config_sha256,
+        "r4_index_ref": evidence_ref,
+        "r4_index_sha256": _sha(authority["index_path"]),
+        "r4_index_artifact_hash": authority["index"]["artifact_hash"],
+        "r4_artifact_hashes": authority["artifact_hashes"],
+        "r4_role_sha256": authority["role_file_sha256"],
+        "producer_commit": S111_R4_PRODUCER_COMMIT,
+        "execution_commit": S111_R4_PRODUCER_COMMIT,
+        "consumer_commit": S111_R4_PRODUCER_COMMIT,
+        "producer_source_sha256": authority["producer_source_sha256"],
+        "producer_source_hash": canonical_json_hash(
+            authority["producer_source_sha256"]
+        ),
+    }
+    manifest = {**manifest_body, "artifact_hash": canonical_json_hash(manifest_body)}
+    _emit_json(output_path / "manifest.json", manifest, field="manifest")
+    return {
+        "manifest_ref": manifest_ref,
+        "manifest_sha256": _sha(output_path / "manifest.json"),
+        "config_ref": config_ref,
+        "config_hash": config_hash,
+        "config_sha256": config_sha256,
+        "commit_refs": dict(refs),
+        "r4_index_ref": evidence_ref,
+        "r4_index_sha256": _sha(authority["index_path"]),
+        "r4_artifact_hashes": authority["artifact_hashes"],
+    }
+
+
 def execute(*, repository: Path, evidence_root: Path, attempt_root: Path, dependencies_path: Path, matrix_path: Path, chart_specs_path: Path, test_summary_binding_path: Path, sync_audit_binding_path: Path, failure_history_path: Path, execution_commit: str, attempt_id: str, worklog_binding_path: Path | None = None) -> dict[str, str]:
     if repository.resolve() != REPOSITORY.resolve() or not evidence_root.is_dir() or not attempt_id or "/" in attempt_id or "\\" in attempt_id or len(execution_commit) != 40 or any(character not in "0123456789abcdef" for character in execution_commit):
         raise Stage1S111FormalError("S1_11_ARGUMENTS_INVALID")
@@ -657,10 +1200,35 @@ def execute(*, repository: Path, evidence_root: Path, attempt_root: Path, depend
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--emit-task-artifacts", action="store_true",
+        help="publish the four formal S1.11 TaskArtifactStore commits from r4",
+    )
+    parser.add_argument(
+        "--workspace-root", type=Path,
+        help="DATA_ROOT/workspace containing the r4 evidence and task store",
+    )
+    parser.add_argument(
+        "--evidence-ref", default=S111_R4_INDEX_REF,
+        help="fixed r4 index ref; emit mode rejects any other value",
+    )
+    parser.add_argument(
+        "--task-output-dir", default=S111_TASK_OUTPUT_DEFAULT,
+        help="POSIX-relative TaskArtifactStore output directory",
+    )
     parser.add_argument("--repository", type=Path, required=True); parser.add_argument("--evidence-root", type=Path, required=True); parser.add_argument("--attempt-root", type=Path, required=True)
     parser.add_argument("--dependencies-json", type=Path, required=True); parser.add_argument("--verification-matrix-json", type=Path, required=True); parser.add_argument("--chart-specs-json", type=Path, required=True)
     parser.add_argument("--test-summary-binding-json", type=Path, required=True); parser.add_argument("--sync-audit-binding-json", type=Path, required=True); parser.add_argument("--failure-history-json", type=Path, required=True); parser.add_argument("--worklog-binding-json", type=Path, required=True); parser.add_argument("--execution-commit", required=True); parser.add_argument("--attempt-id", required=True)
     args = parser.parse_args(argv)
+    if args.emit_task_artifacts:
+        workspace_root = args.workspace_root or args.evidence_root
+        print(emit_task_artifacts(
+            repository=args.repository,
+            evidence_root=workspace_root,
+            output_dir=args.task_output_dir,
+            evidence_ref=args.evidence_ref,
+        ))
+        return 0
     print(execute(repository=args.repository, evidence_root=args.evidence_root, attempt_root=args.attempt_root, dependencies_path=args.dependencies_json, matrix_path=args.verification_matrix_json, chart_specs_path=args.chart_specs_json, test_summary_binding_path=args.test_summary_binding_json, sync_audit_binding_path=args.sync_audit_binding_json, failure_history_path=args.failure_history_json, worklog_binding_path=args.worklog_binding_json, execution_commit=args.execution_commit, attempt_id=args.attempt_id))
     return 0
 
