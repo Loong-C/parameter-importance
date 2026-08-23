@@ -3,6 +3,7 @@
 from pathlib import Path
 
 import numpy as np
+import pytest
 
 from param_importance_nlp.contracts import validate_stage23_artifact
 from param_importance_nlp.experiments.sampling import (
@@ -13,6 +14,10 @@ from param_importance_nlp.experiments.sampling import (
 from param_importance_nlp.experiments.stage2_formal import (
     RecoverablePairedWaveRunner,
     _vector_digest,
+)
+from param_importance_nlp.experiments.stage23_task_runners import (
+    _BoundInputArtifact,
+    _PredecessorContext,
 )
 from param_importance_nlp.providers import SyntheticGradientProvider
 
@@ -42,6 +47,61 @@ def _mapping() -> RepetitionMapping:
         draws=sampling.draws("pilot", 8),
         m_values=(2, 4),
     )
+
+
+def _bound(task_id: str, kind: str, payload: dict[str, object]) -> _BoundInputArtifact:
+    return _BoundInputArtifact(
+        task_id=task_id,
+        artifact_kind=kind,
+        artifact_hash="a" * 64,
+        config_hash="b" * 64,
+        run_intent="formal",
+        formal_eligible=True,
+        commit_ref=f"runs/{task_id}/{kind}.json",
+        source_refs=(),
+        payload=payload,
+    )
+
+
+def test_s25_formal_gate_selection_is_bound_to_s204_task_id() -> None:
+    context = _PredecessorContext(
+        ("stage2.02", "stage2.03", "stage2.04"),
+        (
+            _bound("stage2.02_stage1_handoff_and_fixed_state_contract", "gate_record", {"marker": "s202"}),
+            _bound("stage2.03_assets_checkpoints_and_sampling", "gate_record", {"marker": "s203"}),
+            _bound("stage2.04_reference_target", "gate_record", {"marker": "s204"}),
+        ),
+        (),
+    )
+    assert context.payload_for("stage2.04_reference_target", "gate_record")["marker"] == "s204"
+
+
+@pytest.mark.parametrize(
+    "artifacts",
+    [
+        (
+            _bound("stage2.02_stage1_handoff_and_fixed_state_contract", "gate_record", {"marker": "s202"}),
+            _bound("stage2.03_assets_checkpoints_and_sampling", "gate_record", {"marker": "s203"}),
+        ),
+        (
+            _bound("stage2.02_stage1_handoff_and_fixed_state_contract", "gate_record", {"marker": "s202"}),
+            _bound("stage2.03_assets_checkpoints_and_sampling", "gate_record", {"marker": "s203"}),
+            _bound("stage2.99_wrong_task", "gate_record", {"marker": "wrong"}),
+        ),
+        (
+            _bound("stage2.02_stage1_handoff_and_fixed_state_contract", "gate_record", {"marker": "s202"}),
+            _bound("stage2.03_assets_checkpoints_and_sampling", "gate_record", {"marker": "s203"}),
+            _bound("stage2.04_reference_target", "gate_record", {"marker": "s204-a"}),
+            _bound("stage2.04_reference_target", "gate_record", {"marker": "s204-b"}),
+        ),
+    ],
+)
+def test_s25_formal_gate_selection_rejects_missing_wrong_or_duplicate_s204(
+    artifacts: tuple[_BoundInputArtifact, ...],
+) -> None:
+    context = _PredecessorContext(("stage2.02", "stage2.03", "stage2.04"), artifacts, ())
+    with pytest.raises(RuntimeError, match="NOT_UNIQUE"):
+        context.payload_for("stage2.04_reference_target", "gate_record")
 
 
 def test_s25_runner_emits_three_reference_views_and_replay_evidence(tmp_path: Path) -> None:

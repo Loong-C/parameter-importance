@@ -861,6 +861,21 @@ class _PredecessorContext:
             )
         return matches[0]
 
+    def payload_for(self, task_id: str, artifact_kind: str) -> Mapping[str, object]:
+        """Return one payload bound to both its producer task and artifact kind."""
+
+        matches = [
+            item.payload
+            for item in self.artifacts
+            if item.task_id == task_id and item.artifact_kind == artifact_kind
+        ]
+        if len(matches) != 1:
+            raise RuntimeError(
+                "STAGE23_PREDECESSOR_PAYLOAD_NOT_UNIQUE:"
+                f"{task_id}:{artifact_kind}:{len(matches)}"
+            )
+        return matches[0]
+
 
 def _load_bound_task_input(
     store: TaskArtifactStore,
@@ -3793,7 +3808,10 @@ def _formal_s204_reference_views(
     if manifest.get("registry_hash") != context.provider.registry_hash:
         raise ValueError("S25_FORMAL_REFERENCE_REGISTRY_MISMATCH")
 
-    gate = inputs.payload("gate_record")
+    try:
+        gate = inputs.payload_for("stage2.04_reference_target", "gate_record")
+    except RuntimeError as error:
+        raise ValueError("S25_FORMAL_REFERENCE_G23_GATE_NOT_UNIQUE") from error
     if gate.get("gate_id") != "stage2.G2.3" or gate.get("gate_status") != "PASS":
         raise ValueError("S25_FORMAL_REFERENCE_G23_NOT_PASS")
     bundle_ref = str(manifest["tensor_bundle_ref"])
