@@ -20,6 +20,7 @@ from ops.stage2.materialize_s204 import (
     publish_reference_sizing_plan,
     write_six_cell_configs,
     _load_gpu_health_identity,
+    _gpu_health_binding_payload,
     _load_parameter_registry_artifact,
     _publish_authoritative_asset_manifest,
     publish_per_cell_delta_sci,
@@ -353,7 +354,7 @@ def _g21_handoff_with_raw_report(root: Path) -> str:
         "status": "PASS",
         "excluded_pci_bus_ids": [EXCLUDED_PCI],
         "excluded_device": {
-            "index": 1,
+            "index": 0,
             "pci_bus_id": EXCLUDED_PCI,
             "uuid": "GPU-dc6cfc60-41dd-7bcf-ed09-b7deb5be342c",
             "scheduled": False,
@@ -422,6 +423,19 @@ def test_gpu_identity_reloads_raw_smoke_and_rejects_mapping_drift(tmp_path: Path
     write_canonical_json(report_path, report)
     with pytest.raises(S204MaterializationError, match="S204_GPU_HEALTH_EVIDENCE_INVALID"):
         _load_gpu_health_identity(tmp_path, handoff_ref)
+
+
+def test_gpu_binding_materialization_contains_only_stable_identity() -> None:
+    payload = _gpu_health_binding_payload("evidence/g21/handoff.json", ALLOWED_DEVICES)
+    assert payload["excluded"] == {
+        "pci_bus_id": EXCLUDED_PCI,
+        "uuid": "GPU-dc6cfc60-41dd-7bcf-ed09-b7deb5be342c",
+    }
+    assert payload["allowed_devices"] == [
+        {"pci_bus_id": pci, "uuid": uuid} for pci, uuid in ALLOWED_DEVICES
+    ]
+    assert "index" not in payload["excluded"]
+    assert "allowed_indices" not in payload
 
 
 def test_wrong_task_identity_is_not_promoted(tmp_path: Path) -> None:

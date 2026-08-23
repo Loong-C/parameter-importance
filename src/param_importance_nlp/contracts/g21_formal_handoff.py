@@ -20,6 +20,7 @@ SCHEMA = "stage2-s2.2-g2.1-formal-handoff-v1"
 AUTH_HASH = "51cb1ed87ff6ded4f4001f2a0b67dd469ebf048df2592b27707bc1f535b6db0c"
 STAGE1_IDENTITY = "3f18b04df8922be9894678ae4842bd999c7e8fd5"
 EXCLUDED_PCI = "0000:50:00.0"
+EXCLUDED_UUID = "GPU-dc6cfc60-41dd-7bcf-ed09-b7deb5be342c"
 ALLOWED_DEVICES = (
     ("0000:53:00.0", "GPU-180ff767-885a-7dc9-c8a9-921d65a01bbd"),
     ("0000:9C:00.0", "GPU-5c672d04-4f83-3cc0-80d0-0108b1b63267"),
@@ -192,7 +193,7 @@ def load_g21_formal_handoff(path: str | Path, *, data_root: str | Path | None = 
 
 
 __all__ = [
-    "ALLOWED_DEVICES", "AUTH_HASH", "EXCLUDED_PCI", "G21FormalHandoffError",
+    "ALLOWED_DEVICES", "AUTH_HASH", "EXCLUDED_PCI", "EXCLUDED_UUID", "G21FormalHandoffError",
     "SCHEMA", "STAGE1_IDENTITY", "build_g21_formal_handoff", "load_g21_formal_handoff",
     "write_g21_formal_handoff",
 ]

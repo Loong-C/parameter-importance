@@ -55,6 +55,7 @@ from param_importance_nlp.contracts.stage1_handoff import (  # noqa: E402
 from param_importance_nlp.contracts.g21_formal_handoff import (  # noqa: E402
     ALLOWED_DEVICES as G21_ALLOWED_DEVICES,
     EXCLUDED_PCI as G21_EXCLUDED_PCI,
+    EXCLUDED_UUID as G21_EXCLUDED_UUID,
     load_g21_formal_handoff,
 )
 from param_importance_nlp.experiments.stage2_assets import (  # noqa: E402
@@ -99,10 +100,10 @@ from param_importance_nlp.contracts.config_v2 import ResolvedConfigV2  # noqa: E
 
 S204_TASK_ID: Final = "stage2.04_reference_target"
 S204_SCHEMA: Final = "stage2-reference-sizing-plan-v1"
-EXCLUDED_GPU_INDEX: Final = "1"
-EXCLUDED_PCI: Final = "0000:50:00.0"
-EXCLUDED_UUID: Final = "GPU-dc6cfc60-41dd-7bcf-ed09-b7deb5be342c"
-ALLOWED_GPU_INDICES: Final = frozenset({"0", "2", "3", "4"})
+# G2.1 owns the PCI/UUID identity.  A current nvidia-smi index is resolved by
+# the launcher at execution time and must never be materialized here.
+EXCLUDED_PCI: Final = G21_EXCLUDED_PCI
+EXCLUDED_UUID: Final = G21_EXCLUDED_UUID
 DEFAULT_CANDIDATES: Final = (512, 1024, 2048, 4096)
 DEFAULT_BLOCK_SIZE: Final = 32
 DEFAULT_TOKENIZER_ASSET_ID: Final = "pythia-tokenizer"
@@ -1221,17 +1222,8 @@ def _build_phase_environment(
         g21_ref,
         expected_stage1_ref=stage1_ref,
     )
-    if set(ALLOWED_GPU_INDICES) & {EXCLUDED_GPU_INDEX}:
-        raise _error("GPU_ALLOWED_INDEX_INCLUDES_EXCLUDED")
     binding_ref = PurePosixPath(output_ref).with_name("gpu-health-binding.json").as_posix()
-    binding_payload: dict[str, Any] = {
-        "schema_version": "stage2-s204-gpu-health-binding-v1",
-        "source_ref": gpu_ref,
-        "excluded": {"index": 1, "pci_bus_id": EXCLUDED_PCI, "uuid": EXCLUDED_UUID},
-        "allowed_indices": [int(item) for item in sorted(ALLOWED_GPU_INDICES)],
-        "allowed_devices": [{"pci_bus_id": pci, "uuid": uuid} for pci, uuid in allowed_devices],
-    }
-    binding_payload["binding_hash"] = canonical_json_hash(binding_payload)
+    binding_payload = _gpu_health_binding_payload(gpu_ref, allowed_devices)
     publish_canonical_immutable(_safe_relative(root, binding_ref, "gpu_binding_output"), binding_payload)
     capability_values = {
         name: _load_capability(root, _mapping(capability_refs, "capability_refs").get(name), name)
@@ -2225,9 +2217,8 @@ def _load_authoritative_g21(
     excluded = report.get("excluded_device")
     if (
         not isinstance(excluded, Mapping)
-        or str(excluded.get("index")) != EXCLUDED_GPU_INDEX
-        or str(excluded.get("pci_bus_id")) != EXCLUDED_PCI
-        or str(excluded.get("uuid")) != EXCLUDED_UUID
+        or str(excluded.get("pci_bus_id", "")).casefold() != EXCLUDED_PCI.casefold()
+        or str(excluded.get("uuid", "")).casefold() != EXCLUDED_UUID.casefold()
         or excluded.get("scheduled") is not False
     ):
         raise _error("GPU_SMOKE_REPORT_EXCLUDED_IDENTITY_INVALID", smoke_ref)
@@ -2277,6 +2268,30 @@ def _load_gpu_health_identity(
         if isinstance(item, Mapping)
     )
     return gpu_ref, allowed_devices
+
+
+def _gpu_health_binding_payload(
+    source_ref: str,
+    allowed_devices: Sequence[tuple[str, str]],
+) -> dict[str, Any]:
+    """Build a binding containing only stable PCI/UUID identities.
+
+    Physical nvidia-smi indices are intentionally not persisted.  They are
+    ephemeral selectors and must be resolved against a fresh inventory by the
+    formal launcher immediately before a cell starts.
+    """
+
+    payload: dict[str, Any] = {
+        "schema_version": "stage2-s204-gpu-health-binding-v1",
+        "source_ref": source_ref,
+        "excluded": {"pci_bus_id": EXCLUDED_PCI, "uuid": EXCLUDED_UUID},
+        "allowed_devices": [
+            {"pci_bus_id": pci, "uuid": uuid}
+            for pci, uuid in allowed_devices
+        ],
+    }
+    payload["binding_hash"] = canonical_json_hash(payload)
+    return payload
 
 
 def _load_formal_gate_refs(
@@ -2384,28 +2399,11 @@ def build_formal_runtime_environment(
         g21_handoff_ref,
         expected_stage1_ref=stage1_g1_exit_ref,
     )
-    if set(ALLOWED_GPU_INDICES).intersection({EXCLUDED_GPU_INDEX}):
-        raise _error("GPU_ALLOWED_INDEX_INCLUDES_EXCLUDED")
-
     # Store a dedicated binding object so a consumer can re-read both stable
-    # hardware identities and the scheduler indices.  The indices are merely a
-    # launch allow-list; PCI+UUID pairs remain the identity authority.
+    # hardware identities.  Current scheduler indices are intentionally absent:
+    # they are ephemeral selectors resolved against live nvidia-smi output.
     binding_ref = PurePosixPath(output_ref).with_name("gpu-health-binding.json").as_posix()
-    binding_payload = {
-        "schema_version": "stage2-s204-gpu-health-binding-v1",
-        "source_ref": gpu_ref,
-        "excluded": {
-            "index": int(EXCLUDED_GPU_INDEX),
-            "pci_bus_id": EXCLUDED_PCI,
-            "uuid": EXCLUDED_UUID,
-        },
-        "allowed_indices": [int(item) for item in sorted(ALLOWED_GPU_INDICES)],
-        "allowed_devices": [
-            {"pci_bus_id": pci, "uuid": uuid}
-            for pci, uuid in allowed_devices
-        ],
-    }
-    binding_payload["binding_hash"] = canonical_json_hash(binding_payload)
+    binding_payload = _gpu_health_binding_payload(gpu_ref, allowed_devices)
     binding_target = _safe_relative(root, binding_ref, "gpu_binding_output")
     publish_canonical_immutable(binding_target, binding_payload)
     binding_round_trip = _load_mapping(root, binding_ref, "gpu_binding")
@@ -3818,7 +3816,6 @@ if __name__ == "__main__":
 
 
 __all__ = [
-    "ALLOWED_GPU_INDICES",
     "EXCLUDED_PCI",
     "EXCLUDED_UUID",
     "EXPECTED_CELL_IDS",
