@@ -19,6 +19,7 @@ from typing import Hashable, Iterable, Literal, Mapping, Sequence
 from ..contracts.jsonio import canonical_json_hash
 
 from ..contracts.immutable import freeze_json_mapping, thaw_json_value
+from .stage2_g23_contracts import generator_state_digest
 
 
 STREAM_NAMES = (
@@ -183,12 +184,7 @@ class Draw:
 def _generator_state_digest(state: object) -> str:
     """Hash a Python generator state without serializing it as a run identity."""
 
-    return canonical_json_hash(
-        {
-            "algorithm_version": "stage2-draws-python-randrange-v1",
-            "state": state,
-        }
-    )
+    return generator_state_digest("stage2-draws-python-randrange-v1", state)
 
 
 @dataclass(frozen=True, slots=True)
