@@ -82,46 +82,121 @@ def _stage1_binding(data_root: Path, refs: dict[str, str]) -> str:
     )
 
 
-def _formal_stage1_sources(data_root: Path) -> dict[str, str]:
+def _formal_stage1_sources(data_root: Path, *, config_ref: str, config) -> dict[str, str]:
     store = TaskArtifactStore(data_root, "runs/stage1-11-formal")
-    config_hash = canonical_json_hash({"fixture": "formal-stage1-11", "version": 1})
-    core = {"evidence_type": "formal_stage1_11_exit", "observation": "PASS"}
-    core_hash = canonical_json_hash(core)
-    task_definition_hash = canonical_json_hash({"task": STAGE1_TASK_ID, "contract": "formal"})
-    refs: dict[str, str] = {}
-    for kind in STAGE1_ARTIFACT_KINDS:
-        payload: dict[str, object] = {
-            "schema_version": {
-                "stage_report": "stage1-s1-11-stage-report-v1",
-                "requirements_matrix": "stage1-s1-11-requirements-matrix-v1",
-                "gate_summary": "stage1-s1-11-gate-summary-v1",
-                "delivery_manifest": "stage1-s1-11-delivery-manifest-v1",
-            }[kind],
-            "status": "PASS",
-            "task_id": STAGE1_TASK_ID,
-            "gate_id": "G1-EXIT",
-            "scope": "formal",
-            "config_hash": config_hash,
-            "core_evidence": core,
-            "core_evidence_hash": core_hash,
-            "task_definition_hash": task_definition_hash,
-            "artifact_role": kind,
-        }
-        if kind == "gate_summary":
-            payload["unresolved_failure_count"] = 0
-        if kind == "requirements_matrix":
-            payload["rows"] = [
+    config_hash = config.config_hash
+    producer = "3f18b04df8922be9894678ae4842bd999c7e8fd5"
+    evidence_root = data_root / "evidence/stage1/s1-11-formal" / producer / "fixture"
+    evidence_root.mkdir(parents=True)
+
+    def with_hash(value: dict[str, object]) -> dict[str, object]:
+        value["artifact_hash"] = canonical_json_hash(value)
+        return value
+
+    role_values: dict[str, dict[str, object]] = {
+        "formal_observation": with_hash({
+            "schema_version": "stage1-s1-11-formal-observation-v1",
+            "status": "PASS", "task_id": STAGE1_TASK_ID, "gate_id": "G1-EXIT",
+            "execution_commit": producer,
+        }),
+        "stage_report": with_hash({
+            "schema_version": "stage1-s1-11-stage-report-v1",
+            "status": "PASS", "task_id": STAGE1_TASK_ID, "gate_id": "G1-EXIT",
+        }),
+        "delivery_manifest": with_hash({
+            "schema_version": "stage1-s1-11-delivery-manifest-v1",
+            "task_id": STAGE1_TASK_ID, "gate_id": "G1-EXIT",
+        }),
+        "gate_summary": with_hash({
+            "schema_version": "stage1-s1-11-gate-summary-v1",
+            "status": "PASS", "task_id": STAGE1_TASK_ID, "gate_id": "G1-EXIT",
+            "unresolved_failure_count": 0,
+        }),
+        "requirements_matrix": with_hash({
+            "schema_version": "stage1-s1-11-requirements-matrix-v1",
+            "task_id": STAGE1_TASK_ID, "gate_id": "G1-EXIT",
+            "rows": [
                 {"requirement_id": f"S1.11-R{index:02d}", "status": "PASS"}
                 for index in range(1, 29)
-            ]
+            ],
+        }),
+        "validation": with_hash({
+            "schema_version": "stage1-s1-11-validation-v1", "status": "PASS",
+            "task_id": STAGE1_TASK_ID, "gate_id": "G1-EXIT",
+        }),
+        "replay_validation": with_hash({
+            "schema_version": "stage1-s1-11-replay-validation-v1", "status": "PASS",
+        }),
+    }
+    role_filenames = {
+        "formal_observation": "formal-observation.json",
+        "stage_report": "stage-report.json",
+        "delivery_manifest": "delivery-manifest.json",
+        "gate_summary": "gate-summary.json",
+        "requirements_matrix": "requirements-matrix.json",
+        "validation": "validation.json",
+        "replay_validation": "replay-validation.json",
+    }
+    role_refs = {name: filename for name, filename in role_filenames.items()}
+    role_hashes: dict[str, str] = {}
+    for name, payload in role_values.items():
+        path = evidence_root / role_filenames[name]
+        write_canonical_json(path, payload)
+        role_hashes[name] = _sha(path)
+    index = with_hash({
+        "schema_version": "stage1-s1-11-formalization-index-v1",
+        "status": "PASS", "gate_id": "G1-EXIT", "task_id": STAGE1_TASK_ID,
+        "generator_git_commit": producer, "consumer_git_commit": producer,
+        "next_task_ids": ["stage2", "stage3"],
+        "role_refs": role_refs, "role_sha256": role_hashes,
+        "validation_ref": "validation.json", "validation_sha256": role_hashes["validation"],
+        "replay_ref": "replay-validation.json", "replay_sha256": role_hashes["replay_validation"],
+    })
+    index_ref = f"evidence/stage1/s1-11-formal/{producer}/fixture/index.json"
+    write_canonical_json(data_root / index_ref, index)
+    index_sha = _sha(data_root / index_ref)
+
+    bridge_role_kinds = ("stage_report", "requirements_matrix", "gate_summary", "delivery_manifest")
+    root_role_refs = {
+        name: f"evidence/stage1/s1-11-formal/{producer}/fixture/{role_filenames[name]}"
+        for name in role_filenames
+    }
+    bridge_ref = "runs/stage1-11-formal/stage1-11-bridge-evidence.json"
+    bridge = with_hash({
+        "schema_version": "stage2-s204-stage1-bridge-v1", "status": "PASS",
+        "formal_eligible": True, "task_id": STAGE1_TASK_ID, "gate_id": "stage1.G1-EXIT",
+        "index_ref": index_ref, "index_sha256": index_sha,
+        "index_artifact_hash": index["artifact_hash"], "execution_commit": producer,
+        "role_refs": {name: root_role_refs[name] for name in (
+            "formal_observation", "stage_report", "delivery_manifest", "gate_summary", "requirements_matrix"
+        )},
+        "role_sha256": role_hashes,
+        "payload_hashes": {kind: role_values[kind]["artifact_hash"] for kind in bridge_role_kinds},
+        "bridge_config_ref": config_ref, "bridge_config_hash": config.config_hash,
+        "bridge_config_full_hash": config.full_hash,
+        "source_refs": [index_ref, *[root_role_refs[name] for name in (
+            "formal_observation", "stage_report", "delivery_manifest", "gate_summary", "requirements_matrix"
+        )]],
+    })
+    write_canonical_json(data_root / bridge_ref, bridge)
+    envelope_source_refs = tuple(dict.fromkeys((
+        index_ref,
+        *[root_role_refs[name] for name in (
+            "formal_observation", "stage_report", "delivery_manifest", "gate_summary", "requirements_matrix"
+        )],
+        config_ref,
+        bridge_ref,
+    )))
+    refs: dict[str, str] = {}
+    for kind in STAGE1_ARTIFACT_KINDS:
         refs[kind] = store.publish(
             task_id=STAGE1_TASK_ID,
             artifact_kind=kind,
             config_hash=config_hash,
             run_intent="formal",
             formal_eligible=True,
-            source_refs=(),
-            payload=payload,  # type: ignore[arg-type]
+            source_refs=envelope_source_refs,
+            payload=role_values[kind],  # type: ignore[arg-type]
         ).commit_ref
     return refs
 
@@ -172,12 +247,22 @@ def _publish_s21(
 ) -> dict[str, str]:
     source_refs = source_refs or tuple(stage1_refs[kind] for kind in STAGE1_ARTIFACT_KINDS)
     binding = _stage1_binding(data_root, stage1_refs)
+    bridge_ref = next(
+        ref
+        for ref in load_committed_task_artifact(
+            data_root, stage1_refs["stage_report"], require_formal=True
+        ).source_refs
+        if ref.endswith("/stage1-11-bridge-evidence.json")
+    )
+    bridge = load_canonical_json(data_root / bridge_ref)
+    assert isinstance(bridge, dict)
     prereg = build_stage2_preregistration(
         seed_plan_hash=SeedPlan.from_master_seed(1337).artifact_hash,
         producer_commit=producer_commit or _head(),
         mathematics_hash=_sha(ROOT / MATHEMATICS_PATH),
-        stage1_report_hash=_sha(ROOT / STAGE1_REPORT_PATH),
+        stage1_report_hash=None,
         upstream_binding_hash=binding,
+        stage1_handoff=bridge,
         scope="formal",
     )
     hypothesis = build_stage2_hypothesis_contract(prereg, upstream_binding_hash=binding)
@@ -223,8 +308,8 @@ def _fixture(
 ):
     data_root = tmp_path / "data-root"
     data_root.mkdir(parents=True)
-    stage1_refs = _formal_stage1_sources(data_root)
     config_ref, config = _formal_config(data_root)
+    stage1_refs = _formal_stage1_sources(data_root, config_ref=config_ref, config=config)
     refs = _publish_s21(
         data_root,
         stage1_refs=stage1_refs,

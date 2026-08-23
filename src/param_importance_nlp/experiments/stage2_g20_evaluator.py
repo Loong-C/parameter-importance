@@ -31,6 +31,12 @@ from typing import Any
 from ..contracts.config_v2 import ResolvedConfigV2
 from ..contracts.jsonio import JSONValue, canonical_json_hash, load_canonical_json
 from ..contracts.seed import SeedPlan
+from ..contracts.stage1_handoff import (
+    STAGE1_G1_EXIT_PRODUCER_COMMIT,
+    Stage1ExitEvidence,
+    Stage1HandoffError,
+    validate_stage1_exit_evidence,
+)
 from ..contracts.status import GateRecord, GateStatus
 from ..runtime.task_artifacts import (
     LoadedTaskArtifact,
@@ -82,13 +88,33 @@ FROZEN_PLAN_SHA256 = "9af31ee0b82cbb0526817c7bb741ca708e33f96e7be3dda65d54b188e9
 EVALUATOR_SOURCE_PATH = "src/param_importance_nlp/experiments/stage2_g20_evaluator.py"
 PREREGISTRATION_SOURCE_PATH = "src/param_importance_nlp/experiments/preregistration.py"
 RUNNER_SOURCE_PATH = "src/param_importance_nlp/experiments/stage23_task_runners.py"
+TASK_CATALOG_SOURCE_PATH = "src/param_importance_nlp/contracts/task_catalog.py"
+STAGE1_HANDOFF_SOURCE_PATH = "src/param_importance_nlp/contracts/stage1_handoff.py"
+PREREGISTRATION_SCHEMA_PATH = "schemas/shared/stage2-preregistration-v1.json"
 REPOSITORY_SOURCE_PATHS: tuple[str, ...] = (
     EVALUATOR_SOURCE_PATH,
     PREREGISTRATION_SOURCE_PATH,
     RUNNER_SOURCE_PATH,
+    TASK_CATALOG_SOURCE_PATH,
+    STAGE1_HANDOFF_SOURCE_PATH,
+    PREREGISTRATION_SCHEMA_PATH,
     PLAN_PATH,
     MATHEMATICS_PATH,
-    STAGE1_REPORT_PATH,
+)
+
+# These are the source/contract bytes whose identity makes an older producer
+# commit compatible with the current evaluator.  The checked-in Stage 1
+# report is intentionally absent: it is a local fixture and is never a formal
+# authority for S2.1.
+PRODUCER_COMPATIBILITY_PATHS: tuple[str, ...] = (
+    EVALUATOR_SOURCE_PATH,
+    PREREGISTRATION_SOURCE_PATH,
+    RUNNER_SOURCE_PATH,
+    TASK_CATALOG_SOURCE_PATH,
+    STAGE1_HANDOFF_SOURCE_PATH,
+    PREREGISTRATION_SCHEMA_PATH,
+    PLAN_PATH,
+    MATHEMATICS_PATH,
 )
 
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
@@ -107,7 +133,7 @@ EVALUATION_CONFIG: Mapping[str, JSONValue] = {
     "plan_path": PLAN_PATH,
     "frozen_plan_sha256": FROZEN_PLAN_SHA256,
     "mathematics_path": MATHEMATICS_PATH,
-    "stage1_report_path": STAGE1_REPORT_PATH,
+    "stage1_provenance_rule": "formal_stage1_11_bridge_index_and_role_hashes_only",
     "runner_candidate_rule": "candidate_must_be_NOT_RUN_and_formal_eligible_false",
     "decision_rule": "PASS_only_after_rebuilt_preregistration_and_hypothesis_contract_match",
     "resolved_config_rule": "persisted_resolved_config_v2_must_match_all_three_s21_commits",
@@ -258,6 +284,10 @@ class _Stage1SourceSet:
     artifacts_by_kind: Mapping[str, LoadedTaskArtifact]
     config_hash: str
     binding_hash: str
+    source_refs: tuple[str, ...]
+    bridge_ref: str
+    bridge_payload: Mapping[str, JSONValue]
+    handoff: Stage1ExitEvidence
 
 
 @dataclass(frozen=True, slots=True)
@@ -274,19 +304,28 @@ def _payload_status(payload: Mapping[str, JSONValue]) -> object:
 
 
 def _validate_stage1_payload(kind: str, item: LoadedTaskArtifact) -> None:
+    """Validate one released S1.11 role payload before bridge validation.
+
+    The four role envelopes are not interchangeable PASS-looking summaries.  A
+    role must either be the exact S1.11 formal schema (whose immutable index is
+    checked below) or the older TaskRuntime evidence schema with a complete
+    task-definition/core-evidence bridge.  In particular, a tiny
+    ``{schema,status,task,gate}`` object is never enough.
+    """
+
     payload = item.payload
     schema = payload.get("schema_version")
     if schema == STAGE1_LEGACY_PAYLOAD_SCHEMA:
-        if payload.get("scope") != "formal":
+        if payload.get("scope") != "formal" or payload.get("formal_eligible") is not True:
             raise G20Blocked(f"stage1_source:{kind}:FORMAL_SCOPE_REQUIRED")
         if payload.get("task_id") != STAGE1_TASK_ID:
             raise G20Blocked(f"stage1_source:{kind}:WRONG_TASK_ID")
-        if _payload_status(payload) != "PASS":
+        if _payload_status(payload) != "PASS" or payload.get("gate_status") != "PASS":
             raise G20Blocked(f"stage1_source:{kind}:STATUS_NOT_PASS")
     elif schema == STAGE1_PAYLOAD_SCHEMAS[kind]:
         if payload.get("task_id") != STAGE1_TASK_ID or payload.get("gate_id") != STAGE1_GATE_ID:
             raise G20Blocked(f"stage1_source:{kind}:IDENTITY_INVALID")
-        if _payload_status(payload) != "PASS":
+        if kind != "delivery_manifest" and _payload_status(payload) != "PASS":
             raise G20Blocked(f"stage1_source:{kind}:STATUS_NOT_PASS")
     else:
         raise G20Blocked(f"stage1_source:{kind}:PAYLOAD_SCHEMA_INVALID")
@@ -295,20 +334,32 @@ def _validate_stage1_payload(kind: str, item: LoadedTaskArtifact) -> None:
     if declared_config is not None and declared_config != item.identity.config_hash:
         raise G20Blocked(f"stage1_source:{kind}:CONFIG_HASH_MISMATCH")
     declared_artifact_hash = payload.get("artifact_hash")
-    if declared_artifact_hash is not None:
+    if schema == STAGE1_PAYLOAD_SCHEMAS[kind] or declared_artifact_hash is not None:
         _sha(declared_artifact_hash, f"stage1_source:{kind}.artifact_hash")
-        if canonical_json_hash({key: item for key, item in payload.items() if key != "artifact_hash"}) != declared_artifact_hash:
+        if canonical_json_hash(
+            {key: item for key, item in payload.items() if key != "artifact_hash"}
+        ) != declared_artifact_hash:
             raise G20Blocked(f"stage1_source:{kind}:ARTIFACT_HASH_MISMATCH")
+
+    task_definition = payload.get("task_definition")
     task_definition_hash = payload.get("task_definition_hash")
-    if task_definition_hash is not None:
-        _sha(task_definition_hash, f"stage1_source:{kind}.task_definition_hash")
     core = payload.get("core_evidence")
     core_hash = payload.get("core_evidence_hash")
-    if core is not None:
+    if any(value is not None for value in (task_definition, task_definition_hash, core, core_hash)):
+        if not isinstance(task_definition, Mapping) or not isinstance(task_definition_hash, str):
+            raise G20Blocked(f"stage1_source:{kind}:TASK_DEFINITION_BRIDGE_MISSING")
+        _sha(task_definition_hash, f"stage1_source:{kind}.task_definition_hash")
+        if canonical_json_hash(task_definition) != task_definition_hash:
+            raise G20Blocked(f"stage1_source:{kind}:TASK_DEFINITION_BRIDGE_MISMATCH")
         if not isinstance(core, Mapping) or not isinstance(core_hash, str):
             raise G20Blocked(f"stage1_source:{kind}:CORE_EVIDENCE_BRIDGE_MISSING")
+        _sha(core_hash, f"stage1_source:{kind}.core_evidence_hash")
         if canonical_json_hash(core) != core_hash:
             raise G20Blocked(f"stage1_source:{kind}:CORE_EVIDENCE_BRIDGE_MISMATCH")
+        if core.get("task_id") not in {None, STAGE1_TASK_ID}:
+            raise G20Blocked(f"stage1_source:{kind}:CORE_EVIDENCE_TASK_MISMATCH")
+        if core.get("gate_id") not in {None, STAGE1_GATE_ID, f"stage1.{STAGE1_GATE_ID}"}:
+            raise G20Blocked(f"stage1_source:{kind}:CORE_EVIDENCE_GATE_MISMATCH")
 
     if kind == "gate_summary" and "unresolved_failure_count" in payload:
         if payload.get("unresolved_failure_count") != 0:
@@ -351,6 +402,154 @@ def _stage1_binding_hash(artifacts: Mapping[str, LoadedTaskArtifact], refs: Mapp
     )
 
 
+def _load_stage1_json(data_root: Path, reference: object, field: str) -> Mapping[str, JSONValue]:
+    logical = _logical_path(reference, field)
+    path = _resolve(data_root, logical, field)
+    try:
+        value = load_canonical_json(path)
+    except (OSError, TypeError, ValueError) as error:
+        raise G20Blocked(f"{field}:INVALID") from error
+    if not isinstance(value, Mapping):
+        raise G20Blocked(f"{field}:OBJECT_REQUIRED")
+    return value
+
+
+def _stage1_role_path(data_root: Path, index_ref: str, role_ref: object, field: str) -> str:
+    """Resolve an index-directory role ref to a DATA_ROOT logical path."""
+
+    role = _logical_path(role_ref, field)
+    base = PurePosixPath(index_ref).parent
+    combined = PurePosixPath(*(base.parts + PurePosixPath(role).parts)).as_posix()
+    _resolve(data_root, combined, field)
+    return combined
+
+
+def _validate_stage1_bridge(
+    data_root: Path,
+    *,
+    artifacts_by_kind: Mapping[str, LoadedTaskArtifact],
+    envelope_source_refs: tuple[str, ...],
+) -> tuple[str, Mapping[str, JSONValue], Stage1ExitEvidence]:
+    """Re-read the materializer bridge and the complete S1.11 closure.
+
+    ``stage1_handoff.validate_stage1_exit_evidence`` owns the formal schema,
+    role, validation, replay, requirement and producer checks.  This adapter
+    additionally binds the four TaskArtifact payload bytes to the bridge's
+    role hashes and requires the bridge/config/source-ref identity to be the
+    same in every envelope.
+    """
+
+    source_set = set(envelope_source_refs)
+    index_candidates = [
+        ref
+        for ref in envelope_source_refs
+        if ref.startswith("evidence/stage1/s1-11-formal/") and ref.endswith("/index.json")
+    ]
+    bridge_candidates = [
+        ref for ref in envelope_source_refs if ref.endswith("/stage1-11-bridge-evidence.json")
+    ]
+    config_candidates = [
+        ref for ref in envelope_source_refs if ref.endswith("/stage1-11-resolved-config-v2.json")
+    ]
+    if len(index_candidates) != 1 or len(bridge_candidates) != 1 or len(config_candidates) != 1:
+        raise G20Blocked("stage1_source:BRIDGE_INDEX_CONFIG_REFS_REQUIRED")
+    index_ref = index_candidates[0]
+    bridge_ref = bridge_candidates[0]
+    config_ref = config_candidates[0]
+    bridge = _load_stage1_json(data_root, bridge_ref, "stage1_bridge")
+    if bridge.get("schema_version") != "stage2-s204-stage1-bridge-v1" or bridge.get("status") != "PASS":
+        raise G20Blocked("stage1_source:BRIDGE_SCHEMA_OR_STATUS_INVALID")
+    if bridge.get("formal_eligible") is not True or bridge.get("task_id") != STAGE1_TASK_ID:
+        raise G20Blocked("stage1_source:BRIDGE_SCOPE_INVALID")
+    if bridge.get("gate_id") not in {STAGE1_GATE_ID, f"stage1.{STAGE1_GATE_ID}"}:
+        raise G20Blocked("stage1_source:BRIDGE_GATE_INVALID")
+    bridge_hash = bridge.get("artifact_hash")
+    _sha(bridge_hash, "stage1_bridge.artifact_hash")
+    if canonical_json_hash({key: item for key, item in bridge.items() if key != "artifact_hash"}) != bridge_hash:
+        raise G20Blocked("stage1_source:BRIDGE_ARTIFACT_HASH_MISMATCH")
+    if bridge.get("index_ref") != index_ref:
+        raise G20Blocked("stage1_source:BRIDGE_INDEX_REF_MISMATCH")
+    try:
+        handoff = validate_stage1_exit_evidence(
+            data_root,
+            index_ref,
+            evidence_root=data_root,
+        )
+    except (Stage1HandoffError, FileNotFoundError, OSError, TypeError, ValueError) as error:
+        raise G20Blocked(f"stage1_source:FORMAL_HANDOFF_INVALID:{type(error).__name__}") from error
+    for ref in (index_ref, bridge_ref, config_ref, handoff.formal_observation_ref):
+        _resolve(data_root, ref, f"stage1_source:{ref}")
+    if bridge.get("index_sha256") != handoff.index_sha256 or bridge.get("index_artifact_hash") != handoff.index_artifact_hash:
+        raise G20Blocked("stage1_source:BRIDGE_INDEX_HASH_MISMATCH")
+    if bridge.get("execution_commit") != handoff.execution_commit:
+        raise G20Blocked("stage1_source:BRIDGE_EXECUTION_COMMIT_MISMATCH")
+    if bridge.get("producer_commit", handoff.producer_commit) != handoff.producer_commit:
+        raise G20Blocked("stage1_source:BRIDGE_PRODUCER_COMMIT_MISMATCH")
+    if handoff.producer_commit != STAGE1_G1_EXIT_PRODUCER_COMMIT:
+        raise G20Blocked("stage1_source:UNTRUSTED_PRODUCER_COMMIT")
+
+    index = _load_stage1_json(data_root, index_ref, "stage1_index")
+    index_role_refs = index.get("role_refs")
+    if not isinstance(index_role_refs, Mapping):
+        raise G20Blocked("stage1_source:INDEX_ROLE_REFS_REQUIRED")
+    bridge_role_refs = bridge.get("role_refs")
+    bridge_role_hashes = bridge.get("role_sha256")
+    if not isinstance(bridge_role_refs, Mapping) or not isinstance(bridge_role_hashes, Mapping):
+        raise G20Blocked("stage1_source:BRIDGE_ROLE_REFS_AND_HASHES_REQUIRED")
+    required_bridge_roles = (
+        "formal_observation", "stage_report", "delivery_manifest",
+        "gate_summary", "requirements_matrix",
+    )
+    expected_role_paths: dict[str, str] = {}
+    for role in required_bridge_roles:
+        if role not in index_role_refs or role not in bridge_role_refs:
+            raise G20Blocked(f"stage1_source:BRIDGE_ROLE_MISSING:{role}")
+        expected = _stage1_role_path(data_root, index_ref, index_role_refs[role], f"stage1.role.{role}")
+        observed = _logical_path(bridge_role_refs[role], f"stage1.bridge_role.{role}")
+        _resolve(data_root, observed, f"stage1.bridge_role.{role}")
+        if observed != expected:
+            raise G20Blocked(f"stage1_source:BRIDGE_ROLE_REF_MISMATCH:{role}")
+        expected_role_paths[role] = expected
+    if bridge.get("source_refs") is not None:
+        bridge_sources = bridge.get("source_refs")
+        if not isinstance(bridge_sources, list) or set(bridge_sources) != {
+            index_ref, *expected_role_paths.values()
+        }:
+            raise G20Blocked("stage1_source:BRIDGE_SOURCE_REFS_MISMATCH")
+    # The index must expose and hash the validation/replay roles explicitly;
+    # the shared validator checks their schemas/status, while these checks bind
+    # the index's auxiliary refs to the same DATA_ROOT bytes.
+    for field_name in ("validation_ref", "replay_ref"):
+        ref = index.get(field_name)
+        digest = index.get(field_name.removesuffix("_ref") + "_sha256")
+        if not isinstance(ref, str) or not isinstance(digest, str):
+            raise G20Blocked(f"stage1_source:INDEX_{field_name.upper()}_BRIDGE_MISSING")
+        role_path = _stage1_role_path(data_root, index_ref, ref, f"stage1.index.{field_name}")
+        if _file_sha256(_resolve(data_root, role_path, f"stage1.index.{field_name}"), f"stage1.index.{field_name}") != digest:
+            raise G20Blocked(f"stage1_source:INDEX_{field_name.upper()}_HASH_MISMATCH")
+
+    payload_hashes = bridge.get("payload_hashes")
+    if not isinstance(payload_hashes, Mapping) or set(payload_hashes) != set(STAGE1_ARTIFACT_KINDS):
+        raise G20Blocked("stage1_source:BRIDGE_PAYLOAD_HASH_SET_INVALID")
+    for kind in STAGE1_ARTIFACT_KINDS:
+        role_path = expected_role_paths[kind]
+        role_payload = _load_stage1_json(data_root, role_path, f"stage1.role.{kind}")
+        expected_hash = _sha(payload_hashes[kind], f"stage1.bridge.payload_hashes.{kind}")
+        if canonical_json_hash(dict(role_payload)) != expected_hash:
+            raise G20Blocked(f"stage1_source:BRIDGE_PAYLOAD_HASH_MISMATCH:{kind}")
+        if canonical_json_hash(dict(artifacts_by_kind[kind].payload)) != expected_hash:
+            raise G20Blocked(f"stage1_source:TASK_PAYLOAD_ROLE_MISMATCH:{kind}")
+
+    bridge_config = _load_resolved_config(data_root, config_ref)
+    if bridge.get("bridge_config_ref") != config_ref:
+        raise G20Blocked("stage1_source:BRIDGE_CONFIG_REF_MISMATCH")
+    if bridge.get("bridge_config_hash") != bridge_config.config_hash or bridge.get("bridge_config_full_hash") != bridge_config.full_hash:
+        raise G20Blocked("stage1_source:BRIDGE_CONFIG_HASH_MISMATCH")
+    if bridge_config.config_hash != next(iter({item.identity.config_hash for item in artifacts_by_kind.values()})):
+        raise G20Blocked("stage1_source:BRIDGE_CONFIG_IDENTITY_MISMATCH")
+    return bridge_ref, bridge, handoff
+
+
 def _load_stage1_sources(data_root: Path, refs: Sequence[str]) -> _Stage1SourceSet:
     if len(refs) != len(STAGE1_ARTIFACT_KINDS):
         raise G20Blocked("source_refs:EXACTLY_FOUR_STAGE1_11_COMMITS_REQUIRED")
@@ -376,9 +575,20 @@ def _load_stage1_sources(data_root: Path, refs: Sequence[str]) -> _Stage1SourceS
         raise G20Blocked("source_refs:MIXED_OR_INVALID_CONFIG_HASH")
     refs_by_kind = {kind: ref for kind, ref, _ in loaded}
     artifacts_by_kind = {kind: item for kind, _, item in loaded}
-    # A Stage 1 report family is a bridge, not four unrelated PASS-looking
-    # documents: all members must carry the same core evidence/task definition
-    # where those fields are present.
+    # Every formal Stage1 envelope must carry the same non-empty source closure;
+    # this is the producer/config/source consistency boundary.
+    source_ref_sets: list[tuple[str, ...]] = []
+    for kind, _ref, item in loaded:
+        raw_source_refs = tuple(_logical_path(value, f"stage1_source:{kind}.source_refs") for value in item.source_refs)
+        if not raw_source_refs:
+            raise G20Blocked("stage1_source:SOURCE_REFS_REQUIRED")
+        source_ref_sets.append(raw_source_refs)
+    if len(set(source_ref_sets)) != 1:
+        raise G20Blocked("stage1_source:SOURCE_REFS_NOT_COMMON")
+    envelope_source_refs = source_ref_sets[0]
+    # A Stage 1 role family is a bridge, not four unrelated PASS-looking
+    # documents: all members must carry the same complete core evidence/task
+    # definition when using the TaskRuntime schema.
     core_hashes = {
         item.payload.get("core_evidence_hash")
         for item in artifacts_by_kind.values()
@@ -393,11 +603,20 @@ def _load_stage1_sources(data_root: Path, refs: Sequence[str]) -> _Stage1SourceS
     }
     if len(task_definition_hashes) > 1:
         raise G20Blocked("source_refs:TASK_DEFINITION_BRIDGE_MISMATCH")
+    bridge_ref, bridge_payload, handoff = _validate_stage1_bridge(
+        data_root,
+        artifacts_by_kind=artifacts_by_kind,
+        envelope_source_refs=envelope_source_refs,
+    )
     return _Stage1SourceSet(
         refs_by_kind=refs_by_kind,
         artifacts_by_kind=artifacts_by_kind,
         config_hash=next(iter(configs)),
         binding_hash=_stage1_binding_hash(artifacts_by_kind, refs_by_kind),
+        source_refs=envelope_source_refs,
+        bridge_ref=bridge_ref,
+        bridge_payload=bridge_payload,
+        handoff=handoff,
     )
 
 
@@ -506,6 +725,22 @@ class _RepositoryIdentity:
     validation_error: str | None
 
 
+@dataclass(frozen=True, slots=True)
+class _ProducerCompatibility:
+    producer_commit: str
+    consumer_commit: str
+    mode: str
+    critical_source_hashes: Mapping[str, str]
+
+    def to_dict(self) -> dict[str, JSONValue]:
+        return {
+            "producer_commit": self.producer_commit,
+            "consumer_commit": self.consumer_commit,
+            "mode": self.mode,
+            "critical_source_hashes": dict(self.critical_source_hashes),
+        }
+
+
 def _git_text(root: Path, *arguments: str) -> str:
     try:
         result = subprocess.run(
@@ -590,6 +825,23 @@ def _repository_identity(repository_root: Path) -> _RepositoryIdentity:
     except (OSError, subprocess.SubprocessError) as error:
         errors.append(f"repository_source:DIFF_CHECK_FAILED:{type(error).__name__}")
 
+    # A formal evaluator cannot certify a source identity from a partially
+    # clean checkout.  Check the complete porcelain view, including unrelated
+    # tracked files and every untracked file; the narrowed diff above remains
+    # useful for the source-specific diagnostic.
+    try:
+        status = subprocess.run(
+            ["git", "-C", str(root), "status", "--porcelain=v1", "--untracked-files=all"],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        if status.stdout.strip():
+            errors.append("repository:WORKTREE_DIRTY")
+    except (OSError, subprocess.SubprocessError) as error:
+        errors.append(f"repository:STATUS_CHECK_FAILED:{type(error).__name__}")
+
     # A complete evaluation identity is only made from real 64-hex source
     # digests.  Missing files therefore produce a blocked binding rather than a
     # placeholder digest that can accidentally pass a test fixture.
@@ -604,19 +856,67 @@ def _repository_identity(repository_root: Path) -> _RepositoryIdentity:
     return _RepositoryIdentity(root, head, hashes, evaluation, evaluation_hash, ";".join(errors) if errors else None)
 
 
+def _producer_compatibility(
+    repository: _RepositoryIdentity,
+    producer_commit: str,
+) -> _ProducerCompatibility:
+    """Accept the same commit or an explicitly compatible ancestor only.
+
+    A producer identity is not trusted merely because it is a syntactically
+    valid SHA.  For an older producer, Git ancestry and every critical source /
+    schema / formula / task-catalog blob must agree with the consumer HEAD.
+    """
+
+    try:
+        _git_text(repository.root, "cat-file", "-e", f"{producer_commit}^{{commit}}")
+    except G20Blocked as error:
+        raise G20Blocked("provenance.producer_commit:GIT_OBJECT_MISSING") from error
+    if producer_commit == repository.head:
+        hashes = {
+            relative: repository.source_hashes[relative]
+            for relative in PRODUCER_COMPATIBILITY_PATHS
+        }
+        return _ProducerCompatibility(producer_commit, repository.head, "same_commit", hashes)
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(repository.root), "merge-base", "--is-ancestor", producer_commit, repository.head],
+            capture_output=True,
+            timeout=15,
+        )
+    except (OSError, subprocess.SubprocessError) as error:
+        raise G20Blocked("provenance.producer_commit:ANCESTRY_CHECK_FAILED") from error
+    if result.returncode != 0:
+        raise G20Blocked("provenance.producer_commit:NOT_COMPATIBLE_ANCESTOR")
+    hashes: dict[str, str] = {}
+    for relative in PRODUCER_COMPATIBILITY_PATHS:
+        try:
+            producer_bytes = _git_bytes(repository.root, "show", f"{producer_commit}:{relative}")
+            consumer_bytes = _git_bytes(repository.root, "show", f"{repository.head}:{relative}")
+        except G20Blocked as error:
+            raise G20Blocked(f"provenance.producer_commit:CRITICAL_SOURCE_MISSING:{relative}") from error
+        if producer_bytes != consumer_bytes:
+            raise G20Blocked(f"provenance.producer_commit:CRITICAL_SOURCE_DRIFT:{relative}")
+        hashes[relative] = hashlib.sha256(consumer_bytes).hexdigest()
+    return _ProducerCompatibility(
+        producer_commit,
+        repository.head,
+        "ancestor_critical_sources_equal",
+        hashes,
+    )
+
+
 def _validate_document_bindings(
     preregistration: Mapping[str, Any],
     *,
     repository: _RepositoryIdentity,
     stage1_binding: _Stage1SourceSet,
     config: _ResolvedConfigBinding,
-) -> None:
+) -> _ProducerCompatibility:
     provenance = preregistration.get("provenance")
     if not isinstance(provenance, Mapping):
         raise G20Blocked("preregistration:PROVENANCE_REQUIRED")
     producer = _commit(provenance.get("producer_commit"), "provenance.producer_commit")
-    if producer != repository.head:
-        raise G20Blocked("provenance.producer_commit:TRUSTED_HEAD_MISMATCH")
+    compatibility = _producer_compatibility(repository, producer)
     seed_hash = _sha(provenance.get("seed_plan_hash"), "provenance.seed_plan_hash")
     try:
         identity = config.config.base_config.section("identity")
@@ -629,15 +929,18 @@ def _validate_document_bindings(
     if upstream != stage1_binding.binding_hash:
         raise G20Blocked("provenance.upstream_binding_hash:SOURCE_BINDING_MISMATCH")
     mathematics_hash = _sha(provenance.get("mathematics_hash"), "provenance.mathematics_hash")
-    stage1_hash = _sha(provenance.get("stage1_report_hash"), "provenance.stage1_report_hash")
     if provenance.get("mathematics_path") != MATHEMATICS_PATH:
         raise G20Blocked("provenance.mathematics_path:FROZEN_PATH_MISMATCH")
-    if provenance.get("stage1_report_path") != STAGE1_REPORT_PATH:
-        raise G20Blocked("provenance.stage1_report_path:FROZEN_PATH_MISMATCH")
     if mathematics_hash != repository.source_hashes[MATHEMATICS_PATH]:
         raise G20Blocked("provenance.mathematics_hash:CONTENT_MISMATCH")
-    if stage1_hash != repository.source_hashes[STAGE1_REPORT_PATH]:
-        raise G20Blocked("provenance.stage1_report_hash:CONTENT_MISMATCH")
+    # Stage1 provenance is the DATA_ROOT bridge/index closure.  A tracked
+    # reports/... local fixture is deliberately not read or compared here.
+    declared_handoff = provenance.get("stage1_handoff")
+    if not isinstance(declared_handoff, Mapping):
+        raise G20Blocked("provenance.stage1_handoff:FORMAL_BRIDGE_REQUIRED")
+    if dict(declared_handoff) != dict(stage1_binding.bridge_payload):
+        raise G20Blocked("provenance.stage1_handoff:BRIDGE_CONTENT_MISMATCH")
+    return compatibility
 
 
 def _validate_preregistration(
@@ -646,14 +949,14 @@ def _validate_preregistration(
     repository: _RepositoryIdentity,
     stage1_binding: _Stage1SourceSet,
     config: _ResolvedConfigBinding,
-) -> None:
+) -> _ProducerCompatibility:
     try:
         validate_stage2_preregistration(value)
     except (TypeError, ValueError) as error:
         raise G20Failed(f"preregistration:VALIDATOR_REJECTED:{error}") from error
     if value.get("scope") != "formal" or value.get("formal_eligible") is not False:
         raise G20Failed("preregistration:FORMAL_SCOPE_REQUIRED")
-    _validate_document_bindings(
+    compatibility = _validate_document_bindings(
         value,
         repository=repository,
         stage1_binding=stage1_binding,
@@ -666,14 +969,24 @@ def _validate_preregistration(
             seed_plan_hash=str(provenance["seed_plan_hash"]),
             producer_commit=str(provenance["producer_commit"]),
             mathematics_hash=str(provenance["mathematics_hash"]),
-            stage1_report_hash=str(provenance["stage1_report_hash"]),
+            stage1_report_hash=(
+                str(provenance["stage1_report_hash"])
+                if provenance.get("stage1_report_hash") is not None
+                else None
+            ),
             upstream_binding_hash=str(provenance["upstream_binding_hash"]),
+            stage1_handoff=(
+                dict(provenance["stage1_handoff"])
+                if isinstance(provenance.get("stage1_handoff"), Mapping)
+                else None
+            ),
             scope="formal",
         )
     except (TypeError, ValueError) as error:
         raise G20Failed(f"preregistration:REBUILD_FAILED:{error}") from error
     if dict(value) != rebuilt:
         raise G20Failed("preregistration:FROZEN_CONTENT_MISMATCH")
+    return compatibility
 
 
 def _validate_hypothesis(value: Mapping[str, Any], preregistration: Mapping[str, Any]) -> None:
@@ -738,6 +1051,7 @@ def _make_gate(
     loaded: _LoadedSet | None,
     repository: _RepositoryIdentity | None,
     config: _ResolvedConfigBinding | None,
+    producer_compatibility: _ProducerCompatibility | None = None,
 ) -> GateRecord:
     candidate: Mapping[str, JSONValue] = {}
     prereg_hash: str | None = None
@@ -770,6 +1084,19 @@ def _make_gate(
                 }
                 for kind in STAGE1_ARTIFACT_KINDS
             ]
+            stage1_identity.append(
+                {
+                    "bridge_ref": loaded.stage1.bridge_ref,
+                    "bridge_artifact_hash": loaded.stage1.bridge_payload.get("artifact_hash"),
+                    "index_ref": loaded.stage1.handoff.index_ref,
+                    "index_sha256": loaded.stage1.handoff.index_sha256,
+                    "index_artifact_hash": loaded.stage1.handoff.index_artifact_hash,
+                    "producer_commit": loaded.stage1.handoff.producer_commit,
+                    "execution_commit": loaded.stage1.handoff.execution_commit,
+                    "role_sha256": dict(loaded.stage1.handoff.role_sha256),
+                    "envelope_source_refs": list(loaded.stage1.source_refs),
+                }
+            )
     measured: dict[str, JSONValue] = {
         "input_artifact_count": 3 if loaded is not None else 0,
         "task_id": TASK_ID,
@@ -794,7 +1121,17 @@ def _make_gate(
             }
         ),
         "evaluator": {
-            "producer_commit": None if repository is None else repository.head,
+            "producer_commit": (
+                None
+                if producer_compatibility is None
+                else producer_compatibility.producer_commit
+            ),
+            "consumer_commit": None if repository is None else repository.head,
+            "producer_compatibility": (
+                None
+                if producer_compatibility is None
+                else producer_compatibility.to_dict()
+            ),
             "source_sha256": None if repository is None else repository.source_hashes.get(EVALUATOR_SOURCE_PATH),
             "source_hashes": None if repository is None else dict(repository.source_hashes),
             "evaluation_config": None if repository is None else dict(repository.evaluation_config),
@@ -873,6 +1210,7 @@ def _reuse_existing(
     expected_source_refs: Sequence[str],
     repository: _RepositoryIdentity,
     config: _ResolvedConfigBinding,
+    expected_gate: GateRecord,
 ) -> tuple[GateRecord, LoadedTaskArtifact]:
     _resolve(data_root, commit_ref, "output_commit_ref")
     output = _load_committed(data_root, commit_ref)
@@ -886,14 +1224,18 @@ def _reuse_existing(
         gate = GateRecord.from_mapping(dict(output.payload))
     except (TypeError, ValueError) as error:
         raise G20Blocked("output_commit:GATE_RECORD_INVALID") from error
-    measured = gate.measured
-    if isinstance(measured, Mapping):
-        evaluator = measured.get("evaluator")
-        if isinstance(evaluator, Mapping) and evaluator.get("evaluation_config_hash") != repository.evaluation_config_hash:
-            raise G20Blocked("output_commit:EVALUATION_CONFIG_DRIFT")
-        resolved = measured.get("resolved_config")
-        if isinstance(resolved, Mapping) and resolved.get("full_hash") != config.full_hash:
-            raise G20Blocked("output_commit:RESOLVED_CONFIG_DRIFT")
+    # Reuse is an optimization only after the caller has recomputed the full
+    # current semantic GateRecord.  checked_at and the content hash are the
+    # only fields allowed to differ: the hash is validated by GateRecord and
+    # checked_at is intentionally stable on reuse.  This catches re-signed
+    # envelopes whose status/reasons/measured/evaluator/source/policy changed.
+    observed = gate.to_dict()
+    expected = expected_gate.to_dict()
+    for value in (observed, expected):
+        value.pop("checked_at", None)
+        value.pop("artifact_hash", None)
+    if observed != expected:
+        raise G20Blocked("output_commit:SEMANTIC_GATE_DRIFT")
     return gate, output
 
 
@@ -973,6 +1315,7 @@ def evaluate_formal_g20(
     loaded: _LoadedSet | None = None
     repository: _RepositoryIdentity | None = None
     config: _ResolvedConfigBinding | None = None
+    producer_compatibility: _ProducerCompatibility | None = None
     status = GateStatus.BLOCKED
     reasons: list[str] = []
     try:
@@ -1012,7 +1355,7 @@ def evaluate_formal_g20(
                     prereg = loaded.artifacts_by_kind["preregistration"].payload
                     hypothesis = loaded.artifacts_by_kind["hypothesis_contract"].payload
                     candidate = loaded.artifacts_by_kind["gate_record"].payload
-                    _validate_preregistration(
+                    producer_compatibility = _validate_preregistration(
                         prereg,
                         repository=repository,
                         stage1_binding=loaded.stage1,
@@ -1049,6 +1392,17 @@ def evaluate_formal_g20(
             attempt = _attempt_id(base_dir=base_dir, loaded=loaded, config=config, repository=repository)
             commit_ref = f"{base_dir}/g2.0-attempts/{attempt}/commits/gate_record.json"
             _reject_symlink_chain(data, commit_ref, "output_commit_ref")
+            # Recompute the full semantic GateRecord before inspecting an
+            # existing path.  Reuse is allowed only for this exact meaning.
+            gate = _make_gate(
+                status=status,
+                reasons=reasons,
+                evidence_refs=evidence_refs,
+                loaded=loaded,
+                repository=repository,
+                config=config,
+                producer_compatibility=producer_compatibility,
+            )
             if (data / Path(*PurePosixPath(commit_ref).parts)).exists():
                 existing_gate, existing = _reuse_existing(
                     data,
@@ -1056,6 +1410,7 @@ def evaluate_formal_g20(
                     expected_source_refs=tuple(loaded.refs_by_kind[kind] for kind in ARTIFACT_KINDS),
                     repository=repository,
                     config=config,
+                    expected_gate=gate,
                 )
                 return _result(
                     existing_gate,
@@ -1064,14 +1419,6 @@ def evaluate_formal_g20(
                     config=config,
                     source_refs=evidence_refs,
                 )
-            gate = _make_gate(
-                status=status,
-                reasons=reasons,
-                evidence_refs=evidence_refs,
-                loaded=loaded,
-                repository=repository,
-                config=config,
-            )
             published = _publish(
                 data,
                 base_dir=base_dir,
@@ -1092,6 +1439,7 @@ def evaluate_formal_g20(
             loaded=loaded,
             repository=repository,
             config=config,
+            producer_compatibility=producer_compatibility,
         )
     except Exception as error:
         gate = GateRecord(
