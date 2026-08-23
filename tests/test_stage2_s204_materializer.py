@@ -21,6 +21,7 @@ from ops.stage2.materialize_s204 import (
     write_six_cell_configs,
     _load_gpu_health_identity,
     _load_parameter_registry_artifact,
+    _publish_authoritative_asset_manifest,
     publish_per_cell_delta_sci,
     publish_per_cell_runtime_environments,
     publish_per_cell_sizing_plans,
@@ -506,6 +507,77 @@ def _formal_asset_payload(manifest: AssetResolutionManifest) -> dict[str, object
         "upstream_binding_hash": "b" * 64,
         "formal_eligible": False,
     }
+
+
+def test_authoritative_asset_manifest_accepts_direct_v1_without_republication(tmp_path: Path) -> None:
+    manifest = _formal_asset_manifest()
+    source_ref = "manifests/stage2/assets.json"
+    write_canonical_json(tmp_path / source_ref, manifest.to_dict())
+    source = {
+        "stage2_asset_resolution_manifest": source_ref,
+        "stage2_asset_resolution_sha256": hashlib.sha256(
+            (tmp_path / source_ref).read_bytes()
+        ).hexdigest(),
+    }
+
+    authoritative_ref, loaded = _publish_authoritative_asset_manifest(
+        tmp_path,
+        source=source,
+        raw_refs=None,
+        output_dir="evidence/stage2/s204/materialized-task-inputs",
+    )
+
+    assert authoritative_ref == source_ref
+    assert loaded == manifest
+    assert not (
+        tmp_path
+        / "evidence/stage2/s204/materialized-task-inputs/asset-resolution-manifest.json"
+    ).exists()
+
+
+def test_authoritative_asset_manifest_materializes_amendment_and_preserves_input_lineage(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    manifest = _formal_asset_manifest()
+    source_ref = "manifests/stage2/assets-amendment.json"
+    write_canonical_json(
+        tmp_path / source_ref,
+        {"schema_version": "stage2-asset-resolution-amendment-v1"},
+    )
+    source_sha256 = hashlib.sha256((tmp_path / source_ref).read_bytes()).hexdigest()
+    loader_calls: list[tuple[Path, Path, Path]] = []
+
+    def fake_loader(path: Path, *, root: Path, data_root: Path) -> dict[str, object]:
+        loader_calls.append((path, root, data_root))
+        return manifest.to_dict()
+
+    monkeypatch.setattr(
+        "ops.stage2.materialize_s204.load_asset_resolution_input",
+        fake_loader,
+    )
+    authoritative_ref, loaded = _publish_authoritative_asset_manifest(
+        tmp_path,
+        source={
+            "stage2_asset_resolution_manifest": source_ref,
+            "stage2_asset_resolution_sha256": source_sha256,
+        },
+        raw_refs=None,
+        output_dir="evidence/stage2/s204/materialized-task-inputs-amendment",
+    )
+
+    assert loader_calls == [
+        (tmp_path / source_ref, tmp_path, tmp_path)
+    ]
+    assert loaded == manifest
+    assert authoritative_ref.endswith("/asset-resolution-manifest.json")
+    assert load_canonical_json(tmp_path / authoritative_ref) == manifest.to_dict()
+    lineage = load_canonical_json(
+        tmp_path
+        / "evidence/stage2/s204/materialized-task-inputs-amendment/asset-resolution-input-lineage.json"
+    )
+    assert lineage["input_ref"] == source_ref
+    assert lineage["input_sha256"] == source_sha256
+    assert lineage["materialized_asset_resolution_ref"] == authoritative_ref
 
 
 def test_six_cells_have_unique_identity_and_fresh_resume_separation(tmp_path: Path) -> None:
