@@ -28,6 +28,7 @@ from dataclasses import dataclass
 import hashlib
 import math
 from pathlib import Path, PurePosixPath
+import subprocess
 from time import perf_counter
 
 import numpy as np
@@ -119,6 +120,11 @@ from .sampling import (
     STREAM_NAMES,
 )
 from .stage2 import PairedEstimatorRunner, build_fixture_estimator_decision
+from .preregistration import (
+    build_stage2_hypothesis_contract,
+    build_stage2_preregistration,
+    validate_stage2_preregistration,
+)
 from .stage2_formal import (
     FormalExperimentPlan,
     PilotCellObservation,
@@ -1083,6 +1089,42 @@ def _sampling_plan(request: TaskExecutionRequest, context: _ProviderContext) -> 
     )
 
 
+def _stage2_source_identity() -> tuple[str, str | None, str | None]:
+    """Resolve the reproducibility bindings without writing to the workspace.
+
+    Local fixture tests execute with a temporary artifact root, so the repository
+    identity comes from this source module's worktree rather than that output root.
+    Missing report files are represented as ``None`` for development; formal
+    preflight remains responsible for requiring the Stage 1 evidence.
+    """
+
+    repository_root = Path(__file__).resolve().parents[3]
+    try:
+        producer_commit = subprocess.run(
+            ["git", "-C", str(repository_root), "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        producer_commit = "unresolved-local-source"
+
+    def file_hash(relative: str) -> str | None:
+        path = repository_root / Path(relative)
+        if not path.is_file():
+            return None
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+
+    return (
+        producer_commit,
+        file_hash("docs/mathematics.md"),
+        file_hash(
+            "reports/stage1/cpu-evidence-20260814-s12-r2/"
+            "stage1.11_reporting_and_exit_gate/stage_report.json"
+        ),
+    )
+
+
 def _run_stage2_contract(
     request: TaskExecutionRequest,
     root: Path,
@@ -1107,41 +1149,35 @@ def _run_stage2_contract(
                 retryable=False,
             )
     seed_plan = SeedPlan.from_master_seed(int(identity["master_seed"]))
-    preregistration: dict[str, JSONValue] = {
-        "schema_version": "stage2-task-preregistration-v1",
-        "scope": request.config.run_intent,
-        "estimand": "fixed_state_per_coordinate_gradient_mean_square",
-        "candidate_batch_sizes": list(CANDIDATE_BATCH_SIZES),
-        "candidate_microbatch_counts": list(CANDIDATE_MICROBATCH_COUNTS),
-        "microbatch_selection_order": list(MICROBATCH_SELECTION_ORDER),
-        "sampling_stream_names": list(STREAM_NAMES),
-        "seed_plan_hash": seed_plan.artifact_hash,
-        "formal_primary_values_status": "UNFROZEN",
-        "formal_eligible": False,
-    }
-    hypothesis: dict[str, JSONValue] = {
-        "schema_version": "stage2-task-hypothesis-contract-v1",
-        "primary_comparison": "u_vs_double_under_paired_equal_sample_budget",
-        "null_hypotheses": [
-            "mean_signed_bias_interval_contains_zero",
-            "candidate_corrected_nmse_not_better_than_double",
-        ],
-        "statistical_unit": "independent_repetition",
-        "weight_contract_required": [
-            "statistical_unit",
-            "weight_unit",
-            "sampling_design",
-            "weights_exogenous",
-            "common_mean_assumption",
-        ],
-        "multiplicity_policy": "preregistered_family_no_posthoc_promotion",
-        "upstream_binding_hash": inputs.binding_hash,
-    }
+    producer_commit, mathematics_hash, stage1_report_hash = _stage2_source_identity()
+    preregistration = build_stage2_preregistration(
+        seed_plan_hash=seed_plan.artifact_hash,
+        producer_commit=producer_commit,
+        mathematics_hash=mathematics_hash,
+        stage1_report_hash=stage1_report_hash,
+        upstream_binding_hash=inputs.binding_hash,
+        scope=request.config.run_intent,
+    )
+    validate_stage2_preregistration(preregistration)
+    hypothesis = build_stage2_hypothesis_contract(
+        preregistration,
+        upstream_binding_hash=inputs.binding_hash,
+    )
+    gate = _gate_candidate(request)
+    gate.update(
+        {
+            "gate_id": "stage2.G2.0",
+            "preregistration_hash": preregistration["preregistration_hash"],
+            "hypothesis_contract_hash": hypothesis["hypothesis_contract_hash"],
+            "quality_gate_status": "NOT_RUN",
+            "sample_generation_status": "FORBIDDEN_UNTIL_COMMITTED",
+        }
+    )
     return (
         {
             "preregistration": preregistration,
             "hypothesis_contract": hypothesis,
-            "gate_record": _gate_candidate(request),
+            "gate_record": gate,
         },
         inputs.references,
     )
