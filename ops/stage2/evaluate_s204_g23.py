@@ -20,6 +20,7 @@ if str(_REPOSITORY_ROOT / "src") not in sys.path:
 
 from param_importance_nlp.experiments.stage2_g23_evaluator import (
     CellInput,
+    _reject_absolute_symlink_chain,
     _reject_symlink_chain,
     evaluate_formal_g23,
 )
@@ -59,11 +60,9 @@ def _parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     try:
-        workspace_root = args.workspace_root.resolve()
+        workspace_root = _reject_absolute_symlink_chain(args.workspace_root, "--workspace-root")
         if args.input_index is not None:
-            index_path = args.input_index.resolve()
-            if args.input_index.is_symlink():
-                raise ValueError("--input-index symlink is forbidden")
+            index_path = _reject_absolute_symlink_chain(args.input_index, "--input-index")
             try:
                 index_path.relative_to(workspace_root)
             except ValueError as error:
