@@ -56,6 +56,17 @@ from .stage2_assets import (
     build_data_range_from_prefix,
     validate_formal_asset_identity,
 )
+from .stage2_registry_producer import (
+    REGISTRY_INDEX_SCHEMA,
+    REGISTRY_MANIFEST_SCHEMA,
+    RegistryCellResult,
+    RegistryProducerError,
+    RegistryProductionResult,
+    S203_ARTIFACT_KINDS,
+    S203_TASK_ID,
+    construct_registry_provider,
+    produce_registry_manifests,
+)
 from .stage2 import (
     COST_SEMANTICS,
     CoreEstimatorKernel,
@@ -236,6 +247,15 @@ __all__ = [
     "AblationTrainingStudyOutput",
     "ASSET_SCHEMA_VERSION",
     "AssetResolutionManifest",
+    "REGISTRY_INDEX_SCHEMA",
+    "REGISTRY_MANIFEST_SCHEMA",
+    "RegistryCellResult",
+    "RegistryProducerError",
+    "RegistryProductionResult",
+    "S203_ARTIFACT_KINDS",
+    "S203_TASK_ID",
+    "construct_registry_provider",
+    "produce_registry_manifests",
     "ConfiguredAblationTrainingBuilder",
     "CANDIDATE_BATCH_SIZES",
     "CANDIDATE_MICROBATCH_COUNTS",
