@@ -8,8 +8,11 @@ from pathlib import Path
 import numpy as np
 import pytest
 
+from param_importance_nlp.contracts.jsonio import canonical_json_hash
 from param_importance_nlp.experiments.stage2_g23_evaluator import (
     CellInput,
+    EXPECTED_CELL_IDS,
+    G23Blocked,
     _array,
     _bootstrap_independent_bias_interval,
     _bootstrap_independent_cross_interval,
@@ -17,6 +20,7 @@ from param_importance_nlp.experiments.stage2_g23_evaluator import (
     _moments_from_blocks,
     _pearson,
     _top_overlap,
+    _validate_six_cell_manifest,
     evaluate_formal_g23,
 )
 from param_importance_nlp.experiments.sampling import SamplingPlan, SamplingUniverse
@@ -34,6 +38,102 @@ from param_importance_nlp.experiments.stage2_g23_contracts import (
     validate_weighting_contract,
 )
 from param_importance_nlp.experiments.stage23_task_runners import _actual_sampling_state, _reference_capacity_preflight, _sizing_delta_sci
+
+
+def _six_cell_manifest_for_registry_hashes(
+    registry_hashes: tuple[str, ...],
+    *,
+    include_map: bool = True,
+) -> dict[str, object]:
+    assert len(registry_hashes) == len(EXPECTED_CELL_IDS)
+    rows = [
+        {
+            "cell_id": cell_id,
+            "model_id": cell_id.split(":", 1)[0],
+            "training_stage": cell_id.split(":", 1)[1],
+            "checkpoint_id": f"checkpoint-{index}",
+            "checkpoint_hash": f"{index + 1:064x}",
+            "checkpoint_revision": f"revision-{index}",
+            "registry_hash": registry_hash,
+            "config_hash": f"{index + 101:064x}",
+        }
+        for index, (cell_id, registry_hash) in enumerate(zip(EXPECTED_CELL_IDS, registry_hashes))
+    ]
+    by_cell = dict(zip(EXPECTED_CELL_IDS, registry_hashes))
+    body: dict[str, object] = {
+        "schema_version": "stage2-s204-six-cell-manifest-v1",
+        "status": "READY",
+        "scope": "formal",
+        "asset_resolution_hash": "a" * 64,
+        "asset_producer_commit": "b" * 40,
+        "asset_execution_commit": "c" * 40,
+        "checkpoints": rows,
+        "data": {"data_range_hash": "d" * 64},
+        "data_range_hash": "d" * 64,
+        "registry_hash": (
+            next(iter(set(registry_hashes)))
+            if len(set(registry_hashes)) == 1
+            else canonical_json_hash(by_cell)
+        ),
+    }
+    if include_map:
+        body["registry_hashes_by_cell"] = by_cell
+    body["manifest_hash"] = canonical_json_hash(body)
+    return body
+
+
+def test_six_cell_manifest_binds_model_specific_registry_hashes() -> None:
+    model_specific = ("1" * 64,) * 3 + ("2" * 64,) * 3
+
+    rows = _validate_six_cell_manifest(
+        _six_cell_manifest_for_registry_hashes(model_specific)
+    )
+
+    assert tuple(row["cell_id"] for row in rows) == EXPECTED_CELL_IDS
+    assert tuple(row["registry_hash"] for row in rows) == model_specific
+
+
+@pytest.mark.parametrize(
+    ("tamper", "expected_error"),
+    (
+        ("map", "REGISTRY_ROW_MAP_MISMATCH"),
+        ("row", "REGISTRY_ROW_MAP_MISMATCH"),
+        ("top", "REGISTRY_DIGEST_MISMATCH"),
+    ),
+)
+def test_six_cell_manifest_registry_binding_tamper_is_rejected(
+    tamper: str,
+    expected_error: str,
+) -> None:
+    model_specific = ("1" * 64,) * 3 + ("2" * 64,) * 3
+    manifest = _six_cell_manifest_for_registry_hashes(model_specific)
+    if tamper == "map":
+        assert isinstance(manifest["registry_hashes_by_cell"], dict)
+        manifest["registry_hashes_by_cell"][EXPECTED_CELL_IDS[0]] = "3" * 64  # type: ignore[index]
+    elif tamper == "row":
+        assert isinstance(manifest["checkpoints"], list)
+        manifest["checkpoints"][0]["registry_hash"] = "3" * 64  # type: ignore[index]
+    else:
+        manifest["registry_hash"] = "3" * 64
+    manifest["manifest_hash"] = canonical_json_hash(
+        {key: item for key, item in manifest.items() if key != "manifest_hash"}
+    )
+
+    with pytest.raises(G23Blocked, match=expected_error):
+        _validate_six_cell_manifest(manifest)
+
+
+def test_six_cell_manifest_legacy_common_registry_form_is_explicit() -> None:
+    common = ("1" * 64,) * 6
+    legacy = _six_cell_manifest_for_registry_hashes(common, include_map=False)
+    assert tuple(row["registry_hash"] for row in _validate_six_cell_manifest(legacy)) == common
+
+    model_specific_without_map = _six_cell_manifest_for_registry_hashes(
+        ("1" * 64,) * 3 + ("2" * 64,) * 3,
+        include_map=False,
+    )
+    with pytest.raises(G23Blocked, match="LEGACY_COMMON_REGISTRY_REQUIRED"):
+        _validate_six_cell_manifest(model_specific_without_map)
 
 
 def test_missing_cells_are_not_a_formal_decision(tmp_path: Path) -> None:
