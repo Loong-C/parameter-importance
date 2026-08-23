@@ -78,7 +78,7 @@ def main(argv: list[str] | None = None) -> int:
         )
         print(json.dumps(result, ensure_ascii=False, sort_keys=True, indent=2))
         return 0 if result.get("status") == "PASS" and result.get("formal_eligible") is True else 3
-    except (OSError, TypeError, ValueError, json.JSONDecodeError) as error:
+    except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
         print(f"G2.3 evaluation blocked: {error}", file=sys.stderr)
         return 3
 

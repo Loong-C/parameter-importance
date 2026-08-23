@@ -158,6 +158,8 @@ from .stage2_formal import (
     ReferenceSizingPlan,
     Stage2RecommendationEngine,
     StreamingReferenceSizer,
+    _ReferenceSnapshotStore,
+    _draw_digest,
 )
 from .stage3 import (
     EndpointState,
@@ -2002,6 +2004,275 @@ def _stable_reference_artifact(
     return payload
 
 
+def _reference_identity_hash(value: Mapping[str, object]) -> str:
+    """Hash an identity object without allowing a caller-supplied digest."""
+
+    return canonical_json_hash(dict(value))
+
+
+def _reference_parameter_registry(
+    request: TaskExecutionRequest,
+    root: Path,
+    context: _ProviderContext,
+) -> Mapping[str, object] | None:
+    """Load the canonical parameter grouping used by every G2.3 endpoint.
+
+    Formal execution must receive this artifact from the frozen Stage 1/S2.2
+    handoff.  A local fixture may derive its tiny registry from the fixed
+    provider only because the fixture provider itself publishes the explicit
+    mapping; the evaluator never guesses groups from parameter names.
+    """
+
+    reference = request.environment.evidence_refs.get("stage2_parameter_registry")
+    if reference is not None:
+        try:
+            value = load_canonical_json(_workspace_path(
+                root,
+                reference,
+                field="stage2_parameter_registry",
+            ))
+        except (OSError, TypeError, ValueError):
+            # The task runner's formal root is not carried by the context; the
+            # caller will report the missing artifact as an explicit blocker.
+            return None
+        if not isinstance(value, Mapping):
+            return None
+        if value.get("schema_version") != "stage2-parameter-registry-artifact-v1":
+            return None
+        if value.get("registry_hash") != context.provider.registry_hash:
+            return None
+        groups = value.get("parameter_groups")
+        if not isinstance(groups, Mapping):
+            return None
+        return value
+    if request.config.run_intent != "local_fixture":
+        return None
+    groups: dict[str, object] = {}
+    for name in context.provider.parameter_names:
+        parts = str(name).split(".")
+        groups[str(name)] = {
+            "layer": ".".join(parts[:2]) if len(parts) > 1 else parts[0],
+            "module": parts[0],
+        }
+    body: dict[str, object] = {
+        "schema_version": "stage2-parameter-registry-artifact-v1",
+        "registry_hash": context.provider.registry_hash,
+        "parameter_groups": groups,
+        "source": "local_fixed_state_provider_registry",
+    }
+    body["artifact_hash"] = canonical_json_hash(body)
+    return body
+
+
+def _reference_delta_sci(
+    request: TaskExecutionRequest,
+    root: Path,
+    plan: ReferenceSizingPlan,
+) -> Mapping[str, object]:
+    """Return the frozen candidate-B precision source, never an inferred value."""
+
+    reference = request.environment.evidence_refs.get("stage2_reference_delta_sci")
+    if reference is not None:
+        try:
+            value = load_canonical_json(_workspace_path(root, reference, field="stage2_reference_delta_sci"))
+        except (OSError, TypeError, ValueError) as error:
+            raise _blocked(
+                BlockerCode.CONTRACT_UNFROZEN,
+                "stage2_reference_delta_sci",
+                f"delta_sci artifact unreadable: {type(error).__name__}: {error}",
+                retryable=False,
+                evidence_refs=(reference,),
+            ) from error
+        if not isinstance(value, Mapping) or value.get("schema_version") != "stage2-reference-delta-sci-v1":
+            raise _blocked(
+                BlockerCode.CONTRACT_UNFROZEN,
+                "stage2_reference_delta_sci",
+                "delta_sci artifact schema is not frozen",
+                retryable=False,
+                evidence_refs=(reference,),
+            )
+        values = value.get("delta_sci_by_B")
+        if not isinstance(values, Mapping) or any(str(count) not in values for count in plan.candidate_sample_counts):
+            raise _blocked(
+                BlockerCode.CONTRACT_UNFROZEN,
+                "stage2_reference_delta_sci",
+                "delta_sci artifact does not cover every candidate B",
+                retryable=False,
+                evidence_refs=(reference,),
+            )
+        source = dict(value)
+        source["source_ref"] = reference
+        source["source_hash"] = canonical_json_hash(value)
+        return source
+    if request.config.run_intent != "local_fixture":
+        raise _blocked(
+            BlockerCode.CONTRACT_UNFROZEN,
+            "stage2_reference_delta_sci",
+            "formal reference requires an environment-bound delta_sci artifact",
+            retryable=False,
+        )
+    # Fixture-only deterministic calibration.  It is intentionally huge so
+    # the fixture can exercise all precision paths without representing a
+    # scientific margin for a real model.
+    values = {str(count): 1.0e6 for count in plan.candidate_sample_counts}
+    source: dict[str, object] = {
+        "schema_version": "stage2-reference-delta-sci-v1",
+        "scope": "local_fixture",
+        "delta_sci_by_B": values,
+        "source_ref": "local_fixture/frozen-delta-sci.json",
+    }
+    source["source_hash"] = canonical_json_hash(source)
+    return source
+
+
+def _reference_six_cell_manifest(
+    inputs: _PredecessorContext,
+    context: _ProviderContext,
+) -> Mapping[str, object]:
+    """Project the validated S2.3 six-cell asset matrix into S2.4 output."""
+
+    try:
+        asset_resolution = inputs.payload("asset_resolution")
+    except (KeyError, ValueError, TypeError):
+        return {
+            "schema_version": "stage2-s204-six-cell-manifest-v1",
+            "status": "MISSING",
+            "checkpoints": [],
+        }
+    manifest = asset_resolution.get("stage2_asset_manifest") if isinstance(asset_resolution, Mapping) else None
+    if not isinstance(manifest, Mapping):
+        return {
+            "schema_version": "stage2-s204-six-cell-manifest-v1",
+            "status": "MISSING",
+            "checkpoints": [],
+        }
+    raw = manifest.get("checkpoints")
+    rows: list[Mapping[str, object]] = []
+    if isinstance(raw, list):
+        for item in raw:
+            if not isinstance(item, Mapping):
+                continue
+            rows.append({
+                "cell_id": f"{item.get('model_id')}:{item.get('training_stage')}",
+                "model_id": item.get("model_id"),
+                "training_stage": item.get("training_stage"),
+                "checkpoint_id": item.get("checkpoint_id"),
+                "checkpoint_hash": item.get("manifest_sha256"),
+                "checkpoint_revision": item.get("revision"),
+                "registry_hash": item.get("parameter_registry_hash"),
+                "config_hash": item.get("config_sha256"),
+            })
+    # Keep the S2.3 order frozen (model-major, then initialization/early/
+    # mid_late); the evaluator derives this order from the manifest and never
+    # accepts a caller supplied permutation.
+    model_order = {"pythia-14m": 0, "pythia-31m-deduped": 1}
+    stage_order = {"initialization": 0, "early": 1, "mid_late": 2}
+    rows.sort(
+        key=lambda item: (
+            model_order.get(str(item.get("model_id")), 99),
+            stage_order.get(str(item.get("training_stage")), 99),
+        )
+    )
+    data_range = manifest.get("data_range")
+    body: dict[str, object] = {
+        "schema_version": "stage2-s204-six-cell-manifest-v1",
+        "status": "READY" if len(rows) == 6 else "MISSING",
+        "scope": manifest.get("scope"),
+        "asset_resolution_hash": manifest.get("asset_resolution_hash"),
+        "asset_producer_commit": manifest.get("producer_commit"),
+        "asset_execution_commit": manifest.get("execution_commit"),
+        "checkpoints": rows,
+        "data": dict(data_range) if isinstance(data_range, Mapping) else None,
+        "registry_hash": context.provider.registry_hash,
+    }
+    if isinstance(data_range, Mapping):
+        body["data_range_hash"] = data_range.get("data_range_hash")
+    else:
+        body["data_range_hash"] = None
+    body["manifest_hash"] = canonical_json_hash(body)
+    return body
+
+
+def _reference_numeric_diagnostics(
+    *,
+    final_root: Path,
+    result: OneShotReferenceResult,
+) -> tuple[Mapping[str, object], Mapping[str, object]]:
+    """Recompute U from raw committed blocks with long-double accumulation.
+
+    The returned first object is JSON metadata; the second is stored in the
+    tensor bundle because it contains the signed vectors.
+    """
+
+    commits = sorted((final_root / "commits").glob("*.json"))
+    if not commits:
+        raise RuntimeError("STAGE2_REFERENCE_NUMERIC_BLOCK_COMMITS_MISSING")
+    latest = load_canonical_json(commits[-1])
+    if not isinstance(latest, Mapping):
+        raise RuntimeError("STAGE2_REFERENCE_NUMERIC_LATEST_COMMIT_INVALID")
+    state, bundle = load_tensor_bundle(final_root / str(latest["object_ref"]))
+    if not isinstance(state, Mapping):
+        raise RuntimeError("STAGE2_REFERENCE_NUMERIC_BLOCK_STATE_INVALID")
+    raw_a, raw_b = state.get("blocks_a"), state.get("blocks_b")
+    raw_wa, raw_wb = state.get("block_weights_a"), state.get("block_weights_b")
+    if (
+        not isinstance(raw_a, list)
+        or not isinstance(raw_b, list)
+        or not isinstance(raw_wa, list)
+        or not isinstance(raw_wb, list)
+        or len(raw_a) != len(raw_b)
+        or len(raw_a) != len(raw_wa)
+        or len(raw_b) != len(raw_wb)
+        or not raw_a
+    ):
+        raise RuntimeError("STAGE2_REFERENCE_NUMERIC_RAW_BLOCKS_MISSING")
+    arrays_a = [_as_numpy_vector(item) for item in raw_a]
+    arrays_b = [_as_numpy_vector(item) for item in raw_b]
+    names = tuple(arrays_a[0])
+    if any(tuple(item) != names for item in arrays_a + arrays_b):
+        raise RuntimeError("STAGE2_REFERENCE_NUMERIC_PARAMETER_SET_DRIFT")
+    all_blocks = arrays_a + arrays_b
+    all_weights = [np.longdouble(float(item)) for item in list(raw_wa) + list(raw_wb)]
+    if any(not np.isfinite(item) or item <= 0 for item in all_weights):
+        raise RuntimeError("STAGE2_REFERENCE_NUMERIC_BLOCK_WEIGHTS_INVALID")
+    n1 = sum(all_weights, np.longdouble(0))
+    n2 = sum((weight * weight for weight in all_weights), np.longdouble(0))
+    denominator = n1 * n1 - n2
+    if denominator <= 0:
+        raise RuntimeError("STAGE2_REFERENCE_NUMERIC_U_DENOMINATOR_INVALID")
+    high: dict[str, np.ndarray] = {}
+    accumulated: dict[str, np.ndarray] = {}
+    for name in names:
+        values = [np.asarray(item[name], dtype=np.longdouble) for item in all_blocks]
+        first = np.zeros_like(values[0], dtype=np.longdouble)
+        second = np.zeros_like(values[0], dtype=np.longdouble)
+        for value, weight in zip(values, all_weights):
+            first += weight * value
+            second += weight * weight * value * value
+        high[name] = np.asarray((first * first - second) / denominator, dtype=np.float64)
+        accumulated[name] = np.asarray(result.bias_reference[name], dtype=np.float64)
+    raw_block_digest = canonical_json_hash([_vector_digest(item) for item in arrays_a + arrays_b])
+    numeric_vectors = {
+        "high_precision": high,
+        "accumulated": accumulated,
+    }
+    metadata: dict[str, object] = {
+        "schema_version": "stage2-reference-numerical-diagnostics-v1",
+        "recompute_method": "longdouble_pairwise_u_from_committed_blocks",
+        "raw_block_digest": raw_block_digest,
+        "raw_block_count_a": len(arrays_a),
+        "raw_block_count_b": len(arrays_b),
+        "high_precision_hash": _vector_digest(high),
+        "accumulated_hash": _vector_digest(accumulated),
+        "max_abs_error": max(float(np.max(np.abs(high[name] - accumulated[name]))) for name in names),
+        "resume_latest_commit_ref": commits[-1].relative_to(final_root).as_posix(),
+        "resume_latest_commit_hash": str(latest.get("artifact_hash")),
+        "resume_latest_manifest_hash": str(bundle.manifest_sha256),
+    }
+    metadata["artifact_hash"] = canonical_json_hash(metadata)
+    return metadata, numeric_vectors
+
+
 def _run_stage2_reference(
     request: TaskExecutionRequest,
     root: Path,
@@ -2029,6 +2300,33 @@ def _run_stage2_reference(
         )
     plan, plan_refs = _stage2_reference_plan(request, root, context)
     sampling = upstream_sampling
+    provider_state_before = context.provider.state_digest()
+    six_cell_manifest = _reference_six_cell_manifest(inputs, context)
+    if request.config.run_intent == "formal" and (
+        six_cell_manifest.get("status") != "READY"
+        or six_cell_manifest.get("scope") != "formal"
+    ):
+        raise _blocked(
+            BlockerCode.CONTRACT_UNFROZEN,
+            "stage2_s204_six_cell_manifest",
+            "formal reference requires the validated S2.3 six-cell manifest",
+            retryable=False,
+            evidence_refs=inputs.references,
+        )
+    delta_sci = _reference_delta_sci(request, root, plan)
+    parameter_registry = _reference_parameter_registry(request, root, context)
+    if request.config.run_intent == "formal" and parameter_registry is None:
+        raise _blocked(
+            BlockerCode.CONTRACT_UNFROZEN,
+            "stage2_parameter_registry",
+            "formal reference requires the hash-bound parameter registry artifact",
+            retryable=False,
+            evidence_refs=tuple(
+                [request.environment.evidence_refs["stage2_parameter_registry"]]
+                if "stage2_parameter_registry" in request.environment.evidence_refs
+                else inputs.references
+            ),
+        )
     maximum = plan.candidate_sample_counts[-1]
     sizing_draws = sampling.draws("reference_sizing", maximum)
     result = StreamingReferenceSizer(context.provider).run(
@@ -2049,6 +2347,16 @@ def _run_stage2_reference(
             evidence_refs=inputs.references,
         )
     final_count = result.selected_sample_count_per_stream
+    sizing_draw_hash = _draw_digest(sizing_draws)
+    sizing_identity_hash = canonical_json_hash(
+        {
+            "plan_hash": plan.artifact_hash,
+            "provider_state_digest": result.provider_state_digest,
+            "registry_hash": result.registry_hash,
+            "sizing_draw_hash": sizing_draw_hash,
+            "sizing_stream": "reference_sizing",
+        }
+    )
     one_shot_plan = OneShotReferencePlan(
         reference_id=plan.reference_id,
         sizing_result_hash=result.scientific_artifact_hash,
@@ -2072,6 +2380,138 @@ def _run_stage2_reference(
             retryable=False,
             evidence_refs=inputs.references,
         )
+    provider_state_after = context.provider.state_digest()
+    replay = OneShotReferenceRunner(context.provider).run(
+        one_shot_plan,
+        draws_a=final_a,
+        draws_b=final_b,
+        sizing_draws=sizing_draws,
+        artifact_root=store.root / "resume" / "reference-final",
+    )
+    if replay.status != "COMPLETE" or replay.artifact_hash != one_shot.artifact_hash:
+        raise _blocked(
+            BlockerCode.CONTRACT_UNFROZEN,
+            "stage2_reference_resume_replay",
+            "one-shot resume replay did not reproduce the complete artifact",
+            retryable=False,
+            evidence_refs=inputs.references,
+        )
+    numerical_metadata, numerical_vectors = _reference_numeric_diagnostics(
+        final_root=store.root / "resume" / "reference-final",
+        result=one_shot,
+    )
+    if parameter_registry is None:
+        parameter_registry = {
+            "schema_version": "stage2-parameter-registry-artifact-v1",
+            "status": "MISSING",
+            "registry_hash": context.provider.registry_hash,
+            "parameter_groups": None,
+        }
+    config_identity = {
+        "config_hash": request.config.config_hash,
+        "full_hash": request.config.full_hash,
+        "task_id": request.task.task_id,
+    }
+    # Scientific identity belongs to the immutable v1 base config.  The v2
+    # execution envelope intentionally exposes only execution sections at the
+    # top level, so asking it for ``model``/``data`` would be an accidental
+    # KeyError in the producer rather than a published diagnostic.
+    model_section = request.config.base_config.section("model")
+    data_section = request.config.base_config.section("data")
+    checkpoint_section = request.config.base_config.section("identity")
+    model_identity = dict(model_section) if isinstance(model_section, Mapping) else {}
+    data_identity = dict(data_section) if isinstance(data_section, Mapping) else {}
+    identity_section = dict(checkpoint_section) if isinstance(checkpoint_section, Mapping) else {}
+    data_identity["data_range_hash"] = six_cell_manifest.get("data_range_hash")
+    manifest_rows = six_cell_manifest.get("checkpoints")
+    current_checkpoint_id = identity_section.get("input_checkpoint_id")
+    current_manifest_row: Mapping[str, object] | None = None
+    if isinstance(manifest_rows, list) and current_checkpoint_id is not None:
+        matches = [
+            item for item in manifest_rows
+            if isinstance(item, Mapping) and item.get("checkpoint_id") == current_checkpoint_id
+        ]
+        if len(matches) == 1:
+            current_manifest_row = matches[0]
+    if request.config.run_intent == "formal" and current_manifest_row is None:
+        raise _blocked(
+            BlockerCode.CONTRACT_UNFROZEN,
+            "stage2_s204_checkpoint_identity",
+            "formal reference config checkpoint is not one of the six validated S2.3 cells",
+            retryable=False,
+            evidence_refs=inputs.references,
+        )
+    checkpoint_identity: dict[str, object] = {
+        "checkpoint_id": identity_section.get("input_checkpoint_id"),
+        "checkpoint_revision": model_identity.get("revision"),
+        "checkpoint_asset_id": model_identity.get("asset_id"),
+        "model_id": model_identity.get("asset_id"),
+        "training_stage": None,
+        "checkpoint_hash": None,
+    }
+    if current_manifest_row is not None:
+        config_identity["checkpoint_config_hash"] = current_manifest_row.get("config_hash")
+        checkpoint_identity.update(
+            {
+                "cell_id": current_manifest_row.get("cell_id"),
+                "model_id": current_manifest_row.get("model_id"),
+                "training_stage": current_manifest_row.get("training_stage"),
+                "checkpoint_revision": current_manifest_row.get("checkpoint_revision"),
+                "checkpoint_hash": current_manifest_row.get("checkpoint_hash"),
+                "registry_hash": current_manifest_row.get("registry_hash"),
+                "config_hash": current_manifest_row.get("config_hash"),
+            }
+        )
+    checkpoint_identity["identity_hash"] = _reference_identity_hash(checkpoint_identity)
+    config_identity["identity_hash"] = _reference_identity_hash(config_identity)
+    model_identity["identity_hash"] = _reference_identity_hash(model_identity)
+    data_identity["identity_hash"] = _reference_identity_hash(data_identity)
+    registry_identity = {
+        "registry_hash": context.provider.registry_hash,
+        "parameter_registry_artifact_hash": parameter_registry.get("artifact_hash"),
+    }
+    registry_identity["identity_hash"] = _reference_identity_hash(registry_identity)
+    sizing_plan = plan.to_dict()
+    sizing_plan_hash = plan.artifact_hash
+    final_commits = sorted((store.root / "resume" / "reference-final" / "commits").glob("*.json"))
+    replay_commit_ref = (
+        final_commits[-1]
+        .relative_to(store.root / "resume" / "reference-final")
+        .as_posix()
+        if final_commits
+        else None
+    )
+    replay_commit = load_canonical_json(final_commits[-1]) if final_commits else {}
+    replay_diagnostic = {
+        "schema_version": "stage2-reference-resume-replay-v1",
+        "artifact_ref": replay_commit_ref,
+        "artifact_hash": replay_commit.get("artifact_hash"),
+        "state_digest": replay_commit.get("state_digest"),
+        "object_manifest_hash": replay_commit.get("object_manifest_hash"),
+        "source_one_shot_result_hash": one_shot.artifact_hash,
+        "replayed_one_shot_result_hash": replay.artifact_hash,
+        "sizing_result_identity_hash": canonical_json_hash(
+            {
+                "sizing_result_hash": one_shot_plan.sizing_result_hash,
+                "provider_state_digest": one_shot.provider_state_digest,
+                "registry_hash": one_shot.registry_hash,
+                "stream_a_draw_hash": one_shot.stream_a_draw_hash,
+                "stream_b_draw_hash": one_shot.stream_b_draw_hash,
+            }
+        ),
+    }
+    replay_diagnostic["replay_hash"] = canonical_json_hash(replay_diagnostic)
+    rng_before = canonical_json_hash(
+        {"sampling_plan_hash": sampling.digest, "streams": ["reference_sizing", "reference_A", "reference_B"]}
+    )
+    rng_after = canonical_json_hash(
+        {
+            "sizing_draw_hash": sizing_draw_hash,
+            "stream_a_draw_hash": one_shot.stream_a_draw_hash,
+            "stream_b_draw_hash": one_shot.stream_b_draw_hash,
+        }
+    )
+    producer_commit, _, _ = _stage2_source_identity()
     bundle_path = store.root / "tensor-bundles" / "reference-final"
     bundle = _publish_or_load_bundle(
         bundle_path,
@@ -2085,6 +2525,14 @@ def _run_stage2_reference(
                 "ranking_variance": one_shot.uncertainty.ranking_variance,
             },
             "sequence_variance": one_shot.sequence_variance,
+            "numerical_diagnostics": {
+                "schema_version": "stage2-reference-numerical-diagnostics-v1",
+                "raw_block_digest": numerical_metadata["raw_block_digest"],
+                "high_precision": numerical_vectors["high_precision"],
+                "accumulated": numerical_vectors["accumulated"],
+                "high_precision_hash": numerical_metadata["high_precision_hash"],
+                "accumulated_hash": numerical_metadata["accumulated_hash"],
+            },
         },
     )
     bundle_ref = bundle_path.relative_to(root).as_posix()
@@ -2124,8 +2572,40 @@ def _run_stage2_reference(
         "sampling_plan_hash": sampling.digest,
         "recovery_semantics": "authoritative_block_pair_commits",
         "reference_protocol": "authoritative_sizing_and_one_shot_block_pair_commits",
+        "diagnostics_schema_version": "stage2-reference-producer-diagnostics-v1",
+        "stage2_reference_producer_commit": producer_commit,
+        "formal_scope": request.config.run_intent,
+        "cell_id": checkpoint_identity.get("cell_id"),
+        "six_cell_manifest": six_cell_manifest,
+        "six_cell_manifest_hash": six_cell_manifest.get("manifest_hash"),
+        "sizing_plan": sizing_plan,
+        "sizing_plan_artifact_hash": sizing_plan_hash,
+        "sizing_draw_hash": sizing_draw_hash,
+        "sizing_identity_hash": sizing_identity_hash,
+        "candidate_delta_sci": delta_sci,
+        "candidate_delta_sci_source": delta_sci.get("source_ref"),
+        "candidate_delta_sci_source_hash": delta_sci.get("source_hash"),
+        "config_identity": config_identity,
+        "model_identity": model_identity,
+        "data_identity": data_identity,
+        "checkpoint_identity": checkpoint_identity,
+        "registry_identity": registry_identity,
+        "parameter_registry_artifact": parameter_registry,
+        "numerical_diagnostics": numerical_metadata,
+        "state_invariance": {
+            "model_state_before_hash": provider_state_before,
+            "model_state_after_hash": provider_state_after,
+            "rng_state_before_hash": rng_before,
+            "rng_state_after_hash": rng_after,
+        },
+        "resume_replay": replay_diagnostic,
+        "sizing_result_identity_hash": replay_diagnostic["sizing_result_identity_hash"],
+        "numerical_floor": 1.0e-12,
         "formal_eligible": False,
     }
+    convergence["reference_producer_diagnostics_hash"] = canonical_json_hash(
+        {key: value for key, value in convergence.items() if key != "reference_producer_diagnostics_hash"}
+    )
     payload_by_kind: dict[str, Mapping[str, JSONValue]] = {
         "reference_result": reference,  # type: ignore[dict-item]
         "reference_convergence_report": convergence,

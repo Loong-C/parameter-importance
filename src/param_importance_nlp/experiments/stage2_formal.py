@@ -1401,11 +1401,22 @@ class OneShotReferenceRunner:
 
         provider_state = self.provider.state_digest()
         assumptions = _weighting_contract(self.provider)
+        sizing_result_identity_hash = canonical_json_hash(
+            {
+                "sizing_result_hash": plan.sizing_result_hash,
+                "provider_state_digest": provider_state,
+                "registry_hash": self.provider.registry_hash,
+                "stream_a_draw_hash": _draw_digest(draws_a),
+                "stream_b_draw_hash": _draw_digest(draws_b),
+            }
+        )
         total_pairs = plan.sample_count_per_stream // plan.block_size
         processed_pairs = 0
         moments_a, moments_b = _GradientMoments(), _GradientMoments()
         blocks_a: list[dict[str, np.ndarray]] = []
         blocks_b: list[dict[str, np.ndarray]] = []
+        block_weights_a: list[float] = []
+        block_weights_b: list[float] = []
         root = Path(artifact_root)
         with _ReferenceSnapshotStore(root) as store:
             restored = store.latest()
@@ -1422,6 +1433,8 @@ class OneShotReferenceRunner:
                     raise ValueError("ONE_SHOT_REFERENCE_RESUME_DRAW_A_HASH_MISMATCH")
                 if restored.get("stream_b_draw_hash") != _draw_digest(draws_b):
                     raise ValueError("ONE_SHOT_REFERENCE_RESUME_DRAW_B_HASH_MISMATCH")
+                if restored.get("sizing_result_identity_hash") != sizing_result_identity_hash:
+                    raise ValueError("ONE_SHOT_REFERENCE_RESUME_SIZING_IDENTITY_MISMATCH")
                 processed_pairs = int(restored["processed_block_pairs"])
                 moments_a = _GradientMoments.from_state(restored["a"])  # type: ignore[arg-type]
                 moments_b = _GradientMoments.from_state(restored["b"])  # type: ignore[arg-type]
@@ -1430,7 +1443,12 @@ class OneShotReferenceRunner:
                     raise ValueError("ONE_SHOT_REFERENCE_RESUME_BLOCKS_NOT_ARRAY")
                 blocks_a = [_as_vector(item, field_name="blocks_a") for item in raw_a]  # type: ignore[arg-type]
                 blocks_b = [_as_vector(item, field_name="blocks_b") for item in raw_b]  # type: ignore[arg-type]
-                if len(blocks_a) != processed_pairs or len(blocks_b) != processed_pairs:
+                raw_wa, raw_wb = restored.get("block_weights_a"), restored.get("block_weights_b")
+                if not isinstance(raw_wa, list) or not isinstance(raw_wb, list):
+                    raise ValueError("ONE_SHOT_REFERENCE_RESUME_BLOCK_WEIGHTS_NOT_ARRAY")
+                block_weights_a = [float(item) for item in raw_wa]
+                block_weights_b = [float(item) for item in raw_wb]
+                if not (len(blocks_a) == len(blocks_b) == len(block_weights_a) == len(block_weights_b) == processed_pairs):
                     raise ValueError("ONE_SHOT_REFERENCE_RESUME_BLOCK_COUNT_MISMATCH")
 
             new_pairs = 0
@@ -1447,6 +1465,8 @@ class OneShotReferenceRunner:
                 moments_b.update(batch_b, assumptions)
                 blocks_a.append(vector_a)
                 blocks_b.append(vector_b)
+                block_weights_a.append(float(batch_a.statistical_weight))
+                block_weights_b.append(float(batch_b.statistical_weight))
                 self.provider.assert_unchanged(provider_state)
                 processed_pairs += 1
                 new_pairs += 1
@@ -1464,7 +1484,17 @@ class OneShotReferenceRunner:
                     "b": moments_b.to_state(),
                     "blocks_a": blocks_a,
                     "blocks_b": blocks_b,
+                    "block_weights_a": block_weights_a,
+                    "block_weights_b": block_weights_b,
                     "final_length_required": True,
+                    "sizing_result_identity_hash": sizing_result_identity_hash,
+                    "rng_state_digest": canonical_json_hash(
+                        {
+                            "stream_a_draw_hash": _draw_digest(draws_a),
+                            "stream_b_draw_hash": _draw_digest(draws_b),
+                            "sizing_result_hash": plan.sizing_result_hash,
+                        }
+                    ),
                 }
                 store.publish(processed_pairs, state)
             # A partial state is itself a valid recoverable boundary, but it is
@@ -1565,12 +1595,28 @@ class StreamingReferenceSizer:
 
         provider_state = self.provider.state_digest()
         assumptions = _weighting_contract(self.provider)
+        sizing_draw_hash = _draw_digest(
+            draws_sizing[:maximum] if draws_sizing is not None else draws_a[:maximum]
+        )
+        sizing_identity_hash = canonical_json_hash(
+            {
+                "plan_hash": plan.artifact_hash,
+                "provider_state_digest": provider_state,
+                "registry_hash": self.provider.registry_hash,
+                "sizing_draw_hash": sizing_draw_hash,
+                "sizing_stream": "reference_sizing" if draws_sizing is not None else "reference_A_B",
+            }
+        )
         processed_pairs = 0
         points: list[ReferenceSizingPoint] = []
         streak = 0
         selected: int | None = None
         last_bias: dict[str, np.ndarray] | None = None
         moments_a, moments_b = _GradientMoments(), _GradientMoments()
+        blocks_a: list[dict[str, np.ndarray]] = []
+        blocks_b: list[dict[str, np.ndarray]] = []
+        block_weights_a: list[float] = []
+        block_weights_b: list[float] = []
 
         with _ReferenceSnapshotStore(artifact_root) as store:
             restored = store.latest()
@@ -1583,12 +1629,30 @@ class StreamingReferenceSizer:
                     raise ValueError("REFERENCE_RESUME_REGISTRY_HASH_MISMATCH")
                 if restored.get("weighting_assumptions") != assumptions:
                     raise ValueError("REFERENCE_RESUME_WEIGHTING_CONTRACT_MISMATCH")
+                if restored.get("sizing_draw_hash") != sizing_draw_hash:
+                    raise ValueError("REFERENCE_RESUME_SIZING_DRAW_HASH_MISMATCH")
+                if restored.get("sizing_identity_hash") != sizing_identity_hash:
+                    raise ValueError("REFERENCE_RESUME_SIZING_IDENTITY_MISMATCH")
                 processed_pairs = int(restored["processed_block_pairs"])
                 streak = int(restored["convergence_streak"])
                 selected_value = restored["selected_sample_count_per_stream"]
                 selected = None if selected_value is None else int(selected_value)
                 moments_a = _GradientMoments.from_state(restored["a"])  # type: ignore[arg-type]
                 moments_b = _GradientMoments.from_state(restored["b"])  # type: ignore[arg-type]
+                raw_a, raw_b = restored.get("blocks_a"), restored.get("blocks_b")
+                raw_wa, raw_wb = restored.get("block_weights_a"), restored.get("block_weights_b")
+                if not isinstance(raw_a, list) or not isinstance(raw_b, list):
+                    raise ValueError("REFERENCE_RESUME_BLOCKS_NOT_ARRAY")
+                if not isinstance(raw_wa, list) or not isinstance(raw_wb, list):
+                    raise ValueError("REFERENCE_RESUME_BLOCK_WEIGHTS_NOT_ARRAY")
+                blocks_a = [_as_vector(item, field_name="sizing.blocks_a") for item in raw_a]  # type: ignore[arg-type]
+                blocks_b = [_as_vector(item, field_name="sizing.blocks_b") for item in raw_b]  # type: ignore[arg-type]
+                block_weights_a = [float(item) for item in raw_wa]
+                block_weights_b = [float(item) for item in raw_wb]
+                if not (
+                    len(blocks_a) == len(blocks_b) == len(block_weights_a) == len(block_weights_b) == processed_pairs
+                ):
+                    raise ValueError("REFERENCE_RESUME_BLOCK_COUNT_MISMATCH")
                 raw_points = restored["points"]
                 if not isinstance(raw_points, list):
                     raise ValueError("REFERENCE_RESUME_POINTS_NOT_ARRAY")
@@ -1611,9 +1675,16 @@ class StreamingReferenceSizer:
                     (draws_sizing if draws_sizing is not None else draws_a)[start:stop]
                 )
                 moments_a.update(batch_a, assumptions)
+                blocks_a.append(_as_vector(batch_a.gradients, field_name="sizing.blocks_a"))
+                block_weights_a.append(float(batch_a.statistical_weight))
                 if draws_sizing is None:
                     batch_b = self.provider.gradient(draws_b[start:stop])
                     moments_b.update(batch_b, assumptions)
+                    blocks_b.append(_as_vector(batch_b.gradients, field_name="sizing.blocks_b"))
+                    block_weights_b.append(float(batch_b.statistical_weight))
+                else:
+                    blocks_b.append({name: np.zeros_like(value) for name, value in blocks_a[-1].items()})
+                    block_weights_b.append(0.0)
                 self.provider.assert_unchanged(provider_state)
                 processed_pairs += 1
                 new_pairs += 1
@@ -1676,7 +1747,14 @@ class StreamingReferenceSizer:
                     "last_bias": {} if last_bias is None else last_bias,
                     "a": moments_a.to_state(),
                     "b": moments_b.to_state(),
+                    "blocks_a": blocks_a,
+                    "blocks_b": blocks_b,
+                    "block_weights_a": block_weights_a,
+                    "block_weights_b": block_weights_b,
                     "sizing_stream": draws_sizing is not None,
+                    "sizing_draw_hash": sizing_draw_hash,
+                    "sizing_identity_hash": sizing_identity_hash,
+                    "rng_state_digest": sizing_draw_hash,
                 }
                 store.publish(processed_pairs, state)
 

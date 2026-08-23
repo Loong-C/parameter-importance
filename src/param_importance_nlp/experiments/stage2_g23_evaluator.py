@@ -17,9 +17,12 @@ from __future__ import annotations
 from dataclasses import dataclass
 import hashlib
 import math
+import os
 from pathlib import Path, PurePosixPath
 import re
-from typing import Any, Iterable, Mapping, Sequence
+import tempfile
+import time
+from typing import Mapping, Sequence
 
 import numpy as np
 
@@ -41,6 +44,11 @@ from .stage2_formal import _ReferenceSnapshotStore, _vector_digest
 SCHEMA_VERSION = "stage2-g23-reference-evaluation-v1"
 GATE_ID = "stage2.G2.3"
 REQUIRED_CELL_COUNT = 6
+EXPECTED_CELL_IDS: tuple[str, ...] = tuple(
+    f"{model}:{stage}"
+    for model in ("pythia-14m", "pythia-31m-deduped")
+    for stage in ("initialization", "early", "mid_late")
+)
 THRESHOLDS: Mapping[str, float] = {
     "normalized_l1": 0.02,
     "pearson": 0.995,
@@ -48,6 +56,7 @@ THRESHOLDS: Mapping[str, float] = {
     "layer_module_spearman": 0.995,
     "topk_overlap": 0.98,
     "layer_module_delta": 0.01,
+    "layer_module_l1_q95": 0.01,
     "h_ref_divisor": 4.0,
     "epsilon_num_divisor": 10.0,
 }
@@ -87,6 +96,39 @@ def _path(value: object, field: str) -> str:
     if parsed.is_absolute() or any(part in {"", ".", ".."} for part in parsed.parts):
         raise G23Blocked(f"{field}:PATH_ESCAPE")
     return parsed.as_posix()
+
+
+def _reject_symlink_chain(root: Path, logical: str, field: str) -> None:
+    """Reject symlink indirection even when its resolved target stays in root."""
+
+    current = root
+    for part in PurePosixPath(logical).parts:
+        current = current / part
+        try:
+            if current.is_symlink():
+                raise G23Blocked(f"{field}:SYMLINK_FORBIDDEN")
+        except OSError as error:
+            raise G23Blocked(f"{field}:UNREADABLE") from error
+
+
+def _reject_symlinks_under(path: Path, field: str) -> None:
+    try:
+        if path.is_symlink():
+            raise G23Blocked(f"{field}:SYMLINK_FORBIDDEN")
+        if path.exists():
+            for child in path.rglob("*"):
+                if child.is_symlink():
+                    raise G23Blocked(f"{field}:SYMLINK_FORBIDDEN")
+    except OSError as error:
+        raise G23Blocked(f"{field}:UNREADABLE") from error
+
+
+def _canonical_payload_hash(value: Mapping[str, object], field: str) -> str:
+    declared = _sha(value.get("artifact_hash"), f"{field}.artifact_hash")
+    payload = {key: item for key, item in value.items() if key != "artifact_hash"}
+    if canonical_json_hash(payload) != declared:
+        raise G23Blocked(f"{field}:HASH_MISMATCH")
+    return declared
 
 
 def _array(value: object, field: str) -> np.ndarray:
@@ -224,40 +266,51 @@ def _merge_moments(left: Mapping[str, object], right: Mapping[str, object], fiel
     }
 
 
-def _find(mapping: object, names: Iterable[str]) -> object | None:
-    wanted = set(names)
-    if isinstance(mapping, Mapping):
-        for key, value in mapping.items():
-            if str(key) in wanted:
-                return value
-        for value in mapping.values():
-            found = _find(value, wanted)
-            if found is not None:
-                return found
-    elif isinstance(mapping, list):
-        for value in mapping:
-            found = _find(value, wanted)
-            if found is not None:
-                return found
-    return None
+def _moments_from_blocks(
+    blocks: Sequence[Mapping[str, np.ndarray]],
+    weights: Sequence[object],
+    field: str,
+) -> dict[str, object]:
+    """Rebuild sufficient statistics from every committed raw block."""
+
+    if not blocks or len(blocks) != len(weights):
+        raise G23Blocked(f"{field}:RAW_BLOCKS_AND_WEIGHTS_REQUIRED")
+    parsed_weights = [_finite(value, f"{field}.weight") for value in weights]
+    if any(value <= 0.0 for value in parsed_weights):
+        raise G23Blocked(f"{field}:POSITIVE_BLOCK_WEIGHTS_REQUIRED")
+    first = blocks[0]
+    g1 = {name: np.zeros_like(value, dtype=np.float64) for name, value in first.items()}
+    g2 = {name: np.zeros_like(value, dtype=np.float64) for name, value in first.items()}
+    n1 = 0.0
+    n2 = 0.0
+    for block, weight in zip(blocks, parsed_weights):
+        _compatible(first, block, field)
+        n1 += weight
+        n2 += weight * weight
+        for name in g1:
+            g1[name] += weight * block[name]
+            g2[name] += weight * weight * np.square(block[name])
+    return {
+        "count": len(blocks),
+        "n1": n1,
+        "n2": n2,
+        "g1": g1,
+        "g2": g2,
+    }
 
 
-def _find_key(mapping: object, names: Iterable[str]) -> tuple[str, object] | None:
-    wanted = set(names)
-    if isinstance(mapping, Mapping):
-        for key, value in mapping.items():
-            if str(key) in wanted:
-                return str(key), value
-        for value in mapping.values():
-            found = _find_key(value, wanted)
-            if found is not None:
-                return found
-    elif isinstance(mapping, list):
-        for value in mapping:
-            found = _find_key(value, wanted)
-            if found is not None:
-                return found
-    return None
+def _moments_equal(left: Mapping[str, object], right: Mapping[str, object], field: str) -> None:
+    for key in ("count", "n1", "n2"):
+        if key == "count":
+            if int(left.get(key, -1)) != int(right.get(key, -2)):
+                raise G23Blocked(f"{field}.{key}:MOMENTS_DRIFT")
+        elif not math.isclose(_finite(left.get(key), f"{field}.{key}.left"), _finite(right.get(key), f"{field}.{key}.right"), rel_tol=1e-12, abs_tol=1e-12):
+            raise G23Blocked(f"{field}.{key}:MOMENTS_DRIFT")
+    for key in ("g1", "g2"):
+        lv, rv = _vector(left.get(key), f"{field}.left.{key}"), _vector(right.get(key), f"{field}.right.{key}")
+        _compatible(lv, rv, field)
+        if any(not np.allclose(lv[name], rv[name], rtol=1e-12, atol=1e-12) for name in lv):
+            raise G23Blocked(f"{field}.{key}:MOMENTS_DRIFT")
 
 
 def _digest_bytes(path: Path) -> str:
@@ -266,6 +319,43 @@ def _digest_bytes(path: Path) -> str:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _append_attempt_index(index: Path, artifact_hash: str) -> None:
+    """Append an attempt hash under an exclusive lock and atomic replace."""
+
+    lock = index.with_name(index.name + ".lock")
+    descriptor = -1
+    for _ in range(200):
+        try:
+            descriptor = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            break
+        except FileExistsError:
+            time.sleep(0.005)
+    if descriptor < 0:
+        raise RuntimeError("G23_ATTEMPT_INDEX_LOCK_TIMEOUT")
+    try:
+        os.close(descriptor)
+        descriptor = -1
+        existing = index.read_text(encoding="utf-8") if index.exists() else ""
+        line = artifact_hash + "\n"
+        if line in existing.splitlines(keepends=True):
+            return
+        fd, temporary = tempfile.mkstemp(prefix=index.name + ".", suffix=".tmp", dir=str(index.parent))
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8", newline="") as handle:
+                handle.write(existing)
+                handle.write(line)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, index)
+        finally:
+            if os.path.exists(temporary):
+                os.unlink(temporary)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        lock.unlink(missing_ok=True)
 
 
 @dataclass(frozen=True, slots=True)
@@ -281,7 +371,7 @@ class CellInput:
     config_ref: str | None = None
 
     def __post_init__(self) -> None:
-        if not self.cell_id or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,159}", self.cell_id):
+        if not self.cell_id or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,159}", self.cell_id):
             raise ValueError("cell_id:INVALID")
         _path(self.task_result_ref, "task_result_ref")
         if self.config_ref is not None:
@@ -306,6 +396,7 @@ class _CellEvidence:
     bundle_manifest_hash: str | None = None
     sizing_states: list[Mapping[str, object]] | None = None
     final_state: Mapping[str, object] | None = None
+    final_root: Path | None = None
     identities: dict[str, str] = None  # type: ignore[assignment]
     reasons: list[str] = None  # type: ignore[assignment]
 
@@ -315,7 +406,9 @@ class _CellEvidence:
 
 
 def _resolve(root: Path, reference: str) -> Path:
-    logical = Path(_path(reference, "reference"))
+    logical_ref = _path(reference, "reference")
+    _reject_symlink_chain(root, logical_ref, "reference")
+    logical = Path(logical_ref)
     path = (root / logical).resolve()
     try:
         path.relative_to(root.resolve())
@@ -336,6 +429,8 @@ def _load_json(root: Path, reference: str, field: str) -> Mapping[str, object]:
 
 def _task_result(root: Path, source: CellInput) -> tuple[TaskRunResult, Mapping[str, object]]:
     value = _load_json(root, source.task_result_ref, "task_result")
+    if value.get("schema_version") != "task-run-result-v2":
+        raise G23Blocked("task_result:SCHEMA_REQUIRED")
     try:
         result = TaskRunResult.from_mapping(value)
     except Exception as error:  # TaskRuntimeError is intentionally not leaked as qualification
@@ -351,21 +446,58 @@ def _artifact(root: Path, result: TaskRunResult, kind: str) -> LoadedTaskArtifac
     ref = result.artifact_refs.get(kind)
     if ref is None:
         raise G23Blocked(f"artifact:{kind}:MISSING")
+    _reject_symlink_chain(root, _path(ref, f"artifact.{kind}.commit_ref"), f"artifact.{kind}.commit_ref")
     try:
-        return load_committed_task_artifact(root, ref, require_formal=True)
+        loaded = load_committed_task_artifact(root, ref, require_formal=True)
     except (OSError, ValueError, TypeError) as error:
         raise G23Blocked(f"artifact:{kind}:INVALID") from error
+    expected_schema = {
+        "reference_result": "reference-result-v1",
+        "reference_convergence_report": "stage2-reference-convergence-report-v1",
+        "gate_record": "stage23-task-gate-candidate-v1",
+    }.get(kind)
+    if (
+        loaded.identity.task_id != "stage2.04_reference_target"
+        or loaded.identity.artifact_kind != kind
+        or loaded.identity.config_hash != result.config_hash
+        or loaded.run_intent != "formal"
+        or loaded.identity.formal_eligible is not True
+        or loaded.payload.get("schema_version") != expected_schema
+    ):
+        raise G23Blocked(f"artifact:{kind}:FORMAL_IDENTITY_OR_SCHEMA_MISMATCH")
+    if kind == "gate_record" and (
+        loaded.payload.get("task_id") != "stage2.04_reference_target"
+        or not isinstance(loaded.payload.get("gate_ids"), list)
+        or GATE_ID not in loaded.payload.get("gate_ids", [])
+    ):
+        raise G23Blocked("artifact:gate_record:GATE_ID_MISMATCH")
+    return loaded
 
 
-def _load_resume_commits(root: Path, resume_root: Path, schema: str) -> list[Mapping[str, object]]:
+def _load_resume_commits(
+    root: Path,
+    resume_root: Path,
+    schema: str,
+    *,
+    identities: Mapping[str, object],
+) -> list[Mapping[str, object]]:
     commits_dir = resume_root / "commits"
     if not commits_dir.is_dir():
         raise G23Blocked(f"resume:{schema}:COMMITS_MISSING")
+    try:
+        resume_logical = commits_dir.relative_to(root).as_posix()
+    except ValueError as error:
+        raise G23Blocked(f"resume:{schema}:ROOT_ESCAPE") from error
+    _reject_symlink_chain(root, resume_logical, f"resume.{schema}.root")
     paths = sorted(commits_dir.glob("*.json"))
     if not paths:
         raise G23Blocked(f"resume:{schema}:COMMITS_EMPTY")
     states: list[Mapping[str, object]] = []
     for index, commit_path in enumerate(paths, start=1):
+        try:
+            _reject_symlink_chain(root, commit_path.relative_to(root).as_posix(), f"resume.{schema}.commit")
+        except ValueError as error:
+            raise G23Blocked(f"resume:{schema}:COMMIT_ESCAPE") from error
         try:
             commit = load_canonical_json(commit_path)
         except (OSError, ValueError) as error:
@@ -381,6 +513,8 @@ def _load_resume_commits(root: Path, resume_root: Path, schema: str) -> list[Map
         if commit.get("artifact_hash") != canonical_json_hash(payload):
             raise G23Blocked(f"resume:{schema}:COMMIT_HASH")
         relative = Path(_path(str(commit["object_ref"]), f"resume.{schema}.object_ref"))
+        _reject_symlink_chain(resume_root, relative.as_posix(), f"resume.{schema}.object_ref")
+        _reject_symlinks_under(resume_root / relative, f"resume.{schema}.object_ref")
         try:
             state, bundle = load_tensor_bundle(resume_root / relative)
         except (OSError, ValueError, TypeError) as error:
@@ -395,49 +529,125 @@ def _load_resume_commits(root: Path, resume_root: Path, schema: str) -> list[Map
             raise G23Blocked(f"resume:{schema}:STATE_DIGEST_INVALID") from error
         if state_digest != _sha(commit.get("state_digest"), "resume.state_digest"):
             raise G23Blocked(f"resume:{schema}:STATE_DIGEST_MISMATCH")
+        required_identity = {
+            "plan_hash",
+            "provider_state_digest",
+            "registry_hash",
+            "weighting_assumptions",
+            "rng_state_digest",
+        }
+        if schema == "stage2-reference-progress-state-v1":
+            required_identity |= {"sizing_draw_hash", "sizing_identity_hash", "sizing_stream"}
+        else:
+            required_identity |= {
+                "sizing_result_hash",
+                "stream_a_draw_hash",
+                "stream_b_draw_hash",
+                "sizing_result_identity_hash",
+                "final_length_required",
+            }
+        if not required_identity.issubset(state):
+            raise G23Blocked(f"resume:{schema}:IDENTITY_FIELDS_MISSING")
+        for key, expected in identities.items():
+            if key in state and state.get(key) != expected:
+                raise G23Blocked(f"resume:{schema}:{key}:IDENTITY_DRIFT")
         states.append(state)
     return states
 
 
-def _validate_state_identity(state: Mapping[str, object], identities: Mapping[str, str], field: str) -> None:
-    for state_key, identity_key in (
-        ("registry_hash", "registry_hash"),
-        ("provider_state_digest", "provider_state_digest"),
-        ("sizing_result_hash", "sizing_result_hash"),
-        ("stream_a_draw_hash", "stream_a_draw_hash"),
-        ("stream_b_draw_hash", "stream_b_draw_hash"),
-    ):
-        if state_key in state and identity_key in identities and str(state[state_key]) != identities[identity_key]:
-            raise G23Blocked(f"{field}:{state_key}:IDENTITY_DRIFT")
-
-
 def _resume_roots(root: Path, result_ref: str) -> tuple[Path, Path]:
-    commit = Path(_path(result_ref, "reference_result_ref"))
+    logical_ref = _path(result_ref, "reference_result_ref")
+    _reject_symlink_chain(root, logical_ref, "reference_result_ref")
+    commit = Path(logical_ref)
     # .../<output_dir>/commits/reference_result.json -> .../<output_dir>
     output_dir = (root / commit.parent.parent).resolve()
     try:
         output_dir.relative_to(root.resolve())
     except ValueError as error:
         raise G23Blocked("reference_result_ref:PATH_ESCAPE") from error
+    for child in (output_dir, output_dir / "resume", output_dir / "resume" / "reference-sizing", output_dir / "resume" / "reference-final"):
+        try:
+            _reject_symlink_chain(root, child.relative_to(root).as_posix(), "resume_root")
+        except ValueError as error:
+            raise G23Blocked("resume_root:ESCAPE") from error
     return output_dir / "resume" / "reference-sizing", output_dir / "resume" / "reference-final"
 
 
-def _extract_checkpoint_hash(reference: Mapping[str, object], convergence: Mapping[str, object], result_payload: Mapping[str, object]) -> str:
-    found = _find_key({"reference": reference, "convergence": convergence, "result": result_payload}, {
-        "checkpoint_hash", "checkpoint_manifest_hash", "checkpoint_sha256", "checkpoint_revision_hash",
-    })
-    if found is None:
-        raise G23Blocked("checkpoint_hash:RAW_IDENTITY_MISSING")
-    return _sha(found[1], "checkpoint_hash")
+def _validate_six_cell_manifest(value: object) -> tuple[Mapping[str, object], ...]:
+    if not isinstance(value, Mapping):
+        raise G23Blocked("six_cell_manifest:OBJECT_REQUIRED")
+    if value.get("schema_version") != "stage2-s204-six-cell-manifest-v1" or value.get("status") != "READY" or value.get("scope") != "formal":
+        raise G23Blocked("six_cell_manifest:FORMAL_READY_REQUIRED")
+    declared = _sha(value.get("manifest_hash"), "six_cell_manifest.manifest_hash")
+    if canonical_json_hash({key: item for key, item in value.items() if key != "manifest_hash"}) != declared:
+        raise G23Blocked("six_cell_manifest:HASH_MISMATCH")
+    _sha(value.get("asset_resolution_hash"), "six_cell_manifest.asset_resolution_hash")
+    _commit(value.get("asset_producer_commit"), "six_cell_manifest.asset_producer_commit")
+    _commit(value.get("asset_execution_commit"), "six_cell_manifest.asset_execution_commit")
+    _sha(value.get("data_range_hash"), "six_cell_manifest.data_range_hash")
+    rows = value.get("checkpoints")
+    if not isinstance(rows, list) or len(rows) != REQUIRED_CELL_COUNT:
+        raise G23Blocked("six_cell_manifest:EXACTLY_SIX_ROWS_REQUIRED")
+    by_id: dict[str, Mapping[str, object]] = {}
+    checkpoint_ids: set[object] = set()
+    for row in rows:
+        if not isinstance(row, Mapping):
+            raise G23Blocked("six_cell_manifest:ROW_OBJECT_REQUIRED")
+        cell_id = row.get("cell_id")
+        if cell_id not in EXPECTED_CELL_IDS or cell_id in by_id:
+            raise G23Blocked("six_cell_manifest:CELL_SET_INVALID")
+        model, stage = str(cell_id).split(":", 1)
+        if row.get("model_id") != model or row.get("training_stage") != stage:
+            raise G23Blocked("six_cell_manifest:CELL_ID_FIELDS_MISMATCH")
+        if not isinstance(row.get("checkpoint_id"), str) or not row.get("checkpoint_id") or row.get("checkpoint_id") in checkpoint_ids:
+            raise G23Blocked("six_cell_manifest:CHECKPOINT_IDENTITY_INVALID")
+        checkpoint_ids.add(row.get("checkpoint_id"))
+        if not isinstance(row.get("checkpoint_revision"), str) or not row.get("checkpoint_revision"):
+            raise G23Blocked("six_cell_manifest:CHECKPOINT_REVISION_REQUIRED")
+        _sha(row.get("checkpoint_hash"), f"six_cell_manifest.{cell_id}.checkpoint_hash")
+        _sha(row.get("config_hash"), f"six_cell_manifest.{cell_id}.config_hash")
+        _sha(row.get("registry_hash"), f"six_cell_manifest.{cell_id}.registry_hash")
+        by_id[str(cell_id)] = row
+    if tuple(by_id) != EXPECTED_CELL_IDS:
+        raise G23Blocked("six_cell_manifest:CELL_ORDER_INVALID")
+    registry_hash = _sha(value.get("registry_hash"), "six_cell_manifest.registry_hash")
+    if any(row.get("registry_hash") != registry_hash for row in by_id.values()):
+        raise G23Blocked("six_cell_manifest:REGISTRY_DRIFT")
+    data = value.get("data")
+    if not isinstance(data, Mapping) or data.get("data_range_hash") != value.get("data_range_hash"):
+        raise G23Blocked("six_cell_manifest:DATA_RANGE_DRIFT")
+    return tuple(by_id[cell_id] for cell_id in EXPECTED_CELL_IDS)
 
 
-def _extract_producer_commit(reference: Mapping[str, object], convergence: Mapping[str, object], result_payload: Mapping[str, object]) -> str:
-    found = _find_key({"reference": reference, "convergence": convergence, "result": result_payload}, {
-        "producer_commit", "producer_git_commit", "execution_commit",
-    })
-    if found is None:
-        raise G23Blocked("producer_commit:RAW_IDENTITY_MISSING")
-    return _commit(found[1], "producer_commit")
+def _identity_object(value: object, field: str, *, required: Sequence[str]) -> Mapping[str, object]:
+    if not isinstance(value, Mapping):
+        raise G23Blocked(f"{field}:OBJECT_REQUIRED")
+    for key in required:
+        if key not in value:
+            raise G23Blocked(f"{field}.{key}:MISSING")
+    identity_hash = _sha(value.get("identity_hash"), f"{field}.identity_hash")
+    if canonical_json_hash({key: item for key, item in value.items() if key != "identity_hash"}) != identity_hash:
+        raise G23Blocked(f"{field}:HASH_MISMATCH")
+    return value
+
+
+def _validate_registry_artifact(value: object, registry_hash: str, vector_names: Sequence[str] | None = None) -> Mapping[str, object]:
+    if not isinstance(value, Mapping) or value.get("schema_version") != "stage2-parameter-registry-artifact-v1":
+        raise G23Blocked("parameter_registry_artifact:SCHEMA_REQUIRED")
+    if value.get("status") == "MISSING" or value.get("registry_hash") != registry_hash:
+        raise G23Blocked("parameter_registry_artifact:REGISTRY_REQUIRED")
+    _canonical_payload_hash(value, "parameter_registry_artifact")
+    groups = value.get("parameter_groups")
+    if not isinstance(groups, Mapping) or not groups:
+        raise G23Blocked("parameter_registry_artifact:GROUPS_REQUIRED")
+    if vector_names is not None and set(str(name) for name in groups) != set(vector_names):
+        raise G23Blocked("parameter_registry_artifact:PARAMETER_SET_MISMATCH")
+    for name, item in groups.items():
+        if not isinstance(name, str) or not isinstance(item, Mapping):
+            raise G23Blocked("parameter_registry_artifact:GROUP_ENTRY_INVALID")
+        if not isinstance(item.get("layer"), str) or not item.get("layer") or not isinstance(item.get("module"), str) or not item.get("module"):
+            raise G23Blocked("parameter_registry_artifact:EXPLICIT_LAYER_MODULE_REQUIRED")
+    return value
 
 
 def _prepare_cell(root: Path, source: CellInput) -> _CellEvidence:
@@ -449,17 +659,173 @@ def _prepare_cell(root: Path, source: CellInput) -> _CellEvidence:
         evidence.identities["config_hash"] = _sha(result.config_hash, "config_hash")
         if source.config_ref is not None:
             config = _load_json(root, source.config_ref, "config")
-            if config.get("config_hash") != result.config_hash:
+            if config.get("schema_version") not in {"resolved-config-v1", "resolved-config-v2"} or config.get("config_hash") != result.config_hash:
                 raise G23Blocked("config_hash:CONFIG_RESULT_MISMATCH")
         evidence.reference = _artifact(root, result, "reference_result")
         evidence.convergence = _artifact(root, result, "reference_convergence_report")
         evidence.gate = _artifact(root, result, "gate_record")
         rp, cp = evidence.reference.payload, evidence.convergence.payload
-        evidence.identities["registry_hash"] = _sha(rp.get("registry_hash"), "registry_hash")
-        evidence.identities["checkpoint_hash"] = _extract_checkpoint_hash(rp, cp, result_payload)
-        evidence.identities["producer_commit"] = _extract_producer_commit(rp, cp, result_payload)
+        if rp.get("scope") != "formal" or rp.get("formal_eligible") is not False:
+            raise G23Blocked("reference:FORMAL_SCOPE_REQUIRED")
+        if cp.get("formal_scope") != "formal" or cp.get("formal_eligible") is not False:
+            raise G23Blocked("convergence:FORMAL_SCOPE_REQUIRED")
+        if cp.get("diagnostics_schema_version") != "stage2-reference-producer-diagnostics-v1":
+            raise G23Blocked("convergence:DIAGNOSTICS_SCHEMA_REQUIRED")
+        producer_commit = _commit(cp.get("stage2_reference_producer_commit"), "stage2_reference_producer_commit")
+        six_rows = _validate_six_cell_manifest(cp.get("six_cell_manifest"))
+        six_hash = _sha(cp.get("six_cell_manifest_hash"), "six_cell_manifest_hash")
+        if six_hash != _sha(cp.get("six_cell_manifest", {}).get("manifest_hash"), "six_cell_manifest.manifest_hash"):  # type: ignore[union-attr]
+            raise G23Blocked("six_cell_manifest_hash:MISMATCH")
+        cell_id = cp.get("cell_id")
+        if cell_id not in EXPECTED_CELL_IDS:
+            raise G23Blocked("cell_id:FIXED_SIX_CELL_REQUIRED")
+        row = next(item for item in six_rows if item.get("cell_id") == cell_id)
+        if source.cell_id != cell_id:
+            raise G23Blocked("cell_id:CALLER_REFERENCE_MISMATCH")
+        config_identity = _identity_object(
+            cp.get("config_identity"),
+            "config_identity",
+            required=("config_hash", "full_hash", "task_id", "checkpoint_config_hash"),
+        )
+        if config_identity.get("config_hash") != result.config_hash or config_identity.get("task_id") != result.task_id:
+            raise G23Blocked("config_identity:RESULT_MISMATCH")
+        model_identity = _identity_object(cp.get("model_identity"), "model_identity", required=("asset_id", "revision"))
+        data_identity = _identity_object(cp.get("data_identity"), "data_identity", required=("asset_id", "revision"))
+        if data_identity.get("data_range_hash") != cp.get("six_cell_manifest", {}).get("data_range_hash"):  # type: ignore[union-attr]
+            raise G23Blocked("data_identity:DATA_RANGE_MISMATCH")
+        data_manifest = cp.get("six_cell_manifest", {}).get("data")  # type: ignore[union-attr]
+        if isinstance(data_manifest, Mapping) and data_manifest.get("dataset_id") is not None and data_identity.get("asset_id") != data_manifest.get("dataset_id"):
+            raise G23Blocked("data_identity:DATASET_ID_MISMATCH")
+        checkpoint_identity = _identity_object(
+            cp.get("checkpoint_identity"),
+            "checkpoint_identity",
+            required=("checkpoint_id", "checkpoint_revision", "checkpoint_asset_id", "model_id", "training_stage", "checkpoint_hash", "config_hash", "registry_hash"),
+        )
+        if any(checkpoint_identity.get(key) != row.get(key) for key in ("cell_id", "model_id", "training_stage", "checkpoint_hash", "config_hash", "registry_hash")):
+            raise G23Blocked("checkpoint_identity:SIX_CELL_ROW_MISMATCH")
+        if checkpoint_identity.get("checkpoint_asset_id") != model_identity.get("asset_id"):
+            raise G23Blocked("checkpoint_identity:MODEL_ASSET_MISMATCH")
+        if checkpoint_identity.get("checkpoint_revision") != model_identity.get("revision"):
+            raise G23Blocked("checkpoint_identity:MODEL_REVISION_MISMATCH")
+        if config_identity.get("checkpoint_config_hash") != checkpoint_identity.get("config_hash"):
+            raise G23Blocked("config_identity:CHECKPOINT_CONFIG_MISMATCH")
+        registry_identity = _identity_object(cp.get("registry_identity"), "registry_identity", required=("registry_hash", "parameter_registry_artifact_hash"))
+        registry_hash = _sha(registry_identity.get("registry_hash"), "registry_identity.registry_hash")
+        if registry_hash != row.get("registry_hash") or registry_hash != rp.get("registry_hash"):
+            raise G23Blocked("registry_identity:DRIFT")
+        registry_artifact = _validate_registry_artifact(cp.get("parameter_registry_artifact"), registry_hash)
+        if registry_artifact.get("artifact_hash") != registry_identity.get("parameter_registry_artifact_hash"):
+            raise G23Blocked("parameter_registry_artifact:IDENTITY_HASH_MISMATCH")
+        evidence.identities.update({
+            "registry_hash": registry_hash,
+            "checkpoint_hash": _sha(checkpoint_identity.get("checkpoint_hash"), "checkpoint_hash"),
+            "producer_commit": producer_commit,
+            "cell_id": str(cell_id),
+            "six_cell_manifest_hash": six_hash,
+            "sizing_plan_hash": _sha(cp.get("sizing_plan_artifact_hash"), "sizing_plan_artifact_hash"),
+        })
+        plan = cp.get("sizing_plan")
+        if not isinstance(plan, Mapping) or plan.get("schema_version") != "stage2-reference-sizing-plan-v1":
+            raise G23Blocked("sizing_plan:SCHEMA_REQUIRED")
+        if _sha(plan.get("artifact_hash"), "sizing_plan.artifact_hash") != evidence.identities["sizing_plan_hash"]:
+            raise G23Blocked("sizing_plan:HASH_MISMATCH")
+        if canonical_json_hash({key: item for key, item in plan.items() if key != "artifact_hash"}) != evidence.identities["sizing_plan_hash"]:
+            raise G23Blocked("sizing_plan:CONTENT_HASH_MISMATCH")
+        one_shot = cp.get("one_shot_result")
+        if not isinstance(one_shot, Mapping):
+            raise G23Blocked("one_shot_result:RAW_DIAGNOSTIC_MISSING")
+        one_shot_hash = _canonical_payload_hash(one_shot, "one_shot_result")
+        evidence.identities["one_shot_result_hash"] = one_shot_hash
+        evidence.identities["sizing_result_hash"] = _sha(one_shot.get("sizing_result_hash"), "sizing_result_hash")
+        evidence.identities["provider_state_digest"] = _sha(one_shot.get("provider_state_digest"), "provider_state_digest")
+        evidence.identities["stream_a_draw_hash"] = _sha(one_shot.get("stream_a_draw_hash"), "stream_a_draw_hash")
+        evidence.identities["stream_b_draw_hash"] = _sha(one_shot.get("stream_b_draw_hash"), "stream_b_draw_hash")
+        if evidence.identities["stream_a_draw_hash"] == evidence.identities["stream_b_draw_hash"]:
+            raise G23Blocked("draw_hash:STREAMS_NOT_INDEPENDENT")
+        delta = cp.get("candidate_delta_sci")
+        if not isinstance(delta, Mapping) or delta.get("schema_version") != "stage2-reference-delta-sci-v1":
+            raise G23Blocked("delta_sci:EXPLICIT_SOURCE_REQUIRED")
+        delta_ref = _path(delta.get("source_ref"), "candidate_delta_sci.source_ref")
+        delta_hash = _sha(delta.get("source_hash"), "candidate_delta_sci.source_hash")
+        if cp.get("candidate_delta_sci_source") != delta_ref or cp.get("candidate_delta_sci_source_hash") != delta_hash:
+            raise G23Blocked("delta_sci:SOURCE_BINDING_MISMATCH")
+        source_value = _load_json(root, delta_ref, "candidate_delta_sci.source")
+        if canonical_json_hash(source_value) != delta_hash:
+            raise G23Blocked("delta_sci:SOURCE_HASH_MISMATCH")
+        one_shot_plan = cp.get("one_shot_plan")
+        if not isinstance(one_shot_plan, Mapping) or one_shot_plan.get("schema_version") != "stage2-reference-one-shot-plan-v1":
+            raise G23Blocked("one_shot_plan:SCHEMA_REQUIRED")
+        one_shot_plan_hash = _canonical_payload_hash(one_shot_plan, "one_shot_plan")
+        if one_shot_plan.get("sizing_result_hash") != evidence.identities["sizing_result_hash"] or one_shot.get("plan_hash") != one_shot_plan_hash:
+            raise G23Blocked("one_shot_identity:PLAN_RESULT_MISMATCH")
+        if one_shot.get("provider_state_digest") != evidence.identities["provider_state_digest"] or one_shot.get("registry_hash") != evidence.identities["registry_hash"]:
+            raise G23Blocked("one_shot_identity:PROVIDER_REGISTRY_MISMATCH")
+        if cp.get("sizing_result_hash") != evidence.identities["sizing_result_hash"]:
+            raise G23Blocked("sizing_result_hash:CONVERGENCE_MISMATCH")
+        replay = cp.get("resume_replay")
+        if not isinstance(replay, Mapping):
+            raise G23Blocked("resume_replay:RAW_DIAGNOSTIC_MISSING")
+        sizing_draw_hash = _sha(cp.get("sizing_draw_hash"), "sizing_draw_hash")
+        sizing_identity_hash = _sha(cp.get("sizing_identity_hash"), "sizing_identity_hash")
+        expected_sizing_identity_hash = canonical_json_hash(
+            {
+                "plan_hash": evidence.identities["sizing_plan_hash"],
+                "provider_state_digest": evidence.identities["provider_state_digest"],
+                "registry_hash": evidence.identities["registry_hash"],
+                "sizing_draw_hash": sizing_draw_hash,
+                "sizing_stream": "reference_sizing",
+            }
+        )
+        if sizing_identity_hash != expected_sizing_identity_hash:
+            raise G23Blocked("sizing_identity_hash:FORMULA_MISMATCH")
+        if sizing_draw_hash in {evidence.identities["stream_a_draw_hash"], evidence.identities["stream_b_draw_hash"]}:
+            raise G23Blocked("draw_hash:SIZING_FINAL_REUSE")
+        if one_shot_plan.get("sizing_stream") != "reference_sizing" or one_shot_plan.get("stream_a") != "reference_A" or one_shot_plan.get("stream_b") != "reference_B":
+            raise G23Blocked("one_shot_plan:STREAM_IDENTITY_INVALID")
+        sizing_expected = {
+            "plan_hash": evidence.identities["sizing_plan_hash"],
+            "provider_state_digest": evidence.identities["provider_state_digest"],
+            "registry_hash": evidence.identities["registry_hash"],
+            "weighting_assumptions": one_shot.get("weighting_assumptions"),
+            "sizing_draw_hash": sizing_draw_hash,
+            "sizing_identity_hash": sizing_identity_hash,
+            "sizing_stream": True,
+            "rng_state_digest": sizing_draw_hash,
+        }
+        final_rng_digest = canonical_json_hash(
+            {
+                "stream_a_draw_hash": evidence.identities["stream_a_draw_hash"],
+                "stream_b_draw_hash": evidence.identities["stream_b_draw_hash"],
+                "sizing_result_hash": evidence.identities["sizing_result_hash"],
+            }
+        )
+        final_sizing_identity = _sha(cp.get("sizing_result_identity_hash"), "sizing_result_identity_hash")
+        expected_final_sizing_identity = canonical_json_hash(
+            {
+                "sizing_result_hash": evidence.identities["sizing_result_hash"],
+                "provider_state_digest": evidence.identities["provider_state_digest"],
+                "registry_hash": evidence.identities["registry_hash"],
+                "stream_a_draw_hash": evidence.identities["stream_a_draw_hash"],
+                "stream_b_draw_hash": evidence.identities["stream_b_draw_hash"],
+            }
+        )
+        if final_sizing_identity != expected_final_sizing_identity:
+            raise G23Blocked("sizing_result_identity_hash:FORMULA_MISMATCH")
+        final_expected = {
+            "plan_hash": one_shot_plan_hash,
+            "sizing_result_hash": evidence.identities["sizing_result_hash"],
+            "provider_state_digest": evidence.identities["provider_state_digest"],
+            "registry_hash": evidence.identities["registry_hash"],
+            "weighting_assumptions": one_shot.get("weighting_assumptions"),
+            "stream_a_draw_hash": evidence.identities["stream_a_draw_hash"],
+            "stream_b_draw_hash": evidence.identities["stream_b_draw_hash"],
+            "sizing_result_identity_hash": final_sizing_identity,
+            "rng_state_digest": final_rng_digest,
+            "final_length_required": True,
+        }
         bundle_ref = _path(rp.get("tensor_bundle_ref"), "tensor_bundle_ref")
         bundle_path = _resolve(root, bundle_ref)
+        _reject_symlinks_under(bundle_path, "tensor_bundle")
         state, bundle = load_tensor_bundle(bundle_path)
         if not isinstance(state, Mapping):
             raise G23Blocked("tensor_bundle:OBJECT_REQUIRED")
@@ -488,13 +854,24 @@ def _prepare_cell(root: Path, source: CellInput) -> _CellEvidence:
         if evidence.identities["stream_a_draw_hash"] == evidence.identities["stream_b_draw_hash"]:
             raise G23Blocked("draw_hash:STREAMS_NOT_INDEPENDENT")
         sizing_root, final_root = _resume_roots(root, result.artifact_refs["reference_result"])
-        evidence.sizing_states = _load_resume_commits(root, sizing_root, "stage2-reference-progress-state-v1")
-        final_states = _load_resume_commits(root, final_root, "stage2-reference-one-shot-progress-v1")
+        evidence.sizing_states = _load_resume_commits(
+            root,
+            sizing_root,
+            "stage2-reference-progress-state-v1",
+            identities=sizing_expected,
+        )
+        final_states = _load_resume_commits(
+            root,
+            final_root,
+            "stage2-reference-one-shot-progress-v1",
+            identities=final_expected,
+        )
         evidence.final_state = final_states[-1]
-        _validate_state_identity(evidence.final_state, evidence.identities, "final_resume")
+        evidence.final_root = final_root
         if int(evidence.final_state.get("processed_block_pairs", 0)) != len(final_states):
             raise G23Blocked("final_resume:COMMITTED_LENGTH_MISMATCH")
-        _validate_state_identity(evidence.sizing_states[-1], evidence.identities, "sizing_resume")
+        if int(evidence.sizing_states[-1].get("processed_block_pairs", 0)) != len(evidence.sizing_states):
+            raise G23Blocked("sizing_resume:COMMITTED_LENGTH_MISMATCH")
     except G23Blocked as error:
         evidence.reasons.append(str(error))
     except Exception as error:
@@ -505,10 +882,9 @@ def _prepare_cell(root: Path, source: CellInput) -> _CellEvidence:
 def _sizing_vectors(evidence: _CellEvidence) -> tuple[list[int], list[dict[str, np.ndarray]], Mapping[str, object]]:
     if not evidence.sizing_states:
         raise G23Blocked("sizing:RAW_DIAGNOSTICS_MISSING")
-    latest = evidence.sizing_states[-1]
     plan = None
     if evidence.convergence is not None:
-        plan = evidence.convergence.payload.get("plan")
+        plan = evidence.convergence.payload.get("sizing_plan")
     if not isinstance(plan, Mapping):
         raise G23Blocked("sizing.plan:RAW_DIAGNOSTIC_MISSING")
     raw_counts = plan.get("candidate_sample_counts")
@@ -525,14 +901,26 @@ def _sizing_vectors(evidence: _CellEvidence) -> tuple[list[int], list[dict[str, 
     vectors: list[dict[str, np.ndarray]] = []
     for count in counts[-2:]:
         state = states_by_count[count]
-        a = state.get("a")
-        b = state.get("b")
-        if not isinstance(a, Mapping):
-            raise G23Blocked("sizing.a:MOMENTS_MISSING")
-        if isinstance(b, Mapping) and int(b.get("count", 0)) > 0:
-            vectors.append(_u_from_moments(_merge_moments(a, b, "sizing.moments"), "sizing.u"))
+        raw_a, raw_b = state.get("blocks_a"), state.get("blocks_b")
+        raw_wa, raw_wb = state.get("block_weights_a"), state.get("block_weights_b")
+        if not isinstance(raw_a, list) or not isinstance(raw_b, list) or not isinstance(raw_wa, list) or not isinstance(raw_wb, list):
+            raise G23Blocked("sizing.blocks_and_weights:RAW_DIAGNOSTIC_MISSING")
+        blocks_a = [_vector(item, "sizing.blocks_a") for item in raw_a]
+        blocks_b = [_vector(item, "sizing.blocks_b") for item in raw_b]
+        weights_a = [_finite(item, "sizing.block_weights_a") for item in raw_wa]
+        weights_b = [_finite(item, "sizing.block_weights_b") for item in raw_wb]
+        moments_a = _moments_from_blocks(blocks_a, weights_a, "sizing.moments_a")
+        if all(weight == 0.0 for weight in weights_b):
+            moments = moments_a
         else:
-            vectors.append(_u_from_moments(a, "sizing.u"))
+            moments_b = _moments_from_blocks(blocks_b, weights_b, "sizing.moments_b")
+            moments = _merge_moments(moments_a, moments_b, "sizing.moments")
+        if not isinstance(state.get("a"), Mapping) or not isinstance(state.get("b"), Mapping):
+            raise G23Blocked("sizing.moments:STATE_MISSING")
+        _moments_equal(moments_a, state["a"], "sizing.moments_a")
+        if not all(weight == 0.0 for weight in weights_b):
+            _moments_equal(moments_b, state["b"], "sizing.moments_b")  # type: ignore[possibly-undefined]
+        vectors.append(_u_from_moments(moments, "sizing.u"))
     return counts[-2:], vectors, plan
 
 
@@ -545,11 +933,24 @@ def _final_vectors(evidence: _CellEvidence) -> tuple[dict[str, np.ndarray], dict
         raise G23Blocked("final.blocks_a_b:RAW_DIAGNOSTICS_MISSING")
     blocks_a = [_vector(item, "final.blocks_a") for item in raw_a]
     blocks_b = [_vector(item, "final.blocks_b") for item in raw_b]
+    raw_wa, raw_wb = state.get("block_weights_a"), state.get("block_weights_b")
+    if not isinstance(raw_wa, list) or not isinstance(raw_wb, list):
+        raise G23Blocked("final.block_weights:RAW_DIAGNOSTIC_MISSING")
+    weights_a = [_finite(item, "final.block_weights_a") for item in raw_wa]
+    weights_b = [_finite(item, "final.block_weights_b") for item in raw_wb]
+    if len(weights_a) != len(blocks_a) or len(weights_b) != len(blocks_b):
+        raise G23Blocked("final.block_weights:COUNT_MISMATCH")
     for left, right in zip(blocks_a, blocks_b):
         _compatible(left, right, "final.blocks")
     all_blocks = blocks_a + blocks_b
     mean_a, mean_b, mean_all = _mean(blocks_a, "final.mean_a"), _mean(blocks_b, "final.mean_b"), _mean(all_blocks, "final.mean_all")
-    bias = _u_from_moments(_merge_moments(state["a"], state["b"], "final.moments"), "final.bias")
+    if not isinstance(state.get("a"), Mapping) or not isinstance(state.get("b"), Mapping):
+        raise G23Blocked("final.moments:STATE_MISSING")
+    moments_a = _moments_from_blocks(blocks_a, weights_a, "final.moments_a")
+    moments_b = _moments_from_blocks(blocks_b, weights_b, "final.moments_b")
+    _moments_equal(moments_a, state["a"], "final.moments_a")
+    _moments_equal(moments_b, state["b"], "final.moments_b")
+    bias = _u_from_moments(_merge_moments(moments_a, moments_b, "final.moments"), "final.bias")
     cross = {name: mean_a[name] * mean_b[name] for name in mean_a}
     ranking = {name: np.square(mean_all[name]) for name in mean_all}
     bstate = evidence.bundle_state
@@ -574,24 +975,25 @@ def _final_vectors(evidence: _CellEvidence) -> tuple[dict[str, np.ndarray], dict
 def _group_map(vector: Mapping[str, np.ndarray], evidence: _CellEvidence) -> tuple[dict[str, list[str]], dict[str, list[str]]]:
     layer: dict[str, list[str]] = {}
     module: dict[str, list[str]] = {}
-    metadata = evidence.reference.payload.get("metadata") if evidence.reference is not None else None
-    registry = _find(metadata, {"parameter_registry", "registry", "parameter_groups"})
-    if isinstance(registry, Mapping):
-        for name in vector:
-            item = registry.get(name)
-            if isinstance(item, Mapping):
-                layer_name = str(item.get("layer", item.get("layer_name", name.split(".")[0])))
-                module_name = str(item.get("module", item.get("module_name", name.split(".")[0])))
-            else:
-                layer_name = name.split(".")[0]
-                module_name = layer_name
-            layer.setdefault(layer_name, []).append(name)
-            module.setdefault(module_name, []).append(name)
-    else:
-        for name in vector:
-            parts = name.split(".")
-            layer.setdefault(".".join(parts[:2]) if len(parts) > 1 else parts[0], []).append(name)
-            module.setdefault(parts[0], []).append(name)
+    if evidence.convergence is None:
+        raise G23Blocked("parameter_registry_artifact:CONVERGENCE_MISSING")
+    registry_hash = evidence.identities.get("registry_hash")
+    registry = _validate_registry_artifact(
+        evidence.convergence.payload.get("parameter_registry_artifact"),
+        _sha(registry_hash, "registry_hash"),
+        tuple(vector),
+    )
+    groups = registry["parameter_groups"]
+    assert isinstance(groups, Mapping)
+    for name in vector:
+        item = groups.get(name)
+        if not isinstance(item, Mapping):
+            raise G23Blocked(f"parameter_registry_artifact.{name}:MISSING")
+        layer_name, module_name = item.get("layer"), item.get("module")
+        if not isinstance(layer_name, str) or not isinstance(module_name, str) or not layer_name or not module_name:
+            raise G23Blocked(f"parameter_registry_artifact.{name}:EXPLICIT_LAYER_MODULE_REQUIRED")
+        layer.setdefault(layer_name, []).append(name)
+        module.setdefault(module_name, []).append(name)
     return layer, module
 
 
@@ -607,12 +1009,15 @@ def _aggregate(vector: Mapping[str, np.ndarray], groups: Mapping[str, Sequence[s
 def _delta_sci(evidence: _CellEvidence, counts: Sequence[int]) -> tuple[dict[int, float], float]:
     if evidence.convergence is None:
         raise G23Blocked("delta_sci:CONVERGENCE_MISSING")
-    source = _find(evidence.convergence.payload, {"delta_sci_by_B", "scientific_delta_by_B", "delta_sci"})
-    if not isinstance(source, Mapping):
+    source = evidence.convergence.payload.get("candidate_delta_sci")
+    if not isinstance(source, Mapping) or source.get("schema_version") != "stage2-reference-delta-sci-v1":
+        raise G23Blocked("delta_sci:EXPLICIT_SOURCE_REQUIRED")
+    values_source = source.get("delta_sci_by_B")
+    if not isinstance(values_source, Mapping):
         raise G23Blocked("delta_sci:RAW_DIAGNOSTIC_MISSING")
     values: dict[int, float] = {}
     for count in counts:
-        raw = source.get(str(count), source.get(count))
+        raw = values_source.get(str(count))
         if raw is None:
             raise G23Blocked(f"delta_sci:{count}:MISSING")
         values[count] = _finite(raw, f"delta_sci[{count}]")
@@ -621,39 +1026,264 @@ def _delta_sci(evidence: _CellEvidence, counts: Sequence[int]) -> tuple[dict[int
     return values, min(values.values())
 
 
+def _u_from_blocks_longdouble(
+    blocks: Sequence[Mapping[str, np.ndarray]],
+    weights: Sequence[object],
+    field: str,
+) -> dict[str, np.ndarray]:
+    """Independently recompute weighted block-U values in extended precision."""
+
+    if not blocks or len(blocks) != len(weights):
+        raise G23Blocked(f"{field}:RAW_BLOCKS_AND_WEIGHTS_REQUIRED")
+    parsed_weights = [np.longdouble(_finite(value, f"{field}.weight")) for value in weights]
+    if any(value <= 0 for value in parsed_weights):
+        raise G23Blocked(f"{field}:POSITIVE_BLOCK_WEIGHTS_REQUIRED")
+    first = blocks[0]
+    names = tuple(sorted(first))
+    g1 = {name: np.zeros(first[name].shape, dtype=np.longdouble) for name in names}
+    g2 = {name: np.zeros(first[name].shape, dtype=np.longdouble) for name in names}
+    n1 = np.longdouble(0)
+    n2 = np.longdouble(0)
+    for block, weight in zip(blocks, parsed_weights):
+        _compatible(first, block, field)
+        n1 += weight
+        n2 += weight * weight
+        for name in names:
+            value = np.asarray(block[name], dtype=np.longdouble)
+            g1[name] += weight * value
+            g2[name] += weight * weight * value * value
+    denominator = n1 * n1 - n2
+    if len(blocks) < 2 or denominator <= 0:
+        raise G23Blocked(f"{field}:U_DENOMINATOR_INVALID")
+    return {
+        name: np.asarray((g1[name] * g1[name] - g2[name]) / denominator, dtype=np.float64)
+        for name in names
+    }
+
+
 def _numerical_error(evidence: _CellEvidence, reference: Mapping[str, np.ndarray]) -> float:
-    if evidence.convergence is None:
-        raise G23Blocked("epsilon_num:CONVERGENCE_MISSING")
-    source = _find(evidence.convergence.payload, {"numerical_diagnostics", "numeric_diagnostics", "accumulation_diagnostics"})
-    if not isinstance(source, Mapping):
+    if evidence.convergence is None or evidence.bundle_state is None or evidence.final_state is None:
         raise G23Blocked("epsilon_num:RAW_DIAGNOSTIC_MISSING")
-    high = _find(source, {"high_precision", "pairwise_reference", "reference_high_precision", "fp64_pairwise"})
-    accumulated = _find(source, {"accumulated", "streaming_reference", "reference_accumulated", "fp32_accumulated"})
+    source = evidence.bundle_state.get("numerical_diagnostics")
+    metadata = evidence.convergence.payload.get("numerical_diagnostics")
+    if not isinstance(source, Mapping) or not isinstance(metadata, Mapping) or source.get("schema_version") != "stage2-reference-numerical-diagnostics-v1":
+        raise G23Blocked("epsilon_num:EXPLICIT_DIAGNOSTIC_REQUIRED")
+    _canonical_payload_hash(metadata, "epsilon_num.metadata")
+    raw_a, raw_b = evidence.final_state.get("blocks_a"), evidence.final_state.get("blocks_b")
+    raw_wa, raw_wb = evidence.final_state.get("block_weights_a"), evidence.final_state.get("block_weights_b")
+    if not isinstance(raw_a, list) or not isinstance(raw_b, list) or not isinstance(raw_wa, list) or not isinstance(raw_wb, list):
+        raise G23Blocked("epsilon_num:RAW_BLOCKS_REQUIRED")
+    blocks = [_vector(item, "epsilon_num.blocks") for item in raw_a + raw_b]
+    weights = list(raw_wa) + list(raw_wb)
+    if len(blocks) != len(weights):
+        raise G23Blocked("epsilon_num:BLOCK_WEIGHT_COUNT_MISMATCH")
+    raw_digest = canonical_json_hash([_vector_digest(item) for item in blocks])
+    if source.get("raw_block_digest") != raw_digest or metadata.get("raw_block_digest") != raw_digest:
+        raise G23Blocked("epsilon_num:RAW_BLOCK_BINDING_MISMATCH")
+    high = source.get("high_precision")
+    accumulated = source.get("accumulated")
     if high is None or accumulated is None:
         raise G23Blocked("epsilon_num:HIGH_PRECISION_PAIR_REQUIRED")
     left, right = _vector(high, "epsilon_num.high_precision"), _vector(accumulated, "epsilon_num.accumulated")
     _compatible(left, right, "epsilon_num")
     _compatible(left, reference, "epsilon_num.reference")
-    return float(max(np.max(np.abs(left[name] - right[name])) for name in left))
+    if _vector_digest(left) != _sha(source.get("high_precision_hash"), "epsilon_num.high_precision_hash") or _vector_digest(right) != _sha(source.get("accumulated_hash"), "epsilon_num.accumulated_hash"):
+        raise G23Blocked("epsilon_num:VECTOR_HASH_MISMATCH")
+    if metadata.get("high_precision_hash") != source.get("high_precision_hash") or metadata.get("accumulated_hash") != source.get("accumulated_hash"):
+        raise G23Blocked("epsilon_num:METADATA_HASH_MISMATCH")
+    if evidence.reference is None or evidence.reference.payload.get("bias_reference_hash") != _vector_digest(reference):
+        raise G23Blocked("epsilon_num:REFERENCE_BINDING_MISMATCH")
+    # Recompute both sides from the committed raw blocks.  The producer's
+    # numerical vectors are evidence to cross-check, never an authority that
+    # can be replaced by a caller-authored scalar.
+    expected_high = _u_from_blocks_longdouble(blocks, weights, "epsilon_num.independent_high_precision")
+    expected_accumulated = _u_from_moments(
+        _moments_from_blocks(blocks, weights, "epsilon_num.independent_accumulation"),
+        "epsilon_num.independent_accumulation",
+    )
+    for name in expected_high:
+        if not np.allclose(left[name], expected_high[name], rtol=1e-12, atol=1e-12):
+            raise G23Blocked("epsilon_num:HIGH_PRECISION_RECOMPUTE_MISMATCH")
+        if not np.allclose(right[name], expected_accumulated[name], rtol=1e-12, atol=1e-12):
+            raise G23Blocked("epsilon_num:ACCUMULATED_RECOMPUTE_MISMATCH")
+    if not np.allclose(_flat(right), _flat(reference), rtol=1e-12, atol=1e-12):
+        raise G23Blocked("epsilon_num:REFERENCE_RECOMPUTE_MISMATCH")
+    computed_error = float(max(np.max(np.abs(expected_high[name] - expected_accumulated[name])) for name in expected_high))
+    declared_error = _finite(metadata.get("max_abs_error"), "epsilon_num.max_abs_error")
+    if not math.isclose(declared_error, computed_error, rel_tol=1e-12, abs_tol=1e-12):
+        raise G23Blocked("epsilon_num:DECLARED_ERROR_MISMATCH")
+    if evidence.final_root is None:
+        raise G23Blocked("epsilon_num:RESUME_ROOT_MISSING")
+    commits = sorted((evidence.final_root / "commits").glob("*.json"))
+    if not commits:
+        raise G23Blocked("epsilon_num:RESUME_COMMITS_MISSING")
+    latest_path = commits[-1]
+    _reject_symlink_chain(evidence.final_root, latest_path.relative_to(evidence.final_root).as_posix(), "epsilon_num.latest_commit")
+    latest = load_canonical_json(latest_path)
+    if not isinstance(latest, Mapping):
+        raise G23Blocked("epsilon_num:RESUME_LATEST_INVALID")
+    if metadata.get("resume_latest_commit_ref") != latest_path.relative_to(evidence.final_root).as_posix():
+        raise G23Blocked("epsilon_num:RESUME_COMMIT_REF_MISMATCH")
+    if metadata.get("resume_latest_commit_hash") != latest.get("artifact_hash"):
+        raise G23Blocked("epsilon_num:RESUME_COMMIT_HASH_MISMATCH")
+    if metadata.get("resume_latest_manifest_hash") != latest.get("object_manifest_hash"):
+        raise G23Blocked("epsilon_num:RESUME_MANIFEST_HASH_MISMATCH")
+    return computed_error
 
 
 def _state_replay_verified(evidence: _CellEvidence) -> bool:
-    if evidence.final_state is None or evidence.convergence is None:
+    if evidence.final_state is None or evidence.convergence is None or evidence.final_root is None:
         raise G23Blocked("state_replay:RAW_DIAGNOSTIC_MISSING")
-    source: object = {"final": evidence.final_state, "convergence": evidence.convergence.payload}
-    model_before = _find(source, {"model_state_before_hash", "model_before_hash"})
-    model_after = _find(source, {"model_state_after_hash", "model_after_hash"})
-    rng_before = _find(source, {"rng_state_before_hash", "rng_before_hash"})
-    rng_after = _find(source, {"rng_state_after_hash", "rng_after_hash"})
-    replay = _find(source, {"resume_replay_hash", "replay_hash", "resume_equivalence_hash"})
-    replay_again = _find(source, {"fresh_replay_hash", "uninterrupted_replay_hash", "replayed_hash"})
-    values = (model_before, model_after, rng_before, rng_after, replay, replay_again)
-    if any(value is None for value in values):
-        raise G23Blocked("state_replay:MODEL_RNG_REPLAY_HASHES_REQUIRED")
-    hashes = [_sha(value, "state_replay_hash") for value in values]
-    if hashes[0] != hashes[1] or hashes[2] != hashes[3] or hashes[4] != hashes[5]:
+    invariance = evidence.convergence.payload.get("state_invariance")
+    if not isinstance(invariance, Mapping):
+        raise G23Blocked("state_replay:STATE_INVARIANCE_REQUIRED")
+    model_before = _sha(invariance.get("model_state_before_hash"), "state_replay.model_before")
+    model_after = _sha(invariance.get("model_state_after_hash"), "state_replay.model_after")
+    rng_before = _sha(invariance.get("rng_state_before_hash"), "state_replay.rng_before")
+    rng_after = _sha(invariance.get("rng_state_after_hash"), "state_replay.rng_after")
+    if model_before != model_after:
         return False
+    expected_rng_after = canonical_json_hash(
+        {
+            "sizing_draw_hash": evidence.convergence.payload.get("sizing_draw_hash"),
+            "stream_a_draw_hash": evidence.identities.get("stream_a_draw_hash"),
+            "stream_b_draw_hash": evidence.identities.get("stream_b_draw_hash"),
+        }
+    )
+    if rng_after != expected_rng_after or rng_before == rng_after:
+        return False
+    replay = evidence.convergence.payload.get("resume_replay")
+    if not isinstance(replay, Mapping):
+        raise G23Blocked("state_replay:RESUME_REPLAY_REQUIRED")
+    replay_hash = _sha(replay.get("replay_hash"), "state_replay.replay_hash")
+    if canonical_json_hash({key: item for key, item in replay.items() if key != "replay_hash"}) != replay_hash:
+        raise G23Blocked("state_replay:REPLAY_HASH_MISMATCH")
+    artifact_ref = _path(replay.get("artifact_ref"), "state_replay.artifact_ref")
+    _reject_symlink_chain(evidence.final_root, artifact_ref, "state_replay.artifact_ref")
+    commit_path = evidence.final_root / artifact_ref
+    try:
+        commit = load_canonical_json(commit_path)
+    except (OSError, ValueError, TypeError) as error:
+        raise G23Blocked("state_replay:ARTIFACT_COMMIT_UNREADABLE") from error
+    if not isinstance(commit, Mapping) or set(commit) != {"schema_version", "sequence", "state_digest", "object_ref", "object_manifest_hash", "artifact_hash"}:
+        raise G23Blocked("state_replay:ARTIFACT_COMMIT_FIELDS")
+    if commit.get("schema_version") != "stage2-reference-progress-commit-v1" or commit.get("artifact_hash") != replay.get("artifact_hash"):
+        raise G23Blocked("state_replay:ARTIFACT_COMMIT_BINDING")
+    commit_payload = {key: item for key, item in commit.items() if key != "artifact_hash"}
+    if canonical_json_hash(commit_payload) != commit.get("artifact_hash"):
+        raise G23Blocked("state_replay:ARTIFACT_COMMIT_HASH")
+    object_ref = _path(commit.get("object_ref"), "state_replay.object_ref")
+    _reject_symlink_chain(evidence.final_root, object_ref, "state_replay.object_ref")
+    _reject_symlinks_under(evidence.final_root / object_ref, "state_replay.object_ref")
+    state, bundle = load_tensor_bundle(evidence.final_root / object_ref)
+    if not isinstance(state, Mapping) or state.get("schema_version") != "stage2-reference-one-shot-progress-v1":
+        raise G23Blocked("state_replay:ARTIFACT_STATE_SCHEMA")
+    if bundle.manifest_sha256 != commit.get("object_manifest_hash") or commit.get("state_digest") != _sha(replay.get("state_digest"), "state_replay.state_digest"):
+        raise G23Blocked("state_replay:ARTIFACT_MANIFEST_BINDING")
+    if _ReferenceSnapshotStore._state_digest(state) != commit.get("state_digest"):
+        raise G23Blocked("state_replay:ARTIFACT_STATE_DIGEST")
+    if int(commit.get("sequence", -1)) != int(state.get("processed_block_pairs", -2)):
+        raise G23Blocked("state_replay:ARTIFACT_SEQUENCE")
+    if (
+        int(commit.get("sequence", -1)) != int(evidence.final_state.get("processed_block_pairs", -2))
+        or commit.get("state_digest") != _ReferenceSnapshotStore._state_digest(evidence.final_state)
+    ):
+        raise G23Blocked("state_replay:NOT_FINAL_COMMITTED_STATE")
+    if replay.get("object_manifest_hash") != bundle.manifest_sha256:
+        raise G23Blocked("state_replay:REPLAY_MANIFEST_HASH")
+    if replay.get("source_one_shot_result_hash") != replay.get("replayed_one_shot_result_hash") or replay.get("source_one_shot_result_hash") != evidence.identities.get("one_shot_result_hash"):
+        raise G23Blocked("state_replay:RESULT_HASH_DRIFT")
     return True
+
+
+def _bootstrap_interval(blocks: Sequence[Mapping[str, np.ndarray]], field: str, *, square: bool = False, product: Sequence[Mapping[str, np.ndarray]] | None = None) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Deterministic block bootstrap of endpoint means."""
+
+    if not blocks:
+        raise G23Blocked(f"{field}:EMPTY")
+    names = tuple(sorted(blocks[0]))
+    rows: list[np.ndarray] = []
+    for index, block in enumerate(blocks):
+        _compatible(blocks[0], block, field)
+        value = {name: block[name] for name in names}
+        if square:
+            value = {name: np.square(item) for name, item in value.items()}
+        if product is not None:
+            _compatible(block, product[index], field)
+            value = {name: item * product[index][name] for name, item in value.items()}
+        rows.append(np.concatenate([value[name].reshape(-1) for name in names]))
+    matrix = np.stack(rows, axis=0)
+    rng = np.random.default_rng(2_304_230)
+    reps = max(512, min(2048, 64 * matrix.shape[0]))
+    indices = rng.integers(0, matrix.shape[0], size=(reps, matrix.shape[0]))
+    sampled = matrix[indices].mean(axis=1)
+    return np.quantile(sampled, 0.025, axis=0), np.quantile(sampled, 0.975, axis=0), sampled.mean(axis=0)
+
+
+def _bootstrap_u_diagnostics(
+    blocks_a: Sequence[Mapping[str, np.ndarray]],
+    blocks_b: Sequence[Mapping[str, np.ndarray]],
+    weights_a: Sequence[object],
+    weights_b: Sequence[object],
+    center: Mapping[str, np.ndarray],
+    layer_groups: Mapping[str, Sequence[str]],
+    module_groups: Mapping[str, Sequence[str]],
+) -> tuple[float, float, float]:
+    """Bootstrap the U reference, then aggregate model/layer/module totals."""
+
+    blocks = list(blocks_a) + list(blocks_b)
+    weights = list(weights_a) + list(weights_b)
+    if not blocks:
+        raise G23Blocked("h_ref:RAW_BLOCKS_EMPTY")
+    names = tuple(sorted(blocks[0]))
+    rng = np.random.default_rng(2_304_231)
+    reps = max(512, min(2048, 64 * len(blocks)))
+    model_totals: list[float] = []
+    layer_l1: list[float] = []
+    module_l1: list[float] = []
+    center_layer, center_module = _aggregate(center, layer_groups), _aggregate(center, module_groups)
+    center_layer_total, center_layer_mean = center_layer
+    center_module_total, center_module_mean = center_module
+    for _ in range(reps):
+        indices = rng.integers(0, len(blocks), size=len(blocks))
+        selected_blocks = [blocks[int(index)] for index in indices]
+        selected_weights = [weights[int(index)] for index in indices]
+        u = _u_from_moments(_moments_from_blocks(selected_blocks, selected_weights, "h_ref.bootstrap"), "h_ref.bootstrap.u")
+        model_totals.append(float(np.abs(_flat(u)).sum()))
+        layer_total, layer_mean = _aggregate(u, layer_groups)
+        module_total, module_mean = _aggregate(u, module_groups)
+        layer_ratio = max(
+            float(np.abs(layer_total - center_layer_total).sum() / max(np.abs(center_layer_total).sum(), 1e-300)),
+            float(np.abs(layer_mean - center_layer_mean).sum() / max(np.abs(center_layer_mean).sum(), 1e-300)),
+        )
+        module_ratio = max(
+            float(np.abs(module_total - center_module_total).sum() / max(np.abs(center_module_total).sum(), 1e-300)),
+            float(np.abs(module_mean - center_module_mean).sum() / max(np.abs(center_module_mean).sum(), 1e-300)),
+        )
+        layer_l1.append(layer_ratio)
+        module_l1.append(module_ratio)
+    model_array = np.asarray(model_totals, dtype=np.float64)
+    h_ref = float((np.quantile(model_array, 0.975) - np.quantile(model_array, 0.025)) / 2.0)
+    return h_ref, float(np.quantile(np.asarray(layer_l1), 0.95)), float(np.quantile(np.asarray(module_l1), 0.95))
+
+
+def _bootstrap_u_interval(
+    blocks: Sequence[Mapping[str, np.ndarray]],
+    weights: Sequence[object],
+    field: str,
+) -> tuple[np.ndarray, np.ndarray]:
+    if not blocks:
+        raise G23Blocked(f"{field}:EMPTY")
+    rng = np.random.default_rng(2_304_232)
+    reps = max(512, min(2048, 64 * len(blocks)))
+    sampled: list[np.ndarray] = []
+    for _ in range(reps):
+        indices = rng.integers(0, len(blocks), size=len(blocks))
+        selected = [blocks[int(index)] for index in indices]
+        selected_weights = [weights[int(index)] for index in indices]
+        sampled.append(_flat(_u_from_moments(_moments_from_blocks(selected, selected_weights, field), f"{field}.u")))
+    matrix = np.stack(sampled, axis=0)
+    return np.quantile(matrix, 0.025, axis=0), np.quantile(matrix, 0.975, axis=0)
 
 
 def _sequence_scaling(evidence: _CellEvidence, blocks: Sequence[Mapping[str, np.ndarray]], block_size: int) -> bool:
@@ -704,17 +1334,38 @@ def _evaluate_cell(evidence: _CellEvidence) -> dict[str, object]:
         ranking_variance = _vector(uncertainty["ranking_variance"], "bundle.ranking_variance")
         _compatible(bias_variance, cross_variance, "variance")
         _compatible(bias_variance, ranking_variance, "variance")
-        variance_total = float(sum(np.sum(value) for value in bias_variance.values()))
-        h_ref = 1.96 * math.sqrt(max(0.0, variance_total))
-        cross_diff = _flat(cross) - _flat(bias)
-        cross_sd = np.sqrt(np.maximum(0.0, _flat(bias_variance) + _flat(cross_variance)))
+        if evidence.final_state is None:
+            raise G23Blocked("final:STATE_MISSING")
+        raw_wa, raw_wb = evidence.final_state.get("block_weights_a"), evidence.final_state.get("block_weights_b")
+        if not isinstance(raw_wa, list) or not isinstance(raw_wb, list):
+            raise G23Blocked("final.block_weights:RAW_DIAGNOSTIC_MISSING")
+        h_ref, layer_l1_q95, module_l1_q95 = _bootstrap_u_diagnostics(
+            blocks_a,
+            blocks_b,
+            raw_wa,
+            raw_wb,
+            latest_bias,
+            layer,
+            module,
+        )
+        bias_low, bias_high = _bootstrap_u_interval(
+            blocks_a + blocks_b,
+            list(raw_wa) + list(raw_wb),
+            "bias.bootstrap",
+        )
         a_mean, b_mean = _mean(blocks_a, "a_mean"), _mean(blocks_b, "b_mean")
         a_rank, b_rank = np.square(_flat(a_mean)), np.square(_flat(b_mean))
-        signal_floor = _find(evidence.convergence.payload if evidence.convergence else {}, {"numerical_floor", "numeric_floor"})
+        a_low, a_high, _ = _bootstrap_interval(blocks_a, "a.square.bootstrap", square=True)
+        b_low, b_high, _ = _bootstrap_interval(blocks_b, "b.square.bootstrap", square=True)
+        cross_low, cross_high, _ = _bootstrap_interval(blocks_a, "cross.bootstrap", product=blocks_b)
+        a_half = (a_high - a_low) / 2.0
+        b_half = (b_high - b_low) / 2.0
+        signal_floor = evidence.convergence.payload.get("numerical_floor") if evidence.convergence is not None else None
         if signal_floor is None:
             raise G23Blocked("signal_eligible:numerical_floor_missing")
         floor = _finite(signal_floor, "numerical_floor")
-        signal_mask = np.abs(flat_latest) > np.maximum(5.0 * 1.96 * np.sqrt(np.maximum(0.0, _flat(bias_variance))), 10.0 * floor)
+        reference_half_width = (bias_high - bias_low) / 2.0
+        signal_mask = np.abs(flat_latest) > np.maximum(5.0 * reference_half_width, 10.0 * floor)
         if not np.any(signal_mask):
             raise G23Blocked("signal_eligible:EMPTY")
         metrics: dict[str, object] = {
@@ -727,38 +1378,71 @@ def _evaluate_cell(evidence: _CellEvidence) -> dict[str, object]:
             "topk_overlap_0_05": _top_overlap(flat_prev, flat_latest, 0.05),
             "layer_module_delta": max(layer_delta, module_delta),
             "h_ref": h_ref,
+            "layer_l1_bootstrap_q95": layer_l1_q95,
+            "module_l1_bootstrap_q95": module_l1_q95,
             "min_delta_sci": min_delta,
             "epsilon_num": epsilon_num,
             "a_b_spearman": _spearman(a_rank, b_rank),
+            "a_b_top_overlap_0_001": _top_overlap(a_rank, b_rank, 0.001),
             "a_b_top_overlap_0_01": _top_overlap(a_rank, b_rank, 0.01),
-            "bias_cross_interval_max_z": float(np.max(np.abs(cross_diff) / np.maximum(cross_sd, 1e-300))),
+            "a_b_top_overlap_0_05": _top_overlap(a_rank, b_rank, 0.05),
+            "bias_cross_interval_max_z": float(
+                np.max(
+                    np.abs(_flat(cross) - _flat(bias))
+                    / np.maximum((bias_high - bias_low + cross_high - cross_low) / 2.0, 1e-300)
+                )
+            ),
+            "a_square_interval_halfwidth_max": float(np.max(a_half)),
+            "b_square_interval_halfwidth_max": float(np.max(b_half)),
             "ranking_bias_direction_sum": float(np.sum(_flat(ranking) - _flat(bias))),
             "sizing_min_delta_sci": min_delta,
             "sizing_node_previous": int(counts[0]),
             "sizing_node_latest": int(counts[1]),
         }
         checks: dict[str, bool] = {
-            "normalized_l1": metrics["normalized_l1"] <= 0.02,
-            "pearson": metrics["pearson"] >= 0.995,
-            "signal_eligible_spearman": metrics["signal_eligible_spearman"] >= 0.995,
-            "layer_module_spearman": metrics["layer_module_spearman"] >= 0.995,
-            "topk_overlap_0_001": metrics["topk_overlap_0_001"] >= 0.98,
-            "topk_overlap_0_01": metrics["topk_overlap_0_01"] >= 0.98,
-            "topk_overlap_0_05": metrics["topk_overlap_0_05"] >= 0.98,
-            "layer_module_delta": metrics["layer_module_delta"] <= 0.01,
-            "h_ref": metrics["h_ref"] <= min_delta / 4.0,
-            "epsilon_num": metrics["epsilon_num"] <= min_delta / 10.0,
-            "a_b_spearman": metrics["a_b_spearman"] >= 0.995,
-            "a_b_top_overlap": metrics["a_b_top_overlap_0_01"] >= 0.98,
-            "bias_cross_interval_covered": bool(np.all(np.abs(cross_diff) <= 1.96 * np.maximum(cross_sd, 0.0))),
+            "normalized_l1": metrics["normalized_l1"] <= THRESHOLDS["normalized_l1"],
+            "pearson": metrics["pearson"] >= THRESHOLDS["pearson"],
+            "signal_eligible_spearman": metrics["signal_eligible_spearman"] >= THRESHOLDS["signal_eligible_spearman"],
+            "layer_module_spearman": metrics["layer_module_spearman"] >= THRESHOLDS["layer_module_spearman"],
+            "topk_overlap_0_001": metrics["topk_overlap_0_001"] >= THRESHOLDS["topk_overlap"],
+            "topk_overlap_0_01": metrics["topk_overlap_0_01"] >= THRESHOLDS["topk_overlap"],
+            "topk_overlap_0_05": metrics["topk_overlap_0_05"] >= THRESHOLDS["topk_overlap"],
+            "layer_module_delta": metrics["layer_module_delta"] <= THRESHOLDS["layer_module_delta"],
+            "layer_l1_bootstrap_q95": metrics["layer_l1_bootstrap_q95"] <= THRESHOLDS["layer_module_l1_q95"],
+            "module_l1_bootstrap_q95": metrics["module_l1_bootstrap_q95"] <= THRESHOLDS["layer_module_l1_q95"],
+            "h_ref": metrics["h_ref"] <= min_delta / THRESHOLDS["h_ref_divisor"],
+            "epsilon_num": metrics["epsilon_num"] <= min_delta / THRESHOLDS["epsilon_num_divisor"],
+            "a_b_spearman": metrics["a_b_spearman"] >= THRESHOLDS["pearson"],
+            "a_b_top_overlap_0_001": metrics["a_b_top_overlap_0_001"] >= THRESHOLDS["topk_overlap"],
+            "a_b_top_overlap_0_01": metrics["a_b_top_overlap_0_01"] >= THRESHOLDS["topk_overlap"],
+            "a_b_top_overlap_0_05": metrics["a_b_top_overlap_0_05"] >= THRESHOLDS["topk_overlap"],
+            "bias_cross_interval_covered": bool(
+                np.all(np.abs(_flat(cross) - _flat(bias)) <= (bias_high - bias_low + cross_high - cross_low) / 2.0)
+            ),
             "ranking_bias_direction": metrics["ranking_bias_direction_sum"] >= 0.0,
             "variance_scaling_verified": _sequence_scaling(evidence, blocks_a + blocks_b, block_size),
             "state_replay_verified": _state_replay_verified(evidence),
         }
         one_shot = evidence.convergence.payload.get("one_shot_result") if evidence.convergence else None
         plan_one_shot = evidence.convergence.payload.get("one_shot_plan") if evidence.convergence else None
-        checks["one_shot_complete"] = isinstance(one_shot, Mapping) and one_shot.get("status") == "COMPLETE" and one_shot.get("one_shot") is True and isinstance(plan_one_shot, Mapping) and plan_one_shot.get("one_shot") is True and int(one_shot.get("processed_sample_count_per_stream", 0)) == int(plan_one_shot.get("sample_count_per_stream", -1)) and len(blocks_a) * block_size == int(one_shot.get("processed_sample_count_per_stream", -1))
-        checks["a_b_interval_covered"] = bool(np.all(np.abs(_flat(a_mean) - _flat(b_mean)) <= 1.96 * np.sqrt(np.maximum(0.0, _flat(bias_variance)))))
+        checks["one_shot_complete"] = (
+            isinstance(one_shot, Mapping)
+            and one_shot.get("status") == "COMPLETE"
+            and one_shot.get("one_shot") is True
+            and isinstance(plan_one_shot, Mapping)
+            and plan_one_shot.get("one_shot") is True
+            and plan_one_shot.get("sizing_stream") == "reference_sizing"
+            and plan_one_shot.get("stream_a") == "reference_A"
+            and plan_one_shot.get("stream_b") == "reference_B"
+            and int(one_shot.get("processed_sample_count_per_stream", 0)) == int(plan_one_shot.get("sample_count_per_stream", -1))
+            and len(blocks_a) * block_size == int(one_shot.get("processed_sample_count_per_stream", -1))
+        )
+        checks["a_b_interval_covered"] = bool(np.all(np.abs(a_rank - b_rank) <= a_half + b_half))
+        checks["a_b_top_overlap"] = bool(
+            checks["a_b_top_overlap_0_001"]
+            and checks["a_b_top_overlap_0_01"]
+            and checks["a_b_top_overlap_0_05"]
+        )
         # Keep the machine-facing booleans inside the calculated metrics map as
         # well as in ``checks``.  The formal launcher can therefore bind and
         # consume this artifact without accepting a second caller-authored
@@ -774,7 +1458,39 @@ def _evaluate_cell(evidence: _CellEvidence) -> dict[str, object]:
             "one_shot_complete": checks["one_shot_complete"],
         })
         reasons = [name + ":THRESHOLD_FAILED" for name, passed in checks.items() if not passed]
-        cell.update({"status": "PASS" if not reasons else "BLOCKED", "metrics": metrics, "checks": checks, "reasons": reasons, "endpoints": {"model_total": {"metrics": metrics, "checks": checks}}})
+        cell.update({
+            "status": "PASS" if not reasons else "BLOCKED",
+            "metrics": metrics,
+            "checks": checks,
+            "reasons": reasons,
+            "endpoints": {
+                "model_total": {"metrics": metrics, "checks": checks},
+                "layer": {
+                    "metrics": {
+                        "spearman": layer_spearman,
+                        "total_delta": layer_delta,
+                        "l1_bootstrap_q95": layer_l1_q95,
+                    },
+                    "checks": {
+                        "spearman": checks["layer_module_spearman"],
+                        "total_per_param_delta": checks["layer_module_delta"],
+                        "l1_bootstrap_q95": checks["layer_l1_bootstrap_q95"],
+                    },
+                },
+                "module": {
+                    "metrics": {
+                        "spearman": module_spearman,
+                        "total_delta": module_delta,
+                        "l1_bootstrap_q95": module_l1_q95,
+                    },
+                    "checks": {
+                        "spearman": checks["layer_module_spearman"],
+                        "total_per_param_delta": checks["layer_module_delta"],
+                        "l1_bootstrap_q95": checks["module_l1_bootstrap_q95"],
+                    },
+                },
+            },
+        })
     except G23Blocked as error:
         cell["reasons"] = list(cell.get("reasons", [])) + [str(error)]
     except (KeyError, TypeError, ValueError, OverflowError, FloatingPointError) as error:
@@ -825,21 +1541,38 @@ def evaluate_formal_g23(
         else:
             normalized_items.append(CellInput.from_mapping(item))
     normalized = tuple(normalized_items)
-    inferred = tuple(item.cell_id for item in normalized)
-    expected = tuple(expected_cell_ids or inferred)
-    if len(expected) != REQUIRED_CELL_COUNT or len(set(expected)) != REQUIRED_CELL_COUNT:
-        expected = tuple(f"cell-{index}" for index in range(REQUIRED_CELL_COUNT))
+    # The six-cell set is a S2.3 contract, not a caller-controlled argument.
+    # ``expected_cell_ids`` remains accepted for source compatibility only;
+    # its values never influence the formal decision.
+    expected = EXPECTED_CELL_IDS
     prepared: list[_CellEvidence] = []
     structure_reason: str | None = None
     if len(normalized) == REQUIRED_CELL_COUNT and len(set(item.cell_id for item in normalized)) == REQUIRED_CELL_COUNT:
         prepared = [_prepare_cell(root, item) for item in normalized]
     elif normalized:
         structure_reason = "DUPLICATE_OR_INVALID_CELL_IDENTITIES"
+    if prepared:
+        derived_ids = [item.identities.get("cell_id", "") for item in prepared]
+        if tuple(sorted(derived_ids, key=lambda value: EXPECTED_CELL_IDS.index(value) if value in EXPECTED_CELL_IDS else 99)) != EXPECTED_CELL_IDS:
+            structure_reason = "SIX_CELL_MANIFEST_DERIVATION_MISMATCH"
+        for identity_name in (
+            "result_hash",
+            "config_hash",
+            "checkpoint_hash",
+            "one_shot_result_hash",
+            "stream_a_draw_hash",
+            "stream_b_draw_hash",
+            "bundle_manifest_hash",
+        ):
+            values = [item.identities.get(identity_name, "") for item in prepared]
+            if len(values) != len(set(values)) or "" in values:
+                structure_reason = f"DUPLICATE_{identity_name.upper()}_IDENTITY"
+        manifest_hashes = {item.identities.get("six_cell_manifest_hash", "") for item in prepared}
+        if len(manifest_hashes) != 1 or "" in manifest_hashes:
+            structure_reason = "SIX_CELL_MANIFEST_NOT_COMMON"
     cell_rows = [_evaluate_cell(item) for item in prepared]
-    source_hashes: dict[str, str] = {}
     producer_values: set[str] = set()
     for item in prepared:
-        source_hashes[item.source.cell_id] = item.identities.get("result_hash", "")
         if "producer_commit" in item.identities:
             producer_values.add(item.identities["producer_commit"])
     if len(producer_values) == 1:
@@ -879,10 +1612,7 @@ def evaluate_formal_g23(
         if not target.exists():
             write_canonical_json(target, payload)
         index = out / "g2.3-attempts.jsonl"
-        line = str(payload["artifact_hash"]) + "\n"
-        if not index.exists() or line not in index.read_text(encoding="utf-8").splitlines(keepends=True):
-            with index.open("a", encoding="utf-8") as handle:
-                handle.write(line)
+        _append_attempt_index(index, str(payload["artifact_hash"]))
     return payload
 
 
