@@ -1,0 +1,40 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://parameter-importance.invalid/schemas/shared/stage2-formal-authorization-amendment-v1.json",
+  "title": "Stage 2 formal reproducible-artifact authorization amendment",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version", "amendment_id", "amends", "issued_at", "expires_at",
+    "timezone", "authorization_kind", "user_authorization_original",
+    "scope", "single_copy_accepted", "excluded_pci_bus_ids",
+    "excluded_non_reproducible_evidence", "stage2_exit_condition", "status",
+    "artifact_hash"
+  ],
+  "properties": {
+    "schema_version": {"const": "stage2-formal-authorization-amendment-v1"},
+    "amendment_id": {"type": "string", "pattern": "^stage2-s2\\.2-authorization-20260823$"},
+    "amends": {"type": "string", "const": "reports/stage0/g1-persistence-decision-20260719.json"},
+    "issued_at": {"type": "string", "format": "date-time"},
+    "expires_at": {"type": "string", "format": "date-time"},
+    "timezone": {"type": "string", "const": "Asia/Shanghai"},
+    "authorization_kind": {"type": "string", "const": "user_explicit_stage2_amendment"},
+    "user_authorization_original": {"type": "string", "minLength": 1},
+    "scope": {
+      "type": "array", "minItems": 1, "uniqueItems": true,
+      "items": {"enum": ["reproducible_stage0_artifacts", "reproducible_stage2_artifacts"]}
+    },
+    "single_copy_accepted": {"const": true},
+    "excluded_pci_bus_ids": {
+      "type": "array", "minItems": 1, "uniqueItems": true,
+      "items": {"type": "string", "pattern": "^[0-9A-Fa-f]{4}:[0-9A-Fa-f]{2}:[0-9A-Fa-f]{2}\\.[0-7]$"}
+    },
+    "excluded_non_reproducible_evidence": {
+      "type": "array", "minItems": 1, "uniqueItems": true,
+      "items": {"enum": ["manual_adjudications", "unique_paper_evidence", "non_reproducible_human_evidence"]}
+    },
+    "stage2_exit_condition": {"type": "string", "const": "Stage 2 exit"},
+    "status": {"type": "string", "const": "ACTIVE"},
+    "artifact_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+  }
+}
