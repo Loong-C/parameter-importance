@@ -100,12 +100,13 @@ REPOSITORY_SOURCE_PATHS: tuple[str, ...] = (
     PREREGISTRATION_SCHEMA_PATH,
     PLAN_PATH,
     MATHEMATICS_PATH,
+    STAGE1_REPORT_PATH,
 )
 
 # These are the source/contract bytes whose identity makes an older producer
-# commit compatible with the current evaluator.  The checked-in Stage 1
-# report is intentionally absent: it is a local fixture and is never a formal
-# authority for S2.1.
+# commit compatible with the current evaluator.  The checked-in Stage 1 report
+# is included only as a non-authoritative byte binding; it is never the formal
+# Stage1 authority for S2.1.
 PRODUCER_COMPATIBILITY_PATHS: tuple[str, ...] = (
     EVALUATOR_SOURCE_PATH,
     PREREGISTRATION_SOURCE_PATH,
@@ -115,6 +116,7 @@ PRODUCER_COMPATIBILITY_PATHS: tuple[str, ...] = (
     PREREGISTRATION_SCHEMA_PATH,
     PLAN_PATH,
     MATHEMATICS_PATH,
+    STAGE1_REPORT_PATH,
 )
 
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
@@ -133,6 +135,7 @@ EVALUATION_CONFIG: Mapping[str, JSONValue] = {
     "plan_path": PLAN_PATH,
     "frozen_plan_sha256": FROZEN_PLAN_SHA256,
     "mathematics_path": MATHEMATICS_PATH,
+    "non_authoritative_report_rule": "tracked_stage1_report_hash_only_never_stage1_authority",
     "stage1_provenance_rule": "formal_stage1_11_bridge_index_and_role_hashes_only",
     "runner_candidate_rule": "candidate_must_be_NOT_RUN_and_formal_eligible_false",
     "decision_rule": "PASS_only_after_rebuilt_preregistration_and_hypothesis_contract_match",
