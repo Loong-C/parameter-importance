@@ -25,8 +25,15 @@ from typing import Any
 
 import torch
 
+from ..assets import validate_asset_path
 from ..contracts.config_v2 import ResolvedConfigV2
-from ..contracts.jsonio import JSONValue, canonical_json_hash, load_canonical_json, write_canonical_json
+from ..contracts.jsonio import (
+    JSONValue,
+    canonical_json_hash,
+    load_canonical_json,
+    loads_strict_json,
+    write_canonical_json,
+)
 from ..core.registry import ParameterRegistry
 from ..providers import (
     FixedStateGradientProvider,
@@ -37,7 +44,12 @@ from ..providers import (
 )
 from ..runtime.training_factory import build_optimizer
 from ..data.pythia_mmap import PythiaIndexedDataset, PythiaShardDescriptor
-from .stage2_assets import AssetResolutionManifest, CheckpointRecord, validate_formal_asset_identity
+from .stage2_assets import (
+    AssetResolutionManifest,
+    CheckpointRecord,
+    DataRangeManifest,
+    validate_formal_asset_identity,
+)
 
 
 REGISTRY_MANIFEST_SCHEMA = "stage2-parameter-registry-manifest-v1"
@@ -87,10 +99,11 @@ def _sha256_file(path: Path) -> str:
 def _safe_logical(value: object, *, field: str) -> PurePosixPath:
     if not isinstance(value, str) or not value or "\\" in value:
         raise RegistryProducerError(f"S203_REGISTRY_PATH_INVALID:{field}")
-    path = PurePosixPath(value)
-    if path.is_absolute() or any(part in {"", ".", ".."} for part in path.parts):
-        raise RegistryProducerError(f"S203_REGISTRY_PATH_ESCAPE:{field}")
-    return path
+    try:
+        normalized = validate_asset_path(value)
+    except (TypeError, ValueError) as error:
+        raise RegistryProducerError(f"S203_REGISTRY_PATH_ESCAPE:{field}") from error
+    return PurePosixPath(normalized)
 
 
 def _link_like(path: Path) -> bool:
@@ -320,6 +333,104 @@ def _checkpoint_files(
     )
 
 
+def _data_range_files(
+    data_range: DataRangeManifest,
+    *,
+    data_root: Path,
+    data_asset_root: str | Path,
+    manifest_root: Path,
+) -> tuple[Path, Path]:
+    """Resolve the frozen data files under the qualified data-asset root.
+
+    Stage 2 ``DataFile.path`` values are manifest-relative paths, just like
+    ``ResolvedAsset.path_for`` in the formal G3 runtime.  They are *not*
+    relative to the storage root: the real server asset lives below
+    ``datasets/pile-deduped-pythia-preshuffled``.  The range manifest itself is
+    still resolved against the evidence/manifest root and its hash is checked
+    before any data object is opened.
+    """
+
+    range_manifest = _safe_join(
+        manifest_root,
+        data_range.manifest_ref,
+        field="data_range.manifest_ref",
+    )
+    if _sha256_file(range_manifest) != data_range.manifest_sha256:
+        raise RegistryProducerError("S203_REGISTRY_DATA_MANIFEST_MISMATCH")
+    asset_root = _real_root(data_asset_root, field="data_asset_root")
+    try:
+        asset_root.relative_to(data_root)
+    except ValueError as error:
+        raise RegistryProducerError("S203_REGISTRY_DATA_ASSET_ROOT_OUTSIDE_DATA_ROOT") from error
+    descriptors = {item.path: item for item in data_range.files}
+    try:
+        index_descriptor = descriptors["document.idx"]
+        shard_descriptor = descriptors["document-00000-of-00020.bin"]
+    except KeyError as error:
+        raise RegistryProducerError("S203_REGISTRY_DATA_ALLOWLIST_INVALID") from error
+
+    try:
+        raw_manifest = loads_strict_json(range_manifest.read_bytes(), allow_bom=True)
+    except (OSError, TypeError, ValueError) as error:
+        raise RegistryProducerError("S203_REGISTRY_DATA_MANIFEST_INVALID") from error
+    if not isinstance(raw_manifest, Mapping):
+        raise RegistryProducerError("S203_REGISTRY_DATA_MANIFEST_INVALID")
+
+    def _manifest_path(field: str, expected: str) -> None:
+        raw_path = raw_manifest.get(field)
+        if not isinstance(raw_path, str) or not raw_path:
+            raise RegistryProducerError(f"S203_REGISTRY_DATA_MANIFEST_FIELD_INVALID:{field}")
+        if "\\" in raw_path or any(part in {"", ".", ".."} for part in PurePosixPath(raw_path).parts):
+            raise RegistryProducerError(f"S203_REGISTRY_DATA_MANIFEST_PATH_INVALID:{field}")
+        candidate = Path(raw_path)
+        if candidate.is_absolute():
+            try:
+                resolved = candidate.resolve(strict=True)
+                resolved.relative_to(asset_root)
+            except (FileNotFoundError, ValueError) as error:
+                raise RegistryProducerError(f"S203_REGISTRY_DATA_MANIFEST_PATH_ESCAPE:{field}") from error
+            if _link_like(candidate) or resolved.relative_to(asset_root).as_posix() != expected:
+                raise RegistryProducerError(f"S203_REGISTRY_DATA_MANIFEST_PATH_DRIFT:{field}")
+        else:
+            try:
+                if _safe_logical(raw_path, field=f"data_range.manifest.{field}").as_posix() != expected:
+                    raise RegistryProducerError(f"S203_REGISTRY_DATA_MANIFEST_PATH_DRIFT:{field}")
+            except RegistryProducerError:
+                raise
+        return None
+
+    _manifest_path("idx", index_descriptor.path)
+    _manifest_path("bin", shard_descriptor.path)
+    if raw_manifest.get("idx_sha256") != index_descriptor.sha256:
+        raise RegistryProducerError("S203_REGISTRY_DATA_MANIFEST_INDEX_DRIFT")
+    if raw_manifest.get("bin_sha256") != shard_descriptor.sha256:
+        raise RegistryProducerError("S203_REGISTRY_DATA_MANIFEST_SHARD_DRIFT")
+    if raw_manifest.get("bin_size") != shard_descriptor.size_bytes:
+        raise RegistryProducerError("S203_REGISTRY_DATA_MANIFEST_SHARD_SIZE_DRIFT")
+
+    index_path = _safe_join(
+        asset_root,
+        index_descriptor.path,
+        field="data_range.document.idx",
+    )
+    shard_path = _safe_join(
+        asset_root,
+        shard_descriptor.path,
+        field="data_range.document-00000-of-00020.bin",
+    )
+    if (
+        index_path.stat().st_size != index_descriptor.size_bytes
+        or _sha256_file(index_path) != index_descriptor.sha256
+    ):
+        raise RegistryProducerError("S203_REGISTRY_DATA_INDEX_MISMATCH")
+    if (
+        shard_path.stat().st_size != shard_descriptor.size_bytes
+        or _sha256_file(shard_path) != shard_descriptor.sha256
+    ):
+        raise RegistryProducerError("S203_REGISTRY_DATA_SHARD_MISMATCH")
+    return index_path, shard_path
+
+
 def _registry_manifest(
     *,
     checkpoint: CheckpointRecord,
@@ -372,6 +483,7 @@ def produce_registry_manifests(
     asset_resolution: AssetResolutionManifest | Mapping[str, Any],
     *,
     data_root: str | Path,
+    data_asset_root: str | Path | None = None,
     manifest_root: str | Path,
     output_root: str | Path,
     resolved_config: Mapping[str, Any] | ResolvedConfigV2,
@@ -420,15 +532,17 @@ def produce_registry_manifests(
         # and reuse it for all six sequential model loads.  No cursor/draw is
         # touched by registry production.
         data = assets.data_range
+        if data_asset_root is None:
+            raise RegistryProducerError("S203_REGISTRY_DATA_ASSET_ROOT_REQUIRED")
         data_descriptors = {item.path: item for item in data.files}
         index_descriptor = data_descriptors["document.idx"]
         shard_descriptor = data_descriptors["document-00000-of-00020.bin"]
-        index_path = _safe_join(data_root_path, index_descriptor.path, field="data_range.document.idx")
-        shard_path = _safe_join(data_root_path, shard_descriptor.path, field="data_range.document-00000-of-00020.bin")
-        if index_path.stat().st_size != index_descriptor.size_bytes or _sha256_file(index_path) != index_descriptor.sha256:
-            raise RegistryProducerError("S203_REGISTRY_DATA_INDEX_MISMATCH")
-        if shard_path.stat().st_size != shard_descriptor.size_bytes or _sha256_file(shard_path) != shard_descriptor.sha256:
-            raise RegistryProducerError("S203_REGISTRY_DATA_SHARD_MISMATCH")
+        index_path, shard_path = _data_range_files(
+            data,
+            data_root=data_root_path,
+            data_asset_root=data_asset_root,
+            manifest_root=manifest_root_path,
+        )
         if task_type != "causal_lm":
             raise RegistryProducerError("S203_REGISTRY_DEFAULT_RESOLVER_ONLY_SUPPORTS_CAUSAL_LM")
         try:
@@ -544,6 +658,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--asset-resolution", required=True, type=Path)
     parser.add_argument("--resolved-config", required=True, type=Path)
     parser.add_argument("--data-root", required=True, type=Path)
+    parser.add_argument("--data-asset-root", required=True, type=Path)
     parser.add_argument("--manifest-root", type=Path)
     parser.add_argument("--output-root", required=True, type=Path)
     parser.add_argument("--source-root", type=Path)
@@ -560,6 +675,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     result = produce_registry_manifests(
         asset,
         data_root=args.data_root,
+        data_asset_root=args.data_asset_root,
         manifest_root=args.manifest_root or args.data_root,
         output_root=args.output_root,
         resolved_config=resolved,

@@ -15,6 +15,8 @@ from param_importance_nlp.experiments.stage2_assets import (
 )
 from param_importance_nlp.experiments.stage2_registry_producer import (
     RegistryProducerError,
+    _data_range_files,
+    _safe_join,
     construct_registry_provider,
     produce_registry_manifests,
 )
@@ -23,6 +25,69 @@ from param_importance_nlp.providers import InMemoryFrozenSampleResolver, build_t
 
 def _sha(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def test_real_shape_data_manifest_resolves_qualified_root_and_closes_traversal() -> None:
+    tmp_path = Path(__file__).resolve().parent / ".tmp-s203-data-path"
+    shutil.rmtree(tmp_path, ignore_errors=True)
+    tmp_path.mkdir(parents=True)
+    try:
+        data_root = tmp_path / "storage"
+        asset_root = data_root / "datasets" / "pile-deduped-pythia-preshuffled"
+        asset_root.mkdir(parents=True)
+        index = asset_root / "document.idx"
+        shard = asset_root / "document-00000-of-00020.bin"
+        index.write_bytes(b"index-fixture")
+        shard.write_bytes(b"shard-fixture")
+        range_manifest = tmp_path / "manifests" / "prefix_coverage.json"
+        range_manifest.parent.mkdir(parents=True)
+        range_manifest.write_text(
+            json.dumps(
+                {
+                    "idx": index.resolve().as_posix(),
+                    "bin": shard.resolve().as_posix(),
+                    "idx_sha256": _sha(index),
+                    "bin_sha256": _sha(shard),
+                    "bin_size": shard.stat().st_size,
+                },
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        data_range = build_data_range_from_prefix(
+            dataset_id="fixture-data",
+            revision="b" * 40,
+            manifest_ref="manifests/prefix_coverage.json",
+            manifest_sha256=_sha(range_manifest),
+            shard_sha256=_sha(shard),
+            shard_size_bytes=shard.stat().st_size,
+            index_sha256=_sha(index),
+            index_size_bytes=index.stat().st_size,
+        )
+
+        resolved_index, resolved_shard = _data_range_files(
+            data_range,
+            data_root=data_root,
+            data_asset_root=asset_root,
+            manifest_root=tmp_path,
+        )
+        assert resolved_index == index.resolve()
+        assert resolved_shard == shard.resolve()
+
+        with pytest.raises(RegistryProducerError, match="PATH_ESCAPE"):
+            _safe_join(asset_root, "../document.idx", field="fixture.traversal")
+
+        range_manifest.write_text("{\"idx\": \"tampered\"}\n", encoding="utf-8")
+        with pytest.raises(RegistryProducerError, match="DATA_MANIFEST_MISMATCH"):
+            _data_range_files(
+                data_range,
+                data_root=data_root,
+                data_asset_root=asset_root,
+                manifest_root=tmp_path,
+            )
+    finally:
+        shutil.rmtree(tmp_path, ignore_errors=True)
 
 
 def test_tiny_real_model_registry_is_idempotent_and_tamper_closed() -> None:
