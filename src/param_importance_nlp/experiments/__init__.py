@@ -122,6 +122,13 @@ from .stage2_formal import (
     Stage2RecommendationEngine,
     StreamingReferenceSizer,
 )
+from .stage2_g23_evaluator import (
+    CellInput,
+    G23Blocked,
+    G23ReferenceEvaluator,
+    evaluate_formal_g23,
+    evaluate_g23,
+)
 from .preregistration import (
     build_stage2_amendment_template,
     build_stage2_hypothesis_contract,
@@ -371,6 +378,11 @@ __all__ = [
     "RecoverablePairedWaveRunner",
     "SafeTensorTreeCodec",
     "StreamingReferenceSizer",
+    "CellInput",
+    "G23Blocked",
+    "G23ReferenceEvaluator",
+    "evaluate_formal_g23",
+    "evaluate_g23",
     "build_stage2_amendment_template",
     "build_stage2_hypothesis_contract",
     "build_stage2_preregistration",
