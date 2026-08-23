@@ -71,6 +71,7 @@ _COST_SEMANTICS = (
     "isolated_estimator_cost",
     "online_training_incremental_cost",
 )
+_REFERENCE_VIEW_NAMES = ("bias", "cross", "ranking")
 
 _FORMAL_PLAN_TASK_CONTRACT = {
     "stage2.05_paired_estimator_runner": (
@@ -2166,6 +2167,11 @@ class _WaveUnitStore:
                 "gradient_evaluations": state.get("gradient_evaluations"),
                 "sample_collision_count": state.get("sample_collision_count"),
                 "m2_double_max_abs_error": state.get("m2_double_max_abs_error"),
+                "reference_metrics": state.get("reference_metrics"),
+                "microbatch_diagnostics": state.get("microbatch_diagnostics"),
+                "state_digest_after": state.get("state_digest_after"),
+                "rng_state_before_digest": state.get("rng_state_before_digest"),
+                "rng_state_after_digest": state.get("rng_state_after_digest"),
             }
         )
 
@@ -2182,6 +2188,7 @@ class _WaveUnitStore:
         commit: dict[str, object] = {
             "schema_version": "stage2-wave-unit-commit-v1",
             "unit_id": unit_id,
+            "attempt_id": str(state["attempt_id"]),
             "input_hash": state["input_hash"],
             "scientific_digest": digest,
             "object_ref": f"objects/{digest}",
@@ -2214,11 +2221,13 @@ class _WaveUnitStore:
             if not isinstance(state, Mapping):
                 raise ValueError("WAVE_STATE_NOT_OBJECT")
             required_state = {
-                "schema_version", "unit_id", "input_hash", "registry_hash",
+                "schema_version", "unit_id", "attempt_id", "input_hash", "registry_hash",
                 "state_digest", "vectors", "metrics", "gradient_evaluations",
                 "gradient_seconds", "formula_seconds", "wall_seconds", "sample_budget",
                 "statistical_weight", "sample_collision_count",
                 "m2_double_max_abs_error", "peak_memory_bytes", "weighting_assumptions",
+                "reference_metrics", "microbatch_diagnostics", "state_digest_after",
+                "rng_state_before_digest", "rng_state_after_digest",
             }
             if set(state) != required_state or state.get(
                 "schema_version"
@@ -2226,6 +2235,10 @@ class _WaveUnitStore:
                 raise ValueError("WAVE_STATE_FIELDS_MISMATCH")
             if str(state.get("unit_id")) != str(commit.get("unit_id")):
                 raise ValueError("WAVE_UNIT_ID_MISMATCH")
+            if not isinstance(state.get("attempt_id"), str) or not state["attempt_id"]:
+                raise ValueError("WAVE_ATTEMPT_ID_INVALID")
+            if state.get("attempt_id") != commit.get("attempt_id"):
+                raise ValueError("WAVE_ATTEMPT_ID_MISMATCH")
             metrics = state.get("metrics")
             if not isinstance(metrics, Mapping):
                 raise ValueError("WAVE_STATE_METRICS_NOT_MAPPING")
@@ -2250,16 +2263,72 @@ class _WaveUnitStore:
         }
 
 
+def _normalize_reference_views(
+    reference: Mapping[str, object],
+    references: Mapping[str, Mapping[str, object]] | None = None,
+) -> dict[str, Mapping[str, object]]:
+    """Normalize the three G2.3 views while retaining the legacy fixture API."""
+
+    if references is None:
+        return {name: reference for name in _REFERENCE_VIEW_NAMES}
+    if set(references) != set(_REFERENCE_VIEW_NAMES):
+        raise ValueError("WAVE_REFERENCE_VIEWS_INCOMPLETE")
+    result = {name: references[name] for name in _REFERENCE_VIEW_NAMES}
+    for name, value in result.items():
+        _as_vector(value, field_name=f"reference.{name}")
+    return result
+
+
+def _ranking_metrics(observed: np.ndarray, expected: np.ndarray) -> dict[str, float | int]:
+    """Deterministic magnitude ranking metrics with an explicit top-k definition."""
+
+    if observed.size != expected.size or observed.size == 0:
+        raise ValueError("WAVE_RANKING_VECTOR_SIZE_INVALID")
+    observed_order = np.argsort(-np.abs(observed), kind="mergesort")
+    expected_order = np.argsort(-np.abs(expected), kind="mergesort")
+    observed_rank = np.empty(observed.size, dtype=np.float64)
+    expected_rank = np.empty(expected.size, dtype=np.float64)
+    observed_rank[observed_order] = np.arange(observed.size, dtype=np.float64)
+    expected_rank[expected_order] = np.arange(expected.size, dtype=np.float64)
+    if observed.size < 2 or np.std(observed_rank) == 0 or np.std(expected_rank) == 0:
+        spearman = 0.0
+    else:
+        spearman = float(np.corrcoef(observed_rank, expected_rank)[0, 1])
+    top_k = max(1, int(math.ceil(observed.size * 0.1)))
+    top_k = min(top_k, observed.size)
+    overlap = len(set(observed_order[:top_k]).intersection(expected_order[:top_k])) / top_k
+    return {
+        "spearman": spearman,
+        "top_k": top_k,
+        "top_k_overlap": float(overlap),
+    }
+
+
 def _unit_metrics(
     vectors: Mapping[str, Mapping[str, object]],
     reference: Mapping[str, object],
-) -> dict[str, dict[str, float | int]]:
-    expected = _flatten(reference)
-    metrics: dict[str, dict[str, float | int]] = {}
+    references: Mapping[str, Mapping[str, object]] | None = None,
+) -> dict[str, dict[str, object]]:
+    views = _normalize_reference_views(reference, references)
+    expected = _flatten(views["bias"])
+    metrics: dict[str, dict[str, object]] = {}
     for method, vector in sorted(vectors.items()):
-        _assert_compatible(vector, reference, field_name=f"wave.{method}")
+        _assert_compatible(vector, views["bias"], field_name=f"wave.{method}")
         observed = _flatten(vector)
         error = observed - expected
+        reference_metrics: dict[str, dict[str, float | int]] = {}
+        for view_name, view in views.items():
+            view_expected = _flatten(view)
+            _assert_compatible(vector, view, field_name=f"wave.{method}.{view_name}")
+            view_error = observed - view_expected
+            values: dict[str, float | int] = {
+                "signed_error_sum": float(view_error.sum()),
+                "absolute_error_sum": float(np.abs(view_error).sum()),
+                "squared_error_sum": float(np.square(view_error).sum()),
+            }
+            if view_name == "ranking":
+                values.update(_ranking_metrics(observed, view_expected))
+            reference_metrics[view_name] = values
         metrics[method] = {
             "coordinate_count": int(observed.size),
             "signed_error_sum": float(error.sum()),
@@ -2270,13 +2339,23 @@ def _unit_metrics(
             "negative_count": int(np.count_nonzero(observed < 0)),
             "positive_mass": float(observed[observed > 0].sum(initial=0.0)),
             "negative_mass": float((-observed[observed < 0]).sum(initial=0.0)),
+            "reference_metrics": reference_metrics,
         }
     return metrics
 
 
 def _aggregate_wave(
-    states: Sequence[Mapping[str, object]], reference: Mapping[str, object]
-) -> tuple[dict[str, dict[str, float | int]], dict[str, dict[str, object]]]:
+    states: Sequence[Mapping[str, object]],
+    reference: Mapping[str, object],
+    references: Mapping[str, Mapping[str, object]] | None = None,
+) -> tuple[
+    dict[str, dict[str, float | int]],
+    dict[str, dict[str, dict[str, float | int]]],
+    dict[str, dict[str, object]],
+    list[dict[str, object]],
+    dict[str, object],
+]:
+    views = _normalize_reference_views(reference, references)
     by_method: dict[str, list[np.ndarray]] = {}
     gradient_evaluations = 0
     formula_seconds = 0.0
@@ -2299,7 +2378,7 @@ def _aggregate_wave(
             peak_memory_values.append(int(state["peak_memory_bytes"]))
         sample_budget += int(state["sample_budget"])
         statistical_weight += float(state["statistical_weight"])
-    expected = _flatten(reference)
+    expected = _flatten(views["bias"])
     summaries: dict[str, dict[str, float | int]] = {}
     for method, values in sorted(by_method.items()):
         matrix = np.stack(values, axis=0)
@@ -2353,7 +2432,83 @@ def _aggregate_wave(
             "reason": "online_training_adapter_not_run",
         },
     }
-    return summaries, costs
+    reference_summaries: dict[str, dict[str, dict[str, float | int]]] = {}
+    for view_name, view in views.items():
+        view_expected = _flatten(view)
+        view_bucket: dict[str, dict[str, float | int]] = {}
+        for method, values in sorted(by_method.items()):
+            matrix = np.stack(values, axis=0)
+            mean = matrix.mean(axis=0)
+            error = matrix - view_expected[None, :]
+            variance = np.zeros_like(mean) if matrix.shape[0] < 2 else matrix.var(axis=0, ddof=1)
+            metrics: dict[str, float | int] = {
+                "repetitions": int(matrix.shape[0]),
+                "coordinate_count": int(matrix.shape[1]),
+                "bias": float((mean - view_expected).mean()),
+                "absolute_bias": float(np.abs(mean - view_expected).mean()),
+                "variance": float(variance.mean()),
+                "mse": float(np.square(error).mean()),
+                "mae": float(np.abs(error).mean()),
+            }
+            if view_name == "ranking":
+                metrics.update(_ranking_metrics(mean, view_expected))
+            view_bucket[method] = metrics
+        reference_summaries[view_name] = view_bucket
+
+    diagnostics: list[dict[str, object]] = []
+    for state in sorted(states, key=lambda value: str(value["unit_id"])):
+        raw = state.get("microbatch_diagnostics")
+        if not isinstance(raw, (list, tuple)):
+            raise ValueError("WAVE_MICROBATCH_DIAGNOSTICS_NOT_LIST")
+        for item in raw:
+            if not isinstance(item, Mapping):
+                raise ValueError("WAVE_MICROBATCH_DIAGNOSTIC_NOT_OBJECT")
+            diagnostics.append({"unit_id": str(state["unit_id"]), **dict(item)})
+    unit_ids = [str(state["unit_id"]) for state in sorted(states, key=lambda value: str(value["unit_id"]))]
+    replay = {
+        "schema_version": "stage2-paired-replay-evidence-v1",
+        "attempt_bound": True,
+        "idempotent_reducer": True,
+        "reducer_order": unit_ids,
+        "input_hashes": {
+            str(state["unit_id"]): str(state["input_hash"])
+            for state in sorted(states, key=lambda value: str(value["unit_id"]))
+        },
+        "state_transitions": {
+            str(state["unit_id"]): {
+                "before": str(state["state_digest"]),
+                "after": str(state["state_digest_after"]),
+                "rng_before": state["rng_state_before_digest"],
+                "rng_after": state["rng_state_after_digest"],
+            }
+            for state in sorted(states, key=lambda value: str(value["unit_id"]))
+        },
+    }
+    return summaries, reference_summaries, costs, diagnostics, replay
+
+
+def _provider_rng_digest(provider: object) -> str | None:
+    """Read optional provider RNG evidence without inventing an RNG contract.
+
+    Production providers can expose ``rng_state_digest`` (or ``rng_digest``).
+    Providers that deliberately have no mutable RNG return ``None`` and the
+    replay evidence records that absence explicitly.
+    """
+
+    for name in ("rng_state_digest", "rng_digest"):
+        value = getattr(provider, name, None)
+        if value is None:
+            continue
+        try:
+            value = value() if callable(value) else value
+        except Exception:
+            return None
+        if value is None:
+            return None
+        if isinstance(value, str) and re.fullmatch(r"[0-9a-f]{64}", value):
+            return value
+        return canonical_json_hash(value)
+    return None
 
 
 @dataclass(frozen=True, slots=True)
@@ -2368,12 +2523,22 @@ class PairedWaveSummary:
     scope: str
     resumed_unit_count: int
     weighting_assumptions: Mapping[str, object]
+    reference_hashes: Mapping[str, str]
+    reference_statistics: Mapping[str, Mapping[str, Mapping[str, float | int]]]
+    microbatch_diagnostics: tuple[Mapping[str, object], ...]
+    replay_evidence: Mapping[str, object]
     schema_version: str = "stage2-paired-wave-summary-v1"
 
     def __post_init__(self) -> None:
         _require_identifier(self.wave_id, field_name="wave_id")
         _require_sha256(self.registry_hash, field_name="registry_hash")
         _require_sha256(self.reference_hash, field_name="reference_hash")
+        if set(self.reference_hashes) != set(_REFERENCE_VIEW_NAMES):
+            raise ValueError("reference_hashes 必须完整包含 bias/cross/ranking")
+        for name, digest in self.reference_hashes.items():
+            _require_sha256(digest, field_name=f"reference_hashes.{name}")
+        if self.reference_hashes["bias"] != self.reference_hash:
+            raise ValueError("reference_hash 必须等于 bias reference hash")
         if len(set(self.expected_unit_ids)) != len(self.expected_unit_ids):
             raise ValueError("expected_unit_ids 不能重复")
         if not set(self.completed_unit_ids).issubset(self.expected_unit_ids):
@@ -2399,6 +2564,12 @@ class PairedWaveSummary:
                 field="PairedWaveSummary.weighting_assumptions",
             ),
         )
+        object.__setattr__(self, "reference_hashes", MappingProxyType(dict(self.reference_hashes)))
+        object.__setattr__(self, "reference_statistics", MappingProxyType({
+            str(name): MappingProxyType({str(method): MappingProxyType(dict(values)) for method, values in methods.items()})
+            for name, methods in self.reference_statistics.items()
+        }))
+        object.__setattr__(self, "replay_evidence", freeze_json_mapping(self.replay_evidence, field="PairedWaveSummary.replay_evidence"))
 
     @property
     def complete(self) -> bool:
@@ -2416,6 +2587,7 @@ class PairedWaveSummary:
             "wave_id": self.wave_id,
             "registry_hash": self.registry_hash,
             "reference_hash": self.reference_hash,
+            "reference_hashes": dict(self.reference_hashes),
             "expected_unit_ids": list(self.expected_unit_ids),
             "completed_unit_ids": list(self.completed_unit_ids),
             "complete": self.complete,
@@ -2423,6 +2595,12 @@ class PairedWaveSummary:
             "method_statistics": {
                 name: dict(values) for name, values in sorted(self.method_statistics.items())
             },
+            "reference_statistics": {
+                name: {method: dict(values) for method, values in methods.items()}
+                for name, methods in sorted(self.reference_statistics.items())
+            },
+            "microbatch_diagnostics": [dict(item) for item in self.microbatch_diagnostics],
+            "replay_evidence": thaw_json_value(self.replay_evidence),
             "cost_statistics": {
                 name: dict(values) for name, values in sorted(self.cost_statistics.items())
             },
@@ -2465,12 +2643,17 @@ class RecoverablePairedWaveRunner:
         reference: Mapping[str, object],
         reference_hash: str,
         artifact_root: str | Path,
+        references: Mapping[str, Mapping[str, object]] | None = None,
         max_new_units: int | None = None,
     ) -> PairedWaveSummary:
         _require_identifier(wave_id, field_name="wave_id")
+        reference_views = _normalize_reference_views(reference, references)
         _require_sha256(reference_hash, field_name="reference_hash")
         if reference_hash != _vector_digest(reference):
             raise ValueError("WAVE_REFERENCE_HASH_MISMATCH")
+        reference_hashes = {
+            name: _vector_digest(view) for name, view in reference_views.items()
+        }
         if not mappings:
             raise ValueError("paired wave 至少需要一个 repetition mapping")
         if max_new_units is not None and max_new_units <= 0:
@@ -2486,6 +2669,7 @@ class RecoverablePairedWaveRunner:
             "schema_version": "stage2-paired-wave-plan-v1",
             "wave_id": wave_id,
             "reference_hash": reference_hash,
+            "reference_hashes": reference_hashes,
             "registry_hash": self.provider.registry_hash,
             "provider_state_digest": self.provider.state_digest(),
             "execution_evidence_hash": self.execution.artifact_hash,
@@ -2518,6 +2702,9 @@ class RecoverablePairedWaveRunner:
                 if max_new_units is not None and new_count >= max_new_units:
                     break
                 started = time.perf_counter()
+                attempt_id = f"attempt-{time.time_ns()}"
+                state_before = self.provider.state_digest()
+                rng_before = _provider_rng_digest(self.provider)
                 try:
                     result = self.runner.run(mapping)
                 except BaseException as error:
@@ -2527,7 +2714,6 @@ class RecoverablePairedWaveRunner:
                     # safely recompute this unit.
                     failures = root / "failures"
                     failures.mkdir(parents=True, exist_ok=True)
-                    attempt_id = f"attempt-{time.time_ns()}"
                     failure_path = failures / (
                         f"{mapping.repetition_id}-{attempt_id}.json"
                     )
@@ -2540,6 +2726,8 @@ class RecoverablePairedWaveRunner:
                                 "attempt_id": attempt_id,
                                 "input_hash": mapping.digest,
                                 "last_committed_unit_ids": sorted(existing),
+                                "state_digest_before": state_before,
+                                "rng_state_before_digest": rng_before,
                                 "error_type": type(error).__name__,
                                 "error": str(error),
                             },
@@ -2553,11 +2741,16 @@ class RecoverablePairedWaveRunner:
                 state: dict[str, object] = {
                     "schema_version": "stage2-wave-unit-state-v1",
                     "unit_id": mapping.repetition_id,
+                    "attempt_id": attempt_id,
                     "input_hash": mapping.digest,
                     "registry_hash": result.registry_hash,
                     "state_digest": result.state_digest,
                     "vectors": vectors,
-                    "metrics": _unit_metrics(vectors, reference),
+                    "metrics": _unit_metrics(vectors, reference, reference_views),
+                    "reference_metrics": _unit_metrics(vectors, reference, reference_views),
+                    "microbatch_diagnostics": [
+                        dict(item) for item in result.microbatch_diagnostics
+                    ],
                     "gradient_evaluations": result.gradient_evaluations,
                     "gradient_seconds": result.gradient_seconds,
                     "formula_seconds": result.formula_seconds,
@@ -2567,6 +2760,9 @@ class RecoverablePairedWaveRunner:
                     "statistical_weight": result.statistical_weight,
                     "sample_collision_count": result.sample_collision_count,
                     "m2_double_max_abs_error": result.m2_double_max_abs_error,
+                    "state_digest_after": result.state_digest_after or self.provider.state_digest(),
+                    "rng_state_before_digest": rng_before,
+                    "rng_state_after_digest": _provider_rng_digest(self.provider),
                     "weighting_assumptions": thaw_json_value(
                         result.weighting_assumptions
                     ),
@@ -2588,9 +2784,25 @@ class RecoverablePairedWaveRunner:
                 canonical_json_hash(_weighting_contract(self.provider))
             }:
                 raise ValueError("WAVE_WEIGHTING_CONTRACT_DRIFT")
-            method_statistics, costs = _aggregate_wave(selected_states, reference)
+            (
+                method_statistics,
+                reference_statistics,
+                costs,
+                microbatch_diagnostics,
+                replay_evidence,
+            ) = _aggregate_wave(selected_states, reference, reference_views)
         else:
             method_statistics = {}
+            reference_statistics = {name: {} for name in _REFERENCE_VIEW_NAMES}
+            microbatch_diagnostics = []
+            replay_evidence = {
+                "schema_version": "stage2-paired-replay-evidence-v1",
+                "attempt_bound": True,
+                "idempotent_reducer": True,
+                "reducer_order": [],
+                "input_hashes": {},
+                "state_transitions": {},
+            }
             costs = {
                 name: {
                     "defined": False,
@@ -2612,6 +2824,10 @@ class RecoverablePairedWaveRunner:
             scope=self.execution.run_intent,
             resumed_unit_count=resumed_count,
             weighting_assumptions=_weighting_contract(self.provider),
+            reference_hashes=reference_hashes,
+            reference_statistics=MappingProxyType(reference_statistics),
+            microbatch_diagnostics=tuple(microbatch_diagnostics),
+            replay_evidence=replay_evidence,
         )
 
 
