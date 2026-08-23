@@ -41,9 +41,9 @@
     "gpu_execution": "NOT_RUN"
   },
   "consumer_contract": {
-    "stage2_code_producer_commit": "PENDING_COMMIT",
+    "stage2_code_producer_commit": "bff18458c02bfde8ee3610cede0addef3ad93782",
     "stage2_execution_commit": null,
-    "stage2_consumer_commit": "PENDING_COMMIT",
+    "stage2_consumer_commit": "bff18458c02bfde8ee3610cede0addef3ad93782",
     "three_end_sync": "BLOCKED_UNTIL_STAGE2_FORMAL_GPU_EXECUTION"
   }
 }
