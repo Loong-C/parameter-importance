@@ -171,7 +171,11 @@ def _formal_stage1_sources(data_root: Path, *, config_ref: str, config) -> dict[
             "formal_observation", "stage_report", "delivery_manifest", "gate_summary", "requirements_matrix"
         )},
         "role_sha256": role_hashes,
-        "payload_hashes": {kind: role_values[kind]["artifact_hash"] for kind in bridge_role_kinds},
+        # S2.04 bridge payload_hashes bind the complete role payload bytes,
+        # including the role's own self-hash.  The role ``artifact_hash`` is
+        # the Stage1 handoff self-hash (without that field), whereas the bridge
+        # hash is the canonical hash of the full role object.
+        "payload_hashes": {kind: canonical_json_hash(role_values[kind]) for kind in bridge_role_kinds},
         "bridge_config_ref": config_ref, "bridge_config_hash": config.config_hash,
         "bridge_config_full_hash": config.full_hash,
         "source_refs": [index_ref, *[root_role_refs[name] for name in (
