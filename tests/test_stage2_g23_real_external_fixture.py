@@ -171,6 +171,10 @@ def _build_cell(root: Path, index: int, cell: str, head: str, prereg: dict[str, 
         })
     manifest["data"] = {"data_range_hash": data_range_hash, "dataset_id": "fixture-data"}
     manifest["data_range_hash"] = data_range_hash
+    manifest["registry_hashes_by_cell"] = {
+        row["cell_id"]: row["registry_hash"] for row in manifest["checkpoints"]
+    }
+    manifest["registry_hash"] = canonical_json_hash(manifest["registry_hashes_by_cell"])
     manifest["manifest_hash"] = canonical_json_hash(manifest)
     row = next(item for item in manifest["checkpoints"] if item["cell_id"] == cell)
 
