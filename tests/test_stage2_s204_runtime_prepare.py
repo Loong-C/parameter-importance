@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -10,9 +11,13 @@ from ops.stage2.materialize_s204 import (
     S204_S22_COMMIT_OUTPUT_DIR,
     S204_S22_CONFIG_REF,
     S204_S22_CONTROL_OUTPUT_DIR,
+    S22_G3_FORMAL_EXECUTION_G20_REF,
+    S22_G3_FORMAL_EXECUTION_G21_REF,
     S204MaterializationError,
     _formal_dag_config,
     _publish_resolved_config,
+    _s22_g3_ready_manifest_hashes,
+    _extend_formal_execution,
     _validate_formal_s22_task_group,
     _validate_delta_sci_artifact,
     ensure_formal_s22_task_outputs,
@@ -20,6 +25,7 @@ from ops.stage2.materialize_s204 import (
 )
 from ops.stage2.prepare_s204_formal import _validate_adapter_gate
 from param_importance_nlp.contracts import load_canonical_json, write_canonical_json
+from param_importance_nlp.contracts import FormalExecutionEvidence
 from param_importance_nlp.contracts.status import GateRecord, GateStatus
 from param_importance_nlp.runtime import (
     TaskArtifactStore,
@@ -98,6 +104,91 @@ def test_s22_g3_resolution_must_be_a_formal_task_artifact(tmp_path: Path) -> Non
         )
 
 
+def _fake_s22_g3_runtime(entries: list[dict[str, object]]) -> SimpleNamespace:
+    return SimpleNamespace(resolution={"entries": entries})
+
+
+def test_s22_g3_ready_manifest_hashes_bind_first_execution_extension(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import ops.stage2.materialize_s204 as materializer
+
+    hashes = tuple(f"{index:064x}" for index in range(13))
+    monkeypatch.setattr(
+        materializer.FormalG3RuntimeAssets,
+        "load",
+        staticmethod(
+            lambda _root, _ref: _fake_s22_g3_runtime(
+                [{"ready_manifest_sha256": digest} for digest in hashes]
+            )
+        ),
+    )
+    observed = _s22_g3_ready_manifest_hashes(tmp_path, "evidence/stage0/g3.json")
+    assert observed == hashes
+
+    base = FormalExecutionEvidence(
+        run_intent="formal",
+        contract_freeze_hash="a" * 64,
+        asset_manifest_hashes=("b" * 64,),
+        prerequisite_gates=(
+            GateRecord(
+                gate_id="stage0.G10",
+                stage=0,
+                status=GateStatus.PASS,
+                checked_at="2026-08-24T00:00:00+00:00",
+                evidence_refs=("evidence/stage0/g10.json",),
+            ),
+        ),
+    )
+    base_ref = "evidence/stage2/s204/formal-execution.json"
+    output_ref = S22_G3_FORMAL_EXECUTION_G20_REF
+    legacy_ref = f"{S204_S22_CONTROL_OUTPUT_DIR}/formal-execution-g20.json"
+    legacy_payload = {"legacy": "preserved"}
+    write_canonical_json(tmp_path / base_ref, base.to_dict())
+    write_canonical_json(tmp_path / legacy_ref, legacy_payload)
+    gate = GateRecord(
+        gate_id="stage1.G1-EXIT",
+        stage=1,
+        status=GateStatus.PASS,
+        checked_at="2026-08-24T00:00:00+00:00",
+        evidence_refs=("evidence/stage1/g1.json",),
+    )
+    extended, _ = _extend_formal_execution(
+        tmp_path,
+        evidence_ref=base_ref,
+        gate=gate,
+        asset_hashes=observed,
+        destination=output_ref,
+    )
+    assert set(hashes).issubset(extended.asset_manifest_hashes)
+    assert load_canonical_json(tmp_path / legacy_ref) == legacy_payload
+
+
+@pytest.mark.parametrize(
+    "entries,match",
+    (
+        ([{"ready_manifest_sha256": f"{index:064x}"} for index in range(12)], "S22_G3_MANIFEST_HASHES_INVALID"),
+        ([{"ready_manifest_sha256": "0" * 64} for _ in range(13)], "S22_G3_MANIFEST_HASHES_INVALID"),
+        ([{"ready_manifest_sha256": "not-a-sha"}] + [{"ready_manifest_sha256": f"{index:064x}"} for index in range(1, 13)], "S22_G3_MANIFEST_HASHES_INVALID"),
+    ),
+)
+def test_s22_g3_ready_manifest_hashes_reject_missing_duplicate_or_invalid(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    entries: list[dict[str, object]],
+    match: str,
+) -> None:
+    import ops.stage2.materialize_s204 as materializer
+
+    monkeypatch.setattr(
+        materializer.FormalG3RuntimeAssets,
+        "load",
+        staticmethod(lambda _root, _ref: _fake_s22_g3_runtime(entries)),
+    )
+    with pytest.raises(S204MaterializationError, match=match):
+        _s22_g3_ready_manifest_hashes(tmp_path, "evidence/stage0/g3.json")
+
+
 def _valid_s22_group(root: Path) -> tuple[dict[str, str], dict[str, object], str, str, tuple[str, ...]]:
     """Build only control-plane S2.2 commits for postcondition tests."""
 
@@ -131,7 +222,7 @@ def _valid_s22_group(root: Path) -> tuple[dict[str, str], dict[str, object], str
             source_refs=("evidence/stage2/s201/commits/gate_record.json",),
         ).commit_ref
     evidence_refs = {
-        "formal_execution": f"{S204_S22_CONTROL_OUTPUT_DIR}/formal-execution-g21.json",
+        "formal_execution": S22_G3_FORMAL_EXECUTION_G21_REF,
         "stage0_handoff": "evidence/stage0/handoff.json",
         "stage1_g1_exit": "evidence/stage1/index.json",
         "g3_resolution": "evidence/stage0/g3.json",
@@ -208,7 +299,7 @@ def test_s22_absent_produces_and_complete_rerun_is_idempotent(tmp_path: Path, mo
                 evidence_refs=("evidence/stage2/g2-1.json",),
             ),),
         )
-        evidence_ref = f"{S204_S22_CONTROL_OUTPUT_DIR}/formal-execution-g21.json"
+        evidence_ref = S22_G3_FORMAL_EXECUTION_G21_REF
         write_canonical_json(root / evidence_ref, evidence.to_dict())
         return refs, evidence, evidence_ref, config_ref, environment_ref
 

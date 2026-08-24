@@ -126,6 +126,11 @@ S204_S22_CANONICAL_OUTPUT_DIR: Final = "evidence/stage2/s204/materialized-task-i
 S204_S22_CONTROL_OUTPUT_DIR: Final = "evidence/stage2/s204/formal-s22-r8"
 S204_S22_COMMIT_OUTPUT_DIR: Final = f"{S204_S22_CANONICAL_OUTPUT_DIR}/task-outputs/stage2-02"
 S204_S22_CONFIG_REF: Final = f"{S204_S22_CANONICAL_OUTPUT_DIR}/configs/generated/stage2/stage2-02-resolved-config-v2.json"
+# G3-v5 lineage is append-only: the historical g20/g21 extension files are
+# retained and never overwritten by the S2.2 formal producer.
+S22_G3_FORMAL_EXECUTION_G20_REF: Final = f"{S204_S22_CONTROL_OUTPUT_DIR}/formal-execution-g20-g3-v5.json"
+S22_G3_FORMAL_EXECUTION_G21_REF: Final = f"{S204_S22_CONTROL_OUTPUT_DIR}/formal-execution-g21-g3-v5.json"
+S22_G3_READY_MANIFEST_COUNT: Final = 13
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _COMMIT = re.compile(r"^[0-9a-f]{40}$")
 _LOGICAL = re.compile(r"^[^\\/][^\\]*$")
@@ -1362,6 +1367,41 @@ def _validate_s22_g3_resolution(root: Path, g3_ref: str) -> LoadedTaskArtifact:
     return loaded
 
 
+def _s22_g3_ready_manifest_hashes(root: Path, g3_ref: str) -> tuple[str, ...]:
+    """Load G3 once and bind every qualified manifest digest to S2.2 evidence.
+
+    The S2.2 fixed-state provider resolves only three assets, but its formal
+    execution evidence must carry the complete G3 resolution lineage.  The
+    resolution loader has already validated the entry shape and each digest;
+    this additional check keeps the S2.2 boundary explicit and rejects a
+    truncated or duplicate entry list before any evidence extension is
+    published.
+    """
+
+    normalized = _source_ref(g3_ref, "g3_resolution")
+    try:
+        runtime_assets = FormalG3RuntimeAssets.load(root, normalized)
+        raw_entries = runtime_assets.resolution.get("entries")
+        if (
+            not isinstance(raw_entries, list)
+            or len(raw_entries) != S22_G3_READY_MANIFEST_COUNT
+        ):
+            raise ValueError("G3 ready manifest entry count must be exactly 13")
+        hashes: list[str] = []
+        for index, raw_entry in enumerate(raw_entries):
+            if not isinstance(raw_entry, Mapping):
+                raise ValueError(f"G3 resolution entry {index} is not an object")
+            digest = raw_entry.get("ready_manifest_sha256")
+            if not isinstance(digest, str) or _SHA256.fullmatch(digest) is None:
+                raise ValueError(f"G3 resolution entry {index} has invalid manifest hash")
+            hashes.append(digest)
+        if len(set(hashes)) != S22_G3_READY_MANIFEST_COUNT:
+            raise ValueError("G3 ready manifest hashes must be unique")
+        return tuple(hashes)
+    except Exception as error:
+        raise _error("S22_G3_MANIFEST_HASHES_INVALID", normalized) from error
+
+
 def _build_s22_formal_environment(
     root: Path,
     *,
@@ -1621,6 +1661,10 @@ def _validate_formal_s22_task_group(
     )
     if any(
         key != "g3_resolution"
+        and not (
+            key == "formal_execution"
+            and PurePosixPath(str(ref)).as_posix() == S22_G3_FORMAL_EXECUTION_G21_REF
+        )
         and (
             "g3" in str(ref).casefold()
             or any(token in f"{key}={ref}".casefold() for token in forbidden_tokens)
@@ -1715,18 +1759,19 @@ def produce_formal_s22_task_outputs(
         _source_ref(ref, f"s22.{gate_id}.ref")
     external_g21 = _source_ref(source.get("g21_handoff"), "g21_handoff")
     _load_gpu_health_identity(root, external_g21, expected_stage1_ref=stage1_ref)
+    g3_manifest_hashes = _s22_g3_ready_manifest_hashes(root, g3_ref)
     evidence, phase_evidence_ref = _extend_formal_execution(
         root,
         evidence_ref=formal_execution_ref,
         gate=g20_gate,
-        asset_hashes=(),
-        destination=f"{output_dir}/formal-execution-g20.json",
+        asset_hashes=g3_manifest_hashes,
+        destination=S22_G3_FORMAL_EXECUTION_G20_REF,
     )
     evidence, phase_evidence_ref = _extend_formal_execution(
         root,
         evidence_ref=phase_evidence_ref,
         gate=g21_gate,
-        destination=f"{output_dir}/formal-execution-g21.json",
+        destination=S22_G3_FORMAL_EXECUTION_G21_REF,
     )
     del base_config_ref
     config_ref = _logical(g21_resolved_config_ref, "g21_resolved_config")
@@ -1811,7 +1856,7 @@ def ensure_formal_s22_task_outputs(
         raise _error("S22_OUTPUT_DIR_NOT_CANONICAL", canonical_dir)
     config_ref = S204_S22_CONFIG_REF
     environment_ref = f"{canonical_dir}/environments/stage2-02.json"
-    evidence_ref = f"{canonical_dir}/formal-execution-g21.json"
+    evidence_ref = S22_G3_FORMAL_EXECUTION_G21_REF
     if raw is None:
         refs, evidence, evidence_ref, config_ref, environment_ref = produce_formal_s22_task_outputs(
             root,
