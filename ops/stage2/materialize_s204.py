@@ -3606,10 +3606,26 @@ def publish_per_cell_runtime_environments(
                 output_dir=f"{output_dir}/auxiliary/{_cell_path_component(cell_id)}/six-cell-manifest",
             )
             checkpoint_payload = _load_mapping(root, checkpoint.manifest_ref, f"checkpoint.{cell_id}.manifest")
+            # Checkpoint manifests are direct Stage 2 manifest objects.  Their
+            # historical schema uses ``schema`` (rather than the TaskArtifact
+            # payload's required ``schema_version``), so bridge them through a
+            # versioned binding without mutating or re-publishing the source
+            # manifest.  Verify the source identity before wrapping it.
+            if canonical_json_hash(dict(checkpoint_payload)) != checkpoint.manifest_sha256:
+                raise _error("CHECKPOINT_MANIFEST_HASH_INVALID", cell_id)
+            checkpoint_binding = {
+                "schema_version": "checkpoint-manifest-v1",
+                "checkpoint_id": checkpoint.checkpoint_id,
+                "model_id": checkpoint.model_id,
+                "revision": checkpoint.revision,
+                "checkpoint_manifest": dict(checkpoint_payload),
+                "source_manifest_ref": checkpoint.manifest_ref,
+                "source_manifest_sha256": checkpoint.manifest_sha256,
+            }
             auxiliary["checkpoint_manifest"] = _publish_auxiliary_task_artifact(
                 root,
                 artifact_kind="checkpoint_manifest",
-                payload=checkpoint_payload,
+                payload=checkpoint_binding,
                 config_hash=config.config_hash,
                 source_refs=(checkpoint.manifest_ref,),
                 output_dir=f"{output_dir}/auxiliary/{_cell_path_component(cell_id)}/checkpoint-manifest",
@@ -3617,20 +3633,72 @@ def publish_per_cell_runtime_environments(
             model_asset = g3_assets.resolve(f"{checkpoint.model_id}-step0", expected_kind="model")
             tokenizer_asset = g3_assets.resolve(tokenizer_asset_id, expected_kind="tokenizer")
             data_asset = g3_assets.resolve(data_asset_id, expected_kind="pile")
-            for kind, asset, key in (
-                ("model_manifest", model_asset, "model_manifest"),
-                ("tokenizer_manifest", tokenizer_asset, "tokenizer_manifest"),
-                ("data_manifest", data_asset, "data_manifest"),
-            ):
-                payload = _load_direct_manifest_payload(root, asset.manifest_ref, f"{cell_id}.{kind}")
-                auxiliary[key] = _publish_auxiliary_task_artifact(
-                    root,
-                    artifact_kind=kind,
-                    payload=payload,
-                    config_hash=config.config_hash,
-                    source_refs=(asset.manifest_ref, g3_resolution_ref),
-                    output_dir=f"{output_dir}/auxiliary/{_cell_path_component(cell_id)}/{kind}",
-                )
+            model_payload = _load_direct_manifest_payload(root, model_asset.manifest_ref, f"{cell_id}.model_manifest")
+            model_metadata = model_payload.get("metadata")
+            if not isinstance(model_metadata, Mapping):
+                raise _error("G3_MODEL_MANIFEST_METADATA_INVALID", cell_id)
+            model_binding = {
+                "schema_version": "model-manifest-v1",
+                "asset_id": model_asset.resolved.asset_id,
+                "model_id": checkpoint.model_id,
+                "revision": model_payload.get("revision"),
+                "ready_manifest_sha256": model_asset.ready_manifest_sha256,
+                "parameter_count": model_metadata.get("parameter_count"),
+                "manifest_ref": model_asset.manifest_ref,
+                "source_manifest_sha256": model_asset.ready_manifest_sha256,
+                "asset_manifest": dict(model_payload),
+            }
+            auxiliary["model_manifest"] = _publish_auxiliary_task_artifact(
+                root,
+                artifact_kind="model_manifest",
+                payload=model_binding,
+                config_hash=config.config_hash,
+                source_refs=(model_asset.manifest_ref, g3_resolution_ref),
+                output_dir=f"{output_dir}/auxiliary/{_cell_path_component(cell_id)}/model_manifest",
+            )
+            data_payload = _load_direct_manifest_payload(root, data_asset.manifest_ref, f"{cell_id}.data_manifest")
+            data_binding = {
+                "schema_version": "data-manifest-v1",
+                "asset_id": data_asset.resolved.asset_id,
+                "revision": data_payload.get("revision"),
+                "ready_manifest_sha256": data_asset.ready_manifest_sha256,
+                "manifest_ref": data_asset.manifest_ref,
+                "source_manifest_sha256": data_asset.ready_manifest_sha256,
+                "asset_manifest": dict(data_payload),
+                "s23_data_range": manifest.data_range.to_dict(),
+                "s23_data_files": [item.to_dict() for item in manifest.data_range.files],
+            }
+            auxiliary["data_manifest"] = _publish_auxiliary_task_artifact(
+                root,
+                artifact_kind="data_manifest",
+                payload=data_binding,
+                config_hash=config.config_hash,
+                source_refs=(data_asset.manifest_ref, g3_resolution_ref),
+                output_dir=f"{output_dir}/auxiliary/{_cell_path_component(cell_id)}/data_manifest",
+            )
+            tokenizer_payload = _load_direct_manifest_payload(root, tokenizer_asset.manifest_ref, f"{cell_id}.tokenizer_manifest")
+            tokenizer_metadata = tokenizer_payload.get("metadata")
+            if not isinstance(tokenizer_metadata, Mapping):
+                raise _error("G3_TOKENIZER_MANIFEST_METADATA_INVALID", cell_id)
+            auxiliary["tokenizer_manifest"] = _publish_auxiliary_task_artifact(
+                root,
+                artifact_kind="tokenizer_manifest",
+                payload={
+                    "schema_version": "tokenizer-manifest-v1",
+                    "asset_id": tokenizer_asset.resolved.asset_id,
+                    "revision": tokenizer_payload.get("revision"),
+                    "checkpoint_id": checkpoint.checkpoint_id,
+                    "semantic_vocab_sha256": tokenizer_metadata.get("vocab_mapping_sha256"),
+                    "checkpoint_tokenizer_sha256": checkpoint.tokenizer_sha256,
+                    "ready_manifest_sha256": tokenizer_asset.ready_manifest_sha256,
+                    "manifest_ref": tokenizer_asset.manifest_ref,
+                    "source_manifest_sha256": tokenizer_asset.ready_manifest_sha256,
+                    "asset_manifest": dict(tokenizer_payload),
+                },
+                config_hash=config.config_hash,
+                source_refs=(tokenizer_asset.manifest_ref, g3_resolution_ref),
+                output_dir=f"{output_dir}/auxiliary/{_cell_path_component(cell_id)}/tokenizer_manifest",
+            )
             auxiliary["s23_asset_resolution"] = _source_ref(s23_asset_task_ref, "s23_asset_task")
         evidence_refs = dict(base.evidence_refs)
         evidence_refs.pop("formal_reference_sizing_plan", None)
