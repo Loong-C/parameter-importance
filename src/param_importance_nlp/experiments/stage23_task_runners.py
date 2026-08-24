@@ -1268,6 +1268,50 @@ def _formal_execution_evidence(
     return evidence, reference
 
 
+def _load_formal_parameter_registry(
+    root: Path,
+    reference: str,
+    model: torch.nn.Module,
+) -> ParameterRegistry:
+    """Reload the hash-bound S2.3 coordinate registry for a live model."""
+
+    registry_task = load_committed_task_artifact(
+        root, reference, require_formal=True
+    )
+    if registry_task.identity.artifact_kind != "parameter_registry":
+        raise ValueError("FORMAL_PARAMETER_REGISTRY_TASK_KIND_INVALID")
+    binding = registry_task.payload
+    source_ref = binding.get("source_s203_manifest_ref")
+    source_sha256 = binding.get("source_s203_manifest_sha256")
+    declared_registry_hash = binding.get("registry_hash")
+    if not all(
+        isinstance(value, str) and value
+        for value in (source_ref, source_sha256, declared_registry_hash)
+    ):
+        raise ValueError("FORMAL_PARAMETER_REGISTRY_SOURCE_BINDING_INVALID")
+    source_path = _workspace_path(
+        root, source_ref, field="source_s203_manifest_ref"
+    )
+    if hashlib.sha256(source_path.read_bytes()).hexdigest() != source_sha256:
+        raise ValueError("FORMAL_PARAMETER_REGISTRY_SOURCE_HASH_INVALID")
+    source_manifest = load_canonical_json(source_path)
+    if not isinstance(source_manifest, Mapping):
+        raise ValueError("FORMAL_PARAMETER_REGISTRY_SOURCE_MANIFEST_INVALID")
+    registry_manifest = source_manifest.get("registry")
+    if not isinstance(registry_manifest, Mapping):
+        raise ValueError("FORMAL_PARAMETER_REGISTRY_MANIFEST_MISSING")
+    try:
+        named_parameters = dict(model.named_parameters(remove_duplicate=False))
+        registry = ParameterRegistry.from_manifest(
+            registry_manifest, parameters=named_parameters
+        )
+    except Exception as error:
+        raise ValueError("FORMAL_PARAMETER_REGISTRY_MANIFEST_INVALID") from error
+    if registry.coordinate_registry_hash != declared_registry_hash:
+        raise ValueError("FORMAL_PARAMETER_REGISTRY_COORDINATE_HASH_MISMATCH")
+    return registry
+
+
 def _formal_provider(request: TaskExecutionRequest, root: Path) -> _ProviderContext:
     """验证离线资产并构造真实 Torch fixed-state provider。
 
@@ -1444,10 +1488,23 @@ def _formal_provider(request: TaskExecutionRequest, root: Path) -> _ProviderCont
             "assets": [item.provenance() for item in qualified_assets],
         }
         fixed_id = f"offline-{canonical_json_hash(fixed_binding)[:24]}"
+        # The coordinate registry is an upstream S2.3 authority, not a
+        # property to derive from the current model.  The per-cell auxiliary
+        # TaskArtifact binds the selected S2.3 source manifest and its raw
+        # bytes; reload both before binding current Parameter objects.
+        registry_ref = request.environment.evidence_refs.get(
+            "stage2_parameter_registry"
+        )
+        if not isinstance(registry_ref, str) or not registry_ref:
+            raise ValueError("FORMAL_PARAMETER_REGISTRY_REF_REQUIRED")
+        registry = _load_formal_parameter_registry(
+            root, registry_ref, model.module
+        )
         provider = TorchFixedStateGradientProvider(
             model,
             resolver,
             fixed_state_id=fixed_id,
+            registry=registry,
             output_dtype=torch.float64,
         )
     except DependencyUnavailable as error:

@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import copy
 from pathlib import Path
+import hashlib
+
+import torch
 
 import pytest
 
@@ -12,6 +15,7 @@ from param_importance_nlp.contracts import (
 )
 from param_importance_nlp.contracts.config_v2 import load_resolved_config_compatible
 from param_importance_nlp.contracts.task_catalog import DEFAULT_TASK_CATALOG, RunnerKind
+from param_importance_nlp.core.registry import ParameterRegistry
 from param_importance_nlp.experiments import (
     AssetResolutionManifest,
     CheckpointFile,
@@ -28,6 +32,7 @@ from param_importance_nlp.experiments import (
 from param_importance_nlp.experiments.stage23_task_runners import (
     _formal_stage1_report_artifact_hash,
     _formal_stage2_asset_manifest,
+    _load_formal_parameter_registry,
     _predecessor_context,
     _reference_tokenizer_identity,
     _run_stage2_contract,
@@ -198,6 +203,34 @@ def test_sampling_provider_projection_rebinds_ids_but_preserves_s23_seeds() -> N
     assert projected.universe.sample_ids == provider.universe.sample_ids
     assert projected.universe.metadata["upstream_sampling_plan_hash"] == upstream.digest
     assert projected.draws("pilot", 8) == projected.draws("pilot", 8)
+
+
+def test_formal_parameter_registry_reloads_authoritative_coordinate_manifest_and_tamper_blocks(tmp_path: Path) -> None:
+    model = torch.nn.Linear(2, 1)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+    registry = ParameterRegistry.from_model(model, optimizer)
+    source_ref = "source/s203-registry.json"
+    write_canonical_json(tmp_path / source_ref, {"registry": registry.to_manifest()})
+    source_sha256 = hashlib.sha256((tmp_path / source_ref).read_bytes()).hexdigest()
+    store = TaskArtifactStore(tmp_path, "runs/registry-binding")
+    published = store.publish(
+        task_id="stage2.04_reference_target",
+        artifact_kind="parameter_registry",
+        config_hash="a" * 64,
+        run_intent="formal",
+        formal_eligible=True,
+        payload={
+            "schema_version": "stage2-parameter-registry-artifact-v1",
+            "registry_hash": registry.coordinate_registry_hash,
+            "source_s203_manifest_ref": source_ref,
+            "source_s203_manifest_sha256": source_sha256,
+        },
+    )
+    loaded = _load_formal_parameter_registry(tmp_path, published.commit_ref, model)
+    assert loaded.coordinate_registry_hash == registry.coordinate_registry_hash
+    write_canonical_json(tmp_path / source_ref, {"registry": registry.to_manifest(), "tampered": True})
+    with pytest.raises(ValueError, match="SOURCE_HASH_INVALID"):
+        _load_formal_parameter_registry(tmp_path, published.commit_ref, model)
 
 
 def _formal_stage2_01_request(
