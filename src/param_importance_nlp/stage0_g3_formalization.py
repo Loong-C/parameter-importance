@@ -17,6 +17,8 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 import re
 import stat
+import subprocess
+from hashlib import sha256
 from typing import Any, Mapping
 
 from .asset_download_plan import load_g3_download_plan
@@ -61,6 +63,7 @@ _AUDIT_SCHEMA = "stage0-g3-materialization-audit-v3"
 _RESOLUTION_SCHEMA = "stage0-g3-resolution-audit-v1"
 _EXPECTED_ENTRY_COUNT = 13
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+_GIT_COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
 
 _BOOTSTRAP_INDEX_FIELDS = {
     "schema_version",
@@ -293,6 +296,33 @@ def _safe_file(root: Path, reference: object, *, field: str) -> Path:
     return resolved
 
 
+def _git_commit_is_ancestor(repository: Path, producer: str, consumer: str) -> bool:
+    if _GIT_COMMIT_RE.fullmatch(producer) is None or _GIT_COMMIT_RE.fullmatch(consumer) is None:
+        return False
+    result = subprocess.run(
+        ["git", "merge-base", "--is-ancestor", producer, consumer],
+        cwd=repository,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
+    return result.returncode == 0
+
+
+def _git_blob_sha256(repository: Path, commit: str, reference: str) -> str:
+    try:
+        result = subprocess.run(
+            ["git", "show", f"{commit}:{reference}"],
+            cwd=repository,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            check=True,
+        )
+    except (OSError, subprocess.CalledProcessError) as error:
+        raise Stage0G3FormalizationError("G3_FORMAL_PRODUCER_SOURCE_MISSING") from error
+    return sha256(result.stdout).hexdigest()
+
+
 def _mapping(value: object, *, field: str) -> dict[str, Any]:
     if not isinstance(value, Mapping) or any(not isinstance(key, str) for key in value):
         raise Stage0G3FormalizationError(f"G3_FORMAL_OBJECT_INVALID:{field}")
@@ -351,12 +381,16 @@ def _load_bootstrap(
         root, bootstrap_index_ref, field="bootstrap_index"
     )
     _require_fields(index, _BOOTSTRAP_INDEX_FIELDS, field="bootstrap_index")
+    producer_commit = index.get("generator_git_commit")
     if (
         index.get("schema_version") != "stage0-formal-bootstrap-index-v1"
-        or index.get("generator_git_commit") != binding.git_commit
+        or not isinstance(producer_commit, str)
+        or _GIT_COMMIT_RE.fullmatch(producer_commit) is None
         or index.get("next_task_id") != _TASK_ID
     ):
         raise Stage0G3FormalizationError("G3_FORMAL_BOOTSTRAP_IDENTITY_MISMATCH")
+    if not _git_commit_is_ancestor(binding.repository, producer_commit, binding.git_commit):
+        raise Stage0G3FormalizationError("G3_FORMAL_BOOTSTRAP_PRODUCER_NOT_ANCESTOR")
     _validate_self_hash(index, field="bootstrap_index")
     environment_ref = _logical_ref(
         index.get("environment_ref"), field="bootstrap_index.environment_ref"
@@ -412,8 +446,6 @@ def load_and_replay_g3_materialization(
     if (
         index.get("schema_version") != _INDEX_SCHEMA
         or index.get("status") != "PASS"
-        or index.get("generator_git_commit") != binding.git_commit
-        or index.get("source_git_commit") != binding.git_commit
         or index.get("entry_count") != _EXPECTED_ENTRY_COUNT
     ):
         raise Stage0G3FormalizationError("G3_FORMAL_MATERIALIZATION_IDENTITY_MISMATCH")
@@ -464,14 +496,22 @@ def load_and_replay_g3_materialization(
         or audit.get("resolution_sha256") != resolution_sha
         or audit.get("schema_version") != _AUDIT_SCHEMA
         or audit.get("status") != "PASS"
-        or audit.get("generator_git_commit") != binding.git_commit
     ):
         raise Stage0G3FormalizationError("G3_FORMAL_REPORT_CROSS_BINDING_INVALID")
 
     source_binding = _mapping(audit.get("source_binding"), field="audit.source_binding")
     _require_fields(source_binding, _SOURCE_BINDING_FIELDS, field="audit.source_binding")
-    if source_binding.get("head_commit") != binding.git_commit:
+    producer_commit = index.get("generator_git_commit")
+    if (
+        not isinstance(producer_commit, str)
+        or _GIT_COMMIT_RE.fullmatch(producer_commit) is None
+        or index.get("source_git_commit") != producer_commit
+        or audit.get("generator_git_commit") != producer_commit
+        or source_binding.get("head_commit") != producer_commit
+    ):
         raise Stage0G3FormalizationError("G3_FORMAL_REPORT_SOURCE_COMMIT_MISMATCH")
+    if not _git_commit_is_ancestor(binding.repository, producer_commit, binding.git_commit):
+        raise Stage0G3FormalizationError("G3_FORMAL_PRODUCER_NOT_ANCESTOR")
     requirements_ref = _logical_ref(
         index.get("requirements_ref"), field="index.requirements_ref"
     )
@@ -480,10 +520,7 @@ def load_and_replay_g3_materialization(
         index.get("download_plan_ref"), field="index.download_plan_ref"
     )
     if (
-        requirements_ref != _REQUIREMENTS_REF
-        or layout_ref != _LAYOUT_REF
-        or download_plan_ref != _DOWNLOAD_PLAN_REF
-        or source_binding.get("requirements_ref") != requirements_ref
+        source_binding.get("requirements_ref") != requirements_ref
         or source_binding.get("layout_ref") != layout_ref
         or source_binding.get("download_plan_ref") != download_plan_ref
     ):
@@ -499,6 +536,15 @@ def load_and_replay_g3_materialization(
         != source_binding.get("download_plan_file_sha256")
     ):
         raise Stage0G3FormalizationError("G3_FORMAL_CONTROL_PLANE_FILE_DRIFT")
+    if (
+        _git_blob_sha256(binding.repository, producer_commit, requirements_ref)
+        != source_binding.get("requirements_file_sha256")
+        or _git_blob_sha256(binding.repository, producer_commit, layout_ref)
+        != source_binding.get("layout_file_sha256")
+        or _git_blob_sha256(binding.repository, producer_commit, download_plan_ref)
+        != source_binding.get("download_plan_file_sha256")
+    ):
+        raise Stage0G3FormalizationError("G3_FORMAL_PRODUCER_SOURCE_DRIFT")
     try:
         requirements = load_stage0_asset_requirements(requirements_path)
         layout = load_stage0_asset_layout(layout_path, requirements=requirements)
@@ -624,7 +670,7 @@ def load_and_replay_g3_materialization(
 
     return Stage0G3MaterializationBinding(
         checked_at=checked_at,
-        generator_git_commit=binding.git_commit,
+        generator_git_commit=producer_commit,
         index_ref=index_ref,
         index_sha256=index_sha,
         index_artifact_hash=index_artifact_hash,

@@ -49,7 +49,7 @@ from param_importance_nlp.storage import DATA_ROOT_ENV
 
 
 ROOT = Path(__file__).resolve().parents[1]
-HEAD = "a" * 40
+HEAD = "f32daa2a6c45c08730444df9177388daa39e3787"
 CHECKED_AT = "2026-08-03T16:00:00Z"
 ACQUISITION_SHA = hashlib.sha256(b"acquisition").hexdigest()
 VERIFICATION_SHA = hashlib.sha256(b"verification").hexdigest()
@@ -67,8 +67,8 @@ def _digest(label: str) -> str:
     return hashlib.sha256(label.encode("utf-8")).hexdigest()
 
 
-def _binding() -> Stage0SourceBinding:
-    return Stage0SourceBinding(ROOT, HEAD, "feat/stage0-completion", True)
+def _binding(repository: Path = ROOT) -> Stage0SourceBinding:
+    return Stage0SourceBinding(repository, HEAD, "feat/stage0-completion", True)
 
 
 def _snapshot(tmp_path: Path) -> Stage0RuntimeSnapshot:
@@ -176,29 +176,56 @@ def _with_hash(value: dict[str, object]) -> dict[str, object]:
     return result
 
 
-def _write_materialization(tmp_path: Path) -> tuple[str, dict[str, object]]:
+def _write_materialization(
+    tmp_path: Path, *, versioned_refs: bool = False
+) -> tuple[str, dict[str, object]]:
     resolution = _resolution()
     resolution_hash = str(resolution["artifact_hash"])
     directory = Path("reports/stage0/g3") / resolution_hash
     resolution_ref = (directory / "asset-resolution.json").as_posix()
     audit_ref = (directory / "asset-audit.json").as_posix()
     index_ref = (directory / "asset-index.json").as_posix()
+    requirements_ref = (
+        "configs/stage0/g3-asset-requirements-v5.json"
+        if versioned_refs
+        else "configs/stage0/g3-asset-requirements-v1.json"
+    )
+    layout_ref = (
+        "configs/stage0/g3-asset-layout-v5.json"
+        if versioned_refs
+        else "configs/stage0/g3-asset-layout-v1.json"
+    )
+    download_plan_ref = (
+        "configs/stage0/g3-download-plan-v5.json"
+        if versioned_refs
+        else "configs/stage0/g3-download-plan-v1.json"
+    )
+    if versioned_refs:
+        for source_ref, target_ref in (
+            ("configs/stage0/g3-asset-requirements-v1.json", requirements_ref),
+            ("configs/stage0/g3-asset-layout-v1.json", layout_ref),
+            ("configs/stage0/g3-download-plan-v1.json", download_plan_ref),
+        ):
+            target = tmp_path / target_ref
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes((ROOT / source_ref).read_bytes())
+    control_root = tmp_path if versioned_refs else ROOT
     write_canonical_json(tmp_path / resolution_ref, resolution)
     resolution_sha = sha256_file(tmp_path / resolution_ref)
 
     source_binding = {
         "head_commit": HEAD,
-        "requirements_ref": "configs/stage0/g3-asset-requirements-v1.json",
+        "requirements_ref": requirements_ref,
         "requirements_file_sha256": sha256_file(
-            ROOT / "configs/stage0/g3-asset-requirements-v1.json"
+            control_root / requirements_ref
         ),
-        "layout_ref": "configs/stage0/g3-asset-layout-v1.json",
+        "layout_ref": layout_ref,
         "layout_file_sha256": sha256_file(
-            ROOT / "configs/stage0/g3-asset-layout-v1.json"
+            control_root / layout_ref
         ),
-        "download_plan_ref": "configs/stage0/g3-download-plan-v1.json",
+        "download_plan_ref": download_plan_ref,
         "download_plan_file_sha256": sha256_file(
-            ROOT / "configs/stage0/g3-download-plan-v1.json"
+            control_root / download_plan_ref
         ),
     }
     entries = resolution["entries"]
@@ -247,11 +274,11 @@ def _write_materialization(tmp_path: Path) -> tuple[str, dict[str, object]]:
             "checked_at": CHECKED_AT,
             "generator_git_commit": HEAD,
             "source_git_commit": HEAD,
-            "requirements_ref": "configs/stage0/g3-asset-requirements-v1.json",
+            "requirements_ref": requirements_ref,
             "requirements_artifact_hash": resolution["requirements_artifact_hash"],
-            "layout_ref": "configs/stage0/g3-asset-layout-v1.json",
+            "layout_ref": layout_ref,
             "layout_artifact_hash": resolution["layout_artifact_hash"],
-            "download_plan_ref": "configs/stage0/g3-download-plan-v1.json",
+            "download_plan_ref": download_plan_ref,
             "acquisition_ref": ACQUISITION_REF,
             "acquisition_sha256": ACQUISITION_SHA,
             "verification_ref": VERIFICATION_REF,
@@ -302,6 +329,129 @@ def test_materialization_bundle_is_hash_bound_and_replayed(
     )
     assert result.resolution_artifact_hash == resolution["artifact_hash"]
     assert calls == [CHECKED_AT]
+
+
+def test_materialization_accepts_versioned_refs_bound_by_index_and_source_binding(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    index_ref, resolution = _write_materialization(tmp_path, versioned_refs=True)
+    monkeypatch.setattr(formalization, "_git_commit_is_ancestor", lambda *a: True)
+    monkeypatch.setattr(
+        formalization,
+        "_git_blob_sha256",
+        lambda repository, commit, reference: sha256_file(repository / reference),
+    )
+    monkeypatch.setattr(formalization, "evaluate_stage0_g3", lambda *a, **k: resolution)
+    result = load_and_replay_g3_materialization(
+        binding=_binding(tmp_path),
+        data_root=tmp_path,
+        materialization_index_ref=index_ref,
+    )
+    assert result.resolution_artifact_hash == resolution["artifact_hash"]
+
+
+def test_materialization_rejects_index_source_binding_ref_mismatch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    index_ref, _ = _write_materialization(tmp_path, versioned_refs=True)
+    index = load_canonical_json(tmp_path / index_ref)
+    audit_path = tmp_path / str(index["audit_ref"])
+    audit = load_canonical_json(audit_path)
+    audit["source_binding"]["layout_ref"] = audit["source_binding"]["requirements_ref"]
+    audit.pop("artifact_hash")
+    audit = _with_hash(audit)
+    write_canonical_json(audit_path, audit)
+    index["audit_sha256"] = sha256_file(audit_path)
+    index.pop("artifact_hash")
+    write_canonical_json(tmp_path / index_ref, _with_hash(index))
+    monkeypatch.setattr(
+        formalization,
+        "evaluate_stage0_g3",
+        lambda *args, **kwargs: pytest.fail("mismatched binding reached asset replay"),
+    )
+    with pytest.raises(Stage0G3FormalizationError, match="CONTROL_PLANE_REF_MISMATCH"):
+        load_and_replay_g3_materialization(
+            binding=_binding(tmp_path),
+            data_root=tmp_path,
+            materialization_index_ref=index_ref,
+        )
+
+
+def test_materialization_rejects_producer_commit_mismatch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    index_ref, _ = _write_materialization(tmp_path)
+    index = load_canonical_json(tmp_path / index_ref)
+    audit_path = tmp_path / str(index["audit_ref"])
+    audit = load_canonical_json(audit_path)
+    audit["generator_git_commit"] = "0" * 40
+    audit.pop("artifact_hash")
+    write_canonical_json(audit_path, _with_hash(audit))
+    index["audit_sha256"] = sha256_file(audit_path)
+    index.pop("artifact_hash")
+    write_canonical_json(tmp_path / index_ref, _with_hash(index))
+    monkeypatch.setattr(
+        formalization,
+        "evaluate_stage0_g3",
+        lambda *args, **kwargs: pytest.fail("mismatched producer reached asset replay"),
+    )
+    with pytest.raises(Stage0G3FormalizationError, match="SOURCE_COMMIT_MISMATCH"):
+        load_and_replay_g3_materialization(
+            binding=_binding(),
+            data_root=tmp_path,
+            materialization_index_ref=index_ref,
+        )
+
+
+def test_materialization_rejects_non_ancestor_producer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    index_ref, _ = _write_materialization(tmp_path)
+    index = load_canonical_json(tmp_path / index_ref)
+    audit_path = tmp_path / str(index["audit_ref"])
+    audit = load_canonical_json(audit_path)
+    bad_producer = "0" * 40
+    index["generator_git_commit"] = bad_producer
+    index["source_git_commit"] = bad_producer
+    audit["generator_git_commit"] = bad_producer
+    audit["source_binding"]["head_commit"] = bad_producer
+    audit.pop("artifact_hash")
+    write_canonical_json(audit_path, _with_hash(audit))
+    index["audit_sha256"] = sha256_file(audit_path)
+    index.pop("artifact_hash")
+    write_canonical_json(tmp_path / index_ref, _with_hash(index))
+    monkeypatch.setattr(formalization, "_git_commit_is_ancestor", lambda *args: False)
+    monkeypatch.setattr(
+        formalization,
+        "evaluate_stage0_g3",
+        lambda *args, **kwargs: pytest.fail("non-ancestor producer reached asset replay"),
+    )
+    with pytest.raises(Stage0G3FormalizationError, match="PRODUCER_NOT_ANCESTOR"):
+        load_and_replay_g3_materialization(
+            binding=_binding(),
+            data_root=tmp_path,
+            materialization_index_ref=index_ref,
+        )
+
+
+def test_bootstrap_accepts_ancestor_producer(
+    tmp_path: Path,
+) -> None:
+    bootstrap = bootstrap_formal_stage0(
+        binding=_binding(), data_root=tmp_path, snapshot=_snapshot(tmp_path)
+    )
+    index_path = tmp_path / bootstrap.index_ref
+    index = load_canonical_json(index_path)
+    index["generator_git_commit"] = "dad3b7937ed9bf7f4859abc03b57e04acb308188"
+    index.pop("artifact_hash")
+    write_canonical_json(index_path, _with_hash(index))
+    environment, next_refs, _ = formalization._load_bootstrap(
+        tmp_path,
+        binding=_binding(),
+        bootstrap_index_ref=bootstrap.index_ref,
+    )
+    assert environment.environment_hash == index["environment_hash"]
+    assert len(next_refs) == 3
 
 
 def test_materialization_tamper_fails_before_replay(
