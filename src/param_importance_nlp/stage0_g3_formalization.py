@@ -13,11 +13,13 @@ asset or task-output drift fails closed.
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 import re
 import stat
 import subprocess
+from collections.abc import Iterator
 from hashlib import sha256
 from typing import Any, Mapping
 
@@ -34,7 +36,7 @@ from .contracts import (
     write_canonical_json,
 )
 from .contracts.jsonio import JSONValue
-from .experiments import build_default_task_runtime
+from .experiments import build_default_task_runtime, stage01_task_runners
 from .g3_gate import GATE_IDS, evaluate_stage0_g3, validate_stage0_g3_resolution
 from .runtime import (
     TaskArtifactStore,
@@ -64,6 +66,9 @@ _RESOLUTION_SCHEMA = "stage0-g3-resolution-audit-v1"
 _EXPECTED_ENTRY_COUNT = 13
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _GIT_COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
+_RUNNER_G3_REQUIREMENTS_REF = stage01_task_runners._G3_REQUIREMENTS_REF
+_RUNNER_G3_LAYOUT_REF = stage01_task_runners._G3_LAYOUT_REF
+_RUNNER_G3_CRITICAL_SOURCE_REFS = stage01_task_runners._G3_CRITICAL_SOURCE_REFS
 
 _BOOTSTRAP_INDEX_FIELDS = {
     "schema_version",
@@ -188,6 +193,9 @@ class Stage0G3FormalizationError(RuntimeError):
 class Stage0G3MaterializationBinding:
     checked_at: str
     generator_git_commit: str
+    requirements_ref: str
+    layout_ref: str
+    download_plan_ref: str
     index_ref: str
     index_sha256: str
     index_artifact_hash: str
@@ -321,6 +329,56 @@ def _git_blob_sha256(repository: Path, commit: str, reference: str) -> str:
     except (OSError, subprocess.CalledProcessError) as error:
         raise Stage0G3FormalizationError("G3_FORMAL_PRODUCER_SOURCE_MISSING") from error
     return sha256(result.stdout).hexdigest()
+
+
+@contextmanager
+def _scoped_g3_runner_sources(
+    materialization: Stage0G3MaterializationBinding,
+) -> Iterator[None]:
+    runner = stage01_task_runners
+    original_requirements = runner._G3_REQUIREMENTS_REF
+    original_layout = runner._G3_LAYOUT_REF
+    original_critical = runner._G3_CRITICAL_SOURCE_REFS
+    try:
+        if (
+            original_requirements != _RUNNER_G3_REQUIREMENTS_REF
+            or original_layout != _RUNNER_G3_LAYOUT_REF
+            or type(original_critical) is not tuple
+            or any(not isinstance(ref, str) for ref in original_critical)
+            or len(set(original_critical)) != len(original_critical)
+            or original_critical != _RUNNER_G3_CRITICAL_SOURCE_REFS
+        ):
+            raise Stage0G3FormalizationError(
+                "G3_FORMAL_RUNNER_SOURCE_BINDING_INVALID"
+            )
+        for position, reference in enumerate(original_critical):
+            _logical_ref(reference, field=f"runner.critical_source_refs[{position}]")
+
+        bound_prefix = (
+            _logical_ref(
+                materialization.requirements_ref,
+                field="materialization.requirements_ref",
+            ),
+            _logical_ref(materialization.layout_ref, field="materialization.layout_ref"),
+            _logical_ref(
+                materialization.download_plan_ref,
+                field="materialization.download_plan_ref",
+            ),
+        )
+        bound_critical = bound_prefix + original_critical[3:]
+        if len(set(bound_critical)) != len(bound_critical):
+            raise Stage0G3FormalizationError(
+                "G3_FORMAL_RUNNER_SOURCE_BINDING_INVALID"
+            )
+
+        runner._G3_REQUIREMENTS_REF = bound_prefix[0]
+        runner._G3_LAYOUT_REF = bound_prefix[1]
+        runner._G3_CRITICAL_SOURCE_REFS = bound_critical
+        yield
+    finally:
+        runner._G3_REQUIREMENTS_REF = original_requirements
+        runner._G3_LAYOUT_REF = original_layout
+        runner._G3_CRITICAL_SOURCE_REFS = original_critical
 
 
 def _mapping(value: object, *, field: str) -> dict[str, Any]:
@@ -671,6 +729,9 @@ def load_and_replay_g3_materialization(
     return Stage0G3MaterializationBinding(
         checked_at=checked_at,
         generator_git_commit=producer_commit,
+        requirements_ref=requirements_ref,
+        layout_ref=layout_ref,
+        download_plan_ref=download_plan_ref,
         index_ref=index_ref,
         index_sha256=index_sha,
         index_artifact_hash=index_artifact_hash,
@@ -946,7 +1007,8 @@ def formalize_stage0_g3(
     config_ref = f"{formal_dir}/resolved-config.json"
     write_canonical_json(root / config_ref, config.to_dict())
     runtime = build_default_task_runtime(root)
-    result = runtime.execute(config, environment=unlock_environment)
+    with _scoped_g3_runner_sources(materialization):
+        result = runtime.execute(config, environment=unlock_environment)
     if result.status.value != "PASS" or not result.formal_eligible:
         raise Stage0G3FormalizationError(
             f"G3_FORMAL_TASK_NOT_PASS:{result.status.value}:{result.message}"

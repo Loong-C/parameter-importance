@@ -350,6 +350,69 @@ def test_materialization_accepts_versioned_refs_bound_by_index_and_source_bindin
     assert result.resolution_artifact_hash == resolution["artifact_hash"]
 
 
+def test_formalization_scopes_versioned_runner_refs_and_restores_on_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    index_ref, resolution = _write_materialization(tmp_path, versioned_refs=True)
+    monkeypatch.setattr(formalization, "_git_commit_is_ancestor", lambda *a: True)
+    monkeypatch.setattr(
+        formalization,
+        "_git_blob_sha256",
+        lambda repository, commit, reference: sha256_file(repository / reference),
+    )
+    monkeypatch.setattr(formalization, "evaluate_stage0_g3", lambda *a, **k: resolution)
+    materialization = load_and_replay_g3_materialization(
+        binding=_binding(tmp_path),
+        data_root=tmp_path,
+        materialization_index_ref=index_ref,
+    )
+    original = (
+        stage01._G3_REQUIREMENTS_REF,
+        stage01._G3_LAYOUT_REF,
+        stage01._G3_CRITICAL_SOURCE_REFS,
+    )
+    with pytest.raises(RuntimeError, match="sentinel"):
+        with formalization._scoped_g3_runner_sources(materialization):
+            assert stage01._G3_REQUIREMENTS_REF == materialization.requirements_ref
+            assert stage01._G3_LAYOUT_REF == materialization.layout_ref
+            assert stage01._G3_CRITICAL_SOURCE_REFS[:3] == (
+                materialization.requirements_ref,
+                materialization.layout_ref,
+                materialization.download_plan_ref,
+            )
+            raise RuntimeError("sentinel")
+    assert (
+        stage01._G3_REQUIREMENTS_REF,
+        stage01._G3_LAYOUT_REF,
+        stage01._G3_CRITICAL_SOURCE_REFS,
+    ) == original
+
+
+def test_formalization_rejects_invalid_runner_critical_tuple(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    index_ref, resolution = _write_materialization(tmp_path, versioned_refs=True)
+    monkeypatch.setattr(formalization, "_git_commit_is_ancestor", lambda *a: True)
+    monkeypatch.setattr(
+        formalization,
+        "_git_blob_sha256",
+        lambda repository, commit, reference: sha256_file(repository / reference),
+    )
+    monkeypatch.setattr(formalization, "evaluate_stage0_g3", lambda *a, **k: resolution)
+    materialization = load_and_replay_g3_materialization(
+        binding=_binding(tmp_path),
+        data_root=tmp_path,
+        materialization_index_ref=index_ref,
+    )
+    critical = stage01._G3_CRITICAL_SOURCE_REFS
+    monkeypatch.setattr(stage01, "_G3_CRITICAL_SOURCE_REFS", critical[:-1] + (critical[0],))
+    with pytest.raises(
+        Stage0G3FormalizationError, match="RUNNER_SOURCE_BINDING_INVALID"
+    ):
+        with formalization._scoped_g3_runner_sources(materialization):
+            pytest.fail("invalid runner tuple was accepted")
+
+
 def test_materialization_rejects_index_source_binding_ref_mismatch(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
