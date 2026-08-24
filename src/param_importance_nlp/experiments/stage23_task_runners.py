@@ -1330,8 +1330,16 @@ def _formal_provider(request: TaskExecutionRequest, root: Path) -> _ProviderCont
         expected_data_kind = (
             "pile" if task_type == "causal_lm" else "glue_derived"
         )
+        # G3 qualifies the immutable model initialization (step 0).  The
+        # selected S2.3 checkpoint identity remains in the config and in the
+        # six-cell lineage, but is not a G3 logical asset alias.  Project the
+        # runtime load to the qualified base model instead of inventing a
+        # trained-checkpoint G3 entry.
+        architecture = model_config.get("architecture")
+        if not isinstance(architecture, str) or not architecture:
+            raise G3RuntimeAssetError("G3_RUNTIME_MODEL_ARCHITECTURE_REQUIRED")
         model_asset = runtime_assets.resolve(
-            str(model_config["asset_id"]), expected_kind="model"
+            f"{architecture}-step0", expected_kind="model"
         )
         data_asset = runtime_assets.resolve(
             str(data["asset_id"]), expected_kind=expected_data_kind

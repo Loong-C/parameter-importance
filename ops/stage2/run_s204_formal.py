@@ -1122,18 +1122,24 @@ def _validate_task_result_bindings(
     if not isinstance(provenance, list):
         raise ValueError("S2.4 provider asset provenance missing")
     model_rows = [item for item in provenance if isinstance(item, Mapping)]
-    expected_model = str(expected["checkpoint_asset_id"])
-    if not any(
-        item.get("asset_id") == expected_model or item.get("logical_asset_id") == expected_model
-        for item in model_rows
-    ):
-        raise ValueError("S2.4 result checkpoint asset binding failed")
-    if not any(
-        item.get("ready_manifest_sha256") == expected["checkpoint_manifest_sha256"]
-        and item.get("logical_asset_id") == expected_model
-        for item in model_rows
-    ):
-        raise ValueError("S2.4 result checkpoint manifest binding failed")
+    # G3 qualifies one immutable step-0 model per architecture.  The selected
+    # trained checkpoint remains independently bound by the S2.3 six-cell
+    # manifest and the result's checkpoint_identity; it is not a fabricated G3
+    # logical asset entry.
+    expected_base_model = f"{expected['model_id']}-step0"
+    if not any(item.get("logical_asset_id") == expected_base_model for item in model_rows):
+        raise ValueError("S2.4 result G3 base-model asset binding failed")
+    checkpoint_identity = reference_payload.get("checkpoint_identity")
+    if not isinstance(checkpoint_identity, Mapping):
+        raise ValueError("S2.4 reference_result checkpoint identity missing")
+    checkpoint_fields = {
+        "checkpoint_id": expected["checkpoint_id"],
+        "checkpoint_asset_id": expected["checkpoint_asset_id"],
+        "checkpoint_revision": expected["checkpoint_revision"],
+        "checkpoint_hash": expected["checkpoint_manifest_sha256"],
+    }
+    if any(checkpoint_identity.get(key) != value for key, value in checkpoint_fields.items()):
+        raise ValueError("S2.4 result checkpoint identity binding failed")
     expected_data = str(expected["data_asset_id"])
     if not any(
         item.get("asset_id") == expected_data or item.get("logical_asset_id") == expected_data
