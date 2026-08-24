@@ -29,6 +29,7 @@ from ops.stage2.materialize_s204 import (
     publish_per_cell_runtime_environments,
     publish_per_cell_sizing_plans,
     _build_narrow_formal_environment,
+    _validate_g3_s23_runtime_equivalence,
 )
 from param_importance_nlp.contracts import (
     ContractFreeze,
@@ -625,6 +626,186 @@ def _formal_asset_payload(manifest: AssetResolutionManifest) -> dict[str, object
         "upstream_binding_hash": "b" * 64,
         "formal_eligible": False,
     }
+
+
+def _fake_resolved_g3_asset(
+    *,
+    kind: str,
+    root_ref: str,
+    revision: str,
+    files: tuple[CheckpointFile | DataFile, ...],
+    logical_name: str | None = None,
+    metadata: dict[str, object] | None = None,
+) -> SimpleNamespace:
+    resolved_files = tuple(
+        SimpleNamespace(
+            relative_path=item.path,
+            size_bytes=item.size_bytes,
+            sha256=item.sha256,
+            role=item.role,
+        )
+        for item in files
+    )
+    return SimpleNamespace(
+        kind=kind,
+        logical_name=logical_name or f"fake-{kind}",
+        asset_root_ref=root_ref,
+        manifest_ref=f"manifests/g3/{kind}.json",
+        manifest={"metadata": metadata or {}},
+        resolved=SimpleNamespace(revision=revision, files=resolved_files),
+    )
+
+
+def test_g3_s23_runtime_equivalence_uses_resolved_file_hashes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    manifest = _formal_asset_manifest()
+    checkpoint = manifest.checkpoints[0]
+    model_files = tuple(item for item in checkpoint.files if item.role in {"config", "weights"})
+    tokenizer_files = tuple(item for item in checkpoint.files if item.role == "tokenizer")
+    g3_tokenizer_files = (CheckpointFile("tokenizer.json", 1, "2" * 64, "tokenizer_model"),)
+    model_asset = _fake_resolved_g3_asset(
+        kind="model",
+        root_ref=checkpoint.root_ref,
+        revision=checkpoint.revision or "",
+        files=model_files,
+        logical_name="pythia-14m-step0",
+    )
+    tokenizer_asset = _fake_resolved_g3_asset(
+        kind="tokenizer",
+        root_ref="models/pythia-tokenizer",
+        revision=checkpoint.revision or "",
+        files=g3_tokenizer_files,
+        metadata={
+            "tokenizer_class": "GPTNeoXTokenizerFast",
+            "vocab_size": 50254,
+            "token_count_with_added_tokens": 50277,
+            "vocab_mapping_sha256": "0" * 64,
+        },
+    )
+    data_asset = _fake_resolved_g3_asset(
+        kind="pile",
+        root_ref="datasets/pile",
+        revision=manifest.data_range.revision,
+        files=manifest.data_range.files,
+    )
+    monkeypatch.setattr(
+        "ops.stage2.materialize_s204._load_checkpoint_tokenizer_identity",
+        lambda *args, **kwargs: ("GPTNeoXTokenizerFast", 50254, 50277, "0" * 64),
+    )
+    monkeypatch.setattr(
+        "ops.stage2.materialize_s204._verify_checkpoint_tokenizer_files_on_disk",
+        lambda *args, **kwargs: None,
+    )
+
+    _validate_g3_s23_runtime_equivalence(
+        tmp_path,
+        checkpoint=checkpoint,
+        base_checkpoint=checkpoint,
+        data=manifest.data_range,
+        model_asset=model_asset,
+        tokenizer_asset=tokenizer_asset,
+        data_asset=data_asset,
+        cell_id="pythia-14m:initialization",
+    )
+
+
+def test_g3_s23_runtime_equivalence_rejects_tokenizer_semantic_drift(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    manifest = _formal_asset_manifest()
+    checkpoint = manifest.checkpoints[0]
+    model_files = tuple(item for item in checkpoint.files if item.role in {"config", "weights"})
+    tokenizer_files = tuple(item for item in checkpoint.files if item.role == "tokenizer")
+    monkeypatch.setattr(
+        "ops.stage2.materialize_s204._load_checkpoint_tokenizer_identity",
+        lambda *args, **kwargs: ("GPTNeoXTokenizerFast", 12345, 50277, "0" * 64),
+    )
+    monkeypatch.setattr(
+        "ops.stage2.materialize_s204._verify_checkpoint_tokenizer_files_on_disk",
+        lambda *args, **kwargs: None,
+    )
+    with pytest.raises(S204MaterializationError, match="S204_G3_TOKENIZER_SEMANTIC_MISMATCH"):
+        _validate_g3_s23_runtime_equivalence(
+            tmp_path,
+            checkpoint=checkpoint,
+            base_checkpoint=checkpoint,
+            data=manifest.data_range,
+            model_asset=_fake_resolved_g3_asset(
+                kind="model",
+                root_ref=checkpoint.root_ref,
+                revision=checkpoint.revision or "",
+                files=model_files,
+                logical_name="pythia-14m-step0",
+            ),
+            tokenizer_asset=_fake_resolved_g3_asset(
+                kind="tokenizer",
+                root_ref="models/pythia-tokenizer",
+                revision=checkpoint.revision or "",
+                files=tokenizer_files,
+                metadata={
+                    "tokenizer_class": "GPTNeoXTokenizerFast",
+                    "vocab_size": 50254,
+                    "token_count_with_added_tokens": 50277,
+                    "vocab_mapping_sha256": "0" * 64,
+                },
+            ),
+            data_asset=_fake_resolved_g3_asset(
+                kind="pile",
+                root_ref="datasets/pile",
+                revision=manifest.data_range.revision,
+                files=manifest.data_range.files,
+            ),
+            cell_id="pythia-14m:initialization",
+        )
+
+
+def test_g3_s23_runtime_equivalence_rejects_model_revision_drift(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    manifest = _formal_asset_manifest()
+    checkpoint = manifest.checkpoints[0]
+    monkeypatch.setattr(
+        "ops.stage2.materialize_s204._load_checkpoint_tokenizer_identity",
+        lambda *args, **kwargs: ("GPTNeoXTokenizerFast", 50254, 50277, "0" * 64),
+    )
+    monkeypatch.setattr(
+        "ops.stage2.materialize_s204._verify_checkpoint_tokenizer_files_on_disk",
+        lambda *args, **kwargs: None,
+    )
+    with pytest.raises(S204MaterializationError, match="S204_G3_MODEL_REVISION_MISMATCH"):
+        _validate_g3_s23_runtime_equivalence(
+            tmp_path,
+            checkpoint=checkpoint,
+            base_checkpoint=checkpoint,
+            data=manifest.data_range,
+            model_asset=_fake_resolved_g3_asset(
+                kind="model",
+                root_ref=checkpoint.root_ref,
+                revision="9" * 40,
+                files=tuple(item for item in checkpoint.files if item.role in {"config", "weights"}),
+                logical_name="pythia-14m-step0",
+            ),
+            tokenizer_asset=_fake_resolved_g3_asset(
+                kind="tokenizer",
+                root_ref="models/pythia-tokenizer",
+                revision=checkpoint.revision or "",
+                files=(CheckpointFile("tokenizer.json", 1, "2" * 64, "tokenizer_model"),),
+                metadata={
+                    "tokenizer_class": "GPTNeoXTokenizerFast",
+                    "vocab_size": 50254,
+                    "token_count_with_added_tokens": 50277,
+                    "vocab_mapping_sha256": "0" * 64,
+                },
+            ),
+            data_asset=_fake_resolved_g3_asset(
+                kind="pile",
+                root_ref="datasets/pile",
+                revision=manifest.data_range.revision,
+                files=manifest.data_range.files,
+            ),
+            cell_id="pythia-14m:initialization",
+        )
 
 
 def test_authoritative_asset_manifest_accepts_direct_v1_without_republication(tmp_path: Path) -> None:
