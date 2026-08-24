@@ -1507,21 +1507,54 @@ def _sampling_plan_provider_compatible(
     upstream: SamplingPlan,
     provider_plan: SamplingPlan,
 ) -> bool:
-    """Check the provider/seed projection without replacing S2.3 evidence.
+    """Check the immutable algorithm/seed boundary for a provider projection.
 
-    S2.3 freezes the sampling universe with asset-lineage metadata, while the
-    later fixed-state provider necessarily carries provider-state and registry
-    metadata.  Those metadata namespaces must not be compared as if they were
-    the same artifact.  The immutable compatibility boundary is the draw
-    algorithm, stream seed namespace, and exact ordered sample universe; the
-    caller continues using ``upstream`` as the authoritative plan.
+    S2.3 freezes a logical sampling universe, while the later G3 fixed-state
+    provider exposes the qualified physical universe.  Their universe IDs and
+    ordered sample IDs are therefore intentionally different.  The immutable
+    handoff boundary is the draw algorithm, stream seed namespace, and
+    sampling design; the caller must explicitly project the upstream streams
+    onto the provider universe before requesting any gradients.
     """
 
     return (
         upstream.algorithm_version == provider_plan.algorithm_version
         and dict(upstream.stream_seeds) == dict(provider_plan.stream_seeds)
-        and tuple(upstream.universe.sample_ids)
-        == tuple(provider_plan.universe.sample_ids)
+        and upstream.universe.sampling_design
+        == provider_plan.universe.sampling_design
+        and bool(provider_plan.universe.sample_ids)
+    )
+
+
+def _project_sampling_plan_to_provider(
+    upstream: SamplingPlan,
+    provider_plan: SamplingPlan,
+) -> SamplingPlan:
+    """Project committed S2.3 seeds onto the qualified G3 sample universe.
+
+    The S2.3 artifact remains an immutable source ref.  Only its stream seed
+    namespace and draw algorithm cross the S2.2/S2.4 boundary; physical sample
+    IDs come from the fixed-state provider so every draw is resolvable.  The
+    upstream hash is retained in projection metadata for audit/replay.
+    """
+
+    if not _sampling_plan_provider_compatible(upstream, provider_plan):
+        raise ValueError("STAGE2_SAMPLING_PROVIDER_PROJECTION_INCOMPATIBLE")
+    metadata = dict(provider_plan.universe.metadata)
+    metadata.update(
+        {
+            "projection_schema": "stage2-sampling-provider-projection-v1",
+            "upstream_sampling_plan_hash": upstream.digest,
+        }
+    )
+    return SamplingPlan(
+        SamplingUniverse(
+            provider_plan.universe.universe_id,
+            provider_plan.universe.sample_ids,
+            metadata=metadata,
+        ),
+        upstream.stream_seeds,
+        algorithm_version=upstream.algorithm_version,
     )
 
 
@@ -3283,9 +3316,8 @@ def _run_stage2_reference(
             retryable=False,
             evidence_refs=inputs.references,
         ) from error
-    if not _sampling_plan_provider_compatible(
-        upstream_sampling, _sampling_plan(request, context)
-    ):
+    provider_sampling = _sampling_plan(request, context)
+    if not _sampling_plan_provider_compatible(upstream_sampling, provider_sampling):
         raise _blocked(
             BlockerCode.CONTRACT_UNFROZEN,
             "stage2_sampling_plan",
@@ -3310,7 +3342,7 @@ def _run_stage2_reference(
         model_manifest=external_payloads.get("model_manifest"),
         stable_identity=request.config.run_intent == "local_fixture",
     )
-    sampling = upstream_sampling
+    sampling = _project_sampling_plan_to_provider(upstream_sampling, provider_sampling)
     provider_state_before = context.provider.state_digest()
     six_cell_manifest = _reference_six_cell_manifest(
         inputs,

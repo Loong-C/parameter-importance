@@ -32,6 +32,7 @@ from param_importance_nlp.experiments.stage23_task_runners import (
     _reference_tokenizer_identity,
     _run_stage2_contract,
     _run_formal_stage2_assets_and_sampling,
+    _project_sampling_plan_to_provider,
     _sampling_plan_provider_compatible,
     _stage1_formal_bridge_identity,
     _REQUIRED_PREDECESSORS,
@@ -176,6 +177,27 @@ def test_sampling_provider_compatibility_ignores_lineage_metadata_only() -> None
         upstream,
         SamplingPlan(SamplingUniverse("offline-provider", tuple(range(8))), changed),
     )
+
+
+def test_sampling_provider_projection_rebinds_ids_but_preserves_s23_seeds() -> None:
+    seeds = {name: index + 101 for index, name in enumerate(STREAM_NAMES)}
+    upstream = SamplingPlan(
+        SamplingUniverse("s23-assets", tuple(range(16)), metadata={"asset_resolution_hash": "a"}),
+        seeds,
+    )
+    provider = SamplingPlan(
+        SamplingUniverse(
+            "offline-provider",
+            tuple(f"pile:asset:record:{index:012d}" for index in range(8)),
+            metadata={"provider_state_digest": "b"},
+        ),
+        seeds,
+    )
+    projected = _project_sampling_plan_to_provider(upstream, provider)
+    assert projected.stream_seeds == upstream.stream_seeds
+    assert projected.universe.sample_ids == provider.universe.sample_ids
+    assert projected.universe.metadata["upstream_sampling_plan_hash"] == upstream.digest
+    assert projected.draws("pilot", 8) == projected.draws("pilot", 8)
 
 
 def _formal_stage2_01_request(
