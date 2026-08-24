@@ -355,6 +355,7 @@ def prepare_formal_s204(
         s23_asset_task_ref=asset_ref,
         asset_manifest_ref=asset_ref,
         g3_resolution_ref=g3_ref,
+        preregistration_ref=predecessor_refs[s21_task]["preregistration"],
     )
     index_ref = publish_six_cell_materialization_index(
         root,

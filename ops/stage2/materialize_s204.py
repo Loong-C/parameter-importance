@@ -3456,6 +3456,7 @@ def publish_per_cell_runtime_environments(
     s23_asset_task_ref: str | None = None,
     asset_manifest_ref: str | None = None,
     g3_resolution_ref: str | None = None,
+    preregistration_ref: str | None = None,
     tokenizer_asset_id: str = DEFAULT_TOKENIZER_ASSET_ID,
     data_asset_id: str = DEFAULT_DATA_ASSET_ID,
     delta_phase: str = "pre_sizing",
@@ -3507,6 +3508,15 @@ def publish_per_cell_runtime_environments(
                 raise ValueError("S2.3 asset task kind mismatch")
             manifest = _formal_s23_asset_manifest(s23_loaded.payload, field="s23_asset_task")
             g3_assets = FormalG3RuntimeAssets.load(root, _source_ref(g3_resolution_ref, "g3_resolution"))
+            if not isinstance(preregistration_ref, str) or not preregistration_ref:
+                raise ValueError("formal preregistration TaskArtifact ref missing")
+            preregistration = load_committed_task_artifact(
+                root,
+                _source_ref(preregistration_ref, "preregistration"),
+                require_formal=True,
+            )
+            if preregistration.identity.artifact_kind != "preregistration":
+                raise ValueError("S2.1 preregistration TaskArtifact kind mismatch")
         except Exception as error:
             raise _error("FORMAL_EXTERNAL_LINEAGE_INVALID") from error
         if tuple(config_refs or {}) != EXPECTED_CELL_IDS:
@@ -3721,6 +3731,7 @@ def publish_per_cell_runtime_environments(
                     "stage2_model_manifest": auxiliary["model_manifest"],
                     "stage2_data_manifest": auxiliary["data_manifest"],
                     "stage2_tokenizer_manifest": auxiliary["tokenizer_manifest"],
+                    "stage2_preregistration": _source_ref(preregistration_ref, "preregistration"),
                     "stage2_parameter_registry": auxiliary["parameter_registry"],
                     "stage2_reference_delta_sci": auxiliary["reference_delta_sci"],
                     "stage2_reference_sizing_plan": auxiliary["reference_sizing_plan"],
