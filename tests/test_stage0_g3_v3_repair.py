@@ -28,8 +28,11 @@ from param_importance_nlp.g3_gate import (
 ROOT = Path(__file__).resolve().parents[1]
 V1_REQUIREMENTS = ROOT / "configs/stage0/g3-asset-requirements-v1.json"
 V2_REQUIREMENTS = ROOT / "configs/stage0/g3-asset-requirements-v2.json"
+V3_REQUIREMENTS = ROOT / "configs/stage0/g3-asset-requirements-v3.json"
 V3_LAYOUT = ROOT / "configs/stage0/g3-asset-layout-v3.json"
 V3_PLAN = ROOT / "configs/stage0/g3-download-plan-v3.json"
+V4_LAYOUT = ROOT / "configs/stage0/g3-asset-layout-v4.json"
+V4_PLAN = ROOT / "configs/stage0/g3-download-plan-v4.json"
 
 
 def _repair_fixture(tmp_path: Path) -> tuple[dict[str, object], Path, dict[str, object]]:
@@ -41,7 +44,7 @@ def _repair_fixture(tmp_path: Path) -> tuple[dict[str, object], Path, dict[str, 
     )
     diagnostic = model["legacy_manifest_diagnostic"]
     canonical_value = {
-        "schema_version": "parameter-importance-model-manifest-v1",
+        "schema": "parameter-importance-model-manifest-v1",
         "asset": "pythia-31m-deduped-step0",
     }
     canonical_raw = canonical_json_bytes(canonical_value)
@@ -63,18 +66,25 @@ def _repair_fixture(tmp_path: Path) -> tuple[dict[str, object], Path, dict[str, 
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_bytes(canonical_raw)
     evidence = {
-        "schema_version": "stage2-s23-manifest-repair-v1",
-        "targets": list(diagnostic["refs"]),
-        "original_sha256": diagnostic["sha256"],
-        "canonical_sha256": diagnostic["canonical_sha256"],
-        "original_size_bytes": diagnostic["size_bytes"],
-        "canonical_size_bytes": diagnostic["canonical_size_bytes"],
-        "original_encoding": "utf-8-bom",
-        "canonical_encoding": "utf-8",
-        "replaced_atomically": True,
+        "schema_version": "stage2-manifest-repair-evidence-v1",
+        "repair_id": "s23-manifest-repair-20260823-01",
+        "reason": "remove_utf8_bom_without_changing_json_value",
+        "targets": [
+            {
+                "target": str(root.joinpath(*ref.split("/"))),
+                "original_sha256": diagnostic["sha256"],
+                "original_size_bytes": diagnostic["size_bytes"],
+                "original_json_encoding": "utf-8-bom",
+                "canonical_sha256": diagnostic["canonical_sha256"],
+                "canonical_size_bytes": diagnostic["canonical_size_bytes"],
+                "canonical_json_encoding": "utf-8",
+                "replaced_atomically": True,
+            }
+            for ref in diagnostic["refs"]
+        ],
         "weights_touched": False,
-        "active_part_or_lock_touched": False,
         "pile_objects_touched": False,
+        "active_part_or_lock_touched": False,
     }
     evidence_raw = canonical_json_bytes(evidence)
     diagnostic["repair_evidence_sha256"] = hashlib.sha256(evidence_raw).hexdigest()
@@ -121,6 +131,33 @@ def test_v3_control_plane_is_append_only_and_bound() -> None:
     )
 
 
+def test_v4_control_plane_is_append_only_and_reuses_verified_derived_roots() -> None:
+    previous = load_stage0_asset_requirements(V2_REQUIREMENTS)
+    requirements = load_stage0_asset_requirements(V3_REQUIREMENTS)
+    assert requirements == previous
+    layout = load_stage0_asset_layout(V4_LAYOUT, requirements=requirements)
+    plan = load_g3_download_plan(V4_PLAN, requirements=requirements, layout=layout)
+    assert layout["requirements_ref"].endswith("g3-asset-requirements-v3.json")
+    assert plan["layout_ref"].endswith("g3-asset-layout-v4.json")
+    assert all(
+        entry["manifest_ref"].startswith("manifests/g3-v4/")
+        and entry["qualification_ref"].startswith("manifests/g3-v4/")
+        for entry in layout["entries"]
+    )
+    assert {
+        entry["asset_root_ref"]
+        for entry in layout["entries"]
+        if entry["kind"] == "glue_derived"
+    } == {
+        "datasets/glue-sst2-pretokenized-v3",
+        "datasets/glue-mnli-pretokenized-v3",
+        "datasets/glue-rte-pretokenized-v3",
+    }
+    assert requirements["artifact_hash"] == requirements_artifact_hash(requirements)
+    assert layout["artifact_hash"] == layout_artifact_hash(layout)
+    assert plan["artifact_hash"] == download_plan_artifact_hash(plan)
+
+
 def test_repaired_legacy_manifest_requires_evidence_and_accepts_canonical_pair(
     tmp_path: Path,
 ) -> None:
@@ -164,7 +201,7 @@ def test_repaired_legacy_manifest_rejects_evidence_or_payload_drift(
     elif mutation == "weights":
         evidence["weights_touched"] = True
     else:
-        evidence["replaced_atomically"] = False
+        evidence["targets"][0]["replaced_atomically"] = False
     evidence_path = root.joinpath(*diagnostic["repair_evidence_ref"].split("/"))
     evidence_path.write_bytes(canonical_json_bytes(evidence))
     if mutation not in {"payload", "evidence_hash"}:
