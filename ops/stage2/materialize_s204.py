@@ -1693,8 +1693,20 @@ def _validate_formal_s22_task_group(
             raise _error("S22_CONFIG_IDENTITY_MISMATCH", kind)
         if not required_refs.issubset(item.source_refs):
             raise _error("S22_LINEAGE_BINDING_MISMATCH", kind)
-        if kind in {"handoff_manifest", "fixed_state_contract"}:
+        if kind == "handoff_manifest":
             if item.payload.get("scope") != "formal" or item.payload.get("status") != "FORMAL_CANDIDATE" or item.payload.get("formal_eligible") is not False:
+                raise _error("S22_CANDIDATE_PAYLOAD_INVALID", kind)
+        elif kind == "fixed_state_contract":
+            optional_scope = item.payload.get("scope")
+            if (
+                item.payload.get("schema_version") != _PAYLOAD_SCHEMAS[kind]
+                or (optional_scope is not None and optional_scope != "formal")
+                or item.payload.get("status") != "FORMAL_CANDIDATE"
+                or item.payload.get("formal_eligible") is not False
+                or item.payload.get("contract_version") != "stage2-fixed-state-contract-v1"
+                or not isinstance(item.payload.get("fixed_state_id"), str)
+                or not item.payload["fixed_state_id"]
+            ):
                 raise _error("S22_CANDIDATE_PAYLOAD_INVALID", kind)
         elif item.payload.get("schema_version") != _PAYLOAD_SCHEMAS[kind] or item.payload.get("formal_eligible") is not False:
             raise _error("S22_GATE_CANDIDATE_INVALID")

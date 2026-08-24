@@ -264,7 +264,8 @@ def _valid_s22_group(root: Path) -> tuple[dict[str, str], dict[str, object], str
         },
         "fixed_state_contract": {
             "schema_version": "stage2-task-fixed-state-contract-v1",
-            "scope": "formal",
+            "contract_version": "stage2-fixed-state-contract-v1",
+            "fixed_state_id": "fixture-fixed-state-v1",
             "status": "FORMAL_CANDIDATE",
             "formal_eligible": False,
         },
@@ -318,6 +319,10 @@ def test_s22_absent_produces_and_complete_rerun_is_idempotent(tmp_path: Path, mo
     producer_kwargs["g21_resolved_config_ref"] = S204_S22_CONFIG_REF
     first = ensure_formal_s22_task_outputs(tmp_path, predecessor_refs=predecessor, output_dir=S204_S22_CONTROL_OUTPUT_DIR, producer_kwargs=producer_kwargs)
     assert first[0] == refs and calls == [S204_S22_CONTROL_OUTPUT_DIR]
+    fixed = load_committed_task_artifact(tmp_path, refs["fixed_state_contract"], require_formal=True)
+    assert "scope" not in fixed.payload
+    assert fixed.payload["contract_version"] == "stage2-fixed-state-contract-v1"
+    assert fixed.payload["fixed_state_id"] == "fixture-fixed-state-v1"
     second = ensure_formal_s22_task_outputs(tmp_path, predecessor_refs=predecessor, output_dir=S204_S22_CONTROL_OUTPUT_DIR, producer_kwargs=producer_kwargs)
     assert second[0] == refs and calls == [S204_S22_CONTROL_OUTPUT_DIR]
 
