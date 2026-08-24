@@ -40,6 +40,7 @@ try:  # noqa: E402
         _validate_formal_s22_task_group,
         _safe_relative,
         _source_ref,
+        _extend_formal_execution,
         build_formal_runtime_environment,
         generate_six_cell_configs,
         publish_formal_registry_artifacts,
@@ -68,6 +69,7 @@ except ModuleNotFoundError:  # direct ``python ops/stage2/prepare...`` launch
         _validate_formal_s22_task_group,
         _safe_relative,
         _source_ref,
+        _extend_formal_execution,
         build_formal_runtime_environment,
         generate_six_cell_configs,
         publish_formal_registry_artifacts,
@@ -207,6 +209,9 @@ def prepare_formal_s204(
         gate_ref=_required_ref(sources, "g22_adapter_output"),
         expected_refs=(asset_ref, *tuple(load_committed_task_artifact(root, asset_ref, require_formal=True).source_refs)),
     )
+    g22_gate = GateRecord.from_mapping(
+        dict(load_committed_task_artifact(root, g22_ref, require_formal=True).payload)
+    )
 
     # The external G2.1 handoff report is a hardware authority; it is not the
     # S2.2 TaskArtifact handoff_manifest.  Keep the two refs independent.
@@ -249,6 +254,12 @@ def prepare_formal_s204(
             "stage1_11_refs": stage1_11_refs,
             "g1_ref": _required_ref(_mapping(sources.get("gate_refs"), "gate_refs"), "stage1.G1-EXIT"),
         },
+    )
+    evidence, formal_evidence_ref = _extend_formal_execution(
+        root,
+        evidence_ref=formal_evidence_ref,
+        gate=g22_gate,
+        destination=f"{output}/formal-execution-g22.json",
     )
 
     s21_refs = predecessor_refs["stage2.01_scope_hypotheses_and_preregistration"]
