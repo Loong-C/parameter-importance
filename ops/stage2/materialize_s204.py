@@ -1274,7 +1274,12 @@ def _build_phase_environment(
         raise _error("G3_RUNTIME_ASSETS_INVALID", g3_source) from error
     asset_ref = _source_ref(stage2_asset_ref, "stage2_asset_resolution")
     try:
-        raw_asset = _load_mapping(root, asset_ref, "stage2_asset_resolution")
+        raw_asset = _load_formal_or_direct_payload(
+            root,
+            asset_ref,
+            field="stage2_asset_resolution",
+            artifact_kind="asset_resolution",
+        )
         if raw_asset.get("schema_version") == "stage2-task-asset-resolution-v1":
             asset = _formal_s23_asset_manifest(raw_asset, field=asset_ref)
         else:
@@ -3012,7 +3017,12 @@ def build_formal_runtime_environment(
 
     asset_source = _source_ref(stage2_asset_resolution_ref, "stage2_asset_resolution")
     try:
-        raw_asset = _load_mapping(root, asset_source, "stage2_asset_resolution")
+        raw_asset = _load_formal_or_direct_payload(
+            root,
+            asset_source,
+            field="stage2_asset_resolution",
+            artifact_kind="asset_resolution",
+        )
         if raw_asset.get("schema_version") == "stage2-task-asset-resolution-v1":
             asset_manifest = _formal_s23_asset_manifest(raw_asset, field=asset_source)
         else:
