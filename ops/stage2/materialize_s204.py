@@ -110,7 +110,7 @@ S204_SCHEMA: Final = "stage2-reference-sizing-plan-v1"
 # the launcher at execution time and must never be materialized here.
 EXCLUDED_PCI: Final = G21_EXCLUDED_PCI
 EXCLUDED_UUID: Final = G21_EXCLUDED_UUID
-DEFAULT_CANDIDATES: Final = (512, 1024, 2048, 4096)
+DEFAULT_CANDIDATES: Final = (512, 1024, 2048, 4096, 8192, 16384)
 DEFAULT_BLOCK_SIZE: Final = 32
 DEFAULT_TOKENIZER_ASSET_ID: Final = "pythia-tokenizer"
 DEFAULT_DATA_ASSET_ID: Final = "pile-selected-prefix"

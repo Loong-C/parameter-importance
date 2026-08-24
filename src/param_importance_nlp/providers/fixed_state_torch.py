@@ -732,7 +732,8 @@ class TorchFixedStateGradientProvider:
         computation_error: BaseException | None = None
         drift_reasons: tuple[str, ...] = ()
         try:
-            losses = []
+            loss_numerator_total: torch.Tensor | None = None
+            gradient_sums: dict[str, torch.Tensor] = {}
             total_count = 0
             observed_loss_unit: str | None = None
             with torch.enable_grad():
@@ -748,26 +749,47 @@ class TorchFixedStateGradientProvider:
                         observed_loss_unit = loss.statistical_unit
                     elif observed_loss_unit != loss.statistical_unit:
                         raise ValueError("DRAW_LOSS_STATISTICAL_UNIT_MISMATCH")
-                    losses.append(loss.loss_numerator)
+                    # ``autograd.grad`` is deliberately called per resolved
+                    # sample.  Retaining every sample's graph until a single
+                    # combined backward made block_size a peak-memory
+                    # multiplier.  The detached numerator preserves the old
+                    # combined-loss value without retaining its graph.
+                    numerator = loss.loss_numerator.detach()
+                    loss_numerator_total = (
+                        numerator
+                        if loss_numerator_total is None
+                        else loss_numerator_total + numerator
+                    )
+                    gradients = torch.autograd.grad(
+                        loss.loss_numerator,
+                        tuple(self._parameters[name] for name in self.parameter_names),
+                        create_graph=False,
+                        retain_graph=False,
+                        allow_unused=False,
+                    )
+                    for name, gradient in zip(self.parameter_names, gradients, strict=True):
+                        if gradient.layout is not torch.strided:
+                            raise ValueError(f"FIXED_STATE_SPARSE_GRADIENT:{name}")
+                        detached = gradient.detach().to(dtype=torch.float64)
+                        if not bool(torch.isfinite(detached).all()):
+                            raise ValueError(f"FIXED_STATE_NONFINITE_GRADIENT:{name}")
+                        if name not in gradient_sums:
+                            gradient_sums[name] = detached.clone()
+                        else:
+                            gradient_sums[name].add_(detached)
                     total_count += loss.effective_count
                 if total_count <= 0:  # LossBatch 已拒绝 0，此处保留组合边界
                     raise ValueError("FIXED_STATE_EFFECTIVE_COUNT_ZERO")
-                numerator = losses[0]
-                for value in losses[1:]:
-                    numerator = numerator + value
-                mean_loss = numerator / total_count
-                gradients = torch.autograd.grad(
-                    mean_loss,
-                    tuple(self._parameters[name] for name in self.parameter_names),
-                    create_graph=False,
-                    retain_graph=False,
-                    allow_unused=False,
-                )
+                if loss_numerator_total is None:
+                    raise ValueError("FIXED_STATE_LOSS_NUMERATOR_MISSING")
+                mean_loss = loss_numerator_total / total_count
             output: dict[str, torch.Tensor] = {}
-            for name, gradient in zip(self.parameter_names, gradients, strict=True):
-                if gradient.layout is not torch.strided:
-                    raise ValueError(f"FIXED_STATE_SPARSE_GRADIENT:{name}")
-                converted = gradient.detach().to(dtype=self.output_dtype).clone()
+            for name in self.parameter_names:
+                if name not in gradient_sums:
+                    raise ValueError(f"FIXED_STATE_GRADIENT_MISSING:{name}")
+                converted = (gradient_sums[name] / total_count).to(
+                    dtype=self.output_dtype
+                )
                 if not bool(torch.isfinite(converted).all()):
                     raise ValueError(f"FIXED_STATE_NONFINITE_GRADIENT:{name}")
                 output[name] = converted

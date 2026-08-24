@@ -99,12 +99,45 @@ def test_weighted_draw_mean_matches_explicit_autograd_and_preserves_state() -> N
     assert result.weight_unit == "effective_target_tokens"
     assert result.gradients["weight"].dtype == torch.float32
     torch.testing.assert_close(
-        result.gradients["weight"], expected.to(dtype=torch.float32)
+        result.gradients["weight"],
+        expected.to(dtype=torch.float32),
+        rtol=1e-6,
+        atol=1e-7,
     )
     assert provider.state_digest() == before
     torch.testing.assert_close(module.weight.grad, existing_grad)
     assert module.training is True
     assert module.forward_counter.item() == 0
+
+
+def test_gradient_accumulates_detached_per_sample_grads_without_state_drift(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _ScaleLM()
+    provider = TorchFixedStateGradientProvider(
+        TorchModelAdapter(module, task_type="causal_lm"),
+        _resolver(),
+        fixed_state_id="per-sample-accumulator",
+        output_dtype=torch.float64,
+    )
+    before = provider.state_digest()
+    original_grad = torch.autograd.grad
+    calls: list[object] = []
+
+    def counted_grad(*args: object, **kwargs: object):
+        calls.append(args[0])
+        return original_grad(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(torch.autograd, "grad", counted_grad)
+    result = provider.gradient(
+        [
+            SimpleNamespace(sample_id="a", draw_id="draw-a"),
+            SimpleNamespace(sample_id="b", draw_id="draw-b"),
+        ]
+    )
+    assert len(calls) == 2
+    assert provider.state_digest() == before
+    assert torch.isfinite(result.gradients["weight"]).all()
 
 
 def test_parameter_registry_identity_and_resolver_defensive_copy() -> None:
