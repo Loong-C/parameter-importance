@@ -82,6 +82,15 @@ _G3_CRITICAL_SOURCE_REFS: Final = (
 
 _SHA256_RE: Final = re.compile(r"^[0-9a-f]{64}$")
 _GIT_COMMIT_RE: Final = re.compile(r"^[0-9a-f]{40}$")
+_G3_REQUIREMENTS_REF_RE: Final = re.compile(
+    r"^configs/stage0/g3-asset-requirements-v[1-9][0-9]*\.json$"
+)
+_G3_LAYOUT_REF_RE: Final = re.compile(
+    r"^configs/stage0/g3-asset-layout-v[1-9][0-9]*\.json$"
+)
+_G3_DOWNLOAD_PLAN_REF_RE: Final = re.compile(
+    r"^configs/stage0/g3-download-plan-v[1-9][0-9]*\.json$"
+)
 _LEGACY_PROVIDER_PATH_FIELDS: Final = (
     "model_manifest_ref",
     "model_root_ref",
@@ -250,6 +259,7 @@ def _assert_g3_source_commit_compatible(
     source_commit: str,
     *,
     source_root: str | Path | None = None,
+    critical_source_refs: tuple[str, ...] = _G3_CRITICAL_SOURCE_REFS,
 ) -> None:
     """Accept later unrelated commits, but reject any G3 source drift.
 
@@ -262,6 +272,12 @@ def _assert_g3_source_commit_compatible(
 
     if _GIT_COMMIT_RE.fullmatch(source_commit) is None:
         raise G3RuntimeAssetError("G3_RUNTIME_RESOLUTION_SOURCE_COMMIT_INVALID")
+    if (
+        type(critical_source_refs) is not tuple
+        or any(not isinstance(reference, str) for reference in critical_source_refs)
+        or len(set(critical_source_refs)) != len(critical_source_refs)
+    ):
+        raise G3RuntimeAssetError("G3_RUNTIME_RESOLUTION_SOURCE_REFS_INCOMPLETE")
     root = _git_source_root(source_root)
     verified = _run_git(root, "rev-parse", "--verify", f"{source_commit}^{{commit}}")
     if verified.returncode != 0 or verified.stdout.strip() != source_commit:
@@ -275,7 +291,7 @@ def _assert_g3_source_commit_compatible(
     if ancestor.returncode != 0:
         raise G3RuntimeAssetError("G3_RUNTIME_SOURCE_GIT_UNAVAILABLE")
 
-    for reference in _G3_CRITICAL_SOURCE_REFS:
+    for reference in critical_source_refs:
         present = _run_git(root, "cat-file", "-e", f"{source_commit}:{reference}")
         if present.returncode != 0:
             raise G3RuntimeAssetError(
@@ -288,7 +304,7 @@ def _assert_g3_source_commit_compatible(
         "--quiet",
         f"{source_commit}..{head}",
         "--",
-        *_G3_CRITICAL_SOURCE_REFS,
+        *critical_source_refs,
     )
     if committed.returncode == 1:
         raise G3RuntimeAssetError("G3_RUNTIME_RESOLUTION_CRITICAL_SOURCE_DRIFT")
@@ -301,7 +317,7 @@ def _assert_g3_source_commit_compatible(
             *scope,
             "--quiet",
             "--",
-            *_G3_CRITICAL_SOURCE_REFS,
+            *critical_source_refs,
         )
         if dirty.returncode == 1:
             raise G3RuntimeAssetError("G3_RUNTIME_CRITICAL_SOURCE_WORKTREE_DIRTY")
@@ -320,26 +336,73 @@ def _validate_committed_source_refs(
     source_refs: tuple[str, ...],
     resolution: Mapping[str, Any],
 ) -> str:
-    observed = set(source_refs)
-    git_refs = {reference for reference in observed if reference.startswith("git-source/")}
+    try:
+        observed = set(source_refs)
+    except TypeError as error:
+        raise G3RuntimeAssetError(
+            "G3_RUNTIME_RESOLUTION_SOURCE_REF_INVALID"
+        ) from error
+    if any(not isinstance(reference, str) for reference in source_refs):
+        raise G3RuntimeAssetError("G3_RUNTIME_RESOLUTION_SOURCE_REF_INVALID")
+    git_refs = tuple(
+        reference for reference in source_refs if reference.startswith("git-source/")
+    )
+    if len(git_refs) != len(set(git_refs)):
+        raise G3RuntimeAssetError("G3_RUNTIME_RESOLUTION_SOURCE_REFS_INCOMPLETE")
     source_commits: set[str] = set()
+    git_paths: set[str] = set()
     for reference in git_refs:
         parts = reference.split("/", 2)
-        if len(parts) != 3 or _GIT_COMMIT_RE.fullmatch(parts[1]) is None:
+        if (
+            len(parts) != 3
+            or parts[0] != "git-source"
+            or _GIT_COMMIT_RE.fullmatch(parts[1]) is None
+            or not parts[2]
+        ):
             raise G3RuntimeAssetError("G3_RUNTIME_RESOLUTION_SOURCE_REF_INVALID")
         source_commits.add(parts[1])
+        git_paths.add(parts[2])
     if len(source_commits) != 1:
         raise G3RuntimeAssetError("G3_RUNTIME_RESOLUTION_SOURCE_COMMIT_AMBIGUOUS")
     source_commit = next(iter(source_commits))
+    requirements_ref = resolution.get("requirements_ref")
+    if (
+        not isinstance(requirements_ref, str)
+        or _G3_REQUIREMENTS_REF_RE.fullmatch(requirements_ref) is None
+    ):
+        raise G3RuntimeAssetError("G3_RUNTIME_RESOLUTION_SOURCE_REF_INVALID")
+    layout_refs = {
+        reference for reference in git_paths if _G3_LAYOUT_REF_RE.fullmatch(reference)
+    }
+    download_plan_refs = {
+        reference
+        for reference in git_paths
+        if _G3_DOWNLOAD_PLAN_REF_RE.fullmatch(reference)
+    }
+    if len(layout_refs) != 1 or len(download_plan_refs) != 1:
+        raise G3RuntimeAssetError("G3_RUNTIME_RESOLUTION_SOURCE_REFS_INCOMPLETE")
+    layout_ref = next(iter(layout_refs))
+    download_plan_ref = next(iter(download_plan_refs))
+    critical_source_refs = (
+        requirements_ref,
+        layout_ref,
+        download_plan_ref,
+        *_G3_CRITICAL_SOURCE_REFS[3:],
+    )
+    if len(set(critical_source_refs)) != len(critical_source_refs):
+        raise G3RuntimeAssetError("G3_RUNTIME_RESOLUTION_SOURCE_REFS_INCOMPLETE")
     expected_git_refs = {
         f"git-source/{source_commit}/{reference}"
-        for reference in _G3_CRITICAL_SOURCE_REFS
+        for reference in critical_source_refs
     }
-    if git_refs != expected_git_refs:
+    if set(git_refs) != expected_git_refs:
         raise G3RuntimeAssetError("G3_RUNTIME_RESOLUTION_SOURCE_REFS_INCOMPLETE")
-    _assert_g3_source_commit_compatible(source_commit)
+    _assert_g3_source_commit_compatible(
+        source_commit,
+        critical_source_refs=critical_source_refs,
+    )
 
-    required_evidence_refs = {str(resolution["requirements_ref"])}
+    required_evidence_refs = {requirements_ref}
     raw_entries = resolution.get("entries")
     if not isinstance(raw_entries, list):
         raise G3RuntimeAssetError("G3_RUNTIME_RESOLUTION_ENTRIES_INVALID")

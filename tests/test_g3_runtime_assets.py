@@ -46,7 +46,7 @@ def _bind_fixture_source_head(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         runtime_assets_module,
         "_assert_g3_source_commit_compatible",
-        lambda source_commit, *, source_root=None: None,
+        lambda source_commit, *, source_root=None, critical_source_refs=None: None,
     )
 
 
@@ -262,6 +262,131 @@ def test_source_compatibility_allows_unrelated_commit_but_rejects_drift(
         G3RuntimeAssetError, match="G3_RUNTIME_RESOLUTION_CRITICAL_SOURCE_DRIFT"
     ):
         _ORIGINAL_ASSERT_SOURCE_COMPATIBLE(source_commit, source_root=repo)
+
+
+def _dynamic_source_refs(
+    *,
+    requirements_ref: str = "configs/stage0/g3-asset-requirements-v3.json",
+    layout_ref: str = "configs/stage0/g3-asset-layout-v5.json",
+    download_plan_ref: str = "configs/stage0/g3-download-plan-v5.json",
+    extra: tuple[str, ...] = (),
+) -> tuple[str, ...]:
+    commit = _FIXTURE_SOURCE_HEAD
+    critical = (
+        requirements_ref,
+        layout_ref,
+        download_plan_ref,
+        *runtime_assets_module._G3_CRITICAL_SOURCE_REFS[3:],
+        *extra,
+    )
+    return tuple(f"git-source/{commit}/{reference}" for reference in critical) + (
+        requirements_ref,
+    )
+
+
+def test_committed_source_refs_accept_versioned_control_plane(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, tuple[str, ...]] = {}
+
+    def capture(
+        source_commit: str,
+        *,
+        source_root: str | Path | None = None,
+        critical_source_refs: tuple[str, ...] = (),
+    ) -> None:
+        captured["refs"] = critical_source_refs
+
+    monkeypatch.setattr(runtime_assets_module, "_assert_g3_source_commit_compatible", capture)
+    source_commit = _validate_source_refs_for_test(
+        _dynamic_source_refs(),
+        requirements_ref="configs/stage0/g3-asset-requirements-v3.json",
+    )
+    assert source_commit == _FIXTURE_SOURCE_HEAD
+    assert captured["refs"][:3] == (
+        "configs/stage0/g3-asset-requirements-v3.json",
+        "configs/stage0/g3-asset-layout-v5.json",
+        "configs/stage0/g3-download-plan-v5.json",
+    )
+
+
+def _validate_source_refs_for_test(
+    source_refs: tuple[str, ...], *, requirements_ref: str
+) -> str:
+    return runtime_assets_module._validate_committed_source_refs(
+        source_refs,
+        {"requirements_ref": requirements_ref, "entries": []},
+    )
+
+
+@pytest.mark.parametrize(
+    "source_refs",
+    (
+        _dynamic_source_refs(
+            layout_ref="configs/stage0/g3-asset-layout-v1.json"
+        )
+        + (
+            f"git-source/{_FIXTURE_SOURCE_HEAD}/configs/stage0/g3-asset-layout-v5.json",
+        ),
+        _dynamic_source_refs(extra=("src/extra-uncontrolled.py",)),
+    ),
+)
+def test_committed_source_refs_reject_mixed_or_extra_git_refs(
+    source_refs: tuple[str, ...],
+) -> None:
+    with pytest.raises(
+        G3RuntimeAssetError, match="G3_RUNTIME_RESOLUTION_SOURCE_REFS_INCOMPLETE"
+    ):
+        _validate_source_refs_for_test(
+            source_refs,
+            requirements_ref="configs/stage0/g3-asset-requirements-v3.json",
+        )
+
+
+def test_source_compatibility_checks_dynamic_control_plane_refs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo = tmp_path / "source-repo"
+    repo.mkdir()
+    _git(repo, "init")
+    _git(repo, "config", "user.email", "g3-runtime@example.invalid")
+    _git(repo, "config", "user.name", "G3 Runtime Test")
+    dynamic = (
+        "configs/stage0/g3-asset-requirements-v3.json",
+        "configs/stage0/g3-asset-layout-v5.json",
+        "configs/stage0/g3-download-plan-v5.json",
+        *runtime_assets_module._G3_CRITICAL_SOURCE_REFS[3:],
+    )
+    for reference in dynamic:
+        path = repo.joinpath(*reference.split("/"))
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(f"baseline:{reference}\n", encoding="utf-8")
+    _git(repo, "add", "--all")
+    _git(repo, "commit", "-m", "g3 producer")
+    source_commit = _git(repo, "rev-parse", "HEAD")
+    monkeypatch.setattr(
+        runtime_assets_module,
+        "_current_g3_source_head",
+        lambda source_root=None: _git(Path(source_root or repo), "rev-parse", "HEAD"),
+    )
+    _ORIGINAL_ASSERT_SOURCE_COMPATIBLE(
+        source_commit,
+        source_root=repo,
+        critical_source_refs=dynamic,
+    )
+    changed = repo.joinpath(*dynamic[1].split("/"))
+    changed.write_text("changed\n", encoding="utf-8")
+    _git(repo, "add", dynamic[1])
+    _git(repo, "commit", "-m", "critical source changed")
+    with pytest.raises(
+        G3RuntimeAssetError, match="G3_RUNTIME_RESOLUTION_CRITICAL_SOURCE_DRIFT"
+    ):
+        _ORIGINAL_ASSERT_SOURCE_COMPATIBLE(
+            source_commit,
+            source_root=repo,
+            critical_source_refs=dynamic,
+        )
 
 
 def test_runtime_rejects_legacy_provider_path_fallback() -> None:
