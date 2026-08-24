@@ -3967,17 +3967,19 @@ def _checkpoint_identity(
 ) -> dict[str, Any]:
     if not checkpoint.ready or checkpoint.revision is None:
         raise _error("CHECKPOINT_NOT_READY", checkpoint.checkpoint_id)
-    model_asset_id = f"{checkpoint.model_id}-step{checkpoint.training_step}"
     root_asset_id = _asset_id_from_root(checkpoint.root_ref)
-    if root_asset_id != model_asset_id:
+    expected_root_prefix = f"{checkpoint.model_id}-step{checkpoint.training_step}"
+    if root_asset_id != expected_root_prefix and not root_asset_id.startswith(
+        f"{expected_root_prefix}-"
+    ):
         raise _error(
             "CHECKPOINT_MODEL_ASSET_ID_MISMATCH",
-            f"{checkpoint.checkpoint_id}:{root_asset_id}!={model_asset_id}",
+            f"{checkpoint.checkpoint_id}:{root_asset_id}!={expected_root_prefix}",
         )
     if checkpoint.manifest_sha256 is None or checkpoint.tokenizer_sha256 is None:
         raise _error("CHECKPOINT_MANIFEST_IDENTITY_MISSING", checkpoint.checkpoint_id)
     return {
-        "model_asset_id": model_asset_id,
+        "model_asset_id": root_asset_id,
         "model_id": checkpoint.model_id,
         "training_stage": checkpoint.training_stage,
         "checkpoint_id": checkpoint.checkpoint_id,
