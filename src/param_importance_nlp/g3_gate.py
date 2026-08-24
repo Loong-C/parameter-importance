@@ -547,8 +547,13 @@ def _load_repaired_legacy_model_manifest_diagnostic(
         if not isinstance(target, str) or not target:
             raise G3GateAggregationError("LEGACY_MODEL_MANIFEST_REPAIR_TARGETS_MISMATCH")
         try:
+            target_path = Path(target)
+            if not target_path.is_absolute():
+                raise G3GateAggregationError(
+                    "LEGACY_MODEL_MANIFEST_REPAIR_TARGETS_MISMATCH"
+                )
             expected_target = str((root / PurePosixPath(reference)).resolve(strict=False))
-            observed_target = str(Path(target).resolve(strict=False))
+            observed_target = str(target_path.resolve(strict=False))
         except (OSError, RuntimeError, ValueError) as error:
             raise G3GateAggregationError(
                 "LEGACY_MODEL_MANIFEST_REPAIR_TARGETS_MISMATCH"
