@@ -281,17 +281,37 @@ def prepare_formal_s204(
     )
 
     g3_ref = _required_ref(sources, "g3_resolution")
+    # Every formal preparation must own an append-only config namespace.  The
+    # old hard-coded ``.../s204/fresh`` path allowed a later retry to silently
+    # reuse configs generated from an earlier G3/source projection.  A source
+    # manifest may pin the namespace explicitly; otherwise derive it from the
+    # preparation root so retries remain isolated by default.
+    config_output_dir = PurePosixPath(
+        str(
+            sources.get(
+                "config_output_dir",
+                f"configs/generated/stage2/s204/{PurePosixPath(output).name}",
+            )
+        )
+    ).as_posix()
+    if not config_output_dir or config_output_dir.startswith("/") or "\\" in config_output_dir:
+        raise _error("S204_CONFIG_OUTPUT_DIR_INVALID")
     configs = generate_six_cell_configs(
         root,
         asset_manifest_ref=asset_ref,
         predecessor_refs=predecessor_refs,
         g3_resolution_ref=g3_ref,
-        output_dir=f"configs/generated/stage2/s204",
+        output_dir=config_output_dir,
         parameter_registry_refs=registry_refs,
         delta_sci_refs=delta_refs,
         delta_phase="pre_sizing",
     )
-    config_refs = write_six_cell_configs(configs, root, mode="fresh")
+    config_refs = write_six_cell_configs(
+        configs,
+        root,
+        output_dir=config_output_dir,
+        mode="fresh",
+    )
     manifest_ref = publish_six_cell_manifest(
         root,
         asset_manifest_ref=asset_ref,
