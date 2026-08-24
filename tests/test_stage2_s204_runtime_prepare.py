@@ -11,6 +11,7 @@ from ops.stage2.materialize_s204 import (
     S204_S22_COMMIT_OUTPUT_DIR,
     S204_S22_CONFIG_REF,
     S204_S22_CONTROL_OUTPUT_DIR,
+    S22_G3_FORMAL_ENVIRONMENT_REF,
     S22_G3_FORMAL_EXECUTION_G20_REF,
     S22_G3_FORMAL_EXECUTION_G21_REF,
     S204MaterializationError,
@@ -102,6 +103,14 @@ def test_s22_g3_resolution_must_be_a_formal_task_artifact(tmp_path: Path) -> Non
             tmp_path,
             "evidence/stage0/tasks/04-missing/commits/asset_resolution.json",
         )
+
+
+def test_s22_g3_environment_ref_is_append_only() -> None:
+    legacy_ref = f"{S204_S22_CONTROL_OUTPUT_DIR}/environments/stage2-02.json"
+    assert S22_G3_FORMAL_ENVIRONMENT_REF == (
+        f"{S204_S22_CONTROL_OUTPUT_DIR}/environments/stage2-02-g3-v5.json"
+    )
+    assert S22_G3_FORMAL_ENVIRONMENT_REF != legacy_ref
 
 
 def _fake_s22_g3_runtime(entries: list[dict[str, object]]) -> SimpleNamespace:
@@ -235,7 +244,7 @@ def _valid_s22_group(root: Path) -> tuple[dict[str, str], dict[str, object], str
         passed_gate_ids=frozenset({"stage1.G1-EXIT", "stage2.G2.0", "stage2.G2.1"}),
         evidence_refs=evidence_refs,
     )
-    environment_ref = f"{S204_S22_CONTROL_OUTPUT_DIR}/environments/stage2-02.json"
+    environment_ref = S22_G3_FORMAL_ENVIRONMENT_REF
     write_canonical_json(root / environment_ref, environment.to_dict())
     lineage = tuple(dict.fromkeys((
         "evidence/stage2/s201/commits/preregistration.json",

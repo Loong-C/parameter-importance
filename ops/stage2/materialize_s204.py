@@ -130,6 +130,7 @@ S204_S22_CONFIG_REF: Final = f"{S204_S22_CANONICAL_OUTPUT_DIR}/configs/generated
 # retained and never overwritten by the S2.2 formal producer.
 S22_G3_FORMAL_EXECUTION_G20_REF: Final = f"{S204_S22_CONTROL_OUTPUT_DIR}/formal-execution-g20-g3-v5.json"
 S22_G3_FORMAL_EXECUTION_G21_REF: Final = f"{S204_S22_CONTROL_OUTPUT_DIR}/formal-execution-g21-g3-v5.json"
+S22_G3_FORMAL_ENVIRONMENT_REF: Final = f"{S204_S22_CONTROL_OUTPUT_DIR}/environments/stage2-02-g3-v5.json"
 S22_G3_READY_MANIFEST_COUNT: Final = 13
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _COMMIT = re.compile(r"^[0-9a-f]{40}$")
@@ -1802,7 +1803,7 @@ def produce_formal_s22_task_outputs(
     )
     if tuple(orchestration.get("input_result_refs", ())) != expected_config_inputs:
         raise _error("S22_RESOLVED_CONFIG_INPUT_BINDING_INVALID")
-    environment_ref = f"{output_dir}/environments/stage2-02.json"
+    environment_ref = S22_G3_FORMAL_ENVIRONMENT_REF
     environment = _build_s22_formal_environment(
         root,
         formal_execution_ref=phase_evidence_ref,
@@ -1855,7 +1856,7 @@ def ensure_formal_s22_task_outputs(
     if canonical_dir != S204_S22_CONTROL_OUTPUT_DIR:
         raise _error("S22_OUTPUT_DIR_NOT_CANONICAL", canonical_dir)
     config_ref = S204_S22_CONFIG_REF
-    environment_ref = f"{canonical_dir}/environments/stage2-02.json"
+    environment_ref = S22_G3_FORMAL_ENVIRONMENT_REF
     evidence_ref = S22_G3_FORMAL_EXECUTION_G21_REF
     if raw is None:
         refs, evidence, evidence_ref, config_ref, environment_ref = produce_formal_s22_task_outputs(
@@ -4590,6 +4591,9 @@ __all__ = [
     "S204_S22_CONTROL_OUTPUT_DIR",
     "S204_S22_COMMIT_OUTPUT_DIR",
     "S204_S22_CONFIG_REF",
+    "S22_G3_FORMAL_ENVIRONMENT_REF",
+    "S22_G3_FORMAL_EXECUTION_G20_REF",
+    "S22_G3_FORMAL_EXECUTION_G21_REF",
     "STAGE1_10_TASK_ID",
     "STAGE1_10_TASK_INPUTS",
     "STAGE1_TASK_ID",
