@@ -213,6 +213,29 @@ def _default_control_plane_paths() -> tuple[Path, Path]:
     return source_root / G3_REQUIREMENTS_REF, source_root / G3_LAYOUT_REF
 
 
+def _source_control_plane_path(
+    source_root: str | Path,
+    reference: str,
+    *,
+    field: str,
+) -> Path:
+    if "\\" in reference:
+        raise G3RuntimeAssetError(f"G3_RUNTIME_SOURCE_REF_INVALID:{field}")
+    logical = PurePosixPath(reference)
+    if logical.is_absolute() or any(part in {"", ".", ".."} for part in logical.parts):
+        raise G3RuntimeAssetError(f"G3_RUNTIME_SOURCE_REF_INVALID:{field}")
+    root = Path(source_root).resolve(strict=True)
+    candidate = root.joinpath(*logical.parts)
+    try:
+        resolved = candidate.resolve(strict=True)
+        resolved.relative_to(root)
+    except (OSError, ValueError) as error:
+        raise G3RuntimeAssetError(f"G3_RUNTIME_SOURCE_REF_INVALID:{field}") from error
+    if not resolved.is_file():
+        raise G3RuntimeAssetError(f"G3_RUNTIME_SOURCE_REF_INVALID:{field}")
+    return resolved
+
+
 def _git_source_root(source_root: str | Path | None = None) -> Path:
     return (
         Path(source_root).resolve()
@@ -332,10 +355,10 @@ def current_g3_source_refs() -> tuple[str, ...]:
     return tuple(f"git-source/{head}/{ref}" for ref in _G3_CRITICAL_SOURCE_REFS)
 
 
-def _validate_committed_source_refs(
+def _parse_committed_source_refs(
     source_refs: tuple[str, ...],
     resolution: Mapping[str, Any],
-) -> str:
+) -> tuple[str, str, str, str, tuple[str, ...]]:
     try:
         observed = set(source_refs)
     except TypeError as error:
@@ -424,7 +447,20 @@ def _validate_committed_source_refs(
         raise G3RuntimeAssetError(
             "G3_RUNTIME_RESOLUTION_EVIDENCE_SOURCE_REFS_INCOMPLETE"
         )
-    return source_commit
+    return (
+        source_commit,
+        requirements_ref,
+        layout_ref,
+        download_plan_ref,
+        critical_source_refs,
+    )
+
+
+def _validate_committed_source_refs(
+    source_refs: tuple[str, ...],
+    resolution: Mapping[str, Any],
+) -> str:
+    return _parse_committed_source_refs(source_refs, resolution)[0]
 
 
 def _length_prefixed(digest: Any, value: bytes) -> None:
@@ -791,18 +827,12 @@ class FormalG3RuntimeAssets:
     ) -> "FormalG3RuntimeAssets":
         root = Path(workspace_root).resolve()
         default_requirements, default_layout = _default_control_plane_paths()
-        requirements_source = Path(requirements_path or default_requirements)
-        layout_source = Path(layout_path or default_layout)
         try:
             (
                 normalized_resolution_ref,
                 preview_object_ref,
                 preview_artifact_hash,
             ) = _validated_resolution_commit_ref(root, resolution_ref)
-            requirements = load_stage0_asset_requirements(requirements_source)
-            layout = load_stage0_asset_layout(
-                layout_source, requirements=requirements
-            )
             loaded = load_committed_task_artifact(
                 root, normalized_resolution_ref, require_formal=True
             )
@@ -823,6 +853,37 @@ class FormalG3RuntimeAssets:
             validate_stage0_g3_resolution(resolution)
         except (TypeError, ValueError) as error:
             raise G3RuntimeAssetError("G3_RUNTIME_RESOLUTION_PAYLOAD_INVALID") from error
+        try:
+            (
+                source_git_commit,
+                requirements_ref,
+                layout_ref,
+                _download_plan_ref,
+                _critical_source_refs,
+            ) = _parse_committed_source_refs(loaded.source_refs, resolution)
+            if requirements_path is None and layout_path is None:
+                source_root = _git_source_root()
+                requirements_source = _source_control_plane_path(
+                    source_root,
+                    requirements_ref,
+                    field="requirements_ref",
+                )
+                layout_source = _source_control_plane_path(
+                    source_root,
+                    layout_ref,
+                    field="layout_ref",
+                )
+            else:
+                requirements_source = Path(requirements_path or default_requirements)
+                layout_source = Path(layout_path or default_layout)
+            requirements = load_stage0_asset_requirements(requirements_source)
+            layout = load_stage0_asset_layout(
+                layout_source, requirements=requirements
+            )
+        except (OSError, TypeError, ValueError) as error:
+            if isinstance(error, G3RuntimeAssetError):
+                raise
+            raise G3RuntimeAssetError("G3_RUNTIME_RESOLUTION_LOAD_FAILED") from error
         if (
             resolution.get("schema_version") != G3_RESOLUTION_SCHEMA_VERSION
             or resolution.get("status") != "PASS"
@@ -842,9 +903,6 @@ class FormalG3RuntimeAssets:
         ):
             raise G3RuntimeAssetError("G3_RUNTIME_SUBGATES_NOT_PASS")
         entries = _validated_resolution_entries(resolution, layout)
-        source_git_commit = _validate_committed_source_refs(
-            loaded.source_refs, resolution
-        )
         return cls(
             workspace_root=root,
             resolution_ref=normalized_resolution_ref,

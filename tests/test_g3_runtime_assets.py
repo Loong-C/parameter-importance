@@ -20,7 +20,6 @@ from param_importance_nlp.g3_gate import evaluate_stage0_g3
 from param_importance_nlp.g3_runtime_assets import (
     FormalG3RuntimeAssets,
     G3RuntimeAssetError,
-    current_g3_source_refs,
     formal_pile_route,
     reject_legacy_provider_paths,
 )
@@ -80,7 +79,7 @@ def _publish_resolution(
         fixture.data_root,
         checked_at=_CHECKED_AT,
     )
-    source_refs = list(current_g3_source_refs())
+    source_refs = list(runtime_assets_module.current_g3_source_refs())
     source_refs.append(str(resolution["requirements_ref"]))
     for entry in resolution["entries"]:
         source_refs.extend(
@@ -107,6 +106,31 @@ def _publish_resolution(
     return resolution, published.commit_ref
 
 
+def _versioned_source_root(tmp_path: Path, fixture: Any) -> tuple[Path, tuple[str, ...]]:
+    source_root = tmp_path / "versioned-source"
+    for source, target in (
+        (
+            fixture.requirements_path,
+            source_root / "configs/stage0/g3-asset-requirements-v1.json",
+        ),
+        (
+            fixture.layout_path,
+            source_root / "configs/stage0/g3-asset-layout-v5.json",
+        ),
+    ):
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(source, target)
+    refs = (
+        "configs/stage0/g3-asset-requirements-v1.json",
+        "configs/stage0/g3-asset-layout-v5.json",
+        "configs/stage0/g3-download-plan-v5.json",
+        *runtime_assets_module._G3_CRITICAL_SOURCE_REFS[3:],
+    )
+    return source_root, tuple(
+        f"git-source/{_FIXTURE_SOURCE_HEAD}/{reference}" for reference in refs
+    )
+
+
 def _load_runtime(fixture: Any, reference: str) -> FormalG3RuntimeAssets:
     return FormalG3RuntimeAssets.from_request(
         _request(reference),
@@ -114,6 +138,50 @@ def _load_runtime(fixture: Any, reference: str) -> FormalG3RuntimeAssets:
         requirements_path=fixture.requirements_path,
         layout_path=fixture.layout_path,
     )
+
+
+def test_runtime_defaults_to_versioned_git_control_plane(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = _materialize_fixture(tmp_path)
+    source_root, source_refs = _versioned_source_root(tmp_path, fixture)
+    monkeypatch.setattr(
+        runtime_assets_module,
+        "_git_source_root",
+        lambda source_root=None, source_root_path=source_root: source_root_path,
+    )
+    monkeypatch.setattr(
+        runtime_assets_module, "current_g3_source_refs", lambda: source_refs
+    )
+    _resolution, reference = _publish_resolution(fixture)
+    runtime = FormalG3RuntimeAssets.from_request(_request(reference), fixture.data_root)
+    assert runtime.source_git_commit == _FIXTURE_SOURCE_HEAD
+    assert runtime.layout["artifact_hash"] == load_canonical_json(
+        source_root / "configs/stage0/g3-asset-layout-v5.json"
+    )["artifact_hash"]
+
+
+def test_runtime_default_versioned_control_plane_missing_fails_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = _materialize_fixture(tmp_path)
+    source_root, source_refs = _versioned_source_root(tmp_path, fixture)
+    (source_root / "configs/stage0/g3-asset-layout-v5.json").unlink()
+    monkeypatch.setattr(
+        runtime_assets_module,
+        "_git_source_root",
+        lambda source_root=None, source_root_path=source_root: source_root_path,
+    )
+    monkeypatch.setattr(
+        runtime_assets_module, "current_g3_source_refs", lambda: source_refs
+    )
+    _resolution, reference = _publish_resolution(fixture)
+    with pytest.raises(
+        G3RuntimeAssetError, match="G3_RUNTIME_SOURCE_REF_INVALID:layout_ref"
+    ):
+        FormalG3RuntimeAssets.from_request(_request(reference), fixture.data_root)
 
 
 def test_runtime_uses_only_resolution_logical_ids_and_qualifies_glue(
