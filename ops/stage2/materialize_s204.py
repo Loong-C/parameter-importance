@@ -266,6 +266,37 @@ def _load_mapping(data_root: Path, ref: str, field: str) -> Mapping[str, Any]:
         raise _error("SOURCE_UNREADABLE", f"{field}:{ref}") from error
 
 
+def _load_raw_json_mapping(
+    data_root: Path,
+    ref: str,
+    field: str,
+    *,
+    expected_sha256: str | None = None,
+) -> Mapping[str, Any]:
+    """Load a producer's ordinary JSON manifest with byte-hash binding.
+
+    S2.3's legacy ``prefix_coverage.json`` is intentionally an ordinary JSON
+    file (and contains absolute audit paths), not a canonical control-plane
+    object.  Its declared ``manifest_sha256`` is the raw byte SHA, so it must
+    not be forced through ``load_canonical_json`` or re-hashed as canonical
+    JSON.
+    """
+
+    path = _safe_relative(data_root, ref, field)
+    try:
+        raw = path.read_bytes()
+        if expected_sha256 is not None and hashlib.sha256(raw).hexdigest() != _sha(
+            expected_sha256, f"{field}.sha256"
+        ):
+            raise _error("SOURCE_HASH_MISMATCH", field)
+        value = json.loads(raw.decode("utf-8"))
+    except S204MaterializationError:
+        raise
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError) as error:
+        raise _error("SOURCE_UNREADABLE", f"{field}:{ref}") from error
+    return _mapping(value, field)
+
+
 def _load_source_manifest(data_root: Path, value: str | Path) -> Mapping[str, Any]:
     """Load the CLI source manifest from DATA_ROOT or an explicitly contained path."""
 
@@ -3667,6 +3698,266 @@ def _formal_s23_asset_manifest(
     return manifest
 
 
+def _g3_resolved_file_inventory(
+    asset: Any, *, field: str
+) -> dict[str, tuple[int, str]]:
+    """Return the exact file inventory verified by a qualified G3 asset.
+
+    ``FormalG3RuntimeAssets.resolve`` has already performed the physical size
+    and SHA-256 checks.  Consume that resolved inventory rather than treating
+    ``ready_manifest_sha256`` as a file digest.
+    """
+
+    resolved = getattr(asset, "resolved", None)
+    raw_files = getattr(resolved, "files", None)
+    if not isinstance(raw_files, tuple) or not raw_files:
+        raise _error("G3_MANIFEST_FILE_INVENTORY_INVALID", field)
+    inventory: dict[str, tuple[int, str]] = {}
+    for index, raw in enumerate(raw_files):
+        normalized = getattr(raw, "relative_path", None)
+        size_value = getattr(raw, "size_bytes", None)
+        digest = getattr(raw, "sha256", None)
+        try:
+            normalized = _logical(normalized, f"{field}[{index}].path")
+            digest = _sha(digest, f"{field}[{index}].sha256")
+        except S204MaterializationError as error:
+            raise _error("G3_MANIFEST_FILE_DESCRIPTOR_INVALID", f"{field}[{index}]") from error
+        if isinstance(size_value, bool) or not isinstance(size_value, int) or size_value < 0:
+            raise _error("G3_MANIFEST_FILE_DESCRIPTOR_INVALID", f"{field}[{index}].size_bytes")
+        if normalized in inventory:
+            raise _error("G3_MANIFEST_FILE_PATH_DUPLICATE", f"{field}:{normalized}")
+        inventory[normalized] = (size_value, digest)
+    return inventory
+
+
+def _match_g3_file(
+    inventory: Mapping[str, tuple[int, str]],
+    path: str,
+    expected: tuple[int, str],
+    *,
+    field: str,
+) -> None:
+    """Match by relative path, with a unique basename fallback for manifests."""
+
+    observed = inventory.get(path)
+    if observed is None:
+        basename = PurePosixPath(path).name
+        candidates = [value for key, value in inventory.items() if PurePosixPath(key).name == basename]
+        if len(candidates) != 1:
+            raise _error("G3_FILE_PATH_MISSING", field)
+        observed = candidates[0]
+    if observed != expected:
+        raise _error("G3_FILE_HASH_MISMATCH", field)
+
+
+def _checkpoint_inventory(
+    checkpoint: CheckpointRecord, *, roles: set[str] | None = None
+) -> dict[str, tuple[int, str]]:
+    selected = checkpoint.files if roles is None else tuple(
+        item for item in checkpoint.files if item.role in roles
+    )
+    return {item.path: (item.size_bytes, item.sha256) for item in selected}
+
+
+def _load_checkpoint_tokenizer_identity(
+    root: Path,
+    checkpoint: CheckpointRecord,
+    *,
+    cell_id: str,
+) -> tuple[str, int, int, str]:
+    """Load one checkpoint tokenizer offline and return semantic identity."""
+
+    try:
+        from transformers import AutoTokenizer
+    except ImportError as error:
+        raise _error("G3_TOKENIZER_RUNTIME_UNAVAILABLE", cell_id) from error
+    tokenizer_root = _safe_relative(root, checkpoint.root_ref, f"checkpoint.{cell_id}.root_ref")
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(
+            str(tokenizer_root), local_files_only=True, trust_remote_code=False
+        )
+        vocab = tokenizer.get_vocab()
+        if not isinstance(vocab, Mapping) or any(
+            not isinstance(key, str) or type(value) is not int for key, value in vocab.items()
+        ):
+            raise TypeError("tokenizer vocabulary mapping is invalid")
+        observed = (
+            type(tokenizer).__name__,
+            int(tokenizer.vocab_size),
+            int(len(tokenizer)),
+            canonical_json_hash(vocab),
+        )
+    except Exception as error:
+        raise _error("G3_TOKENIZER_OFFLINE_LOAD_FAILED", cell_id) from error
+    return observed
+
+
+def _verify_checkpoint_tokenizer_files_on_disk(
+    root: Path,
+    checkpoint: CheckpointRecord,
+    *,
+    cell_id: str,
+) -> None:
+    """Retain S2.3 tokenizer file identity while permitting semantic equivalence."""
+
+    tokenizer_files = [item for item in checkpoint.files if item.role == "tokenizer"]
+    if len(tokenizer_files) != 1:
+        raise _error("G3_TOKENIZER_FILE_REQUIRED", cell_id)
+    for item in checkpoint.files:
+        if item.role not in {"tokenizer", "tokenizer_model", "special_tokens", "tokenizer_config"}:
+            continue
+        path = _safe_relative(root, f"{checkpoint.root_ref}/{item.path}", f"checkpoint.{cell_id}.{item.path}")
+        try:
+            if path.stat().st_size != item.size_bytes:
+                raise _error("G3_CHECKPOINT_FILE_SIZE_MISMATCH", f"{cell_id}:{item.path}")
+            digest = hashlib.sha256()
+            with path.open("rb") as stream:
+                for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                    digest.update(chunk)
+        except S204MaterializationError:
+            raise
+        except (OSError, ValueError) as error:
+            raise _error("G3_CHECKPOINT_FILE_UNREADABLE", f"{cell_id}:{item.path}") from error
+        if digest.hexdigest() != item.sha256:
+            raise _error("G3_CHECKPOINT_FILE_HASH_MISMATCH", f"{cell_id}:{item.path}")
+
+
+def _validate_g3_checkpoint_binding(
+    root: Path,
+    *,
+    checkpoint: CheckpointRecord,
+    base_checkpoint: CheckpointRecord,
+    model_asset: Any,
+    tokenizer_asset: Any,
+    cell_id: str,
+) -> None:
+    """Bind each S2.4 checkpoint to the G3-qualified base model safely.
+
+    The G3 model entry is a step-0 asset.  Early/mid-late S2.3 rows therefore
+    bind through their model's initialization row, not by pretending G3
+    published those later checkpoint manifests.  Tokenizer file hashes are
+    checked against the approved checkpoint root; the independently-versioned
+    G3 tokenizer manifest remains a separately bound runtime identity.
+    """
+
+    if model_asset.asset_root_ref != base_checkpoint.root_ref:
+        raise _error(
+            "G3_MODEL_ROOT_MISMATCH",
+            f"{cell_id}:{model_asset.asset_root_ref}!={base_checkpoint.root_ref}",
+        )
+    if model_asset.logical_name != _asset_id_from_root(base_checkpoint.root_ref):
+        raise _error("G3_MODEL_ASSET_ID_MISMATCH", cell_id)
+    if model_asset.resolved.revision != base_checkpoint.revision:
+        raise _error(
+            "G3_MODEL_REVISION_MISMATCH",
+            f"{cell_id}:{model_asset.resolved.revision}!={base_checkpoint.revision}",
+        )
+    model_inventory = _g3_resolved_file_inventory(
+        model_asset, field=f"g3.model.{model_asset.logical_name}.files"
+    )
+    expected_model = _checkpoint_inventory(base_checkpoint, roles={"config", "weights"})
+    if len(model_inventory) != len(expected_model):
+        raise _error("G3_MODEL_FILE_INVENTORY_MISMATCH", cell_id)
+    for path, expected in expected_model.items():
+        _match_g3_file(model_inventory, path, expected, field=f"{cell_id}:model:{path}")
+
+    # The generic G3 tokenizer is deliberately not compared by ready-manifest
+    # hash or by tokenizer.json bytes.  It is independently qualified and its
+    # semantic metadata is the cross-version contract.  The exact S2.3
+    # tokenizer files remain bound to every checkpoint root below.
+    base_tokenizer = _checkpoint_inventory(
+        base_checkpoint,
+        roles={"tokenizer", "tokenizer_model", "special_tokens", "tokenizer_config"},
+    )
+    current_tokenizer = _checkpoint_inventory(
+        checkpoint,
+        roles={"tokenizer", "tokenizer_model", "special_tokens", "tokenizer_config"},
+    )
+    if not base_tokenizer or current_tokenizer != base_tokenizer:
+        raise _error("G3_TOKENIZER_FILE_INVENTORY_MISMATCH", cell_id)
+    tokenizer_inventory = _g3_resolved_file_inventory(
+        tokenizer_asset, field=f"g3.tokenizer.{tokenizer_asset.logical_name}.files"
+    )
+    if not any(PurePosixPath(path).name == "tokenizer.json" for path in tokenizer_inventory):
+        raise _error("G3_TOKENIZER_FILE_REQUIRED", cell_id)
+    metadata = tokenizer_asset.manifest.get("metadata")
+    if not isinstance(metadata, Mapping):
+        raise _error("G3_TOKENIZER_METADATA_INVALID", cell_id)
+    expected_semantics = (
+        metadata.get("tokenizer_class"),
+        metadata.get("vocab_size"),
+        metadata.get("token_count_with_added_tokens"),
+        metadata.get("vocab_mapping_sha256"),
+    )
+    if (
+        not isinstance(expected_semantics[0], str)
+        or isinstance(expected_semantics[1], bool)
+        or not isinstance(expected_semantics[1], int)
+        or isinstance(expected_semantics[2], bool)
+        or not isinstance(expected_semantics[2], int)
+    ):
+        raise _error("G3_TOKENIZER_METADATA_INVALID", cell_id)
+    try:
+        _sha(expected_semantics[3], "g3.tokenizer.vocab_mapping_sha256")
+    except S204MaterializationError as error:
+        raise _error("G3_TOKENIZER_METADATA_INVALID", cell_id) from error
+    observed_semantics = _load_checkpoint_tokenizer_identity(root, checkpoint, cell_id=cell_id)
+    if observed_semantics != expected_semantics:
+        raise _error("G3_TOKENIZER_SEMANTIC_MISMATCH", cell_id)
+    _verify_checkpoint_tokenizer_files_on_disk(root, checkpoint, cell_id=cell_id)
+
+    # Force the separate tokenizer asset to be resolved and retained in the
+    # caller's auxiliary evidence.  Its ready-manifest hash is intentionally
+    # not compared with a checkpoint file SHA.
+    if tokenizer_asset.kind != "tokenizer" or not tokenizer_asset.manifest_ref:
+        raise _error("G3_TOKENIZER_ASSET_INVALID", cell_id)
+
+
+def _validate_g3_data_binding(
+    data: Any,
+    data_asset: Any,
+    *,
+    cell_id: str,
+) -> None:
+    """Require exact revision and two-file S2.3/G3 pile inventory equality."""
+
+    g3_revision = data_asset.resolved.revision
+    if g3_revision != data.revision:
+        raise _error("G3_DATA_REVISION_MISMATCH", f"{cell_id}:{g3_revision}!={data.revision}")
+    expected = {item.path: (item.size_bytes, item.sha256) for item in data.files}
+    observed = _g3_resolved_file_inventory(
+        data_asset, field=f"g3.data.{data_asset.logical_name}.files"
+    )
+    if len(observed) != len(expected):
+        raise _error("G3_DATA_FILE_INVENTORY_MISMATCH", cell_id)
+    for path, descriptor in expected.items():
+        _match_g3_file(observed, path, descriptor, field=f"{cell_id}:data:{path}")
+
+
+def _validate_g3_s23_runtime_equivalence(
+    root: Path,
+    *,
+    checkpoint: CheckpointRecord,
+    base_checkpoint: CheckpointRecord,
+    data: Any,
+    model_asset: Any,
+    tokenizer_asset: Any,
+    data_asset: Any,
+    cell_id: str,
+) -> None:
+    """Fail-closed S2.3↔G3 equivalence for one formal S2.4 cell."""
+
+    _validate_g3_checkpoint_binding(
+        root,
+        checkpoint=checkpoint,
+        base_checkpoint=base_checkpoint,
+        model_asset=model_asset,
+        tokenizer_asset=tokenizer_asset,
+        cell_id=cell_id,
+    )
+    _validate_g3_data_binding(data, data_asset, cell_id=cell_id)
+
+
 def _checkpoint_identity(
     checkpoint: CheckpointRecord,
     *,
@@ -4239,6 +4530,13 @@ def generate_six_cell_configs(
         raise _error("BASE_CONFIG_FORMAL_REQUIRED")
     data = manifest.data_range
     checkpoints = _expected_cell_checkpoints(manifest)
+    base_checkpoints = {
+        item.model_id: item
+        for item in checkpoints
+        if item.training_step == 0 and item.training_stage == "initialization"
+    }
+    if set(base_checkpoints) != {item.model_id for item in checkpoints}:
+        raise _error("G3_BASE_CHECKPOINT_SET_INVALID")
     expected_cell_ids = set(EXPECTED_CELL_IDS)
     if mode == "resume":
         if resume_refs is None:
@@ -4267,21 +4565,28 @@ def generate_six_cell_configs(
                 data_asset = g3_assets.resolve(data_asset_id, expected_kind="pile")
             except Exception as error:
                 raise _error("G3_CONFIG_ASSET_ID_UNRESOLVED", cell_id) from error
-            if (
-                tokenizer_asset.ready_manifest_sha256 != checkpoint.tokenizer_sha256
-                or data_asset.manifest_ref != data.manifest_ref
-                or data_asset.ready_manifest_sha256 != data.manifest_sha256
-            ):
-                raise _error("G3_CONFIG_MANIFEST_IDENTITY_MISMATCH", cell_id)
+            _validate_g3_s23_runtime_equivalence(
+                root,
+                checkpoint=checkpoint,
+                base_checkpoint=base_checkpoints[checkpoint.model_id],
+                model_asset=model_asset,
+                tokenizer_asset=tokenizer_asset,
+                data=data,
+                data_asset=data_asset,
+                cell_id=cell_id,
+            )
             checkpoint_root = _safe_relative(root, checkpoint.root_ref, f"checkpoint.{cell_id}.root_ref")
             if not checkpoint_root.is_dir():
                 raise _error("CHECKPOINT_ROOT_MISSING", cell_id)
             checkpoint_manifest = _load_mapping(root, checkpoint.manifest_ref, f"checkpoint.{cell_id}.manifest")
             if canonical_json_hash(dict(checkpoint_manifest)) != checkpoint.manifest_sha256:
                 raise _error("CHECKPOINT_MANIFEST_HASH_MISMATCH", cell_id)
-            data_manifest = _load_mapping(root, data.manifest_ref, "data.manifest")
-            if canonical_json_hash(dict(data_manifest)) != data.manifest_sha256:
-                raise _error("DATA_MANIFEST_HASH_MISMATCH", cell_id)
+            _load_raw_json_mapping(
+                root,
+                data.manifest_ref,
+                "data.manifest",
+                expected_sha256=data.manifest_sha256,
+            )
         if cell_id in cells:
             raise _error("CELL_ID_DUPLICATE", cell_id)
         if mode == "resume":
