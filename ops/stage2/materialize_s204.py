@@ -3866,7 +3866,7 @@ def publish_per_cell_delta_sci_plans(
     required = ("preregistration", "hypothesis_contract")
     if set(s21_refs) != set(required):
         raise _error("REFERENCE_DELTA_SCI_S21_INPUTS_REQUIRED")
-    contracts: list[tuple[str, LoadedTaskArtifact, Mapping[str, Any]]] = []
+    contracts: list[tuple[str, LoadedTaskArtifact]] = []
     for kind in required:
         ref = _source_ref(s21_refs[kind], f"s21.{kind}")
         loaded = _load_formal_source(
@@ -3875,13 +3875,17 @@ def publish_per_cell_delta_sci_plans(
             task_id="stage2.01_scope_hypotheses_and_preregistration",
             artifact_kind=kind,
         )
-        precision = loaded.payload.get("equivalence_and_precision")
-        if not isinstance(precision, Mapping) or not precision:
-            raise _error("REFERENCE_DELTA_SCI_FORMULA_CONTRACT_REQUIRED", kind)
-        contracts.append((ref, loaded, dict(precision)))
-    formula_hashes = {canonical_json_hash(item[2]) for item in contracts}
-    if len(formula_hashes) != 1:
-        raise _error("REFERENCE_DELTA_SCI_FORMULA_CONTRACT_DRIFT")
+        contracts.append((ref, loaded))
+    preregistration = contracts[0][1].payload
+    precision = preregistration.get("equivalence_and_precision")
+    if not isinstance(precision, Mapping) or not precision:
+        raise _error("REFERENCE_DELTA_SCI_FORMULA_CONTRACT_REQUIRED", "preregistration")
+    preregistration_hash = preregistration.get("preregistration_hash")
+    hypothesis_hash = contracts[1][1].payload.get("preregistration_hash")
+    if not isinstance(preregistration_hash, str) or hypothesis_hash != preregistration_hash:
+        raise _error("REFERENCE_DELTA_SCI_HYPOTHESIS_PREREGISTRATION_MISMATCH")
+    formula_contract = dict(precision)
+    formula_hash = canonical_json_hash(formula_contract)
     counts = tuple(int(item) for item in candidate_sample_counts)
     if tuple(sorted(set(counts))) != counts or any(item <= 0 for item in counts):
         raise _error("REFERENCE_DELTA_SCI_CANDIDATES_INVALID")
@@ -3894,8 +3898,8 @@ def publish_per_cell_delta_sci_plans(
             "phase": "pre_sizing",
             "cell_id": cell_id,
             "candidate_sample_counts": list(counts),
-            "formula_contract": contracts[0][2],
-            "formula_contract_hash": next(iter(formula_hashes)),
+            "formula_contract": formula_contract,
+            "formula_contract_hash": formula_hash,
             "source_contract_refs": [item[0] for item in contracts],
             "source_contract_artifact_hashes": [item[1].identity.artifact_hash for item in contracts],
             "numeric_delta_source": "stage2-reference-sizing-raw-shards-v2-after-sizing-commit",

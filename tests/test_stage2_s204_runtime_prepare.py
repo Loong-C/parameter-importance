@@ -27,6 +27,7 @@ from ops.stage2.materialize_s204 import (
 from ops.stage2.prepare_s204_formal import _validate_adapter_gate
 from param_importance_nlp.contracts import load_canonical_json, write_canonical_json
 from param_importance_nlp.contracts import FormalExecutionEvidence
+from param_importance_nlp.contracts.jsonio import canonical_json_hash
 from param_importance_nlp.contracts.status import GateRecord, GateStatus
 from param_importance_nlp.runtime import (
     TaskArtifactStore,
@@ -36,16 +37,29 @@ from param_importance_nlp.runtime import (
 
 
 def _s21_formula_refs(root: Path) -> dict[str, str]:
-    refs: dict[str, str] = {}
-    for kind in ("preregistration", "hypothesis_contract"):
-        payload = {
-            "schema_version": f"stage2-{kind.replace('_', '-')}-v1",
+    preregistration_body = {
+        "schema_version": "stage2-preregistration-v1",
+        "scope": "formal",
+        "equivalence_and_precision": {
+            "scientific_margin_formula": "max(0.10*Delta_c_e(B),0.01*S_c_e)",
+            "absolute_floors": {"tau_model": 1e-12, "tau_layer": 1e-12, "tau_module": 1e-12},
+        },
+    }
+    preregistration = dict(
+        preregistration_body,
+        preregistration_hash=canonical_json_hash(preregistration_body),
+    )
+    payloads = {
+        "preregistration": preregistration,
+        "hypothesis_contract": {
+            "schema_version": "stage2-hypothesis-contract-v1",
             "scope": "formal",
-            "equivalence_and_precision": {
-                "scientific_margin_formula": "max(0.10*Delta_c_e(B),0.01*S_c_e)",
-                "absolute_floors": {"tau_model": 1e-12, "tau_layer": 1e-12, "tau_module": 1e-12},
-            },
-        }
+            "preregistration_hash": preregistration["preregistration_hash"],
+            "upstream_binding_hash": "f" * 64,
+        },
+    }
+    refs: dict[str, str] = {}
+    for kind, payload in payloads.items():
         refs[kind] = TaskArtifactStore(root, f"s21/{kind}").publish(
             task_id="stage2.01_scope_hypotheses_and_preregistration",
             artifact_kind=kind,
@@ -72,17 +86,46 @@ def test_cell_id_and_path_projection_are_reversible() -> None:
 
 
 def test_pre_sizing_delta_plan_has_no_numeric_margin(tmp_path: Path) -> None:
-    refs = publish_per_cell_delta_sci_plans(tmp_path, s21_refs=_s21_formula_refs(tmp_path))
+    source_refs = _s21_formula_refs(tmp_path)
+    refs = publish_per_cell_delta_sci_plans(tmp_path, s21_refs=source_refs)
     assert tuple(refs) == EXPECTED_CELL_IDS
     payload = load_canonical_json(tmp_path / refs[EXPECTED_CELL_IDS[0]])
     assert payload["schema_version"] == "stage2-reference-delta-sci-plan-v1"
     assert "delta_sci_by_B" not in payload
+    assert payload["source_contract_refs"] == [
+        source_refs["preregistration"],
+        source_refs["hypothesis_contract"],
+    ]
+    assert payload["source_contract_artifact_hashes"] == [
+        load_committed_task_artifact(tmp_path, source_refs[kind], require_formal=True).identity.artifact_hash
+        for kind in ("preregistration", "hypothesis_contract")
+    ]
     with pytest.raises(S204MaterializationError, match="REFERENCE_DELTA_SCI_NUMERIC_REQUIRED"):
         _validate_delta_sci_artifact(
             tmp_path,
             refs[EXPECTED_CELL_IDS[0]],
             cell_id=EXPECTED_CELL_IDS[0],
         )
+
+
+def test_pre_sizing_delta_plan_rejects_hypothesis_parent_mismatch(tmp_path: Path) -> None:
+    source_refs = _s21_formula_refs(tmp_path)
+    hypothesis = load_committed_task_artifact(tmp_path, source_refs["hypothesis_contract"], require_formal=True)
+    broken = dict(hypothesis.payload, preregistration_hash="0" * 64)
+    broken_ref = TaskArtifactStore(tmp_path, "s21/hypothesis-mismatch").publish(
+        task_id="stage2.01_scope_hypotheses_and_preregistration",
+        artifact_kind="hypothesis_contract",
+        config_hash="a" * 64,
+        run_intent="formal",
+        payload=broken,
+        formal_eligible=True,
+    ).commit_ref
+    source_refs["hypothesis_contract"] = broken_ref
+    with pytest.raises(
+        S204MaterializationError,
+        match="REFERENCE_DELTA_SCI_HYPOTHESIS_PREREGISTRATION_MISMATCH",
+    ):
+        publish_per_cell_delta_sci_plans(tmp_path, s21_refs=source_refs)
 
 
 def test_missing_formal_g22_commit_blocks_prepare(tmp_path: Path) -> None:
