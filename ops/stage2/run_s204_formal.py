@@ -90,9 +90,15 @@ def _formal_logical_identity(checkpoint: Mapping[str, Any]) -> dict[str, str]:
     base_revision = _FORMAL_BASE_REVISIONS.get(model_id)
     if base_revision is None:
         raise ValueError(f"formal checkpoint model is not selected: {model_id}")
-    expected_asset_id = f"{model_id}-step{step}"
+    # Bind the launcher to the immutable S2.3 checkpoint root and identity.
+    # Trained checkpoints carry a revision-qualified root basename; deriving
+    # ``model-stepN`` here silently loses that identity.
+    root_ref = checkpoint.get("root_ref")
+    if not isinstance(root_ref, str) or not root_ref:
+        raise ValueError("formal checkpoint root_ref is incomplete")
+    expected_asset_id = PurePosixPath(root_ref).name
     expected_architecture = model_id
-    initialization_id = f"EleutherAI/{model_id}@{base_revision}:step0"
+    initialization_id = checkpoint_id
     return {
         "asset_id": expected_asset_id,
         "initialization_id": initialization_id,
