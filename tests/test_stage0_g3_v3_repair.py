@@ -33,6 +33,8 @@ V3_LAYOUT = ROOT / "configs/stage0/g3-asset-layout-v3.json"
 V3_PLAN = ROOT / "configs/stage0/g3-download-plan-v3.json"
 V4_LAYOUT = ROOT / "configs/stage0/g3-asset-layout-v4.json"
 V4_PLAN = ROOT / "configs/stage0/g3-download-plan-v4.json"
+V5_LAYOUT = ROOT / "configs/stage0/g3-asset-layout-v5.json"
+V5_PLAN = ROOT / "configs/stage0/g3-download-plan-v5.json"
 
 
 def _repair_fixture(tmp_path: Path) -> tuple[dict[str, object], Path, dict[str, object]]:
@@ -152,6 +154,35 @@ def test_v4_control_plane_is_append_only_and_reuses_verified_derived_roots() -> 
         "datasets/glue-sst2-pretokenized-v3",
         "datasets/glue-mnli-pretokenized-v3",
         "datasets/glue-rte-pretokenized-v3",
+    }
+    assert requirements["artifact_hash"] == requirements_artifact_hash(requirements)
+    assert layout["artifact_hash"] == layout_artifact_hash(layout)
+    assert plan["artifact_hash"] == download_plan_artifact_hash(plan)
+
+
+def test_v5_control_plane_uses_new_publication_namespace_and_derived_roots() -> None:
+    requirements = load_stage0_asset_requirements(V3_REQUIREMENTS)
+    layout = load_stage0_asset_layout(V5_LAYOUT, requirements=requirements)
+    plan = load_g3_download_plan(V5_PLAN, requirements=requirements, layout=layout)
+    assert layout["requirements_ref"].endswith("g3-asset-requirements-v3.json")
+    assert plan["layout_ref"].endswith("g3-asset-layout-v5.json")
+    assert layout["generator_git_commit"] == (
+        "dad3b7937ed9bf7f4859abc03b57e04acb308188"
+    )
+    assert plan["generator_git_commit"] == layout["generator_git_commit"]
+    assert all(
+        entry["manifest_ref"].startswith("manifests/g3-v5/")
+        and entry["qualification_ref"].startswith("manifests/g3-v5/")
+        for entry in layout["entries"]
+    )
+    assert {
+        entry["asset_root_ref"]
+        for entry in layout["entries"]
+        if entry["kind"] == "glue_derived"
+    } == {
+        "datasets/glue-sst2-pretokenized-v5",
+        "datasets/glue-mnli-pretokenized-v5",
+        "datasets/glue-rte-pretokenized-v5",
     }
     assert requirements["artifact_hash"] == requirements_artifact_hash(requirements)
     assert layout["artifact_hash"] == layout_artifact_hash(layout)
