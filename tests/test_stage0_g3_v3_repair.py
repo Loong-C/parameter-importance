@@ -196,8 +196,9 @@ def test_repaired_legacy_manifest_rejects_evidence_or_payload_drift(
     elif mutation == "evidence_hash":
         diagnostic["repair_evidence_sha256"] = "0" * 64
     elif mutation == "targets":
-        evidence["targets"] = list(reversed(evidence["targets"])
-        )
+        evidence["targets"][0]["target"] = Path(
+            evidence["targets"][0]["target"]
+        ).name
     elif mutation == "weights":
         evidence["weights_touched"] = True
     else:
