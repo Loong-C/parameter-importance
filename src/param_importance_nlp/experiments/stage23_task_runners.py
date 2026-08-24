@@ -1495,6 +1495,28 @@ def _sampling_plan(request: TaskExecutionRequest, context: _ProviderContext) -> 
     )
 
 
+def _sampling_plan_provider_compatible(
+    upstream: SamplingPlan,
+    provider_plan: SamplingPlan,
+) -> bool:
+    """Check the provider/seed projection without replacing S2.3 evidence.
+
+    S2.3 freezes the sampling universe with asset-lineage metadata, while the
+    later fixed-state provider necessarily carries provider-state and registry
+    metadata.  Those metadata namespaces must not be compared as if they were
+    the same artifact.  The immutable compatibility boundary is the draw
+    algorithm, stream seed namespace, and exact ordered sample universe; the
+    caller continues using ``upstream`` as the authoritative plan.
+    """
+
+    return (
+        upstream.algorithm_version == provider_plan.algorithm_version
+        and dict(upstream.stream_seeds) == dict(provider_plan.stream_seeds)
+        and tuple(upstream.universe.sample_ids)
+        == tuple(provider_plan.universe.sample_ids)
+    )
+
+
 def _sampling_plan_for_ids(
     request: TaskExecutionRequest,
     sample_ids: Sequence[Hashable],
@@ -3253,7 +3275,9 @@ def _run_stage2_reference(
             retryable=False,
             evidence_refs=inputs.references,
         ) from error
-    if upstream_sampling.digest != _sampling_plan(request, context).digest:
+    if not _sampling_plan_provider_compatible(
+        upstream_sampling, _sampling_plan(request, context)
+    ):
         raise _blocked(
             BlockerCode.CONTRACT_UNFROZEN,
             "stage2_sampling_plan",

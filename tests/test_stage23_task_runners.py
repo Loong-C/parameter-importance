@@ -32,11 +32,13 @@ from param_importance_nlp.experiments.stage23_task_runners import (
     _reference_tokenizer_identity,
     _run_stage2_contract,
     _run_formal_stage2_assets_and_sampling,
+    _sampling_plan_provider_compatible,
     _stage1_formal_bridge_identity,
     _REQUIRED_PREDECESSORS,
     build_stage23_runner_overrides,
     register_stage23_runners,
 )
+from param_importance_nlp.experiments.sampling import SamplingPlan, SamplingUniverse, STREAM_NAMES
 from param_importance_nlp.runtime.task_artifacts import TaskArtifactStore
 from param_importance_nlp.runtime.task_runtime import (
     BlockerCode,
@@ -150,6 +152,29 @@ def test_formal_reference_tokenizer_manifest_valid_identity_is_hash_bound() -> N
     assert identity["checkpoint_id"] == "checkpoint-14m-initialization"
     assert identity["identity_hash"] == canonical_json_hash(
         {key: value for key, value in identity.items() if key != "identity_hash"}
+    )
+
+
+def test_sampling_provider_compatibility_ignores_lineage_metadata_only() -> None:
+    seeds = {name: index + 101 for index, name in enumerate(STREAM_NAMES)}
+    upstream = SamplingPlan(
+        SamplingUniverse(
+            "s23-assets", tuple(range(8)), metadata={"asset_resolution_hash": "a"}
+        ),
+        seeds,
+    )
+    provider = SamplingPlan(
+        SamplingUniverse(
+            "offline-provider", tuple(range(8)), metadata={"provider_state_digest": "b"}
+        ),
+        seeds,
+    )
+    assert _sampling_plan_provider_compatible(upstream, provider)
+    changed = dict(seeds)
+    changed["pilot"] += 10
+    assert not _sampling_plan_provider_compatible(
+        upstream,
+        SamplingPlan(SamplingUniverse("offline-provider", tuple(range(8))), changed),
     )
 
 
