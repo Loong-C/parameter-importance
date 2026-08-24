@@ -3030,14 +3030,10 @@ def build_formal_runtime_environment(
             validate_formal_asset_identity(asset_manifest)
     except Exception as error:
         raise _error("S23_ASSET_RESOLUTION_INVALID", asset_source) from error
+    # G2.2's formal gate binds the canonical S2.3 asset commit directly.  Its
+    # TaskArtifact source_refs are S2.1 lineage and are intentionally not
+    # duplicated in the G2.2 gate evidence_refs.
     asset_gate_refs: tuple[str, ...] = (asset_source,)
-    try:
-        asset_task = load_committed_task_artifact(root, asset_source, require_formal=True)
-        asset_gate_refs = (asset_source, *tuple(asset_task.source_refs))
-    except Exception:
-        # Direct formal manifests remain accepted by the narrow base API.  The
-        # six-cell external-lineage path separately requires the TaskArtifact.
-        pass
 
     # Formal S2.4 consumes the complete adapter chain.  A lone G2.2 record is
     # insufficient because it cannot prove the fixed-state handoff or the
