@@ -30,6 +30,7 @@ from ops.stage2.materialize_s204 import (
     publish_per_cell_sizing_plans,
     _build_narrow_formal_environment,
     _validate_g3_s23_runtime_equivalence,
+    _load_raw_json_mapping,
 )
 from param_importance_nlp.contracts import (
     ContractFreeze,
@@ -806,6 +807,19 @@ def test_g3_s23_runtime_equivalence_rejects_model_revision_drift(
             ),
             cell_id="pythia-14m:initialization",
         )
+
+
+def test_raw_s23_manifest_uses_byte_hash_not_canonical_hash(tmp_path: Path) -> None:
+    ref = "manifests/prefix_coverage.json"
+    payload = b'{\n  "idx": "/absolute/a",\n  "covered": true\n}\n'
+    path = tmp_path / ref
+    path.parent.mkdir(parents=True)
+    path.write_bytes(payload)
+    expected = hashlib.sha256(payload).hexdigest()
+    loaded = _load_raw_json_mapping(tmp_path, ref, "data.manifest", expected_sha256=expected)
+    assert loaded["covered"] is True
+    with pytest.raises(S204MaterializationError, match="S204_SOURCE_HASH_MISMATCH"):
+        _load_raw_json_mapping(tmp_path, ref, "data.manifest", expected_sha256="0" * 64)
 
 
 def test_authoritative_asset_manifest_accepts_direct_v1_without_republication(tmp_path: Path) -> None:

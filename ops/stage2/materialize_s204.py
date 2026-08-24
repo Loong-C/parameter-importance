@@ -266,6 +266,37 @@ def _load_mapping(data_root: Path, ref: str, field: str) -> Mapping[str, Any]:
         raise _error("SOURCE_UNREADABLE", f"{field}:{ref}") from error
 
 
+def _load_raw_json_mapping(
+    data_root: Path,
+    ref: str,
+    field: str,
+    *,
+    expected_sha256: str | None = None,
+) -> Mapping[str, Any]:
+    """Load a producer's ordinary JSON manifest with byte-hash binding.
+
+    S2.3's legacy ``prefix_coverage.json`` is intentionally an ordinary JSON
+    file (and contains absolute audit paths), not a canonical control-plane
+    object.  Its declared ``manifest_sha256`` is the raw byte SHA, so it must
+    not be forced through ``load_canonical_json`` or re-hashed as canonical
+    JSON.
+    """
+
+    path = _safe_relative(data_root, ref, field)
+    try:
+        raw = path.read_bytes()
+        if expected_sha256 is not None and hashlib.sha256(raw).hexdigest() != _sha(
+            expected_sha256, f"{field}.sha256"
+        ):
+            raise _error("SOURCE_HASH_MISMATCH", field)
+        value = json.loads(raw.decode("utf-8"))
+    except S204MaterializationError:
+        raise
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError) as error:
+        raise _error("SOURCE_UNREADABLE", f"{field}:{ref}") from error
+    return _mapping(value, field)
+
+
 def _load_source_manifest(data_root: Path, value: str | Path) -> Mapping[str, Any]:
     """Load the CLI source manifest from DATA_ROOT or an explicitly contained path."""
 
@@ -4550,9 +4581,12 @@ def generate_six_cell_configs(
             checkpoint_manifest = _load_mapping(root, checkpoint.manifest_ref, f"checkpoint.{cell_id}.manifest")
             if canonical_json_hash(dict(checkpoint_manifest)) != checkpoint.manifest_sha256:
                 raise _error("CHECKPOINT_MANIFEST_HASH_MISMATCH", cell_id)
-            data_manifest = _load_mapping(root, data.manifest_ref, "data.manifest")
-            if canonical_json_hash(dict(data_manifest)) != data.manifest_sha256:
-                raise _error("DATA_MANIFEST_HASH_MISMATCH", cell_id)
+            _load_raw_json_mapping(
+                root,
+                data.manifest_ref,
+                "data.manifest",
+                expected_sha256=data.manifest_sha256,
+            )
         if cell_id in cells:
             raise _error("CELL_ID_DUPLICATE", cell_id)
         if mode == "resume":
