@@ -407,7 +407,14 @@ def _load_repaired_legacy_model_manifest_diagnostic(
     replacement_ref: str,
     diagnostic: Mapping[str, Any],
 ) -> dict[str, Any]:
-    """Validate canonicalized legacy refs and their S2.3 repair evidence."""
+    """Validate canonicalized legacy refs and their S2.3 repair evidence.
+
+    The evidence was emitted by the S2.3 repair utility, whose ``targets``
+    field is an array of per-target records (rather than the two logical
+    references used by the requirements artifact).  Keep this compatibility
+    branch deliberately narrow: only that exact evidence shape, identity and
+    atomic-safety flags can admit the canonicalized legacy pair.
+    """
 
     canonical_sha256 = diagnostic["canonical_sha256"]
     canonical_size_bytes = diagnostic["canonical_size_bytes"]
@@ -448,7 +455,7 @@ def _load_repaired_legacy_model_manifest_diagnostic(
             raise G3GateAggregationError(
                 "LEGACY_MODEL_MANIFEST_CANONICAL_JSON_NOT_CANONICAL"
             )
-        if value.get("schema_version") != "parameter-importance-model-manifest-v1":
+        if value.get("schema") != "parameter-importance-model-manifest-v1":
             raise G3GateAggregationError(
                 "LEGACY_MODEL_MANIFEST_CANONICAL_SCHEMA_INVALID"
             )
@@ -483,39 +490,29 @@ def _load_repaired_legacy_model_manifest_diagnostic(
             "LEGACY_MODEL_MANIFEST_REPAIR_EVIDENCE_NOT_CANONICAL"
         )
 
-    required = {
+    expected_evidence_fields = {
+        "schema_version",
+        "repair_id",
+        "reason",
         "targets",
-        "original_sha256",
-        "canonical_sha256",
-        "original_size_bytes",
-        "canonical_size_bytes",
-        "replaced_atomically",
         "weights_touched",
-        "active_part_or_lock_touched",
         "pile_objects_touched",
+        "active_part_or_lock_touched",
     }
-    if not required.issubset(evidence):
+    if set(evidence) != expected_evidence_fields:
         raise G3GateAggregationError("LEGACY_MODEL_MANIFEST_REPAIR_EVIDENCE_INCOMPLETE")
+    if (
+        evidence["schema_version"] != "stage2-manifest-repair-evidence-v1"
+        or evidence["repair_id"] != "s23-manifest-repair-20260823-01"
+        or evidence["reason"] != "remove_utf8_bom_without_changing_json_value"
+    ):
+        raise G3GateAggregationError("LEGACY_MODEL_MANIFEST_REPAIR_EVIDENCE_INVALID")
     if (
         not isinstance(evidence["targets"], list)
         or len(evidence["targets"]) != 2
-        or any(not isinstance(item, str) for item in evidence["targets"])
-        or any(
-            not isinstance(evidence[field], str)
-            or len(evidence[field]) != 64
-            or any(character not in "0123456789abcdef" for character in evidence[field])
-            for field in ("original_sha256", "canonical_sha256")
-        )
-        or any(
-            isinstance(evidence[field], bool)
-            or not isinstance(evidence[field], int)
-            or evidence[field] < 1
-            for field in ("original_size_bytes", "canonical_size_bytes")
-        )
         or any(
             not isinstance(evidence[field], bool)
             for field in (
-                "replaced_atomically",
                 "weights_touched",
                 "active_part_or_lock_touched",
                 "pile_objects_touched",
@@ -523,30 +520,68 @@ def _load_repaired_legacy_model_manifest_diagnostic(
         )
     ):
         raise G3GateAggregationError("LEGACY_MODEL_MANIFEST_REPAIR_EVIDENCE_INVALID")
-    if evidence["targets"] != list(refs):
-        raise G3GateAggregationError("LEGACY_MODEL_MANIFEST_REPAIR_TARGETS_MISMATCH")
     if (
-        evidence["original_sha256"] != original_sha256
-        or evidence["original_size_bytes"] != original_size_bytes
-        or evidence["canonical_sha256"] != canonical_sha256
-        or evidence["canonical_size_bytes"] != canonical_size_bytes
-    ):
-        raise G3GateAggregationError("LEGACY_MODEL_MANIFEST_REPAIR_IDENTITY_MISMATCH")
-    if (
-        evidence["replaced_atomically"] is not True
-        or evidence["weights_touched"] is not False
+        evidence["weights_touched"] is not False
         or evidence["active_part_or_lock_touched"] is not False
         or evidence["pile_objects_touched"] is not False
     ):
         raise G3GateAggregationError("LEGACY_MODEL_MANIFEST_REPAIR_SAFETY_FLAGS_INVALID")
-    if evidence.get("original_encoding", "utf-8-bom") != "utf-8-bom":
-        raise G3GateAggregationError("LEGACY_MODEL_MANIFEST_REPAIR_ENCODING_INVALID")
-    if evidence.get("canonical_encoding", "utf-8") != "utf-8":
-        raise G3GateAggregationError("LEGACY_MODEL_MANIFEST_REPAIR_ENCODING_INVALID")
-    if "artifact_hash" in evidence and evidence["artifact_hash"] != canonical_json_hash(
-        {key: value for key, value in evidence.items() if key != "artifact_hash"}
-    ):
-        raise G3GateAggregationError("LEGACY_MODEL_MANIFEST_REPAIR_EVIDENCE_ARTIFACT_HASH_MISMATCH")
+
+    expected_target_fields = {
+        "target",
+        "original_sha256",
+        "original_size_bytes",
+        "original_json_encoding",
+        "canonical_sha256",
+        "canonical_size_bytes",
+        "canonical_json_encoding",
+        "replaced_atomically",
+    }
+    target_records = evidence["targets"]
+    for index, (reference, record) in enumerate(zip(refs, target_records, strict=True)):
+        if not isinstance(record, Mapping) or set(record) != expected_target_fields:
+            raise G3GateAggregationError(
+                "LEGACY_MODEL_MANIFEST_REPAIR_TARGET_RECORD_INVALID"
+            )
+        target = record["target"]
+        if not isinstance(target, str) or not target:
+            raise G3GateAggregationError("LEGACY_MODEL_MANIFEST_REPAIR_TARGETS_MISMATCH")
+        try:
+            expected_target = str((root / PurePosixPath(reference)).resolve(strict=False))
+            observed_target = str(Path(target).resolve(strict=False))
+        except (OSError, RuntimeError, ValueError) as error:
+            raise G3GateAggregationError(
+                "LEGACY_MODEL_MANIFEST_REPAIR_TARGETS_MISMATCH"
+            ) from error
+        if observed_target != expected_target:
+            raise G3GateAggregationError("LEGACY_MODEL_MANIFEST_REPAIR_TARGETS_MISMATCH")
+        for field in ("original_sha256", "canonical_sha256"):
+            value = record[field]
+            if (
+                not isinstance(value, str)
+                or len(value) != 64
+                or any(character not in "0123456789abcdef" for character in value)
+            ):
+                raise G3GateAggregationError(
+                    "LEGACY_MODEL_MANIFEST_REPAIR_TARGET_RECORD_INVALID"
+                )
+        for field in ("original_size_bytes", "canonical_size_bytes"):
+            value = record[field]
+            if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+                raise G3GateAggregationError(
+                    "LEGACY_MODEL_MANIFEST_REPAIR_TARGET_RECORD_INVALID"
+                )
+        if (
+            record["original_sha256"] != original_sha256
+            or record["original_size_bytes"] != original_size_bytes
+            or record["canonical_sha256"] != canonical_sha256
+            or record["canonical_size_bytes"] != canonical_size_bytes
+            or record["original_json_encoding"] != "utf-8-bom"
+            or record["canonical_json_encoding"] != "utf-8"
+        ):
+            raise G3GateAggregationError("LEGACY_MODEL_MANIFEST_REPAIR_IDENTITY_MISMATCH")
+        if record["replaced_atomically"] is not True:
+            raise G3GateAggregationError("LEGACY_MODEL_MANIFEST_REPAIR_SAFETY_FLAGS_INVALID")
     return {
         "refs": list(refs),
         "size_bytes": original_size_bytes,
