@@ -322,6 +322,8 @@ def _worker(args: argparse.Namespace) -> dict[str, object]:
 
 
 def _detach(args: argparse.Namespace) -> dict[str, object]:
+    if not args.execute:
+        raise S27ExecutionBlocked("S27_DETACH_REQUIRES_EXECUTE")
     root = args.data_root.resolve()
     run_root = _logical(root, args.run_root, field="run_root")
     run_root.mkdir(parents=True, exist_ok=True)
@@ -386,9 +388,11 @@ def _parser() -> argparse.ArgumentParser:
     action.add_argument("--preflight", action="store_true")
     action.add_argument("--execute", action="store_true")
     action.add_argument("--worker", action="store_true")
-    action.add_argument("--detach", action="store_true")
     action.add_argument("--status", action="store_true")
     action.add_argument("--wait", action="store_true")
+    # Detachment is a wrapper around the foreground execute action.  It must
+    # be composable with ``--execute`` so the child receives a valid action.
+    parser.add_argument("--detach", action="store_true")
     parser.add_argument("--data-root", type=Path, required=True)
     parser.add_argument("--plan-ref", required=True)
     parser.add_argument("--run-root", required=True)
