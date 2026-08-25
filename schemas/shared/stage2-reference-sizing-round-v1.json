@@ -1,0 +1,51 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://parameter-importance.invalid/schemas/shared/stage2-reference-sizing-round-v1.json",
+  "title": "Append-only S2.4 independent reference sizing round",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version", "round_id", "prior_round_id", "prior_round_status",
+    "parent_preregistration_hash", "prior_round_ref", "sizing",
+    "new_draws_before_freeze", "final_reference_created",
+    "final_reference_plan_schema", "output_namespace", "amendment"
+  ],
+  "properties": {
+    "schema_version": {"const": "stage2-reference-sizing-round-v1"},
+    "round_id": {"const": "r22"},
+    "prior_round_id": {"const": "r21"},
+    "prior_round_status": {"const": "INCONCLUSIVE"},
+    "parent_preregistration_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "prior_round_ref": {"type": "string", "minLength": 1},
+    "sizing": {
+      "type": "object", "additionalProperties": false,
+      "required": ["stream", "seed_namespace", "candidate_sample_counts", "block_size", "normalized_l1_threshold", "required_consecutive", "complete_all_candidates", "optional_stopping", "reuse_prior_sizing_prefix"],
+      "properties": {
+        "stream": {"const": "reference_sizing"},
+        "seed_namespace": {"type": "string", "minLength": 1},
+        "candidate_sample_counts": {"const": [32768, 65536]},
+        "block_size": {"const": 32},
+        "normalized_l1_threshold": {"const": 0.02},
+        "required_consecutive": {"const": 1},
+        "complete_all_candidates": {"const": true},
+        "optional_stopping": {"const": false},
+        "reuse_prior_sizing_prefix": {"const": false}
+      }
+    },
+    "new_draws_before_freeze": {"const": false},
+    "final_reference_created": {"const": false},
+    "final_reference_plan_schema": {"const": "schemas/shared/stage2-reference-one-shot-plan-v1.json"},
+    "output_namespace": {"type": "string", "pattern": "^.*r22.*$"},
+    "amendment": {
+      "type": "object", "additionalProperties": false,
+      "required": ["append_only", "created_before_new_sizing_draws", "unchanged_scientific_contract"],
+      "properties": {
+        "append_only": {"const": true},
+        "created_before_new_sizing_draws": {"const": true},
+        "unchanged_scientific_contract": {
+          "const": ["threshold=0.02", "block_size=32", "required_consecutive=1", "margin_schema_unchanged", "evaluator_schema_unchanged", "final_A_B_schema_unchanged"]
+        }
+      }
+    }
+  }
+}
