@@ -27,6 +27,8 @@ from param_importance_nlp.experiments.stage2_s211_delivery import (
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Strict Stage 2 S2.11/G2.8 delivery and replay control plane")
     parser.add_argument("--g27b-gate", type=Path, required=True)
+    for option in ("g20", "g21", "g22", "g23", "g24a", "g24b", "g25", "g26", "g27a"):
+        parser.add_argument(f"--{option}-gate", type=Path, required=True)
     parser.add_argument("--g27b-decision", type=Path)
     parser.add_argument("--g27b-lineage", type=Path)
     parser.add_argument("--stage2-lineage", type=Path, required=True)
@@ -40,7 +42,9 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--decision", type=Path)
     parser.add_argument("--replay-audit-31m", type=Path)
     parser.add_argument("--output-root", type=Path, required=True)
-    parser.add_argument("--data-root", type=Path, help="Recorded for operator context; refs remain explicit and are never guessed")
+    parser.add_argument("--data-root", type=Path, required=True)
+    for role in ("plan", "task-catalog", "replay-report", "gate-summary", "sync-report", "estimator-decision", "large-artifact-index", "worklog", "dirty-head-evidence", "failure-retry-amendment-history"):
+        parser.add_argument(f"--{role}", type=Path, required=True)
     parser.add_argument("--run-id", default="s211-g28-delivery")
     parser.add_argument("--producer-commit", required=True)
     parser.add_argument("--consumer-commit")
@@ -66,6 +70,20 @@ def main(argv: Sequence[str] | None = None) -> int:
         if value is not None
     }
     try:
+        predecessor_gates = {
+            gate_id: getattr(args, option)
+            for gate_id, option in {
+                "stage2.G2.0": "g20_gate",
+                "stage2.G2.1": "g21_gate",
+                "stage2.G2.2": "g22_gate",
+                "stage2.G2.3": "g23_gate",
+                "stage2.G2.4a": "g24a_gate",
+                "stage2.G2.4b": "g24b_gate",
+                "stage2.G2.5": "g25_gate",
+                "stage2.G2.6": "g26_gate",
+                "stage2.G2.7a": "g27a_gate",
+            }.items()
+        }
         result = run_s211_g28(
             g27b_gate=args.g27b_gate,
             g27b_decision=args.g27b_decision,
@@ -74,6 +92,18 @@ def main(argv: Sequence[str] | None = None) -> int:
             boundary_refs=boundaries,
             replay_audit_31m=args.replay_audit_31m,
             output_root=args.output_root,
+            data_root=args.data_root,
+            predecessor_gates=predecessor_gates,
+            plan=args.plan,
+            task_catalog=args.task_catalog,
+            replay_report=args.replay_report,
+            gate_summary=args.gate_summary,
+            sync_report=args.sync_report,
+            estimator_decision=args.estimator_decision,
+            large_artifact_index=args.large_artifact_index,
+            worklog=args.worklog,
+            dirty_head_evidence=args.dirty_head_evidence,
+            failure_retry_amendment_history=args.failure_retry_amendment_history,
             run_id=args.run_id,
             producer_commit=args.producer_commit,
             consumer_commit=args.consumer_commit,
