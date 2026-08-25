@@ -325,7 +325,12 @@ def _reference_views(
     return views, None, variances, sequence, "independent_reference_variance_combination"
 
 
-def _read_raw_payload(root: Path, descriptor: Mapping[str, Any]) -> Mapping[str, Any]:
+def _read_raw_payload(
+    root: Path,
+    descriptor: Mapping[str, Any],
+    *,
+    memmap_root: Path | None = None,
+) -> Mapping[str, Any]:
     ref = descriptor.get("raw_artifact_ref")
     if not isinstance(ref, str):
         inline = descriptor.get("artifact")
@@ -338,10 +343,14 @@ def _read_raw_payload(root: Path, descriptor: Mapping[str, Any]) -> Mapping[str,
         if not source_path.exists():
             raise S28G26Blocked(f"raw_artifact_ref:NOT_FOUND:{ref}")
         if source_path.is_dir():
+            if memmap_root is None:
+                raise S28G26Blocked("raw_artifact_bundle:EXPLICIT_MEMMAP_ROOT_REQUIRED")
             try:
                 from .stage2_s208_production import _decode_bundle, _flat_memmap
 
-                state, manifest_hash = _decode_bundle(source_path, source_path.parent / ".s208-memmap", source_path.name)
+                cache_root = memmap_root.resolve() / "raw"
+                cache_stem = hashlib.sha256(str(ref).encode("utf-8")).hexdigest()[:24]
+                state, manifest_hash = _decode_bundle(source_path, cache_root, cache_stem)
                 vectors = state.get("vectors")
                 if not isinstance(vectors, Mapping):
                     raise S28G26Blocked("raw_artifact_bundle:VECTORS_REQUIRED")
@@ -349,7 +358,7 @@ def _read_raw_payload(root: Path, descriptor: Mapping[str, Any]) -> Mapping[str,
                 flat_vectors: dict[str, np.ndarray] = {}
                 for method, vector in vectors.items():
                     ids: list[str] = list(coordinate_ids) if coordinate_ids else []
-                    flat_vectors[str(method)] = _flat_memmap(vector, ids, source_path.parent / ".s208-memmap", f"{source_path.name}-{method}")
+                    flat_vectors[str(method)] = _flat_memmap(vector, ids, cache_root, f"{cache_stem}-{method}")
                     if coordinate_ids and ids != coordinate_ids:
                         raise S28G26Blocked("raw_artifact_bundle:COORDINATE_REGISTRY_MISMATCH")
                     if not coordinate_ids:
@@ -656,6 +665,7 @@ def _extract_cell_data(
     raw_root: Path,
     reference_payload: Mapping[str, Any],
     matrix: Mapping[str, Any],
+    memmap_root: Path | None = None,
 ) -> _CellData:
     model, stage = _cell_parts(cell_id)
     cell_matrix = _resolve_matrix_cell(matrix, cell_id)
@@ -676,7 +686,7 @@ def _extract_cell_data(
             raise S28G26Blocked(f"raw.{cell_id}:UNIT_ID_REQUIRED")
         if unit_id in rows or repetition_id in {item[1].get("repetition_id") for item in rows.values()}:
             raise S28G26Blocked(f"raw.{cell_id}:DUPLICATE_REPETITION")
-        payload = _read_raw_payload(raw_root, descriptor)
+        payload = _read_raw_payload(raw_root, descriptor, memmap_root=memmap_root)
         if payload.get("unit_id") not in (None, unit_id, repetition_id):
             raise S28G26Blocked(f"raw.{cell_id}:{unit_id}:UNIT_IDENTITY_MISMATCH")
         if payload.get("cell_id") not in (None, cell_id):
@@ -1256,6 +1266,7 @@ def analyze_s208_g26(
     hypothesis_contract: Mapping[str, Any] | str | Path,
     upstream_gates: Mapping[str, Mapping[str, Any] | str | Path],
     output_root: str | Path | None = None,
+    memmap_root: str | Path | None = None,
     bootstrap_replicates: int = 1000,
     bootstrap_seed: int = 20260825,
 ) -> dict[str, Any]:
@@ -1341,7 +1352,16 @@ def analyze_s208_g26(
             raise S28G26Blocked(f"reference.{cell}:G2.3_BINDING_MISMATCH")
     cell_data: list[_CellData] = []
     for cell in S28_CELL_IDS:
-        cell_data.append(_extract_cell_data(cell, grouped[cell], raw_root=raw_root_path, reference_payload=refs_by_cell[cell], matrix=matrix_payload))
+        cell_data.append(
+            _extract_cell_data(
+                cell,
+                grouped[cell],
+                raw_root=raw_root_path,
+                reference_payload=refs_by_cell[cell],
+                matrix=matrix_payload,
+                memmap_root=None if memmap_root is None else Path(memmap_root).resolve(),
+            )
+        )
     long_rows: list[dict[str, Any]] = []
     summaries: list[dict[str, Any]] = []
     family_rows: list[dict[str, Any]] = []

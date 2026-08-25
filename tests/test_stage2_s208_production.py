@@ -12,6 +12,7 @@ from param_importance_nlp.experiments.stage2_s208_production import (
     S208ProductionBlocked,
     load_s208_reference_bundle,
 )
+from param_importance_nlp.experiments.stage2_s208_g26 import S28G26Blocked, _read_raw_payload
 from param_importance_nlp.runtime.tensor_bundle import publish_tensor_bundle
 
 
@@ -177,3 +178,28 @@ def test_loader_rejects_tampered_bounded_vectors(tmp_path: Path, field: str) -> 
             gate.relative_to(tmp_path),
             memmap_root=tmp_path / "memmap",
         )
+
+
+def test_raw_bundle_requires_explicit_scratch_and_never_writes_sealed_parent(tmp_path: Path) -> None:
+    raw_parent = tmp_path / "sealed"
+    raw_parent.mkdir()
+    raw_bundle = raw_parent / "unit-0"
+    identity = publish_tensor_bundle(
+        raw_bundle,
+        {
+            "coordinate_ids": ["a[0]", "a[1]"],
+            "vectors": {
+                "raw": {"a": np.asarray([1.0, 2.0], dtype=np.float64)},
+                "double": {"a": np.asarray([1.0, 2.0], dtype=np.float64)},
+                "u_m16": {"a": np.asarray([1.0, 2.0], dtype=np.float64)},
+            },
+        },
+    )
+    descriptor = {"raw_artifact_ref": "sealed/unit-0", "raw_artifact_hash": identity.manifest_sha256}
+    with pytest.raises(S28G26Blocked, match="EXPLICIT_MEMMAP_ROOT_REQUIRED"):
+        _read_raw_payload(tmp_path, descriptor)
+    scratch = tmp_path / "scratch"
+    loaded = _read_raw_payload(tmp_path, descriptor, memmap_root=scratch)
+    assert loaded["vectors"]
+    assert not (raw_parent / ".s208-memmap").exists()
+    assert (scratch / "raw").is_dir()
