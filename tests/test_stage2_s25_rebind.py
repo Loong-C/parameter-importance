@@ -30,6 +30,7 @@ from param_importance_nlp.experiments.stage2_s25_formal import (
 )
 from param_importance_nlp.experiments.sampling import SamplingPlan, SamplingUniverse
 from param_importance_nlp.experiments.stage2_formal import FormalExperimentPlan
+from ops.stage2.run_s205_formal import _S205DynamicLPTQueue
 
 
 G3_REF = "evidence/stage0/tasks/g3-v5/commits/asset_resolution.json"
@@ -405,3 +406,34 @@ def test_s25_preflight_is_read_only_and_binds_sampling_plan(tmp_path: Path) -> N
     assert result["status"] == "READY"
     assert result["confirmatory_draws_generated"] is False
     assert not (tmp_path / spec.s205_output_root).exists()
+
+
+def test_s205_dynamic_lpt_queue_no_wave_barrier_and_no_overlap() -> None:
+    queue = _S205DynamicLPTQueue(EXPECTED_CELL_IDS, APPROVED_GPU_UUIDS)
+    first = queue.fill()
+    assert [cell_id for cell_id, _ in first] == [
+        "pythia-31m-deduped:mid_late",
+        "pythia-31m-deduped:early",
+        "pythia-31m-deduped:initialization",
+        "pythia-14m:mid_late",
+    ]
+    assert len(queue.active) == 4
+    assert len(set(queue.active.values())) == len(queue.active)
+
+    dispatches = list(first)
+    refill = queue.complete(first[0][0])
+    dispatches.extend(refill)
+    assert refill == (("pythia-14m:early", first[0][1]),)
+    assert len(queue.active) == 4  # a freed GPU is refilled immediately
+    assert len(set(queue.active.values())) == len(queue.active)
+
+    while queue.active:
+        completed = next(iter(queue.active))
+        dispatches.extend(queue.complete(completed))
+        assert len(set(queue.active.values())) == len(queue.active)
+
+    assert not queue.pending
+    assert len(dispatches) == len(EXPECTED_CELL_IDS)
+    assert [cell_id for cell_id, _ in dispatches] == list(dict.fromkeys(cell_id for cell_id, _ in dispatches))
+    assert {cell_id for cell_id, _ in dispatches} == set(EXPECTED_CELL_IDS)
+    assert {gpu_uuid for _, gpu_uuid in dispatches} <= set(APPROVED_GPU_UUIDS)

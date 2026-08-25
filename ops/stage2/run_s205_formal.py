@@ -2,7 +2,8 @@
 
 ``--preflight`` is read-only and revalidates the fresh S2.4/G2.3 rebind,
 sampling plan and preregistered pilot B/M/R plan.  ``--execute`` reruns that
-preflight immediately before starting six UUID-bound workers in two waves;
+preflight immediately before starting six UUID-bound workers through a
+deterministic four-GPU LPT queue;
 the workers call the S2.5-only strict runner and never create draws.  A final
 G2.4a object is published only after all six immutable cell summaries pass.
 """
@@ -10,7 +11,8 @@ G2.4a object is published only after all six immutable cell summaries pass.
 from __future__ import annotations
 
 import argparse
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from collections import deque
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from datetime import datetime, timezone
 import json
 import os
@@ -97,6 +99,58 @@ def _write_status(path: Path, payload: Mapping[str, object]) -> None:
     write_canonical_json(path, value)
 
 
+class _S205DynamicLPTQueue:
+    """Deterministic four-GPU queue for the six frozen S2.5 cells."""
+
+    _MODEL_RANK = {"pythia-14m": 1, "pythia-31m-deduped": 2}
+    _STAGE_RANK = {"initialization": 1, "early": 2, "mid_late": 3}
+
+    def __init__(self, cell_ids: Sequence[str], gpu_ids: Sequence[str]) -> None:
+        if tuple(cell_ids) != tuple(EXPECTED_CELL_IDS):
+            raise ValueError("S205_QUEUE_CELL_SET_MISMATCH")
+        if tuple(gpu_ids) != tuple(APPROVED_GPU_UUIDS):
+            raise ValueError("S205_QUEUE_GPU_SET_MISMATCH")
+        self._pending = deque(sorted(cell_ids, key=self._lpt_key))
+        self._free = deque(gpu_ids)
+        self._active: dict[str, str] = {}
+        self._completed: list[str] = []
+
+    @classmethod
+    def _lpt_key(cls, cell_id: str) -> tuple[int, int, int]:
+        model, stage = cell_id.split(":", 1)
+        return (-cls._MODEL_RANK[model], -cls._STAGE_RANK[stage], EXPECTED_CELL_IDS.index(cell_id))
+
+    def fill(self) -> tuple[tuple[str, str], ...]:
+        assignments: list[tuple[str, str]] = []
+        while self._pending and self._free:
+            cell_id = self._pending.popleft()
+            gpu_uuid = self._free.popleft()
+            self._active[cell_id] = gpu_uuid
+            assignments.append((cell_id, gpu_uuid))
+        return tuple(assignments)
+
+    def complete(self, cell_id: str) -> tuple[tuple[str, str], ...]:
+        if cell_id not in self._active:
+            raise ValueError(f"S205_QUEUE_CELL_NOT_ACTIVE:{cell_id}")
+        gpu_uuid = self._active.pop(cell_id)
+        self._completed.append(cell_id)
+        free = [*self._free, gpu_uuid]
+        self._free = deque(sorted(free, key=APPROVED_GPU_UUIDS.index))
+        return self.fill()
+
+    @property
+    def active(self) -> dict[str, str]:
+        return dict(self._active)
+
+    @property
+    def pending(self) -> tuple[str, ...]:
+        return tuple(self._pending)
+
+    @property
+    def completed(self) -> tuple[str, ...]:
+        return tuple(self._completed)
+
+
 def _preflight(args: argparse.Namespace) -> dict[str, object]:
     root = args.data_root.resolve()
     plan = load_s25_rebind_plan(root, args.s205_rebind_ref)
@@ -177,12 +231,13 @@ def _execute(args: argparse.Namespace) -> dict[str, object]:
     if args.gpu_inventory_json is not None:
         base += ["--gpu-inventory-json", str(args.gpu_inventory_json.resolve())]
     records: list[dict[str, object]] = []
+    queue = _S205DynamicLPTQueue(EXPECTED_CELL_IDS, APPROVED_GPU_UUIDS)
     try:
-        for wave in (EXPECTED_CELL_IDS[:4], EXPECTED_CELL_IDS[4:]):
-            with ThreadPoolExecutor(max_workers=len(wave)) as pool:
-                futures = {}
-                for index, cell_id in enumerate(wave):
-                    gpu_uuid = APPROVED_GPU_UUIDS[index] if len(wave) == 4 else APPROVED_GPU_UUIDS[index]
+        with ThreadPoolExecutor(max_workers=len(APPROVED_GPU_UUIDS)) as pool:
+            futures = {}
+
+            def submit(assignments: Sequence[tuple[str, str]]) -> None:
+                for cell_id, gpu_uuid in assignments:
                     command = [*base, "--cell-id", cell_id, "--gpu-uuid", gpu_uuid]
                     log = operations / "workers" / f"{cell_id.replace(':', '__')}.log"
                     log.parent.mkdir(parents=True, exist_ok=True)
@@ -197,8 +252,12 @@ def _execute(args: argparse.Namespace) -> dict[str, object]:
                         check=False,
                     )
                     futures[future] = (cell_id, gpu_uuid, log, handle)
-                for future in as_completed(futures):
-                    cell_id, gpu_uuid, log, handle = futures[future]
+
+            submit(queue.fill())
+            while futures:
+                done, _ = wait(tuple(futures), return_when=FIRST_COMPLETED)
+                for future in sorted(done, key=lambda item: futures[item][0]):
+                    cell_id, gpu_uuid, log, handle = futures.pop(future)
                     completed = future.result()
                     handle.close()
                     record = {"cell_id": cell_id, "gpu_uuid": gpu_uuid, "returncode": completed.returncode, "log_ref": str(log.relative_to(root))}
@@ -207,6 +266,11 @@ def _execute(args: argparse.Namespace) -> dict[str, object]:
                     _write_status(status_path, status)
                     if completed.returncode != 0:
                         raise S25ExecutionBlocked(f"S205_CELL_WORKER_FAILED:{cell_id}:{completed.returncode}")
+                    # Refill immediately on each individual completion; there is
+                    # intentionally no second wave/barrier.
+                    submit(queue.complete(cell_id))
+        if queue.pending or queue.active or set(queue.completed) != set(EXPECTED_CELL_IDS):
+            raise S25ExecutionBlocked("S205_QUEUE_DID_NOT_COMPLETE_ALL_CELLS")
         from param_importance_nlp.experiments.stage2_s25_formal import _load_object
         _, sampling_value = _load_object(root, args.sampling_plan_ref, field="sampling_plan_ref")
         from param_importance_nlp.experiments.sampling import SamplingPlan
