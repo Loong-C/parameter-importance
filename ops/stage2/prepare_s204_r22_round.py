@@ -92,6 +92,8 @@ def validate_r22_round(value: Mapping[str, Any]) -> None:
         raise ValueError("S204_R22_FINAL_REFERENCE_NOT_YET_ALLOWED")
     if value.get("final_reference_plan_schema") != FINAL_REFERENCE_PLAN_SCHEMA:
         raise ValueError("S204_R22_FINAL_SCHEMA_MISMATCH")
+    if value.get("continuation_control") != "precommitted_disjoint_segment_no_pooling_with_r21":
+        raise ValueError("S204_R22_SEQUENTIAL_CONTROL_REQUIRED")
     output_namespace = value.get("output_namespace")
     if not isinstance(output_namespace, str) or "r22" not in output_namespace or "r21" in output_namespace:
         raise ValueError("S204_R22_OUTPUT_NAMESPACE_INVALID")
@@ -133,6 +135,7 @@ def prepare_r22_round(value: Mapping[str, Any]) -> dict[str, Any]:
             "prior_r21_prefix_is_read_only": True,
         },
         "r21_output_is_read_only": True,
+        "claim_scope": "r22_segment_only_no_pooling_with_r21",
     }
     body["artifact_hash"] = _canonical_hash(body)
     return body

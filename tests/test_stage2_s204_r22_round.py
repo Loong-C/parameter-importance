@@ -47,6 +47,7 @@ def _round() -> dict[str, object]:
         "new_draws_before_freeze": False,
         "final_reference_created": False,
         "final_reference_plan_schema": "schemas/shared/stage2-reference-one-shot-plan-v1.json",
+        "continuation_control": "precommitted_disjoint_segment_no_pooling_with_r21",
         "output_namespace": "evidence/stage2/s204/formal-r22-g3-v5",
         "amendment": {
             "append_only": True,
