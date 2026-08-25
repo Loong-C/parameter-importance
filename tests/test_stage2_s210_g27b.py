@@ -4,6 +4,7 @@ from pathlib import Path
 
 import pytest
 
+from param_importance_nlp.contracts.artifacts import validate_estimator_decision_artifact
 from param_importance_nlp.contracts.jsonio import canonical_json_bytes, canonical_json_hash, write_canonical_json
 from param_importance_nlp.contracts.status import GateRecord
 from param_importance_nlp.experiments.stage2_s204_ids import EXPECTED_CELL_IDS
@@ -111,6 +112,62 @@ def _inputs() -> dict[str, object]:
     return {"quality": quality, "hypothesis": hypothesis, "long": long, "family": family, "cost": _hashed(cost_body)}
 
 
+def _formal_inputs(*, double_qualified: bool) -> dict[str, object]:
+    values = _inputs()
+    values["g26_gate"] = _g26_gate("PASS")
+
+    quality = dict(values["quality"])
+    quality.pop("artifact_hash", None)
+    quality["status"] = "PASS"
+    quality["formal_eligible"] = True
+    quality["gates"] = [{"gate": "reference_convergence", "status": "PASS"}]
+    values["quality"] = _hashed(quality)
+
+    family = dict(values["family"])
+    family.pop("artifact_hash", None)
+    family["global"] = {
+        "double": {"bias_qualified": double_qualified},
+        "u_m16": {"bias_qualified": True},
+    }
+    family["rows"] = [
+        {
+            "cell_id": cell,
+            "method": method,
+            "endpoint": endpoint,
+            "state": "PASS" if method == "u_m16" or double_qualified else "FAIL",
+        }
+        for cell in EXPECTED_CELL_IDS
+        for method in ("double", "u_m16")
+        for endpoint in ("model_total_signed_bias", "layer_total_l1_bias", "module_total_l1_bias")
+    ]
+    noninferiority_endpoints = (
+        "corrected_parameter_nmse_noninferiority",
+        "parameter_spearman_noninferiority",
+        "parameter_overlap_at_1_percent_noninferiority",
+    )
+    family["noninferiority_rows"] = [
+        {"cell_id": cell, "method": "u_m16", "endpoint": endpoint, "state": "PASS"}
+        for cell in EXPECTED_CELL_IDS
+        for endpoint in noninferiority_endpoints
+    ]
+    family["noninferiority_global"] = {
+        endpoint: {"all_cells": True} for endpoint in noninferiority_endpoints
+    }
+    values["family"] = _hashed(family)
+
+    cost = dict(values["cost"])
+    cost.pop("artifact_hash", None)
+    cost["health_snapshot"] = {"healthy": True, "cost_io_quiescent": True}
+    values["cost"] = _hashed(cost)
+    values["raw_calibration"] = _hashed(
+        {
+            "schema_version": "stage2-s208-raw-calibration-v1",
+            "rows": [{"cell_id": EXPECTED_CELL_IDS[0], "slope": 1.0, "intercept": 0.0}],
+        }
+    )
+    return values
+
+
 def test_s210_rejects_missing_sources() -> None:
     with pytest.raises(S210G27BBlocked, match="INPUT_REQUIRED"):
         run_s210_g27b()
@@ -132,6 +189,9 @@ def test_s210_publishes_blocked_append_only_report(tmp_path: Path) -> None:
     )
     assert result["status"] == "BLOCKED"
     assert result["gate"]["status"] == "BLOCKED"
+    assert result["decision"]["selected_estimator"] is None
+    assert result["decision"]["gate_status"] == "BLOCKED"
+    assert result["report"]["formal_eligible"] is False
     assert (output / "estimator_decision.json").exists()
     with pytest.raises(S210G27BBlocked, match="OUTPUT_ROOT_MUST_BE_NEW"):
         run_s210_g27b(
@@ -144,6 +204,68 @@ def test_s210_publishes_blocked_append_only_report(tmp_path: Path) -> None:
             g27a_gate=_g27a_gate(),
             output_root=output,
         )
+
+
+def test_s210_u_only_is_nonformal_provisional_and_blocked(tmp_path: Path) -> None:
+    values = _formal_inputs(double_qualified=False)
+    result = run_s210_g27b(
+        g26_gate=values["g26_gate"],
+        g26_quality_gates=values["quality"],
+        g26_hypothesis_decisions=values["hypothesis"],
+        g26_statistics_long_table=values["long"],
+        g26_raw_calibration=values["raw_calibration"],
+        g26_family_decisions=values["family"],
+        g27a_report=values["cost"],
+        g27a_gate=_g27a_gate(),
+        output_root=tmp_path / "u-provisional",
+        checked_at="2026-08-25T00:00:00+00:00",
+    )
+
+    assert result["status"] == "BLOCKED"
+    assert result["formal_eligible"] is False
+    assert result["gate"]["status"] == "BLOCKED"
+    decision = result["decision"]
+    assert decision["scope"] == "local_fixture"
+    assert decision["status"] == "BLOCKED"
+    assert decision["state"] == "UNFROZEN"
+    assert decision["selected_estimator"] is None
+    assert decision["gate_status"] == "BLOCKED"
+    assert decision["batch_size"] is None
+    assert decision["microbatch_count"] is None
+    assert decision["repetitions"] is None
+    assert decision["metadata"]["decision_rule"] == "u_provisional_revalidate_double"
+    assert decision["metadata"]["provisional"] is True
+    assert "DOUBLE_REVALIDATION_REQUIRED" in decision["metadata"]["reasons"]
+    assert result["charts"] == []
+    validate_estimator_decision_artifact(decision)
+
+
+def test_s210_formal_selection_still_passes_after_provisional_guard(tmp_path: Path) -> None:
+    values = _formal_inputs(double_qualified=True)
+    result = run_s210_g27b(
+        g26_gate=values["g26_gate"],
+        g26_quality_gates=values["quality"],
+        g26_hypothesis_decisions=values["hypothesis"],
+        g26_statistics_long_table=values["long"],
+        g26_raw_calibration=values["raw_calibration"],
+        g26_family_decisions=values["family"],
+        g27a_report=values["cost"],
+        g27a_gate=_g27a_gate(),
+        output_root=tmp_path / "formal-pass",
+        checked_at="2026-08-25T00:00:00+00:00",
+    )
+
+    assert result["status"] == "PASS"
+    assert result["formal_eligible"] is True
+    assert result["gate"]["status"] == "PASS"
+    decision = result["decision"]
+    assert decision["scope"] == "formal"
+    assert decision["status"] == "SELECTED"
+    assert decision["selected_estimator"] == "u"
+    assert decision["gate_status"] == "PASS"
+    assert decision["metadata"]["provisional"] is False
+    assert len(result["charts"]) == 5
+    validate_estimator_decision_artifact(decision, require_formal=True)
 
 
 def test_s210_path_inputs_reject_hash_forgery(tmp_path: Path) -> None:

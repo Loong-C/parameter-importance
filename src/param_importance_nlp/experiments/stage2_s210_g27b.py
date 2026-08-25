@@ -579,20 +579,28 @@ def _decision(
             selected = "double"
             rule = "double_primary_only_qualified"
         elif u_ok and u_cost:
-            selected = "u"
             rule = "u_provisional_revalidate_double"
             follow_up.append("revalidate_double_before_claiming_full_calibration")
+            # A U-only result is an explicitly provisional finding until the
+            # independent double-sampling revalidation is complete.  Keep the
+            # candidate unselected so this branch cannot leak a formal PASS.
+            reasons.append("DOUBLE_REVALIDATION_REQUIRED")
         else:
             reasons.extend(double_cost_reasons + u_cost_reasons)
     if selected is None and not reasons:
         reasons.append("NO_ESTIMATOR_CANDIDATE_QUALIFIED")
 
     status = "SELECTED" if selected is not None and not upstream_reasons else "BLOCKED"
+    # Any blocked/provisional result is non-formal.  This also keeps the
+    # nullable selected_estimator representation valid for the decision
+    # contract; only a selected candidate may carry scope=formal.
+    decision_scope = "formal" if status == "SELECTED" else "local_fixture"
+    provisional = rule == "u_provisional_revalidate_double"
     decision_body: dict[str, Any] = {
         "schema_version": S210_DECISION_SCHEMA,
         "decision_id": "stage2-s210-estimator-decision",
         "selected_estimator": selected,
-        "scope": "formal",
+        "scope": decision_scope,
         "status": status,
         "state": "SELECTED" if selected is not None else "UNFROZEN",
         "batch_size": b if selected is not None else None,
@@ -612,6 +620,7 @@ def _decision(
             "upstream_artifacts": dict(upstream),
             "reasons": sorted(set(reasons)),
             "follow_up": follow_up,
+            "provisional": provisional,
         },
     }
     decision_body["artifact_hash"] = canonical_json_hash(decision_body)
@@ -619,6 +628,8 @@ def _decision(
         "schema_version": "stage2-s210-decision-explanation-v1",
         "decision_rule": rule,
         "selected_estimator": selected,
+        "scope": decision_scope,
+        "provisional": provisional,
         "primary": {"batch_size": b, "microbatch_count": m, "repetitions": repetitions},
         "checks": {
             "double_bias_qualified": double_ok,
@@ -629,7 +640,7 @@ def _decision(
         },
         "reasons": sorted(set(reasons)),
         "follow_up": follow_up,
-        "formal_conclusion": selected is not None,
+        "formal_conclusion": selected is not None and decision_scope == "formal",
         "artifact_hash": "",
     }
     explanation["artifact_hash"] = canonical_json_hash(_body(explanation))
