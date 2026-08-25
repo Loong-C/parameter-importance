@@ -1267,6 +1267,44 @@ def _prepare_cell(root: Path, source: CellInput, *, repo_root: Path | None = Non
         checkpoint_lineage = cp.get("external_lineage", {}).get("checkpoint_manifest") if isinstance(cp.get("external_lineage"), Mapping) else None
         if not isinstance(checkpoint_lineage, Mapping) or not isinstance(result.checkpoint_ref, str) or result.checkpoint_ref != checkpoint_lineage.get("commit_ref"):
             raise G23Blocked("task_result.checkpoint_ref:EXTERNAL_BINDING_MISMATCH")
+        provider = cp.get("provider")
+        provider_checkpoint = provider.get("checkpoint_identity") if isinstance(provider, Mapping) else None
+        external_checkpoint = external_payloads.get("checkpoint_manifest")
+        if not isinstance(provider_checkpoint, Mapping) or not isinstance(external_checkpoint, Mapping):
+            raise G23Blocked("provider.checkpoint_identity:REQUIRED")
+        provider_required = (
+            "model_id", "training_stage", "checkpoint_id", "revision",
+            "root_ref", "manifest_ref", "manifest_sha256", "registry_hash",
+            "config_hash",
+        )
+        if set(provider_checkpoint) != set(provider_required):
+            raise G23Blocked("provider.checkpoint_identity:FIELDS_INVALID")
+        provider_expected = {
+            "model_id": checkpoint_identity.get("model_id"),
+            "training_stage": checkpoint_identity.get("training_stage"),
+            "checkpoint_id": checkpoint_identity.get("checkpoint_id"),
+            "revision": checkpoint_identity.get("checkpoint_revision"),
+            "root_ref": row.get("checkpoint_root_ref"),
+            "manifest_ref": external_checkpoint.get("source_manifest_ref"),
+            "manifest_sha256": external_checkpoint.get("source_manifest_sha256"),
+            "registry_hash": checkpoint_identity.get("registry_hash"),
+            "config_hash": checkpoint_identity.get("config_hash"),
+        }
+        if provider_checkpoint != provider_expected:
+            raise G23Blocked("provider.checkpoint_identity:TOP_LEVEL_MISMATCH")
+        if (
+            external_checkpoint.get("checkpoint_id") != provider_checkpoint.get("checkpoint_id")
+            or external_checkpoint.get("model_id") != provider_checkpoint.get("model_id")
+            or external_checkpoint.get("revision") != provider_checkpoint.get("revision")
+            or external_checkpoint.get("source_manifest_ref") != row.get("checkpoint_manifest_ref")
+            or external_checkpoint.get("source_manifest_sha256") != provider_checkpoint.get("manifest_sha256")
+        ):
+            raise G23Blocked("provider.checkpoint_identity:EXTERNAL_MANIFEST_MISMATCH")
+        source_manifest = external_checkpoint.get("checkpoint_manifest")
+        if not isinstance(source_manifest, Mapping) or canonical_json_hash(dict(source_manifest)) != provider_checkpoint.get("manifest_sha256"):
+            raise G23Blocked("provider.checkpoint_identity:SOURCE_MANIFEST_HASH_MISMATCH")
+        if row.get("checkpoint_root_ref") != provider_checkpoint.get("root_ref"):
+            raise G23Blocked("provider.checkpoint_identity:SIX_CELL_ROOT_MISMATCH")
         tokenizer_identity = _identity_object(
             cp.get("tokenizer_identity"),
             "tokenizer_identity",

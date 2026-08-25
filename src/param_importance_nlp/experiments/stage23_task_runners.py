@@ -29,6 +29,7 @@ import hashlib
 import math
 from pathlib import Path, PurePosixPath
 import random
+import re
 import shutil
 import subprocess
 from time import perf_counter
@@ -183,6 +184,7 @@ from .stage2_g23_contracts import (
     validate_sizing_plan_contract,
     validate_weighting_contract,
 )
+from .stage2_s204_ids import EXPECTED_CELL_IDS
 from .stage3 import (
     EndpointState,
     NodeCacheKey,
@@ -212,6 +214,15 @@ _STAGE2_ESTIMATOR_TASKS = frozenset(
     {"stage2.05_paired_estimator_runner", "stage2.07_main_sweep"}
 )
 _STAGE2_PILOT_TASK = "stage2.06_pilot_and_matrix_freeze"
+_FORMAL_SELECTED_CHECKPOINT_TASKS = frozenset(
+    {
+        _STAGE2_REFERENCE_TASK,
+        "stage2.05_paired_estimator_runner",
+        _STAGE2_PILOT_TASK,
+        "stage2.07_main_sweep",
+    }
+)
+_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _STAGE3_ENDPOINT_TASK = "stage3.03_endpoint_and_probe_pipeline"
 _STAGE3_REFERENCE_TASK = "stage3.05_reference_integral_and_precision"
 _STAGE3_PILOT_TASK = "stage3.06_pilot_and_threshold_freeze"
@@ -658,9 +669,14 @@ class _ProviderContext:
     # provider still supplies the full tuple explicitly; a missing value here
     # means "no external asset provenance", never an inferred formal claim.
     asset_provenance: tuple[Mapping[str, JSONValue], ...] = ()
+    # Stage 2.04--2.07 formal providers additionally bind the selected S2.3
+    # checkpoint.  G3 assets remain in ``asset_provenance`` as the runtime
+    # authorization/provenance boundary; this field records the actual model
+    # root loaded for gradients.
+    checkpoint_identity: Mapping[str, JSONValue] | None = None
 
     def to_payload(self) -> dict[str, JSONValue]:
-        return {
+        payload: dict[str, JSONValue] = {
             "provider_kind": self.provider_kind,
             "fixed_state_id": self.provider.fixed_state_id,
             "provider_state_digest": self.provider.state_digest(),
@@ -686,6 +702,9 @@ class _ProviderContext:
                 "common_mean_assumption": self.provider.common_mean_assumption,
             },
         }
+        if self.checkpoint_identity is not None:
+            payload["checkpoint_identity"] = dict(self.checkpoint_identity)
+        return payload
 
 
 def _local_provider(request: TaskExecutionRequest) -> _ProviderContext:
@@ -1312,6 +1331,327 @@ def _load_formal_parameter_registry(
     return registry
 
 
+@dataclass(frozen=True, slots=True)
+class _FormalCheckpointBinding:
+    """The exact S2.3 model root consumed by a formal Stage 2 provider."""
+
+    model_id: str
+    training_stage: str
+    checkpoint_id: str
+    revision: str
+    root_ref: str
+    manifest_ref: str
+    manifest_sha256: str
+    registry_hash: str
+    config_hash: str
+    root: Path
+
+    def to_payload(self) -> dict[str, JSONValue]:
+        return {
+            "model_id": self.model_id,
+            "training_stage": self.training_stage,
+            "checkpoint_id": self.checkpoint_id,
+            "revision": self.revision,
+            "root_ref": self.root_ref,
+            "manifest_ref": self.manifest_ref,
+            "manifest_sha256": self.manifest_sha256,
+            "registry_hash": self.registry_hash,
+            "config_hash": self.config_hash,
+        }
+
+
+def _formal_external_payload(
+    request: TaskExecutionRequest,
+    root: Path,
+    *,
+    environment_key: str,
+    expected_kind: str,
+) -> LoadedTaskArtifact:
+    """Load one formal materializer TaskArtifact with source-byte binding."""
+
+    reference = request.environment.evidence_refs.get(environment_key)
+    if not isinstance(reference, str) or not reference:
+        raise ValueError(f"FORMAL_CHECKPOINT_{environment_key.upper()}_REF_REQUIRED")
+    loaded = load_committed_task_artifact(root, reference, require_formal=True)
+    if loaded.identity.artifact_kind != expected_kind:
+        raise ValueError(
+            f"FORMAL_CHECKPOINT_{environment_key.upper()}_KIND_INVALID"
+        )
+    validate_external_manifest(loaded, root, expected_kind=expected_kind)
+    if not isinstance(loaded.payload, Mapping):
+        raise ValueError(f"FORMAL_CHECKPOINT_{environment_key.upper()}_PAYLOAD_INVALID")
+    return loaded
+
+
+def _sha256_file(path: Path) -> tuple[int, str]:
+    digest = hashlib.sha256()
+    size = 0
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            size += len(chunk)
+            digest.update(chunk)
+    return size, digest.hexdigest()
+
+
+def _validate_formal_checkpoint_root(
+    root: Path,
+    *,
+    root_ref: str,
+    manifest_ref: str,
+    manifest_sha256: str,
+    manifest: Mapping[str, object],
+) -> Path:
+    """Verify selected-root bytes before allowing Transformers to load them."""
+
+    model_root = _workspace_path(root, root_ref, field="checkpoint_root_ref")
+    manifest_path = _workspace_path(root, manifest_ref, field="checkpoint_manifest_ref")
+    if not model_root.is_dir() or manifest_path.parent != model_root:
+        raise ValueError("FORMAL_CHECKPOINT_ROOT_MANIFEST_PARENT_MISMATCH")
+    if manifest_path.name != "model-manifest.json":
+        raise ValueError("FORMAL_CHECKPOINT_MANIFEST_NAME_INVALID")
+    if hashlib.sha256(manifest_path.read_bytes()).hexdigest() != manifest_sha256:
+        raise ValueError("FORMAL_CHECKPOINT_SOURCE_MANIFEST_HASH_INVALID")
+    if _SHA256_RE.fullmatch(manifest_sha256) is None:
+        raise ValueError("FORMAL_CHECKPOINT_SOURCE_MANIFEST_SHA256_INVALID")
+    files = manifest.get("files")
+    if not isinstance(files, list) or not files:
+        raise ValueError("FORMAL_CHECKPOINT_MANIFEST_FILES_INVALID")
+    expected: dict[str, tuple[int, str]] = {}
+    for item in files:
+        if not isinstance(item, Mapping) or set(item) != {
+            "name", "official_lfs_sha256", "sha256", "size_bytes"
+        }:
+            raise ValueError("FORMAL_CHECKPOINT_MANIFEST_FILE_SCHEMA_INVALID")
+        name = item["name"]
+        digest = item["sha256"]
+        size = item["size_bytes"]
+        official_lfs_sha256 = item["official_lfs_sha256"]
+        if (
+            not isinstance(name, str)
+            or not name
+            or name in expected
+            or isinstance(size, bool)
+            or not isinstance(size, int)
+            or size < 0
+            or not isinstance(digest, str)
+            or _SHA256_RE.fullmatch(digest) is None
+            or (
+                official_lfs_sha256 is not None
+                and (
+                    not isinstance(official_lfs_sha256, str)
+                    or _SHA256_RE.fullmatch(official_lfs_sha256) is None
+                )
+            )
+            or (
+                name.endswith(".safetensors")
+                and (
+                    not isinstance(official_lfs_sha256, str)
+                    or _SHA256_RE.fullmatch(official_lfs_sha256) is None
+                )
+            )
+        ):
+            raise ValueError("FORMAL_CHECKPOINT_MANIFEST_FILE_IDENTITY_INVALID")
+        file_path = _workspace_path(
+            root, f"{root_ref}/{name}", field="checkpoint_file"
+        )
+        if not file_path.is_file() or file_path.is_symlink():
+            raise ValueError("FORMAL_CHECKPOINT_FILE_MISSING_OR_SYMLINK")
+        expected[name] = (size, digest)
+    for name, expected_identity in expected.items():
+        if _sha256_file(model_root / name) != expected_identity:
+            raise ValueError(f"FORMAL_CHECKPOINT_FILE_BYTES_INVALID:{name}")
+    sidecar_path = model_root / "SHA256SUMS"
+    if not sidecar_path.is_file() or sidecar_path.is_symlink():
+        raise ValueError("FORMAL_CHECKPOINT_SIDECAR_MISSING_OR_SYMLINK")
+    expected_sidecar = [
+        (name, digest) for name, (_size, digest) in expected.items()
+    ] + [("model-manifest.json", manifest_sha256)]
+    observed_sidecar: list[tuple[str, str]] = []
+    try:
+        for line in sidecar_path.read_text(encoding="ascii").splitlines():
+            if not line or "  " not in line:
+                raise ValueError
+            digest, name = line.split("  ", 1)
+            if name.startswith("*"):
+                name = name[1:]
+            observed_sidecar.append((name, digest))
+    except (OSError, UnicodeError, ValueError) as error:
+        raise ValueError("FORMAL_CHECKPOINT_SIDECAR_INVALID") from error
+    if observed_sidecar != [(name, digest) for name, digest in expected_sidecar]:
+        raise ValueError("FORMAL_CHECKPOINT_SIDECAR_MISMATCH")
+    actual_files: set[str] = set()
+    for path in model_root.rglob("*"):
+        if path.is_symlink():
+            raise ValueError("FORMAL_CHECKPOINT_ROOT_SYMLINK_REJECTED")
+        if path.is_file():
+            actual_files.add(path.relative_to(model_root).as_posix())
+        elif not path.is_dir():
+            raise ValueError("FORMAL_CHECKPOINT_ROOT_NONREGULAR_ENTRY")
+    allowed_files = set(expected) | {"model-manifest.json", "SHA256SUMS"}
+    if actual_files != allowed_files:
+        raise ValueError("FORMAL_CHECKPOINT_ROOT_FILE_SET_INVALID")
+    return model_root
+
+
+def _load_formal_selected_checkpoint(
+    request: TaskExecutionRequest,
+    root: Path,
+) -> _FormalCheckpointBinding | None:
+    """Resolve and cross-check the selected S2.3 root for Stage 2.04--2.07."""
+
+    if request.task.task_id not in _FORMAL_SELECTED_CHECKPOINT_TASKS:
+        return None
+    checkpoint_artifact = _formal_external_payload(
+        request, root, environment_key="stage2_checkpoint_manifest", expected_kind="checkpoint_manifest"
+    )
+    six_cell_artifact = _formal_external_payload(
+        request, root, environment_key="stage2_s23_six_cell_manifest", expected_kind="six_cell_manifest"
+    )
+    resolved_artifact = _formal_external_payload(
+        request, root, environment_key="stage2_resolved_config", expected_kind="resolved_config"
+    )
+    registry_artifact = _formal_external_payload(
+        request, root, environment_key="stage2_parameter_registry", expected_kind="parameter_registry"
+    )
+    source_artifacts = (
+        checkpoint_artifact,
+        six_cell_artifact,
+        resolved_artifact,
+        registry_artifact,
+    )
+    if any(
+        item.identity.task_id != _STAGE2_REFERENCE_TASK
+        or item.identity.formal_eligible is not True
+        for item in source_artifacts
+    ):
+        raise ValueError("FORMAL_CHECKPOINT_SOURCE_PRODUCER_IDENTITY_INVALID")
+    checkpoint = checkpoint_artifact.payload
+    six_cell = six_cell_artifact.payload
+    resolved = resolved_artifact.payload
+    registry = registry_artifact.payload
+    required = {
+        "schema_version", "checkpoint_id", "model_id", "revision",
+        "checkpoint_manifest", "source_manifest_ref", "source_manifest_sha256",
+    }
+    if set(checkpoint) != required or checkpoint["schema_version"] != "checkpoint-manifest-v1":
+        raise ValueError("FORMAL_CHECKPOINT_BINDING_FIELDS_INVALID")
+    model_id = checkpoint["model_id"]
+    checkpoint_id = checkpoint["checkpoint_id"]
+    revision = checkpoint["revision"]
+    manifest_ref = checkpoint["source_manifest_ref"]
+    manifest_sha256 = checkpoint["source_manifest_sha256"]
+    manifest = checkpoint["checkpoint_manifest"]
+    if not all(
+        isinstance(value, str) and value
+        for value in (model_id, checkpoint_id, revision, manifest_ref, manifest_sha256)
+    ) or not isinstance(manifest, Mapping):
+        raise ValueError("FORMAL_CHECKPOINT_BINDING_IDENTITY_INVALID")
+    source_config_hash = resolved.get("config_hash")
+    if not isinstance(source_config_hash, str) or _SHA256_RE.fullmatch(source_config_hash) is None:
+        raise ValueError("FORMAL_CHECKPOINT_RESOLVED_CONFIG_HASH_INVALID")
+    if any(
+        item.identity.config_hash != source_config_hash
+        for item in source_artifacts
+    ):
+        raise ValueError("FORMAL_CHECKPOINT_SOURCE_ARTIFACT_CONFIG_HASH_MISMATCH")
+    # Downstream S2.5--2.7 envelopes may derive a new execution hash while
+    # retaining the S2.4 resolved-config/checkpoint/registry identity.
+    if (
+        request.task.task_id == _STAGE2_REFERENCE_TASK
+        and request.config.config_hash != source_config_hash
+    ):
+        raise ValueError("FORMAL_CHECKPOINT_SOURCE_CONFIG_HASH_MISMATCH")
+    if canonical_json_hash(dict(manifest)) != manifest_sha256:
+        raise ValueError("FORMAL_CHECKPOINT_MANIFEST_PAYLOAD_HASH_INVALID")
+    if manifest.get("schema") != "parameter-importance-model-manifest-v1":
+        raise ValueError("FORMAL_CHECKPOINT_MANIFEST_SCHEMA_INVALID")
+    if manifest.get("revision") != revision:
+        raise ValueError("FORMAL_CHECKPOINT_MANIFEST_REVISION_MISMATCH")
+
+    base_model = request.config.base_config.section("model")
+    base_identity = request.config.base_config.section("identity")
+    if not isinstance(base_model, Mapping) or not isinstance(base_identity, Mapping):
+        raise ValueError("FORMAL_CHECKPOINT_CONFIG_SECTIONS_INVALID")
+    if (
+        base_model.get("architecture") != model_id
+        or base_model.get("asset_id") != PurePosixPath(manifest_ref).parent.name
+        or base_model.get("revision") != revision
+        or base_model.get("initialization_id") != checkpoint_id
+        or base_identity.get("input_checkpoint_id") != checkpoint_id
+    ):
+        raise ValueError("FORMAL_CHECKPOINT_CONFIG_IDENTITY_MISMATCH")
+    resolved_base = resolved.get("base_config")
+    if not isinstance(resolved_base, Mapping):
+        raise ValueError("FORMAL_CHECKPOINT_RESOLVED_CONFIG_BASE_MISSING")
+    resolved_model = resolved_base.get("model")
+    resolved_identity = resolved_base.get("identity")
+    if not isinstance(resolved_model, Mapping) or not isinstance(resolved_identity, Mapping):
+        raise ValueError("FORMAL_CHECKPOINT_RESOLVED_CONFIG_SECTIONS_INVALID")
+    for section, expected in ((resolved_model, base_model), (resolved_identity, base_identity)):
+        for field in ("architecture", "asset_id", "revision", "initialization_id", "input_checkpoint_id"):
+            if field in expected and section.get(field) != expected.get(field):
+                raise ValueError("FORMAL_CHECKPOINT_RESOLVED_CONFIG_IDENTITY_MISMATCH")
+
+    rows = six_cell.get("checkpoints")
+    if six_cell.get("schema_version") != "stage2-s204-six-cell-manifest-v1" or six_cell.get("status") != "READY" or six_cell.get("scope") != "formal" or not isinstance(rows, list):
+        raise ValueError("FORMAL_CHECKPOINT_SIX_CELL_MANIFEST_INVALID")
+    if len(rows) != len(EXPECTED_CELL_IDS) or tuple(
+        row.get("cell_id") if isinstance(row, Mapping) else None for row in rows
+    ) != EXPECTED_CELL_IDS:
+        raise ValueError("FORMAL_CHECKPOINT_SIX_CELL_CELL_ORDER_INVALID")
+    matches = [
+        row for row in rows
+        if isinstance(row, Mapping) and row.get("checkpoint_id") == checkpoint_id
+    ]
+    if len(matches) != 1:
+        raise ValueError("FORMAL_CHECKPOINT_SIX_CELL_CHECKPOINT_NOT_UNIQUE")
+    row = matches[0]
+    row_fields = ("model_id", "training_stage", "checkpoint_root_ref", "checkpoint_manifest_ref", "checkpoint_revision", "checkpoint_hash", "registry_hash", "config_hash")
+    if any(not isinstance(row.get(field), str) or not row.get(field) for field in row_fields):
+        raise ValueError("FORMAL_CHECKPOINT_SIX_CELL_IDENTITY_INVALID")
+    model_root_ref = PurePosixPath(manifest_ref).parent.as_posix()
+    if (
+        row["model_id"] != model_id
+        or row["checkpoint_root_ref"] != model_root_ref
+        or row["checkpoint_manifest_ref"] != manifest_ref
+        or row["checkpoint_revision"] != revision
+        or row["checkpoint_hash"] != canonical_json_hash(manifest_sha256)
+        or row["config_hash"] != source_config_hash
+    ):
+        raise ValueError("FORMAL_CHECKPOINT_SIX_CELL_IDENTITY_MISMATCH")
+    registry_hash = row["registry_hash"]
+    if (
+        registry.get("schema_version") != "stage2-parameter-registry-artifact-v1"
+        or registry.get("status") != "READY"
+        or registry.get("scope") != "formal"
+        or registry.get("checkpoint_id") != checkpoint_id
+        or registry.get("model_id") != model_id
+        or registry.get("training_stage") != row["training_stage"]
+        or registry.get("registry_hash") != registry_hash
+        or registry.get("config_hash") != source_config_hash
+    ):
+        raise ValueError("FORMAL_CHECKPOINT_REGISTRY_IDENTITY_MISMATCH")
+    selected_root = _validate_formal_checkpoint_root(
+        root,
+        root_ref=model_root_ref,
+        manifest_ref=manifest_ref,
+        manifest_sha256=manifest_sha256,
+        manifest=manifest,
+    )
+    return _FormalCheckpointBinding(
+        model_id=str(model_id),
+        training_stage=str(row["training_stage"]),
+        checkpoint_id=str(checkpoint_id),
+        revision=str(revision),
+        root_ref=model_root_ref,
+        manifest_ref=str(manifest_ref),
+        manifest_sha256=str(manifest_sha256),
+        registry_hash=str(registry_hash),
+        config_hash=str(source_config_hash),
+        root=selected_root,
+    )
+
+
 def _formal_provider(request: TaskExecutionRequest, root: Path) -> _ProviderContext:
     """验证离线资产并构造真实 Torch fixed-state provider。
 
@@ -1359,6 +1699,7 @@ def _formal_provider(request: TaskExecutionRequest, root: Path) -> _ProviderCont
     reject_legacy_provider_paths(providers)
 
     resolution_ref = request.environment.evidence_refs.get("g3_resolution")
+    selected_checkpoint: _FormalCheckpointBinding | None = None
     try:
         runtime_assets = FormalG3RuntimeAssets.from_request(request, root)
         base = request.config.base_config
@@ -1391,7 +1732,11 @@ def _formal_provider(request: TaskExecutionRequest, root: Path) -> _ProviderCont
         tokenizer_asset = runtime_assets.resolve(
             str(model_config["tokenizer_asset_id"]), expected_kind="tokenizer"
         )
-    except (FileNotFoundError, G3RuntimeAssetError, TypeError, ValueError) as error:
+        # G3 continues to authorize the base model/data/tokenizer assets.  The
+        # selected S2.3 checkpoint is a separate hash-bound input and is loaded
+        # only for the four formal Stage 2 provider consumers.
+        selected_checkpoint = _load_formal_selected_checkpoint(request, root)
+    except (FileNotFoundError, OSError, G3RuntimeAssetError, TypeError, ValueError) as error:
         raise _blocked(
             BlockerCode.ASSET_UNAVAILABLE,
             "qualified_g3_runtime_assets",
@@ -1416,8 +1761,13 @@ def _formal_provider(request: TaskExecutionRequest, root: Path) -> _ProviderCont
         )
 
     try:
+        model_root = (
+            model_asset.resolved.root
+            if selected_checkpoint is None
+            else selected_checkpoint.root
+        )
         model = OfflineHuggingFaceModelAdapter.from_local_directory(
-            model_asset.resolved.root,
+            model_root,
             task_type=task_type,
             num_labels=providers["num_labels"],  # type: ignore[arg-type]
             # Frozen-state main gradients are preregistered in FP32; only
@@ -1493,6 +1843,11 @@ def _formal_provider(request: TaskExecutionRequest, root: Path) -> _ProviderCont
         fixed_binding = {
             "g3_resolution_artifact_hash": runtime_assets.resolution_artifact_hash,
             "assets": [item.provenance() for item in qualified_assets],
+            "selected_checkpoint": (
+                selected_checkpoint.to_payload()
+                if selected_checkpoint is not None
+                else None
+            ),
         }
         fixed_id = f"offline-{canonical_json_hash(fixed_binding)[:24]}"
         # The coordinate registry is an upstream S2.3 authority, not a
@@ -1507,6 +1862,12 @@ def _formal_provider(request: TaskExecutionRequest, root: Path) -> _ProviderCont
         registry = _load_formal_parameter_registry(
             root, registry_ref, model.module
         )
+        if (
+            selected_checkpoint is not None
+            and registry.coordinate_registry_hash
+            != selected_checkpoint.registry_hash
+        ):
+            raise ValueError("FORMAL_CHECKPOINT_REGISTRY_MODEL_HASH_MISMATCH")
         provider = TorchFixedStateGradientProvider(
             model,
             resolver,
@@ -1547,6 +1908,11 @@ def _formal_provider(request: TaskExecutionRequest, root: Path) -> _ProviderCont
         asset_provenance=tuple(item.provenance() for item in qualified_assets),
         stage1_exit=stage1_exit,
         stage0_handoff=stage0_handoff,
+        checkpoint_identity=(
+            selected_checkpoint.to_payload()
+            if selected_checkpoint is not None
+            else None
+        ),
     )
 
 
