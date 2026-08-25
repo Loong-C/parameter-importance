@@ -1515,6 +1515,7 @@ def _formal_provider(request: TaskExecutionRequest, root: Path) -> _ProviderCont
             output_dtype=torch.float32,
             gradient_chunk_size=1,
             enable_formal_batched=True,
+            formal_batch_chunk_size=4,
         )
     except DependencyUnavailable as error:
         raise _blocked(
@@ -2181,6 +2182,10 @@ def _run_stage2_handoff_audit(
             "formal_batched_execution_property": "enable_formal_batched",
             "formal_batched_execution": bool(
                 getattr(context.provider, "enable_formal_batched", False)
+            ),
+            "formal_batch_chunk_size_property": "formal_batch_chunk_size",
+            "formal_batch_chunk_size": getattr(
+                context.provider, "formal_batch_chunk_size", None
             ),
             "mutation_policy": "read_only_gradient_queries",
         },

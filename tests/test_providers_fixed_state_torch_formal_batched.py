@@ -85,6 +85,7 @@ def _provider(
     *,
     batched: bool,
     chunk_size: int = 1,
+    formal_chunk_size: int = 4,
 ) -> TorchFixedStateGradientProvider:
     provider = TorchFixedStateGradientProvider(
         TorchModelAdapter(module, task_type="causal_lm"),
@@ -93,6 +94,7 @@ def _provider(
         output_dtype=torch.float32,
         gradient_chunk_size=chunk_size,
         enable_formal_batched=batched,
+        formal_batch_chunk_size=formal_chunk_size,
     )
     # Short CPU fixtures retain the production guard's logic while avoiding a
     # 32*2048-token test tensor.  The formal runtime never changes this value.
@@ -135,8 +137,12 @@ def test_formal_flag_and_chunk_size_are_digest_bound() -> None:
     first = _provider(module, _resolver(), batched=False, chunk_size=1)
     second = _provider(module, _resolver(), batched=False, chunk_size=2)
     formal = _provider(module, _resolver(), batched=True, chunk_size=1)
+    formal_chunked = _provider(
+        module, _resolver(), batched=True, chunk_size=1, formal_chunk_size=2
+    )
     assert first.state_digest() != second.state_digest()
     assert first.state_digest() != formal.state_digest()
+    assert formal.state_digest() != formal_chunked.state_digest()
 
 
 def test_formal_guard_falls_back_for_generic_resolver_and_training_model() -> None:

@@ -550,6 +550,7 @@ class TorchFixedStateGradientProvider:
         output_dtype: torch.dtype = torch.float32,
         gradient_chunk_size: int = 4,
         enable_formal_batched: bool = False,
+        formal_batch_chunk_size: int = 4,
     ) -> None:
         if not isinstance(model, ModelAdapter):
             raise TypeError("MODEL_ADAPTER_PROTOCOL_NOT_IMPLEMENTED")
@@ -567,6 +568,10 @@ class TorchFixedStateGradientProvider:
             raise TypeError("FIXED_STATE_FORMAL_BATCHED_FLAG_INVALID")
         if enable_formal_batched and output_dtype is not torch.float32:
             raise ValueError("FIXED_STATE_FORMAL_BATCHED_REQUIRES_FLOAT32_OUTPUT")
+        if isinstance(formal_batch_chunk_size, bool) or not isinstance(
+            formal_batch_chunk_size, int
+        ) or not 0 < formal_batch_chunk_size <= self._FORMAL_BATCH_MAX_DRAWS:
+            raise ValueError("FIXED_STATE_FORMAL_BATCH_CHUNK_SIZE_INVALID")
         for field_name in (
             "resolver_id",
             "loss_unit",
@@ -623,6 +628,7 @@ class TorchFixedStateGradientProvider:
         # ``1`` is the strict per-sample reference path.
         self._gradient_chunk_size = gradient_chunk_size
         self._enable_formal_batched = enable_formal_batched
+        self._formal_batch_chunk_size = formal_batch_chunk_size
         self._digest_baseline: _DigestBaseline | None = None
 
     @property
@@ -674,6 +680,12 @@ class TorchFixedStateGradientProvider:
         """Whether the strictly guarded Pythia formal fast path is enabled."""
 
         return self._enable_formal_batched
+
+    @property
+    def formal_batch_chunk_size(self) -> int:
+        """Maximum fixed-shape Pythia sequences in one autograd graph."""
+
+        return self._formal_batch_chunk_size
 
     @property
     def model_adapter(self) -> ModelAdapter:
@@ -789,6 +801,7 @@ class TorchFixedStateGradientProvider:
                     "output_dtype": str(self.output_dtype),
                     "gradient_chunk_size": self.gradient_chunk_size,
                     "enable_formal_batched": self.enable_formal_batched,
+                    "formal_batch_chunk_size": self.formal_batch_chunk_size,
                 }
             ),
         )
@@ -840,6 +853,7 @@ class TorchFixedStateGradientProvider:
             str(self.output_dtype),
             self.gradient_chunk_size,
             self.enable_formal_batched,
+            self.formal_batch_chunk_size,
         )
 
     def assert_unchanged(self, expected_digest: str) -> None:
@@ -1018,19 +1032,41 @@ class TorchFixedStateGradientProvider:
                     raise TypeError("RESOLVER_RESULT_NOT_TRAINING_MICROBATCH")
                 resolved_batches = resolved  # type: ignore[assignment]
             with torch.enable_grad():
-                if self._formal_batch_eligible(resolved_batches, sample_ids):
-                    (
-                        loss_numerator_total,
-                        total_count,
-                        observed_loss_unit,
-                        batched_gradients,
-                    ) = self._formal_batched_gradients(
-                        resolved_batches, parameter_tuple
-                    )
-                    for name, gradient in zip(
-                        self.parameter_names, batched_gradients, strict=True
+                formal_batch_eligible = self._formal_batch_eligible(
+                    resolved_batches, sample_ids
+                )
+                if formal_batch_eligible:
+                    for batch_start in range(
+                        0, len(resolved_batches), self.formal_batch_chunk_size
                     ):
-                        gradient_sums[name] = gradient
+                        (
+                            chunk_numerator_total,
+                            chunk_count,
+                            chunk_loss_unit,
+                            batched_gradients,
+                        ) = self._formal_batched_gradients(
+                            resolved_batches[
+                                batch_start : batch_start + self.formal_batch_chunk_size
+                            ],
+                            parameter_tuple,
+                        )
+                        if observed_loss_unit is None:
+                            observed_loss_unit = chunk_loss_unit
+                        elif observed_loss_unit != chunk_loss_unit:
+                            raise ValueError("DRAW_LOSS_STATISTICAL_UNIT_MISMATCH")
+                        loss_numerator_total = (
+                            chunk_numerator_total
+                            if loss_numerator_total is None
+                            else loss_numerator_total + chunk_numerator_total
+                        )
+                        total_count += chunk_count
+                        for name, gradient in zip(
+                            self.parameter_names, batched_gradients, strict=True
+                        ):
+                            if name not in gradient_sums:
+                                gradient_sums[name] = gradient.clone()
+                            else:
+                                gradient_sums[name].add_(gradient)
                 # Keep only a bounded number of forward graphs alive.  The
                 # old combined-loss backward retained all 32 graphs, while a
                 # strictly per-sample backward launched one autograd traversal
@@ -1038,7 +1074,7 @@ class TorchFixedStateGradientProvider:
                 # order and stochastic/RNG behavior, but cuts Python/autograd
                 # launch overhead without making memory proportional to the
                 # public block size.
-                elif not self._formal_batch_eligible(resolved_batches, sample_ids):
+                elif not formal_batch_eligible:
                     for chunk_start in range(0, len(sample_ids), self.gradient_chunk_size):
                         chunk_losses: list[torch.Tensor] = []
                         chunk_count = 0
