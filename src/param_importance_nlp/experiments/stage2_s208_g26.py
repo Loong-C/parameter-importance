@@ -61,6 +61,14 @@ class S28G26Blocked(RuntimeError):
 
 
 def _finite(value: Any, *, field: str = "value") -> None:
+    # Production S2.4 bundles are exposed as read-only ndarray/memmap views.
+    # They are checked chunk-wise by the loader; retaining this recursive
+    # guard here prevents a memmap from being mistaken for a JSON scalar while
+    # still rejecting NaN/Inf before analysis.
+    if isinstance(value, np.ndarray):
+        if value.ndim == 0 or not np.isfinite(value).all():
+            raise S28G26Blocked(f"{field}:NONFINITE_OR_EMPTY_ARRAY")
+        return
     if isinstance(value, bool) or value is None or isinstance(value, str):
         return
     if isinstance(value, (int, float)):
@@ -102,6 +110,9 @@ def _load(value: Mapping[str, Any] | str | Path, *, field: str) -> Mapping[str, 
 
 
 def _verify_hash(value: Mapping[str, Any], *, field: str, required: bool = True) -> str | None:
+    if value.get("_streaming_payload") is True:
+        declared = value.get("candidate_artifact_hash", value.get("reference_hash"))
+        return _sha(declared, field=f"{field}.candidate_artifact_hash")
     declared = value.get("artifact_hash")
     if declared is None and not required:
         return None
@@ -126,14 +137,26 @@ def _path_under(root: Path, reference: str, *, field: str) -> Path:
 def _vector(value: Any, *, field: str, coordinate_ids: Sequence[str] | None = None) -> tuple[tuple[str, ...], np.ndarray]:
     """Normalize a signed vector while preserving a canonical coordinate order."""
 
-    if isinstance(value, Mapping):
+    if isinstance(value, np.ndarray):
+        array = np.asarray(value, dtype=np.float64).reshape(-1)
+        keys = tuple(str(item) for item in (coordinate_ids or tuple(range(len(array)))))
+    elif isinstance(value, Mapping):
         if not value:
             raise S28G26Blocked(f"{field}:EMPTY_VECTOR")
         keys = tuple(sorted(str(key) for key in value))
         if len(keys) != len(set(keys)):
             raise S28G26Blocked(f"{field}:DUPLICATE_COORDINATE")
         try:
-            array = np.asarray([float(value[key]) for key in keys], dtype=np.float64)
+            raw = [value[key] for key in keys]
+            if raw and all(isinstance(item, np.ndarray) for item in raw):
+                # Parameter-name -> tensor mappings are the native S2.4
+                # representation.  Production loaders flatten them into a
+                # memmap before this point; this fallback keeps small direct
+                # bundles auditable without JSON list expansion.
+                array = np.concatenate([np.asarray(item, dtype=np.float64).reshape(-1) for item in raw])
+                keys = tuple(str(item) for item in (coordinate_ids or tuple(range(len(array)))))
+            else:
+                array = np.asarray([float(item) for item in raw], dtype=np.float64)
         except (KeyError, TypeError, ValueError) as error:
             raise S28G26Blocked(f"{field}:NUMERIC_VECTOR_REQUIRED") from error
     elif isinstance(value, (list, tuple)):
@@ -238,8 +261,28 @@ def _reference_views(payload: Mapping[str, Any], *, field: str) -> tuple[dict[st
         normalized = [_vector(item, field=f"{field}.{name}[{index}]", coordinate_ids=views[name][0]) for index, item in enumerate(source)]
         for item in normalized:
             _same_vector(views[name], item, field=f"{field}.{name}.block")
-        # Keep blocks as an object array-like flattened matrix in the return map.
-        blocks[name] = (views[name][0], np.stack([item[1] for item in normalized], axis=0))
+        # Keep formal block matrices on disk when the source vectors are
+        # memmaps.  ``np.stack`` here used to duplicate every reference block
+        # in RAM (catastrophic for 14M/31M coordinates).
+        arrays = [item[1] for item in normalized]
+        if arrays and all(isinstance(item, np.memmap) for item in arrays):
+            source = arrays[0]
+            target_path = Path(source.filename).with_name(Path(source.filename).name + f".{name}.blocks.f64.dat")
+            target_path.parent.mkdir(parents=True, exist_ok=True)
+            expected_size = len(arrays) * int(source.size) * 8
+            if target_path.exists() and target_path.stat().st_size != expected_size:
+                raise S28G26Blocked(f"{field}.{name}:BLOCK_MEMMAP_COLLISION")
+            if not target_path.exists():
+                with target_path.open("wb") as handle:
+                    handle.truncate(expected_size)
+            stacked = np.memmap(target_path, mode="r+", dtype=np.float64, shape=(len(arrays), source.size))
+            for index, array in enumerate(arrays):
+                stacked[index] = array
+            stacked.flush()
+            stacked.flags.writeable = False
+        else:
+            stacked = np.stack(arrays, axis=0)
+        blocks[name] = (views[name][0], stacked)
     return views, blocks
 
 
@@ -253,21 +296,48 @@ def _read_raw_payload(root: Path, descriptor: Mapping[str, Any]) -> Mapping[str,
         source_path = None
     else:
         source_path = _path_under(root, ref, field="raw_artifact_ref")
-        if not source_path.exists() or not source_path.is_file():
+        if not source_path.exists():
             raise S28G26Blocked(f"raw_artifact_ref:NOT_FOUND:{ref}")
-        try:
-            payload = dict(_load(source_path, field=f"raw_artifact_ref:{ref}"))
-        except S28G26Blocked:
-            raise
+        if source_path.is_dir():
+            try:
+                from .stage2_s208_production import _decode_bundle, _flat_memmap
+
+                state, manifest_hash = _decode_bundle(source_path, source_path.parent / ".s208-memmap", source_path.name)
+                vectors = state.get("vectors")
+                if not isinstance(vectors, Mapping):
+                    raise S28G26Blocked("raw_artifact_bundle:VECTORS_REQUIRED")
+                coordinate_ids = state.get("coordinate_ids") if isinstance(state.get("coordinate_ids"), list) else []
+                flat_vectors: dict[str, np.ndarray] = {}
+                for method, vector in vectors.items():
+                    ids: list[str] = list(coordinate_ids) if coordinate_ids else []
+                    flat_vectors[str(method)] = _flat_memmap(vector, ids, source_path.parent / ".s208-memmap", f"{source_path.name}-{method}")
+                    if coordinate_ids and ids != coordinate_ids:
+                        raise S28G26Blocked("raw_artifact_bundle:COORDINATE_REGISTRY_MISMATCH")
+                    if not coordinate_ids:
+                        coordinate_ids = ids
+                payload = {key: value for key, value in state.items() if key != "vectors"}
+                payload.update({"vectors": flat_vectors, "coordinate_ids": coordinate_ids, "_streaming_payload": True, "candidate_artifact_hash": manifest_hash})
+            except S28G26Blocked:
+                raise
+            except (OSError, TypeError, ValueError) as error:
+                raise S28G26Blocked("raw_artifact_bundle:INVALID") from error
+        else:
+            try:
+                payload = dict(_load(source_path, field=f"raw_artifact_ref:{ref}"))
+            except S28G26Blocked:
+                raise
     declared = descriptor.get("raw_artifact_hash")
     _sha(declared, field="raw_artifact_hash")
     # Producer artifacts may carry their own canonical hash; otherwise the
     # descriptor binds the full canonical body.  A byte hash is accepted only
     # when it is exactly the hash of the canonical source file.
-    body_hash = canonical_json_hash({key: item for key, item in payload.items() if key != "artifact_hash"})
+    if payload.get("_streaming_payload") is True:
+        body_hash = str(payload.get("candidate_artifact_hash", ""))
+    else:
+        body_hash = canonical_json_hash({key: item for key, item in payload.items() if key != "artifact_hash"})
     object_hash = payload.get("artifact_hash")
     candidates = {body_hash, object_hash}
-    if source_path is not None:
+    if source_path is not None and source_path.is_file():
         candidates.add(hashlib.sha256(source_path.read_bytes()).hexdigest())
     if declared not in candidates:
         raise S28G26Blocked("raw_artifact_hash:CONTENT_MISMATCH")
@@ -346,12 +416,20 @@ def _bootstrap(
     if replicates < 100:
         raise S28G26Blocked("BOOTSTRAP_REPLICATES_TOO_SMALL")
     rng = random.Random(int(seed))
-    outer_array = np.stack(tuple(outer), axis=0)
+    outer_values = tuple(outer)
     draws = np.empty(replicates, dtype=np.float64)
     for index in range(replicates):
-        outer_indices = [rng.randrange(outer_array.shape[0]) for _ in range(outer_array.shape[0])]
+        outer_indices = [rng.randrange(len(outer_values)) for _ in range(len(outer_values))]
         inner_indices = [rng.randrange(reference_blocks.shape[0]) for _ in range(reference_blocks.shape[0])]
-        draws[index] = statistic(outer_array[outer_indices].mean(axis=0), reference_blocks[inner_indices].mean(axis=0))
+        outer_mean = np.zeros_like(outer_values[0], dtype=np.float64)
+        for item in outer_indices:
+            outer_mean += outer_values[item]
+        outer_mean /= float(len(outer_indices))
+        reference_mean = np.zeros_like(reference_blocks[0], dtype=np.float64)
+        for item in inner_indices:
+            reference_mean += reference_blocks[item]
+        reference_mean /= float(len(inner_indices))
+        draws[index] = statistic(outer_mean, reference_mean)
     if not np.isfinite(draws).all():
         raise S28G26Blocked("BOOTSTRAP_NONFINITE")
     return {
@@ -546,19 +624,52 @@ def _group_values(vector: np.ndarray, ids: Sequence[str], groups: Mapping[str, S
     return {name: float(sum(vector[positions[item]] for item in coordinates)) for name, coordinates in groups.items()}
 
 
+def _mean_vectors(vectors: Sequence[np.ndarray]) -> np.ndarray:
+    if not vectors:
+        raise S28G26Blocked("VECTOR_SEQUENCE_EMPTY")
+    result = np.zeros_like(vectors[0], dtype=np.float64)
+    for vector in vectors:
+        if vector.shape != result.shape:
+            raise S28G26Blocked("VECTOR_SEQUENCE_SHAPE_MISMATCH")
+        result += vector
+    result /= float(len(vectors))
+    return result
+
+
+def _mean_square_error(vectors: Sequence[np.ndarray], target: np.ndarray) -> float:
+    return sum(float(np.mean(np.square(vector - target))) for vector in vectors) / float(len(vectors))
+
+
+def _variance_scalar(vectors: Sequence[np.ndarray], mean: np.ndarray, *, ddof: int) -> float:
+    if len(vectors) <= ddof:
+        return 0.0
+    return sum(float(np.mean(np.square(vector - mean))) for vector in vectors) / float(len(vectors) - ddof)
+
+
+def _negative_stats(vectors: Sequence[np.ndarray]) -> tuple[float, float, float]:
+    count = 0
+    negative_mass = 0.0
+    positive_mass = 0.0
+    for vector in vectors:
+        count += int(np.count_nonzero(vector < 0))
+        negative_mass += float(np.abs(vector[vector < 0]).sum())
+        positive_mass += float(vector[vector > 0].sum())
+    return count / float(len(vectors) * vectors[0].size), negative_mass, positive_mass
+
+
 def _method_statistics(cell: _CellData, method: str, *, bootstrap_replicates: int, seed: int) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     ids = cell.references["bias"][0]
     reference = cell.references["bias"][1]
     rows = list(cell.repetitions.values())
     vectors = [item[0][method][1] for item in rows]
-    matrix = np.stack(vectors, axis=0)
-    mean = matrix.mean(axis=0)
+    mean = _mean_vectors(vectors)
     error = mean - reference
-    v_r = float(np.mean(np.square(matrix - mean[None, :])))
-    s2 = float(np.mean(np.var(matrix, axis=0, ddof=1))) if len(rows) > 1 else 0.0
+    v_r = _variance_scalar(vectors, mean, ddof=0)
+    s2 = _variance_scalar(vectors, mean, ddof=1)
     observed_nmse = float(np.mean(np.square(error)) / cell.denominator)
     ref_blocks = cell.reference_blocks["bias"]
-    v_ref = float(np.mean(np.var(ref_blocks, axis=0, ddof=1)) / cell.denominator)
+    v_ref = _variance_scalar(tuple(ref_blocks), _mean_vectors(tuple(ref_blocks)), ddof=1) / cell.denominator
+    negative_fraction, negative_mass, positive_mass = _negative_stats(vectors)
     corrected = observed_nmse - v_ref
     long_rows: list[dict[str, Any]] = []
     for view_name in ("bias", "cross", "ranking"):
@@ -576,17 +687,17 @@ def _method_statistics(cell: _CellData, method: str, *, bootstrap_replicates: in
             "scope": "parameter",
             "reference_view": view_name,
             "repetitions": len(rows),
-            "coordinate_count": int(matrix.shape[1]),
+            "coordinate_count": int(mean.shape[0]),
             "signed_bias": float(np.sum(view_error)),
             "absolute_bias": float(np.sum(np.abs(view_error))),
             "variance_s2": s2,
             "variance_v_r": v_r,
-            "mse_observed": float(np.mean(np.square(matrix - target[None, :]))),
-            "mae": float(np.mean(np.abs(matrix - target[None, :]))),
+            "mse_observed": _mean_square_error(vectors, target),
+            "mae": float(sum(float(np.mean(np.abs(vector - target))) for vector in vectors) / len(vectors)),
             "bootstrap": bootstrap,
-            "negative_fraction": float(np.mean(matrix < 0)),
-            "negative_mass": float(np.sum(np.abs(matrix[matrix < 0]))),
-            "positive_mass": float(np.sum(matrix[matrix > 0])),
+            "negative_fraction": negative_fraction,
+            "negative_mass": negative_mass,
+            "positive_mass": positive_mass,
         }
         if view_name == "ranking":
             metric["pearson"] = _pearson(mean, target)
@@ -602,7 +713,7 @@ def _method_statistics(cell: _CellData, method: str, *, bootstrap_replicates: in
         for name in ranking:
             if name in top:
                 ranking[name].append(top[name])
-    long_rows.append({"cell_id": cell.cell_id, "model": cell.model, "training_stage": cell.stage, "batch_size": cell.batch_size, "microbatch_count": cell.microbatch_count, "method": method, "scope": "parameter", "reference_view": "ranking_repetition_mean", "repetitions": len(rows), "coordinate_count": int(matrix.shape[1]), "pearson": _pearson(mean, rank_target), "spearman": _spearman(mean, rank_target), **_top_metrics(mean, rank_target)})
+    long_rows.append({"cell_id": cell.cell_id, "model": cell.model, "training_stage": cell.stage, "batch_size": cell.batch_size, "microbatch_count": cell.microbatch_count, "method": method, "scope": "parameter", "reference_view": "ranking_repetition_mean", "repetitions": len(rows), "coordinate_count": int(mean.shape[0]), "pearson": _pearson(mean, rank_target), "spearman": _spearman(mean, rank_target), **_top_metrics(mean, rank_target)})
     summary = {
         "cell_id": cell.cell_id,
         "model": cell.model,
@@ -616,12 +727,12 @@ def _method_statistics(cell: _CellData, method: str, *, bootstrap_replicates: in
         "variance_s2": s2,
         "variance_v_r": v_r,
         "mse_observed": float(np.mean(np.square(error)) + v_r),
-        "mse_identity_residual": float(np.mean(np.square(matrix - reference[None, :])) - (v_r + np.mean(np.square(error)))),
+        "mse_identity_residual": float(_mean_square_error(vectors, reference) - (v_r + np.mean(np.square(error)))),
         "reference_variance_v_ref": v_ref,
         "corrected_nmse": corrected,
-        "negative_fraction": float(np.mean(matrix < 0)),
-        "negative_mass": float(np.sum(np.abs(matrix[matrix < 0]))),
-        "positive_mass": float(np.sum(matrix[matrix > 0])),
+        "negative_fraction": negative_fraction,
+        "negative_mass": negative_mass,
+        "positive_mass": positive_mass,
         "ranking_repetition_mean": {name: float(np.mean(values)) for name, values in ranking.items()},
         "ranking_repeat_mean": {"pearson": _pearson(mean, rank_target), "spearman": _spearman(mean, rank_target), **_top_metrics(mean, rank_target)},
         "reference_sensitivity": {view: float(np.sum(mean - cell.references[view][1])) for view in ("bias", "cross", "ranking")},
@@ -633,7 +744,7 @@ def _family_endpoint(cell: _CellData, method: str, endpoint: str, *, bootstrap_r
     ids = cell.references["bias"][0]
     target = cell.references["bias"][1]
     vectors = [item[0][method][1] for item in cell.repetitions.values()]
-    mean = np.mean(np.stack(vectors, axis=0), axis=0)
+    mean = _mean_vectors(vectors)
     bias = mean - target
     groups = _group_values(bias, ids, cell.group_registry)
     if endpoint == "model_total_signed_bias":
@@ -662,7 +773,7 @@ def _family_endpoint(cell: _CellData, method: str, endpoint: str, *, bootstrap_r
         passed = hi < cell.margins[endpoint]
     precision_ok = cell.reference_half_width <= cell.margins[endpoint] / 4.0 and cell.numeric_error <= cell.margins[endpoint] / 10.0
     state = "PASS" if passed and precision_ok else "INCONCLUSIVE" if passed or not precision_ok else "FAIL"
-    cross_mean = np.mean(np.stack(vectors, axis=0), axis=0)
+    cross_mean = _mean_vectors(vectors)
     cross_blocks = cell.reference_blocks["cross"]
     cross_bootstrap = _bootstrap(vectors, cross_blocks, statistic, replicates=bootstrap_replicates, seed=seed + 77)
     if interval_name == "joint_90":
@@ -692,12 +803,23 @@ def _paired_bootstrap(
     if len(left) != len(right) or len(left) < 2 or reference_blocks.ndim != 2 or reference_blocks.shape[0] < 3:
         raise S28G26Blocked("PAIRED_BOOTSTRAP_SHAPES_INVALID")
     rng = random.Random(int(seed))
-    left_array, right_array = np.stack(tuple(left)), np.stack(tuple(right))
+    left_values, right_values = tuple(left), tuple(right)
     draws = np.empty(replicates, dtype=np.float64)
     for index in range(replicates):
-        outer_indices = [rng.randrange(left_array.shape[0]) for _ in range(left_array.shape[0])]
+        outer_indices = [rng.randrange(len(left_values)) for _ in range(len(left_values))]
         inner_indices = [rng.randrange(reference_blocks.shape[0]) for _ in range(reference_blocks.shape[0])]
-        draws[index] = statistic(left_array[outer_indices].mean(axis=0), right_array[outer_indices].mean(axis=0), reference_blocks[inner_indices].mean(axis=0))
+        left_mean = np.zeros_like(left_values[0], dtype=np.float64)
+        right_mean = np.zeros_like(right_values[0], dtype=np.float64)
+        for item in outer_indices:
+            left_mean += left_values[item]
+            right_mean += right_values[item]
+        left_mean /= float(len(outer_indices))
+        right_mean /= float(len(outer_indices))
+        reference_mean = np.zeros_like(reference_blocks[0], dtype=np.float64)
+        for item in inner_indices:
+            reference_mean += reference_blocks[item]
+        reference_mean /= float(len(inner_indices))
+        draws[index] = statistic(left_mean, right_mean, reference_mean)
     if not np.isfinite(draws).all():
         raise S28G26Blocked("PAIRED_BOOTSTRAP_NONFINITE")
     return {"unit": S28_BOOTSTRAP_UNIT, "replicates": int(replicates), "seed": int(seed), "quantile_0.025": float(np.quantile(draws, 0.025)), "quantile_0.05": float(np.quantile(draws, 0.05)), "quantile_0.95": float(np.quantile(draws, 0.95)), "quantile_0.975": float(np.quantile(draws, 0.975)), "mean": float(draws.mean()), "std": float(draws.std(ddof=1)), "parameter_coordinate_resampling": False}
@@ -713,8 +835,9 @@ def _noninferiority_rows(cell: _CellData, *, bootstrap_replicates: int, seed: in
     ref_blocks = cell.reference_blocks["bias"]
     denominator = cell.denominator
     ref_var = float(np.mean(np.var(ref_blocks, axis=0, ddof=1)) / denominator)
-    u_nmse = float(np.mean(np.square(np.mean(np.stack(left), axis=0) - target)) / denominator - ref_var)
-    d_nmse = float(np.mean(np.square(np.mean(np.stack(right), axis=0) - target)) / denominator - ref_var)
+    left_mean, right_mean = _mean_vectors(left), _mean_vectors(right)
+    u_nmse = float(np.mean(np.square(left_mean - target)) / denominator - ref_var)
+    d_nmse = float(np.mean(np.square(right_mean - target)) / denominator - ref_var)
     rows: list[dict[str, Any]] = []
     if d_nmse <= float(ABSOLUTE_FLOORS["tau_nmse"]):
         nmse_state = "INCONCLUSIVE"
@@ -726,11 +849,11 @@ def _noninferiority_rows(cell: _CellData, *, bootstrap_replicates: int, seed: in
     rank_target = cell.references["ranking"][1]
     rank_bootstrap = _paired_bootstrap(left, right, cell.reference_blocks["ranking"], lambda u, d, r: _spearman(u, r) - _spearman(d, r), replicates=bootstrap_replicates, seed=seed + 17)
     rank_state = "PASS" if float(rank_bootstrap["quantile_0.05"]) >= -0.02 else "FAIL"
-    rows.append({"cell_id": cell.cell_id, "method": u_method, "endpoint": "parameter_spearman_noninferiority", "effect": _spearman(np.mean(np.stack(left), axis=0), rank_target) - _spearman(np.mean(np.stack(right), axis=0), rank_target), "baseline": "double", "threshold": {"lower": -0.02}, "interval": rank_bootstrap, "multiplicity": "intersection_union_across_six_primary_cells", "state": rank_state})
+    rows.append({"cell_id": cell.cell_id, "method": u_method, "endpoint": "parameter_spearman_noninferiority", "effect": _spearman(left_mean, rank_target) - _spearman(right_mean, rank_target), "baseline": "double", "threshold": {"lower": -0.02}, "interval": rank_bootstrap, "multiplicity": "intersection_union_across_six_primary_cells", "state": rank_state})
     overlap_key = "overlap_at_0.01"
     overlap_bootstrap = _paired_bootstrap(left, right, cell.reference_blocks["ranking"], lambda u, d, r: float(_top_metrics(u, r)[overlap_key] - _top_metrics(d, r)[overlap_key]), replicates=bootstrap_replicates, seed=seed + 31)
     overlap_state = "PASS" if float(overlap_bootstrap["quantile_0.05"]) >= -0.03 else "FAIL"
-    rows.append({"cell_id": cell.cell_id, "method": u_method, "endpoint": "parameter_overlap_at_1_percent_noninferiority", "effect": float(_top_metrics(np.mean(np.stack(left), axis=0), rank_target)[overlap_key] - _top_metrics(np.mean(np.stack(right), axis=0), rank_target)[overlap_key]), "baseline": "double", "threshold": {"lower": -0.03}, "interval": overlap_bootstrap, "multiplicity": "intersection_union_across_six_primary_cells", "state": overlap_state})
+    rows.append({"cell_id": cell.cell_id, "method": u_method, "endpoint": "parameter_overlap_at_1_percent_noninferiority", "effect": float(_top_metrics(left_mean, rank_target)[overlap_key] - _top_metrics(right_mean, rank_target)[overlap_key]), "baseline": "double", "threshold": {"lower": -0.03}, "interval": overlap_bootstrap, "multiplicity": "intersection_union_across_six_primary_cells", "state": overlap_state})
     return rows
 
 
@@ -751,9 +874,9 @@ def _raw_calibration_row(cell: _CellData) -> dict[str, Any]:
         if ids != cell.references["bias"][0]:
             raise S28G26Blocked(f"raw_calibration.{cell.cell_id}:COORDINATE_REGISTRY_MISMATCH")
         values.append(vector)
-    theory = np.mean(np.stack(values), axis=0) / cell.batch_size
-    raw_vectors = np.stack([item[0]["raw"][1] for item in cell.repetitions.values()])
-    observed = np.mean(raw_vectors, axis=0) - cell.references["bias"][1]
+    theory = _mean_vectors(values) / cell.batch_size
+    raw_vectors = [item[0]["raw"][1] for item in cell.repetitions.values()]
+    observed = _mean_vectors(raw_vectors) - cell.references["bias"][1]
     slope = float(np.dot(theory, observed) / np.dot(theory, theory)) if float(np.dot(theory, theory)) > 0 else 0.0
     intercept = float(np.mean(observed - slope * theory))
     return {"cell_id": cell.cell_id, "batch_size": cell.batch_size, "observed_signed_bias_sum": float(np.sum(observed)), "theoretical_sigma2_over_B_sum": float(np.sum(theory)), "slope": slope, "intercept": intercept, "slope_threshold": [0.8, 1.2], "status": "PASS" if 0.8 <= slope <= 1.2 else "NOT_SUPPORTED"}
