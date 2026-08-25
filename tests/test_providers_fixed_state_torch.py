@@ -119,6 +119,7 @@ def test_gradient_accumulates_detached_per_sample_grads_without_state_drift(
         _resolver(),
         fixed_state_id="per-sample-accumulator",
         output_dtype=torch.float64,
+        gradient_chunk_size=1,
     )
     before = provider.state_digest()
     original_grad = torch.autograd.grad

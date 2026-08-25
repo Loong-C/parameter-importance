@@ -213,6 +213,23 @@ class _ExecutionSnapshot:
     cuda_rng: tuple[torch.Tensor, ...] | None
 
 
+@dataclass(slots=True)
+class _DigestBaseline:
+    """Cached state captured by :meth:`state_digest` for cheap rechecks.
+
+    The tensors stay on their original device.  This is deliberate: repeated
+    formal ``assert_unchanged`` calls should compare the live model against a
+    resident baseline instead of copying the complete model to the host for
+    every 32-draw block.  The baseline is only an optimization; callers whose
+    expected digest is not the cached one take the original full-digest path.
+    """
+
+    digest: str
+    resolver_digest: str
+    static_identity: tuple[object, ...]
+    snapshot: _ExecutionSnapshot
+
+
 def _take_snapshot(module: torch.nn.Module) -> _ExecutionSnapshot:
     parameters = {
         name: value.detach().clone()
@@ -288,6 +305,48 @@ def _snapshot_drift(module: torch.nn.Module, snapshot: _ExecutionSnapshot) -> tu
     return tuple(reasons)
 
 
+def _rng_matches_snapshot(snapshot: _ExecutionSnapshot) -> bool:
+    """Return whether all RNG domains match a captured execution snapshot."""
+
+    if random.getstate() != snapshot.python_rng:
+        return False
+    current_numpy = np.random.get_state()
+    expected_numpy = snapshot.numpy_rng
+    if (
+        current_numpy[0] != expected_numpy[0]
+        or not np.array_equal(current_numpy[1], expected_numpy[1])
+        or int(current_numpy[2]) != int(expected_numpy[2])
+        or int(current_numpy[3]) != int(expected_numpy[3])
+        or float(current_numpy[4]) != float(expected_numpy[4])
+    ):
+        return False
+    if not torch.equal(torch.random.get_rng_state(), snapshot.torch_rng):
+        return False
+    cuda_initialized = torch.cuda.is_available() and torch.cuda.is_initialized()
+    if snapshot.cuda_rng is None:
+        return not cuda_initialized
+    if not cuda_initialized:
+        return False
+    current_cuda = torch.cuda.get_rng_state_all()
+    return len(current_cuda) == len(snapshot.cuda_rng) and all(
+        torch.equal(current, expected)
+        for current, expected in zip(current_cuda, snapshot.cuda_rng, strict=True)
+    )
+
+
+def _snapshot_matches(
+    module: torch.nn.Module,
+    snapshot: _ExecutionSnapshot,
+    *,
+    include_rng: bool,
+) -> bool:
+    """Check a live module against a resident snapshot without host copies."""
+
+    if _snapshot_drift(module, snapshot):
+        return False
+    return not include_rng or _rng_matches_snapshot(snapshot)
+
+
 def _restore_snapshot(module: torch.nn.Module, snapshot: _ExecutionSnapshot) -> None:
     """恢复模型和 RNG；任一恢复失败都不被吞掉。"""
 
@@ -312,6 +371,12 @@ def _restore_snapshot(module: torch.nn.Module, snapshot: _ExecutionSnapshot) -> 
         raise RuntimeError("MODEL_MODULE_STRUCTURE_MUTATED_UNRECOVERABLE")
     for name, training in snapshot.modes.items():
         modules[name].training = training
+    _restore_rng_snapshot(snapshot)
+
+
+def _restore_rng_snapshot(snapshot: _ExecutionSnapshot) -> None:
+    """Restore RNG domains without recopying an unchanged model."""
+
     random.setstate(snapshot.python_rng)  # type: ignore[arg-type]
     np.random.set_state(snapshot.numpy_rng)  # type: ignore[arg-type]
     torch.random.set_rng_state(snapshot.torch_rng)
@@ -471,6 +536,7 @@ class TorchFixedStateGradientProvider:
         fixed_state_id: str,
         registry: ParameterRegistry | None = None,
         output_dtype: torch.dtype = torch.float32,
+        gradient_chunk_size: int = 4,
     ) -> None:
         if not isinstance(model, ModelAdapter):
             raise TypeError("MODEL_ADAPTER_PROTOCOL_NOT_IMPLEMENTED")
@@ -480,6 +546,10 @@ class TorchFixedStateGradientProvider:
             raise ValueError("FIXED_STATE_ID_EMPTY")
         if output_dtype not in {torch.float32, torch.float64}:
             raise ValueError("FIXED_STATE_GRADIENT_DTYPE_UNSUPPORTED")
+        if isinstance(gradient_chunk_size, bool) or not isinstance(
+            gradient_chunk_size, int
+        ) or gradient_chunk_size <= 0:
+            raise ValueError("FIXED_STATE_GRADIENT_CHUNK_SIZE_INVALID")
         for field_name in (
             "resolver_id",
             "loss_unit",
@@ -529,6 +599,13 @@ class TorchFixedStateGradientProvider:
         )
         self._device = next(iter(devices))
         self._output_dtype = output_dtype
+        # Formal S2.4 asks for 32-draw blocks, while autograd graph retention
+        # must remain bounded.  A small internal chunk reduces Python/autograd
+        # launch overhead without changing the public block contract.  The
+        # constructor knob is intentionally private to the provider contract;
+        # ``1`` is the strict per-sample reference path.
+        self._gradient_chunk_size = gradient_chunk_size
+        self._digest_baseline: _DigestBaseline | None = None
 
     @property
     def registry_hash(self) -> str:
@@ -567,6 +644,12 @@ class TorchFixedStateGradientProvider:
         """返回 provider 明确的梯度输出 dtype。"""
 
         return self._output_dtype
+
+    @property
+    def gradient_chunk_size(self) -> int:
+        """Number of sequential sample graphs retained per autograd call."""
+
+        return self._gradient_chunk_size
 
     @property
     def model_adapter(self) -> ModelAdapter:
@@ -662,6 +745,12 @@ class TorchFixedStateGradientProvider:
     def state_digest(self) -> str:
         """摘要全部参数、buffer、模式、RNG 与 resolver 状态。"""
 
+        # Capture once and hash the captured values.  In addition to avoiding
+        # a second read of a large accelerator model, this gives
+        # ``assert_unchanged`` a resident baseline for the repeated block
+        # checks performed by formal Stage 2.
+        snapshot = _take_snapshot(self._model.module)
+        resolver_digest = self._resolver.state_digest()
         digest = hashlib.sha256()
         _length_prefixed(
             digest,
@@ -672,44 +761,75 @@ class TorchFixedStateGradientProvider:
                     "parameter_names": list(self.parameter_names),
                     "task_type": self._model.task_type,
                     "resolver_id": self._resolver.resolver_id,
-                    "resolver_digest": self._resolver.state_digest(),
+                    "resolver_digest": resolver_digest,
                     "output_dtype": str(self.output_dtype),
                 }
             ),
         )
-        for name, parameter in self._model.module.named_parameters(remove_duplicate=True):
+        for name, parameter in snapshot.parameters.items():
             _update_tensor_digest(digest, role="parameter", name=name, value=parameter)
-        for name, buffer in self._model.module.named_buffers(remove_duplicate=True):
+        for name, buffer in snapshot.buffers.items():
             _update_tensor_digest(digest, role="buffer", name=name, value=buffer)
         _length_prefixed(
             digest,
             canonical_json_bytes(
-                [
-                    [name, child.training]
-                    for name, child in self._model.module.named_modules()
-                ]
+                [[name, training] for name, training in snapshot.modes.items()]
             ),
         )
-        _length_prefixed(digest, repr(random.getstate()).encode("ascii"))
-        numpy_state = np.random.get_state()
-        _length_prefixed(digest, str(numpy_state[0]).encode("ascii"))
-        _length_prefixed(digest, np.asarray(numpy_state[1], dtype=np.uint32).tobytes())
+        _length_prefixed(digest, repr(snapshot.python_rng).encode("ascii"))
+        _length_prefixed(digest, str(snapshot.numpy_rng[0]).encode("ascii"))
+        _length_prefixed(
+            digest, np.asarray(snapshot.numpy_rng[1], dtype=np.uint32).tobytes()
+        )
         _length_prefixed(
             digest,
-            f"{int(numpy_state[2])}:{int(numpy_state[3])}:{float(numpy_state[4]).hex()}".encode(
+            f"{int(snapshot.numpy_rng[2])}:{int(snapshot.numpy_rng[3])}:{float(snapshot.numpy_rng[4]).hex()}".encode(
                 "ascii"
             ),
         )
-        _length_prefixed(digest, _tensor_bytes(torch.random.get_rng_state()))
-        if torch.cuda.is_available() and torch.cuda.is_initialized():  # pragma: no cover
-            for index, state in enumerate(torch.cuda.get_rng_state_all()):
+        _length_prefixed(digest, _tensor_bytes(snapshot.torch_rng))
+        if snapshot.cuda_rng is not None:  # pragma: no cover
+            for index, state in enumerate(snapshot.cuda_rng):
                 _update_tensor_digest(
                     digest, role="cuda_rng", name=str(index), value=state
                 )
-        return digest.hexdigest()
+        result = digest.hexdigest()
+        self._digest_baseline = _DigestBaseline(
+            digest=result,
+            resolver_digest=resolver_digest,
+            static_identity=self._static_digest_identity(),
+            snapshot=snapshot,
+        )
+        return result
+
+    def _static_digest_identity(self) -> tuple[object, ...]:
+        """Fields in ``state_digest`` that are not part of the module snapshot."""
+
+        return (
+            self.fixed_state_id,
+            self.registry_hash,
+            self.parameter_names,
+            self._model.task_type,
+            self._resolver.resolver_id,
+            str(self.output_dtype),
+        )
 
     def assert_unchanged(self, expected_digest: str) -> None:
         _validate_digest(expected_digest, field_name="expected provider digest")
+        baseline = self._digest_baseline
+        if baseline is not None and baseline.digest == expected_digest:
+            # ``state_digest`` includes the resolver and static provider
+            # contract in addition to model/RNG state.  Check all of those
+            # before accepting the resident fast path.  Any mismatch falls
+            # through to the canonical full digest for an exact diagnostic.
+            if (
+                baseline.static_identity == self._static_digest_identity()
+                and self._resolver.state_digest() == baseline.resolver_digest
+                and _snapshot_matches(
+                    self._model.module, baseline.snapshot, include_rng=True
+                )
+            ):
+                return
         if self.state_digest() != expected_digest:
             raise RuntimeError("TORCH_FIXED_STATE_PROVIDER_STATE_CHANGED")
 
@@ -725,9 +845,13 @@ class TorchFixedStateGradientProvider:
         if not draws:
             raise ValueError("FIXED_STATE_DRAWS_EMPTY")
         sample_ids = tuple(_draw_sample_id(draw) for draw in draws)
-        before_digest = self.state_digest()
         resolver_digest = self._resolver.state_digest()
-        snapshot = _take_snapshot(self._model.module)
+        static_identity = self._static_digest_identity()
+        baseline = self._digest_baseline
+        reuse_baseline = baseline is not None and _snapshot_matches(
+            self._model.module, baseline.snapshot, include_rng=True
+        )
+        snapshot = baseline.snapshot if reuse_baseline else _take_snapshot(self._model.module)
         result: GradientBatch | None = None
         computation_error: BaseException | None = None
         drift_reasons: tuple[str, ...] = ()
@@ -736,33 +860,50 @@ class TorchFixedStateGradientProvider:
             gradient_sums: dict[str, torch.Tensor] = {}
             total_count = 0
             observed_loss_unit: str | None = None
+            parameter_tuple = tuple(
+                self._parameters[name] for name in self.parameter_names
+            )
             with torch.enable_grad():
-                for sample_id in sample_ids:
-                    resolved = self._resolver.resolve(sample_id)
-                    if not isinstance(resolved, TrainingMicrobatch):
-                        raise TypeError("RESOLVER_RESULT_NOT_TRAINING_MICROBATCH")
-                    batch = resolved.to(self._device)
-                    loss = self._model.loss(batch)
-                    if loss.statistical_unit != self._resolver.loss_unit:
-                        raise ValueError("RESOLVER_LOSS_UNIT_MISMATCH")
-                    if observed_loss_unit is None:
-                        observed_loss_unit = loss.statistical_unit
-                    elif observed_loss_unit != loss.statistical_unit:
-                        raise ValueError("DRAW_LOSS_STATISTICAL_UNIT_MISMATCH")
-                    # ``autograd.grad`` is deliberately called per resolved
-                    # sample.  Retaining every sample's graph until a single
-                    # combined backward made block_size a peak-memory
-                    # multiplier.  The detached numerator preserves the old
-                    # combined-loss value without retaining its graph.
-                    numerator = loss.loss_numerator.detach()
-                    loss_numerator_total = (
-                        numerator
-                        if loss_numerator_total is None
-                        else loss_numerator_total + numerator
-                    )
+                # Keep only a bounded number of forward graphs alive.  The
+                # old combined-loss backward retained all 32 graphs, while a
+                # strictly per-sample backward launched one autograd traversal
+                # per draw.  Summing a small sequential chunk preserves draw
+                # order and stochastic/RNG behavior, but cuts Python/autograd
+                # launch overhead without making memory proportional to the
+                # public block size.
+                for chunk_start in range(0, len(sample_ids), self.gradient_chunk_size):
+                    chunk_losses: list[torch.Tensor] = []
+                    chunk_count = 0
+                    for sample_id in sample_ids[
+                        chunk_start : chunk_start + self.gradient_chunk_size
+                    ]:
+                        resolved = self._resolver.resolve(sample_id)
+                        if not isinstance(resolved, TrainingMicrobatch):
+                            raise TypeError("RESOLVER_RESULT_NOT_TRAINING_MICROBATCH")
+                        batch = resolved.to(self._device)
+                        loss = self._model.loss(batch)
+                        if loss.statistical_unit != self._resolver.loss_unit:
+                            raise ValueError("RESOLVER_LOSS_UNIT_MISMATCH")
+                        if observed_loss_unit is None:
+                            observed_loss_unit = loss.statistical_unit
+                        elif observed_loss_unit != loss.statistical_unit:
+                            raise ValueError("DRAW_LOSS_STATISTICAL_UNIT_MISMATCH")
+                        numerator = loss.loss_numerator.detach()
+                        loss_numerator_total = (
+                            numerator
+                            if loss_numerator_total is None
+                            else loss_numerator_total + numerator
+                        )
+                        chunk_losses.append(loss.loss_numerator)
+                        chunk_count += loss.effective_count
+                    if not chunk_losses:
+                        raise ValueError("FIXED_STATE_GRADIENT_CHUNK_EMPTY")
+                    chunk_numerator = chunk_losses[0]
+                    for numerator in chunk_losses[1:]:
+                        chunk_numerator = chunk_numerator + numerator
                     gradients = torch.autograd.grad(
-                        loss.loss_numerator,
-                        tuple(self._parameters[name] for name in self.parameter_names),
+                        chunk_numerator,
+                        parameter_tuple,
                         create_graph=False,
                         retain_graph=False,
                         allow_unused=False,
@@ -777,7 +918,7 @@ class TorchFixedStateGradientProvider:
                             gradient_sums[name] = detached.clone()
                         else:
                             gradient_sums[name].add_(detached)
-                    total_count += loss.effective_count
+                    total_count += chunk_count
                 if total_count <= 0:  # LossBatch 已拒绝 0，此处保留组合边界
                     raise ValueError("FIXED_STATE_EFFECTIVE_COUNT_ZERO")
                 if loss_numerator_total is None:
@@ -808,15 +949,24 @@ class TorchFixedStateGradientProvider:
             computation_error = exc
         finally:
             drift_reasons = _snapshot_drift(self._model.module, snapshot)
-            _restore_snapshot(self._model.module, snapshot)
+            if drift_reasons or not reuse_baseline:
+                _restore_snapshot(self._model.module, snapshot)
+            else:
+                # No model/buffer/mode/grad drift was observed.  Restoring
+                # only RNG avoids recopying the full resident model after each
+                # formal block while retaining the same fixed-state replay.
+                _restore_rng_snapshot(snapshot)
 
         resolver_error: BaseException | None = None
         try:
             self._resolver.assert_unchanged(resolver_digest)
         except BaseException as exc:
             resolver_error = exc
-        after_digest = self.state_digest()
-        if after_digest != before_digest:
+        if not _snapshot_matches(self._model.module, snapshot, include_rng=True):
+            raise RuntimeError("TORCH_FIXED_STATE_DIGEST_CHANGED_AFTER_RESTORE") from (
+                resolver_error or computation_error
+            )
+        if self._static_digest_identity() != static_identity:
             raise RuntimeError("TORCH_FIXED_STATE_DIGEST_CHANGED_AFTER_RESTORE") from (
                 resolver_error or computation_error
             )
