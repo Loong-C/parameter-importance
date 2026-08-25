@@ -543,6 +543,7 @@ def _independent_variance_bootstrap(
         "parameter_coordinate_resampling": False,
         "reference_uncertainty_mode": "independent_reference_variance_combination",
         "reference_standard_error": float(reference_standard_error),
+        "coordinate_covariance_assumption": "none_worst_case_standard_error_bound",
         "raw_reference_blocks_reconstructed": False,
     }
 
@@ -600,10 +601,12 @@ def _reference_variance_vector(cell: _CellData, view: str) -> np.ndarray:
 
 
 def _reference_scalar_standard_error(cell: _CellData, view: str) -> float:
-    # This is the diagonal jackknife variance combination explicitly allowed
-    # by S2.8 when the bounded producer does not retain raw block vectors.
+    # The producer retains only marginal jackknife variances.  Summing marginal
+    # standard errors is the Cauchy upper bound for any compatible coordinate
+    # covariance matrix; unlike sqrt(sum(var)), it does not assume coordinate
+    # independence.
     variance = _reference_variance_vector(cell, view)
-    return math.sqrt(max(0.0, float(np.sum(variance))))
+    return float(np.sum(np.sqrt(variance)))
 
 
 def _cell_bootstrap(
@@ -1097,6 +1100,7 @@ def _paired_independent_variance_bootstrap(
         "parameter_coordinate_resampling": False,
         "reference_uncertainty_mode": "independent_reference_variance_combination",
         "reference_standard_error": float(reference_standard_error),
+        "coordinate_covariance_assumption": "none_worst_case_standard_error_bound",
         "raw_reference_blocks_reconstructed": False,
     }
 
@@ -1140,17 +1144,23 @@ def _noninferiority_rows(cell: _CellData, *, bootstrap_replicates: int, seed: in
             derivative_left = 2.0 * (target - left_mean) / scale
             derivative_right = 2.0 * (target - right_mean) / scale
             derivative = (derivative_left * baseline - numerator * derivative_right) / (baseline * baseline)
-            reference_se = math.sqrt(max(0.0, float(np.sum(np.square(derivative) * variance))))
+            reference_se = float(np.sum(np.abs(derivative) * np.sqrt(variance)))
             nmse_bootstrap = _paired_independent_variance_bootstrap(
                 left,
                 right,
                 target,
                 statistic,
-                reference_standard_error=reference_se,
+                reference_standard_error=0.0,
                 replicates=bootstrap_replicates,
                 seed=seed,
             )
-        nmse_state = "PASS" if float(nmse_bootstrap["quantile_0.95"]) <= 1.10 else "FAIL"
+            reference_bound = 1.96 * reference_se
+            nmse_bootstrap["reference_uncertainty_mode"] = "independent_reference_delta_bound_combination"
+            nmse_bootstrap["reference_standard_error_bound"] = reference_se
+            nmse_bootstrap["reference_error_bound_95"] = reference_bound
+            nmse_bootstrap["combined_quantile_0.95"] = float(nmse_bootstrap["quantile_0.95"]) + reference_bound
+        nmse_upper = float(nmse_bootstrap.get("combined_quantile_0.95", nmse_bootstrap["quantile_0.95"]))
+        nmse_state = "PASS" if nmse_upper <= 1.10 else "FAIL"
     rows.append({"cell_id": cell.cell_id, "method": u_method, "endpoint": "corrected_parameter_nmse_noninferiority", "effect": u_nmse / d_nmse if d_nmse > 0 else None, "baseline": "double", "threshold": {"upper": 1.10, "positive_floor": float(ABSOLUTE_FLOORS["tau_nmse"])}, "interval": nmse_bootstrap, "multiplicity": "intersection_union_across_six_primary_cells", "state": nmse_state})
     rank_target = cell.references["ranking"][1]
     rank_statistic = lambda u, d, r: _spearman(u, r) - _spearman(d, r)

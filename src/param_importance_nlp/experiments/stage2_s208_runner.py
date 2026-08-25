@@ -23,8 +23,41 @@ from .stage2_s208_production import S208ProductionBlocked, load_s208_reference_b
 S208_RUNNER_SCHEMA = "stage2-s208-g26-production-runner-v1"
 
 
+def _new_descendant(path: str | Path, parent: Path, *, field: str) -> Path:
+    candidate = Path(path).resolve()
+    boundary = parent.resolve()
+    try:
+        relative = candidate.relative_to(boundary)
+    except ValueError as error:
+        raise S208ProductionBlocked(f"{field}:OUTSIDE_REQUIRED_BOUNDARY") from error
+    if not relative.parts:
+        raise S208ProductionBlocked(f"{field}:UNIQUE_NAMESPACE_REQUIRED")
+    if candidate.exists():
+        raise S208ProductionBlocked(f"{field}:NAMESPACE_ALREADY_EXISTS")
+    return candidate
+
+
+def _validate_production_paths(
+    data_root: str | Path,
+    memmap_root: str | Path | None,
+    output_root: str | Path,
+) -> tuple[Path, Path, Path]:
+    root = Path(data_root).resolve()
+    if not root.is_dir():
+        raise S208ProductionBlocked("data_root:DIRECTORY_REQUIRED")
+    if memmap_root is None:
+        raise S208ProductionBlocked("S208_EXPLICIT_MEMMAP_ROOT_REQUIRED")
+    scratch = _new_descendant(memmap_root, root / "tmp", field="memmap_root")
+    destination = _new_descendant(
+        output_root,
+        root / "results" / "stage2" / "derived",
+        field="output_root",
+    )
+    return root, scratch, destination
+
+
 def _atomic_publish(destination: Path, files: Mapping[str, Mapping[str, Any]]) -> tuple[str, ...]:
-    if destination.exists() and any(destination.iterdir()):
+    if destination.exists():
         raise S28G26Blocked("OUTPUT_ANALYSIS_DIRECTORY_MUST_BE_NEW")
     destination.parent.mkdir(parents=True, exist_ok=True)
     staging = destination.parent / f".{destination.name}.stage-{uuid.uuid4().hex}"
@@ -75,17 +108,17 @@ def run_s208_g26_production(
 ) -> dict[str, Any]:
     """Run S2.8 from real sealed refs and publish PASS/BLOCKED atomically."""
 
-    destination = Path(output_root).resolve()
+    root, scratch, destination = _validate_production_paths(data_root, memmap_root, output_root)
+    scratch.parent.mkdir(parents=True, exist_ok=True)
+    scratch.mkdir(parents=False, exist_ok=False)
     loaded: dict[str, Any] | None = None
     try:
-        if memmap_root is None:
-            raise S208ProductionBlocked("S208_EXPLICIT_MEMMAP_ROOT_REQUIRED")
         loaded = load_s208_reference_bundle(
-            data_root,
+            root,
             reference_bundle,
             g23_gate,
             reference_root=reference_root,
-            memmap_root=memmap_root,
+            memmap_root=scratch,
         )
         gates = dict(upstream_gates)
         # The G2.3 object consumed by the strict reference loader is the only
@@ -100,7 +133,7 @@ def run_s208_g26_production(
             hypothesis_contract=hypothesis_contract,
             upstream_gates=gates,
             output_root=None,
-            memmap_root=memmap_root,
+            memmap_root=scratch,
             bootstrap_replicates=bootstrap_replicates,
             bootstrap_seed=bootstrap_seed,
         )
