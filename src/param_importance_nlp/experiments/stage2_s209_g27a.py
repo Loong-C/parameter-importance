@@ -396,6 +396,8 @@ def _normalize_record(
         if name in result and result[name] != expected:
             raise S29G27ABlocked(f"{semantic}:{name}:LINEAGE_MISMATCH")
         result[name] = expected
+    for name in ("inventory_artifact_hash", "inventory_source_sha256"):
+        result[name] = _sha(result.get(name), field=f"{semantic}.{name}")
     result["anchor_id"] = _id(result.get("anchor_id", f"{semantic}-anchor"), field=f"{semantic}.anchor_id")
     result["repetition"] = _positive(result.get("repetition", 0), field=f"{semantic}.repetition", zero_ok=True)
     result["gpu_uuid"] = str(result.get("gpu_uuid", ""))
@@ -504,7 +506,17 @@ def _health_reasons(snapshot: Any, *, expected_io: bool) -> tuple[list[str], lis
     provisional: list[str] = []
     if not isinstance(snapshot, Mapping):
         return ["HEALTH_SNAPSHOT_REQUIRED"], provisional
-    required = ("healthy", "idle", "same_gpu_class", "gpu_class", "gpu_uuids", "ecc_errors", "xid_errors")
+    required = (
+        "healthy",
+        "idle",
+        "same_gpu_class",
+        "gpu_class",
+        "gpu_uuids",
+        "ecc_errors",
+        "xid_errors",
+        "inventory_artifact_hash",
+        "inventory_source_sha256",
+    )
     missing = [name for name in required if name not in snapshot]
     if missing:
         blockers.append("HEALTH_FIELDS_MISSING:" + ",".join(missing))
@@ -516,6 +528,11 @@ def _health_reasons(snapshot: Any, *, expected_io: bool) -> tuple[list[str], lis
         blockers.append("APPROVED_GPU_UUIDS_REQUIRED")
     if snapshot.get("ecc_errors") != 0 or snapshot.get("xid_errors") != 0:
         blockers.append("GPU_ERROR_COUNTER_NONZERO")
+    try:
+        _sha(snapshot.get("inventory_artifact_hash"), field="health.inventory_artifact_hash")
+        _sha(snapshot.get("inventory_source_sha256"), field="health.inventory_source_sha256")
+    except S29G27ABlocked as error:
+        blockers.append(str(error))
     io = snapshot.get("cost_io_quiescent")
     if type(io) is not bool:
         blockers.append("HEALTH_IO_QUIESCENCE_REQUIRED")
@@ -738,9 +755,55 @@ def _pareto(rows: Sequence[Mapping[str, Any]], accuracy_rows: Sequence[Mapping[s
 
 
 def _capacity(rows: Sequence[Mapping[str, Any]], inputs: Mapping[str, Any] | None) -> dict[str, Any]:
+    if not isinstance(inputs, Mapping):
+        return {
+            "status": "BLOCKED",
+            "steps": {"stage4": 0, "stage5": 0, "total": 0},
+            "forecasts": {},
+            "warnings": ["CAPACITY_INPUTS_REQUIRED"],
+        }
+    required_hashes = ("capacity_evidence_hash", "ulimit_evidence_hash")
+    if any(not isinstance(inputs.get(name), str) or _SHA256.fullmatch(str(inputs.get(name))) is None for name in required_hashes):
+        return {
+            "status": "BLOCKED",
+            "steps": {"stage4": 0, "stage5": 0, "total": 0},
+            "forecasts": {},
+            "warnings": ["CAPACITY_OR_ULIMIT_EVIDENCE_HASH_REQUIRED"],
+        }
+    if inputs.get("ulimit_nofile_soft") != 1024:
+        return {
+            "status": "BLOCKED",
+            "steps": {"stage4": 0, "stage5": 0, "total": 0},
+            "forecasts": {},
+            "warnings": ["ULIMIT_NOFILE_SOFT_MUST_BE_1024"],
+        }
+    for field in ("disk_free_bytes", "inode_free"):
+        value = inputs.get(field)
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            return {
+                "status": "BLOCKED",
+                "steps": {"stage4": 0, "stage5": 0, "total": 0},
+                "forecasts": {},
+                "warnings": [f"CAPACITY_{field.upper()}_REQUIRED"],
+            }
+    try:
+        steps = int(inputs.get("stage4_steps", 0))
+        stage5_steps = int(inputs.get("stage5_steps", 0))
+    except (TypeError, ValueError):
+        return {
+            "status": "BLOCKED",
+            "steps": {"stage4": 0, "stage5": 0, "total": 0},
+            "forecasts": {},
+            "warnings": ["CAPACITY_STAGE_STEPS_INVALID"],
+        }
     online = _group(rows, semantic="online_training_incremental_cost")
-    steps = int(inputs.get("stage4_steps", 0)) if isinstance(inputs, Mapping) else 0
-    stage5_steps = int(inputs.get("stage5_steps", 0)) if isinstance(inputs, Mapping) else 0
+    if steps <= 0 or stage5_steps <= 0:
+        return {
+            "status": "BLOCKED",
+            "steps": {"stage4": steps, "stage5": stage5_steps, "total": max(0, steps) + max(0, stage5_steps)},
+            "forecasts": {},
+            "warnings": ["CAPACITY_STAGE_STEPS_REQUIRED"],
+        }
     total_steps = steps + stage5_steps
     forecasts: dict[str, Any] = {}
     for method in S29_METHODS:
@@ -768,7 +831,7 @@ def _capacity(rows: Sequence[Mapping[str, Any]], inputs: Mapping[str, Any] | Non
         byte_budget = inputs.get("output_bytes_budget")
         if byte_budget is not None and forecasts and any(value["projected_output_bytes"] > int(byte_budget) for value in forecasts.values()):
             warnings.append("OUTPUT_BYTES_BUDGET_EXCEEDED")
-    return {"status": "PASS", "steps": {"stage4": steps, "stage5": stage5_steps, "total": total_steps}, "forecasts": forecasts, "warnings": warnings}
+    return {"status": "PASS", "steps": {"stage4": steps, "stage5": stage5_steps, "total": total_steps}, "forecasts": forecasts, "warnings": warnings, "capacity_evidence_hash": inputs["capacity_evidence_hash"], "ulimit_evidence_hash": inputs["ulimit_evidence_hash"], "ulimit_nofile_soft": inputs["ulimit_nofile_soft"]}
 
 
 def run_s209_g27a(
@@ -820,6 +883,8 @@ def run_s209_g27a(
     blockers, provisional = _health_reasons(health_snapshot, expected_io=expected_io)
     health_gpu_uuids = set(health_snapshot.get("gpu_uuids", ())) if isinstance(health_snapshot, Mapping) else set()
     health_gpu_class = health_snapshot.get("gpu_class") if isinstance(health_snapshot, Mapping) else None
+    health_inventory_hash = health_snapshot.get("inventory_artifact_hash") if isinstance(health_snapshot, Mapping) else None
+    health_source_sha256 = health_snapshot.get("inventory_source_sha256") if isinstance(health_snapshot, Mapping) else None
     for row in reduced:
         if row["cost_io_quiescent"] is not True:
             provisional.append(f"COST_IO_NOT_QUIESCENT:{row['semantic']}:{row['anchor_id']}")
@@ -829,6 +894,8 @@ def run_s209_g27a(
             blockers.append(f"OBSERVATION_GPU_NOT_IN_HEALTH_SNAPSHOT:{row['semantic']}:{row['anchor_id']}")
         if row.get("gpu_class") is not None and row.get("gpu_class") != health_gpu_class:
             blockers.append(f"OBSERVATION_GPU_CLASS_DRIFT:{row['semantic']}:{row['anchor_id']}")
+        if row.get("inventory_artifact_hash") != health_inventory_hash or row.get("inventory_source_sha256") != health_source_sha256:
+            blockers.append(f"OBSERVATION_GPU_INVENTORY_IDENTITY_DRIFT:{row['semantic']}:{row['anchor_id']}")
     blockers.extend(_anchor_reasons(single_gpu_anchor, frozen=frozen, expected_devices=1))
     four_reasons = _anchor_reasons(four_gpu_anchor, frozen=frozen, expected_devices=4)
     if four_reasons:
@@ -843,6 +910,8 @@ def run_s209_g27a(
     pareto, pareto_reasons = _pareto(reduced, accuracy_rows)
     blockers.extend(pareto_reasons)
     capacity = _capacity(reduced, capacity_inputs)
+    if capacity.get("status") != "PASS":
+        blockers.extend(str(item) for item in capacity.get("warnings", ["CAPACITY_EVIDENCE_INVALID"]))
     only_provisional = bool(provisional) and not blockers
     if not blockers and provisional:
         # A missing four-card anchor is deliberately not a formal PASS.  The
@@ -863,6 +932,11 @@ def run_s209_g27a(
         "record_count": len(reduced),
         "online_ratios": online_ratios,
         "four_card_complete": not bool(four_reasons),
+        "inventory_artifact_hash": health_snapshot.get("inventory_artifact_hash") if isinstance(health_snapshot, Mapping) else None,
+        "inventory_source_sha256": health_snapshot.get("inventory_source_sha256") if isinstance(health_snapshot, Mapping) else None,
+        "capacity_evidence_hash": capacity.get("capacity_evidence_hash"),
+        "ulimit_evidence_hash": capacity.get("ulimit_evidence_hash"),
+        "ulimit_nofile_soft": capacity.get("ulimit_nofile_soft"),
     }
     gate = GateRecord(
         gate_id="stage2.G2.7a",

@@ -60,12 +60,11 @@ def _load_optional(root: Path, reference: str | None, *, field: str) -> Any:
     return value
 
 
-def _inventory_rows(root: Path, reference: str) -> list[Mapping[str, Any]]:
+def _inventory_envelope(root: Path, reference: str) -> Mapping[str, Any]:
     value = _load_optional(root, reference, field="gpu_inventory")
-    rows = value.get("gpus", value.get("rows")) if isinstance(value, Mapping) else value
-    if not isinstance(rows, list) or not all(isinstance(item, Mapping) for item in rows):
-        raise S29RunnerBlocked("GPU_INVENTORY_ROWS_INVALID")
-    return [dict(item) for item in rows]
+    if not isinstance(value, Mapping):
+        raise S29RunnerBlocked("GPU_INVENTORY_ENVELOPE_REQUIRED")
+    return dict(value)
 
 
 def _preflight(args: argparse.Namespace) -> dict[str, Any]:
@@ -77,7 +76,11 @@ def _preflight(args: argparse.Namespace) -> dict[str, Any]:
         measurement_plan_ref=args.measurement_plan_ref,
         gpu_inventory_ref=args.gpu_inventory_ref,
         io_evidence_ref=args.io_evidence_ref,
+        capacity_ref=args.capacity_ref,
+        ulimit_ref=args.ulimit_ref,
     )
+    if preflight.measurement_plan.get("run_id") != args.run_id:
+        raise S29RunnerBlocked("MEASUREMENT_PLAN_RUN_ID_MISMATCH")
     return {
         "schema_version": "stage2-s209-g27a-production-preflight-v1",
         "status": "READY",
@@ -90,9 +93,15 @@ def _preflight(args: argparse.Namespace) -> dict[str, Any]:
         "approved_gpu_uuids": preflight.inventory["approved_gpu_uuids"],
         "excluded_gpu_uuid": preflight.inventory["excluded_gpu_uuid"],
         "excluded_pci": preflight.inventory["excluded_pci"],
-        "inventory_hash": preflight.inventory["artifact_hash"],
+        "inventory_hash": preflight.inventory["inventory_artifact_hash"],
+        "inventory_source_sha256": preflight.inventory["inventory_source_sha256"],
+        "inventory_source_ref": preflight.inventory["inventory_source_ref"],
         "io_evidence_hash": preflight.io_evidence["artifact_hash"],
         "cost_io_quiescent": preflight.io_evidence["cost_io_quiescent"],
+        "capacity_ref": preflight.capacity_ref,
+        "capacity_evidence_hash": preflight.capacity_inputs["capacity_evidence_hash"] if preflight.capacity_inputs else None,
+        "ulimit_ref": preflight.ulimit_ref,
+        "ulimit_evidence_hash": preflight.ulimit_evidence["ulimit_evidence_hash"] if preflight.ulimit_evidence else None,
         "actual_measurements_required": True,
         "four_gpu_anchor_required": True,
         "resumable_terminal_rows": True,
@@ -101,7 +110,7 @@ def _preflight(args: argparse.Namespace) -> dict[str, Any]:
 
 def _prepare(args: argparse.Namespace) -> dict[str, Any]:
     root = args.data_root.resolve()
-    inventory = _inventory_rows(root, args.gpu_inventory_ref) if args.gpu_inventory_ref else None
+    inventory = _inventory_envelope(root, args.gpu_inventory_ref) if args.gpu_inventory_ref else None
     io_value = _load_optional(root, args.io_evidence_ref, field="io_evidence") if args.io_evidence_ref else None
     plan = prepare_s209_plan(
         data_root=root,
@@ -128,6 +137,8 @@ def _execute(args: argparse.Namespace) -> dict[str, Any]:
         measurement_plan_ref=args.measurement_plan_ref,
         gpu_inventory_ref=args.gpu_inventory_ref,
         io_evidence_ref=args.io_evidence_ref,
+        capacity_ref=args.capacity_ref,
+        ulimit_ref=args.ulimit_ref,
     )
     root = args.data_root.resolve()
     single_anchor = _load_optional(root, args.single_gpu_anchor_ref, field="single_gpu_anchor")
@@ -137,9 +148,6 @@ def _execute(args: argparse.Namespace) -> dict[str, Any]:
         accuracy = accuracy.get("rows", accuracy.get("accuracy_rows", []))
     if not isinstance(accuracy, list) or not all(isinstance(item, Mapping) for item in accuracy):
         raise S29RunnerBlocked("ACCURACY_ROWS_INVALID")
-    capacity = _load_optional(root, args.capacity_ref, field="capacity") if args.capacity_ref else None
-    if capacity is not None and not isinstance(capacity, Mapping):
-        raise S29RunnerBlocked("CAPACITY_INPUTS_INVALID")
     profiler = subprocess_profiler_executor(args.profiler_command)
     runner = S29ProfilerRunner(
         preflight=preflight,
@@ -153,12 +161,17 @@ def _execute(args: argparse.Namespace) -> dict[str, Any]:
             if args.crosscheck_ref else None
         ),
         accuracy_rows=[dict(item) for item in accuracy],
-        capacity_inputs=dict(capacity) if isinstance(capacity, Mapping) else None,
+        capacity_inputs=dict(preflight.capacity_inputs or {}),
     )
     return runner.run()
 
 
 def _detach(args: argparse.Namespace) -> dict[str, Any]:
+    if not args.profiler_command:
+        raise S29RunnerBlocked("PROFILER_COMMAND_REQUIRED")
+    # No detached child may exist until all immutable input, inventory, I/O,
+    # capacity, and ulimit evidence has passed the same launch-time preflight.
+    _preflight(args)
     root = args.data_root.resolve()
     run_root = _logical(root, args.run_root, field="run_root")
     run_root.mkdir(parents=True, exist_ok=True)
@@ -201,6 +214,9 @@ def _detach(args: argparse.Namespace) -> dict[str, Any]:
 
 
 def _status(args: argparse.Namespace, *, wait: bool) -> int:
+    # Status/replay consumers must reject inventory or frozen-cost identity drift
+    # before trusting an existing detached status file.
+    _preflight(args)
     path = _logical(args.data_root.resolve(), args.run_root, field="run_root") / "status.json"
     deadline = None if args.timeout_seconds is None else time.monotonic() + args.timeout_seconds
     while True:
@@ -239,6 +255,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--four-gpu-anchor-ref")
     parser.add_argument("--accuracy-ref")
     parser.add_argument("--capacity-ref")
+    parser.add_argument("--ulimit-ref")
     parser.add_argument("--crosscheck-ref")
     parser.add_argument("--anchor-id", action="append", default=["method-only-anchor-0", "method-only-anchor-1"])
     parser.add_argument("--repetitions", type=int, default=2)

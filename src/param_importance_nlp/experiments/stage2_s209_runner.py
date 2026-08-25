@@ -15,8 +15,9 @@ decision cannot be mistaken for an atomic gate.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
+import hashlib
 import json
 import os
 from pathlib import Path, PurePosixPath
@@ -29,6 +30,7 @@ from typing import Any, Callable, Mapping, Protocol, Sequence
 
 from ..contracts.jsonio import canonical_json_hash, load_canonical_json, write_canonical_json
 from ..contracts.status import GateRecord
+from ..contracts.g21_formal_handoff import ALLOWED_DEVICES, EXCLUDED_UUID
 from .stage2_s207_formal import APPROVED_GPU_UUIDS, EXCLUDED_GPU_UUID, EXCLUDED_PCI
 from .stage2_s209_g27a import (
     S29_COUNT_FIELDS,
@@ -44,11 +46,46 @@ from .stage2_s209_g27a import (
 
 
 S29_RUNNER_SCHEMA = "stage2-s209-g27a-profiler-runner-v1"
-S29_STATUS_SCHEMA = "stage2-s209-g27a-detached-status-v1"
+S29_STATUS_SCHEMA = "stage2-s209-g27a-detached-status-v2"
 S29_ATTEMPT_SCHEMA = "stage2-s209-g27a-measurement-attempt-v1"
 S29_FAILURE_SCHEMA = "stage2-s209-g27a-failure-evidence-v1"
 S29_IO_SCHEMA = "stage2-s209-g27a-io-quiescence-v1"
 S29_INVENTORY_SCHEMA = "stage2-s209-g27a-gpu-inventory-v1"
+S29_CAPACITY_SCHEMA = "stage2-s209-g27a-capacity-v1"
+S29_ULIMIT_SCHEMA = "stage2-s209-g27a-ulimit-v1"
+S29_ACCEPTED_INVENTORY_SCHEMAS = frozenset({
+    S29_INVENTORY_SCHEMA,
+    "stage2-s206-gpu-inventory-v1",
+})
+S29_LIVE_GPU_COUNT = 8
+S29_INVENTORY_HEALTH_ALIASES = {
+    "memory_used_mib": ("memory_used_mib", "memory_used", "memory.used"),
+    "memory_total_mib": ("memory_total_mib", "memory_total", "memory.total"),
+    "utilization_gpu_percent": (
+        "utilization_gpu_percent",
+        "utilization_percent",
+        "utilization_gpu",
+        "utilization.gpu",
+    ),
+    "ecc_uncorrected_volatile": (
+        "ecc_uncorrected_volatile",
+        "ecc_volatile_uncorrected",
+        "ecc.errors.uncorrected.volatile.total",
+    ),
+    "ecc_uncorrected_aggregate": (
+        "ecc_uncorrected_aggregate",
+        "ecc_aggregate_uncorrected",
+        "ecc.errors.uncorrected.aggregate.total",
+    ),
+    "row_remap_status": (
+        "row_remap_status",
+        "row_remap",
+        "row_remap_pending",
+    ),
+    "gpu_recovery_action": ("gpu_recovery_action", "recovery_action"),
+    "xid_errors": ("xid_errors", "xid_error_count"),
+    "gpu_class": ("gpu_class", "product_name", "name"),
+}
 S29_STATUS_VALUES = ("PREPARED", "RUNNING", "PAUSED", "FAILED", "SEALED", "BLOCKED")
 S29_TERMINAL_VALUES = frozenset({"FAILED", "SEALED", "BLOCKED"})
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
@@ -73,6 +110,14 @@ def _sha(value: Any, *, field: str) -> str:
     if not isinstance(value, str) or _SHA256.fullmatch(value) is None:
         raise S29RunnerBlocked(f"{field}:SHA256_REQUIRED")
     return value
+
+
+def _file_sha256(path: str | Path) -> str:
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def _finite_json(value: Any, *, field: str = "value") -> None:
@@ -139,50 +184,200 @@ def _write_once(path: Path, value: Mapping[str, Any], *, field: str) -> None:
     write_canonical_json(path, value)
 
 
-def _normalise_inventory(inventory: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
-    if not isinstance(inventory, Sequence) or isinstance(inventory, (str, bytes)) or not inventory:
+def _canonical_pci(value: Any, *, field: str) -> str:
+    if not isinstance(value, str):
+        raise S29RunnerBlocked(f"{field}:PCI_REQUIRED")
+    text = value.strip().upper()
+    match = re.fullmatch(r"(?:[0-9A-F]{4}|[0-9A-F]{8}):([0-9A-F]{2}):([0-9A-F]{2})\.([0-9])", text)
+    if match is None:
+        raise S29RunnerBlocked(f"{field}:PCI_INVALID")
+    return f"0000:{match.group(1)}:{match.group(2)}.{match.group(3)}"
+
+
+def _canonical_uuid(value: Any, *, field: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise S29RunnerBlocked(f"{field}:UUID_REQUIRED")
+    text = value.strip()
+    if not text.upper().startswith("GPU-"):
+        text = "GPU-" + text
+    return text
+
+
+def _normalise_inventory(
+    inventory: Sequence[Mapping[str, Any]],
+    *,
+    compute_apps: Sequence[Mapping[str, Any]] = (),
+) -> list[dict[str, Any]]:
+    """Validate the complete live inventory before any formal scheduling.
+
+    The four approved cards and the known excluded card are checked as a
+    bidirectional PCI/UUID mapping.  Every live row carries health fields so
+    that the excluded device's ECC/remap facts remain auditable, while only
+    approved cards with a clean/idle snapshot become schedulable.
+    """
+
+    if not isinstance(inventory, Sequence) or isinstance(inventory, (str, bytes)):
         raise S29RunnerBlocked("GPU_INVENTORY_REQUIRED")
+    if len(inventory) != S29_LIVE_GPU_COUNT:
+        raise S29RunnerBlocked(f"GPU_INVENTORY_LIVE_CARD_COUNT_INVALID:{len(inventory)}")
     rows: list[dict[str, Any]] = []
     seen_uuid: set[str] = set()
     seen_pci: set[str] = set()
     for index, source in enumerate(inventory):
         if not isinstance(source, Mapping):
             raise S29RunnerBlocked(f"GPU_INVENTORY_ROW_INVALID:{index}")
-        uuid = source.get("uuid", source.get("gpu_uuid"))
-        pci = source.get("pci_bus_id", source.get("pci"))
-        if not isinstance(uuid, str) or not uuid or not isinstance(pci, str) or not pci:
-            raise S29RunnerBlocked(f"GPU_INVENTORY_IDENTITY_INCOMPLETE:{index}")
-        uuid = uuid.strip()
-        pci = pci.strip().lower()
-        if uuid in APPROVED_GPU_UUIDS and pci == EXCLUDED_PCI.lower():
+        uuid = _canonical_uuid(source.get("uuid", source.get("gpu_uuid")), field=f"gpu[{index}]")
+        pci = _canonical_pci(source.get("pci_bus_id", source.get("pci")), field=f"gpu[{index}]")
+        uuid_key = uuid.casefold()
+        pci_key = pci.casefold()
+        if uuid_key in {item.casefold() for item in APPROVED_GPU_UUIDS} and pci_key == EXCLUDED_PCI.casefold():
             raise S29RunnerBlocked("APPROVED_GPU_BOUND_TO_EXCLUDED_PCI")
-        if uuid in seen_uuid or pci in seen_pci:
-            raise S29RunnerBlocked("GPU_INVENTORY_DUPLICATE_IDENTITY")
-        seen_uuid.add(uuid)
-        seen_pci.add(pci)
+        if uuid_key in seen_uuid:
+            raise S29RunnerBlocked("GPU_INVENTORY_DUPLICATE_UUID")
+        if pci_key in seen_pci:
+            raise S29RunnerBlocked("GPU_INVENTORY_DUPLICATE_PCI")
+        seen_uuid.add(uuid_key)
+        seen_pci.add(pci_key)
         row = dict(source)
         row["uuid"] = uuid
         row["pci_bus_id"] = pci
-        row["selected"] = uuid in APPROVED_GPU_UUIDS
-        row["permanently_excluded"] = uuid == EXCLUDED_GPU_UUID or pci == EXCLUDED_PCI.lower()
+        for canonical, aliases in S29_INVENTORY_HEALTH_ALIASES.items():
+            found = next((row[name] for name in aliases if name in row), None)
+            if found is None:
+                raise S29RunnerBlocked(f"GPU_INVENTORY_HEALTH_FIELD_MISSING:{canonical}")
+            row[canonical] = found
+        row["selected"] = uuid_key in {item.casefold() for item in APPROVED_GPU_UUIDS}
+        row["permanently_excluded"] = uuid_key == EXCLUDED_GPU_UUID.casefold() or pci_key == EXCLUDED_PCI.casefold()
         rows.append(row)
-    approved = [row for row in rows if row["uuid"] in APPROVED_GPU_UUIDS]
-    if {row["uuid"] for row in approved} != set(APPROVED_GPU_UUIDS):
-        missing = sorted(set(APPROVED_GPU_UUIDS) - {row["uuid"] for row in approved})
-        raise S29RunnerBlocked(f"APPROVED_GPU_UUIDS_MISSING:{','.join(missing)}")
-    if any(row["pci_bus_id"] == EXCLUDED_PCI.lower() for row in approved):
-        raise S29RunnerBlocked("APPROVED_GPU_BOUND_TO_EXCLUDED_PCI")
-    # The excluded identity is immutable policy.  Its appearance in NVML is
-    # acceptable, but it can never enter the selected list or CUDA visibility.
-    if any(row["uuid"] == EXCLUDED_GPU_UUID and not row["permanently_excluded"] for row in rows):
-        raise S29RunnerBlocked("EXCLUDED_GPU_IDENTITY_NOT_BOUND_TO_EXCLUDED_POLICY")
+
+    expected = {pci.casefold(): uuid.casefold() for pci, uuid in ALLOWED_DEVICES}
+    expected[EXCLUDED_PCI.casefold()] = EXCLUDED_UUID.casefold()
+    observed = {
+        str(row["pci_bus_id"]).casefold(): str(row["uuid"]).casefold()
+        for row in rows
+        if str(row["pci_bus_id"]).casefold() in expected
+    }
+    if observed != expected:
+        raise S29RunnerBlocked("GPU_INVENTORY_APPROVED_OR_EXCLUDED_IDENTITY_DRIFT")
+    if not any(str(row["uuid"]).casefold() == EXCLUDED_GPU_UUID.casefold() for row in rows):
+        raise S29RunnerBlocked("GPU_INVENTORY_EXCLUDED_CARD_REQUIRED")
+
+    approved_keys = {item.casefold() for item in APPROVED_GPU_UUIDS}
+    apps_by_uuid: dict[str, list[dict[str, Any]]] = {}
+    if not isinstance(compute_apps, Sequence) or isinstance(compute_apps, (str, bytes)):
+        raise S29RunnerBlocked("GPU_INVENTORY_COMPUTE_APPS_REQUIRED")
+    live_keys = {str(row["uuid"]).casefold() for row in rows}
+    for index, source in enumerate(compute_apps):
+        if not isinstance(source, Mapping):
+            raise S29RunnerBlocked(f"GPU_INVENTORY_COMPUTE_APP_INVALID:{index}")
+        app = dict(source)
+        app_uuid = _canonical_uuid(app.get("gpu_uuid", app.get("uuid")), field=f"compute_app[{index}]")
+        if app_uuid.casefold() not in live_keys:
+            raise S29RunnerBlocked("GPU_INVENTORY_COMPUTE_APP_GPU_UNKNOWN")
+        app["gpu_uuid"] = app_uuid
+        apps_by_uuid.setdefault(app_uuid.casefold(), []).append(app)
+
+    approved_gpu_classes: set[str] = set()
+    for row in rows:
+        row_uuid = str(row["uuid"]).casefold()
+        if row_uuid not in approved_keys:
+            continue
+        try:
+            memory_used = float(row["memory_used_mib"])
+            memory_total = float(row["memory_total_mib"])
+            utilization = float(row["utilization_gpu_percent"])
+            ecc_volatile = float(row["ecc_uncorrected_volatile"])
+            ecc_aggregate = float(row["ecc_uncorrected_aggregate"])
+            xid_errors = float(row["xid_errors"])
+        except (TypeError, ValueError) as error:
+            raise S29RunnerBlocked("GPU_INVENTORY_APPROVED_HEALTH_INVALID") from error
+        if memory_total <= 0 or memory_used != 0 or utilization != 0:
+            raise S29RunnerBlocked("GPU_INVENTORY_APPROVED_CARD_NOT_IDLE")
+        if ecc_volatile != 0 or ecc_aggregate != 0:
+            raise S29RunnerBlocked("GPU_INVENTORY_APPROVED_CARD_ECC_NOT_CLEAN")
+        if xid_errors != 0:
+            raise S29RunnerBlocked("GPU_INVENTORY_APPROVED_XID_NOT_CLEAN")
+        gpu_class = str(row["gpu_class"]).strip()
+        if not gpu_class:
+            raise S29RunnerBlocked("GPU_INVENTORY_GPU_CLASS_REQUIRED")
+        approved_gpu_classes.add(gpu_class)
+        remap = str(row["row_remap_status"]).strip().casefold()
+        if remap not in {"none", "0", "clean", "false", "not_pending", "not-pending", "n/a", "na"}:
+            raise S29RunnerBlocked("GPU_INVENTORY_APPROVED_ROW_REMAP_NOT_CLEAN")
+        recovery = str(row["gpu_recovery_action"]).strip().casefold()
+        if recovery not in {"none", "0", "clean", "n/a", "na"}:
+            raise S29RunnerBlocked("GPU_INVENTORY_APPROVED_CARD_RECOVERY_NOT_CLEAN")
+        if apps_by_uuid.get(row_uuid):
+            raise S29RunnerBlocked("GPU_INVENTORY_APPROVED_CARD_NOT_IDLE")
+    if len(approved_gpu_classes) != 1:
+        raise S29RunnerBlocked("GPU_INVENTORY_APPROVED_GPU_CLASS_DRIFT")
     return rows
 
 
-def validate_s209_gpu_inventory(inventory: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+def _load_inventory_envelope(
+    value: Mapping[str, Any],
+    *,
+    root: Path | None = None,
+    inventory_ref: str | None = None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Validate a hash-bound live inventory envelope and return rows/identity."""
+
+    if not isinstance(value, Mapping):
+        raise S29RunnerBlocked("GPU_INVENTORY_ENVELOPE_REQUIRED")
+    payload = dict(value)
+    if payload.get("schema_version") not in S29_ACCEPTED_INVENTORY_SCHEMAS:
+        raise S29RunnerBlocked("GPU_INVENTORY_SCHEMA_INVALID")
+    source_ref = payload.get("source_ref")
+    if not isinstance(source_ref, str) or not source_ref or "\\" in source_ref:
+        raise S29RunnerBlocked("GPU_INVENTORY_SOURCE_REF_REQUIRED")
+    if root is not None:
+        _logical(root, source_ref, field="gpu_inventory.source_ref")
+        if inventory_ref is not None:
+            try:
+                expected_source_ref = Path(inventory_ref).resolve().relative_to(root.resolve()).as_posix()
+            except ValueError as error:
+                raise S29RunnerBlocked("GPU_INVENTORY_PATH_OUTSIDE_DATA_ROOT") from error
+            if source_ref != expected_source_ref:
+                raise S29RunnerBlocked("GPU_INVENTORY_SOURCE_REF_PATH_MISMATCH")
+    rows = payload.get("rows")
+    apps = payload.get("compute_apps")
+    if not isinstance(rows, list) or not all(isinstance(item, Mapping) for item in rows):
+        raise S29RunnerBlocked("GPU_INVENTORY_ROWS_REQUIRED")
+    if not isinstance(apps, list) or not all(isinstance(item, Mapping) for item in apps):
+        raise S29RunnerBlocked("GPU_INVENTORY_COMPUTE_APPS_REQUIRED")
+    artifact_hash = _verify_hash(payload, field="gpu_inventory")
+    source_sha = _file_sha256(inventory_ref) if inventory_ref is not None else ""
+    declared_source_sha = payload.get("source_sha256")
+    if declared_source_sha is not None:
+        if not isinstance(declared_source_sha, str) or declared_source_sha != source_sha:
+            raise S29RunnerBlocked("GPU_INVENTORY_SOURCE_SHA256_MISMATCH")
+    normalized = validate_s209_gpu_inventory(rows, compute_apps=apps)
+    identity = {
+        "source_ref": source_ref,
+        "artifact_hash": artifact_hash,
+        "source_sha256": source_sha,
+        "schema_version": str(payload["schema_version"]),
+    }
+    normalized_summary = dict(normalized)
+    normalized_summary.update(
+        {
+            "inventory_source_ref": source_ref,
+            "inventory_artifact_hash": artifact_hash,
+            "inventory_source_sha256": source_sha,
+            "inventory_schema_version": str(payload["schema_version"]),
+        }
+    )
+    return normalized_summary, identity
+
+
+def validate_s209_gpu_inventory(
+    inventory: Sequence[Mapping[str, Any]],
+    *,
+    compute_apps: Sequence[Mapping[str, Any]] = (),
+) -> dict[str, Any]:
     """Return a canonical inventory summary without selecting by CUDA index."""
 
-    rows = _normalise_inventory(inventory)
+    rows = _normalise_inventory(inventory, compute_apps=compute_apps)
     summary: dict[str, Any] = {
         "schema_version": S29_INVENTORY_SCHEMA,
         "approved_gpu_uuids": list(APPROVED_GPU_UUIDS),
@@ -220,6 +415,44 @@ def validate_s209_io_evidence(value: Mapping[str, Any]) -> dict[str, Any]:
     return payload
 
 
+def _load_capacity_evidence(root: Path, reference: str | None) -> tuple[dict[str, Any], dict[str, Any]]:
+    if reference is None:
+        raise S29RunnerBlocked("CAPACITY_EVIDENCE_REQUIRED")
+    path = _logical(root, reference, field="capacity")
+    payload = _load_object(path, field="capacity")
+    artifact_hash = _verify_hash(payload, field="capacity")
+    if payload.get("schema_version") != S29_CAPACITY_SCHEMA:
+        raise S29RunnerBlocked("CAPACITY_SCHEMA_INVALID")
+    if not isinstance(payload.get("observed_at"), str) or not payload["observed_at"].strip():
+        raise S29RunnerBlocked("CAPACITY_OBSERVED_AT_REQUIRED")
+    for field in ("stage4_steps", "stage5_steps", "disk_free_bytes", "inode_free"):
+        value = payload.get(field)
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            raise S29RunnerBlocked(f"CAPACITY_{field.upper()}_INVALID")
+    payload["capacity_evidence_hash"] = artifact_hash
+    return payload, {"ref": reference, "artifact_hash": artifact_hash}
+
+
+def _load_ulimit_evidence(root: Path, reference: str | None) -> tuple[dict[str, Any], dict[str, Any]]:
+    if reference is None:
+        raise S29RunnerBlocked("ULIMIT_EVIDENCE_REQUIRED")
+    path = _logical(root, reference, field="ulimit")
+    payload = _load_object(path, field="ulimit")
+    artifact_hash = _verify_hash(payload, field="ulimit")
+    if payload.get("schema_version") != S29_ULIMIT_SCHEMA:
+        raise S29RunnerBlocked("ULIMIT_SCHEMA_INVALID")
+    if payload.get("resource") != "nofile":
+        raise S29RunnerBlocked("ULIMIT_RESOURCE_INVALID")
+    soft = payload.get("soft_nofile", payload.get("soft_limit"))
+    hard = payload.get("hard_nofile", payload.get("hard_limit"))
+    if isinstance(soft, bool) or not isinstance(soft, int) or soft != 1024:
+        raise S29RunnerBlocked("ULIMIT_NOFILE_SOFT_MUST_BE_1024")
+    if isinstance(hard, bool) or not isinstance(hard, int) or hard < soft:
+        raise S29RunnerBlocked("ULIMIT_NOFILE_HARD_INVALID")
+    payload["ulimit_evidence_hash"] = artifact_hash
+    return payload, {"ref": reference, "artifact_hash": artifact_hash, "soft_nofile": soft}
+
+
 @dataclass(frozen=True, slots=True)
 class S29Preflight:
     """All identities and evidence bound immediately before execution."""
@@ -238,6 +471,10 @@ class S29Preflight:
     measurement_plan_ref: str
     gpu_inventory_ref: str = "gpu-inventory.json"
     io_evidence_ref: str = "io-evidence.json"
+    capacity_inputs: dict[str, Any] | None = None
+    capacity_ref: str = "capacity.json"
+    ulimit_evidence: dict[str, Any] | None = None
+    ulimit_ref: str = "ulimit.json"
 
     @property
     def plan_hash(self) -> str:
@@ -254,7 +491,7 @@ def prepare_s209_plan(
     anchor_ids: Sequence[str] = ("method-only-anchor-0", "method-only-anchor-1"),
     repetitions: int = 2,
     randomization_seed: int = 2909,
-    inventory: Sequence[Mapping[str, Any]] | None = None,
+    inventory: Mapping[str, Any] | None = None,
     io_evidence: Mapping[str, Any] | None = None,
     output_ref: str | None = None,
 ) -> dict[str, Any]:
@@ -269,7 +506,7 @@ def prepare_s209_plan(
     raw = _load_object(raw_path, field="s27_raw_manifest")
     frozen = bind_s209_inputs(matrix=matrix, g24b_gate=gate, raw_manifest=raw, matrix_ref=matrix_ref, raw_manifest_ref=raw_manifest_ref)
     if inventory is not None:
-        validate_s209_gpu_inventory(inventory)
+        _load_inventory_envelope(inventory, root=root)
     if io_evidence is not None:
         validate_s209_io_evidence(io_evidence)
     plan = prepare_s209_measurement_plan(frozen, run_id=run_id, anchor_ids=anchor_ids, repetitions=repetitions, randomization_seed=randomization_seed)
@@ -288,6 +525,8 @@ def load_s209_preflight(
     measurement_plan_ref: str,
     gpu_inventory_ref: str,
     io_evidence_ref: str,
+    capacity_ref: str | None = None,
+    ulimit_ref: str | None = None,
 ) -> S29Preflight:
     """Re-read and re-bind all producer artifacts at launch time."""
 
@@ -310,11 +549,17 @@ def load_s209_preflight(
     from .stage2_s209_g27a import _validate_measurement_plan  # private, same contract
     _validate_measurement_plan(plan, frozen=frozen)
     inventory_raw = _load_object(refs["inventory"], field="gpu_inventory")
-    rows = inventory_raw.get("gpus", inventory_raw.get("rows"))
-    if not isinstance(rows, list) or not all(isinstance(item, Mapping) for item in rows):
-        raise S29RunnerBlocked("GPU_INVENTORY_ROWS_INVALID")
-    inventory = validate_s209_gpu_inventory([dict(item) for item in rows])
+    inventory, inventory_identity = _load_inventory_envelope(
+        inventory_raw,
+        root=root,
+        inventory_ref=refs["inventory"],
+    )
     io_evidence = validate_s209_io_evidence(_load_object(refs["io"], field="io_evidence"))
+    capacity_inputs, capacity_identity = _load_capacity_evidence(root, capacity_ref)
+    ulimit_evidence, ulimit_identity = _load_ulimit_evidence(root, ulimit_ref)
+    inventory["inventory_identity"] = inventory_identity
+    inventory["capacity_identity"] = capacity_identity
+    inventory["ulimit_identity"] = ulimit_identity
     return S29Preflight(
         root=root,
         frozen=frozen,
@@ -330,6 +575,10 @@ def load_s209_preflight(
         measurement_plan_ref=measurement_plan_ref,
         gpu_inventory_ref=gpu_inventory_ref,
         io_evidence_ref=io_evidence_ref,
+        capacity_inputs=capacity_inputs,
+        capacity_ref=capacity_identity["ref"],
+        ulimit_evidence=ulimit_evidence,
+        ulimit_ref=ulimit_identity["ref"],
     )
 
 
@@ -343,6 +592,10 @@ class S29DetachedStatus:
     updated_at: str
     owner_pid: int | None = None
     terminal_reason: str | None = None
+    inventory_artifact_hash: str | None = None
+    inventory_source_sha256: str | None = None
+    matrix_hash: str | None = None
+    raw_manifest_hash: str | None = None
 
     def __post_init__(self) -> None:
         _safe_id(self.run_id, field="status.run_id")
@@ -355,6 +608,14 @@ class S29DetachedStatus:
             raise S29RunnerBlocked("STATUS_EXPECTED_TASKS_INVALID")
         if self.status in S29_TERMINAL_VALUES and not self.terminal_reason:
             raise S29RunnerBlocked("STATUS_TERMINAL_REASON_REQUIRED")
+        for field, value in (
+            ("status.inventory_artifact_hash", self.inventory_artifact_hash),
+            ("status.inventory_source_sha256", self.inventory_source_sha256),
+            ("status.matrix_hash", self.matrix_hash),
+            ("status.raw_manifest_hash", self.raw_manifest_hash),
+        ):
+            if value is not None:
+                _sha(value, field=field)
 
     def to_dict(self) -> dict[str, Any]:
         body = {
@@ -367,6 +628,10 @@ class S29DetachedStatus:
             "updated_at": self.updated_at,
             "owner_pid": self.owner_pid,
             "terminal_reason": self.terminal_reason,
+            "inventory_artifact_hash": self.inventory_artifact_hash,
+            "inventory_source_sha256": self.inventory_source_sha256,
+            "matrix_hash": self.matrix_hash,
+            "raw_manifest_hash": self.raw_manifest_hash,
         }
         body["artifact_hash"] = canonical_json_hash(body)
         return body
@@ -384,10 +649,33 @@ class S29StatusStore:
         "BLOCKED": {"BLOCKED"},
     }
 
-    def __init__(self, path: str | Path, *, run_id: str, plan_hash: str) -> None:
+    def __init__(
+        self,
+        path: str | Path,
+        *,
+        run_id: str,
+        plan_hash: str,
+        inventory_identity: Mapping[str, Any] | None = None,
+        cost_identity: Mapping[str, Any] | None = None,
+    ) -> None:
         self.path = Path(path)
         self.run_id = _safe_id(run_id, field="status.run_id")
         self.plan_hash = _sha(plan_hash, field="status.plan_hash")
+        self.inventory_identity = dict(inventory_identity) if isinstance(inventory_identity, Mapping) else None
+        self.cost_identity = dict(cost_identity) if isinstance(cost_identity, Mapping) else None
+
+    def _bind_identity(self, status: S29DetachedStatus) -> S29DetachedStatus:
+        expected = {
+            "inventory_artifact_hash": None if self.inventory_identity is None else self.inventory_identity.get("artifact_hash"),
+            "inventory_source_sha256": None if self.inventory_identity is None else self.inventory_identity.get("source_sha256"),
+            "matrix_hash": None if self.cost_identity is None else self.cost_identity.get("matrix_hash"),
+            "raw_manifest_hash": None if self.cost_identity is None else self.cost_identity.get("raw_manifest_hash"),
+        }
+        for field, value in expected.items():
+            actual = getattr(status, field)
+            if value is not None and actual not in {None, value}:
+                raise S29RunnerBlocked(f"STATUS_{field.upper()}_DRIFT")
+        return replace(status, **{field: value if value is not None else getattr(status, field) for field, value in expected.items()})
 
     def load(self) -> S29DetachedStatus:
         value = _load_object(self.path, field="status")
@@ -398,7 +686,7 @@ class S29StatusStore:
             raise S29RunnerBlocked("STATUS_HASH_MISMATCH")
         if value.get("run_id") != self.run_id or value.get("plan_hash") != self.plan_hash:
             raise S29RunnerBlocked("STATUS_IDENTITY_MISMATCH")
-        return S29DetachedStatus(
+        status = S29DetachedStatus(
             run_id=self.run_id,
             plan_hash=self.plan_hash,
             status=str(value["status"]),
@@ -407,9 +695,18 @@ class S29StatusStore:
             updated_at=str(value["updated_at"]),
             owner_pid=(None if value.get("owner_pid") is None else int(value["owner_pid"])),
             terminal_reason=(None if value.get("terminal_reason") is None else str(value["terminal_reason"])),
+            inventory_artifact_hash=(None if value.get("inventory_artifact_hash") is None else str(value["inventory_artifact_hash"])),
+            inventory_source_sha256=(None if value.get("inventory_source_sha256") is None else str(value["inventory_source_sha256"])),
+            matrix_hash=(None if value.get("matrix_hash") is None else str(value["matrix_hash"])),
+            raw_manifest_hash=(None if value.get("raw_manifest_hash") is None else str(value["raw_manifest_hash"])),
         )
+        bound = self._bind_identity(status)
+        if bound != status:
+            raise S29RunnerBlocked("STATUS_IDENTITY_MISSING")
+        return status
 
     def publish(self, status: S29DetachedStatus) -> None:
+        status = self._bind_identity(status)
         if status.run_id != self.run_id or status.plan_hash != self.plan_hash:
             raise S29RunnerBlocked("STATUS_IDENTITY_MISMATCH")
         if self.path.exists():
@@ -488,6 +785,7 @@ def _validate_measured_row(
     task: Mapping[str, Any],
     frozen: S29FrozenInputs,
     io_evidence: Mapping[str, Any],
+    inventory_identity: Mapping[str, Any],
 ) -> dict[str, Any]:
     """Require actual profiler fields and bind immutable task identity."""
 
@@ -506,6 +804,8 @@ def _validate_measured_row(
         "gpu_uuid": str(task["gpu_uuid"]),
         "device_count": int(task["device_count"]),
     }
+    if semantic != "anchor" and int(task["device_count"]) != 1:
+        raise S29RunnerBlocked("METHOD_TASK_SINGLE_GPU_REQUIRED")
     for name, expected in expected_identity.items():
         if name in row and row[name] != expected:
             raise S29RunnerBlocked(f"PROFILER_IDENTITY_DRIFT:{name}")
@@ -521,6 +821,8 @@ def _validate_measured_row(
     output["microbatch_count"] = frozen.microbatch_count
     output["gpu_uuid"] = str(task["gpu_uuid"])
     output["device_count"] = int(task["device_count"])
+    output["inventory_artifact_hash"] = _sha(inventory_identity.get("artifact_hash"), field="inventory_artifact_hash")
+    output["inventory_source_sha256"] = _sha(inventory_identity.get("source_sha256"), field="inventory_source_sha256")
     output["anchor_kind"] = "shared_runner" if semantic == "scientific_equal_sample_cost" else "method_only"
     output["cost_io_quiescent"] = io_evidence.get("cost_io_quiescent") is True
     output["io_evidence_hash"] = str(io_evidence["artifact_hash"])
@@ -622,7 +924,16 @@ class S29ProfilerRunner:
         self.measurement_root = self.run_root / "measurements"
         self.attempt_root = self.run_root / "attempts"
         self.failure_root = self.run_root / "failures"
-        self.status_store = S29StatusStore(self.run_root / "status.json", run_id=self.run_id, plan_hash=preflight.plan_hash)
+        self.status_store = S29StatusStore(
+            self.run_root / "status.json",
+            run_id=self.run_id,
+            plan_hash=preflight.plan_hash,
+            inventory_identity=preflight.inventory.get("inventory_identity"),
+            cost_identity={
+                "matrix_hash": preflight.frozen.matrix_hash,
+                "raw_manifest_hash": preflight.frozen.raw_manifest_hash,
+            },
+        )
 
     def _task_key(self, task: Mapping[str, Any]) -> str:
         return f"{task['semantic']}__{task.get('method','shared')}__{task['anchor_id']}__r{task['repetition']}"
@@ -676,7 +987,13 @@ class S29ProfilerRunner:
             cost_task = dict(task)
             cost_task["semantic"] = "scientific_equal_sample_cost"
             cost_task["method"] = "raw"
-            row = _validate_measured_row(measured, task=cost_task, frozen=self.preflight.frozen, io_evidence=self.preflight.io_evidence)
+            row = _validate_measured_row(
+                measured,
+                task=cost_task,
+                frozen=self.preflight.frozen,
+                io_evidence=self.preflight.io_evidence,
+                inventory_identity=self.preflight.inventory["inventory_identity"],
+            )
             anchor = {
                 "status": "PASS",
                 "matrix_hash": self.preflight.frozen.matrix_hash,
@@ -711,7 +1028,13 @@ class S29ProfilerRunner:
             if not path.exists():
                 continue
             row = _load_object(path, field=f"measurement.{self._task_key(task)}")
-            normalized = _validate_measured_row(row, task=task, frozen=self.preflight.frozen, io_evidence=self.preflight.io_evidence)
+            normalized = _validate_measured_row(
+                row,
+                task=task,
+                frozen=self.preflight.frozen,
+                io_evidence=self.preflight.io_evidence,
+                inventory_identity=self.preflight.inventory["inventory_identity"],
+            )
             if canonical_json_hash(normalized) != canonical_json_hash(row):
                 raise S29RunnerBlocked(f"MEASUREMENT_ROW_IDENTITY_DRIFT:{self._task_key(task)}")
             completed[self._task_key(task)] = row
@@ -772,12 +1095,20 @@ class S29ProfilerRunner:
                 "S29_METHOD": str(task.get("method", "shared")),
                 "S29_ANCHOR_ID": str(task["anchor_id"]),
                 "S29_REPETITION": str(task["repetition"]),
-                "S29_GPU_UUIDS": ",".join(self.preflight.inventory["selected_gpu_uuids"]),
+                # Every method task is an isolated single-GPU process.  The
+                # four-card set is reserved exclusively for _run_measured_anchor.
+                "S29_GPU_UUIDS": str(task["gpu_uuid"]),
                 "CUDA_VISIBLE_DEVICES": str(task["gpu_uuid"]),
             }
             try:
                 measured = self.profiler(task, environment=env)
-                row = _validate_measured_row(measured, task=task, frozen=self.preflight.frozen, io_evidence=self.preflight.io_evidence)
+                row = _validate_measured_row(
+                    measured,
+                    task=task,
+                    frozen=self.preflight.frozen,
+                    io_evidence=self.preflight.io_evidence,
+                    inventory_identity=self.preflight.inventory["inventory_identity"],
+                )
                 _write_once(self._row_path(task), row, field=f"measurement.{key}")
                 terminal = dict(attempt_payload)
                 terminal["status"] = "SUCCEEDED"
@@ -834,26 +1165,50 @@ class S29ProfilerRunner:
         destination.parent.mkdir(parents=True, exist_ok=True)
         staging = Path(tempfile.mkdtemp(prefix=f".{destination.name}.staging-", dir=destination.parent))
         try:
+            approved_rows = [
+                row for row in self.preflight.inventory["rows"]
+                if str(row.get("uuid", "")).casefold() in {uuid.casefold() for uuid in APPROVED_GPU_UUIDS}
+            ]
+            gpu_classes = {str(row.get("gpu_class", "")).strip() for row in approved_rows}
+            health_snapshot = {
+                "healthy": all(
+                    float(row["ecc_uncorrected_volatile"]) == 0
+                    and float(row["ecc_uncorrected_aggregate"]) == 0
+                    and str(row["row_remap_status"]).strip().casefold() in {"none", "0", "clean", "false", "not_pending", "not-pending", "n/a", "na"}
+                    and str(row["gpu_recovery_action"]).strip().casefold() in {"none", "0", "clean", "n/a", "na"}
+                    for row in approved_rows
+                ),
+                "idle": all(
+                    float(row["memory_used_mib"]) == 0 and float(row["utilization_gpu_percent"]) == 0
+                    for row in approved_rows
+                ),
+                "same_gpu_class": len(gpu_classes) == 1 and "" not in gpu_classes,
+                "gpu_class": next(iter(gpu_classes), None),
+                "gpu_uuids": list(self.preflight.inventory["selected_gpu_uuids"]),
+                "ecc_errors": sum(
+                    int(float(row["ecc_uncorrected_volatile"]) + float(row["ecc_uncorrected_aggregate"]))
+                    for row in approved_rows
+                ),
+                "xid_errors": sum(int(float(row["xid_errors"])) for row in approved_rows),
+                "cost_io_quiescent": self.preflight.io_evidence["cost_io_quiescent"],
+                "inventory_artifact_hash": self.preflight.inventory["inventory_artifact_hash"],
+                "inventory_source_sha256": self.preflight.inventory["inventory_source_sha256"],
+            }
+            capacity_inputs = dict(self.preflight.capacity_inputs or {})
+            if self.preflight.ulimit_evidence is not None:
+                capacity_inputs["ulimit_evidence_hash"] = self.preflight.ulimit_evidence["ulimit_evidence_hash"]
+                capacity_inputs["ulimit_nofile_soft"] = self.preflight.ulimit_evidence.get("soft_nofile", self.preflight.ulimit_evidence.get("soft_limit"))
             report = run_s209_g27a(
                 matrix=self.preflight.matrix,
                 g24b_gate=self.preflight.gate,
                 raw_manifest=self.preflight.raw_manifest,
                 cost_observations=cost_observations,
-                health_snapshot={
-                    "healthy": all(row.get("health_ok") is True for row in self.preflight.inventory["rows"] if row.get("selected")),
-                    "idle": True,
-                    "same_gpu_class": True,
-                    "gpu_class": "A100-80GB",
-                    "gpu_uuids": list(self.preflight.inventory["selected_gpu_uuids"]),
-                    "ecc_errors": 0,
-                    "xid_errors": 0,
-                    "cost_io_quiescent": self.preflight.io_evidence["cost_io_quiescent"],
-                },
+                health_snapshot=health_snapshot,
                 single_gpu_anchor=self.single_gpu_anchor,
                 four_gpu_anchor=self.four_gpu_anchor,
                 shared_attribution_cross_check=self.shared_attribution_cross_check,
                 accuracy_rows=self.accuracy_rows,
-                capacity_inputs=self.capacity_inputs,
+                capacity_inputs=capacity_inputs,
                 run_id=self.run_id,
                 cost_io_quiescent=self.preflight.io_evidence["cost_io_quiescent"],
                 output_root=staging,
@@ -875,6 +1230,8 @@ class S29ProfilerRunner:
                 self.preflight.measurement_plan_ref,
                 self.preflight.gpu_inventory_ref,
                 self.preflight.io_evidence_ref,
+                self.preflight.capacity_ref,
+                self.preflight.ulimit_ref,
             }))
             gate_payload = GateRecord(
                 gate_id=gate.gate_id,
@@ -894,7 +1251,10 @@ class S29ProfilerRunner:
                 "schema_version": S29_RUNNER_SCHEMA,
                 "run_id": self.run_id,
                 "measurement_plan_hash": self.preflight.plan_hash,
-                "inventory_hash": self.preflight.inventory["artifact_hash"],
+                "inventory_hash": self.preflight.inventory["inventory_artifact_hash"],
+                "inventory_source_sha256": self.preflight.inventory["inventory_source_sha256"],
+                "capacity_evidence_hash": capacity_inputs.get("capacity_evidence_hash"),
+                "ulimit_evidence_hash": capacity_inputs.get("ulimit_evidence_hash"),
                 "io_evidence_hash": self.preflight.io_evidence["artifact_hash"],
                 "gpu_inventory_ref": self.preflight.gpu_inventory_ref,
                 "io_evidence_ref": self.preflight.io_evidence_ref,

@@ -16,6 +16,9 @@ from param_importance_nlp.experiments.stage2_s209_g27a import (
     run_s209_g27a,
 )
 
+INVENTORY_ARTIFACT_HASH = "1" * 64
+INVENTORY_SOURCE_SHA256 = "2" * 64
+
 
 def _gate() -> dict[str, object]:
     return GateRecord(
@@ -101,6 +104,8 @@ def _row(method: str, *, semantic: str, anchor: str, repetition: int = 0, wall: 
         "anchor_id": anchor,
         "repetition": repetition,
         "gpu_uuid": gpu,
+        "inventory_artifact_hash": INVENTORY_ARTIFACT_HASH,
+        "inventory_source_sha256": INVENTORY_SOURCE_SHA256,
         "device_count": 1,
         "sequence_count": 32,
         "token_count": 1024,
@@ -151,6 +156,8 @@ def _health() -> dict[str, object]:
         "gpu_uuids": list(APPROVED_GPU_UUIDS),
         "ecc_errors": 0,
         "xid_errors": 0,
+        "inventory_artifact_hash": INVENTORY_ARTIFACT_HASH,
+        "inventory_source_sha256": INVENTORY_SOURCE_SHA256,
         "cost_io_quiescent": True,
     }
 
@@ -239,7 +246,15 @@ def test_s209_complete_fixture_emits_pass_pareto_capacity(tmp_path: Path) -> Non
         four_gpu_anchor=_anchor(4, list(APPROVED_GPU_UUIDS)),
         shared_attribution_cross_check={method: {"shared_wall_seconds": 10.0, "isolated_wall_seconds": 11.0, "relative_difference": 1 / 11} for method in ("raw", "double", "u")},
         accuracy_rows=_accuracy(),
-        capacity_inputs={"stage4_steps": 10, "stage5_steps": 20},
+        capacity_inputs={
+            "stage4_steps": 10,
+            "stage5_steps": 20,
+            "disk_free_bytes": 10**12,
+            "inode_free": 10**6,
+            "capacity_evidence_hash": "3" * 64,
+            "ulimit_evidence_hash": "4" * 64,
+            "ulimit_nofile_soft": 1024,
+        },
         output_root=tmp_path / "pass",
         checked_at="2026-08-25T00:00:00+00:00",
     )
@@ -249,3 +264,35 @@ def test_s209_complete_fixture_emits_pass_pareto_capacity(tmp_path: Path) -> Non
     assert result["pareto"]["status"] == "PASS"
     assert result["capacity"]["forecasts"]["u"]["projected_total_a100_hours"] > 0
     assert (tmp_path / "pass" / "g2.7a-gate.json").exists()
+
+
+def test_s209_missing_capacity_or_ulimit_evidence_cannot_pass(tmp_path: Path) -> None:
+    matrix, gate, manifest = _inputs()
+    with pytest.raises(S29G27ABlocked, match="COST_SEMANTICS"):
+        # A malformed/empty cost payload remains rejected before capacity
+        # reduction; this guards the fail-closed entry boundary.
+        run_s209_g27a(
+            matrix=matrix,
+            g24b_gate=gate,
+            raw_manifest=manifest,
+            cost_observations={},
+            health_snapshot=_health(),
+            single_gpu_anchor=_anchor(1, [APPROVED_GPU_UUIDS[0]]),
+            four_gpu_anchor=_anchor(4, list(APPROVED_GPU_UUIDS)),
+            shared_attribution_cross_check={},
+        )
+    result = run_s209_g27a(
+        matrix=matrix,
+        g24b_gate=gate,
+        raw_manifest=manifest,
+        cost_observations=_costs(),
+        health_snapshot=_health(),
+        single_gpu_anchor=_anchor(1, [APPROVED_GPU_UUIDS[0]]),
+        four_gpu_anchor=_anchor(4, list(APPROVED_GPU_UUIDS)),
+        shared_attribution_cross_check={method: {"shared_wall_seconds": 10.0, "isolated_wall_seconds": 11.0, "relative_difference": 1 / 11} for method in ("raw", "double", "u")},
+        accuracy_rows=_accuracy(),
+        capacity_inputs=None,
+        output_root=tmp_path / "missing-capacity",
+    )
+    assert result["status"] == "BLOCKED"
+    assert "CAPACITY_INPUTS_REQUIRED" in result["reasons"]
