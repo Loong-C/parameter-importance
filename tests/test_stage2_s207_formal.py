@@ -27,6 +27,7 @@ from param_importance_nlp.experiments.stage2_s207_formal import (
     validate_gpu_inventory,
 )
 from param_importance_nlp.experiments.stage2_s207_runner import partition_s27_units
+from ops.stage2.run_s207_formal import _parser
 
 
 def _gate_payload() -> dict[str, object]:
@@ -40,6 +41,44 @@ def _gate_payload() -> dict[str, object]:
         evidence_refs=("s206/report.json",),
     )
     return gate.to_dict()
+
+
+def test_s27_detach_is_a_wrapper_around_execute() -> None:
+    args = _parser().parse_args(
+        [
+            "--detach",
+            "--execute",
+            "--data-root",
+            "/data-root",
+            "--plan-ref",
+            "s207/plan.json",
+            "--run-root",
+            "s207/run",
+            "--materialization-index-ref",
+            "s204/materialization-index.json",
+            "--execution-evidence-ref",
+            "s202/formal-execution.json",
+        ]
+    )
+    assert args.detach is True
+    assert args.execute is True
+
+    with pytest.raises(SystemExit):
+        _parser().parse_args(
+            [
+                "--detach",
+                "--data-root",
+                "/data-root",
+                "--plan-ref",
+                "s207/plan.json",
+                "--run-root",
+                "s207/run",
+                "--materialization-index-ref",
+                "s204/materialization-index.json",
+                "--execution-evidence-ref",
+                "s202/formal-execution.json",
+            ]
+        )
 
 
 def _matrix_payload(gate_hash: str) -> dict[str, object]:
