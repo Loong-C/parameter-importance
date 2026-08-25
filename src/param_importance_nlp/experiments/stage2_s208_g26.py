@@ -10,9 +10,10 @@ The public entry point is :func:`analyze_s208_g26`.  It accepts JSON mappings
 or canonical JSON paths for the four upstream Gate records, the frozen matrix,
 the preregistration/hypothesis contracts, the sealed raw manifest, and one
 reference payload per primary cell.  A reference payload must contain the
-three reference views and independent reference blocks.  Bootstrap resampling
-is only over independent repetitions and reference blocks; parameter
-coordinates are never resampled.
+three reference views plus either independent raw reference blocks or the
+bounded producer's hash-bound jackknife variance vectors.  The latter uses
+the preregistered equivalent independent-variance combination and never
+reconstructs pseudo blocks.  Parameter coordinates are never resampled.
 """
 
 from __future__ import annotations
@@ -221,8 +222,18 @@ def _verify_gate(value: Mapping[str, Any] | str | Path, gate_id: str) -> _Verifi
     return _VerifiedGate(gate.gate_id, gate.artifact_hash, dict(gate.measured) if isinstance(gate.measured, Mapping) else {})
 
 
-def _reference_views(payload: Mapping[str, Any], *, field: str) -> tuple[dict[str, tuple[tuple[str, ...], np.ndarray]], dict[str, tuple[tuple[str, ...], np.ndarray]]]:
-    """Read the three final views and independent block views from a reference."""
+def _reference_views(
+    payload: Mapping[str, Any],
+    *,
+    field: str,
+) -> tuple[
+    dict[str, tuple[tuple[str, ...], np.ndarray]],
+    dict[str, tuple[tuple[str, ...], np.ndarray]] | None,
+    dict[str, tuple[tuple[str, ...], np.ndarray]] | None,
+    tuple[tuple[str, ...], np.ndarray] | None,
+    str,
+]:
+    """Read raw-block or bounded reference uncertainty without fabricating blocks."""
 
     declared_hash = _verify_hash(payload, field=field)
     del declared_hash
@@ -251,39 +262,67 @@ def _reference_views(payload: Mapping[str, Any], *, field: str) -> tuple[dict[st
         _same_vector(views["bias"], views[name], field=f"{field}.{name}")
 
     raw_blocks = payload.get("reference_blocks", payload.get("block_vectors"))
-    if not isinstance(raw_blocks, Mapping):
-        raise S28G26Blocked(f"{field}:REFERENCE_BLOCKS_REQUIRED")
-    blocks: dict[str, tuple[tuple[str, ...], np.ndarray]] = {}
+    if isinstance(raw_blocks, Mapping):
+        blocks: dict[str, tuple[tuple[str, ...], np.ndarray]] = {}
+        for name in ("bias", "cross", "ranking"):
+            source = raw_blocks.get(name)
+            if not isinstance(source, list) or len(source) < 3:
+                raise S28G26Blocked(f"{field}.{name}:AT_LEAST_THREE_BLOCKS_REQUIRED")
+            normalized = [_vector(item, field=f"{field}.{name}[{index}]", coordinate_ids=views[name][0]) for index, item in enumerate(source)]
+            for item in normalized:
+                _same_vector(views[name], item, field=f"{field}.{name}.block")
+            # Keep formal block matrices on disk when the source vectors are
+            # memmaps.  ``np.stack`` here used to duplicate every reference
+            # block in RAM (catastrophic for 14M/31M coordinates).
+            arrays = [item[1] for item in normalized]
+            if arrays and all(isinstance(item, np.memmap) for item in arrays):
+                source = arrays[0]
+                target_path = Path(source.filename).with_name(Path(source.filename).name + f".{name}.blocks.f64.dat")
+                target_path.parent.mkdir(parents=True, exist_ok=True)
+                expected_size = len(arrays) * int(source.size) * 8
+                if target_path.exists() and target_path.stat().st_size != expected_size:
+                    raise S28G26Blocked(f"{field}.{name}:BLOCK_MEMMAP_COLLISION")
+                if not target_path.exists():
+                    with target_path.open("wb") as handle:
+                        handle.truncate(expected_size)
+                stacked = np.memmap(target_path, mode="r+", dtype=np.float64, shape=(len(arrays), source.size))
+                for index, array in enumerate(arrays):
+                    stacked[index] = array
+                stacked.flush()
+                stacked.flags.writeable = False
+            else:
+                stacked = np.stack(arrays, axis=0)
+            blocks[name] = (views[name][0], stacked)
+        return views, blocks, None, None, "reference_block_bootstrap"
+
+    raw_variances = payload.get("reference_variances")
+    metadata = payload.get("reference_uncertainty")
+    if not isinstance(raw_variances, Mapping) or not isinstance(metadata, Mapping):
+        raise S28G26Blocked(f"{field}:REFERENCE_BLOCKS_OR_BOUNDED_VARIANCE_REQUIRED")
+    if (
+        metadata.get("schema_version") != "stage2-reference-uncertainty-v1"
+        or metadata.get("estimator") != "block_u_delete_one_jackknife"
+        or not isinstance(metadata.get("block_count_a"), int)
+        or not isinstance(metadata.get("block_count_b"), int)
+        or int(metadata["block_count_a"]) < 3
+        or int(metadata["block_count_b"]) < 3
+    ):
+        raise S28G26Blocked(f"{field}:BOUNDED_UNCERTAINTY_METADATA_INVALID")
+    variances: dict[str, tuple[tuple[str, ...], np.ndarray]] = {}
     for name in ("bias", "cross", "ranking"):
-        source = raw_blocks.get(name)
-        if not isinstance(source, list) or len(source) < 3:
-            raise S28G26Blocked(f"{field}.{name}:AT_LEAST_THREE_BLOCKS_REQUIRED")
-        normalized = [_vector(item, field=f"{field}.{name}[{index}]", coordinate_ids=views[name][0]) for index, item in enumerate(source)]
-        for item in normalized:
-            _same_vector(views[name], item, field=f"{field}.{name}.block")
-        # Keep formal block matrices on disk when the source vectors are
-        # memmaps.  ``np.stack`` here used to duplicate every reference block
-        # in RAM (catastrophic for 14M/31M coordinates).
-        arrays = [item[1] for item in normalized]
-        if arrays and all(isinstance(item, np.memmap) for item in arrays):
-            source = arrays[0]
-            target_path = Path(source.filename).with_name(Path(source.filename).name + f".{name}.blocks.f64.dat")
-            target_path.parent.mkdir(parents=True, exist_ok=True)
-            expected_size = len(arrays) * int(source.size) * 8
-            if target_path.exists() and target_path.stat().st_size != expected_size:
-                raise S28G26Blocked(f"{field}.{name}:BLOCK_MEMMAP_COLLISION")
-            if not target_path.exists():
-                with target_path.open("wb") as handle:
-                    handle.truncate(expected_size)
-            stacked = np.memmap(target_path, mode="r+", dtype=np.float64, shape=(len(arrays), source.size))
-            for index, array in enumerate(arrays):
-                stacked[index] = array
-            stacked.flush()
-            stacked.flags.writeable = False
-        else:
-            stacked = np.stack(arrays, axis=0)
-        blocks[name] = (views[name][0], stacked)
-    return views, blocks
+        item = _vector(raw_variances.get(name), field=f"{field}.{name}_variance", coordinate_ids=views[name][0])
+        _same_vector(views[name], item, field=f"{field}.{name}_variance")
+        if np.any(item[1] < 0):
+            raise S28G26Blocked(f"{field}.{name}:REFERENCE_VARIANCE_NEGATIVE")
+        variances[name] = item
+    raw_sequence = payload.get("sequence_variance")
+    if raw_sequence is None:
+        raise S28G26Blocked(f"{field}:BOUNDED_SEQUENCE_VARIANCE_REQUIRED")
+    sequence = _vector(raw_sequence, field=f"{field}.sequence_variance", coordinate_ids=views["bias"][0])
+    _same_vector(views["bias"], sequence, field=f"{field}.sequence_variance")
+    if np.any(sequence[1] < 0):
+        raise S28G26Blocked(f"{field}:SEQUENCE_VARIANCE_NEGATIVE")
+    return views, None, variances, sequence, "independent_reference_variance_combination"
 
 
 def _read_raw_payload(root: Path, descriptor: Mapping[str, Any]) -> Mapping[str, Any]:
@@ -443,6 +482,59 @@ def _bootstrap(
         "mean": float(draws.mean()),
         "std": float(draws.std(ddof=1)),
         "parameter_coordinate_resampling": False,
+        "reference_uncertainty_mode": "reference_block_bootstrap",
+    }
+
+
+def _independent_variance_bootstrap(
+    outer: Sequence[np.ndarray],
+    reference: np.ndarray,
+    statistic: Callable[[np.ndarray, np.ndarray], float],
+    *,
+    reference_standard_error: float,
+    replicates: int,
+    seed: int,
+) -> dict[str, Any]:
+    """Combine repetition bootstrap variance with an independent reference SE.
+
+    The bounded S2.4 producer publishes the delete-one-block jackknife
+    variance, but deliberately does not retain raw block vectors.  The S2.1
+    plan permits an equivalent independent variance combination.  We therefore
+    bootstrap only the independent estimator repetitions and add one scalar
+    reference-error draw at the endpoint level.  Coordinates are never
+    resampled and no pseudo reference blocks are reconstructed.
+    """
+
+    if len(outer) < 2 or replicates < 100:
+        raise S28G26Blocked("BOOTSTRAP_REQUIRES_REPETITIONS_AND_100_REPLICATES")
+    if not math.isfinite(reference_standard_error) or reference_standard_error < 0:
+        raise S28G26Blocked("REFERENCE_STANDARD_ERROR_INVALID")
+    rng = random.Random(int(seed))
+    outer_values = tuple(outer)
+    draws = np.empty(replicates, dtype=np.float64)
+    for index in range(replicates):
+        outer_mean = np.zeros_like(outer_values[0], dtype=np.float64)
+        for _ in range(len(outer_values)):
+            outer_mean += outer_values[rng.randrange(len(outer_values))]
+        outer_mean /= float(len(outer_values))
+        reference_error = rng.gauss(0.0, reference_standard_error) if reference_standard_error else 0.0
+        draws[index] = statistic(outer_mean, reference) + reference_error
+    if not np.isfinite(draws).all():
+        raise S28G26Blocked("BOOTSTRAP_NONFINITE")
+    return {
+        "unit": S28_BOOTSTRAP_UNIT,
+        "replicates": int(replicates),
+        "seed": int(seed),
+        "quantile_0.025": float(np.quantile(draws, 0.025)),
+        "quantile_0.05": float(np.quantile(draws, 0.05)),
+        "quantile_0.95": float(np.quantile(draws, 0.95)),
+        "quantile_0.975": float(np.quantile(draws, 0.975)),
+        "mean": float(draws.mean()),
+        "std": float(draws.std(ddof=1)),
+        "parameter_coordinate_resampling": False,
+        "reference_uncertainty_mode": "independent_reference_variance_combination",
+        "reference_standard_error": float(reference_standard_error),
+        "raw_reference_blocks_reconstructed": False,
     }
 
 
@@ -480,12 +572,63 @@ class _CellData:
     microbatch_count: int
     repetitions: Mapping[str, tuple[dict[str, tuple[tuple[str, ...], np.ndarray]], Mapping[str, Any]]]
     references: Mapping[str, tuple[tuple[str, ...], np.ndarray]]
-    reference_blocks: Mapping[str, np.ndarray]
+    reference_blocks: Mapping[str, np.ndarray] | None
+    reference_variances: Mapping[str, np.ndarray] | None
+    sequence_variance: np.ndarray | None
+    reference_uncertainty_mode: str
     denominator: float
     margins: Mapping[str, float]
     reference_half_width: float
+    reference_half_widths: Mapping[str, float]
     numeric_error: float
     group_registry: Mapping[str, tuple[str, ...]]
+
+
+def _reference_variance_vector(cell: _CellData, view: str) -> np.ndarray:
+    if cell.reference_variances is None or view not in cell.reference_variances:
+        raise S28G26Blocked(f"reference.{cell.cell_id}.{view}:BOUNDED_VARIANCE_REQUIRED")
+    return cell.reference_variances[view]
+
+
+def _reference_scalar_standard_error(cell: _CellData, view: str) -> float:
+    # This is the diagonal jackknife variance combination explicitly allowed
+    # by S2.8 when the bounded producer does not retain raw block vectors.
+    variance = _reference_variance_vector(cell, view)
+    return math.sqrt(max(0.0, float(np.sum(variance))))
+
+
+def _cell_bootstrap(
+    cell: _CellData,
+    outer: Sequence[np.ndarray],
+    view: str,
+    statistic: Callable[[np.ndarray, np.ndarray], float],
+    *,
+    replicates: int,
+    seed: int,
+    reference_standard_error: float | None = None,
+) -> dict[str, Any]:
+    if cell.reference_blocks is not None:
+        return _bootstrap(
+            outer,
+            cell.reference_blocks[view],
+            statistic,
+            replicates=replicates,
+            seed=seed,
+        )
+    if cell.reference_variances is None:
+        raise S28G26Blocked(f"reference.{cell.cell_id}:UNCERTAINTY_REQUIRED")
+    return _independent_variance_bootstrap(
+        outer,
+        cell.references[view][1],
+        statistic,
+        reference_standard_error=(
+            _reference_scalar_standard_error(cell, view)
+            if reference_standard_error is None
+            else reference_standard_error
+        ),
+        replicates=replicates,
+        seed=seed,
+    )
 
 
 def _cell_parts(cell_id: str) -> tuple[str, str]:
@@ -516,7 +659,7 @@ def _extract_cell_data(
 ) -> _CellData:
     model, stage = _cell_parts(cell_id)
     cell_matrix = _resolve_matrix_cell(matrix, cell_id)
-    views, blocks = _reference_views(reference_payload, field=f"reference.{cell_id}")
+    views, blocks, variances, sequence_variance, uncertainty_mode = _reference_views(reference_payload, field=f"reference.{cell_id}")
     reference_hash = reference_payload.get("reference_hash", reference_payload.get("artifact_hash"))
     if reference_hash is None:
         raise S28G26Blocked(f"reference.{cell_id}:REFERENCE_HASH_REQUIRED")
@@ -542,7 +685,10 @@ def _extract_cell_data(
             raise S28G26Blocked(f"raw.{cell_id}:{unit_id}:REFERENCE_HASH_MISMATCH")
         if payload.get("clamp_applied") is True or payload.get("clip_mode") not in (None, "none") or payload.get("mean_gradient_consistent") is False:
             raise S28G26Blocked(f"raw.{cell_id}:{unit_id}:ESTIMATOR_INTEGRITY_MARKER_FAILED")
-        m2_error = payload.get("m2_identity_max_abs_error", payload.get("m2_identity_max_abs"))
+        m2_error = payload.get(
+            "m2_identity_max_abs_error",
+            payload.get("m2_identity_max_abs", payload.get("m2_double_max_abs_error")),
+        )
         if m2_error is not None and (isinstance(m2_error, bool) or not isinstance(m2_error, (int, float)) or not math.isfinite(float(m2_error)) or float(m2_error) > 1.0e-12):
             raise S28G26Blocked(f"raw.{cell_id}:{unit_id}:M2_DOUBLE_IDENTITY_FAILED")
         vectors = _extract_vectors(payload, field=f"raw.{cell_id}.{unit_id}")
@@ -595,10 +741,26 @@ def _extract_cell_data(
         if isinstance(raw_margin, bool) or not isinstance(raw_margin, (int, float)) or not math.isfinite(float(raw_margin)) or float(raw_margin) <= 0:
             raise S28G26Blocked(f"matrix.{cell_id}:{endpoint}:FROZEN_MARGIN_REQUIRED")
         margins[endpoint] = float(raw_margin)
-    half_width = cell_matrix.get("reference_half_width", reference_payload.get("bias_half_width_l2"))
+    raw_half_widths = cell_matrix.get("reference_half_widths", cell_matrix.get("reference_half_width_by_endpoint"))
+    half_widths: dict[str, float] = {}
+    if isinstance(raw_half_widths, Mapping):
+        aliases = {
+            "model_total_signed_bias": ("model_total_signed_bias", "model_total", "bias", "h_ref_model_total"),
+            "layer_total_l1_bias": ("layer_total_l1_bias", "layer", "nmse", "h_ref_layer"),
+            "module_total_l1_bias": ("module_total_l1_bias", "module", "rank", "h_ref_module"),
+        }
+        for endpoint, names in aliases.items():
+            value = next((raw_half_widths[name] for name in names if name in raw_half_widths), None)
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value)) or float(value) < 0:
+                raise S28G26Blocked(f"reference.{cell_id}:{endpoint}:REFERENCE_HALF_WIDTH_REQUIRED")
+            half_widths[endpoint] = float(value)
+        half_width = max(half_widths.values())
+    else:
+        half_width = cell_matrix.get("reference_half_width", reference_payload.get("bias_half_width_l2"))
+        if isinstance(half_width, bool) or not isinstance(half_width, (int, float)) or not math.isfinite(float(half_width)) or float(half_width) < 0:
+            raise S28G26Blocked(f"reference.{cell_id}:REFERENCE_HALF_WIDTH_REQUIRED")
+        half_widths = {endpoint: float(half_width) for endpoint in margins}
     numeric_error = cell_matrix.get("numeric_error", reference_payload.get("numeric_error", 0.0))
-    if isinstance(half_width, bool) or not isinstance(half_width, (int, float)) or not math.isfinite(float(half_width)) or float(half_width) < 0:
-        raise S28G26Blocked(f"reference.{cell_id}:REFERENCE_HALF_WIDTH_REQUIRED")
     if isinstance(numeric_error, bool) or not isinstance(numeric_error, (int, float)) or not math.isfinite(float(numeric_error)) or float(numeric_error) < 0:
         raise S28G26Blocked(f"reference.{cell_id}:NUMERIC_ERROR_INVALID")
     groups_source = cell_matrix.get("group_registry", matrix.get("group_registry"))
@@ -616,7 +778,25 @@ def _extract_cell_data(
         groups[name] = tuple(coordinates)
     if not groups or seen != set(ids):
         raise S28G26Blocked(f"matrix.{cell_id}:GROUP_REGISTRY_NOT_EXHAUSTIVE")
-    return _CellData(cell_id, model, stage, b_value, m_value, rows, views, {name: value[1] for name, value in blocks.items()}, float(denominator), margins, float(half_width), float(numeric_error), groups)
+    return _CellData(
+        cell_id,
+        model,
+        stage,
+        b_value,
+        m_value,
+        rows,
+        views,
+        None if blocks is None else {name: value[1] for name, value in blocks.items()},
+        None if variances is None else {name: value[1] for name, value in variances.items()},
+        None if sequence_variance is None else sequence_variance[1],
+        uncertainty_mode,
+        float(denominator),
+        margins,
+        float(half_width),
+        half_widths,
+        float(numeric_error),
+        groups,
+    )
 
 
 def _group_values(vector: np.ndarray, ids: Sequence[str], groups: Mapping[str, Sequence[str]]) -> dict[str, float]:
@@ -667,8 +847,13 @@ def _method_statistics(cell: _CellData, method: str, *, bootstrap_replicates: in
     v_r = _variance_scalar(vectors, mean, ddof=0)
     s2 = _variance_scalar(vectors, mean, ddof=1)
     observed_nmse = float(np.mean(np.square(error)) / cell.denominator)
-    ref_blocks = cell.reference_blocks["bias"]
-    v_ref = _variance_scalar(tuple(ref_blocks), _mean_vectors(tuple(ref_blocks)), ddof=1) / cell.denominator
+    if cell.reference_blocks is not None:
+        ref_blocks = cell.reference_blocks["bias"]
+        v_ref = _variance_scalar(tuple(ref_blocks), _mean_vectors(tuple(ref_blocks)), ddof=1) / cell.denominator
+    else:
+        # S2.1 defines V_ref as trace(Sigma_ref) / D_c.  The bounded producer
+        # publishes that diagonal exactly through its jackknife variance.
+        v_ref = float(np.sum(_reference_variance_vector(cell, "bias"))) / cell.denominator
     negative_fraction, negative_mass, positive_mass = _negative_stats(vectors)
     corrected = observed_nmse - v_ref
     long_rows: list[dict[str, Any]] = []
@@ -676,7 +861,14 @@ def _method_statistics(cell: _CellData, method: str, *, bootstrap_replicates: in
         target = cell.references[view_name][1]
         view_error = mean - target
         view_seed = {"bias": 11, "cross": 23, "ranking": 37}[view_name]
-        bootstrap = _bootstrap(vectors, cell.reference_blocks[view_name], lambda m, r: float(np.sum(m - r)), replicates=bootstrap_replicates, seed=seed + view_seed)
+        bootstrap = _cell_bootstrap(
+            cell,
+            vectors,
+            view_name,
+            lambda m, r: float(np.sum(m - r)),
+            replicates=bootstrap_replicates,
+            seed=seed + view_seed,
+        )
         metric: dict[str, Any] = {
             "cell_id": cell.cell_id,
             "model": cell.model,
@@ -764,25 +956,52 @@ def _family_endpoint(cell: _CellData, method: str, endpoint: str, *, bootstrap_r
         lower, upper = 0.0, 0.95
     else:  # pragma: no cover - endpoint list is closed above
         raise S28G26Blocked(f"endpoint:{endpoint}:UNSUPPORTED")
-    bootstrap = _bootstrap(vectors, cell.reference_blocks["bias"], statistic, replicates=bootstrap_replicates, seed=seed)
+    bootstrap = _cell_bootstrap(
+        cell,
+        vectors,
+        "bias",
+        statistic,
+        replicates=bootstrap_replicates,
+        seed=seed,
+        # In bounded mode the authoritative G2.4a endpoint half-width is
+        # combined below as a conservative bound.  Passing zero here keeps
+        # the outer repetition bootstrap distinct and auditable.
+        reference_standard_error=0.0 if cell.reference_blocks is None else None,
+    )
+    reference_bound = cell.reference_half_widths[endpoint] if cell.reference_blocks is None else 0.0
+    if reference_bound:
+        bootstrap["reference_uncertainty_mode"] = "independent_reference_endpoint_bound_combination"
+        bootstrap["reference_error_bound"] = reference_bound
+        bootstrap["raw_reference_blocks_reconstructed"] = False
     if interval_name == "joint_90":
-        lo, hi = float(bootstrap["quantile_0.05"]), float(bootstrap["quantile_0.95"])
+        lo, hi = float(bootstrap["quantile_0.05"]) - reference_bound, float(bootstrap["quantile_0.95"]) + reference_bound
         passed = lo >= -cell.margins[endpoint] and hi <= cell.margins[endpoint]
     else:
-        lo, hi = 0.0, float(bootstrap["quantile_0.95"])
+        lo, hi = 0.0, float(bootstrap["quantile_0.95"]) + reference_bound
         passed = hi < cell.margins[endpoint]
-    precision_ok = cell.reference_half_width <= cell.margins[endpoint] / 4.0 and cell.numeric_error <= cell.margins[endpoint] / 10.0
+    endpoint_half_width = cell.reference_half_widths[endpoint]
+    precision_ok = endpoint_half_width <= cell.margins[endpoint] / 4.0 and cell.numeric_error <= cell.margins[endpoint] / 10.0
     state = "PASS" if passed and precision_ok else "INCONCLUSIVE" if passed or not precision_ok else "FAIL"
-    cross_mean = _mean_vectors(vectors)
-    cross_blocks = cell.reference_blocks["cross"]
-    cross_bootstrap = _bootstrap(vectors, cross_blocks, statistic, replicates=bootstrap_replicates, seed=seed + 77)
+    cross_bootstrap = _cell_bootstrap(
+        cell,
+        vectors,
+        "cross",
+        statistic,
+        replicates=bootstrap_replicates,
+        seed=seed + 77,
+        reference_standard_error=0.0 if cell.reference_blocks is None else None,
+    )
+    if reference_bound:
+        cross_bootstrap["reference_uncertainty_mode"] = "independent_reference_endpoint_bound_combination"
+        cross_bootstrap["reference_error_bound"] = reference_bound
+        cross_bootstrap["raw_reference_blocks_reconstructed"] = False
     if interval_name == "joint_90":
-        cross_pass = float(cross_bootstrap["quantile_0.05"]) >= -cell.margins[endpoint] and float(cross_bootstrap["quantile_0.95"]) <= cell.margins[endpoint]
+        cross_pass = float(cross_bootstrap["quantile_0.05"]) - reference_bound >= -cell.margins[endpoint] and float(cross_bootstrap["quantile_0.95"]) + reference_bound <= cell.margins[endpoint]
     else:
-        cross_pass = float(cross_bootstrap["quantile_0.95"]) < cell.margins[endpoint]
+        cross_pass = float(cross_bootstrap["quantile_0.95"]) + reference_bound < cell.margins[endpoint]
     if cross_pass != passed:
         state = "INCONCLUSIVE"
-    return {"cell_id": cell.cell_id, "method": method, "endpoint": endpoint, "effect": observed, "interval": {"lower": lo, "upper": hi, "confidence_level": S28_CONFIDENCE_LEVELS["equivalence"] if interval_name == "joint_90" else S28_CONFIDENCE_LEVELS["upper"]}, "margin": cell.margins[endpoint], "reference_half_width": cell.reference_half_width, "numeric_error": cell.numeric_error, "reference_precision_pass": precision_ok, "cross_reference_state": "PASS" if cross_pass else "FAIL", "bootstrap": bootstrap, "cross_bootstrap": cross_bootstrap, "multiplicity": "intersection_union_across_six_primary_cells", "state": state}
+    return {"cell_id": cell.cell_id, "method": method, "endpoint": endpoint, "effect": observed, "interval": {"lower": lo, "upper": hi, "confidence_level": S28_CONFIDENCE_LEVELS["equivalence"] if interval_name == "joint_90" else S28_CONFIDENCE_LEVELS["upper"]}, "margin": cell.margins[endpoint], "reference_half_width": endpoint_half_width, "numeric_error": cell.numeric_error, "reference_precision_pass": precision_ok, "cross_reference_state": "PASS" if cross_pass else "FAIL", "bootstrap": bootstrap, "cross_bootstrap": cross_bootstrap, "multiplicity": "intersection_union_across_six_primary_cells", "state": state}
 
 
 def _paired_bootstrap(
@@ -822,7 +1041,54 @@ def _paired_bootstrap(
         draws[index] = statistic(left_mean, right_mean, reference_mean)
     if not np.isfinite(draws).all():
         raise S28G26Blocked("PAIRED_BOOTSTRAP_NONFINITE")
-    return {"unit": S28_BOOTSTRAP_UNIT, "replicates": int(replicates), "seed": int(seed), "quantile_0.025": float(np.quantile(draws, 0.025)), "quantile_0.05": float(np.quantile(draws, 0.05)), "quantile_0.95": float(np.quantile(draws, 0.95)), "quantile_0.975": float(np.quantile(draws, 0.975)), "mean": float(draws.mean()), "std": float(draws.std(ddof=1)), "parameter_coordinate_resampling": False}
+    return {"unit": S28_BOOTSTRAP_UNIT, "replicates": int(replicates), "seed": int(seed), "quantile_0.025": float(np.quantile(draws, 0.025)), "quantile_0.05": float(np.quantile(draws, 0.05)), "quantile_0.95": float(np.quantile(draws, 0.95)), "quantile_0.975": float(np.quantile(draws, 0.975)), "mean": float(draws.mean()), "std": float(draws.std(ddof=1)), "parameter_coordinate_resampling": False, "reference_uncertainty_mode": "reference_block_bootstrap"}
+
+
+def _paired_independent_variance_bootstrap(
+    left: Sequence[np.ndarray],
+    right: Sequence[np.ndarray],
+    reference: np.ndarray,
+    statistic: Callable[[np.ndarray, np.ndarray, np.ndarray], float],
+    *,
+    reference_standard_error: float,
+    replicates: int,
+    seed: int,
+) -> dict[str, Any]:
+    if len(left) != len(right) or len(left) < 2 or replicates < 100:
+        raise S28G26Blocked("PAIRED_BOOTSTRAP_SHAPES_INVALID")
+    if not math.isfinite(reference_standard_error) or reference_standard_error < 0:
+        raise S28G26Blocked("REFERENCE_STANDARD_ERROR_INVALID")
+    rng = random.Random(int(seed))
+    left_values, right_values = tuple(left), tuple(right)
+    draws = np.empty(replicates, dtype=np.float64)
+    for index in range(replicates):
+        left_mean = np.zeros_like(left_values[0], dtype=np.float64)
+        right_mean = np.zeros_like(right_values[0], dtype=np.float64)
+        for _ in range(len(left_values)):
+            item = rng.randrange(len(left_values))
+            left_mean += left_values[item]
+            right_mean += right_values[item]
+        left_mean /= float(len(left_values))
+        right_mean /= float(len(right_values))
+        reference_error = rng.gauss(0.0, reference_standard_error) if reference_standard_error else 0.0
+        draws[index] = statistic(left_mean, right_mean, reference) + reference_error
+    if not np.isfinite(draws).all():
+        raise S28G26Blocked("PAIRED_BOOTSTRAP_NONFINITE")
+    return {
+        "unit": S28_BOOTSTRAP_UNIT,
+        "replicates": int(replicates),
+        "seed": int(seed),
+        "quantile_0.025": float(np.quantile(draws, 0.025)),
+        "quantile_0.05": float(np.quantile(draws, 0.05)),
+        "quantile_0.95": float(np.quantile(draws, 0.95)),
+        "quantile_0.975": float(np.quantile(draws, 0.975)),
+        "mean": float(draws.mean()),
+        "std": float(draws.std(ddof=1)),
+        "parameter_coordinate_resampling": False,
+        "reference_uncertainty_mode": "independent_reference_variance_combination",
+        "reference_standard_error": float(reference_standard_error),
+        "raw_reference_blocks_reconstructed": False,
+    }
 
 
 def _noninferiority_rows(cell: _CellData, *, bootstrap_replicates: int, seed: int) -> list[dict[str, Any]]:
@@ -832,9 +1098,12 @@ def _noninferiority_rows(cell: _CellData, *, bootstrap_replicates: int, seed: in
     left = [item[0][u_method][1] for item in cell.repetitions.values()]
     right = [item[0]["double"][1] for item in cell.repetitions.values()]
     target = cell.references["bias"][1]
-    ref_blocks = cell.reference_blocks["bias"]
+    ref_blocks = None if cell.reference_blocks is None else cell.reference_blocks["bias"]
     denominator = cell.denominator
-    ref_var = float(np.mean(np.var(ref_blocks, axis=0, ddof=1)) / denominator)
+    if ref_blocks is not None:
+        ref_var = float(np.mean(np.var(ref_blocks, axis=0, ddof=1)) / denominator)
+    else:
+        ref_var = float(np.sum(_reference_variance_vector(cell, "bias")) / denominator)
     left_mean, right_mean = _mean_vectors(left), _mean_vectors(right)
     u_nmse = float(np.mean(np.square(left_mean - target)) / denominator - ref_var)
     d_nmse = float(np.mean(np.square(right_mean - target)) / denominator - ref_var)
@@ -843,16 +1112,59 @@ def _noninferiority_rows(cell: _CellData, *, bootstrap_replicates: int, seed: in
         nmse_state = "INCONCLUSIVE"
         nmse_bootstrap: dict[str, Any] = {"reason": "DOUBLE_CORRECTED_NMSE_NOT_ABOVE_POSITIVE_FLOOR"}
     else:
-        nmse_bootstrap = _paired_bootstrap(left, right, ref_blocks, lambda u, d, r: float((np.mean(np.square(u - r)) / denominator - ref_var) / (np.mean(np.square(d - r)) / denominator - ref_var)), replicates=bootstrap_replicates, seed=seed)
+        statistic = lambda u, d, r: float((np.mean(np.square(u - r)) / denominator - ref_var) / (np.mean(np.square(d - r)) / denominator - ref_var))
+        if ref_blocks is not None:
+            nmse_bootstrap = _paired_bootstrap(
+                left,
+                right,
+                ref_blocks,
+                statistic,
+                replicates=bootstrap_replicates,
+                seed=seed,
+            )
+        else:
+            variance = _reference_variance_vector(cell, "bias")
+            numerator = np.mean(np.square(left_mean - target)) / denominator - ref_var
+            baseline = np.mean(np.square(right_mean - target)) / denominator - ref_var
+            scale = float(target.size) * denominator
+            derivative_left = 2.0 * (target - left_mean) / scale
+            derivative_right = 2.0 * (target - right_mean) / scale
+            derivative = (derivative_left * baseline - numerator * derivative_right) / (baseline * baseline)
+            reference_se = math.sqrt(max(0.0, float(np.sum(np.square(derivative) * variance))))
+            nmse_bootstrap = _paired_independent_variance_bootstrap(
+                left,
+                right,
+                target,
+                statistic,
+                reference_standard_error=reference_se,
+                replicates=bootstrap_replicates,
+                seed=seed,
+            )
         nmse_state = "PASS" if float(nmse_bootstrap["quantile_0.95"]) <= 1.10 else "FAIL"
     rows.append({"cell_id": cell.cell_id, "method": u_method, "endpoint": "corrected_parameter_nmse_noninferiority", "effect": u_nmse / d_nmse if d_nmse > 0 else None, "baseline": "double", "threshold": {"upper": 1.10, "positive_floor": float(ABSOLUTE_FLOORS["tau_nmse"])}, "interval": nmse_bootstrap, "multiplicity": "intersection_union_across_six_primary_cells", "state": nmse_state})
     rank_target = cell.references["ranking"][1]
-    rank_bootstrap = _paired_bootstrap(left, right, cell.reference_blocks["ranking"], lambda u, d, r: _spearman(u, r) - _spearman(d, r), replicates=bootstrap_replicates, seed=seed + 17)
-    rank_state = "PASS" if float(rank_bootstrap["quantile_0.05"]) >= -0.02 else "FAIL"
+    rank_statistic = lambda u, d, r: _spearman(u, r) - _spearman(d, r)
+    if cell.reference_blocks is not None:
+        rank_bootstrap = _paired_bootstrap(left, right, cell.reference_blocks["ranking"], rank_statistic, replicates=bootstrap_replicates, seed=seed + 17)
+        rank_state = "PASS" if float(rank_bootstrap["quantile_0.05"]) >= -0.02 else "FAIL"
+    elif not np.any(_reference_variance_vector(cell, "ranking")):
+        rank_bootstrap = _paired_independent_variance_bootstrap(left, right, rank_target, rank_statistic, reference_standard_error=0.0, replicates=bootstrap_replicates, seed=seed + 17)
+        rank_state = "PASS" if float(rank_bootstrap["quantile_0.05"]) >= -0.02 else "FAIL"
+    else:
+        rank_bootstrap = {"reason": "BOUNDED_RANKING_VARIANCE_HAS_NO_RAW_BLOCK_ORDER", "reference_uncertainty_mode": cell.reference_uncertainty_mode, "raw_reference_blocks_reconstructed": False}
+        rank_state = "INCONCLUSIVE"
     rows.append({"cell_id": cell.cell_id, "method": u_method, "endpoint": "parameter_spearman_noninferiority", "effect": _spearman(left_mean, rank_target) - _spearman(right_mean, rank_target), "baseline": "double", "threshold": {"lower": -0.02}, "interval": rank_bootstrap, "multiplicity": "intersection_union_across_six_primary_cells", "state": rank_state})
     overlap_key = "overlap_at_0.01"
-    overlap_bootstrap = _paired_bootstrap(left, right, cell.reference_blocks["ranking"], lambda u, d, r: float(_top_metrics(u, r)[overlap_key] - _top_metrics(d, r)[overlap_key]), replicates=bootstrap_replicates, seed=seed + 31)
-    overlap_state = "PASS" if float(overlap_bootstrap["quantile_0.05"]) >= -0.03 else "FAIL"
+    overlap_statistic = lambda u, d, r: float(_top_metrics(u, r)[overlap_key] - _top_metrics(d, r)[overlap_key])
+    if cell.reference_blocks is not None:
+        overlap_bootstrap = _paired_bootstrap(left, right, cell.reference_blocks["ranking"], overlap_statistic, replicates=bootstrap_replicates, seed=seed + 31)
+        overlap_state = "PASS" if float(overlap_bootstrap["quantile_0.05"]) >= -0.03 else "FAIL"
+    elif not np.any(_reference_variance_vector(cell, "ranking")):
+        overlap_bootstrap = _paired_independent_variance_bootstrap(left, right, rank_target, overlap_statistic, reference_standard_error=0.0, replicates=bootstrap_replicates, seed=seed + 31)
+        overlap_state = "PASS" if float(overlap_bootstrap["quantile_0.05"]) >= -0.03 else "FAIL"
+    else:
+        overlap_bootstrap = {"reason": "BOUNDED_RANKING_VARIANCE_HAS_NO_RAW_BLOCK_ORDER", "reference_uncertainty_mode": cell.reference_uncertainty_mode, "raw_reference_blocks_reconstructed": False}
+        overlap_state = "INCONCLUSIVE"
     rows.append({"cell_id": cell.cell_id, "method": u_method, "endpoint": "parameter_overlap_at_1_percent_noninferiority", "effect": float(_top_metrics(left_mean, rank_target)[overlap_key] - _top_metrics(right_mean, rank_target)[overlap_key]), "baseline": "double", "threshold": {"lower": -0.03}, "interval": overlap_bootstrap, "multiplicity": "intersection_union_across_six_primary_cells", "state": overlap_state})
     return rows
 
@@ -865,21 +1177,26 @@ def _raw_calibration_row(cell: _CellData) -> dict[str, Any]:
     a variance estimated from the same repetitions.
     """
 
-    values: list[np.ndarray] = []
-    for vectors, payload in cell.repetitions.values():
-        source = payload.get("sequence_variance", payload.get("sigma2"))
-        if source is None:
-            return {"cell_id": cell.cell_id, "batch_size": cell.batch_size, "status": "INCONCLUSIVE", "reason": "SEQUENCE_VARIANCE_NOT_BOUND"}
-        ids, vector = _vector(source, field=f"raw_calibration.{cell.cell_id}", coordinate_ids=cell.references["bias"][0])
-        if ids != cell.references["bias"][0]:
-            raise S28G26Blocked(f"raw_calibration.{cell.cell_id}:COORDINATE_REGISTRY_MISMATCH")
-        values.append(vector)
-    theory = _mean_vectors(values) / cell.batch_size
+    if cell.sequence_variance is not None:
+        theory = cell.sequence_variance / cell.batch_size
+        sequence_source = "s204_hash_bound_sequence_variance"
+    else:
+        values: list[np.ndarray] = []
+        for vectors, payload in cell.repetitions.values():
+            source = payload.get("sequence_variance", payload.get("sigma2"))
+            if source is None:
+                return {"cell_id": cell.cell_id, "batch_size": cell.batch_size, "status": "INCONCLUSIVE", "reason": "SEQUENCE_VARIANCE_NOT_BOUND"}
+            ids, vector = _vector(source, field=f"raw_calibration.{cell.cell_id}", coordinate_ids=cell.references["bias"][0])
+            if ids != cell.references["bias"][0]:
+                raise S28G26Blocked(f"raw_calibration.{cell.cell_id}:COORDINATE_REGISTRY_MISMATCH")
+            values.append(vector)
+        theory = _mean_vectors(values) / cell.batch_size
+        sequence_source = "s27_repetition_payload"
     raw_vectors = [item[0]["raw"][1] for item in cell.repetitions.values()]
     observed = _mean_vectors(raw_vectors) - cell.references["bias"][1]
     slope = float(np.dot(theory, observed) / np.dot(theory, theory)) if float(np.dot(theory, theory)) > 0 else 0.0
     intercept = float(np.mean(observed - slope * theory))
-    return {"cell_id": cell.cell_id, "batch_size": cell.batch_size, "observed_signed_bias_sum": float(np.sum(observed)), "theoretical_sigma2_over_B_sum": float(np.sum(theory)), "slope": slope, "intercept": intercept, "slope_threshold": [0.8, 1.2], "status": "PASS" if 0.8 <= slope <= 1.2 else "NOT_SUPPORTED"}
+    return {"cell_id": cell.cell_id, "batch_size": cell.batch_size, "observed_signed_bias_sum": float(np.sum(observed)), "theoretical_sigma2_over_B_sum": float(np.sum(theory)), "slope": slope, "intercept": intercept, "slope_threshold": [0.8, 1.2], "sequence_variance_source": sequence_source, "status": "PASS" if 0.8 <= slope <= 1.2 else "NOT_SUPPORTED"}
 
 
 def _quality_record(name: str, status: str, *, observed: Any = None, threshold: Any = None, reasons: Sequence[str] = (), evidence: Sequence[str] = ()) -> dict[str, Any]:
@@ -1049,12 +1366,13 @@ def analyze_s208_g26(
         "raw_manifest_hash": manifest_hash,
         "matrix_hash": matrix_hash,
         "repetitions_per_cell": {cell.cell_id: len(cell.repetitions) for cell in cell_data},
+        "reference_uncertainty_modes": {cell.cell_id: cell.reference_uncertainty_mode for cell in cell_data},
     }
     precision_ok = all(bool(item.get("reference_precision_pass")) for item in family_rows)
     quality_records = [
         _quality_record("fixed_state", "PASS", observed={"clamp_applied": False, "clip_mode": "none"}, threshold={"required": True}),
         _quality_record("sample_independence", "PASS", observed={"draw_id_reuse_checked": True}, threshold={"cross_stream_reuse": False}),
-        _quality_record("reference_convergence", "PASS" if precision_ok else "BLOCKED", observed={"reference_half_widths": {cell.cell_id: cell.reference_half_width for cell in cell_data}}, threshold={"precision_margin_divisors": {"reference": 4.0, "numeric": 10.0}}, reasons=() if precision_ok else ("REFERENCE_OR_NUMERIC_PRECISION_INSUFFICIENT",)),
+        _quality_record("reference_convergence", "PASS" if precision_ok else "BLOCKED", observed={"reference_half_widths": {cell.cell_id: dict(cell.reference_half_widths) for cell in cell_data}}, threshold={"precision_margin_divisors": {"reference": 4.0, "numeric": 10.0}}, reasons=() if precision_ok else ("REFERENCE_OR_NUMERIC_PRECISION_INSUFFICIENT",)),
         _quality_record("result_completeness", "PASS", observed={"expected": expected_count, "completed": completed_count, "failed": failed_count}, threshold={"failed": 0}),
         _quality_record("finite_numeric_values", "PASS", observed={"statistics_rows": len(long_rows)}, threshold={"nonfinite": 0}),
         _quality_record("fair_total_draw_budget", "PASS", observed={"batch_sizes": sorted({cell.batch_size for cell in cell_data})}, threshold={"equal_budget": True}),
@@ -1071,7 +1389,7 @@ def analyze_s208_g26(
         noninf_global[endpoint] = {"all_cells": bool(endpoint_rows) and all(item["state"] == "PASS" for item in endpoint_rows), "states_by_cell": {str(item["cell_id"]): str(item["state"]) for item in endpoint_rows}}
     family_payload: dict[str, Any] = {"schema_version": S28_FAMILY_SCHEMA, "primary_cells": list(S28_CELL_IDS), "b_primary": matrix_payload.get("b_primary"), "m_primary": matrix_payload.get("m_primary"), "multiplicity": "intersection_union_across_six_primary_cells", "methods": family_methods, "rows": family_rows, "noninferiority_rows": noninferiority_rows, "global": family_qualified, "noninferiority_global": noninf_global, "artifact_hash": ""}
     family_payload["artifact_hash"] = canonical_json_hash({key: value for key, value in family_payload.items() if key != "artifact_hash"})
-    audit: dict[str, Any] = {"schema_version": S28_INPUT_AUDIT_SCHEMA, "raw_manifest_hash": manifest_hash, "matrix_hash": matrix_hash, "gate_hashes": {key: value.artifact_hash for key, value in gates.items()}, "primary_cells": list(S28_CELL_IDS), "unit_count": len(units), "units_per_cell": {cell.cell_id: len(cell.repetitions) for cell in cell_data}, "bootstrap_unit": S28_BOOTSTRAP_UNIT, "parameter_coordinate_pseudoreplication": False, "status": "PASS", "artifact_hash": ""}
+    audit: dict[str, Any] = {"schema_version": S28_INPUT_AUDIT_SCHEMA, "raw_manifest_hash": manifest_hash, "matrix_hash": matrix_hash, "gate_hashes": {key: value.artifact_hash for key, value in gates.items()}, "primary_cells": list(S28_CELL_IDS), "unit_count": len(units), "units_per_cell": {cell.cell_id: len(cell.repetitions) for cell in cell_data}, "bootstrap_unit": S28_BOOTSTRAP_UNIT, "reference_uncertainty_modes": {cell.cell_id: cell.reference_uncertainty_mode for cell in cell_data}, "raw_reference_blocks_reconstructed": False, "parameter_coordinate_pseudoreplication": False, "status": "PASS", "artifact_hash": ""}
     audit["artifact_hash"] = canonical_json_hash({key: value for key, value in audit.items() if key != "artifact_hash"})
     lineage: dict[str, Any] = {"schema_version": S28_LINEAGE_SCHEMA, "producer_task": "stage2.08_statistics_and_robustness", "consumer_commit_required": "record_at_execution", "raw_manifest_hash": manifest_hash, "matrix_hash": matrix_hash, "gate_hashes": {key: value.artifact_hash for key, value in gates.items()}, "reference_hashes": {cell.cell_id: refs_by_cell[cell.cell_id].get("reference_hash", refs_by_cell[cell.cell_id].get("artifact_hash")) for cell in cell_data}, "derived_artifacts": ["analysis_input_audit.json", "statistics_long_table.json", "statistics_summary.json", "raw_calibration.json", "confirmatory_family_decisions.json", "quality_gates.json", "hypothesis_decisions.json", "lineage_manifest.json"], "artifact_hash": ""}
     lineage["artifact_hash"] = canonical_json_hash({key: value for key, value in lineage.items() if key != "artifact_hash"})

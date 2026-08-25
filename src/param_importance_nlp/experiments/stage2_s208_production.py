@@ -299,20 +299,101 @@ def _materialize_cell(root: Path, row: Mapping[str, Any], gate_hash: str, cache_
             raise S208ProductionBlocked(f"reference.{cell_id}:{short}:VIEW_HASH_MISMATCH")
         source_vectors[short] = vector
     raw_blocks = state.get("reference_blocks", state.get("block_vectors"))
-    if not isinstance(raw_blocks, Mapping):
-        raise S208ProductionBlocked(f"reference.{cell_id}:REFERENCE_BLOCKS_REQUIRED")
-    blocks: dict[str, list[np.memmap]] = {}
-    for short in ("bias", "cross", "ranking"):
-        source = raw_blocks.get(short)
-        if not isinstance(source, list) or len(source) < 3:
-            raise S208ProductionBlocked(f"reference.{cell_id}:{short}:THREE_BLOCKS_REQUIRED")
-        blocks[short] = []
-        for index, item in enumerate(source):
-            block_ids: list[str] = []
-            block = _flat_memmap(item, block_ids, cache_root, f"{re.sub(r'[^A-Za-z0-9_.-]', '_', cell_id)}-{short}-block-{index}")
-            if tuple(block_ids) != tuple(ids) or block.shape != source_vectors[short].shape:
-                raise S208ProductionBlocked(f"reference.{cell_id}:{short}:BLOCK_SHAPE_MISMATCH")
-            blocks[short].append(block)
+    blocks: dict[str, list[np.memmap]] | None = None
+    variances: dict[str, np.memmap] | None = None
+    uncertainty_metadata: Mapping[str, Any] | None = None
+    uncertainty_mode: str
+    if isinstance(raw_blocks, Mapping):
+        blocks = {}
+        for short in ("bias", "cross", "ranking"):
+            source = raw_blocks.get(short)
+            if not isinstance(source, list) or len(source) < 3:
+                raise S208ProductionBlocked(f"reference.{cell_id}:{short}:THREE_BLOCKS_REQUIRED")
+            blocks[short] = []
+            for index, item in enumerate(source):
+                block_ids: list[str] = []
+                block = _flat_memmap(item, block_ids, cache_root, f"{re.sub(r'[^A-Za-z0-9_.-]', '_', cell_id)}-{short}-block-{index}")
+                if tuple(block_ids) != tuple(ids) or block.shape != source_vectors[short].shape:
+                    raise S208ProductionBlocked(f"reference.{cell_id}:{short}:BLOCK_SHAPE_MISMATCH")
+                blocks[short].append(block)
+        uncertainty_mode = "reference_block_bootstrap"
+    else:
+        # bounded-online-fp64-v1 intentionally retains the exact delete-one
+        # jackknife variance vectors, not the raw block vectors.  S2.8 may use
+        # the preregistered equivalent independent-variance combination, but
+        # only after binding every opened vector to the S2.4 candidate.
+        raw_uncertainty = state.get("uncertainty")
+        candidate_metadata = candidate.get("metadata")
+        declared_uncertainty = candidate_metadata.get("uncertainty") if isinstance(candidate_metadata, Mapping) else None
+        if not isinstance(raw_uncertainty, Mapping) or not isinstance(declared_uncertainty, Mapping):
+            raise S208ProductionBlocked(f"reference.{cell_id}:REFERENCE_BLOCKS_OR_BOUNDED_VARIANCE_REQUIRED")
+        if (
+            declared_uncertainty.get("schema_version") != "stage2-reference-uncertainty-v1"
+            or declared_uncertainty.get("estimator") != "block_u_delete_one_jackknife"
+            or not isinstance(declared_uncertainty.get("block_count_a"), int)
+            or not isinstance(declared_uncertainty.get("block_count_b"), int)
+            or int(declared_uncertainty["block_count_a"]) < 3
+            or int(declared_uncertainty["block_count_b"]) < 3
+        ):
+            raise S208ProductionBlocked(f"reference.{cell_id}:BOUNDED_UNCERTAINTY_METADATA_INVALID")
+        declared_uncertainty_hash = _sha(
+            declared_uncertainty.get("artifact_hash"),
+            f"reference.{cell_id}.uncertainty.artifact_hash",
+        )
+        if canonical_json_hash({key: value for key, value in declared_uncertainty.items() if key != "artifact_hash"}) != declared_uncertainty_hash:
+            raise S208ProductionBlocked(f"reference.{cell_id}:BOUNDED_UNCERTAINTY_ARTIFACT_HASH_MISMATCH")
+        variances = {}
+        for short in ("bias", "cross", "ranking"):
+            long_name = f"{short}_variance"
+            source = raw_uncertainty.get(long_name)
+            variance_ids: list[str] = []
+            variance = _flat_memmap(
+                source,
+                variance_ids,
+                cache_root,
+                f"{re.sub(r'[^A-Za-z0-9_.-]', '_', cell_id)}-{short}-variance",
+            )
+            if tuple(variance_ids) != tuple(ids) or variance.shape != source_vectors[short].shape:
+                raise S208ProductionBlocked(f"reference.{cell_id}:{short}:VARIANCE_SHAPE_MISMATCH")
+            if np.any(variance < 0):
+                raise S208ProductionBlocked(f"reference.{cell_id}:{short}:VARIANCE_NEGATIVE")
+            declared_variance_hash = _sha(
+                declared_uncertainty.get(f"{short}_variance_hash"),
+                f"reference.{cell_id}.uncertainty.{short}_variance_hash",
+            )
+            source_digest = _vector_digest_stream(source) if isinstance(source, Mapping) else _flat_digest(variance)
+            if source_digest != declared_variance_hash:
+                raise S208ProductionBlocked(f"reference.{cell_id}:{short}:VARIANCE_HASH_MISMATCH")
+            variances[short] = variance
+        uncertainty_metadata = dict(declared_uncertainty)
+        uncertainty_mode = "independent_reference_variance_combination"
+
+    sequence_variance: np.memmap | None = None
+    raw_sequence_variance = state.get("sequence_variance")
+    candidate_metadata = candidate.get("metadata")
+    if raw_sequence_variance is not None:
+        if not isinstance(candidate_metadata, Mapping):
+            raise S208ProductionBlocked(f"reference.{cell_id}:SEQUENCE_VARIANCE_METADATA_REQUIRED")
+        sequence_ids: list[str] = []
+        sequence_variance = _flat_memmap(
+            raw_sequence_variance,
+            sequence_ids,
+            cache_root,
+            f"{re.sub(r'[^A-Za-z0-9_.-]', '_', cell_id)}-sequence-variance",
+        )
+        if tuple(sequence_ids) != tuple(ids) or sequence_variance.shape != source_vectors["bias"].shape:
+            raise S208ProductionBlocked(f"reference.{cell_id}:SEQUENCE_VARIANCE_SHAPE_MISMATCH")
+        if np.any(sequence_variance < 0):
+            raise S208ProductionBlocked(f"reference.{cell_id}:SEQUENCE_VARIANCE_NEGATIVE")
+        declared_sequence_hash = _sha(
+            candidate_metadata.get("sequence_variance_hash"),
+            f"reference.{cell_id}.sequence_variance_hash",
+        )
+        source_digest = _vector_digest_stream(raw_sequence_variance) if isinstance(raw_sequence_variance, Mapping) else _flat_digest(sequence_variance)
+        if source_digest != declared_sequence_hash:
+            raise S208ProductionBlocked(f"reference.{cell_id}:SEQUENCE_VARIANCE_HASH_MISMATCH")
+    elif variances is not None:
+        raise S208ProductionBlocked(f"reference.{cell_id}:BOUNDED_SEQUENCE_VARIANCE_REQUIRED")
     result: dict[str, Any] = {
         "schema_version": "reference-result-v1",
         "reference_hash": candidate_hash,
@@ -321,7 +402,7 @@ def _materialize_cell(root: Path, row: Mapping[str, Any], gate_hash: str, cache_
         "formal_eligible": True,
         "coordinate_ids": ids,
         "vectors": source_vectors,
-        "reference_blocks": blocks,
+        "reference_uncertainty_mode": uncertainty_mode,
         "metadata": {
             "qualification_gate_hash": gate_hash,
             "candidate_artifact_hash": candidate_hash,
@@ -330,6 +411,13 @@ def _materialize_cell(root: Path, row: Mapping[str, Any], gate_hash: str, cache_
         },
         "_streaming_payload": True,
     }
+    if blocks is not None:
+        result["reference_blocks"] = blocks
+    if variances is not None:
+        result["reference_variances"] = variances
+        result["reference_uncertainty"] = dict(uncertainty_metadata or {})
+    if sequence_variance is not None:
+        result["sequence_variance"] = sequence_variance
     # S2.8 margins/half-widths come from the frozen S2.6 matrix.  Preserve any
     # producer annotations without treating them as qualification evidence.
     for key in ("sizing_denominator", "bias_half_width_l2", "numeric_error"):
