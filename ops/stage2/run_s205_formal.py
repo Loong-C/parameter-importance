@@ -411,8 +411,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.wait:
             return _status(args, wait=True)
         if args.gate_only:
-            print(json.dumps(_gate_only(args), ensure_ascii=False, sort_keys=True, indent=2))
-            return 0
+            payload = _gate_only(args)
+            print(json.dumps(payload, ensure_ascii=False, sort_keys=True, indent=2))
+            return 0 if payload.get("status") == "PASS" else 3
         if args.preflight:
             print(json.dumps(_preflight(args), ensure_ascii=False, sort_keys=True, indent=2))
             return 0
