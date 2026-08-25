@@ -43,7 +43,9 @@ _FormalResolver.__module__ = "param_importance_nlp.providers.pythia_mmap"
 _FormalResolver.__name__ = "PythiaMMapFrozenSampleResolver"
 
 
-def _resolver(*, count: int = 5) -> InMemoryFrozenSampleResolver:
+def _resolver(
+    *, count: int = 5, formal_identity: bool = True
+) -> InMemoryFrozenSampleResolver:
     samples: dict[str, TrainingMicrobatch] = {}
     for index in range(count):
         sample_id = f"sample-{index}"
@@ -56,7 +58,9 @@ def _resolver(*, count: int = 5) -> InMemoryFrozenSampleResolver:
         samples[sample_id] = TrainingMicrobatch(
             f"batch-{index}",
             {
-                "input_ids": torch.tensor([[index + 1, 2, 3, 4]], dtype=torch.int64),
+                "input_ids": torch.tensor(
+                    [[index % 16 + 1, 2, 3, 4]], dtype=torch.int64
+                ),
                 "target_ids": target,
                 "attention_mask": mask,
             },
@@ -66,7 +70,7 @@ def _resolver(*, count: int = 5) -> InMemoryFrozenSampleResolver:
                 "global_record_index": index,
             },
         )
-    klass = _FormalResolver if count <= 32 else InMemoryFrozenSampleResolver
+    klass = _FormalResolver if formal_identity else InMemoryFrozenSampleResolver
     return klass(
         samples,
         resolver_id="formal-batched-test-v1",
@@ -159,7 +163,7 @@ def test_formal_batch_is_capped_at_public_block_size(monkeypatch: pytest.MonkeyP
     module = _TinyPythia()
     # A generic resolver with 33 rows cannot enter the formal path.  The
     # bounded generic chunk still limits each autograd call to eight rows.
-    resolver = _resolver(count=33)
+    resolver = _resolver(count=33, formal_identity=True)
     provider = _provider(module, resolver, batched=True, chunk_size=8)
     calls: list[object] = []
     original_grad = torch.autograd.grad
@@ -169,8 +173,8 @@ def test_formal_batch_is_capped_at_public_block_size(monkeypatch: pytest.MonkeyP
         return original_grad(*args, **kwargs)  # type: ignore[arg-type]
 
     monkeypatch.setattr(torch.autograd, "grad", counted_grad)
-    provider.gradient(_draws(5))
-    assert len(calls) == 1  # this fixture's five IDs are not formal-eligible
+    provider.gradient(_draws(33))
+    assert len(calls) == 5  # 33 draws exceed the 32-draw formal cap
     assert provider._FORMAL_BATCH_MAX_DRAWS == 32
 
 
