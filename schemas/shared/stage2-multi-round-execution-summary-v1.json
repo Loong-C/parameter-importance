@@ -1,0 +1,103 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://parameter-importance.invalid/schemas/shared/stage2-multi-round-execution-summary-v1.json",
+  "title": "Immutable S2.4 r21/r22 multi-round execution summary",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version", "study_id", "status", "retryable", "no_pooling", "read_only",
+    "prior_round_ids", "rounds", "evaluations", "final_reference_created", "one_shot_ab_created", "source_manifest", "artifact_hash"
+  ],
+  "properties": {
+    "schema_version": {"const": "stage2-multi-round-execution-summary-v1"},
+    "study_id": {"const": "stage2-s204"},
+    "status": {"enum": ["BLOCKED", "INCONCLUSIVE"]},
+    "retryable": {"const": false},
+    "no_pooling": {"const": true},
+    "read_only": {"const": true},
+    "prior_round_ids": {"const": ["r21", "r22"]},
+    "rounds": {
+      "type": "object", "additionalProperties": false,
+      "required": ["r21", "r22"],
+      "properties": {
+        "r21": {"$ref": "#/$defs/round"},
+        "r22": {"$ref": "#/$defs/round"}
+      }
+    },
+    "evaluations": {
+      "type": "object", "additionalProperties": false,
+      "required": ["r21:r21", "r22:r22-retry2", "r22:r22-retry3"],
+      "properties": {
+        "r21:r21": {"type": ["null", "object"]},
+        "r22:r22-retry2": {"type": ["null", "object"]},
+        "r22:r22-retry3": {"type": ["null", "object"]}
+      }
+    },
+    "final_reference_created": {"const": false},
+    "one_shot_ab_created": {"const": false},
+    "source_manifest": {"$ref": "#/$defs/source"},
+    "artifact_hash": {"$ref": "#/$defs/hash"}
+  },
+  "$defs": {
+    "hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "source": {
+      "type": "object", "additionalProperties": false,
+      "required": ["ref", "sha256"],
+      "properties": {"ref": {"type": "string", "minLength": 1}, "sha256": {"$ref": "#/$defs/hash"}}
+    },
+    "cell": {
+      "type": "object", "additionalProperties": false,
+      "required": [
+        "cell_id", "queue_status", "status", "attempt_id", "status_ref", "task_result_ref",
+        "task_result_hash", "retryable", "final_reference_created", "one_shot_ab_created"
+      ],
+      "properties": {
+        "cell_id": {"type": "string", "minLength": 1},
+        "queue_status": {"enum": ["COMPLETE", "FAILED"]},
+        "status": {"enum": ["COMPLETE", "BLOCKED", "FAIL", "SKIPPED", "MISSING"]},
+        "attempt_id": {"type": ["null", "string"]},
+        "status_ref": {"type": ["null", "object"]},
+        "task_result_ref": {"type": ["null", "object"]},
+        "task_result_hash": {"type": ["null", "string"]},
+        "retryable": {"type": "boolean"},
+        "final_reference_created": {"const": false},
+        "one_shot_ab_created": {"const": false}
+      }
+    },
+    "attempt": {
+      "type": "object", "additionalProperties": false,
+      "required": [
+        "attempt_id", "queue_final", "queue_manifest", "queue_status", "run_id", "execution_commit",
+        "output_root", "cells", "evaluation", "retryable", "final_reference_created", "one_shot_ab_created"
+      ],
+      "properties": {
+        "attempt_id": {"type": "string", "minLength": 1},
+        "queue_final": {"$ref": "#/$defs/source"},
+        "queue_manifest": {"$ref": "#/$defs/source"},
+        "queue_status": {"enum": ["COMPLETE", "FAILED"]},
+        "run_id": {"type": "string", "minLength": 1},
+        "execution_commit": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+        "output_root": {"type": "string", "minLength": 1},
+        "cells": {"type": "array", "minItems": 6, "maxItems": 6, "items": {"$ref": "#/$defs/cell"}},
+        "evaluation": {"type": ["null", "object"]},
+        "retryable": {"type": "boolean"},
+        "final_reference_created": {"const": false},
+        "one_shot_ab_created": {"const": false}
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {"attempt_id": {"const": "r22-retry2"}},
+            "required": ["attempt_id"]
+          },
+          "then": {"properties": {"queue_status": {"const": "FAILED"}}}
+        }
+      ]
+    },
+    "round": {
+      "type": "object", "additionalProperties": false,
+      "required": ["attempts"],
+      "properties": {"attempts": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/attempt"}}}
+    }
+  }
+}

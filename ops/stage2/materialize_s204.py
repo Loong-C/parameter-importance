@@ -3292,6 +3292,7 @@ def publish_per_cell_sizing_plans(
     draw_end_position_exclusive: int | None = None,
     require_terminal_convergence: bool = False,
     round_manifest_ref: str | None = None,
+    round_namespace: str | None = None,
     final_stream_start_position: int | None = None,
     final_stream_end_position_exclusive: int | None = None,
     output_dir: str = "evidence/stage2/s204/reference-sizing",
@@ -3299,10 +3300,17 @@ def publish_per_cell_sizing_plans(
     """Publish six independent sizing studies with stable cell identities."""
 
     root = Path(data_root).resolve()
+    if round_namespace is not None:
+        if not round_namespace or any(
+            char not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-"
+            for char in round_namespace
+        ):
+            raise _error("SIZING_PLAN_ROUND_NAMESPACE_INVALID")
     refs: dict[str, str] = {}
     for cell_id in EXPECTED_CELL_IDS:
         component = _cell_path_component(cell_id)
-        reference_id = f"stage2-s204-{component}-sizing"
+        namespace = f"{round_namespace}-" if round_namespace else ""
+        reference_id = f"stage2-s204-{namespace}{component}-sizing"
         output_ref = f"{output_dir}/{component}/reference-sizing-plan.json"
         _plan, ref = publish_reference_sizing_plan(
             root,

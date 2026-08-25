@@ -111,13 +111,38 @@ def _required_ref(source: Mapping[str, Any], key: str) -> str:
 
 
 def _load_r22_round_manifest(root: Path, raw_ref: object) -> tuple[str, Mapping[str, Any]]:
-    """Load the append-only r22 sizing contract before any draw is read."""
+    """Load an immutable r22 contract or its verified versioned amendment.
+
+    The original ``stage2-reference-sizing-round-v1`` object remains frozen.
+    A candidate-expansion amendment is a separate schema/path and must verify
+    its parent plus the bounded machine diagnostic before it can influence any
+    newly generated sizing plan.
+    """
 
     if not isinstance(raw_ref, str) or not raw_ref:
         raise _error("S204_R22_ROUND_REF_REQUIRED")
     ref = _source_ref(raw_ref, "s204_r22_round_manifest")
     value = load_canonical_json(_safe_relative(root, ref, "s204_r22_round_manifest"))
-    if not isinstance(value, Mapping) or value.get("schema_version") != "stage2-reference-sizing-round-v1":
+    if not isinstance(value, Mapping):
+        raise _error("S204_R22_ROUND_MANIFEST_SCHEMA_INVALID")
+    if value.get("schema_version") == "stage2-reference-sizing-amendment-v1":
+        try:
+            from ops.stage2.prepare_s204_r22_amendment import (  # type: ignore[import-not-found]
+                validate_r22_amendment,
+                verify_amendment_sources,
+            )
+        except ModuleNotFoundError:  # direct ``python ops/stage2/...`` launch
+            from prepare_s204_r22_amendment import (  # type: ignore[no-redef]
+                validate_r22_amendment,
+                verify_amendment_sources,
+            )
+        try:
+            validate_r22_amendment(value)
+            verify_amendment_sources(value, root)
+        except (OSError, TypeError, ValueError, KeyError) as error:
+            raise _error("S204_R22_AMENDMENT_NOT_VERIFIED") from error
+        return ref, value
+    if value.get("schema_version") != "stage2-reference-sizing-round-v1":
         raise _error("S204_R22_ROUND_MANIFEST_SCHEMA_INVALID")
     if value.get("round_id") != "r22" or value.get("prior_round_id") != "r21" or value.get("prior_round_status") != "INCONCLUSIVE":
         raise _error("S204_R22_ROUND_LINEAGE_INVALID")
@@ -348,6 +373,12 @@ def prepare_formal_s204(
         ),
         require_terminal_convergence=r22_round is not None,
         round_manifest_ref=r22_round_ref,
+        round_namespace=(
+            "r23"
+            if r22_round is not None
+            and r22_round.get("schema_version") == "stage2-reference-sizing-amendment-v1"
+            else None
+        ),
         final_stream_start_position=(
             int(r22_round["sizing"]["segment_start_position"])  # type: ignore[index]
             if r22_round is not None
@@ -476,6 +507,16 @@ def prepare_formal_s204(
     if r22_round_ref is not None:
         summary["r22_round_manifest_ref"] = r22_round_ref
         summary["r22_round_manifest_hash"] = r22_round.get("artifact_hash") if r22_round else None
+        if r22_round and r22_round.get("schema_version") == "stage2-reference-sizing-amendment-v1":
+            summary["s204_amendment_id"] = r22_round.get("amendment_id")
+            summary["run_identity"] = r22_round.get("run_identity")
+            sizing_control = r22_round.get("sizing")
+            if isinstance(sizing_control, Mapping):
+                for field in ("reference_study_id", "sizing_run_id", "fresh_attempt_id", "resume_ref", "seed_namespaces", "producer_commit"):
+                    summary[field] = sizing_control.get(field)
+            execution_contract = r22_round.get("execution_contract")
+            if isinstance(execution_contract, Mapping):
+                summary["r23_execution_contract"] = dict(execution_contract)
     summary["artifact_hash"] = canonical_json_hash(summary)
     summary_ref = f"{output}/preparation.json"
     publish_canonical_immutable(_safe_relative(root, summary_ref, "preparation_summary"), summary)

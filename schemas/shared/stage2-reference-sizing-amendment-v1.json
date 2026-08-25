@@ -1,0 +1,236 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://parameter-importance.invalid/schemas/shared/stage2-reference-sizing-amendment-v1.json",
+  "title": "Append-only S2.4 r23 independent recovery amendment",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version", "round_id", "prior_round_id", "prior_round_status",
+    "amendment_id", "amendment_version", "parent_round_id",
+    "parent_round_ref", "parent_round_artifact_hash", "parent_preregistration_hash", "parent_execution_status",
+    "parent_blocker_code", "sizing", "machine_diagnostics", "multi_round_control", "run_identity",
+    "output_namespace", "new_draws_before_freeze", "final_reference_created",
+    "final_reference_plan_schema", "continuation_control", "amendment",
+    "status", "formal_reference_status", "artifact_hash", "execution_contract"
+  ],
+  "properties": {
+    "schema_version": {"const": "stage2-reference-sizing-amendment-v1"},
+    "round_id": {"const": "r23"},
+    "prior_round_id": {"const": "r22"},
+    "prior_round_status": {"const": "BLOCKED"},
+    "amendment_id": {"const": "r23-amend-r1"},
+    "amendment_version": {"const": 1},
+    "parent_round_id": {"const": "r22"},
+    "parent_round_ref": {"type": "string", "minLength": 1},
+    "parent_round_artifact_hash": {"$ref": "#/$defs/hash"},
+    "parent_preregistration_hash": {"$ref": "#/$defs/hash"},
+    "parent_execution_status": {"const": "BLOCKED"},
+    "parent_blocker_code": {"const": "contract_unfrozen"},
+    "sizing": {
+      "type": "object", "additionalProperties": false,
+      "required": [
+        "stream", "reference_study_id", "sizing_run_id", "fresh_attempt_id", "resume_ref", "seed_namespaces", "producer_commit",
+        "seed_namespace", "seed_namespace_mode", "parent_sampling_plan_hash",
+        "candidate_sample_counts", "block_size", "normalized_l1_threshold",
+        "required_consecutive", "complete_all_candidates", "optional_stopping",
+        "reuse_prior_sizing_prefix", "segment_start_position",
+        "segment_end_position_exclusive", "prior_consumed_end_position",
+        "final_stream_segments"
+      ],
+      "properties": {
+        "stream": {"const": "reference_sizing"},
+        "seed_namespace": {"type": "string", "minLength": 1},
+        "seed_namespace_mode": {"const": "same_frozen_seed_disjoint_segment"},
+        "parent_sampling_plan_hash": {"$ref": "#/$defs/hash"},
+        "candidate_sample_counts": {"const": [131072, 262144]},
+        "block_size": {"const": 32},
+        "normalized_l1_threshold": {"const": 0.02},
+        "required_consecutive": {"const": 1},
+        "complete_all_candidates": {"const": true},
+        "optional_stopping": {"const": false},
+        "reuse_prior_sizing_prefix": {"const": false},
+        "segment_start_position": {"const": 81920},
+        "segment_end_position_exclusive": {"const": 344064},
+        "prior_consumed_end_position": {"const": 81920},
+        "final_stream_segments": {
+          "type": "object", "additionalProperties": false,
+          "required": ["reference_A", "reference_B"],
+          "properties": {
+            "reference_A": {"const": {"start_position": 81920, "end_position_exclusive": 344064}},
+            "reference_B": {"const": {"start_position": 81920, "end_position_exclusive": 344064}}
+          }
+        },
+        "reference_study_id": {"type": "string", "minLength": 1},
+        "sizing_run_id": {"type": "string", "const": "r23-g3-v5-independent-segment-amend-r1"},
+        "fresh_attempt_id": {"type": "string", "const": "fresh-r23-amend-r1"},
+        "resume_ref": {"type": ["null", "string"]},
+        "seed_namespaces": {
+          "type": "object", "additionalProperties": false,
+          "required": ["reference_sizing", "reference_A", "reference_B"],
+          "properties": {
+            "reference_sizing": {"type": "string", "minLength": 1},
+            "reference_A": {"type": "string", "minLength": 1},
+            "reference_B": {"type": "string", "minLength": 1}
+          }
+        },
+        "producer_commit": {"type": "string", "pattern": "^[0-9a-f]{40}$"}
+      }
+    },
+    "machine_diagnostics": {
+      "type": "object", "additionalProperties": false,
+      "required": [
+        "basis_type", "cell_id", "attempt_id", "retryable", "formal_eligible", "execution_commit",
+        "config_path", "config_hash", "config_full_hash", "checkpoint_revision", "input_checkpoint_id",
+        "parameter_registry_hash", "plan_identity", "registry_identity", "draw_identity", "sizing_points", "source_refs", "terminal_sample_count_per_stream",
+        "terminal_comparison_defined", "terminal_normalized_l1_from_previous",
+        "terminal_convergence_streak", "terminal_selected_sample_count_per_stream",
+        "threshold", "projection_model", "projection_semantics",
+        "projected_required_sample_count", "conservative_terminal_sample_count",
+        "projected_terminal_normalized_l1"
+      ],
+      "properties": {
+        "basis_type": {"const": "bounded_checkpoint_terminal_failure"},
+        "cell_id": {"type": "string", "minLength": 1},
+        "attempt_id": {"type": "string", "minLength": 1},
+        "retryable": {"const": false},
+        "formal_eligible": {"const": false},
+        "execution_commit": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+        "config_path": {"type": "string", "minLength": 1},
+        "config_hash": {"$ref": "#/$defs/hash"},
+        "config_full_hash": {"$ref": "#/$defs/hash"},
+        "checkpoint_revision": {"type": "string", "minLength": 1},
+        "input_checkpoint_id": {"type": "string", "minLength": 1},
+        "parameter_registry_hash": {"$ref": "#/$defs/hash"},
+        "plan_identity": {
+          "type": "object", "additionalProperties": false,
+          "required": ["reference_id", "artifact_hash"],
+          "properties": {"reference_id": {"type": "string", "minLength": 1}, "artifact_hash": {"$ref": "#/$defs/hash"}}
+        },
+        "registry_identity": {
+          "type": "object", "additionalProperties": false,
+          "required": ["registry_hash", "parameter_registry_artifact_hash"],
+          "properties": {"registry_hash": {"$ref": "#/$defs/hash"}, "parameter_registry_artifact_hash": {"$ref": "#/$defs/hash"}}
+        },
+        "draw_identity": {
+          "type": "object", "additionalProperties": false,
+          "required": ["parent_sampling_plan_hash", "sizing_draw_hash", "sizing_identity_hash", "seed_namespace", "segment_start_position", "segment_end_position_exclusive"],
+          "properties": {
+            "parent_sampling_plan_hash": {"$ref": "#/$defs/hash"},
+            "sizing_draw_hash": {"$ref": "#/$defs/hash"},
+            "sizing_identity_hash": {"$ref": "#/$defs/hash"},
+            "seed_namespace": {"type": "string", "minLength": 1},
+            "segment_start_position": {"const": 16384},
+            "segment_end_position_exclusive": {"const": 81920}
+          }
+        },
+        "sizing_points": {
+          "type": "array", "minItems": 2, "maxItems": 2,
+          "items": {"type": "object", "additionalProperties": false,
+            "required": ["sample_count_per_stream", "block_count_total", "bias_reference_hash", "cross_reference_hash", "ranking_reference_hash", "comparison_defined", "comparison_reason", "normalized_l1_from_previous", "convergence_streak"],
+            "properties": {
+              "sample_count_per_stream": {"type": "integer"}, "block_count_total": {"type": "integer", "minimum": 2},
+              "bias_reference_hash": {"$ref": "#/$defs/hash"}, "cross_reference_hash": {"$ref": "#/$defs/hash"}, "ranking_reference_hash": {"$ref": "#/$defs/hash"},
+              "comparison_defined": {"type": "boolean"}, "comparison_reason": {"type": ["null", "string"]},
+              "normalized_l1_from_previous": {"type": ["null", "number"]}, "convergence_streak": {"const": 0}
+            }
+          }
+        },
+        "source_refs": {
+          "type": "object", "additionalProperties": false,
+          "required": ["final_status", "bounded_checkpoint_manifest"],
+          "properties": {
+            "final_status": {"$ref": "#/$defs/source"},
+            "bounded_checkpoint_manifest": {"$ref": "#/$defs/source"}
+          }
+        },
+        "terminal_sample_count_per_stream": {"const": 65536},
+        "terminal_comparison_defined": {"const": true},
+        "terminal_normalized_l1_from_previous": {"type": "number", "exclusiveMinimum": 0.02},
+        "terminal_convergence_streak": {"const": 0},
+        "terminal_selected_sample_count_per_stream": {"type": ["null", "integer"]},
+        "threshold": {"const": 0.02},
+        "projection_model": {"const": "normalized_l1_planning_projection=observed_gap*sqrt(base_n/n)"},
+        "projection_semantics": {"const": "descriptive_planning_only_not_an_upper_bound_or_selection_criterion;terminal_must_be_measured"},
+        "projected_required_sample_count": {"type": "number", "exclusiveMinimum": 0.02},
+        "conservative_terminal_sample_count": {"const": 262144},
+        "projected_terminal_normalized_l1": {"type": "number", "exclusiveMinimum": 0, "exclusiveMaximum": 0.02}
+      }
+    },
+    "multi_round_control": {
+      "type": "object", "additionalProperties": false,
+      "required": [
+        "schema_version", "method", "horizon_round_ids", "allowed_recovery_round_ids",
+        "prior_round_ids", "prior_rounds_not_pooled", "prior_final_ab_created",
+        "execution_summary_ref", "final_ab_policy", "max_final_ab_rounds",
+        "r23_failure_policy", "anytime_valid", "multiplicity_policy",
+        "r23_is_only_recovery", "r23_is_only_confirmatory_look", "confirmatory_look_policy"
+      ],
+      "properties": {
+        "schema_version": {"const": "stage2-multi-round-control-v1"},
+        "method": {"const": "single_confirmatory_look_control_v1"},
+        "horizon_round_ids": {"const": ["r22", "r23"]},
+        "allowed_recovery_round_ids": {"const": ["r23"]},
+        "prior_round_ids": {"const": ["r21", "r22"]},
+        "prior_rounds_not_pooled": {"const": true},
+        "prior_final_ab_created": {"const": {"r21": false, "r22": false}},
+        "execution_summary_ref": {"$ref": "#/$defs/source"},
+        "final_ab_policy": {"const": "single_research_one_shot_only"},
+        "max_final_ab_rounds": {"const": 1},
+        "r23_failure_policy": {"const": "INCONCLUSIVE_NO_FURTHER_RETRY"},
+        "anytime_valid": {"const": false},
+        "multiplicity_policy": {"const": "no_cross_round_pooling;confirmatory_claims_withheld_until_single_final_A_B"},
+        "r23_is_only_recovery": {"const": true},
+        "r23_is_only_confirmatory_look": {"const": true},
+        "confirmatory_look_policy": {"const": "r23_only_single_final_A_B_look;failure_is_final_INCONCLUSIVE"}
+      }
+    },
+    "run_identity": {"type": "string", "pattern": "^r23-.*amend-r1.*$"},
+    "output_namespace": {"type": "string", "minLength": 1, "pattern": "^.*r23-.*amend-r1.*$"},
+    "new_draws_before_freeze": {"const": false},
+    "final_reference_created": {"const": false},
+    "final_reference_plan_schema": {"const": "schemas/shared/stage2-reference-one-shot-plan-v2.json"},
+    "continuation_control": {"const": "precommitted_new_round_disjoint_segment_no_pooling_with_prior_r22"},
+    "status": {"const": "FROZEN_BEFORE_NEW_SIZING_DRAWS"},
+    "formal_reference_status": {"const": "NOT_CREATED_UNTIL_SIZING_GATE"},
+    "artifact_hash": {"$ref": "#/$defs/hash"},
+    "execution_contract": {"type": "object"},
+    "amendment": {
+      "type": "object", "additionalProperties": false,
+      "required": ["append_only", "version", "created_before_new_sizing_draws", "candidate_expansion", "unchanged_scientific_contract", "reason", "changed_fields", "non_posthoc_basis", "affected_gates", "review"],
+      "properties": {
+        "append_only": {"const": true},
+        "version": {"const": 1},
+        "created_before_new_sizing_draws": {"const": true},
+        "candidate_expansion": {"const": "append_next_two_doubling_nodes_after_terminal"},
+        "unchanged_scientific_contract": {
+          "const": ["threshold=0.02", "block_size=32", "required_consecutive=1", "margin_schema_unchanged", "evaluator_schema_unchanged", "final_A_B_schema_unchanged"]
+        },
+        "reason": {"const": "r22_terminal_65536_gap_above_threshold"},
+        "changed_fields": {"const": ["round_id", "sizing.candidate_sample_counts", "sizing.segment_start_position", "sizing.segment_end_position_exclusive", "multi_round_control"]},
+        "non_posthoc_basis": {"const": "bounded_checkpoint_machine_diagnostic_before_r23_draws"},
+        "affected_gates": {"const": ["G2.3", "G2.4"]},
+        "review": {
+          "type": "object", "additionalProperties": false,
+          "required": ["status", "reviewer_role", "reviewed_before_new_draws", "reviewed_at"],
+          "properties": {
+            "status": {"const": "ACCEPTED"},
+            "reviewer_role": {"const": "root"},
+            "reviewed_before_new_draws": {"const": true},
+            "reviewed_at": {"type": "string", "format": "date-time", "pattern": "Z$"}
+          }
+        }
+      }
+    }
+  },
+  "$defs": {
+    "hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "source": {
+      "type": "object", "additionalProperties": false,
+      "required": ["ref", "sha256"],
+      "properties": {
+        "ref": {"type": "string", "minLength": 1},
+        "sha256": {"$ref": "#/$defs/hash"}
+      }
+    }
+  }
+}
