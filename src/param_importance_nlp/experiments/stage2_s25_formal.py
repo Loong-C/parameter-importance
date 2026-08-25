@@ -27,11 +27,23 @@ from ..contracts.config_v2 import ResolvedConfigV2
 from ..contracts.jsonio import canonical_json_hash, load_canonical_json, write_canonical_json
 from ..contracts.stage23 import FormalExecutionEvidence
 from ..contracts.task_catalog import DEFAULT_TASK_CATALOG
-from ..experiments.sampling import RepetitionMapping, SamplingPlan
+from ..experiments.sampling import RepetitionMapping, SamplingPlan, SamplingUniverse
+from ..providers import SyntheticGradientProvider
 from ..runtime.task_artifacts import load_committed_task_artifact
 from ..runtime.task_runtime import TaskExecutionRequest, TaskRuntimeEnvironment
 from ..runtime.tensor_bundle import load_tensor_bundle
-from .stage2_formal import RecoverablePairedWaveRunner, _vector_digest
+from .stage2 import (
+    DeterministicShardReducer,
+    PairedEstimatorRunner,
+    ReferenceRunner,
+    SufficientStatisticShard,
+)
+from .stage2_formal import (
+    OneShotReferencePlan,
+    OneShotReferenceRunner,
+    RecoverablePairedWaveRunner,
+    _vector_digest,
+)
 from .stage2_s25_rebind import (
     APPROVED_GPU_UUIDS,
     CELL_COMPONENTS,
@@ -50,10 +62,424 @@ S25_M2_TOLERANCE = 1e-10
 
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _COMMIT = re.compile(r"^[0-9a-f]{40}$")
+S25_QUALIFICATION_FIXTURE_SCHEMA = "stage2-g24a-runner-qualification-fixture-v1"
 
 
 class S25ExecutionBlocked(RuntimeError):
     """Raised when a formal S2.5 source or recovery boundary is unsafe."""
+
+
+def run_s25_runner_qualification(
+    *,
+    artifact_root: str | Path,
+    rebind_plan: Mapping[str, object],
+    runner_commit: str,
+) -> dict[str, object]:
+    """Execute the bounded, plan-independent G2.4a runner qualification.
+
+    This is deliberately a local synthetic fixture.  It exercises the same
+    paired, recovery, reference, and reducer executors used by S2.5, but it
+    never loads ``FormalExperimentPlan`` and never emits formal experiment
+    parameters.  The returned object is the only authority for the
+    gate-only route: ``formal_eligible`` means that this runner may be used by
+    the later S2.6 pilot, not that formal data execution is authorized.
+    """
+
+    checks: dict[str, dict[str, object]] = {}
+
+    def check(name: str, passed: bool, detail: object = None) -> None:
+        checks[name] = {
+            "status": "PASS" if passed else "FAIL",
+            "detail": detail,
+        }
+
+    if _COMMIT.fullmatch(str(runner_commit)) is None:
+        check("runner_commit_bound", False, "RUNNER_COMMIT_SHA1_REQUIRED")
+        return {
+            "schema_version": S25_QUALIFICATION_FIXTURE_SCHEMA,
+            "gate_id": "stage2.G2.4a",
+            "status": "FAIL",
+            "formal_eligible": False,
+            "formal_data_execution_allowed": False,
+            "fixture_only": True,
+            "runner_commit": runner_commit,
+            "checks": checks,
+            "error": "RUNNER_COMMIT_SHA1_REQUIRED",
+        }
+
+    root = Path(artifact_root).resolve()
+    sampling: SamplingPlan | None = None
+    provider_state_before: str | None = None
+    summary: object | None = None
+    try:
+        # These constants are versioned fixture inputs, not a formal plan.
+        sampling = SamplingPlan(
+            SamplingUniverse(
+                "s205-g24a-qualification-universe-v1", tuple(range(16))
+            ),
+            {
+                "pilot": 205,
+                "confirmatory": 206,
+                "reference_sizing": 207,
+                "reference_A": 208,
+                "reference_B": 209,
+            },
+        )
+        fixture_table = {
+            index: {
+                "p": np.array(
+                    [(-1.0) ** index * (index + 1), (index % 5) - 2.0]
+                ),
+                "q": np.array(
+                    [1.5 - 0.2 * index, (-1.0) ** (index + 1) * 0.5]
+                ),
+            }
+            for index in range(16)
+        }
+        provider = SyntheticGradientProvider(
+            fixture_table,
+            fixed_state_id="s205-g24a-runner-qualification-v1",
+            statistical_unit="synthetic_draw_group_mean",
+            weight_unit="synthetic_draw_count",
+            sampling_design="uniform_with_replacement_disjoint_draw_groups",
+            weights_exogenous=True,
+            common_mean_assumption=True,
+        )
+        provider_state_before = provider.state_digest()
+        pilot_draws = sampling.draws("pilot", 16)
+        mappings = tuple(
+            RepetitionMapping.create(
+                repetition_id=f"s205-g24a-qualification-{index:02d}",
+                draws=pilot_draws[index * 8 : (index + 1) * 8],
+                m_values=(2, 4),
+            )
+            for index in range(2)
+        )
+        pool_ok = all(
+            len(mapping.draws) == len(mapping.double_halves[0]) * 2
+            and not {
+                draw.draw_id for draw in mapping.double_halves[0]
+            }.intersection(
+                draw.draw_id for draw in mapping.double_halves[1]
+            )
+            and all(
+                len(
+                    tuple(
+                        draw.draw_id
+                        for group in mapping.groups(m)
+                        for draw in group
+                    )
+                )
+                == mapping.batch_size
+                for m in mapping.m_values
+            )
+            for mapping in mappings
+        )
+        check(
+            "same_total_sample_pool_and_disjoint_double_halves",
+            pool_ok,
+            {"mapping_schema": "stage2-repetition-mapping-v1", "mapping_count": len(mappings)},
+        )
+
+        # Offline and streaming reference paths must agree on all three
+        # reference identities, while preserving the provider state proof.
+        reference_a = sampling.draws("reference_A", 6)
+        reference_b = sampling.draws("reference_B", 6)
+        offline = ReferenceRunner(provider).run(
+            reference_id="s205-g24a-qualification-reference",
+            draws_a=reference_a,
+            draws_b=reference_b,
+            block_size=2,
+        )
+        streaming_provider = SyntheticGradientProvider(
+            fixture_table,
+            fixed_state_id=provider.fixed_state_id,
+            statistical_unit=provider.statistical_unit,
+            weight_unit=provider.weight_unit,
+            sampling_design=provider.sampling_design,
+            weights_exogenous=provider.weights_exogenous,
+            common_mean_assumption=provider.common_mean_assumption,
+        )
+        stream_plan = OneShotReferencePlan(
+            reference_id="s205-g24a-qualification-reference",
+            sizing_result_hash="a" * 64,
+            sample_count_per_stream=6,
+            block_size=2,
+        )
+        streaming = OneShotReferenceRunner(streaming_provider).run(
+            stream_plan,
+            draws_a=reference_a,
+            draws_b=reference_b,
+            artifact_root=root / "streaming-reference",
+        )
+        offline_views = {
+            "bias": offline.bias_reference,
+            "cross": offline.cross_reference,
+            "ranking": offline.ranking_reference,
+        }
+        streaming_views = {
+            "bias": streaming.bias_reference,
+            "cross": streaming.cross_reference,
+            "ranking": streaming.ranking_reference,
+        }
+        stream_equal = all(
+            _vector_digest(offline_views[name]) == _vector_digest(streaming_views[name])
+            for name in offline_views
+        )
+        check(
+            "streaming_vs_offline_reference",
+            streaming.status == "COMPLETE" and stream_equal,
+            {name: _vector_digest(offline_views[name]) for name in offline_views},
+        )
+
+        references = offline_views
+        wave_root = root / "paired-wave"
+        summary = RecoverablePairedWaveRunner(provider).run(
+            wave_id="s205-g24a-qualification-wave",
+            mappings=mappings,
+            reference=references["bias"],
+            reference_hash=_vector_digest(references["bias"]),
+            references=references,
+            artifact_root=wave_root,
+        )
+        resumed = RecoverablePairedWaveRunner(provider).run(
+            wave_id="s205-g24a-qualification-wave",
+            mappings=mappings,
+            reference=references["bias"],
+            reference_hash=_vector_digest(references["bias"]),
+            references=references,
+            artifact_root=wave_root,
+        )
+        methods = set(summary.method_statistics)
+        check(
+            "m2_u_equals_double_and_all_m_mean_gradients",
+            summary.complete
+            and resumed.resumed_unit_count == len(mappings)
+            and {"raw", "double", "u_m2", "u_m4"}.issubset(methods)
+            and all(
+                float(state.get("m2_double_max_abs_error", float("inf")))
+                <= S25_M2_TOLERANCE
+                for path in (wave_root / "commits").glob("*.json")
+                for state, _bundle in [
+                    load_tensor_bundle(
+                        wave_root / str(load_canonical_json(path)["object_ref"])
+                    )
+                ]
+            ),
+            {"methods": sorted(methods), "tolerance": S25_M2_TOLERANCE},
+        )
+
+        mean_gradient_ok = True
+        signed_negative = False
+        for mapping in mappings:
+            full = provider.gradient(mapping.draws).gradients
+            for m in mapping.m_values:
+                batches = [provider.gradient(group).gradients for group in mapping.groups(m)]
+                for name in full:
+                    mean = sum(np.asarray(batch[name], dtype=np.float64) for batch in batches) / len(batches)
+                    mean_gradient_ok &= bool(
+                        np.allclose(mean, np.asarray(full[name]), rtol=0.0, atol=1e-12)
+                    )
+            for path in (wave_root / "commits").glob("*.json"):
+                state, _bundle = load_tensor_bundle(
+                    wave_root / str(load_canonical_json(path)["object_ref"])
+                )
+                vectors = state.get("vectors", {})
+                signed_negative |= any(
+                    np.any(np.asarray(value) < 0)
+                    for method in vectors.values()
+                    for value in method.values()
+                )
+        check("complete_batch_mean_gradient_invariant_across_M", mean_gradient_ok)
+        check("signed_u_and_double_outputs_not_clamped", signed_negative)
+
+        required_state = {
+            "gradient_evaluations", "formula_seconds", "sample_budget",
+            "microbatch_diagnostics", "peak_memory_bytes", "state_digest",
+            "state_digest_after",
+        }
+        field_ok = True
+        state_unchanged = provider.state_digest() == provider_state_before
+        for path in (wave_root / "commits").glob("*.json"):
+            state, _bundle = load_tensor_bundle(
+                wave_root / str(load_canonical_json(path)["object_ref"])
+            )
+            field_ok &= required_state.issubset(state)
+            field_ok &= state.get("state_digest") == state.get("state_digest_after")
+            field_ok &= int(state.get("sample_budget", 0)) > 0
+            field_ok &= int(state.get("gradient_evaluations", -1)) >= 0
+            field_ok &= float(state.get("formula_seconds", -1.0)) >= 0.0
+            diagnostics = state.get("microbatch_diagnostics")
+            if not isinstance(diagnostics, list):
+                field_ok = False
+            else:
+                field_ok &= all(
+                    isinstance(item, Mapping)
+                    and {"microbatch_index", "token_count", "loss", "gradient_norm"}
+                    == set(item)
+                    and float(item["token_count"]) > 0
+                    and float(item["gradient_norm"]) >= 0
+                    for item in diagnostics
+                )
+        check("gradient_formula_sample_token_and_memory_fields", field_ok)
+        check("state_summary_unchanged_before_after", state_unchanged)
+        check(
+            "reference_topk_cross_M_summaries_retained",
+            set(summary.reference_statistics)
+            == {"bias", "cross", "ranking"}
+            and summary.reference_statistics["ranking"]["raw"]["top_k"] >= 1
+            and {"u_m2", "u_m4"}.issubset(summary.reference_statistics["cross"]),
+        )
+        check(
+            "replay_evidence_and_atomic_publish",
+            summary.replay_evidence["attempt_bound"] is True
+            and summary.replay_evidence["idempotent_reducer"] is True,
+        )
+
+        class _FailOnceProvider:
+            def __init__(self, inner: SyntheticGradientProvider) -> None:
+                self.inner = inner
+                self.failed = False
+
+            def gradient(self, draws: Sequence[object]) -> object:
+                if not self.failed:
+                    self.failed = True
+                    raise RuntimeError("qualification-injected-retry")
+                return self.inner.gradient(draws)
+
+            def __getattr__(self, name: str) -> object:
+                return getattr(self.inner, name)
+
+        retry_root = root / "failure-retry"
+        retry_mapping = (mappings[0],)
+        try:
+            RecoverablePairedWaveRunner(_FailOnceProvider(provider)).run(
+                wave_id="s205-g24a-retry-wave",
+                mappings=retry_mapping,
+                reference=references["bias"],
+                reference_hash=_vector_digest(references["bias"]),
+                references=references,
+                artifact_root=retry_root,
+            )
+        except RuntimeError:
+            failed_once = True
+        else:
+            failed_once = False
+        recovered = RecoverablePairedWaveRunner(provider).run(
+            wave_id="s205-g24a-retry-wave",
+            mappings=retry_mapping,
+            reference=references["bias"],
+            reference_hash=_vector_digest(references["bias"]),
+            references=references,
+            artifact_root=retry_root,
+        )
+        failures = list((retry_root / "failures").glob("*.json"))
+        failure_input_ok = bool(failures) and load_canonical_json(failures[0])["input_hash"] == mappings[0].digest
+        check(
+            "failure_retry_replays_same_mapping_and_atomic_publish",
+            failed_once and recovered.complete and failure_input_ok,
+        )
+
+        result_values = [PairedEstimatorRunner(provider).run(mapping) for mapping in mappings]
+        shards = [
+            SufficientStatisticShard.from_result(result, attempt_id="qualification-attempt")
+            for result in result_values
+        ]
+        left = DeterministicShardReducer()
+        right = DeterministicShardReducer()
+        for shard in shards:
+            left.add(shard)
+        for shard in reversed(shards):
+            right.add(shard)
+        duplicate_ignored = left.add(shards[0]) is False
+        try:
+            left.add(
+                SufficientStatisticShard.from_result(
+                    result_values[0], attempt_id="qualification-retry-attempt"
+                )
+            )
+        except ValueError:
+            retry_rejected = True
+        else:
+            retry_rejected = False
+        check(
+            "worker_order_retry_reducer_hash",
+            left.reduce().digest == right.reduce().digest
+            and duplicate_ignored
+            and retry_rejected,
+            {"reducer_hash": left.reduce().digest},
+        )
+
+        partial_root = root / "partial-publication"
+        with DeterministicShardReducer(partial_root) as persisted:
+            persisted.add(shards[0])
+            (partial_root / "objects" / "orphan-fixture").mkdir(parents=True, exist_ok=True)
+            write_canonical_json(
+                partial_root / "commits" / ("0" * 64 + ".json"),
+                {"schema_version": "partial-fixture"},
+            )
+            reconciliation = persisted.reconcile_artifacts()
+        check(
+            "partial_publication_rejected",
+            bool(reconciliation["invalid_commits"])
+            and "orphan-fixture" in reconciliation["orphan_objects"],
+        )
+    except Exception as error:
+        check("qualification_execution", False, f"{type(error).__name__}:{error}")
+
+    passed = bool(checks) and all(item["status"] == "PASS" for item in checks.values())
+    g23_identity = {
+        "evaluation_ref": rebind_plan.get("_g23_ref"),
+        "evaluation_hash": rebind_plan.get("g23_evaluation_hash"),
+        "cell_ids": list(EXPECTED_CELL_IDS),
+    }
+    reference_refs = [
+        row.get("reference_artifact_refs")
+        for row in rebind_plan.get("cells", [])
+        if isinstance(row, Mapping)
+    ]
+    binding = {
+        "runner_commit": runner_commit,
+        "s22_sampling": {
+            "schema_version": "sampling-plan-v1",
+            "sampling_plan_hash": None if sampling is None else sampling.digest,
+            "scope": "qualification_fixture",
+        },
+        "s24_reference": {
+            "schema_versions": [
+                "reference-result-v1",
+                "stage2-reference-convergence-report-v1",
+                "stage23-task-gate-candidate-v1",
+            ],
+            "g23_identity": g23_identity,
+            "reference_artifact_identity_hash": canonical_json_hash(reference_refs),
+        },
+    }
+    payload: dict[str, object] = {
+        "schema_version": S25_QUALIFICATION_FIXTURE_SCHEMA,
+        "gate_id": "stage2.G2.4a",
+        "status": "PASS" if passed else "FAIL",
+        "formal_eligible": passed,
+        "formal_data_execution_allowed": False,
+        "fixture_only": True,
+        "formal_experiment_plan_consumed": False,
+        "runner_commit": runner_commit,
+        "s22_sampling_schema_version": "sampling-plan-v1",
+        "s22_sampling_hash": None if sampling is None else sampling.digest,
+        "s24_reference_schema_versions": binding["s24_reference"]["schema_versions"],  # type: ignore[index]
+        "g23_identity": g23_identity,
+        "fixture_identity": {
+            "schema_version": S25_QUALIFICATION_FIXTURE_SCHEMA,
+            "provider_state_digest": provider_state_before,
+            "sampling_fixture_hash": None if sampling is None else sampling.digest,
+        },
+        "binding": binding,
+        "checks": checks,
+    }
+    if summary is not None:
+        payload["runner_summary_hash"] = canonical_json_hash(summary.to_dict())  # type: ignore[union-attr]
+    payload["artifact_hash"] = canonical_json_hash(payload)
+    return payload
 
 
 def _sha(value: object, *, field: str) -> str:

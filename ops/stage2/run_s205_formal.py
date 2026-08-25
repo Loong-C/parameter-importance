@@ -34,6 +34,7 @@ from param_importance_nlp.experiments.stage2_s25_formal import (
     S25FormalRunner,
     load_s25_rebind_plan,
     preflight_s25,
+    run_s25_runner_qualification,
 )
 
 
@@ -123,30 +124,46 @@ def _write_once(path: Path, payload: Mapping[str, object]) -> None:
     write_canonical_json(path, dict(payload))
 
 
+def _repository_commit(repository: Path) -> str:
+    try:
+        completed = subprocess.run(
+            ["git", "-C", str(repository.resolve()), "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except (OSError, subprocess.CalledProcessError) as error:
+        raise S25ExecutionBlocked("S205_RUNNER_COMMIT_UNAVAILABLE") from error
+    commit = completed.stdout.strip()
+    if len(commit) != 40 or any(character not in "0123456789abcdef" for character in commit):
+        raise S25ExecutionBlocked("S205_RUNNER_COMMIT_INVALID")
+    return commit
+
+
 def _gate_only(args: argparse.Namespace) -> dict[str, object]:
-    """Publish plan-independent runner readiness without running data."""
+    """Run the bounded qualification fixture; never run formal data."""
 
     root = args.data_root.resolve()
     plan = load_s25_rebind_plan(root, args.s205_rebind_ref)
     operations = _logical(root, args.operations_root, field="operations_root", allow_missing=True)
     operations.mkdir(parents=True, exist_ok=True)
-    payload: dict[str, object] = {
-        "schema_version": "stage2-s205-runner-gate-readiness-v1",
-        "gate_id": "stage2.G2.4a",
-        "status": "READY_CONTROL_PLANE",
-        "formal_eligible": False,
-        "execution_allowed": False,
-        "b_m_r_bound": False,
-        "experiment_plan_required_for_data_execution": True,
-        "gate_requirements": list(_S205_GATE_REQUIREMENTS),
+    runner_commit = _repository_commit(getattr(args, "repository", _REPOSITORY_ROOT))
+    payload = run_s25_runner_qualification(
+        artifact_root=operations / "g2.4a-runner-qualification" / runner_commit,
+        rebind_plan=plan,
+        runner_commit=runner_commit,
+    )
+    payload = {
+        **payload,
         "rebind_ref": str(plan.get("_rebind_ref", args.s205_rebind_ref)),
         "rebind_hash": plan.get("artifact_hash"),
         "g23_evaluation_ref": plan.get("_g23_ref"),
         "g23_evaluation_hash": plan.get("g23_evaluation_hash"),
-        "reason": "S205_DATA_EXECUTION_DEFERRED_UNTIL_FROZEN_EXPERIMENT_PLAN",
+        "gate_requirements": list(_S205_GATE_REQUIREMENTS),
     }
+    payload.pop("artifact_hash", None)
     payload["artifact_hash"] = canonical_json_hash(payload)
-    _write_once(operations / "g2.4a-runner-readiness.json", payload)
+    _write_once(operations / "g2.4a-runner-qualification.json", payload)
     return payload
 
 

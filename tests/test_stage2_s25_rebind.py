@@ -439,7 +439,7 @@ def test_s205_dynamic_lpt_queue_no_wave_barrier_and_no_overlap() -> None:
     assert {gpu_uuid for _, gpu_uuid in dispatches} <= set(APPROVED_GPU_UUIDS)
 
 
-def test_s205_gate_only_readiness_never_binds_or_runs_b_m_r(
+def test_s205_gate_only_runs_fixture_gate_without_formal_plan(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     import argparse
@@ -462,10 +462,17 @@ def test_s205_gate_only_readiness_never_binds_or_runs_b_m_r(
         operations_root="operations/stage2/s205-gate-only",
     )
     payload = _gate_only(args)
-    assert payload["status"] == "READY_CONTROL_PLANE"
-    assert payload["formal_eligible"] is False
-    assert payload["execution_allowed"] is False
-    assert payload["b_m_r_bound"] is False
-    assert payload["experiment_plan_required_for_data_execution"] is True
+    assert payload["status"] == "PASS"
+    assert payload["formal_eligible"] is True
+    assert payload["formal_data_execution_allowed"] is False
+    assert payload["fixture_only"] is True
+    assert payload["formal_experiment_plan_consumed"] is False
+    assert all(
+        item["status"] == "PASS" for item in payload["checks"].values()
+    )
     assert not (tmp_path / "operations/stage2/s205-gate-only" / "status.json").exists()
-    assert (tmp_path / "operations/stage2/s205-gate-only" / "g2.4a-runner-readiness.json").is_file()
+    assert (
+        tmp_path
+        / "operations/stage2/s205-gate-only"
+        / "g2.4a-runner-qualification.json"
+    ).is_file()
