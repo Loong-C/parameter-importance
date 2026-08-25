@@ -17,6 +17,7 @@ from param_importance_nlp.experiments.stage2_g23_evaluator import (
     _bootstrap_independent_bias_interval,
     _bootstrap_independent_cross_interval,
     _bootstrap_u_diagnostics,
+    _bounded_moments_strict,
     _moments_from_blocks,
     _pearson,
     _top_overlap,
@@ -26,6 +27,7 @@ from param_importance_nlp.experiments.stage2_g23_evaluator import (
 from param_importance_nlp.experiments.sampling import SamplingPlan, SamplingUniverse
 from param_importance_nlp.experiments.stage2_formal import (
     ReferenceSizingPlan,
+    _BoundedMoments,
     _ReferenceShardStore,
     _moments_from_shards,
     estimate_reference_uncertainty_shards,
@@ -268,6 +270,16 @@ def test_sizing_delta_formula_uses_noise_or_signal_floor_at_boundary() -> None:
     assert _sizing_delta_sci(100.0, 30.0) == pytest.approx(3.0)
     with pytest.raises(ValueError):
         _sizing_delta_sci(float("nan"), 1.0)
+
+
+def test_bounded_final_moments_missing_higher_fields_are_blocked() -> None:
+    moments = _BoundedMoments(include_higher=False)
+    moments.update_vector({"p": np.asarray([1.0, 2.0])}, 1.0)
+
+    with pytest.raises(G23Blocked, match="HIGHER_MOMENTS_REQUIRED"):
+        _bounded_moments_strict(
+            moments.to_state(), "bounded.final", require_higher=True
+        )
 
 
 def test_capacity_preflight_uses_full_14m_and_31m_counts(tmp_path: Path) -> None:
