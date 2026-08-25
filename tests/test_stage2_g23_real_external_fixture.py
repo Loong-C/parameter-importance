@@ -22,13 +22,18 @@ from param_importance_nlp.experiments.sampling import SamplingPlan, SamplingUniv
 from param_importance_nlp.experiments.stage2_formal import (
     FormalExecutionEvidence,
     ReferenceSizingPlan,
+    _BoundedCheckpointStore,
+    _BoundedMoments,
     _GradientMoments,
     _ReferenceShardStore,
     _ReferenceSnapshotStore,
     _draw_digest,
     _moments_from_shards,
     _vector_digest,
+    bounded_reference_numeric_diagnostics,
+    estimate_reference_uncertainty_bounded,
     estimate_reference_uncertainty_shards,
+    estimate_sequence_variance_bounded,
     estimate_sequence_variance_shards,
 )
 from param_importance_nlp.experiments.stage2_g23_evaluator import CellInput, EXPECTED_CELL_IDS, evaluate_formal_g23
@@ -44,7 +49,7 @@ from param_importance_nlp.experiments.stage23_task_runners import (
 )
 from param_importance_nlp.providers.synthetic import SyntheticGradientProvider
 from param_importance_nlp.runtime.task_artifacts import TaskArtifactStore
-from param_importance_nlp.runtime.tensor_bundle import publish_tensor_bundle
+from param_importance_nlp.runtime.tensor_bundle import load_tensor_bundle, publish_tensor_bundle
 
 
 def _git_head(root: Path) -> str:
@@ -106,7 +111,15 @@ def _make_provider(cell: str) -> SyntheticGradientProvider:
     )
 
 
-def _build_cell(root: Path, index: int, cell: str, head: str, prereg: dict[str, object]) -> CellInput:
+def _build_cell(
+    root: Path,
+    index: int,
+    cell: str,
+    head: str,
+    prereg: dict[str, object],
+    *,
+    bounded: bool = False,
+) -> CellInput:
     provider = _make_provider(cell)
     assumptions = {
         "statistical_unit": provider.statistical_unit,
@@ -182,7 +195,7 @@ def _build_cell(root: Path, index: int, cell: str, head: str, prereg: dict[str, 
     sampling = SamplingPlan(
         universe=universe,
         stream_seeds={
-            "reference_sizing": 101 + index * 11,
+            "reference_sizing": 1 + index * 3,
             "reference_A": 201 + index * 11,
             "reference_B": 301 + index * 11,
             "pilot": 401 + index * 11,
@@ -261,10 +274,28 @@ def _build_cell(root: Path, index: int, cell: str, head: str, prereg: dict[str, 
     (output_root / "resume" / "reference-final" / "commits").mkdir(parents=True)
     sizing_store = _ReferenceShardStore(output_root / "resume" / "reference-sizing")
     final_store = _ReferenceShardStore(output_root / "resume" / "reference-final")
+
+    def bounded_moments(
+        store: _ReferenceShardStore,
+        refs: list[dict[str, object]],
+        *,
+        include_higher: bool,
+    ) -> _BoundedMoments:
+        moments = _BoundedMoments(include_higher=include_higher)
+        for ref in refs:
+            vector, weight, _ = store.load(ref)
+            moments.update_vector(vector, weight)
+        return moments
+
     sizing_refs: list[dict[str, object]] = []
     for draw in sizing_draws:
         batch = provider.gradient([draw])
-        sizing_refs.append(sizing_store.publish(batch.gradients, 1.0 + 0.01 * (int(draw.position) + 1)))
+        sizing_refs.append(
+            sizing_store.publish(
+                batch.gradients,
+                1.0 if bounded else 1.0 + 0.01 * (int(draw.position) + 1),
+            )
+        )
     final_refs_a: list[dict[str, object]] = []
     final_refs_b: list[dict[str, object]] = []
     for draw_a, draw_b in zip(draws_a, draws_b):
@@ -276,6 +307,8 @@ def _build_cell(root: Path, index: int, cell: str, head: str, prereg: dict[str, 
         final_refs_b.append(final_store.publish(provider.gradient([draw_b]).gradients, 1.0))
 
     empty = _GradientMoments().to_state()
+    sizing_states: dict[int, dict[str, object]] = {}
+    final_states: dict[int, dict[str, object]] = {}
     for sequence in range(1, 5):
         refs = sizing_refs[:sequence]
         moments = _moments_from_shards(sizing_store, refs, assumptions)
@@ -301,7 +334,32 @@ def _build_cell(root: Path, index: int, cell: str, head: str, prereg: dict[str, 
             "rng_state": sizing_rng_boundaries[sequence],
             "rng_state_digest": boundary_digest(sizing_rng_boundaries[sequence]),
         }
+        sizing_states[sequence] = state
         _publish_state(output_root / "resume" / "reference-sizing", sequence, state)
+    if bounded:
+        bounded_candidates = {
+            str(sequence): {
+                "a": bounded_moments(
+                    sizing_store, sizing_refs[:sequence], include_higher=False
+                ).to_state(),
+                "b": _BoundedMoments().to_state(),
+            }
+            for sequence in (2, 4)
+        }
+        bounded_sizing_state = dict(sizing_states[4])
+        bounded_sizing_state.update(
+            {
+                "a": bounded_candidates["4"]["a"],
+                "b": bounded_candidates["4"]["b"],
+                "candidate_states": bounded_candidates,
+                "shard_refs_a": [],
+                "shard_refs_b": [],
+                "shard_count": 0,
+            }
+        )
+        _BoundedCheckpointStore(
+            output_root / "resume" / "reference-sizing"
+        ).publish(4, bounded_sizing_state)
     sizing_moments = _moments_from_shards(sizing_store, sizing_refs, assumptions)
     sizing_payload = {
         "schema_version": "stage2-reference-sizing-result-v1",
@@ -364,13 +422,49 @@ def _build_cell(root: Path, index: int, cell: str, head: str, prereg: dict[str, 
                 "b": final_b_rng_boundaries[sequence],
             }),
         }
+        final_states[sequence] = state
         latest_final_commit = _publish_state(output_root / "resume" / "reference-final", sequence, state)
     moments_a = _moments_from_shards(final_store, final_refs_a, assumptions)
     moments_b = _moments_from_shards(final_store, final_refs_b, assumptions)
     combined = moments_a.combine(moments_b)
     bias, cross, ranking = combined.u(assumptions=assumptions), {name: moments_a.mean()[name] * moments_b.mean()[name] for name in moments_a.mean()}, {name: np.square(value) for name, value in combined.mean().items()}
-    uncertainty = estimate_reference_uncertainty_shards(final_store, final_refs_a, final_refs_b, assumptions)
-    sequence_variance = estimate_sequence_variance_shards(final_store, final_refs_a + final_refs_b, block_size=1)
+    if bounded:
+        bounded_a = bounded_moments(
+            final_store, final_refs_a, include_higher=True
+        )
+        bounded_b = bounded_moments(
+            final_store, final_refs_b, include_higher=True
+        )
+        final_bounded_state = dict(final_states[4])
+        final_bounded_state.update(
+            {
+                "a": bounded_a.to_state(),
+                "b": bounded_b.to_state(),
+                "shard_refs_a": [],
+                "shard_refs_b": [],
+            }
+        )
+        _BoundedCheckpointStore(
+            output_root / "resume" / "reference-final"
+        ).publish(4, final_bounded_state)
+        combined_bounded = bounded_a.combine(bounded_b)
+        bias = combined_bounded.u(assumptions=assumptions)
+        mean_a_bounded, mean_b_bounded = bounded_a.mean(), bounded_b.mean()
+        cross = {
+            name: mean_a_bounded[name] * mean_b_bounded[name]
+            for name in mean_a_bounded
+        }
+        ranking = {
+            name: np.square(value)
+            for name, value in combined_bounded.mean().items()
+        }
+        uncertainty = estimate_reference_uncertainty_bounded(bounded_a, bounded_b)
+        sequence_variance = estimate_sequence_variance_bounded(
+            combined_bounded, block_size=1
+        )
+    else:
+        uncertainty = estimate_reference_uncertainty_shards(final_store, final_refs_a, final_refs_b, assumptions)
+        sequence_variance = estimate_sequence_variance_shards(final_store, final_refs_a + final_refs_b, block_size=1)
     one_shot_payload = {
         "schema_version": "stage2-reference-one-shot-result-v1",
         "plan_hash": final_plan["artifact_hash"],
@@ -390,31 +484,115 @@ def _build_cell(root: Path, index: int, cell: str, head: str, prereg: dict[str, 
         "sequence_variance_hash": _vector_digest(sequence_variance),
     }
     one_shot_payload = _hashed(one_shot_payload)
-    numeric_rows = []
-    for ref in final_refs_a + final_refs_b:
-        vector, weight, _ = final_store.load(ref)
-        numeric_rows.append({"vector_hash": _vector_digest(vector), "weight": float(weight)})
-    raw_block_digest = canonical_json_hash(numeric_rows)
-    numerical = _hashed({
-        "schema_version": "stage2-reference-numerical-diagnostics-v1",
-        "recompute_method": "longdouble_pairwise_u_from_content_addressed_shards",
-        "raw_block_digest": raw_block_digest,
-        "raw_block_count_a": 4,
-        "raw_block_count_b": 4,
-        "high_precision_hash": _vector_digest(bias),
-        "accumulated_hash": _vector_digest(bias),
-        "max_abs_error": 0.0,
-        "resume_latest_commit_ref": "commits/00000004.json",
-        "resume_latest_commit_hash": latest_final_commit["artifact_hash"],
-        "resume_latest_manifest_hash": latest_final_commit["object_manifest_hash"],
-    })
+    if bounded:
+        high_precision, accumulated, error_bound = (
+            bounded_reference_numeric_diagnostics(bounded_a, bounded_b)
+        )
+        _, bounded_checkpoint_bundle = load_tensor_bundle(
+            output_root / "resume" / "reference-final" / "bounded-checkpoint"
+        )
+        bounded_state_digest = canonical_json_hash(
+            {
+                "checkpoint_schema": _BoundedCheckpointStore.schema_version,
+                "object_manifest_hash": bounded_checkpoint_bundle.manifest_sha256,
+            }
+        )
+        numerical = _hashed(
+            {
+                "schema_version": "stage2-reference-numerical-diagnostics-v2",
+                "storage_mode": "bounded-online-fp64-v1",
+                "recompute_method": "longdouble_u_from_hash_bound_bounded_moments_with_fp64_error_envelope",
+                "bounded_checkpoint_ref": "bounded-checkpoint",
+                "bounded_checkpoint_manifest_hash": bounded_checkpoint_bundle.manifest_sha256,
+                "bounded_checkpoint_state_digest": bounded_state_digest,
+                "moments_a_hash": canonical_json_hash(
+                    {
+                        "schema_version": _BoundedMoments.schema_version,
+                        "count": bounded_a.count,
+                        "n1": bounded_a.n1,
+                        "n2": bounded_a.n2,
+                        "g1_hash": _vector_digest(bounded_a.g1),
+                        "g2_hash": _vector_digest(bounded_a.g2),
+                        "p2_hash": _vector_digest(bounded_a.p2),
+                        "p3_hash": _vector_digest(bounded_a.p3),
+                        "p4_hash": _vector_digest(bounded_a.p4),
+                    }
+                ),
+                "moments_b_hash": canonical_json_hash(
+                    {
+                        "schema_version": _BoundedMoments.schema_version,
+                        "count": bounded_b.count,
+                        "n1": bounded_b.n1,
+                        "n2": bounded_b.n2,
+                        "g1_hash": _vector_digest(bounded_b.g1),
+                        "g2_hash": _vector_digest(bounded_b.g2),
+                        "p2_hash": _vector_digest(bounded_b.p2),
+                        "p3_hash": _vector_digest(bounded_b.p3),
+                        "p4_hash": _vector_digest(bounded_b.p4),
+                    }
+                ),
+                "high_precision_hash": _vector_digest(high_precision),
+                "accumulated_hash": _vector_digest(accumulated),
+                "error_bound_hash": _vector_digest(error_bound),
+                "max_abs_error": max(
+                    float(np.max(value)) for value in error_bound.values()
+                ),
+            }
+        )
+        raw_block_digest = None
+    else:
+        numeric_rows = []
+        for ref in final_refs_a + final_refs_b:
+            vector, weight, _ = final_store.load(ref)
+            numeric_rows.append({"vector_hash": _vector_digest(vector), "weight": float(weight)})
+        raw_block_digest = canonical_json_hash(numeric_rows)
+        high_precision = accumulated = bias
+        error_bound = None
+        numerical = _hashed({
+            "schema_version": "stage2-reference-numerical-diagnostics-v1",
+            "recompute_method": "longdouble_pairwise_u_from_content_addressed_shards",
+            "raw_block_digest": raw_block_digest,
+            "raw_block_count_a": 4,
+            "raw_block_count_b": 4,
+            "high_precision_hash": _vector_digest(bias),
+            "accumulated_hash": _vector_digest(bias),
+            "max_abs_error": 0.0,
+            "resume_latest_commit_ref": "commits/00000004.json",
+            "resume_latest_commit_hash": latest_final_commit["artifact_hash"],
+            "resume_latest_manifest_hash": latest_final_commit["object_manifest_hash"],
+        })
     bundle_state = {
         "bias_reference": dict(bias),
         "cross_reference": dict(cross),
         "ranking_reference": dict(ranking),
         "uncertainty": {"bias_variance": dict(uncertainty.bias_variance), "cross_variance": dict(uncertainty.cross_variance), "ranking_variance": dict(uncertainty.ranking_variance)},
         "sequence_variance": dict(sequence_variance),
-        "numerical_diagnostics": {"schema_version": "stage2-reference-numerical-diagnostics-v1", "raw_block_digest": raw_block_digest, "high_precision": dict(bias), "accumulated": dict(bias), "high_precision_hash": _vector_digest(bias), "accumulated_hash": _vector_digest(bias)},
+        "numerical_diagnostics": (
+            {
+                "schema_version": "stage2-reference-numerical-diagnostics-v2",
+                "storage_mode": "bounded-online-fp64-v1",
+                "bounded_checkpoint_ref": "bounded-checkpoint",
+                "bounded_checkpoint_manifest_hash": bounded_checkpoint_bundle.manifest_sha256,
+                "bounded_checkpoint_state_digest": bounded_state_digest,
+                "moments_a_hash": numerical["moments_a_hash"],
+                "moments_b_hash": numerical["moments_b_hash"],
+                "high_precision": dict(high_precision),
+                "accumulated": dict(accumulated),
+                "error_bound": dict(error_bound),
+                "high_precision_hash": _vector_digest(high_precision),
+                "accumulated_hash": _vector_digest(accumulated),
+                "error_bound_hash": _vector_digest(error_bound),
+            }
+            if bounded
+            else {
+                "schema_version": "stage2-reference-numerical-diagnostics-v1",
+                "raw_block_digest": raw_block_digest,
+                "high_precision": dict(bias),
+                "accumulated": dict(bias),
+                "high_precision_hash": _vector_digest(bias),
+                "accumulated_hash": _vector_digest(bias),
+            }
+        ),
     }
     bundle = publish_tensor_bundle(output_root / "tensor-bundles" / "reference-final", bundle_state)
     reference_payload = _hashed({
@@ -439,11 +617,24 @@ def _build_cell(root: Path, index: int, cell: str, head: str, prereg: dict[str, 
     rng_before, rng_after = canonical_json_hash(rng_before_state), canonical_json_hash(rng_after_state)
     replay_commit = latest_final_commit
     replay = {
-        "schema_version": "stage2-reference-resume-replay-v1",
-        "artifact_ref": "commits/00000004.json",
-        "artifact_hash": replay_commit["artifact_hash"],
-        "state_digest": replay_commit["state_digest"],
-        "object_manifest_hash": replay_commit["object_manifest_hash"],
+        "schema_version": (
+            "stage2-reference-resume-replay-v2"
+            if bounded
+            else "stage2-reference-resume-replay-v1"
+        ),
+        **({"storage_mode": "bounded-online-fp64-v1"} if bounded else {}),
+        "artifact_ref": "bounded-checkpoint" if bounded else "commits/00000004.json",
+        "artifact_hash": (
+            bounded_checkpoint_bundle.manifest_sha256
+            if bounded
+            else replay_commit["artifact_hash"]
+        ),
+        "state_digest": bounded_state_digest if bounded else replay_commit["state_digest"],
+        "object_manifest_hash": (
+            bounded_checkpoint_bundle.manifest_sha256
+            if bounded
+            else replay_commit["object_manifest_hash"]
+        ),
         "source_one_shot_result_hash": one_shot_payload["artifact_hash"],
         "replayed_one_shot_result_hash": one_shot_payload["artifact_hash"],
         "sizing_result_identity_hash": sizing_result_identity_hash,
@@ -456,13 +647,22 @@ def _build_cell(root: Path, index: int, cell: str, head: str, prereg: dict[str, 
         "candidate_max_sample_count_per_stream": 4,
         "block_size": 1,
         "max_block_count_per_stream": 4,
-        "single_copy_shard_bytes": 4 * 2 * 4 * 8,
-        "snapshot_moment_bytes": 4 * 4 * 4 * 8,
-        "estimated_disk_bytes": int((4 * 2 * 4 * 8 + 4 * 4 * 4 * 8) * 1.20 + 64 * 1024**2),
+        **({"storage_mode": "bounded-online-fp64-v1"} if bounded else {}),
+        "single_copy_shard_bytes": 0 if bounded else 4 * 2 * 4 * 8,
+        "snapshot_moment_bytes": (25 * 4 * 8) if bounded else 4 * 4 * 4 * 8,
+        "estimated_disk_bytes": int(
+            ((25 * 4 * 8) if bounded else (4 * 2 * 4 * 8 + 4 * 4 * 4 * 8))
+            * 1.20
+            + 64 * 1024**2
+        ),
         "free_disk_bytes": shutil.disk_usage(root).free,
         "peak_ram_bytes": 3 * 4 * 8 + 64 * 1024**2,
         "available_ram_bytes": _available_ram(),
-        "disk_ok": shutil.disk_usage(root).free >= int((4 * 2 * 4 * 8 + 4 * 4 * 4 * 8) * 1.20 + 64 * 1024**2),
+        "disk_ok": shutil.disk_usage(root).free >= int(
+            ((25 * 4 * 8) if bounded else (4 * 2 * 4 * 8 + 4 * 4 * 4 * 8))
+            * 1.20
+            + 64 * 1024**2
+        ),
         "ram_ok": _available_ram() >= 3 * 4 * 8 + 64 * 1024**2,
         "fail_closed_if_unknown": True,
     }
@@ -544,11 +744,14 @@ def _build_cell(root: Path, index: int, cell: str, head: str, prereg: dict[str, 
     return CellInput(cell, result_ref.relative_to(root).as_posix())
 
 
-def _build_real_fixture(root: Path) -> list[CellInput]:
+def _build_real_fixture(root: Path, *, bounded: bool = False) -> list[CellInput]:
     head = _git_head(Path(__file__).resolve().parents[1])
     prereg = build_stage2_preregistration(seed_plan_hash=SeedPlan.from_master_seed(917).artifact_hash, producer_commit=head, scope="formal")
     validate_stage2_preregistration(prereg)
-    return [_build_cell(root, index, cell, head, prereg) for index, cell in enumerate(EXPECTED_CELL_IDS)]
+    return [
+        _build_cell(root, index, cell, head, prereg, bounded=bounded)
+        for index, cell in enumerate(EXPECTED_CELL_IDS)
+    ]
 
 
 def test_real_external_task_artifacts_pass_and_resume_tamper_blocks(tmp_path: Path) -> None:
@@ -560,6 +763,32 @@ def test_real_external_task_artifacts_pass_and_resume_tamper_blocks(tmp_path: Pa
     tensor_file = next((tmp_path / first / "tensor-bundles" / "reference-final" / "tensors").glob("*.bin"))
     tensor_file.write_bytes(tensor_file.read_bytes() + b"tamper")
     blocked = evaluate_formal_g23(tmp_path, cells, output_root=tmp_path / "attempts")
+    assert blocked["status"] == "BLOCKED"
+    assert blocked["formal_eligible"] is False
+
+
+def test_bounded_external_task_artifacts_pass_and_checkpoint_tamper_blocks(
+    tmp_path: Path,
+) -> None:
+    cells = _build_real_fixture(tmp_path, bounded=True)
+    passed = evaluate_formal_g23(tmp_path, cells, output_root=tmp_path / "attempts")
+    assert passed["status"] == "PASS", passed
+    assert passed["formal_eligible"] is True
+    first = Path(cells[0].task_result_ref).parent
+    tensor_file = next(
+        (
+            tmp_path
+            / first
+            / "resume"
+            / "reference-final"
+            / "bounded-checkpoint"
+            / "tensors"
+        ).glob("*.bin")
+    )
+    tensor_file.write_bytes(tensor_file.read_bytes() + b"tamper")
+    blocked = evaluate_formal_g23(
+        tmp_path, cells, output_root=tmp_path / "attempts"
+    )
     assert blocked["status"] == "BLOCKED"
     assert blocked["formal_eligible"] is False
 

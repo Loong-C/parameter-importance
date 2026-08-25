@@ -48,6 +48,8 @@ from .stage2_formal import (
     _BoundedCheckpointStore,
     _BoundedMoments,
     _bounded_moments_digest,
+    bounded_reference_numeric_diagnostics,
+    estimate_reference_uncertainty_bounded,
     estimate_sequence_variance_bounded,
     _moments_from_shards,
     _vector_digest,
@@ -680,11 +682,21 @@ def _load_resume_commits(
     bounded_path = resume_root / "bounded-checkpoint"
     if bounded_path.exists():
         try:
-            latest, _ = load_tensor_bundle(bounded_path)
+            _reject_symlinks_under(bounded_path, f"resume.{schema}.bounded_checkpoint")
+            latest, bounded_bundle = load_tensor_bundle(bounded_path)
         except (OSError, TypeError, ValueError) as error:
             raise G23Blocked(f"resume:{schema}:BOUNDED_CHECKPOINT_UNREADABLE") from error
         if not isinstance(latest, Mapping) or latest.get("checkpoint_schema") != _BoundedCheckpointStore.schema_version:
             raise G23Blocked(f"resume:{schema}:BOUNDED_CHECKPOINT_SCHEMA")
+        for key, expected in identities.items():
+            if key in {"final_length_required", "sizing_stream"}:
+                if latest.get(key) is not expected:
+                    raise G23Blocked(f"resume:{schema}:BOUNDED_IDENTITY_DRIFT:{key}")
+            elif latest.get(key) != expected:
+                raise G23Blocked(f"resume:{schema}:BOUNDED_IDENTITY_DRIFT:{key}")
+        latest = dict(latest)
+        latest["bounded_checkpoint_ref"] = "bounded-checkpoint"
+        latest["bounded_checkpoint_manifest_hash"] = bounded_bundle.manifest_sha256
         if schema == "stage2-reference-progress-state-v1":
             candidates = latest.get("candidate_states")
             if not isinstance(candidates, Mapping) or not candidates:
@@ -830,6 +842,61 @@ def _load_resume_commits(
         previous_refs_a = [dict(item) for item in raw_refs_a]
         previous_refs_b = [dict(item) for item in raw_refs_b]
     return states
+
+
+def _bounded_moments_strict(
+    value: object,
+    field: str,
+    *,
+    require_higher: bool,
+) -> _BoundedMoments:
+    if not isinstance(value, Mapping):
+        raise G23Blocked(f"{field}:OBJECT_REQUIRED")
+    try:
+        moments = _BoundedMoments.from_state(value)
+    except (KeyError, TypeError, ValueError, OverflowError) as error:
+        raise G23Blocked(f"{field}:INVALID") from error
+    if (
+        moments.count <= 0
+        or not math.isfinite(moments.n1)
+        or not math.isfinite(moments.n2)
+        or moments.n1 <= 0.0
+        or moments.n2 <= 0.0
+        or moments.first_weight is None
+        or not math.isfinite(moments.first_weight)
+        or moments.first_weight <= 0.0
+        or not moments.all_equal_weights
+    ):
+        raise G23Blocked(f"{field}:EQUAL_WEIGHT_IDENTITY_REQUIRED")
+    expected_names = set(moments.g1)
+    required_vectors = (moments.g2, moments.p2)
+    if not expected_names or any(set(vector) != expected_names for vector in required_vectors):
+        raise G23Blocked(f"{field}:MOMENT_PARAMETER_SET_MISMATCH")
+    if require_higher and (
+        not moments.include_higher
+        or set(moments.p3) != expected_names
+        or set(moments.p4) != expected_names
+    ):
+        raise G23Blocked(f"{field}:HIGHER_MOMENTS_REQUIRED")
+    for vector in (moments.g1, moments.g2, moments.p2, moments.p3, moments.p4):
+        for item in vector.values():
+            if not np.all(np.isfinite(item)):
+                raise G23Blocked(f"{field}:NON_FINITE")
+    weight = float(moments.first_weight)
+    if not math.isclose(moments.n1, moments.count * weight, rel_tol=1e-12, abs_tol=1e-12):
+        raise G23Blocked(f"{field}:N1_COUNT_WEIGHT_MISMATCH")
+    if not math.isclose(moments.n2, moments.count * weight * weight, rel_tol=1e-12, abs_tol=1e-12):
+        raise G23Blocked(f"{field}:N2_COUNT_WEIGHT_MISMATCH")
+    for name in expected_names:
+        if np.any(moments.p2[name] < 0.0) or np.any(moments.g2[name] < 0.0):
+            raise G23Blocked(f"{field}:SECOND_MOMENT_NEGATIVE")
+        if not np.allclose(
+            moments.g2[name], weight * weight * moments.p2[name], rtol=1e-12, atol=1e-12
+        ):
+            raise G23Blocked(f"{field}:WEIGHTED_POWER_SUM_DRIFT")
+        if np.any(np.square(moments.g1[name]) > moments.count * moments.g2[name] * (1.0 + 1e-12) + 1e-12):
+            raise G23Blocked(f"{field}:CAUCHY_BOUND_FAILED")
+    return moments
 
 
 def _resume_roots(root: Path, result_ref: str) -> tuple[Path, Path]:
@@ -1634,8 +1701,25 @@ def _sizing_vectors(evidence: _CellEvidence) -> tuple[list[int], list[dict[str, 
     if selected_states != {selected_declared} or selected_declared not in counts:
         raise G23Blocked("sizing:SELECTED_NODE_NOT_INDEPENDENTLY_COMMITTED")
     vectors: list[dict[str, np.ndarray]] = []
+    bounded = bool(evidence.sizing_states[-1].get("bounded_storage"))
     for count in counts[-2:]:
         state = states_by_count[count]
+        if bounded:
+            moments = _bounded_moments_strict(
+                state.get("a"), f"sizing.bounded.{count}.a", require_higher=False
+            )
+            expected_blocks = count // block_size
+            if moments.count != expected_blocks or int(state.get("processed_block_pairs", -1)) != expected_blocks:
+                raise G23Blocked("sizing:BOUNDED_COUNT_MISMATCH")
+            assumptions = state.get("weighting_assumptions")
+            if not isinstance(assumptions, Mapping):
+                raise G23Blocked("sizing.weighting_assumptions:MISSING")
+            try:
+                validate_weighting_contract(assumptions, field="sizing.weighting_assumptions")
+                vectors.append(moments.u(assumptions=assumptions))
+            except (TypeError, ValueError) as error:
+                raise G23Blocked(f"sizing:BOUNDED_MOMENTS_INVALID:{type(error).__name__}") from error
+            continue
         refs_a = state.get("shard_refs_a")
         if not isinstance(refs_a, list) or not refs_a:
             raise G23Blocked("sizing.shard_refs_a:SHARDS_REQUIRED")
@@ -1651,6 +1735,80 @@ def _sizing_vectors(evidence: _CellEvidence) -> tuple[list[int], list[dict[str, 
         _moments_equal(rebuilt_a, state["a"], "sizing.moments_a")
         vectors.append(_u_from_moments(moments.to_state(), "sizing.u"))
     return counts[-2:], vectors, plan
+
+
+def _final_vectors_bounded(
+    evidence: _CellEvidence,
+) -> tuple[
+    dict[str, np.ndarray],
+    dict[str, np.ndarray],
+    dict[str, np.ndarray],
+    _BoundedMoments,
+    _BoundedMoments,
+    ReferenceUncertainty,
+]:
+    if evidence.final_state is None or evidence.bundle_state is None:
+        raise G23Blocked("final:RAW_DIAGNOSTICS_MISSING")
+    state = evidence.final_state
+    if not bool(state.get("bounded_storage")):
+        raise G23Blocked("final:BOUNDED_STORAGE_REQUIRED")
+    moments_a = _bounded_moments_strict(
+        state.get("a"), "final.bounded.a", require_higher=True
+    )
+    moments_b = _bounded_moments_strict(
+        state.get("b"), "final.bounded.b", require_higher=True
+    )
+    processed = int(state.get("processed_block_pairs", 0))
+    if processed <= 0 or moments_a.count != processed or moments_b.count != processed:
+        raise G23Blocked("final:BOUNDED_COUNT_MISMATCH")
+    assumptions = state.get("weighting_assumptions")
+    if not isinstance(assumptions, Mapping):
+        raise G23Blocked("final.weighting_assumptions:MISSING")
+    try:
+        validate_weighting_contract(assumptions, field="final.weighting_assumptions")
+        combined = moments_a.combine(moments_b)
+        bias = combined.u(assumptions=assumptions)
+        mean_a, mean_b = moments_a.mean(), moments_b.mean()
+        cross = {name: mean_a[name] * mean_b[name] for name in mean_a}
+        ranking = {name: np.square(value) for name, value in combined.mean().items()}
+        recomputed = estimate_reference_uncertainty_bounded(moments_a, moments_b)
+        sequence_variance = estimate_sequence_variance_bounded(
+            combined,
+            block_size=int(state.get("block_size", 0)),
+        )
+    except (TypeError, ValueError) as error:
+        raise G23Blocked(f"final:BOUNDED_RECOMPUTE_FAILED:{type(error).__name__}") from error
+    bundle_state = evidence.bundle_state
+    for key, value in (
+        ("bias_reference", bias),
+        ("cross_reference", cross),
+        ("ranking_reference", ranking),
+    ):
+        loaded = _vector(bundle_state.get(key), f"bundle.{key}")
+        _compatible(value, loaded, f"bundle.{key}")
+        if not all(np.array_equal(value[name], loaded[name]) for name in value):
+            raise G23Blocked(f"bundle.{key}:BOUNDED_VALUE_MISMATCH")
+        if evidence.reference is not None and _sha(
+            evidence.reference.payload.get(f"{key}_hash"), f"reference.{key}_hash"
+        ) != _vector_digest(value):
+            raise G23Blocked(f"reference.{key}_hash:VALUE_MISMATCH")
+    uncertainty = bundle_state.get("uncertainty")
+    if not isinstance(uncertainty, Mapping):
+        raise G23Blocked("bundle.uncertainty:MISSING")
+    for name, expected in (
+        ("bias_variance", recomputed.bias_variance),
+        ("cross_variance", recomputed.cross_variance),
+        ("ranking_variance", recomputed.ranking_variance),
+    ):
+        loaded = _vector(uncertainty.get(name), f"bundle.{name}")
+        _compatible(expected, loaded, f"bundle.{name}")
+        if not all(np.allclose(expected[key], loaded[key], rtol=1e-12, atol=1e-12) for key in expected):
+            raise G23Blocked(f"bundle.{name}:BOUNDED_JACKKNIFE_VALUE_MISMATCH")
+    loaded_sequence = _vector(bundle_state.get("sequence_variance"), "bundle.sequence_variance")
+    _compatible(sequence_variance, loaded_sequence, "bundle.sequence_variance")
+    if not all(np.allclose(sequence_variance[name], loaded_sequence[name], rtol=1e-12, atol=1e-12) for name in sequence_variance):
+        raise G23Blocked("bundle.sequence_variance:BOUNDED_VALUE_MISMATCH")
+    return bias, cross, ranking, moments_a, moments_b, recomputed
 
 
 def _final_vectors(
@@ -1966,8 +2124,74 @@ def _numerical_error(evidence: _CellEvidence, reference: Mapping[str, np.ndarray
         raise G23Blocked("epsilon_num:RAW_DIAGNOSTIC_MISSING")
     source = evidence.bundle_state.get("numerical_diagnostics")
     metadata = evidence.convergence.payload.get("numerical_diagnostics")
-    if not isinstance(source, Mapping) or not isinstance(metadata, Mapping) or source.get("schema_version") != "stage2-reference-numerical-diagnostics-v1":
+    if not isinstance(source, Mapping) or not isinstance(metadata, Mapping):
         raise G23Blocked("epsilon_num:EXPLICIT_DIAGNOSTIC_REQUIRED")
+    if bool(evidence.final_state.get("bounded_storage")):
+        if (
+            source.get("schema_version") != "stage2-reference-numerical-diagnostics-v2"
+            or metadata.get("schema_version") != "stage2-reference-numerical-diagnostics-v2"
+            or source.get("storage_mode") != "bounded-online-fp64-v1"
+            or metadata.get("storage_mode") != "bounded-online-fp64-v1"
+        ):
+            raise G23Blocked("epsilon_num:BOUNDED_DIAGNOSTIC_SCHEMA_REQUIRED")
+        _canonical_payload_hash(metadata, "epsilon_num.metadata")
+        moments_a = _bounded_moments_strict(
+            evidence.final_state.get("a"), "epsilon_num.bounded.a", require_higher=True
+        )
+        moments_b = _bounded_moments_strict(
+            evidence.final_state.get("b"), "epsilon_num.bounded.b", require_higher=True
+        )
+        try:
+            expected_high, expected_accumulated, expected_bound = bounded_reference_numeric_diagnostics(
+                moments_a, moments_b
+            )
+        except ValueError as error:
+            raise G23Blocked("epsilon_num:BOUNDED_RECOMPUTE_FAILED") from error
+        high = _vector(source.get("high_precision"), "epsilon_num.high_precision")
+        accumulated = _vector(source.get("accumulated"), "epsilon_num.accumulated")
+        error_bound = _vector(source.get("error_bound"), "epsilon_num.error_bound")
+        for observed, expected, label in (
+            (high, expected_high, "HIGH_PRECISION"),
+            (accumulated, expected_accumulated, "ACCUMULATED"),
+            (error_bound, expected_bound, "ERROR_BOUND"),
+        ):
+            _compatible(observed, expected, f"epsilon_num.{label.lower()}")
+            if not all(np.allclose(observed[name], expected[name], rtol=1e-12, atol=1e-12) for name in expected):
+                raise G23Blocked(f"epsilon_num:{label}_RECOMPUTE_MISMATCH")
+        manifest_hash = evidence.final_state.get("bounded_checkpoint_manifest_hash")
+        state_digest = canonical_json_hash(
+            {
+                "checkpoint_schema": _BoundedCheckpointStore.schema_version,
+                "object_manifest_hash": manifest_hash,
+            }
+        )
+        required_bindings = {
+            "bounded_checkpoint_ref": "bounded-checkpoint",
+            "bounded_checkpoint_manifest_hash": manifest_hash,
+            "bounded_checkpoint_state_digest": state_digest,
+            "moments_a_hash": _bounded_moments_digest(moments_a),
+            "moments_b_hash": _bounded_moments_digest(moments_b),
+            "high_precision_hash": _vector_digest(expected_high),
+            "accumulated_hash": _vector_digest(expected_accumulated),
+            "error_bound_hash": _vector_digest(expected_bound),
+        }
+        for key, expected in required_bindings.items():
+            if metadata.get(key) != expected or source.get(key) != expected:
+                raise G23Blocked(f"epsilon_num:BOUNDED_{key.upper()}_MISMATCH")
+        _compatible(expected_accumulated, reference, "epsilon_num.reference")
+        if not all(np.allclose(expected_accumulated[name], reference[name], rtol=1e-12, atol=1e-12) for name in reference):
+            raise G23Blocked("epsilon_num:REFERENCE_RECOMPUTE_MISMATCH")
+        computed_error = max(float(np.max(value)) for value in expected_bound.values())
+        if not math.isclose(
+            _finite(metadata.get("max_abs_error"), "epsilon_num.max_abs_error"),
+            computed_error,
+            rel_tol=1e-12,
+            abs_tol=1e-12,
+        ):
+            raise G23Blocked("epsilon_num:DECLARED_ERROR_MISMATCH")
+        return computed_error
+    if source.get("schema_version") != "stage2-reference-numerical-diagnostics-v1":
+        raise G23Blocked("epsilon_num:RAW_DIAGNOSTIC_SCHEMA_REQUIRED")
     _canonical_payload_hash(metadata, "epsilon_num.metadata")
     if evidence.final_root is None:
         raise G23Blocked("epsilon_num:SHARD_ROOT_REQUIRED")
@@ -2199,7 +2423,12 @@ def _state_replay_verified(evidence: _CellEvidence) -> bool:
 
     if not evidence.sizing_states or not evidence.final_states:
         raise G23Blocked("state_replay:ALL_RESUME_STATES_REQUIRED")
-    for index, state in enumerate(evidence.sizing_states, start=1):
+    sizing_states_to_validate = (
+        evidence.sizing_states[-1:]
+        if bool(evidence.sizing_states[-1].get("bounded_storage"))
+        else evidence.sizing_states
+    )
+    for index, state in enumerate(sizing_states_to_validate, start=1):
         validate_resume_rng_state(
             state,
             schema="sizing",
@@ -2223,6 +2452,39 @@ def _state_replay_verified(evidence: _CellEvidence) -> bool:
         raise G23Blocked("state_replay:REPLAY_HASH_MISMATCH")
     artifact_ref = _path(replay.get("artifact_ref"), "state_replay.artifact_ref")
     _reject_symlink_chain(evidence.final_root, artifact_ref, "state_replay.artifact_ref")
+    if bool(evidence.final_state.get("bounded_storage")):
+        if (
+            replay.get("schema_version") != "stage2-reference-resume-replay-v2"
+            or replay.get("storage_mode") != "bounded-online-fp64-v1"
+            or artifact_ref != "bounded-checkpoint"
+        ):
+            raise G23Blocked("state_replay:BOUNDED_REPLAY_SCHEMA_REQUIRED")
+        checkpoint_path = evidence.final_root / artifact_ref
+        _reject_symlinks_under(checkpoint_path, "state_replay.bounded_checkpoint")
+        try:
+            state, bundle = load_tensor_bundle(checkpoint_path)
+        except (OSError, TypeError, ValueError) as error:
+            raise G23Blocked("state_replay:BOUNDED_CHECKPOINT_UNREADABLE") from error
+        if not isinstance(state, Mapping) or state.get("checkpoint_schema") != _BoundedCheckpointStore.schema_version:
+            raise G23Blocked("state_replay:BOUNDED_CHECKPOINT_SCHEMA")
+        state_digest = canonical_json_hash(
+            {
+                "checkpoint_schema": _BoundedCheckpointStore.schema_version,
+                "object_manifest_hash": bundle.manifest_sha256,
+            }
+        )
+        if (
+            replay.get("artifact_hash") != bundle.manifest_sha256
+            or replay.get("object_manifest_hash") != bundle.manifest_sha256
+            or replay.get("state_digest") != state_digest
+            or evidence.final_state.get("bounded_checkpoint_manifest_hash") != bundle.manifest_sha256
+        ):
+            raise G23Blocked("state_replay:BOUNDED_CHECKPOINT_BINDING")
+        if int(state.get("processed_block_pairs", -1)) != int(evidence.final_state.get("processed_block_pairs", -2)):
+            raise G23Blocked("state_replay:BOUNDED_FINAL_COUNT_DRIFT")
+        if replay.get("source_one_shot_result_hash") != replay.get("replayed_one_shot_result_hash") or replay.get("source_one_shot_result_hash") != evidence.identities.get("one_shot_result_hash"):
+            raise G23Blocked("state_replay:RESULT_HASH_DRIFT")
+        return True
     commit_path = evidence.final_root / artifact_ref
     try:
         commit = load_canonical_json(commit_path)
@@ -2427,6 +2689,140 @@ def _bootstrap_independent_bias_interval(
     return np.quantile(matrix, 0.025, axis=0), np.quantile(matrix, 0.975, axis=0)
 
 
+_CHEBYSHEV_95 = math.sqrt(20.0)
+
+
+def _bounded_square_mean_variance(moment: _BoundedMoments, field: str) -> dict[str, np.ndarray]:
+    """Exact delete-one jackknife variance of ``mean(block)^2`` from powers."""
+
+    if moment.count < 3 or not moment.include_higher or not moment.p3 or not moment.p4:
+        raise G23Blocked(f"{field}:HIGHER_MOMENTS_REQUIRED")
+    n = float(moment.count)
+    weight = float(moment.first_weight or 0.0)
+    if weight <= 0.0:
+        raise G23Blocked(f"{field}:WEIGHT_REQUIRED")
+    result: dict[str, np.ndarray] = {}
+    for name in moment.g1:
+        s1 = moment.g1[name] / weight
+        s2, s3, s4 = moment.p2[name], moment.p3[name], moment.p4[name]
+        center = np.square(s1 / n)
+        denominator = np.square(n - 1.0)
+        a = np.square(s1) / denominator
+        b = -2.0 * s1 / denominator
+        c = np.full_like(s1, 1.0 / denominator)
+        sum_theta = n * a + b * s1 + c * s2
+        sum_theta2 = (
+            n * np.square(a)
+            + np.square(b) * s2
+            + np.square(c) * s4
+            + 2.0 * a * b * s1
+            + 2.0 * a * c * s2
+            + 2.0 * b * c * s3
+        )
+        variance = (n - 1.0) / n * (
+            sum_theta2 - 2.0 * center * sum_theta + n * np.square(center)
+        )
+        tolerance = 1e-12 * np.maximum(1.0, np.abs(sum_theta2))
+        if np.any(variance < -tolerance):
+            raise G23Blocked(f"{field}:NEGATIVE_JACKKNIFE_VARIANCE")
+        result[name] = np.maximum(variance, 0.0)
+    return result
+
+
+def _bounded_precision_diagnostics(
+    *,
+    bias: Mapping[str, np.ndarray],
+    cross: Mapping[str, np.ndarray],
+    moments_a: _BoundedMoments,
+    moments_b: _BoundedMoments,
+    uncertainty: ReferenceUncertainty,
+    layer_groups: Mapping[str, Sequence[str]],
+    module_groups: Mapping[str, Sequence[str]],
+) -> dict[str, object]:
+    """Conservative 95% endpoint envelopes from exact bounded jackknife data.
+
+    Raw-shard rounds retain their fixed bootstrap implementation.  For the
+    bounded representation, a distribution-free Chebyshev multiplier is
+    applied to the exact online jackknife variance.  This is deliberately
+    wider (and therefore harder for the precision Gate) than a normal 95%
+    interval; thresholds and margins are unchanged.
+    """
+
+    bias_half = {
+        name: _CHEBYSHEV_95 * np.sqrt(np.maximum(value, 0.0))
+        for name, value in uncertainty.bias_variance.items()
+    }
+    cross_half = {
+        name: _CHEBYSHEV_95 * np.sqrt(np.maximum(value, 0.0))
+        for name, value in uncertainty.cross_variance.items()
+    }
+    a_variance = _bounded_square_mean_variance(moments_a, "bounded.a_square")
+    b_variance = _bounded_square_mean_variance(moments_b, "bounded.b_square")
+    a_half_map = {name: _CHEBYSHEV_95 * np.sqrt(value) for name, value in a_variance.items()}
+    b_half_map = {name: _CHEBYSHEV_95 * np.sqrt(value) for name, value in b_variance.items()}
+    mean_a, mean_b = moments_a.mean(), moments_b.mean()
+    a_rank_map = {name: np.square(value) for name, value in mean_a.items()}
+    b_rank_map = {name: np.square(value) for name, value in mean_b.items()}
+
+    def relative_l1_bound(groups: Mapping[str, Sequence[str]]) -> float:
+        center_total, center_mean = _aggregate(bias, groups)
+        total_bound = 0.0
+        mean_bound = 0.0
+        for names in groups.values():
+            group_bound = float(sum(np.sum(bias_half[name]) for name in names))
+            group_count = float(sum(bias[name].size for name in names))
+            total_bound += group_bound
+            mean_bound += group_bound / max(group_count, 1.0)
+        return max(
+            total_bound / max(float(np.abs(center_total).sum()), 1e-300),
+            mean_bound / max(float(np.abs(center_mean).sum()), 1e-300),
+        )
+
+    model_half = float(sum(np.sum(value) for value in bias_half.values()))
+    layer_q95 = relative_l1_bound(layer_groups)
+    module_q95 = relative_l1_bound(module_groups)
+    flat_bias_half = _flat(bias_half)
+    flat_cross_half = _flat(cross_half)
+    flat_a_half = _flat(a_half_map)
+    flat_b_half = _flat(b_half_map)
+    flat_a = _flat(a_rank_map)
+    flat_b = _flat(b_rank_map)
+    return {
+        "uncertainty_method": "bounded-exact-jackknife-chebyshev95-v1",
+        "h_ref": max(model_half, layer_q95, module_q95),
+        "model_half_width": model_half,
+        "layer_l1_q95": layer_q95,
+        "module_l1_q95": module_q95,
+        "bias_low": _flat(bias) - flat_bias_half,
+        "bias_high": _flat(bias) + flat_bias_half,
+        "cross_low": _flat(cross) - flat_cross_half,
+        "cross_high": _flat(cross) + flat_cross_half,
+        "a_rank": flat_a,
+        "b_rank": flat_b,
+        "a_half": flat_a_half,
+        "b_half": flat_b_half,
+    }
+
+
+def _sequence_scaling_bounded(
+    evidence: _CellEvidence,
+    moments_a: _BoundedMoments,
+    moments_b: _BoundedMoments,
+    block_size: int,
+) -> bool:
+    if evidence.bundle_state is None:
+        raise G23Blocked("variance_scaling:bundle_missing")
+    stored = _vector(evidence.bundle_state.get("sequence_variance"), "bundle.sequence_variance")
+    try:
+        expected = estimate_sequence_variance_bounded(
+            moments_a.combine(moments_b), block_size=block_size
+        )
+    except ValueError as error:
+        raise G23Blocked("variance_scaling:BOUNDED_RECOMPUTE_FAILED") from error
+    _compatible(expected, stored, "variance_scaling")
+    return all(np.allclose(expected[name], stored[name], rtol=1e-12, atol=1e-12) for name in expected)
+
+
 def _sequence_scaling(
     evidence: _CellEvidence,
     blocks: Sequence[Mapping[str, np.ndarray]],
@@ -2472,7 +2868,15 @@ def _evaluate_cell(evidence: _CellEvidence) -> dict[str, object]:
         return cell
     try:
         counts, previous, plan = _sizing_vectors(evidence)
-        bias, cross, ranking, blocks_a, blocks_b, uncertainty = _final_vectors(evidence)
+        bounded = bool(evidence.final_state and evidence.final_state.get("bounded_storage"))
+        moments_a: _BoundedMoments | None = None
+        moments_b: _BoundedMoments | None = None
+        if bounded:
+            bias, cross, ranking, moments_a, moments_b, uncertainty = _final_vectors_bounded(evidence)
+            blocks_a: Sequence[Mapping[str, np.ndarray]] = ()
+            blocks_b: Sequence[Mapping[str, np.ndarray]] = ()
+        else:
+            bias, cross, ranking, blocks_a, blocks_b, uncertainty = _final_vectors(evidence)
         previous_bias, latest_bias = previous
         flat_prev, flat_latest = _flat(previous_bias), _flat(latest_bias)
         delta_sci, min_delta_by_endpoint = _delta_sci(evidence, [int(item) for item in plan["candidate_sample_counts"]])
@@ -2498,7 +2902,11 @@ def _evaluate_cell(evidence: _CellEvidence) -> dict[str, object]:
         high_numeric = _vector(numeric_bundle.get("high_precision"), "epsilon_num.high_precision")
         accumulated_numeric = _vector(numeric_bundle.get("accumulated"), "epsilon_num.accumulated")
         _compatible(high_numeric, accumulated_numeric, "epsilon_num")
-        error_vector = {name: np.abs(high_numeric[name] - accumulated_numeric[name]) for name in high_numeric}
+        error_vector = (
+            _vector(numeric_bundle.get("error_bound"), "epsilon_num.error_bound")
+            if bounded
+            else {name: np.abs(high_numeric[name] - accumulated_numeric[name]) for name in high_numeric}
+        )
         epsilon_by_endpoint = {
             "model_total": float(sum(np.sum(value) for value in error_vector.values())),
             "layer": float(sum(np.sum(error_vector[name]) for names in layer.values() for name in names)),
@@ -2511,39 +2919,57 @@ def _evaluate_cell(evidence: _CellEvidence) -> dict[str, object]:
         _compatible(bias_variance, ranking_variance, "variance")
         if evidence.final_state is None:
             raise G23Blocked("final:STATE_MISSING")
-        if evidence.final_root is None:
-            raise G23Blocked("final:SHARD_ROOT_MISSING")
-        _, weights_a, _ = _load_shard_records(
-            evidence.final_root,
-            evidence.final_state.get("shard_refs_a"),
-            "final.shard_refs_a",
-        )
-        _, weights_b, _ = _load_shard_records(
-            evidence.final_root,
-            evidence.final_state.get("shard_refs_b"),
-            "final.shard_refs_b",
-        )
-        h_ref, model_half_width, layer_l1_q95, module_l1_q95 = _bootstrap_u_diagnostics(
-            blocks_a,
-            blocks_b,
-            weights_a,
-            weights_b,
-            latest_bias,
-            layer,
-            module,
-        )
-        bias_low, bias_high = _bootstrap_independent_bias_interval(
-            blocks_a, weights_a, blocks_b, weights_b, "bias.bootstrap"
-        )
-        a_mean, b_mean = _weighted_mean_from_moments(_moments_from_blocks(blocks_a, weights_a, "a_mean"), "a_mean"), _weighted_mean_from_moments(_moments_from_blocks(blocks_b, weights_b, "b_mean"), "b_mean")
-        a_rank, b_rank = np.square(_flat(a_mean)), np.square(_flat(b_mean))
-        a_low, a_high, _ = _bootstrap_interval(blocks_a, weights_a, "a.square.bootstrap", square=True)
-        b_low, b_high, _ = _bootstrap_interval(blocks_b, weights_b, "b.square.bootstrap", square=True)
-        cross_low, cross_high = _bootstrap_independent_cross_interval(
-            blocks_a, weights_a, blocks_b, weights_b, "cross.bootstrap"
-        )
-        a_half = (a_high - a_low) / 2.0
-        b_half = (b_high - b_low) / 2.0
+        if bounded:
+            if moments_a is None or moments_b is None:
+                raise G23Blocked("final:BOUNDED_MOMENTS_MISSING")
+            bounded_precision = _bounded_precision_diagnostics(
+                bias=bias,
+                cross=cross,
+                moments_a=moments_a,
+                moments_b=moments_b,
+                uncertainty=uncertainty,
+                layer_groups=layer,
+                module_groups=module,
+            )
+            h_ref = float(bounded_precision["h_ref"])
+            model_half_width = float(bounded_precision["model_half_width"])
+            layer_l1_q95 = float(bounded_precision["layer_l1_q95"])
+            module_l1_q95 = float(bounded_precision["module_l1_q95"])
+            bias_low = np.asarray(bounded_precision["bias_low"])
+            bias_high = np.asarray(bounded_precision["bias_high"])
+            cross_low = np.asarray(bounded_precision["cross_low"])
+            cross_high = np.asarray(bounded_precision["cross_high"])
+            a_rank = np.asarray(bounded_precision["a_rank"])
+            b_rank = np.asarray(bounded_precision["b_rank"])
+            a_half = np.asarray(bounded_precision["a_half"])
+            b_half = np.asarray(bounded_precision["b_half"])
+            weights_a: list[float] = []
+            weights_b: list[float] = []
+        else:
+            if evidence.final_root is None:
+                raise G23Blocked("final:SHARD_ROOT_MISSING")
+            _, weights_a, _ = _load_shard_records(
+                evidence.final_root, evidence.final_state.get("shard_refs_a"), "final.shard_refs_a"
+            )
+            _, weights_b, _ = _load_shard_records(
+                evidence.final_root, evidence.final_state.get("shard_refs_b"), "final.shard_refs_b"
+            )
+            h_ref, model_half_width, layer_l1_q95, module_l1_q95 = _bootstrap_u_diagnostics(
+                blocks_a, blocks_b, weights_a, weights_b, latest_bias, layer, module
+            )
+            bias_low, bias_high = _bootstrap_independent_bias_interval(
+                blocks_a, weights_a, blocks_b, weights_b, "bias.bootstrap"
+            )
+            a_mean = _weighted_mean_from_moments(_moments_from_blocks(blocks_a, weights_a, "a_mean"), "a_mean")
+            b_mean = _weighted_mean_from_moments(_moments_from_blocks(blocks_b, weights_b, "b_mean"), "b_mean")
+            a_rank, b_rank = np.square(_flat(a_mean)), np.square(_flat(b_mean))
+            a_low, a_high, _ = _bootstrap_interval(blocks_a, weights_a, "a.square.bootstrap", square=True)
+            b_low, b_high, _ = _bootstrap_interval(blocks_b, weights_b, "b.square.bootstrap", square=True)
+            cross_low, cross_high = _bootstrap_independent_cross_interval(
+                blocks_a, weights_a, blocks_b, weights_b, "cross.bootstrap"
+            )
+            a_half = (a_high - a_low) / 2.0
+            b_half = (b_high - b_low) / 2.0
         signal_floor = evidence.convergence.payload.get("numerical_floor") if evidence.convergence is not None else None
         if signal_floor is None:
             raise G23Blocked("signal_eligible:numerical_floor_missing")
@@ -2590,6 +3016,11 @@ def _evaluate_cell(evidence: _CellEvidence) -> dict[str, object]:
             "sizing_min_delta_sci": min(min_delta_by_endpoint.values()),
             "sizing_node_previous": int(counts[0]),
             "sizing_node_latest": int(counts[1]),
+            "uncertainty_method": (
+                bounded_precision["uncertainty_method"]
+                if bounded
+                else "raw-shard-fixed-bootstrap-v1"
+            ),
         }
         checks: dict[str, bool] = {
             "normalized_l1": metrics["normalized_l1"] <= THRESHOLDS["normalized_l1"],
@@ -2623,9 +3054,13 @@ def _evaluate_cell(evidence: _CellEvidence) -> dict[str, object]:
                 for vector in (bias_variance, cross_variance, ranking_variance)
                 for value in vector.values()
             ),
-            "variance_scaling_verified": _sequence_scaling(
-                evidence, blocks_a, block_size, weights_a,
-                extra_blocks=blocks_b, extra_weights=weights_b,
+            "variance_scaling_verified": (
+                _sequence_scaling_bounded(evidence, moments_a, moments_b, block_size)
+                if bounded and moments_a is not None and moments_b is not None
+                else _sequence_scaling(
+                    evidence, blocks_a, block_size, weights_a,
+                    extra_blocks=blocks_b, extra_weights=weights_b,
+                )
             ),
             "state_replay_verified": _state_replay_verified(evidence),
         }
@@ -2641,7 +3076,11 @@ def _evaluate_cell(evidence: _CellEvidence) -> dict[str, object]:
             and plan_one_shot.get("stream_a") == "reference_A"
             and plan_one_shot.get("stream_b") == "reference_B"
             and int(one_shot.get("processed_sample_count_per_stream", 0)) == int(plan_one_shot.get("sample_count_per_stream", -1))
-            and len(blocks_a) * block_size == int(one_shot.get("processed_sample_count_per_stream", -1))
+            and (
+                int(evidence.final_state.get("processed_block_pairs", 0)) * block_size
+                if bounded and evidence.final_state is not None
+                else len(blocks_a) * block_size
+            ) == int(one_shot.get("processed_sample_count_per_stream", -1))
         )
         checks["a_b_interval_covered"] = bool(np.all(np.abs(a_rank - b_rank) <= a_half + b_half))
         checks["a_b_top_overlap"] = bool(

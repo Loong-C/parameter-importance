@@ -44,6 +44,8 @@ from param_importance_nlp.experiments.stage23_task_runners import (
     build_stage23_runner_overrides,
     register_stage23_runners,
 )
+from param_importance_nlp.experiments import stage23_task_runners
+from param_importance_nlp.experiments.stage2_formal import ReferenceSizingPlan
 from param_importance_nlp.experiments.sampling import SamplingPlan, SamplingUniverse, STREAM_NAMES
 from param_importance_nlp.runtime.task_artifacts import TaskArtifactStore
 from param_importance_nlp.runtime.task_runtime import (
@@ -457,6 +459,58 @@ def test_stage2_reference_runner_executes_and_task_resume_is_hash_identical(
     assert convergence["recovery_semantics"] == "authoritative_block_pair_commits"
     assert gate["gate_status"] == "NOT_RUN"
     assert gate["local_validation_status"] == "PASS"
+
+
+def test_stage2_reference_bounded_task_runtime_completes_with_reloadable_diagnostics(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original_plan = stage23_task_runners._stage2_reference_plan
+
+    def bounded_fixture_plan(request, root, context, authoritative=None):
+        plan, refs = original_plan(request, root, context, authoritative)
+        if request.config.run_intent != "local_fixture":
+            return plan, refs
+        return (
+            ReferenceSizingPlan(
+                reference_id=plan.reference_id,
+                candidate_sample_counts=plan.candidate_sample_counts,
+                block_size=plan.block_size,
+                convergence_tolerance=plan.convergence_tolerance,
+                required_consecutive=plan.required_consecutive,
+                execution=plan.execution,
+                require_terminal_convergence=True,
+            ),
+            refs,
+        )
+
+    monkeypatch.setattr(
+        stage23_task_runners, "_stage2_reference_plan", bounded_fixture_plan
+    )
+    _runtime_value, _configs, results = _run_chain(
+        tmp_path, stop_after="stage2.04_reference_target"
+    )
+    result = results["stage2.04_reference_target"]
+    assert result.status is TaskRunStatus.PASS
+    convergence = _payload(
+        tmp_path, result.artifact_refs["reference_convergence_report"]
+    )
+    resume = tmp_path / "runs" / "stage2-04_reference_target" / "resume"
+    assert (resume / "reference-sizing" / "bounded-checkpoint").is_dir()
+    assert (resume / "reference-final" / "bounded-checkpoint").is_dir()
+    assert not tuple(resume.rglob("commits/*.json"))
+    assert (
+        convergence["numerical_diagnostics"]["schema_version"]
+        == "stage2-reference-numerical-diagnostics-v2"
+    )
+    assert (
+        convergence["resume_replay"]["schema_version"]
+        == "stage2-reference-resume-replay-v2"
+    )
+    assert (
+        convergence["numerical_diagnostics"]["storage_mode"]
+        == "bounded-online-fp64-v1"
+    )
 
 
 def test_stage2_partial_shard_requires_explicit_resume_ref(tmp_path: Path) -> None:

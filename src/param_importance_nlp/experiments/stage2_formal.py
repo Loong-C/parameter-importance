@@ -1458,6 +1458,81 @@ def estimate_reference_uncertainty_bounded(
     return ReferenceUncertainty(bias_variance, cross_variance, ranking_variance, moments_a.count, moments_b.count)
 
 
+def bounded_reference_numeric_diagnostics(
+    moments_a: "_BoundedMoments",
+    moments_b: "_BoundedMoments",
+) -> tuple[dict[str, np.ndarray], dict[str, np.ndarray], dict[str, np.ndarray]]:
+    """Recompute bounded U arithmetic and a conservative FP64 error bound.
+
+    The bounded formal representation deliberately does not retain raw block
+    vectors.  It does retain equal-weight first through fourth power sums.
+    Those sums are sufficient to recompute the U statistic in extended
+    precision and to bound the preceding FP64 online additions.  Returning
+    the bound as a vector keeps the numerical Gate at least as strict as the
+    raw-shard absolute-error check; it never turns missing raw blocks into a
+    caller-authored scalar.
+    """
+
+    if (
+        moments_a.count < 3
+        or moments_b.count < 3
+        or not moments_a.all_equal_weights
+        or not moments_b.all_equal_weights
+        or moments_a.first_weight is None
+        or moments_b.first_weight is None
+        or moments_a.first_weight != moments_b.first_weight
+    ):
+        raise ValueError("REFERENCE_BOUNDED_NUMERIC_REQUIRES_EQUAL_WEIGHTS")
+    combined = moments_a.combine(moments_b)
+    if not combined.include_higher or not combined.p3 or not combined.p4:
+        raise ValueError("REFERENCE_BOUNDED_HIGHER_MOMENTS_MISSING")
+    accumulated = combined.u(
+        assumptions={"weights_exogenous": True, "common_mean_assumption": True}
+    )
+    weight = float(combined.first_weight)
+    denominator = np.longdouble(combined.n1) ** 2 - np.longdouble(combined.n2)
+    if not np.isfinite(denominator) or denominator <= 0:
+        raise ValueError("REFERENCE_BOUNDED_NUMERIC_DENOMINATOR_INVALID")
+    eps = float(np.finfo(np.float64).eps)
+    operations = max(1, combined.count)
+    if operations * eps >= 1.0:
+        raise ValueError("REFERENCE_BOUNDED_NUMERIC_ERROR_BOUND_UNDEFINED")
+    gamma = operations * eps / (1.0 - operations * eps)
+    high: dict[str, np.ndarray] = {}
+    error_bound: dict[str, np.ndarray] = {}
+    denominator_float = float(combined.n1**2 - combined.n2)
+    for name in combined.g1:
+        first = np.asarray(combined.g1[name], dtype=np.longdouble)
+        second = np.asarray(combined.g2[name], dtype=np.longdouble)
+        high[name] = np.asarray((first * first - second) / denominator, dtype=np.float64)
+
+        # Cauchy gives sum(abs(x_i)) <= sqrt(n * sum(x_i^2)); p2 is the
+        # unweighted sum of squares and the formal bounded path requires one
+        # common positive block weight.
+        sum_abs_bound = np.sqrt(
+            float(combined.count)
+            * np.maximum(np.asarray(combined.p2[name], dtype=np.float64), 0.0)
+        )
+        first_error = gamma * abs(weight) * sum_abs_bound
+        second_error = gamma * weight * weight * np.maximum(
+            np.asarray(combined.p2[name], dtype=np.float64), 0.0
+        )
+        numerator_error = (
+            2.0 * np.abs(combined.g1[name]) * first_error
+            + np.square(first_error)
+            + second_error
+        )
+        final_rounding = eps * np.abs(accumulated[name]) / (1.0 - eps)
+        bound = numerator_error / denominator_float + final_rounding
+        # The observable extended-vs-FP64 difference is itself a lower bound
+        # on the required envelope, so retain the larger value coordinatewise.
+        error_bound[name] = np.maximum(
+            np.asarray(bound, dtype=np.float64),
+            np.abs(high[name] - accumulated[name]),
+        )
+    return high, accumulated, error_bound
+
+
 @dataclass(frozen=True, slots=True)
 class OneShotReferencePlan:
     """Frozen final A/B run created only after sizing has selected B_ref."""
@@ -2670,7 +2745,8 @@ class OneShotReferenceRunner:
                     raise ValueError("ONE_SHOT_REFERENCE_RESUME_SHARD_REFS_MISSING")
                 shard_refs_a = [dict(item) for item in raw_a if isinstance(item, Mapping)]
                 shard_refs_b = [dict(item) for item in raw_b if isinstance(item, Mapping)]
-                if len(shard_refs_a) != processed_pairs or len(shard_refs_b) != processed_pairs:
+                expected_refs = 0 if bounded_storage else processed_pairs
+                if len(shard_refs_a) != expected_refs or len(shard_refs_b) != expected_refs:
                     raise ValueError("ONE_SHOT_REFERENCE_RESUME_SHARD_COUNT_MISMATCH")
                 if not bounded_storage:
                     rebuilt_a = _moments_from_shards(shard_store, shard_refs_a, assumptions)
@@ -2919,8 +2995,13 @@ class StreamingReferenceSizer:
                     raise ValueError("REFERENCE_RESUME_SHARD_REFS_MISSING")
                 shard_refs_a = [dict(item) for item in raw_a if isinstance(item, Mapping)]
                 shard_refs_b = [dict(item) for item in raw_b if isinstance(item, Mapping)]
-                expected_b_refs = 0 if draws_sizing is not None else processed_pairs
-                if len(shard_refs_a) != processed_pairs or len(shard_refs_b) != expected_b_refs:
+                expected_a_refs = 0 if bounded_storage else processed_pairs
+                expected_b_refs = (
+                    0
+                    if bounded_storage or draws_sizing is not None
+                    else processed_pairs
+                )
+                if len(shard_refs_a) != expected_a_refs or len(shard_refs_b) != expected_b_refs:
                     raise ValueError("REFERENCE_RESUME_SHARD_COUNT_MISMATCH")
                 if not bounded_storage:
                     rebuilt_a = _moments_from_shards(shard_store, shard_refs_a, assumptions)

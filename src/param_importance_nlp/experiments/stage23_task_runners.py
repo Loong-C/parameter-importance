@@ -176,6 +176,7 @@ from .stage2_formal import (
     _BoundedCheckpointStore,
     _BoundedMoments,
     _bounded_moments_digest,
+    bounded_reference_numeric_diagnostics,
     estimate_sequence_variance_bounded,
     _moments_from_shards,
     _draw_digest,
@@ -3797,6 +3798,58 @@ def _reference_numeric_diagnostics(
     tensor bundle because it contains the signed vectors.
     """
 
+    bounded_path = final_root / "bounded-checkpoint"
+    if bounded_path.exists():
+        state, bundle = load_tensor_bundle(bounded_path)
+        if (
+            not isinstance(state, Mapping)
+            or state.get("checkpoint_schema") != _BoundedCheckpointStore.schema_version
+            or state.get("schema_version") != "stage2-reference-one-shot-progress-v1"
+        ):
+            raise RuntimeError("STAGE2_REFERENCE_NUMERIC_BOUNDED_CHECKPOINT_INVALID")
+        try:
+            moments_a = _BoundedMoments.from_state(state["a"])  # type: ignore[arg-type]
+            moments_b = _BoundedMoments.from_state(state["b"])  # type: ignore[arg-type]
+            high, accumulated, error_bound = bounded_reference_numeric_diagnostics(
+                moments_a, moments_b
+            )
+        except (KeyError, TypeError, ValueError) as error:
+            raise RuntimeError("STAGE2_REFERENCE_NUMERIC_BOUNDED_MOMENTS_INVALID") from error
+        if any(
+            not np.array_equal(accumulated[name], np.asarray(result.bias_reference[name]))
+            for name in accumulated
+        ):
+            raise RuntimeError("STAGE2_REFERENCE_NUMERIC_BOUNDED_RESULT_DRIFT")
+        state_digest = canonical_json_hash(
+            {
+                "checkpoint_schema": _BoundedCheckpointStore.schema_version,
+                "object_manifest_hash": bundle.manifest_sha256,
+            }
+        )
+        numeric_vectors = {
+            "high_precision": high,
+            "accumulated": accumulated,
+            "error_bound": error_bound,
+        }
+        metadata: dict[str, object] = {
+            "schema_version": "stage2-reference-numerical-diagnostics-v2",
+            "storage_mode": "bounded-online-fp64-v1",
+            "recompute_method": "longdouble_u_from_hash_bound_bounded_moments_with_fp64_error_envelope",
+            "bounded_checkpoint_ref": "bounded-checkpoint",
+            "bounded_checkpoint_manifest_hash": bundle.manifest_sha256,
+            "bounded_checkpoint_state_digest": state_digest,
+            "moments_a_hash": _bounded_moments_digest(moments_a),
+            "moments_b_hash": _bounded_moments_digest(moments_b),
+            "high_precision_hash": _vector_digest(high),
+            "accumulated_hash": _vector_digest(accumulated),
+            "error_bound_hash": _vector_digest(error_bound),
+            "max_abs_error": max(
+                float(np.max(value)) for value in error_bound.values()
+            ),
+        }
+        metadata["artifact_hash"] = canonical_json_hash(metadata)
+        return metadata, numeric_vectors
+
     commits = sorted((final_root / "commits").glob("*.json"))
     if not commits:
         raise RuntimeError("STAGE2_REFERENCE_NUMERIC_BLOCK_COMMITS_MISSING")
@@ -3975,7 +4028,7 @@ def _run_stage2_reference(
         artifact_root=store.root / "resume" / "reference-sizing",
         rng_boundaries=sizing_rng_boundaries,
         require_rng_boundaries=request.config.run_intent == "formal",
-        bounded_storage=request.config.run_intent == "formal" and plan.require_terminal_convergence,
+        bounded_storage=plan.require_terminal_convergence,
     )
     terminal_point = result.points[-1] if result.points else None
     terminal_pass = bool(
@@ -4076,7 +4129,7 @@ def _run_stage2_reference(
         rng_boundaries_a=final_a_rng_boundaries,
         rng_boundaries_b=final_b_rng_boundaries,
         require_rng_boundaries=request.config.run_intent == "formal",
-        bounded_storage=request.config.run_intent == "formal" and plan.require_terminal_convergence,
+        bounded_storage=plan.require_terminal_convergence,
     )
     if one_shot.status != "COMPLETE":
         raise _blocked(
@@ -4096,7 +4149,7 @@ def _run_stage2_reference(
         rng_boundaries_a=final_a_rng_boundaries,
         rng_boundaries_b=final_b_rng_boundaries,
         require_rng_boundaries=request.config.run_intent == "formal",
-        bounded_storage=request.config.run_intent == "formal" and plan.require_terminal_convergence,
+        bounded_storage=plan.require_terminal_convergence,
     )
     if replay.status != "COMPLETE" or replay.artifact_hash != one_shot.artifact_hash:
         raise _blocked(
@@ -4189,21 +4242,49 @@ def _run_stage2_reference(
     registry_identity["identity_hash"] = _reference_identity_hash(registry_identity)
     sizing_plan = plan.to_dict()
     sizing_plan_hash = plan.artifact_hash
-    final_commits = sorted((store.root / "resume" / "reference-final" / "commits").glob("*.json"))
-    replay_commit_ref = (
-        final_commits[-1]
-        .relative_to(store.root / "resume" / "reference-final")
-        .as_posix()
-        if final_commits
-        else None
-    )
-    replay_commit = load_canonical_json(final_commits[-1]) if final_commits else {}
+    final_resume_root = store.root / "resume" / "reference-final"
+    final_commits = sorted((final_resume_root / "commits").glob("*.json"))
+    bounded_replay_path = final_resume_root / "bounded-checkpoint"
+    if bounded_replay_path.exists():
+        bounded_replay_state, bounded_replay_bundle = load_tensor_bundle(
+            bounded_replay_path
+        )
+        if (
+            not isinstance(bounded_replay_state, Mapping)
+            or bounded_replay_state.get("checkpoint_schema")
+            != _BoundedCheckpointStore.schema_version
+        ):
+            raise RuntimeError("STAGE2_REFERENCE_REPLAY_BOUNDED_CHECKPOINT_INVALID")
+        replay_commit_ref: str | None = "bounded-checkpoint"
+        replay_artifact_hash = bounded_replay_bundle.manifest_sha256
+        replay_object_manifest_hash = bounded_replay_bundle.manifest_sha256
+        replay_state_digest = canonical_json_hash(
+            {
+                "checkpoint_schema": _BoundedCheckpointStore.schema_version,
+                "object_manifest_hash": bounded_replay_bundle.manifest_sha256,
+            }
+        )
+        replay_schema = "stage2-reference-resume-replay-v2"
+        replay_storage_mode = "bounded-online-fp64-v1"
+    else:
+        replay_commit_ref = (
+            final_commits[-1].relative_to(final_resume_root).as_posix()
+            if final_commits
+            else None
+        )
+        replay_commit = load_canonical_json(final_commits[-1]) if final_commits else {}
+        replay_artifact_hash = replay_commit.get("artifact_hash")
+        replay_object_manifest_hash = replay_commit.get("object_manifest_hash")
+        replay_state_digest = replay_commit.get("state_digest")
+        replay_schema = "stage2-reference-resume-replay-v1"
+        replay_storage_mode = "raw-shards-v1"
     replay_diagnostic = {
-        "schema_version": "stage2-reference-resume-replay-v1",
+        "schema_version": replay_schema,
+        "storage_mode": replay_storage_mode,
         "artifact_ref": replay_commit_ref,
-        "artifact_hash": replay_commit.get("artifact_hash"),
-        "state_digest": replay_commit.get("state_digest"),
-        "object_manifest_hash": replay_commit.get("object_manifest_hash"),
+        "artifact_hash": replay_artifact_hash,
+        "state_digest": replay_state_digest,
+        "object_manifest_hash": replay_object_manifest_hash,
         "source_one_shot_result_hash": one_shot.artifact_hash,
         "replayed_one_shot_result_hash": replay.artifact_hash,
         "sizing_result_identity_hash": canonical_json_hash(
@@ -4257,8 +4338,23 @@ def _run_stage2_reference(
             },
             "sequence_variance": one_shot.sequence_variance,
             "numerical_diagnostics": {
-                "schema_version": "stage2-reference-numerical-diagnostics-v1",
-                "raw_block_digest": numerical_metadata["raw_block_digest"],
+                "schema_version": numerical_metadata["schema_version"],
+                **(
+                    {
+                        "raw_block_digest": numerical_metadata["raw_block_digest"],
+                    }
+                    if numerical_metadata.get("storage_mode") is None
+                    else {
+                        "storage_mode": numerical_metadata["storage_mode"],
+                        "bounded_checkpoint_ref": numerical_metadata["bounded_checkpoint_ref"],
+                        "bounded_checkpoint_manifest_hash": numerical_metadata["bounded_checkpoint_manifest_hash"],
+                        "bounded_checkpoint_state_digest": numerical_metadata["bounded_checkpoint_state_digest"],
+                        "moments_a_hash": numerical_metadata["moments_a_hash"],
+                        "moments_b_hash": numerical_metadata["moments_b_hash"],
+                        "error_bound": numerical_vectors["error_bound"],
+                        "error_bound_hash": numerical_metadata["error_bound_hash"],
+                    }
+                ),
                 "high_precision": numerical_vectors["high_precision"],
                 "accumulated": numerical_vectors["accumulated"],
                 "high_precision_hash": numerical_metadata["high_precision_hash"],
