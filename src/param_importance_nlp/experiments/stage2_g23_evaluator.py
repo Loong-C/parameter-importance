@@ -717,6 +717,11 @@ def _load_resume_commits(
             raise G23Blocked(f"resume:{schema}:MANIFEST_HASH")
         if not isinstance(state, Mapping) or state.get("schema_version") != schema:
             raise G23Blocked(f"resume:{schema}:STATE_SCHEMA")
+        if state.get("snapshot_encoding") == _ReferenceSnapshotStore._COMPACT_ENCODING:
+            try:
+                state = _ReferenceSnapshotStore.materialize(state, resume_root)
+            except (OSError, TypeError, ValueError) as error:
+                raise G23Blocked(f"resume:{schema}:COMPACT_SNAPSHOT_INVALID") from error
         if "blocks_a" in state or "blocks_b" in state or "block_weights_a" in state or "block_weights_b" in state:
             raise G23Blocked(f"resume:{schema}:RAW_BLOCKS_FORBIDDEN_USE_SHARDS")
         raw_refs_a, raw_refs_b = state.get("shard_refs_a"), state.get("shard_refs_b")

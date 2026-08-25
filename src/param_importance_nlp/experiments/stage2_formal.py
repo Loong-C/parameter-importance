@@ -1362,6 +1362,8 @@ class OneShotReferenceResult:
 class _ReferenceSnapshotStore:
     """每个 block pair 发布一个不可变状态对象和独立权威 commit。"""
 
+    _COMPACT_ENCODING = "stage2-reference-snapshot-shard-reconstruct-v1"
+
     def __init__(self, root: str | Path) -> None:
         self.root = Path(root)
         self.objects = self.root / "objects"
@@ -1395,14 +1397,37 @@ class _ReferenceSnapshotStore:
         payload = {
             key: value
             for key, value in state.items()
-            if key not in {"a", "b", "last_bias", "blocks_a", "blocks_b"}
+            if key
+            not in {
+                "a",
+                "b",
+                "last_bias",
+                "blocks_a",
+                "blocks_b",
+                "snapshot_encoding",
+            }
         }
-        payload["a_g1_hash"] = _vector_digest(a["g1"]) if a["g1"] else None
-        payload["a_g2_hash"] = _vector_digest(a["g2"]) if a["g2"] else None
-        payload["b_g1_hash"] = _vector_digest(b["g1"]) if b["g1"] else None
-        payload["b_g2_hash"] = _vector_digest(b["g2"]) if b["g2"] else None
+        for prefix, moments in (("a", a), ("b", b)):
+            for name in ("g1", "g2"):
+                value = moments.get(name)
+                hash_value = moments.get(f"{name}_hash")
+                if isinstance(value, Mapping):
+                    payload[f"{prefix}_{name}_hash"] = (
+                        _vector_digest(value) if value else None
+                    )
+                elif hash_value is None:
+                    raise ValueError("REFERENCE_MOMENTS_STATE_HASH_MISSING")
+                else:
+                    payload[f"{prefix}_{name}_hash"] = hash_value
         last = state.get("last_bias", {})
-        payload["last_bias_hash"] = _vector_digest(last) if last else None
+        if not isinstance(last, Mapping):
+            raise ValueError("REFERENCE_LAST_BIAS_STATE_NOT_MAPPING")
+        last_hash = last.get("vector_hash")
+        payload["last_bias_hash"] = (
+            _vector_digest(last)
+            if "vector_hash" not in last and last
+            else last_hash
+        )
         for key in ("blocks_a", "blocks_b"):
             blocks = state.get(key, [])
             if not isinstance(blocks, list):
@@ -1412,11 +1437,125 @@ class _ReferenceSnapshotStore:
             )
         return canonical_json_hash(payload)
 
+    @staticmethod
+    def _compact_moments(state: Mapping[str, object]) -> dict[str, object]:
+        required = {
+            "count",
+            "n1",
+            "n2",
+            "first_weight",
+            "all_equal_weights",
+            "g1",
+            "g2",
+        }
+        if set(state) != required:
+            raise ValueError("REFERENCE_MOMENTS_STATE_FIELDS_MISMATCH")
+        g1, g2 = state["g1"], state["g2"]
+        if not isinstance(g1, Mapping) or not isinstance(g2, Mapping):
+            raise TypeError("REFERENCE_MOMENTS_TENSORS_NOT_MAPPINGS")
+        return {
+            "count": int(state["count"]),
+            "n1": float(state["n1"]),
+            "n2": float(state["n2"]),
+            "first_weight": state["first_weight"],
+            "all_equal_weights": bool(state["all_equal_weights"]),
+            "g1_hash": _vector_digest(g1) if g1 else None,
+            "g2_hash": _vector_digest(g2) if g2 else None,
+        }
+
+    @classmethod
+    def _compact_state(cls, state: Mapping[str, object]) -> dict[str, object]:
+        """Drop cumulative arrays; immutable block shards remain the source of truth."""
+
+        compact = dict(state)
+        compact["a"] = cls._compact_moments(state["a"])  # type: ignore[arg-type]
+        compact["b"] = cls._compact_moments(state["b"])  # type: ignore[arg-type]
+        last = state.get("last_bias", {})
+        if not isinstance(last, Mapping):
+            raise ValueError("REFERENCE_LAST_BIAS_STATE_NOT_MAPPING")
+        compact["last_bias"] = {
+            "vector_hash": _vector_digest(last) if last else None,
+        }
+        compact["snapshot_encoding"] = cls._COMPACT_ENCODING
+        return compact
+
+    @classmethod
+    def materialize(
+        cls, state: Mapping[str, object], root: str | Path
+    ) -> dict[str, object]:
+        """Rebuild cumulative moments/last bias from immutable shard prefixes."""
+
+        if state.get("snapshot_encoding") != cls._COMPACT_ENCODING:
+            return dict(state)
+        raw_a, raw_b = state.get("shard_refs_a"), state.get("shard_refs_b")
+        if not isinstance(raw_a, list) or not isinstance(raw_b, list):
+            raise ValueError("REFERENCE_RESUME_SHARD_REFS_MISSING")
+        assumptions = state.get("weighting_assumptions")
+        if not isinstance(assumptions, Mapping):
+            raise ValueError("REFERENCE_RESUME_WEIGHTING_CONTRACT_MISMATCH")
+        shard_store = _ReferenceShardStore(root)
+        references_a = [dict(item) for item in raw_a if isinstance(item, Mapping)]
+        references_b = [dict(item) for item in raw_b if isinstance(item, Mapping)]
+        if len(references_a) != len(raw_a) or len(references_b) != len(raw_b):
+            raise ValueError("REFERENCE_SHARD_REFS_INVALID")
+        moments_a = _moments_from_shards(shard_store, references_a, assumptions)
+        moments_b = _moments_from_shards(shard_store, references_b, assumptions)
+
+        def verify_meta(name: str, moments: _GradientMoments) -> None:
+            raw = state.get(name)
+            if not isinstance(raw, Mapping):
+                raise ValueError("REFERENCE_MOMENTS_STATE_NOT_MAPPING")
+            rebuilt = moments.to_state()
+            for field_name in ("count", "n1", "n2", "first_weight", "all_equal_weights"):
+                if raw.get(field_name) != rebuilt[field_name]:
+                    raise ValueError(f"REFERENCE_RESUME_{name.upper()}_MOMENTS_DRIFT")
+            for field_name in ("g1", "g2"):
+                expected = raw.get(f"{field_name}_hash")
+                actual = _vector_digest(rebuilt[field_name]) if rebuilt[field_name] else None
+                if expected != actual:
+                    raise ValueError(f"REFERENCE_RESUME_{name.upper()}_MOMENTS_DRIFT")
+
+        verify_meta("a", moments_a)
+        verify_meta("b", moments_b)
+        materialized = dict(state)
+        materialized["a"] = moments_a.to_state()
+        materialized["b"] = moments_b.to_state()
+        raw_last = state.get("last_bias")
+        if not isinstance(raw_last, Mapping):
+            raise ValueError("REFERENCE_RESUME_LAST_BIAS_NOT_MAPPING")
+        expected_last_hash = raw_last.get("vector_hash")
+        if expected_last_hash is None:
+            materialized["last_bias"] = {}
+        else:
+            last_pairs = int(state.get("last_bias_block_pairs", 0))
+            if last_pairs <= 0 or last_pairs > len(references_a):
+                raise ValueError("REFERENCE_RESUME_LAST_BIAS_PREFIX_INVALID")
+            prefix_a = _moments_from_shards(
+                shard_store, references_a[:last_pairs], assumptions
+            )
+            if state.get("sizing_stream") is True:
+                last_bias = _reference_vectors_single(prefix_a, assumptions)[0]
+            else:
+                if len(references_b) < last_pairs:
+                    raise ValueError("REFERENCE_RESUME_LAST_BIAS_PREFIX_INVALID")
+                prefix_b = _moments_from_shards(
+                    shard_store, references_b[:last_pairs], assumptions
+                )
+                last_bias = _reference_vectors(prefix_a, prefix_b, assumptions)[0]
+            if _vector_digest(last_bias) != expected_last_hash:
+                raise ValueError("REFERENCE_RESUME_LAST_BIAS_DRIFT")
+            materialized["last_bias"] = last_bias
+        materialized.pop("snapshot_encoding", None)
+        if cls._state_digest(materialized) != cls._state_digest(state):
+            raise ValueError("REFERENCE_STATE_DIGEST_MISMATCH")
+        return materialized
+
     def publish(self, sequence: int, state: Mapping[str, object]) -> None:
         state_digest = self._state_digest(state)
         object_path = self.objects / state_digest
+        compact_state = self._compact_state(state)
         if not object_path.exists():
-            bundle = publish_tensor_bundle(object_path, dict(state))
+            bundle = publish_tensor_bundle(object_path, compact_state)
         else:
             restored, bundle = load_tensor_bundle(object_path)
             if not isinstance(restored, Mapping) or self._state_digest(restored) != state_digest:
@@ -1465,7 +1604,7 @@ class _ReferenceSnapshotStore:
             raise ValueError("REFERENCE_OBJECT_MANIFEST_HASH_MISMATCH")
         if not isinstance(state, Mapping) or self._state_digest(state) != commit["state_digest"]:
             raise ValueError("REFERENCE_STATE_DIGEST_MISMATCH")
-        return state
+        return self.materialize(state, self.root)
 
 
 class _ReferenceShardStore:
@@ -1923,6 +2062,7 @@ class StreamingReferenceSizer:
         streak = 0
         selected: int | None = None
         last_bias: dict[str, np.ndarray] | None = None
+        last_bias_block_pairs = 0
         moments_a, moments_b = _GradientMoments(), _GradientMoments()
         shard_store = _ReferenceShardStore(artifact_root)
         shard_refs_a: list[Mapping[str, object]] = []
@@ -1981,6 +2121,7 @@ class StreamingReferenceSizer:
                     if not isinstance(raw_last, Mapping):
                         raise ValueError("REFERENCE_RESUME_LAST_BIAS_NOT_MAPPING")
                     last_bias = _as_vector(raw_last)
+                last_bias_block_pairs = int(restored.get("last_bias_block_pairs", 0))
 
             resumed_from = processed_pairs
             new_pairs = 0
@@ -2064,6 +2205,7 @@ class StreamingReferenceSizer:
                     )
                     points.append(point)
                     last_bias = bias
+                    last_bias_block_pairs = processed_pairs
                     if selected is None and streak >= plan.required_consecutive:
                         selected = sample_count
                 state: dict[str, object] = {
@@ -2077,6 +2219,7 @@ class StreamingReferenceSizer:
                     "selected_sample_count_per_stream": selected,
                     "points": [point.to_dict() for point in points],
                     "last_bias": {} if last_bias is None else last_bias,
+                    "last_bias_block_pairs": last_bias_block_pairs,
                     "a": moments_a.to_state(),
                     "b": moments_b.to_state(),
                     "shard_refs_a": list(shard_refs_a),
