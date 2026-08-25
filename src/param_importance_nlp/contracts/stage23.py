@@ -337,6 +337,10 @@ _STAGE23_ARTIFACT_FIELDS: dict[str, set[str]] = {
         "convergence_tolerance",
         "required_consecutive",
         "execution_evidence_hash",
+        "draw_start_position",
+        "draw_end_position_exclusive",
+        "require_terminal_convergence",
+        "round_manifest_ref",
         "artifact_hash",
     },
     "stage2-reference-sizing-result-v1": {
@@ -544,10 +548,18 @@ def validate_stage23_artifact(value: Mapping[str, object]) -> object:
     if not isinstance(schema, str) or schema not in _STAGE23_ARTIFACT_FIELDS:
         raise ValueError(f"未知 Stage2/3 artifact schema: {schema!r}")
     required = _STAGE23_ARTIFACT_FIELDS[schema]
-    if set(value) != required:
+    allowed_field_sets = (required,)
+    if schema == "stage2-reference-sizing-plan-v1":
+        legacy = required - {
+            "draw_start_position",
+            "draw_end_position_exclusive",
+            "require_terminal_convergence",
+            "round_manifest_ref",
+        }
+        allowed_field_sets = (legacy, required)
+    if set(value) not in allowed_field_sets:
         raise ValueError(
-            f"{schema} 字段集合不匹配：missing={sorted(required-set(value))}, "
-            f"extra={sorted(set(value)-required)}"
+            f"{schema} 字段集合不匹配：observed={sorted(set(value))}"
         )
     supplied = value.get("artifact_hash")
     if not isinstance(supplied, str):

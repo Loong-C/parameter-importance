@@ -19,17 +19,22 @@
     "prior_round_ref": {"type": "string", "minLength": 1},
     "sizing": {
       "type": "object", "additionalProperties": false,
-      "required": ["stream", "seed_namespace", "candidate_sample_counts", "block_size", "normalized_l1_threshold", "required_consecutive", "complete_all_candidates", "optional_stopping", "reuse_prior_sizing_prefix"],
+      "required": ["stream", "seed_namespace", "seed_namespace_mode", "parent_sampling_plan_hash", "candidate_sample_counts", "block_size", "normalized_l1_threshold", "required_consecutive", "complete_all_candidates", "optional_stopping", "reuse_prior_sizing_prefix", "segment_start_position", "segment_end_position_exclusive", "prior_consumed_end_position"],
       "properties": {
         "stream": {"const": "reference_sizing"},
         "seed_namespace": {"type": "string", "minLength": 1},
+        "seed_namespace_mode": {"const": "same_frozen_seed_disjoint_segment"},
+        "parent_sampling_plan_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
         "candidate_sample_counts": {"const": [32768, 65536]},
         "block_size": {"const": 32},
         "normalized_l1_threshold": {"const": 0.02},
         "required_consecutive": {"const": 1},
         "complete_all_candidates": {"const": true},
         "optional_stopping": {"const": false},
-        "reuse_prior_sizing_prefix": {"const": false}
+        "reuse_prior_sizing_prefix": {"const": false},
+        "segment_start_position": {"const": 16384},
+        "segment_end_position_exclusive": {"const": 81920},
+        "prior_consumed_end_position": {"const": 16384}
       }
     },
     "new_draws_before_freeze": {"const": false},

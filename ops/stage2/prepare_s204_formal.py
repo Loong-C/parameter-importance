@@ -27,6 +27,8 @@ from param_importance_nlp.runtime import load_committed_task_artifact, publish_c
 try:  # noqa: E402
     from ops.stage2.materialize_s204 import (
         EXPECTED_CELL_IDS,
+        DEFAULT_CANDIDATES,
+        DEFAULT_BLOCK_SIZE,
         S204_S22_CANONICAL_OUTPUT_DIR,
         S204_S22_CONTROL_OUTPUT_DIR,
         S204_S22_CONFIG_REF,
@@ -56,6 +58,8 @@ try:  # noqa: E402
 except ModuleNotFoundError:  # direct ``python ops/stage2/prepare...`` launch
     from materialize_s204 import (
         EXPECTED_CELL_IDS,
+        DEFAULT_CANDIDATES,
+        DEFAULT_BLOCK_SIZE,
         S204_S22_CANONICAL_OUTPUT_DIR,
         S204_S22_CONTROL_OUTPUT_DIR,
         S204_S22_CONFIG_REF,
@@ -106,6 +110,44 @@ def _required_ref(source: Mapping[str, Any], key: str) -> str:
     return value
 
 
+def _load_r22_round_manifest(root: Path, raw_ref: object) -> tuple[str, Mapping[str, Any]]:
+    """Load the append-only r22 sizing contract before any draw is read."""
+
+    if not isinstance(raw_ref, str) or not raw_ref:
+        raise _error("S204_R22_ROUND_REF_REQUIRED")
+    ref = _source_ref(raw_ref, "s204_r22_round_manifest")
+    value = load_canonical_json(_safe_relative(root, ref, "s204_r22_round_manifest"))
+    if not isinstance(value, Mapping) or value.get("schema_version") != "stage2-reference-sizing-round-v1":
+        raise _error("S204_R22_ROUND_MANIFEST_SCHEMA_INVALID")
+    if value.get("round_id") != "r22" or value.get("prior_round_id") != "r21" or value.get("prior_round_status") != "INCONCLUSIVE":
+        raise _error("S204_R22_ROUND_LINEAGE_INVALID")
+    sizing = value.get("sizing")
+    if not isinstance(sizing, Mapping):
+        raise _error("S204_R22_ROUND_SIZING_INVALID")
+    if (
+        sizing.get("stream") != "reference_sizing"
+        or sizing.get("candidate_sample_counts") != [32768, 65536]
+        or sizing.get("block_size") != 32
+        or sizing.get("normalized_l1_threshold") != 0.02
+        or sizing.get("required_consecutive") != 1
+        or sizing.get("complete_all_candidates") is not True
+        or sizing.get("optional_stopping") is not False
+        or sizing.get("reuse_prior_sizing_prefix") is not False
+        or sizing.get("segment_start_position") != 16384
+        or sizing.get("segment_end_position_exclusive") != 81920
+        or sizing.get("prior_consumed_end_position") != 16384
+    ):
+        raise _error("S204_R22_ROUND_SIZING_CONTRACT_INVALID")
+    if value.get("new_draws_before_freeze") is not False or value.get("final_reference_created") is not False:
+        raise _error("S204_R22_ROUND_ORDER_INVALID")
+    declared_hash = value.get("artifact_hash")
+    if not isinstance(declared_hash, str) or declared_hash != canonical_json_hash(
+        {key: item for key, item in value.items() if key != "artifact_hash"}
+    ):
+        raise _error("S204_R22_ROUND_HASH_INVALID")
+    return ref, value
+
+
 def _validate_adapter_gate(
     root: Path,
     *,
@@ -151,6 +193,12 @@ def prepare_formal_s204(
 
     root = Path(data_root).resolve()
     output = PurePosixPath(output_dir).as_posix()
+    r22_round_ref: str | None = None
+    r22_round: Mapping[str, Any] | None = None
+    if sources.get("s204_r22_round_manifest") is not None:
+        r22_round_ref, r22_round = _load_r22_round_manifest(
+            root, sources.get("s204_r22_round_manifest")
+        )
     formal_execution_ref = _required_ref(sources, "formal_execution")
     evidence = FormalExecutionEvidence.from_mapping(
         load_canonical_json(_safe_relative(root, formal_execution_ref, "formal_execution"))
@@ -271,6 +319,33 @@ def prepare_formal_s204(
     sizing_refs = publish_per_cell_sizing_plans(
         root,
         formal_execution=evidence,
+        candidate_sample_counts=(
+            tuple(r22_round["sizing"]["candidate_sample_counts"])  # type: ignore[index]
+            if r22_round is not None
+            else DEFAULT_CANDIDATES
+        ),
+        block_size=(
+            int(r22_round["sizing"]["block_size"])  # type: ignore[index]
+            if r22_round is not None
+            else DEFAULT_BLOCK_SIZE
+        ),
+        convergence_tolerance=(
+            float(r22_round["sizing"]["normalized_l1_threshold"])  # type: ignore[index]
+            if r22_round is not None
+            else 0.02
+        ),
+        draw_start_position=(
+            int(r22_round["sizing"]["segment_start_position"])  # type: ignore[index]
+            if r22_round is not None
+            else 0
+        ),
+        draw_end_position_exclusive=(
+            int(r22_round["sizing"]["segment_end_position_exclusive"])  # type: ignore[index]
+            if r22_round is not None
+            else None
+        ),
+        require_terminal_convergence=r22_round is not None,
+        round_manifest_ref=r22_round_ref,
         output_dir=f"{output}/reference-sizing",
     )
     registry_refs = publish_formal_registry_artifacts(
@@ -386,6 +461,9 @@ def prepare_formal_s204(
         "materialization_index_ref": index_ref,
         "numeric_delta_policy": "v2_is_published_only_by_the_TaskRuntime_after_committed_sizing_shards",
     }
+    if r22_round_ref is not None:
+        summary["r22_round_manifest_ref"] = r22_round_ref
+        summary["r22_round_manifest_hash"] = r22_round.get("artifact_hash") if r22_round else None
     summary["artifact_hash"] = canonical_json_hash(summary)
     summary_ref = f"{output}/preparation.json"
     publish_canonical_immutable(_safe_relative(root, summary_ref, "preparation_summary"), summary)

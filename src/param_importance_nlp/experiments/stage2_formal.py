@@ -677,6 +677,13 @@ class ReferenceSizingPlan:
         default_factory=lambda: FormalExecutionEvidence("local_fixture")
     )
     schema_version: str = "stage2-reference-sizing-plan-v1"
+    # A non-zero start is used only by an append-only continuation round. The
+    # counts remain relative to that segment, while positions are absolute in
+    # the already frozen reference_sizing stream.
+    draw_start_position: int = 0
+    draw_end_position_exclusive: int | None = None
+    require_terminal_convergence: bool = False
+    round_manifest_ref: str | None = None
 
     def __post_init__(self) -> None:
         if self.schema_version != "stage2-reference-sizing-plan-v1":
@@ -708,6 +715,31 @@ class ReferenceSizingPlan:
             or self.required_consecutive <= 0
         ):
             raise ValueError("required_consecutive 必须是正整数")
+        if (
+            isinstance(self.draw_start_position, bool)
+            or not isinstance(self.draw_start_position, int)
+            or self.draw_start_position < 0
+        ):
+            raise ValueError("draw_start_position 必须是非负整数")
+        expected_end = self.draw_start_position + counts[-1]
+        if self.draw_end_position_exclusive is None:
+            object.__setattr__(self, "draw_end_position_exclusive", expected_end)
+        elif (
+            isinstance(self.draw_end_position_exclusive, bool)
+            or not isinstance(self.draw_end_position_exclusive, int)
+            or self.draw_end_position_exclusive != expected_end
+        ):
+            raise ValueError("draw_end_position_exclusive 必须等于 start+最大候选")
+        if type(self.require_terminal_convergence) is not bool:
+            raise TypeError("require_terminal_convergence 必须是 bool")
+        if self.round_manifest_ref is not None and (
+            not isinstance(self.round_manifest_ref, str)
+            or not self.round_manifest_ref
+            or "\\" in self.round_manifest_ref
+            or PurePosixPath(self.round_manifest_ref).is_absolute()
+            or any(part in {"", ".", ".."} for part in PurePosixPath(self.round_manifest_ref).parts)
+        ):
+            raise ValueError("round_manifest_ref 必须是安全 POSIX 引用")
         if self.execution.run_intent == "formal":
             self.execution.require_for_stage(2)
         # The fixed doubling/one-consecutive ladder is the formal S2.4
@@ -728,7 +760,7 @@ class ReferenceSizingPlan:
         return self.execution.run_intent
 
     def payload_dict(self) -> dict[str, object]:
-        return {
+        payload = {
             "schema_version": self.schema_version,
             "reference_id": self.reference_id,
             "candidate_sample_counts": list(self.candidate_sample_counts),
@@ -737,6 +769,18 @@ class ReferenceSizingPlan:
             "required_consecutive": self.required_consecutive,
             "execution_evidence_hash": self.execution.artifact_hash,
         }
+        # Preserve historical r21 plan hashes; continuation metadata is
+        # emitted only for a non-zero/terminal-gated continuation plan.
+        if self.draw_start_position or self.require_terminal_convergence or self.round_manifest_ref:
+            payload.update(
+                {
+                    "draw_start_position": self.draw_start_position,
+                    "draw_end_position_exclusive": self.draw_end_position_exclusive,
+                    "require_terminal_convergence": self.require_terminal_convergence,
+                    "round_manifest_ref": self.round_manifest_ref,
+                }
+            )
+        return payload
 
     @property
     def artifact_hash(self) -> str:
@@ -2428,6 +2472,10 @@ class StreamingReferenceSizer:
         if max_new_block_pairs is not None and max_new_block_pairs <= 0:
             raise ValueError("max_new_block_pairs 必须为正整数或 null")
         maximum = plan.candidate_sample_counts[-1]
+        segment_start = plan.draw_start_position
+        segment_end = plan.draw_end_position_exclusive
+        if segment_end != segment_start + maximum:
+            raise ValueError("REFERENCE_SIZING_SEGMENT_BOUNDARY_MISMATCH")
         total_pairs = maximum // plan.block_size
         if require_rng_boundaries and rng_boundaries is None:
             raise ValueError("REFERENCE_SIZING_FORMAL_RNG_BOUNDARIES_REQUIRED")
@@ -2457,6 +2505,11 @@ class StreamingReferenceSizer:
         sizing_draw_hash = _draw_digest(
             draws_sizing[:maximum] if draws_sizing is not None else draws_a[:maximum]
         )
+        selected_draws = draws_sizing[:maximum] if draws_sizing is not None else draws_a[:maximum]
+        for offset, draw in enumerate(selected_draws):
+            expected_position = segment_start + offset
+            if getattr(draw, "position", expected_position) != expected_position:
+                raise ValueError("REFERENCE_SIZING_SEGMENT_POSITION_MISMATCH")
         sizing_identity_hash = canonical_json_hash(
             {
                 "plan_hash": plan.artifact_hash,
@@ -2464,6 +2517,8 @@ class StreamingReferenceSizer:
                 "registry_hash": self.provider.registry_hash,
                 "sizing_draw_hash": sizing_draw_hash,
                 "sizing_stream": "reference_sizing" if draws_sizing is not None else "reference_A_B",
+                "draw_start_position": segment_start,
+                "draw_end_position_exclusive": segment_end,
             }
         )
         processed_pairs = 0

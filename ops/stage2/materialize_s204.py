@@ -3217,6 +3217,10 @@ def publish_reference_sizing_plan(
     # adjacent convergence transition.  Raising this locally would change
     # the scientific stop rule without a preregistered basis.
     required_consecutive: int = 1,
+    draw_start_position: int = 0,
+    draw_end_position_exclusive: int | None = None,
+    require_terminal_convergence: bool = False,
+    round_manifest_ref: str | None = None,
     output_ref: str = "evidence/stage2/s204/reference-sizing-plan.json",
 ) -> tuple[ReferenceSizingPlan, str]:
     """Create and immutably publish the sizing-only S2.4 plan."""
@@ -3232,6 +3236,10 @@ def publish_reference_sizing_plan(
         convergence_tolerance=convergence_tolerance,
         required_consecutive=required_consecutive,
         execution=formal_execution,
+        draw_start_position=draw_start_position,
+        draw_end_position_exclusive=draw_end_position_exclusive,
+        require_terminal_convergence=require_terminal_convergence,
+        round_manifest_ref=round_manifest_ref,
     )
     # Validate the exact wire contract before publication.  This also checks
     # that the plan is not accidentally written as a fixture/schema variant.
@@ -3254,6 +3262,10 @@ def publish_per_cell_sizing_plans(
     candidate_sample_counts: Sequence[int] = DEFAULT_CANDIDATES,
     block_size: int = DEFAULT_BLOCK_SIZE,
     convergence_tolerance: float = 0.02,
+    draw_start_position: int = 0,
+    draw_end_position_exclusive: int | None = None,
+    require_terminal_convergence: bool = False,
+    round_manifest_ref: str | None = None,
     output_dir: str = "evidence/stage2/s204/reference-sizing",
 ) -> dict[str, str]:
     """Publish six independent sizing studies with stable cell identities."""
@@ -3272,6 +3284,10 @@ def publish_per_cell_sizing_plans(
             block_size=block_size,
             convergence_tolerance=convergence_tolerance,
             required_consecutive=1,
+            draw_start_position=draw_start_position,
+            draw_end_position_exclusive=draw_end_position_exclusive,
+            require_terminal_convergence=require_terminal_convergence,
+            round_manifest_ref=round_manifest_ref,
             output_ref=output_ref,
         )
         refs[cell_id] = ref

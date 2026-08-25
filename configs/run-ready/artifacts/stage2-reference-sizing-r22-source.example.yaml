@@ -1,0 +1,39 @@
+# S2.4 r22 append-only sizing continuation.
+# Replace both hash placeholders with the immutable server artifacts before
+# running prepare_s204_formal.py. This source declares the segment before any
+# new draw is read; it never modifies r21.
+schema_version: stage2-reference-sizing-round-v1
+round_id: r22
+prior_round_id: r21
+prior_round_status: INCONCLUSIVE
+parent_preregistration_hash: REPLACE_WITH_R21_PARENT_PREREGISTRATION_HASH
+prior_round_ref: evidence/stage2/s204/formal-r20-g3-v5/r21/preparation.json
+new_draws_before_freeze: false
+final_reference_created: false
+final_reference_plan_schema: schemas/shared/stage2-reference-one-shot-plan-v1.json
+output_namespace: evidence/stage2/s204/formal-r22-g3-v5
+sizing:
+  stream: reference_sizing
+  seed_namespace: reference_sizing:frozen-parent-plan
+  seed_namespace_mode: same_frozen_seed_disjoint_segment
+  parent_sampling_plan_hash: REPLACE_WITH_R21_SAMPLING_PLAN_HASH
+  candidate_sample_counts: [32768, 65536]
+  block_size: 32
+  normalized_l1_threshold: 0.02
+  required_consecutive: 1
+  complete_all_candidates: true
+  optional_stopping: false
+  reuse_prior_sizing_prefix: false
+  segment_start_position: 16384
+  segment_end_position_exclusive: 81920
+  prior_consumed_end_position: 16384
+amendment:
+  append_only: true
+  created_before_new_sizing_draws: true
+  unchanged_scientific_contract:
+    - threshold=0.02
+    - block_size=32
+    - required_consecutive=1
+    - margin_schema_unchanged
+    - evaluator_schema_unchanged
+    - final_A_B_schema_unchanged

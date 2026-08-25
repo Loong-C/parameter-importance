@@ -2,9 +2,9 @@
 """Prepare the append-only S2.4 r22 sizing-round contract.
 
 This is deliberately a control-plane-only command.  It does not read a draw,
-extend r21, create final A/B manifests, or run a provider.  A new round must
-carry a new sizing namespace because r21 was observed to be inconclusive
-before the decision to extend the ladder was made.
+extend r21, create final A/B manifests, or run a provider.  r22 is an
+append-only sequential continuation over a pre-registered, unconsumed segment
+of the already frozen reference_sizing stream; it is never pooled with r21.
 """
 
 from __future__ import annotations
@@ -22,6 +22,8 @@ ROUND_ID = "r22"
 PRIOR_ROUND_ID = "r21"
 STREAM = "reference_sizing"
 CANDIDATE_SAMPLE_COUNTS = (32768, 65536)
+SEGMENT_START_POSITION = 16384
+SEGMENT_END_POSITION_EXCLUSIVE = SEGMENT_START_POSITION + CANDIDATE_SAMPLE_COUNTS[-1]
 BLOCK_SIZE = 32
 NORMALIZED_L1_THRESHOLD = 0.02
 REQUIRED_CONSECUTIVE = 1
@@ -57,8 +59,13 @@ def validate_r22_round(value: Mapping[str, Any]) -> None:
     if sizing.get("stream") != STREAM:
         raise ValueError("S204_R22_STREAM_MISMATCH")
     namespace = sizing.get("seed_namespace")
-    if not isinstance(namespace, str) or not namespace or "r21" in namespace:
-        raise ValueError("S204_R22_NEW_SEED_NAMESPACE_REQUIRED")
+    if not isinstance(namespace, str) or not namespace:
+        raise ValueError("S204_R22_SEED_NAMESPACE_REQUIRED")
+    if sizing.get("seed_namespace_mode") != "same_frozen_seed_disjoint_segment":
+        raise ValueError("S204_R22_SEED_NAMESPACE_MODE_INVALID")
+    parent_sampling_plan_hash = sizing.get("parent_sampling_plan_hash")
+    if not isinstance(parent_sampling_plan_hash, str) or _SHA256.fullmatch(parent_sampling_plan_hash) is None:
+        raise ValueError("S204_R22_PARENT_SAMPLING_PLAN_HASH_INVALID")
     if tuple(sizing.get("candidate_sample_counts", ())) != CANDIDATE_SAMPLE_COUNTS:
         raise ValueError("S204_R22_CANDIDATE_NODES_MISMATCH")
     if sizing.get("block_size") != BLOCK_SIZE:
@@ -73,6 +80,12 @@ def validate_r22_round(value: Mapping[str, Any]) -> None:
         raise ValueError("S204_R22_OPTIONAL_STOPPING_FORBIDDEN")
     if sizing.get("reuse_prior_sizing_prefix") is not False:
         raise ValueError("S204_R22_PREFIX_REUSE_FORBIDDEN")
+    if sizing.get("segment_start_position") != SEGMENT_START_POSITION:
+        raise ValueError("S204_R22_SEGMENT_START_INVALID")
+    if sizing.get("segment_end_position_exclusive") != SEGMENT_END_POSITION_EXCLUSIVE:
+        raise ValueError("S204_R22_SEGMENT_END_INVALID")
+    if sizing.get("prior_consumed_end_position") != SEGMENT_START_POSITION:
+        raise ValueError("S204_R22_PRIOR_SEGMENT_BOUNDARY_INVALID")
     if value.get("new_draws_before_freeze") is not False:
         raise ValueError("S204_R22_FREEZE_REQUIRED_BEFORE_DRAWS")
     if value.get("final_reference_created") is not False:
@@ -112,6 +125,13 @@ def prepare_r22_round(value: Mapping[str, Any]) -> dict[str, Any]:
         "resume_requires_same_round_hash": True,
         "resume_requires_same_seed_namespace": True,
         "resume_requires_same_candidate_nodes": True,
+        "resume_requires_same_segment_start": True,
+        "resume_requires_same_segment_end": True,
+        "draw_positions": {
+            "start": SEGMENT_START_POSITION,
+            "end_exclusive": SEGMENT_END_POSITION_EXCLUSIVE,
+            "prior_r21_prefix_is_read_only": True,
+        },
         "r21_output_is_read_only": True,
     }
     body["artifact_hash"] = _canonical_hash(body)

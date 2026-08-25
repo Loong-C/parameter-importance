@@ -2830,6 +2830,18 @@ def _stage2_reference_plan(
         convergence_tolerance=float(value["convergence_tolerance"]),
         required_consecutive=int(value["required_consecutive"]),
         execution=context.evidence,
+        draw_start_position=int(value.get("draw_start_position", 0)),
+        draw_end_position_exclusive=(
+            None
+            if value.get("draw_end_position_exclusive") is None
+            else int(value["draw_end_position_exclusive"])
+        ),
+        require_terminal_convergence=bool(value.get("require_terminal_convergence", False)),
+        round_manifest_ref=(
+            None
+            if value.get("round_manifest_ref") is None
+            else str(value["round_manifest_ref"])
+        ),
     )
     if value.get("artifact_hash") != plan.artifact_hash:
         raise _blocked(
@@ -3830,10 +3842,11 @@ def _run_stage2_reference(
             ),
         )
     maximum = plan.candidate_sample_counts[-1]
-    sizing_draws = sampling.draws("reference_sizing", maximum)
-    sizing_rng_state = _actual_sampling_state(sampling, "reference_sizing", maximum)
+    sizing_start = plan.draw_start_position
+    sizing_draws = sampling.draws("reference_sizing", maximum, start=sizing_start)
+    sizing_rng_state = _actual_sampling_state(sampling, "reference_sizing", sizing_start + maximum)
     sizing_rng_boundaries = tuple(
-        generator_boundary(sampling, "reference_sizing", index * plan.block_size)
+        generator_boundary(sampling, "reference_sizing", sizing_start + index * plan.block_size)
         for index in range(maximum // plan.block_size + 1)
     )
     result = StreamingReferenceSizer(context.provider).run(
@@ -3847,11 +3860,22 @@ def _run_stage2_reference(
         rng_boundaries=sizing_rng_boundaries,
         require_rng_boundaries=request.config.run_intent == "formal",
     )
-    if not result.converged or result.selected_sample_count_per_stream is None:
+    terminal_point = result.points[-1] if result.points else None
+    terminal_pass = bool(
+        terminal_point is not None
+        and terminal_point.comparison_defined
+        and terminal_point.normalized_l1_from_previous is not None
+        and terminal_point.normalized_l1_from_previous <= plan.convergence_tolerance
+    )
+    if (
+        not result.converged
+        or result.selected_sample_count_per_stream is None
+        or (plan.require_terminal_convergence and not terminal_pass)
+    ):
         raise _blocked(
             BlockerCode.CONTRACT_UNFROZEN,
             "stage2_reference_sizing",
-            "reference sizing 未达到预注册收敛条件，禁止创建 one-shot A/B",
+            "reference sizing 未达到预注册收敛条件（含末节点要求），禁止创建 one-shot A/B",
             retryable=False,
             evidence_refs=inputs.references,
         )
@@ -3869,6 +3893,8 @@ def _run_stage2_reference(
             "registry_hash": result.registry_hash,
             "sizing_draw_hash": sizing_draw_hash,
             "sizing_stream": "reference_sizing",
+            "draw_start_position": sizing_start,
+            "draw_end_position_exclusive": sizing_start + maximum,
         }
     )
     # Freeze the sizing-derived numeric margin before *any* final A/B draw is
@@ -4174,7 +4200,7 @@ def _run_stage2_reference(
         "draw_artifacts": {
             "reference_sizing": {
                 "sampling_plan": sampling.to_dict(),
-                "manifest": sampling.draw_manifest("reference_sizing", maximum).to_manifest(),
+                "manifest": sampling.draw_manifest("reference_sizing", maximum, start=sizing_start).to_manifest(),
                 "actual_state": sizing_rng_state,
             },
             "reference_A": {
