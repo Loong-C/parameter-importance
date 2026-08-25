@@ -50,6 +50,10 @@ from .stage2_s25_rebind import (
     EXPECTED_CELL_IDS,
     EXCLUDED_PCI,
 )
+from .stage2_s25_inputs import (
+    S205_SWEEP_SCHEMA,
+    validate_s205_development_sweep,
+)
 
 
 S25_REBIND_SCHEMA = "stage2-s205-rebind-plan-v1"
@@ -745,10 +749,19 @@ def _reference_views(root: Path, row: Mapping[str, object]) -> dict[str, Mapping
 
 
 def load_s25_experiment_plan(data_root: str | Path, plan_ref: str) -> dict[str, Any]:
-    """Load the pre-registered pilot B/M/R plan; no draw is generated."""
+    """Load a frozen S2.5 plan; no draw is generated.
+
+    Production consumes the exhaustive development sweep.  The legacy
+    single-plan form remains loadable for bounded qualification fixtures.
+    """
 
     root = Path(data_root).resolve()
     _path, value = _load_object(root, plan_ref, field="s205_experiment_plan_ref")
+    if value.get("schema_version") == S205_SWEEP_SCHEMA:
+        try:
+            return validate_s205_development_sweep(value)
+        except (TypeError, ValueError, RuntimeError) as error:
+            raise S25ExecutionBlocked(f"S205_EXPERIMENT_SWEEP_INVALID:{error}") from error
     try:
         from .stage2_formal import FormalExperimentPlan
 
@@ -822,11 +835,33 @@ def _build_provider(root: Path, plan: Mapping[str, object], row: Mapping[str, ob
     return context.provider, execution, provider_sampling
 
 
-def _make_mappings(sampling: SamplingPlan, plan: Mapping[str, object]) -> tuple[RepetitionMapping, ...]:
+def _experiment_plan_entries(plan: Mapping[str, object]) -> tuple[tuple[int, Mapping[str, object]], ...]:
+    if plan.get("schema_version") != S205_SWEEP_SCHEMA:
+        return ((0, plan),)
+    validated = validate_s205_development_sweep(plan)
+    entries = validated["entries"]
+    assert isinstance(entries, list)
+    return tuple(
+        (int(entry["start_position"]), entry["plan"])
+        for entry in entries
+        if isinstance(entry, Mapping) and isinstance(entry.get("plan"), Mapping)
+    )
+
+
+def _make_mappings(
+    sampling: SamplingPlan,
+    plan: Mapping[str, object],
+    *,
+    start_position: int = 0,
+) -> tuple[RepetitionMapping, ...]:
     from .stage2_formal import FormalExperimentPlan
 
     formal_plan = FormalExperimentPlan.from_mapping(dict(plan))
-    draws = sampling.draws("pilot", formal_plan.repetitions * formal_plan.batch_size)
+    draws = sampling.draws(
+        "pilot",
+        formal_plan.repetitions * formal_plan.batch_size,
+        start=start_position,
+    )
     return tuple(
         RepetitionMapping.create(
             repetition_id=f"rep-{index:04d}",
@@ -917,29 +952,83 @@ class S25FormalRunner:
             projected = _project_sampling_plan_to_provider(self.sampling_plan, provider_sampling)
         except Exception as error:
             raise S25ExecutionBlocked(f"S205_SAMPLING_PROVIDER_BIND_FAILED:{cell_id}:{error}") from error
-        mappings = _make_mappings(projected, self.experiment_plan)
         views = _reference_views(self.data_root, row)
         runner = RecoverablePairedWaveRunner(provider, execution=execution, m2_tolerance=self.m2_tolerance)
-        summary = runner.run(
-            wave_id=f"s205-{component}",
-            mappings=mappings,
-            reference=views["bias"],
-            reference_hash=_vector_digest(views["bias"]),
-            references=views,
-            artifact_root=cell_root / "paired-wave",
-        )
-        summary_payload = summary.to_dict()
-        summary_output = cell_root / "paired-wave" / "summary.json"
-        _write_once(summary_output, summary_payload)
-        checks = _cell_checks(self.data_root, cell_root / "paired-wave", summary.completed_unit_ids)
-        transitions = summary.replay_evidence.get("state_transitions")
-        checks["replay_complete"] = isinstance(transitions, Mapping) and set(transitions) == set(summary.expected_unit_ids)
-        checks["complete"] = summary.complete
-        passed = all(bool(value) for value in checks.values() if isinstance(value, bool))
+        wave_records: list[dict[str, object]] = []
+        wave_checks: list[dict[str, object]] = []
+        expected_ids: list[str] = []
+        completed_ids: list[str] = []
+        sample_budget = 0.0
+        reference_hashes: dict[str, object] | None = None
+        for start_position, formal_plan in _experiment_plan_entries(self.experiment_plan):
+            batch_size = int(formal_plan["batch_size"])
+            wave_root = cell_root / f"paired-wave-b{batch_size}"
+            mappings = _make_mappings(projected, formal_plan, start_position=start_position)
+            summary = runner.run(
+                wave_id=f"s205-{component}-b{batch_size}",
+                mappings=mappings,
+                reference=views["bias"],
+                reference_hash=_vector_digest(views["bias"]),
+                references=views,
+                artifact_root=wave_root,
+            )
+            summary_payload = summary.to_dict()
+            summary_output = wave_root / "summary.json"
+            _write_once(summary_output, summary_payload)
+            checks = _cell_checks(self.data_root, wave_root, summary.completed_unit_ids)
+            transitions = summary.replay_evidence.get("state_transitions")
+            checks["replay_complete"] = isinstance(transitions, Mapping) and set(transitions) == set(summary.expected_unit_ids)
+            checks["complete"] = summary.complete
+            wave_checks.append(checks)
+            expected_ids.extend(f"b{batch_size}:{item}" for item in summary.expected_unit_ids)
+            completed_ids.extend(f"b{batch_size}:{item}" for item in summary.completed_unit_ids)
+            budget = summary.cost_statistics["scientific_equal_sample_cost"].get("sample_budget")
+            if not isinstance(budget, (int, float)) or isinstance(budget, bool) or not math.isfinite(float(budget)):
+                raise S25ExecutionBlocked(f"S205_SAMPLE_BUDGET_INVALID:{cell_id}:b{batch_size}")
+            sample_budget += float(budget)
+            current_hashes = dict(summary.reference_hashes)
+            if reference_hashes is None:
+                reference_hashes = current_hashes
+            elif reference_hashes != current_hashes:
+                raise S25ExecutionBlocked(f"S205_REFERENCE_HASH_DRIFT:{cell_id}:b{batch_size}")
+            wave_records.append({
+                "batch_size": batch_size,
+                "start_position": start_position,
+                "end_position_exclusive": start_position + batch_size,
+                "summary_hash": summary.artifact_hash,
+                "summary_ref": summary_output.relative_to(self.data_root).as_posix(),
+                "expected_unit_ids": list(summary.expected_unit_ids),
+                "completed_unit_ids": list(summary.completed_unit_ids),
+                "failure_evidence_dir": (wave_root / "failures").relative_to(self.data_root).as_posix(),
+            })
+        checks = {
+            "state_replay_verified": all(bool(item.get("state_replay_verified")) for item in wave_checks),
+            "m2_equivalent": all(bool(item.get("m2_equivalent")) for item in wave_checks),
+            "finite_costs": all(bool(item.get("finite_costs")) for item in wave_checks),
+            "signed_outputs": all(bool(item.get("signed_outputs")) for item in wave_checks),
+            "replay_complete": all(bool(item.get("replay_complete")) for item in wave_checks),
+            "complete": all(bool(item.get("complete")) for item in wave_checks),
+            "batch_candidate_count": len(wave_records),
+            "unit_count": sum(int(item["unit_count"]) for item in wave_checks),
+        }
+        passed = bool(wave_records) and all(bool(value) for value in checks.values() if isinstance(value, bool))
+        sweep_summary: dict[str, object] = {
+            "schema_version": "stage2-s25-development-sweep-cell-summary-v1",
+            "cell_id": cell_id,
+            "status": "PASS" if passed else "BLOCKED",
+            "waves": wave_records,
+            "checks": checks,
+            "primary_parameters_selected": False,
+            "confirmatory_draws_generated": False,
+            "reference_draws_generated": False,
+        }
+        sweep_summary["artifact_hash"] = canonical_json_hash(sweep_summary)
+        summary_output = cell_root / "development-sweep-summary.json"
+        _write_once(summary_output, sweep_summary)
         g23_cells = self.rebind_plan["_g23"]["cells"]  # type: ignore[index]
         g23_cell = next(item for item in g23_cells if item["cell_id"] == cell_id)
         metrics = dict(g23_cell["metrics"])
-        metrics.update({"runner": checks, "sample_budget": summary.cost_statistics["scientific_equal_sample_cost"].get("sample_budget")})
+        metrics.update({"runner": checks, "sample_budget": sample_budget})
         payload: dict[str, object] = {
             "schema_version": S25_CELL_SUMMARY_SCHEMA,
             "cell_id": cell_id,
@@ -949,14 +1038,15 @@ class S25FormalRunner:
             "g23_evaluation_hash": self.rebind_plan["g23_evaluation_hash"],
             "experiment_plan_hash": canonical_json_hash(self.experiment_plan),
             "sampling_plan_hash": self.sampling_plan.digest,
-            "summary_hash": summary.artifact_hash,
+            "summary_hash": sweep_summary["artifact_hash"],
             "summary_ref": summary_output.relative_to(self.data_root).as_posix(),
             "metrics": metrics,
             "checks": checks,
-            "reference_hashes": dict(summary.reference_hashes),
-            "expected_unit_ids": list(summary.expected_unit_ids),
-            "completed_unit_ids": list(summary.completed_unit_ids),
-            "failure_evidence_dir": (cell_root / "paired-wave" / "failures").relative_to(self.data_root).as_posix(),
+            "reference_hashes": reference_hashes or {},
+            "expected_unit_ids": expected_ids,
+            "completed_unit_ids": completed_ids,
+            "wave_summaries": wave_records,
+            "failure_evidence_dir": cell_root.relative_to(self.data_root).as_posix(),
         }
         payload["artifact_hash"] = canonical_json_hash(payload)
         _write_once(summary_path, payload)
@@ -1013,11 +1103,23 @@ def preflight_s25(
     artifact = _ref(root, artifact_root, field="artifact_root", allow_missing=True)
     if artifact.exists() and not artifact.is_dir():
         raise S25ExecutionBlocked("S205_ARTIFACT_ROOT_NOT_DIRECTORY")
-    from .stage2_formal import FormalExperimentPlan
+    if experiment.get("schema_version") == S205_SWEEP_SCHEMA:
+        try:
+            validate_s205_development_sweep(experiment, sampling=sampling)
+        except (TypeError, ValueError, RuntimeError) as error:
+            raise S25ExecutionBlocked(f"S205_EXPERIMENT_SWEEP_INVALID:{error}") from error
+        pilot_draw_count = experiment["pilot_draw_count"]
+        candidate_batch_sizes = experiment["candidate_batch_sizes"]
+        candidate_microbatch_counts = experiment["candidate_microbatch_counts"]
+    else:
+        from .stage2_formal import FormalExperimentPlan
 
-    parsed = FormalExperimentPlan.from_mapping(experiment)
-    if parsed.sampling_plan_hash != sampling.digest:
-        raise S25ExecutionBlocked("S205_EXPERIMENT_SAMPLING_HASH_MISMATCH")
+        parsed = FormalExperimentPlan.from_mapping(experiment)
+        if parsed.sampling_plan_hash != sampling.digest:
+            raise S25ExecutionBlocked("S205_EXPERIMENT_SAMPLING_HASH_MISMATCH")
+        pilot_draw_count = parsed.batch_size * parsed.repetitions
+        candidate_batch_sizes = [parsed.batch_size]
+        candidate_microbatch_counts = list(parsed.microbatch_counts)
     return {
         "schema_version": "stage2-s205-formal-preflight-v1",
         "status": "READY",
@@ -1031,6 +1133,10 @@ def preflight_s25(
         "sampling_plan_hash": sampling.digest,
         "experiment_plan_ref": str(experiment_plan_ref),
         "experiment_plan_hash": canonical_json_hash(experiment),
+        "candidate_batch_sizes": candidate_batch_sizes,
+        "candidate_microbatch_counts": candidate_microbatch_counts,
+        "pilot_draw_count": pilot_draw_count,
+        "primary_parameters_selected": False,
         "artifact_root": str(artifact_root),
         "cell_count": 6,
         "approved_gpu_uuids": list(APPROVED_GPU_UUIDS),
