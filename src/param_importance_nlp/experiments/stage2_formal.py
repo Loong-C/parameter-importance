@@ -1623,11 +1623,126 @@ class _ReferenceShardStore:
 
     SCHEMA = "stage2-reference-block-shard-v1"
     REF_SCHEMA = "stage2-reference-block-shard-ref-v1"
+    _PACKED_ENCODING = "flat-f64-layout-v1"
 
     def __init__(self, root: str | Path) -> None:
         self.root = Path(root)
         self.shards = self.root / "shards"
         self.shards.mkdir(parents=True, exist_ok=True)
+
+    @classmethod
+    def _pack_vector(
+        cls, vector: Mapping[str, object]
+    ) -> tuple[np.ndarray, list[dict[str, object]]]:
+        """Pack a canonical parameter mapping into one immutable tensor.
+
+        The logical vector remains the sorted name -> shape mapping used by all
+        estimators.  Only the bundle representation changes: one contiguous
+        FP64 tensor plus a canonical layout table replaces one tensor file per
+        parameter.  Keeping the layout in the JSON state makes the packing
+        self-describing and allows exact reconstruction without a model object.
+        """
+
+        parsed = _as_vector(vector, field_name="reference_shard.vector")
+        layout: list[dict[str, object]] = []
+        flattened: list[np.ndarray] = []
+        offset = 0
+        for name, array in parsed.items():
+            contiguous = np.ascontiguousarray(array, dtype=np.float64).reshape(-1)
+            length = int(contiguous.size)
+            layout.append(
+                {
+                    "name": name,
+                    "shape": [int(value) for value in array.shape],
+                    "offset": offset,
+                    "length": length,
+                    "dtype": contiguous.dtype.str,
+                }
+            )
+            flattened.append(contiguous)
+            offset += length
+        if flattened:
+            packed = np.concatenate(flattened).astype(np.float64, copy=False)
+        else:  # pragma: no cover - _as_vector rejects an empty mapping
+            packed = np.empty(0, dtype=np.float64)
+        return np.ascontiguousarray(packed), layout
+
+    @classmethod
+    def _unpack_vector(
+        cls, state: Mapping[str, object]
+    ) -> dict[str, np.ndarray]:
+        """Reconstruct a vector, accepting legacy per-parameter bundles."""
+
+        # Bundles written before the packed representation remain readable.
+        # Reject mixed encodings so a tampered object cannot silently choose a
+        # different source of truth.
+        if "vector" in state:
+            if any(
+                field in state
+                for field in ("vector_encoding", "vector_packed", "vector_layout")
+            ):
+                raise ValueError("REFERENCE_SHARD_VECTOR_ENCODING_MIXED")
+            return _as_vector(state.get("vector"), field_name="reference_shard.vector")
+
+        if state.get("vector_encoding") != cls._PACKED_ENCODING:
+            raise ValueError("REFERENCE_SHARD_VECTOR_ENCODING_INVALID")
+        raw_packed = state.get("vector_packed")
+        raw_layout = state.get("vector_layout")
+        packed = _as_array(raw_packed, field_name="reference_shard.vector_packed")
+        if packed.ndim != 1:
+            raise ValueError("REFERENCE_SHARD_PACKED_VECTOR_NOT_FLAT")
+        if not isinstance(raw_layout, list) or not raw_layout:
+            raise ValueError("REFERENCE_SHARD_VECTOR_LAYOUT_INVALID")
+
+        result: dict[str, np.ndarray] = {}
+        cursor = 0
+        previous_name: str | None = None
+        for entry in raw_layout:
+            if not isinstance(entry, Mapping) or set(entry) != {
+                "name", "shape", "offset", "length", "dtype"
+            }:
+                raise ValueError("REFERENCE_SHARD_VECTOR_LAYOUT_ENTRY_INVALID")
+            name = entry.get("name")
+            if (
+                not isinstance(name, str)
+                or not name
+                or (previous_name is not None and name <= previous_name)
+            ):
+                raise ValueError("REFERENCE_SHARD_VECTOR_LAYOUT_NAMES_INVALID")
+            previous_name = name
+            shape = entry.get("shape")
+            if not isinstance(shape, list) or any(
+                isinstance(value, bool) or not isinstance(value, int) or value < 0
+                for value in shape
+            ):
+                raise ValueError("REFERENCE_SHARD_VECTOR_LAYOUT_SHAPE_INVALID")
+            offset = entry.get("offset")
+            length = entry.get("length")
+            if (
+                isinstance(offset, bool)
+                or not isinstance(offset, int)
+                or isinstance(length, bool)
+                or not isinstance(length, int)
+                or offset != cursor
+                or length != math.prod(shape, start=1)
+            ):
+                raise ValueError("REFERENCE_SHARD_VECTOR_LAYOUT_RANGE_INVALID")
+            dtype = entry.get("dtype")
+            if dtype != np.dtype(np.float64).str or packed.dtype.str != dtype:
+                raise ValueError("REFERENCE_SHARD_VECTOR_LAYOUT_DTYPE_INVALID")
+            end = offset + length
+            if end > int(packed.size):
+                raise ValueError("REFERENCE_SHARD_VECTOR_LAYOUT_RANGE_INVALID")
+            result[name] = np.array(
+                packed[offset:end].reshape(tuple(shape)),
+                dtype=np.float64,
+                copy=True,
+                order="C",
+            )
+            cursor = end
+        if cursor != int(packed.size):
+            raise ValueError("REFERENCE_SHARD_VECTOR_LAYOUT_SIZE_INVALID")
+        return result
 
     @staticmethod
     def _digest(vector: Mapping[str, object], weight: float) -> str:
@@ -1645,9 +1760,12 @@ class _ReferenceShardStore:
         parsed = _as_vector(vector, field_name="reference_shard.vector")
         digest = self._digest(parsed, float(weight))
         path = self.shards / digest
+        packed, layout = self._pack_vector(parsed)
         state = {
             "schema_version": self.SCHEMA,
-            "vector": parsed,
+            "vector_encoding": self._PACKED_ENCODING,
+            "vector_packed": packed,
+            "vector_layout": layout,
             "weight": float(weight),
             "vector_hash": _vector_digest(parsed),
             "shard_hash": digest,
@@ -1656,7 +1774,7 @@ class _ReferenceShardStore:
             restored, bundle = load_tensor_bundle(path)
             if not isinstance(restored, Mapping):
                 raise ValueError("REFERENCE_SHARD_IDENTITY_COLLISION")
-            loaded_vector = _as_vector(restored.get("vector"), field_name="reference_shard.vector")
+            loaded_vector = self._unpack_vector(restored)
             loaded_weight = float(restored.get("weight"))
             if (
                 restored.get("schema_version") != self.SCHEMA
@@ -1698,7 +1816,7 @@ class _ReferenceShardStore:
             raise ValueError("REFERENCE_SHARD_SCHEMA_INVALID")
         if bundle.manifest_sha256 != reference.get("manifest_hash"):
             raise ValueError("REFERENCE_SHARD_MANIFEST_MISMATCH")
-        vector = _as_vector(state.get("vector"), field_name="reference_shard.vector")
+        vector = self._unpack_vector(state)
         weight = float(state.get("weight"))
         if not math.isfinite(weight) or weight <= 0.0 or weight != float(reference.get("weight")):
             raise ValueError("REFERENCE_SHARD_WEIGHT_MISMATCH")

@@ -12,10 +12,13 @@ from param_importance_nlp.experiments.sampling import SamplingPlan, SamplingUniv
 from param_importance_nlp.experiments.stage2_formal import (
     ReferenceSizingPlan,
     StreamingReferenceSizer,
+    _ReferenceShardStore,
     _ReferenceSnapshotStore,
+    _vector_digest,
 )
 from param_importance_nlp.providers import SyntheticGradientProvider
 from param_importance_nlp.runtime.tensor_bundle import load_tensor_bundle
+from param_importance_nlp.runtime.tensor_bundle import publish_tensor_bundle
 
 
 def _provider() -> SyntheticGradientProvider:
@@ -65,6 +68,54 @@ def test_snapshot_object_stores_hashes_and_shard_refs_only(tmp_path: Path) -> No
     restored = _ReferenceSnapshotStore.materialize(state, root)
     assert _ReferenceSnapshotStore._state_digest(restored) == commit["state_digest"]
     assert result.processed_sample_count_per_stream == 3
+
+
+def test_shard_pack_roundtrip_uses_one_tensor_and_reads_legacy_bundle(tmp_path: Path) -> None:
+    root = tmp_path / "packed"
+    store = _ReferenceShardStore(root)
+    vector = {
+        "z.weight": np.arange(6, dtype=np.float64).reshape(2, 3),
+        "a.bias": np.array([2.5, -4.0], dtype=np.float64),
+    }
+    reference = store.publish(vector, 3.0)
+    state, bundle = load_tensor_bundle(root / str(reference["shard_ref"]))
+    assert state["vector_encoding"] == store._PACKED_ENCODING
+    assert "vector" not in state
+    assert bundle.tensor_count == 1
+    restored, weight, digest = store.load(reference)
+    assert weight == 3.0 and digest == reference["shard_hash"]
+    assert tuple(restored) == ("a.bias", "z.weight")
+    for name in restored:
+        np.testing.assert_array_equal(restored[name], vector[name])
+
+    tampered = dict(state)
+    tampered["vector_layout"] = [dict(item) for item in state["vector_layout"]]
+    tampered["vector_layout"][0]["offset"] = 1
+    with pytest.raises(ValueError, match="REFERENCE_SHARD_VECTOR_LAYOUT_RANGE_INVALID"):
+        store._unpack_vector(tampered)
+
+    # v1 objects already published with one tensor per parameter remain valid.
+    legacy_digest = store._digest(vector, 4.0)
+    legacy_path = root / "shards" / legacy_digest
+    legacy_state = {
+        "schema_version": store.SCHEMA,
+        "vector": vector,
+        "weight": 4.0,
+        "vector_hash": _vector_digest(vector),
+        "shard_hash": legacy_digest,
+    }
+    legacy_bundle = publish_tensor_bundle(legacy_path, legacy_state)
+    legacy_reference = {
+        "schema_version": store.REF_SCHEMA,
+        "shard_ref": f"shards/{legacy_digest}",
+        "shard_hash": legacy_digest,
+        "manifest_hash": legacy_bundle.manifest_sha256,
+        "weight": 4.0,
+    }
+    legacy_restored, legacy_weight, _ = store.load(legacy_reference)
+    assert legacy_weight == 4.0
+    for name in legacy_restored:
+        np.testing.assert_array_equal(legacy_restored[name], vector[name])
 
 
 def test_compact_resume_reconstructs_exact_reference(tmp_path: Path) -> None:
