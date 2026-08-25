@@ -78,6 +78,8 @@ def run_s208_g26_production(
     destination = Path(output_root).resolve()
     loaded: dict[str, Any] | None = None
     try:
+        if memmap_root is None:
+            raise S208ProductionBlocked("S208_EXPLICIT_MEMMAP_ROOT_REQUIRED")
         loaded = load_s208_reference_bundle(
             data_root,
             reference_bundle,
@@ -98,6 +100,7 @@ def run_s208_g26_production(
             hypothesis_contract=hypothesis_contract,
             upstream_gates=gates,
             output_root=None,
+            memmap_root=memmap_root,
             bootstrap_replicates=bootstrap_replicates,
             bootstrap_seed=bootstrap_seed,
         )

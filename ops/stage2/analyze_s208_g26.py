@@ -19,6 +19,7 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Fail-closed Stage 2 S2.8/G2.6 statistics")
     parser.add_argument("--raw-manifest", type=Path, required=True)
     parser.add_argument("--raw-root", type=Path, required=True, help="directory containing raw_artifact_ref paths")
+    parser.add_argument("--memmap-root", type=Path, default=None, help="explicit scratch root required for tensor-bundle inputs")
     parser.add_argument("--references", type=Path, required=True, help="canonical six-cell reference payload")
     parser.add_argument("--matrix", type=Path, required=True, help="canonical formal S2.6 matrix freeze")
     parser.add_argument("--preregistration", type=Path, required=True)
@@ -45,6 +46,7 @@ def main(argv: list[str] | None = None) -> int:
             hypothesis_contract=args.hypothesis_contract,
             upstream_gates=gates,
             output_root=args.output_root,
+            memmap_root=args.memmap_root,
             bootstrap_replicates=args.bootstrap_replicates,
             bootstrap_seed=args.bootstrap_seed,
         )
