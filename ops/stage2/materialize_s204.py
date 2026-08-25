@@ -3103,6 +3103,28 @@ def build_formal_runtime_environment(
             convergence_tolerance=float(sizing_value["convergence_tolerance"]),
             required_consecutive=int(sizing_value["required_consecutive"]),
             execution=evidence,
+            draw_start_position=int(sizing_value.get("draw_start_position", 0)),
+            draw_end_position_exclusive=(
+                None
+                if sizing_value.get("draw_end_position_exclusive") is None
+                else int(sizing_value["draw_end_position_exclusive"])
+            ),
+            require_terminal_convergence=bool(sizing_value.get("require_terminal_convergence", False)),
+            round_manifest_ref=(
+                None
+                if sizing_value.get("round_manifest_ref") is None
+                else str(sizing_value["round_manifest_ref"])
+            ),
+            final_stream_start_position=(
+                None
+                if sizing_value.get("final_stream_start_position") is None
+                else int(sizing_value["final_stream_start_position"])
+            ),
+            final_stream_end_position_exclusive=(
+                None
+                if sizing_value.get("final_stream_end_position_exclusive") is None
+                else int(sizing_value["final_stream_end_position_exclusive"])
+            ),
         )
     except Exception as error:
         raise _error("SIZING_PLAN_INVALID", sizing_ref) from error
