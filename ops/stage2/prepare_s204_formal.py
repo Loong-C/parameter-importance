@@ -121,6 +121,8 @@ def _load_r22_round_manifest(root: Path, raw_ref: object) -> tuple[str, Mapping[
         raise _error("S204_R22_ROUND_MANIFEST_SCHEMA_INVALID")
     if value.get("round_id") != "r22" or value.get("prior_round_id") != "r21" or value.get("prior_round_status") != "INCONCLUSIVE":
         raise _error("S204_R22_ROUND_LINEAGE_INVALID")
+    if value.get("continuation_control") != "precommitted_disjoint_segment_no_pooling_with_r21":
+        raise _error("S204_R22_ROUND_SEQUENTIAL_CONTROL_INVALID")
     sizing = value.get("sizing")
     if not isinstance(sizing, Mapping):
         raise _error("S204_R22_ROUND_SIZING_INVALID")

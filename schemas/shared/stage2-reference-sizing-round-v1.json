@@ -8,7 +8,7 @@
     "schema_version", "round_id", "prior_round_id", "prior_round_status",
     "parent_preregistration_hash", "prior_round_ref", "sizing",
     "new_draws_before_freeze", "final_reference_created",
-    "final_reference_plan_schema", "output_namespace", "amendment"
+    "final_reference_plan_schema", "continuation_control", "output_namespace", "amendment"
   ],
   "properties": {
     "schema_version": {"const": "stage2-reference-sizing-round-v1"},
@@ -40,7 +40,12 @@
     "new_draws_before_freeze": {"const": false},
     "final_reference_created": {"const": false},
     "final_reference_plan_schema": {"const": "schemas/shared/stage2-reference-one-shot-plan-v1.json"},
+    "continuation_control": {"const": "precommitted_disjoint_segment_no_pooling_with_r21"},
     "output_namespace": {"type": "string", "pattern": "^.*r22.*$"},
+    "status": {"const": "FROZEN_BEFORE_NEW_SIZING_DRAWS"},
+    "formal_reference_status": {"const": "NOT_CREATED_UNTIL_SIZING_GATE"},
+    "artifact_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "execution_contract": {"type": "object"},
     "amendment": {
       "type": "object", "additionalProperties": false,
       "required": ["append_only", "created_before_new_sizing_draws", "unchanged_scientific_contract"],
