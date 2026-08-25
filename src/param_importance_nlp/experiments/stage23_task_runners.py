@@ -1615,7 +1615,7 @@ def _load_formal_selected_checkpoint(
         or row["checkpoint_root_ref"] != model_root_ref
         or row["checkpoint_manifest_ref"] != manifest_ref
         or row["checkpoint_revision"] != revision
-        or row["checkpoint_hash"] != canonical_json_hash(manifest_sha256)
+        or row["checkpoint_hash"] != manifest_sha256
         or row["config_hash"] != source_config_hash
     ):
         raise ValueError("FORMAL_CHECKPOINT_SIX_CELL_IDENTITY_MISMATCH")

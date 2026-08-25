@@ -6,7 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from param_importance_nlp.contracts.jsonio import canonical_json_hash, write_canonical_json
+from param_importance_nlp.contracts.jsonio import write_canonical_json
 from param_importance_nlp.experiments.stage23_task_runners import (
     _load_formal_selected_checkpoint,
 )
@@ -95,7 +95,7 @@ def _publish_selected_cell(
         "model_id": model_id,
         "training_stage": stage,
         "checkpoint_id": checkpoint_id,
-        "checkpoint_hash": canonical_json_hash(manifest_sha256),
+        "checkpoint_hash": manifest_sha256,
         "checkpoint_revision": revision,
         "registry_hash": "a" * 64,
         "config_hash": source_config_hash,
@@ -117,7 +117,7 @@ def _publish_selected_cell(
                 "model_id": other_model,
                 "training_stage": other_stage,
                 "checkpoint_id": other_checkpoint_id,
-                "checkpoint_hash": canonical_json_hash(other_manifest_sha256),
+                "checkpoint_hash": other_manifest_sha256,
                 "checkpoint_revision": other_revision,
                 "registry_hash": "b" * 64,
                 "config_hash": source_config_hash,
