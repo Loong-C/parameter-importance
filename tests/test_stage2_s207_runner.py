@@ -14,6 +14,7 @@ from param_importance_nlp.experiments.stage2_s207_formal import (
     S27CellPlan,
 )
 from param_importance_nlp.experiments.stage2_s207_runner import (
+    _GradientAuditProxy,
     S27ExecutionBlocked,
     S27RetryPolicy,
     build_s27_worker_command,
@@ -112,3 +113,33 @@ def test_retry_policy_and_worker_command_are_fail_closed() -> None:
     assert "--worker" in command
     assert "--gpu-uuid" in command
     assert "--draw" not in command
+
+
+def test_weighted_mean_materializes_cuda_like_values_before_numpy() -> None:
+    class CudaLikeTensor:
+        def __init__(self, values: list[float], *, detached: bool = False, on_cpu: bool = False) -> None:
+            self._values = values
+            self.detached = detached
+            self.on_cpu = on_cpu
+
+        def __array__(self, dtype: object = None) -> object:
+            raise TypeError("can't convert cuda:0 device type tensor to numpy")
+
+        def detach(self) -> "CudaLikeTensor":
+            return CudaLikeTensor(self._values, detached=True, on_cpu=self.on_cpu)
+
+        def cpu(self) -> "CudaLikeTensor":
+            return CudaLikeTensor(self._values, detached=self.detached, on_cpu=True)
+
+        def numpy(self) -> np.ndarray:
+            assert self.detached
+            assert self.on_cpu
+            return np.asarray(self._values, dtype=np.float32)
+
+    vectors = [
+        {"weight": CudaLikeTensor([1.0, 3.0])},
+        {"weight": CudaLikeTensor([5.0, 7.0])},
+    ]
+    result = _GradientAuditProxy._weighted_vector_mean(vectors, [1.0, 3.0])
+    np.testing.assert_allclose(result["weight"], np.asarray([4.0, 6.0], dtype=np.float64))
+    assert result["weight"].dtype == np.float64

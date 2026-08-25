@@ -920,6 +920,29 @@ class _GradientAuditProxy:
         return _GradientAuditProxy._weighted_vector_mean(vectors, weights)
 
     @staticmethod
+    def _as_fp64_numpy(value: object) -> np.ndarray:
+        """Materialize a gradient value without asking NumPy to read CUDA memory.
+
+        The real Torch provider returns detached tensors, and a CUDA tensor's
+        ``__array__`` implementation intentionally rejects direct NumPy
+        conversion.  The audit is a CPU-side FP64 reduction, so detach first,
+        move to CPU, then materialize the NumPy array and cast explicitly.
+        The duck-typed calls keep this control-plane module importable without
+        making Torch a hard dependency for its contract tests.
+        """
+
+        detach = getattr(value, "detach", None)
+        if callable(detach):
+            value = detach()
+        cpu = getattr(value, "cpu", None)
+        if callable(cpu):
+            value = cpu()
+        to_numpy = getattr(value, "numpy", None)
+        if callable(to_numpy):
+            value = to_numpy()
+        return np.asarray(value, dtype=np.float64)
+
+    @staticmethod
     def _weighted_vector_mean(
         vectors: Sequence[Mapping[str, object]], weights: Sequence[float]
     ) -> dict[str, np.ndarray]:
@@ -931,11 +954,13 @@ class _GradientAuditProxy:
             raise S27ExecutionBlocked("S27_MEAN_GRADIENT_WEIGHT_INVALID")
         result: dict[str, np.ndarray] = {}
         for name in names:
-            value = np.zeros_like(np.asarray(vectors[0][name]), dtype=np.float64)
+            value = np.zeros_like(
+                _GradientAuditProxy._as_fp64_numpy(vectors[0][name]), dtype=np.float64
+            )
             for gradients, weight in zip(vectors, weights):
                 if tuple(gradients.keys()) != names:
                     raise S27ExecutionBlocked("S27_MEAN_GRADIENT_PARAMETER_SET_DRIFT")
-                value += np.asarray(gradients[name], dtype=np.float64) * weight
+                value += _GradientAuditProxy._as_fp64_numpy(gradients[name]) * weight
             result[name] = value / total_weight
         return result
 
