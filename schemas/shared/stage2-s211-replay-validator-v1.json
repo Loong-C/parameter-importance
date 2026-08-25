@@ -1,0 +1,22 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://parameter-importance.invalid/schemas/shared/stage2-s211-replay-validator-v1.json",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "validator_id", "required_model", "required_audit_type", "required_fields", "network_forbidden", "synthetic_forbidden", "empty_output_root_required", "expected_source_artifact_hash", "status", "reasons", "artifact_hash"],
+  "properties": {
+    "schema_version": {"const": "stage2-s211-replay-validator-v1"},
+    "validator_id": {"type": "string", "minLength": 1},
+    "required_model": {"const": "31M"},
+    "required_audit_type": {"const": "confirmatory_31m_repetition"},
+    "required_fields": {"type": "array", "items": {"type": "string"}},
+    "network_forbidden": {"const": true},
+    "synthetic_forbidden": {"const": true},
+    "empty_output_root_required": {"const": true},
+    "expected_source_artifact_hash": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/hash"}]},
+    "status": {"enum": ["READY", "BLOCKED"]},
+    "reasons": {"type": "array", "items": {"type": "string"}},
+    "artifact_hash": {"$ref": "#/$defs/hash"}
+  },
+  "$defs": {"hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"}}
+}

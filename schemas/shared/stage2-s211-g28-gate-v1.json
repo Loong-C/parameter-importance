@@ -1,0 +1,7 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://parameter-importance.invalid/schemas/shared/stage2-s211-g28-gate-v1.json",
+  "title": "Stage 2.11 G2.8 gate alias",
+  "description": "The implementation emits gate-record-v1; this schema records its Stage 2.11 role for discovery.",
+  "allOf": [{"$ref": "gate-record-v1.json"}]
+}

@@ -1,0 +1,22 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://parameter-importance.invalid/schemas/shared/stage2-s211-replay-instructions-v1.json",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "task_id", "replay_id", "status", "formal_eligible", "started_from_empty_output_root", "network_required", "forbidden_inputs", "source_refs", "command", "reasons", "artifact_hash"],
+  "properties": {
+    "schema_version": {"const": "stage2-s211-replay-instructions-v1"},
+    "task_id": {"const": "stage2.11_delivery_and_exit_gate"},
+    "replay_id": {"type": "string", "minLength": 1},
+    "status": {"enum": ["READY", "BLOCKED"]},
+    "formal_eligible": {"type": "boolean"},
+    "started_from_empty_output_root": {"const": true},
+    "network_required": {"const": false},
+    "forbidden_inputs": {"type": "array", "minItems": 1, "items": {"type": "string"}},
+    "source_refs": {"type": "object"},
+    "command": {"oneOf": [{"type": "null"}, {"type": "array", "items": {"type": "string"}}]},
+    "reasons": {"type": "array", "items": {"type": "string"}},
+    "artifact_hash": {"$ref": "#/$defs/hash"}
+  },
+  "$defs": {"hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"}}
+}

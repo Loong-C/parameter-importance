@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://parameter-importance.invalid/schemas/shared/stage2-s211-replay-audit-v1.json",
+  "type": "object",
+  "additionalProperties": true,
+  "required": ["schema_version", "status", "formal_eligible", "replay_executed", "equivalent", "validation_status", "artifact_hash"],
+  "properties": {
+    "schema_version": {"const": "stage2-s211-replay-audit-v1"},
+    "status": {"enum": ["PASS", "BLOCKED"]},
+    "formal_eligible": {"type": "boolean"},
+    "replay_executed": {"type": "boolean"},
+    "equivalent": {"type": "boolean"},
+    "validation_status": {"enum": ["PASS", "BLOCKED"]},
+    "artifact_hash": {"$ref": "#/$defs/hash"}
+  },
+  "$defs": {"hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"}}
+}
