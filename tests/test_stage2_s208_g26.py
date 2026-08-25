@@ -30,7 +30,7 @@ def _gate(gate_id: str) -> dict[str, object]:
     ).to_dict()
 
 
-def _formal_inputs(tmp_path: Path) -> dict[str, object]:
+def _formal_inputs(tmp_path: Path, *, bounded: bool = False) -> dict[str, object]:
     prereg = build_stage2_preregistration(
         seed_plan_hash="1" * 64,
         producer_commit="2" * 40,
@@ -65,13 +65,31 @@ def _formal_inputs(tmp_path: Path) -> dict[str, object]:
             "formal_eligible": True,
             "coordinate_ids": coordinate_ids,
             "vectors": {"bias": [1.0, 1.0, 1.0], "cross": [1.0, 1.0, 1.0], "ranking": [1.0, 1.0, 1.0]},
-            "reference_blocks": {
+            "metadata": {"qualification_gate_hash": gates["stage2.G2.3"]["artifact_hash"]},
+        }
+        if bounded:
+            ref_body.update({
+                "reference_uncertainty_mode": "independent_reference_variance_combination",
+                "reference_variances": {
+                    "bias": [0.0, 0.0, 0.0],
+                    "cross": [0.0, 0.0, 0.0],
+                    "ranking": [0.0, 0.0, 0.0],
+                },
+                "reference_uncertainty": {
+                    "schema_version": "stage2-reference-uncertainty-v1",
+                    "estimator": "block_u_delete_one_jackknife",
+                    "confidence_level": 0.95,
+                    "block_count_a": 3,
+                    "block_count_b": 3,
+                },
+                "sequence_variance": [0.0, 0.0, 0.0],
+            })
+        else:
+            ref_body["reference_blocks"] = {
                 "bias": [[1.0, 1.0, 1.0], [1.0, 1.0, 1.0], [1.0, 1.0, 1.0]],
                 "cross": [[1.0, 1.0, 1.0], [1.0, 1.0, 1.0], [1.0, 1.0, 1.0]],
                 "ranking": [[1.0, 1.0, 1.0], [1.0, 1.0, 1.0], [1.0, 1.0, 1.0]],
-            },
-            "metadata": {"qualification_gate_hash": gates["stage2.G2.3"]["artifact_hash"]},
-        }
+            }
         ref_body["artifact_hash"] = canonical_json_hash(ref_body)
         refs[cell] = ref_body
         for rep in range(3):
@@ -158,3 +176,50 @@ def test_s208_formal_fixture_publishes_machine_artifacts(tmp_path: Path) -> None
     family = result["confirmatory_family_decisions"]
     assert len(family["rows"]) == 6 * 2 * 3
     assert family["global"]["double"]["bias_qualified"] is True
+
+
+def test_s208_bounded_uncertainty_uses_independent_variance_combination(tmp_path: Path) -> None:
+    values = _formal_inputs(tmp_path, bounded=True)
+    result = analyze_s208_g26(
+        raw_manifest=values["manifest"], raw_root=values["raw_root"], references=values["refs"], matrix=values["matrix"],
+        preregistration=values["prereg"], hypothesis_contract=values["hypothesis"], upstream_gates=values["gates"],
+        bootstrap_replicates=100, bootstrap_seed=11,
+    )
+    assert result["status"] == "PASS"
+    assert all(
+        row["bootstrap"]["reference_uncertainty_mode"] == "independent_reference_variance_combination"
+        for row in result["confirmatory_family_decisions"]["rows"]
+    )
+    assert all(row["sequence_variance_source"] == "s204_hash_bound_sequence_variance" for row in result["raw_calibration"])
+
+
+def test_s208_bounded_uncertainty_missing_variance_fails_closed(tmp_path: Path) -> None:
+    values = _formal_inputs(tmp_path, bounded=True)
+    cell = EXPECTED_CELL_IDS[0]
+    refs = values["refs"]["cells"]
+    refs[cell]["reference_variances"].pop("cross")
+    refs[cell]["artifact_hash"] = canonical_json_hash({key: value for key, value in refs[cell].items() if key != "artifact_hash"})
+    with pytest.raises(S28G26Blocked, match="cross_variance:VECTOR_REQUIRED"):
+        analyze_s208_g26(
+            raw_manifest=values["manifest"], raw_root=values["raw_root"], references=values["refs"], matrix=values["matrix"],
+            preregistration=values["prereg"], hypothesis_contract=values["hypothesis"], upstream_gates=values["gates"],
+            bootstrap_replicates=100, bootstrap_seed=11,
+        )
+
+
+def test_s208_bounded_nonzero_ranking_variance_is_inconclusive_not_fake_pass(tmp_path: Path) -> None:
+    values = _formal_inputs(tmp_path, bounded=True)
+    for reference in values["refs"]["cells"].values():
+        reference["reference_variances"]["ranking"] = [1.0e-8, 1.0e-8, 1.0e-8]
+        reference["artifact_hash"] = canonical_json_hash({key: value for key, value in reference.items() if key != "artifact_hash"})
+    result = analyze_s208_g26(
+        raw_manifest=values["manifest"], raw_root=values["raw_root"], references=values["refs"], matrix=values["matrix"],
+        preregistration=values["prereg"], hypothesis_contract=values["hypothesis"], upstream_gates=values["gates"],
+        bootstrap_replicates=100, bootstrap_seed=11,
+    )
+    ranking_rows = [
+        row for row in result["confirmatory_family_decisions"]["noninferiority_rows"]
+        if row["endpoint"] in {"parameter_spearman_noninferiority", "parameter_overlap_at_1_percent_noninferiority"}
+    ]
+    assert ranking_rows and all(row["state"] == "INCONCLUSIVE" for row in ranking_rows)
+    assert all(row["interval"]["raw_reference_blocks_reconstructed"] is False for row in ranking_rows)

@@ -26,7 +26,7 @@ def _hashed(body: dict[str, object]) -> dict[str, object]:
     return body
 
 
-def _fixture(root: Path) -> tuple[Path, Path]:
+def _fixture(root: Path, *, bounded: bool = False) -> tuple[Path, Path]:
     refs = root / "refs"
     bundles = root / "bundles"
     refs.mkdir()
@@ -35,19 +35,39 @@ def _fixture(root: Path) -> tuple[Path, Path]:
     gate_rows: list[dict[str, object]] = []
     for index, cell in enumerate(CELLS):
         values = {"a": np.asarray([1.0 + index, 2.0 + index, 3.0 + index], dtype=np.float64)}
-        state = {
+        uncertainty_vectors = {
+            name: {"a": np.zeros(3, dtype=np.float64)}
+            for name in ("bias_variance", "cross_variance", "ranking_variance")
+        }
+        uncertainty_metadata = _hashed({
+            "schema_version": "stage2-reference-uncertainty-v1",
+            "estimator": "block_u_delete_one_jackknife",
+            "confidence_level": 0.95,
+            "block_count_a": 3,
+            "block_count_b": 3,
+            "bias_variance_hash": _vector_digest(uncertainty_vectors["bias_variance"]),
+            "cross_variance_hash": _vector_digest(uncertainty_vectors["cross_variance"]),
+            "ranking_variance_hash": _vector_digest(uncertainty_vectors["ranking_variance"]),
+            "trace_bias_variance": 0.0,
+            "bias_half_width_l2": 0.0,
+        })
+        sequence_variance = {"a": np.asarray([0.5, 0.5, 0.5], dtype=np.float64)}
+        state: dict[str, object] = {
             "coordinate_ids": ["a[0]", "a[1]", "a[2]"],
             "bias_reference": values,
             "cross_reference": values,
             "ranking_reference": values,
-            "reference_blocks": {
+        }
+        if bounded:
+            state.update({"uncertainty": uncertainty_vectors, "sequence_variance": sequence_variance})
+        else:
+            state["reference_blocks"] = {
                 name: [values, values, values]
                 for name in ("bias", "cross", "ranking")
-            },
-        }
+            }
         bundle_path = bundles / f"cell-{index}"
         bundle = publish_tensor_bundle(bundle_path, state)
-        candidate = _hashed({
+        candidate_body: dict[str, object] = {
             "schema_version": "reference-result-v1",
             "reference_id": f"ref-{index}",
             "bias_reference_hash": _vector_digest(values),
@@ -57,7 +77,13 @@ def _fixture(root: Path) -> tuple[Path, Path]:
             "tensor_bundle_manifest_hash": bundle.manifest_sha256,
             "scope": "formal",
             "formal_eligible": False,
-        })
+        }
+        if bounded:
+            candidate_body["metadata"] = {
+                "uncertainty": uncertainty_metadata,
+                "sequence_variance_hash": _vector_digest(sequence_variance),
+            }
+        candidate = _hashed(candidate_body)
         ref_path = refs / f"cell-{index}.json"
         write_canonical_json(ref_path, candidate)
         rows.append({"cell_id": cell, "reference_ref": ref_path.relative_to(root).as_posix(), "reference_hash": candidate["artifact_hash"]})
@@ -101,3 +127,53 @@ def test_loader_rejects_candidate_self_qualification(tmp_path: Path) -> None:
     write_canonical_json(tmp_path / "refs" / "cell-0.json", raw)
     with pytest.raises(S208ProductionBlocked, match="CANDIDATE_MUST_NOT_SELF_QUALIFY"):
         load_s208_reference_bundle(tmp_path, bundle.relative_to(tmp_path), gate.relative_to(tmp_path), memmap_root=tmp_path / "memmap")
+
+
+def test_loader_accepts_hash_bound_bounded_uncertainty_and_sequence_variance(tmp_path: Path) -> None:
+    bundle, gate = _fixture(tmp_path, bounded=True)
+    loaded = load_s208_reference_bundle(
+        tmp_path,
+        bundle.relative_to(tmp_path),
+        gate.relative_to(tmp_path),
+        memmap_root=tmp_path / "memmap",
+    )
+    for reference in loaded["cells"].values():
+        assert reference["reference_uncertainty_mode"] == "independent_reference_variance_combination"
+        assert set(reference["reference_variances"]) == {"bias", "cross", "ranking"}
+        assert isinstance(reference["sequence_variance"], np.memmap)
+        assert "reference_blocks" not in reference
+
+
+@pytest.mark.parametrize("field", ["bias_variance", "sequence_variance"])
+def test_loader_rejects_tampered_bounded_vectors(tmp_path: Path, field: str) -> None:
+    bundle, gate = _fixture(tmp_path, bounded=True)
+    bundle_path = tmp_path / "bundles" / "cell-0"
+    state, _identity = __import__(
+        "param_importance_nlp.runtime.tensor_bundle", fromlist=["load_tensor_bundle"]
+    ).load_tensor_bundle(bundle_path)
+    if field == "sequence_variance":
+        state["sequence_variance"]["a"][0] += 1.0
+    else:
+        state["uncertainty"][field]["a"][0] += 1.0
+    # Publish the changed bytes under a fresh bundle identity but keep the
+    # candidate's authoritative vector hashes unchanged.
+    import shutil
+
+    shutil.rmtree(bundle_path)
+    changed = publish_tensor_bundle(bundle_path, state)
+    candidate_path = tmp_path / "refs" / "cell-0.json"
+    candidate = json.loads(candidate_path.read_text(encoding="utf-8"))
+    candidate["tensor_bundle_manifest_hash"] = changed.manifest_sha256
+    candidate["artifact_hash"] = canonical_json_hash({key: value for key, value in candidate.items() if key != "artifact_hash"})
+    write_canonical_json(candidate_path, candidate)
+    bundle_manifest = json.loads(bundle.read_text(encoding="utf-8"))
+    bundle_manifest["cells"][0]["reference_hash"] = candidate["artifact_hash"]
+    bundle_manifest["artifact_hash"] = canonical_json_hash({key: value for key, value in bundle_manifest.items() if key != "artifact_hash"})
+    write_canonical_json(bundle, bundle_manifest)
+    with pytest.raises(S208ProductionBlocked, match="VARIANCE_HASH_MISMATCH"):
+        load_s208_reference_bundle(
+            tmp_path,
+            bundle.relative_to(tmp_path),
+            gate.relative_to(tmp_path),
+            memmap_root=tmp_path / "memmap",
+        )
