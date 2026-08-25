@@ -1420,9 +1420,16 @@ def _formal_provider(request: TaskExecutionRequest, root: Path) -> _ProviderCont
             model_asset.resolved.root,
             task_type=task_type,
             num_labels=providers["num_labels"],  # type: ignore[arg-type]
-            torch_dtype=torch.float64,
+            # Frozen-state main gradients are preregistered in FP32; only
+            # reference/statistic accumulation is FP64.  Coordinate registry
+            # hashes intentionally exclude dtype, so this binds the existing
+            # S2.3 coordinates without rerunning qualification.
+            torch_dtype=torch.float32,
         )
         model.module.to(torch.device(str(runtime["device"])))
+        model.module.eval()
+        if any(parameter.dtype is not torch.float32 for parameter in model.module.parameters()):
+            raise ValueError("FORMAL_MAIN_GRADIENT_MODEL_DTYPE_NOT_FLOAT32")
         if task_type == "causal_lm":
             if data_asset.storage_kind != "pythia_mmap_shards":
                 raise G3RuntimeAssetError(
@@ -1505,7 +1512,9 @@ def _formal_provider(request: TaskExecutionRequest, root: Path) -> _ProviderCont
             resolver,
             fixed_state_id=fixed_id,
             registry=registry,
-            output_dtype=torch.float64,
+            output_dtype=torch.float32,
+            gradient_chunk_size=1,
+            enable_formal_batched=True,
         )
     except DependencyUnavailable as error:
         raise _blocked(
@@ -2167,6 +2176,12 @@ def _run_stage2_handoff_audit(
             "registry_hash_property": "registry_hash",
             "parameter_names_property": "parameter_names",
             "output_dtype_property": "output_dtype",
+            "gradient_chunk_size_property": "gradient_chunk_size",
+            "gradient_chunk_size": getattr(context.provider, "gradient_chunk_size", None),
+            "formal_batched_execution_property": "enable_formal_batched",
+            "formal_batched_execution": bool(
+                getattr(context.provider, "enable_formal_batched", False)
+            ),
             "mutation_policy": "read_only_gradient_queries",
         },
         "state_contract": {

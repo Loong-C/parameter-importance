@@ -528,6 +528,18 @@ class InMemoryFrozenSampleResolver:
 class TorchFixedStateGradientProvider:
     """从 ``ModelAdapter`` 与冻结 resolver 计算固定状态加权 mean gradient。"""
 
+    # This is deliberately a narrow execution contract, rather than a general
+    # ``torch.vmap`` switch.  Pythia's frozen resolver emits one pre-shifted,
+    # fixed-length sequence per draw, so concatenating those sequences is the
+    # same additive loss numerator as evaluating them one at a time.  Other
+    # adapters (including custom modules with stochastic forwards) use the
+    # generic bounded path below.
+    _FORMAL_BATCH_MAX_DRAWS = 32
+    _FORMAL_RESOLVER_MODULE = "param_importance_nlp.providers.pythia_mmap"
+    _FORMAL_RESOLVER_NAME = "PythiaMMapFrozenSampleResolver"
+    _FORMAL_METADATA_VERSION = "pythia-mmap-frozen-sample-metadata-v1"
+    _FORMAL_SEQUENCE_LENGTH = 2048
+
     def __init__(
         self,
         model: ModelAdapter,
@@ -537,6 +549,7 @@ class TorchFixedStateGradientProvider:
         registry: ParameterRegistry | None = None,
         output_dtype: torch.dtype = torch.float32,
         gradient_chunk_size: int = 4,
+        enable_formal_batched: bool = False,
     ) -> None:
         if not isinstance(model, ModelAdapter):
             raise TypeError("MODEL_ADAPTER_PROTOCOL_NOT_IMPLEMENTED")
@@ -550,6 +563,10 @@ class TorchFixedStateGradientProvider:
             gradient_chunk_size, int
         ) or gradient_chunk_size <= 0:
             raise ValueError("FIXED_STATE_GRADIENT_CHUNK_SIZE_INVALID")
+        if type(enable_formal_batched) is not bool:
+            raise TypeError("FIXED_STATE_FORMAL_BATCHED_FLAG_INVALID")
+        if enable_formal_batched and output_dtype is not torch.float32:
+            raise ValueError("FIXED_STATE_FORMAL_BATCHED_REQUIRES_FLOAT32_OUTPUT")
         for field_name in (
             "resolver_id",
             "loss_unit",
@@ -605,6 +622,7 @@ class TorchFixedStateGradientProvider:
         # constructor knob is intentionally private to the provider contract;
         # ``1`` is the strict per-sample reference path.
         self._gradient_chunk_size = gradient_chunk_size
+        self._enable_formal_batched = enable_formal_batched
         self._digest_baseline: _DigestBaseline | None = None
 
     @property
@@ -650,6 +668,12 @@ class TorchFixedStateGradientProvider:
         """Number of sequential sample graphs retained per autograd call."""
 
         return self._gradient_chunk_size
+
+    @property
+    def enable_formal_batched(self) -> bool:
+        """Whether the strictly guarded Pythia formal fast path is enabled."""
+
+        return self._enable_formal_batched
 
     @property
     def model_adapter(self) -> ModelAdapter:
@@ -763,6 +787,8 @@ class TorchFixedStateGradientProvider:
                     "resolver_id": self._resolver.resolver_id,
                     "resolver_digest": resolver_digest,
                     "output_dtype": str(self.output_dtype),
+                    "gradient_chunk_size": self.gradient_chunk_size,
+                    "enable_formal_batched": self.enable_formal_batched,
                 }
             ),
         )
@@ -812,6 +838,8 @@ class TorchFixedStateGradientProvider:
             self._model.task_type,
             self._resolver.resolver_id,
             str(self.output_dtype),
+            self.gradient_chunk_size,
+            self.enable_formal_batched,
         )
 
     def assert_unchanged(self, expected_digest: str) -> None:
@@ -832,6 +860,121 @@ class TorchFixedStateGradientProvider:
                 return
         if self.state_digest() != expected_digest:
             raise RuntimeError("TORCH_FIXED_STATE_PROVIDER_STATE_CHANGED")
+
+    def _formal_batch_eligible(
+        self, batches: Sequence[TrainingMicrobatch], sample_ids: Sequence[Hashable]
+    ) -> bool:
+        """Return whether the opt-in formal concatenation contract is proven.
+
+        This guard intentionally rejects rather than guesses.  In particular,
+        arbitrary ``TrainingMicrobatch`` payloads and resolver subclasses can
+        have data-dependent shapes, side effects, or stochastic semantics that
+        are not equivalent to one concatenated forward.
+        """
+
+        if not self.enable_formal_batched:
+            return False
+        if not batches or len(batches) != len(sample_ids):
+            return False
+        if len(batches) > self._FORMAL_BATCH_MAX_DRAWS:
+            return False
+        resolver_type = type(self._resolver)
+        if (
+            resolver_type.__module__ != self._FORMAL_RESOLVER_MODULE
+            or resolver_type.__name__ != self._FORMAL_RESOLVER_NAME
+        ):
+            return False
+        if self._model.task_type != "causal_lm":
+            return False
+        if any(module.training for module in self._model.module.modules()):
+            return False
+        expected_keys = {"input_ids", "target_ids", "attention_mask"}
+        for batch, sample_id in zip(batches, sample_ids, strict=True):
+            if len(batch.sample_ids) != 1 or batch.sample_ids[0] != sample_id:
+                return False
+            metadata = batch.metadata
+            if metadata.get("schema_version") != self._FORMAL_METADATA_VERSION:
+                return False
+            if not isinstance(metadata.get("global_record_index"), int):
+                return False
+            if set(batch.payload) != expected_keys:
+                return False
+            for name in expected_keys:
+                value = batch.payload[name]
+                if (
+                    value.device.type != "cpu"
+                    or value.layout is not torch.strided
+                    or not value.is_contiguous()
+                    or value.ndim != 2
+                    or tuple(value.shape) != (1, self._FORMAL_SEQUENCE_LENGTH)
+                    or value.dtype not in {torch.int64, torch.int32}
+                ):
+                    return False
+            if not bool(
+                ((batch.payload["attention_mask"] == 0)
+                 | (batch.payload["attention_mask"] == 1)).all()
+            ):
+                return False
+        return True
+
+    def _formal_batched_gradients(
+        self,
+        batches: Sequence[TrainingMicrobatch],
+        parameter_tuple: Sequence[torch.nn.Parameter],
+    ) -> tuple[torch.Tensor, int, str, tuple[torch.Tensor, ...]]:
+        """Compute one additive Pythia draw-group loss/backward.
+
+        The Pythia resolver's target IDs are already aligned with logits.  A
+        concatenated batch therefore changes neither the target-token set nor
+        the numerator; it only lets Torch execute the fixed 32 sequences as a
+        single GPU workload.  The returned gradients are deliberately kept in
+        float64 until the existing provider output conversion.
+        """
+
+        keys = ("input_ids", "target_ids", "attention_mask")
+        payload = {
+            name: torch.cat([batch.payload[name] for batch in batches], dim=0).to(
+                device=self._device
+            )
+            for name in keys
+        }
+        sample_ids = tuple(
+            sample_id for batch in batches for sample_id in batch.sample_ids
+        )
+        merged = TrainingMicrobatch(
+            f"formal-batched:{sample_ids[0]}:{sample_ids[-1]}",
+            payload,
+            sample_ids,
+            batches[0].metadata,
+        )
+        loss = self._model.loss(merged)
+        if loss.statistical_unit != self._resolver.loss_unit:
+            raise ValueError("RESOLVER_LOSS_UNIT_MISMATCH")
+        expected_count = int(
+            merged.payload["target_ids"]
+            .ne(-100)
+            .logical_and(merged.payload["attention_mask"].ne(0))
+            .sum()
+            .item()
+        )
+        if expected_count != loss.effective_count:
+            raise RuntimeError("FIXED_STATE_BATCHED_EFFECTIVE_COUNT_MISMATCH")
+        gradients = torch.autograd.grad(
+            loss.loss_numerator,
+            tuple(parameter_tuple),
+            create_graph=False,
+            retain_graph=False,
+            allow_unused=False,
+        )
+        checked: list[torch.Tensor] = []
+        for name, gradient in zip(self.parameter_names, gradients, strict=True):
+            if gradient.layout is not torch.strided:
+                raise ValueError(f"FIXED_STATE_SPARSE_GRADIENT:{name}")
+            detached = gradient.detach().to(dtype=torch.float64)
+            if not bool(torch.isfinite(detached).all()):
+                raise ValueError(f"FIXED_STATE_NONFINITE_GRADIENT:{name}")
+            checked.append(detached)
+        return loss.loss_numerator.detach(), loss.effective_count, loss.statistical_unit, tuple(checked)
 
     def gradient(self, draws: Sequence[object]) -> GradientBatch:
         """
@@ -863,7 +1006,31 @@ class TorchFixedStateGradientProvider:
             parameter_tuple = tuple(
                 self._parameters[name] for name in self.parameter_names
             )
+            resolved_batches: tuple[TrainingMicrobatch, ...] = ()
+            if self.enable_formal_batched:
+                # Resolve once so a failed strict guard falls back without
+                # changing duplicate-ID order or consulting the frozen source
+                # a second time.
+                resolved = tuple(
+                    self._resolver.resolve(sample_id) for sample_id in sample_ids
+                )
+                if not all(isinstance(batch, TrainingMicrobatch) for batch in resolved):
+                    raise TypeError("RESOLVER_RESULT_NOT_TRAINING_MICROBATCH")
+                resolved_batches = resolved  # type: ignore[assignment]
             with torch.enable_grad():
+                if self._formal_batch_eligible(resolved_batches, sample_ids):
+                    (
+                        loss_numerator_total,
+                        total_count,
+                        observed_loss_unit,
+                        batched_gradients,
+                    ) = self._formal_batched_gradients(
+                        resolved_batches, parameter_tuple
+                    )
+                    for name, gradient in zip(
+                        self.parameter_names, batched_gradients, strict=True
+                    ):
+                        gradient_sums[name] = gradient
                 # Keep only a bounded number of forward graphs alive.  The
                 # old combined-loss backward retained all 32 graphs, while a
                 # strictly per-sample backward launched one autograd traversal
@@ -871,54 +1038,62 @@ class TorchFixedStateGradientProvider:
                 # order and stochastic/RNG behavior, but cuts Python/autograd
                 # launch overhead without making memory proportional to the
                 # public block size.
-                for chunk_start in range(0, len(sample_ids), self.gradient_chunk_size):
-                    chunk_losses: list[torch.Tensor] = []
-                    chunk_count = 0
-                    for sample_id in sample_ids[
-                        chunk_start : chunk_start + self.gradient_chunk_size
-                    ]:
-                        resolved = self._resolver.resolve(sample_id)
-                        if not isinstance(resolved, TrainingMicrobatch):
-                            raise TypeError("RESOLVER_RESULT_NOT_TRAINING_MICROBATCH")
-                        batch = resolved.to(self._device)
-                        loss = self._model.loss(batch)
-                        if loss.statistical_unit != self._resolver.loss_unit:
-                            raise ValueError("RESOLVER_LOSS_UNIT_MISMATCH")
-                        if observed_loss_unit is None:
-                            observed_loss_unit = loss.statistical_unit
-                        elif observed_loss_unit != loss.statistical_unit:
-                            raise ValueError("DRAW_LOSS_STATISTICAL_UNIT_MISMATCH")
-                        numerator = loss.loss_numerator.detach()
-                        loss_numerator_total = (
-                            numerator
-                            if loss_numerator_total is None
-                            else loss_numerator_total + numerator
+                elif not self._formal_batch_eligible(resolved_batches, sample_ids):
+                    for chunk_start in range(0, len(sample_ids), self.gradient_chunk_size):
+                        chunk_losses: list[torch.Tensor] = []
+                        chunk_count = 0
+                        for offset, sample_id in enumerate(
+                            sample_ids[
+                                chunk_start : chunk_start + self.gradient_chunk_size
+                            ],
+                            start=chunk_start,
+                        ):
+                            resolved = (
+                                resolved_batches[offset]
+                                if resolved_batches
+                                else self._resolver.resolve(sample_id)
+                            )
+                            if not isinstance(resolved, TrainingMicrobatch):
+                                raise TypeError("RESOLVER_RESULT_NOT_TRAINING_MICROBATCH")
+                            batch = resolved.to(self._device)
+                            loss = self._model.loss(batch)
+                            if loss.statistical_unit != self._resolver.loss_unit:
+                                raise ValueError("RESOLVER_LOSS_UNIT_MISMATCH")
+                            if observed_loss_unit is None:
+                                observed_loss_unit = loss.statistical_unit
+                            elif observed_loss_unit != loss.statistical_unit:
+                                raise ValueError("DRAW_LOSS_STATISTICAL_UNIT_MISMATCH")
+                            numerator = loss.loss_numerator.detach()
+                            loss_numerator_total = (
+                                numerator
+                                if loss_numerator_total is None
+                                else loss_numerator_total + numerator
+                            )
+                            chunk_losses.append(loss.loss_numerator)
+                            chunk_count += loss.effective_count
+                        if not chunk_losses:
+                            raise ValueError("FIXED_STATE_GRADIENT_CHUNK_EMPTY")
+                        chunk_numerator = chunk_losses[0]
+                        for numerator in chunk_losses[1:]:
+                            chunk_numerator = chunk_numerator + numerator
+                        gradients = torch.autograd.grad(
+                            chunk_numerator,
+                            parameter_tuple,
+                            create_graph=False,
+                            retain_graph=False,
+                            allow_unused=False,
                         )
-                        chunk_losses.append(loss.loss_numerator)
-                        chunk_count += loss.effective_count
-                    if not chunk_losses:
-                        raise ValueError("FIXED_STATE_GRADIENT_CHUNK_EMPTY")
-                    chunk_numerator = chunk_losses[0]
-                    for numerator in chunk_losses[1:]:
-                        chunk_numerator = chunk_numerator + numerator
-                    gradients = torch.autograd.grad(
-                        chunk_numerator,
-                        parameter_tuple,
-                        create_graph=False,
-                        retain_graph=False,
-                        allow_unused=False,
-                    )
-                    for name, gradient in zip(self.parameter_names, gradients, strict=True):
-                        if gradient.layout is not torch.strided:
-                            raise ValueError(f"FIXED_STATE_SPARSE_GRADIENT:{name}")
-                        detached = gradient.detach().to(dtype=torch.float64)
-                        if not bool(torch.isfinite(detached).all()):
-                            raise ValueError(f"FIXED_STATE_NONFINITE_GRADIENT:{name}")
-                        if name not in gradient_sums:
-                            gradient_sums[name] = detached.clone()
-                        else:
-                            gradient_sums[name].add_(detached)
-                    total_count += chunk_count
+                        for name, gradient in zip(self.parameter_names, gradients, strict=True):
+                            if gradient.layout is not torch.strided:
+                                raise ValueError(f"FIXED_STATE_SPARSE_GRADIENT:{name}")
+                            detached = gradient.detach().to(dtype=torch.float64)
+                            if not bool(torch.isfinite(detached).all()):
+                                raise ValueError(f"FIXED_STATE_NONFINITE_GRADIENT:{name}")
+                            if name not in gradient_sums:
+                                gradient_sums[name] = detached.clone()
+                            else:
+                                gradient_sums[name].add_(detached)
+                        total_count += chunk_count
                 if total_count <= 0:  # LossBatch 已拒绝 0，此处保留组合边界
                     raise ValueError("FIXED_STATE_EFFECTIVE_COUNT_ZERO")
                 if loss_numerator_total is None:
