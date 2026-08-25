@@ -348,6 +348,16 @@ def prepare_formal_s204(
         ),
         require_terminal_convergence=r22_round is not None,
         round_manifest_ref=r22_round_ref,
+        final_stream_start_position=(
+            int(r22_round["sizing"]["segment_start_position"])  # type: ignore[index]
+            if r22_round is not None
+            else None
+        ),
+        final_stream_end_position_exclusive=(
+            int(r22_round["sizing"]["segment_end_position_exclusive"])  # type: ignore[index]
+            if r22_round is not None
+            else None
+        ),
         output_dir=f"{output}/reference-sizing",
     )
     registry_refs = publish_formal_registry_artifacts(

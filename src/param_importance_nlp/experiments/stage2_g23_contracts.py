@@ -123,20 +123,29 @@ def generator_boundary(
     sampling: object,
     stream: str,
     count: int,
+    *,
+    start: int = 0,
 ) -> dict[str, object]:
-    """Capture actual initial/final MT19937 states for one frozen prefix."""
+    """Capture actual MT19937 states for one frozen interval.
 
-    if not hasattr(sampling, "_stream_seed") or count < 0:
+    The historical prefix form (``start=0``) is byte-compatible.  Continuation
+    rounds publish the absolute interval start so a resumed segment cannot be
+    mistaken for the old prefix.
+    """
+
+    if not hasattr(sampling, "_stream_seed") or count < 0 or start < 0:
         raise ValueError("GENERATOR_BOUNDARY_ARGUMENT_INVALID")
     algorithm_version = str(getattr(sampling, "algorithm_version"))
     rng = random.Random(sampling._stream_seed(stream))  # type: ignore[attr-defined]
-    before = _jsonable_state(rng.getstate())
     universe = getattr(sampling, "universe")
     size = len(getattr(universe, "sample_ids"))
+    for _ in range(start):
+        rng.randrange(size)
+    before = _jsonable_state(rng.getstate())
     for _ in range(count):
         rng.randrange(size)
     after = _jsonable_state(rng.getstate())
-    return {
+    result = {
         "algorithm_version": algorithm_version,
         "stream": stream,
         "count": count,
@@ -145,6 +154,9 @@ def generator_boundary(
         "state_before_sha256": generator_state_digest(algorithm_version, before),
         "state_after_sha256": generator_state_digest(algorithm_version, after),
     }
+    if start:
+        result.update({"start_position": start, "end_position_exclusive": start + count})
+    return result
 
 
 def validate_generator_boundary(
@@ -154,15 +166,28 @@ def validate_generator_boundary(
     stream: str,
     count: int,
     field: str,
+    start: int | None = None,
 ) -> dict[str, object]:
     """Verify actual serialized states, replay, and both state digests."""
 
-    if not isinstance(value, Mapping) or set(value) != {
+    if not isinstance(value, Mapping) or set(value) not in ({
         "algorithm_version", "stream", "count", "state_before", "state_after",
         "state_before_sha256", "state_after_sha256",
-    }:
+    }, {
+        "algorithm_version", "stream", "count", "state_before", "state_after",
+        "state_before_sha256", "state_after_sha256", "start_position",
+        "end_position_exclusive",
+    }):
         raise ValueError(f"{field}:ACTUAL_GENERATOR_STATE_REQUIRED")
+    observed_start = int(value.get("start_position", 0))
+    if start is not None and observed_start != start:
+        raise ValueError(f"{field}:SEGMENT_START_MISMATCH")
+    start = observed_start
+    if start < 0 or value.get("end_position_exclusive", start + count) != start + count:
+        raise ValueError(f"{field}:SEGMENT_BOUNDARY_INVALID")
     expected = generator_boundary(sampling, stream, count)
+    if start:
+        expected = generator_boundary(sampling, stream, count, start=start)
     candidate = dict(value)
     if candidate != expected:
         raise ValueError(f"{field}:GENERATOR_STATE_REPLAY_MISMATCH")

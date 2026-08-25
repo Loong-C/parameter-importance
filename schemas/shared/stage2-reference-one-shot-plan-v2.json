@@ -1,0 +1,25 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://parameter-importance.invalid/schemas/shared/stage2-reference-one-shot-plan-v2.json",
+  "title": "Stage 2 final reference one-shot plan with absolute draw segments",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "reference_id", "sizing_result_hash", "sample_count_per_stream", "block_size", "sizing_stream", "stream_a", "stream_b", "one_shot", "stream_a_draw_start_position", "stream_a_draw_end_position_exclusive", "stream_b_draw_start_position", "stream_b_draw_end_position_exclusive", "artifact_hash"],
+  "properties": {
+    "schema_version": {"const": "stage2-reference-one-shot-plan-v2"},
+    "reference_id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,159}$"},
+    "sizing_result_hash": {"$ref": "#/defs/hash"},
+    "sample_count_per_stream": {"type": "integer", "minimum": 1},
+    "block_size": {"type": "integer", "minimum": 1},
+    "sizing_stream": {"const": "reference_sizing"},
+    "stream_a": {"const": "reference_A"},
+    "stream_b": {"const": "reference_B"},
+    "one_shot": {"const": true},
+    "stream_a_draw_start_position": {"type": "integer", "minimum": 0},
+    "stream_a_draw_end_position_exclusive": {"type": "integer", "minimum": 1},
+    "stream_b_draw_start_position": {"type": "integer", "minimum": 0},
+    "stream_b_draw_end_position_exclusive": {"type": "integer", "minimum": 1},
+    "artifact_hash": {"$ref": "#/defs/hash"}
+  },
+  "$defs": {"hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"}}
+}

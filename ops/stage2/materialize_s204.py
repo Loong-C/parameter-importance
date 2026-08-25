@@ -3221,6 +3221,8 @@ def publish_reference_sizing_plan(
     draw_end_position_exclusive: int | None = None,
     require_terminal_convergence: bool = False,
     round_manifest_ref: str | None = None,
+    final_stream_start_position: int | None = None,
+    final_stream_end_position_exclusive: int | None = None,
     output_ref: str = "evidence/stage2/s204/reference-sizing-plan.json",
 ) -> tuple[ReferenceSizingPlan, str]:
     """Create and immutably publish the sizing-only S2.4 plan."""
@@ -3240,6 +3242,8 @@ def publish_reference_sizing_plan(
         draw_end_position_exclusive=draw_end_position_exclusive,
         require_terminal_convergence=require_terminal_convergence,
         round_manifest_ref=round_manifest_ref,
+        final_stream_start_position=final_stream_start_position,
+        final_stream_end_position_exclusive=final_stream_end_position_exclusive,
     )
     # Validate the exact wire contract before publication.  This also checks
     # that the plan is not accidentally written as a fixture/schema variant.
@@ -3266,6 +3270,8 @@ def publish_per_cell_sizing_plans(
     draw_end_position_exclusive: int | None = None,
     require_terminal_convergence: bool = False,
     round_manifest_ref: str | None = None,
+    final_stream_start_position: int | None = None,
+    final_stream_end_position_exclusive: int | None = None,
     output_dir: str = "evidence/stage2/s204/reference-sizing",
 ) -> dict[str, str]:
     """Publish six independent sizing studies with stable cell identities."""
@@ -3288,6 +3294,8 @@ def publish_per_cell_sizing_plans(
             draw_end_position_exclusive=draw_end_position_exclusive,
             require_terminal_convergence=require_terminal_convergence,
             round_manifest_ref=round_manifest_ref,
+            final_stream_start_position=final_stream_start_position,
+            final_stream_end_position_exclusive=final_stream_end_position_exclusive,
             output_ref=output_ref,
         )
         refs[cell_id] = ref

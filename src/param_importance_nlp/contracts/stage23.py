@@ -341,6 +341,8 @@ _STAGE23_ARTIFACT_FIELDS: dict[str, set[str]] = {
         "draw_end_position_exclusive",
         "require_terminal_convergence",
         "round_manifest_ref",
+        "final_stream_start_position",
+        "final_stream_end_position_exclusive",
         "artifact_hash",
     },
     "stage2-reference-sizing-result-v1": {
@@ -386,6 +388,22 @@ _STAGE23_ARTIFACT_FIELDS: dict[str, set[str]] = {
         "stream_a",
         "stream_b",
         "one_shot",
+        "artifact_hash",
+    },
+    "stage2-reference-one-shot-plan-v2": {
+        "schema_version",
+        "reference_id",
+        "sizing_result_hash",
+        "sample_count_per_stream",
+        "block_size",
+        "sizing_stream",
+        "stream_a",
+        "stream_b",
+        "one_shot",
+        "stream_a_draw_start_position",
+        "stream_a_draw_end_position_exclusive",
+        "stream_b_draw_start_position",
+        "stream_b_draw_end_position_exclusive",
         "artifact_hash",
     },
     "stage2-reference-one-shot-result-v1": {
@@ -805,7 +823,7 @@ def validate_stage23_artifact(value: Mapping[str, object]) -> object:
             if not isinstance(item, (int, float)) or isinstance(item, bool) or not math.isfinite(float(item)) or float(item) < 0:
                 raise ValueError(f"{field_name} 必须是有限非负数")
 
-    if schema == "stage2-reference-one-shot-plan-v1":
+    if schema in {"stage2-reference-one-shot-plan-v1", "stage2-reference-one-shot-plan-v2"}:
         for field_name in ("reference_id", "sizing_stream", "stream_a", "stream_b"):
             if not isinstance(value[field_name], str) or not value[field_name]:
                 raise TypeError(f"{field_name} 必须是非空字符串")
@@ -819,6 +837,13 @@ def validate_stage23_artifact(value: Mapping[str, object]) -> object:
             "reference_sizing", "reference_A", "reference_B"
         ) or value["one_shot"] is not True:
             raise ValueError("one-shot reference stream contract drift")
+        if schema.endswith("-v2"):
+            count = value["sample_count_per_stream"]
+            for prefix in ("stream_a", "stream_b"):
+                start = _require_int(value[f"{prefix}_draw_start_position"], f"{prefix}_draw_start_position", minimum=0)
+                end = _require_int(value[f"{prefix}_draw_end_position_exclusive"], f"{prefix}_draw_end_position_exclusive", minimum=1)
+                if end != start + count:
+                    raise ValueError("one-shot draw segment boundary mismatch")
 
     if schema == "stage2-reference-one-shot-result-v1":
         for field_name in (

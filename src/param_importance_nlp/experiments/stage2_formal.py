@@ -684,6 +684,10 @@ class ReferenceSizingPlan:
     draw_end_position_exclusive: int | None = None
     require_terminal_convergence: bool = False
     round_manifest_ref: str | None = None
+    # r22 also reserves disjoint future intervals for the final A/B streams.
+    # Defaults preserve the historical prefix plan byte-for-byte.
+    final_stream_start_position: int | None = None
+    final_stream_end_position_exclusive: int | None = None
 
     def __post_init__(self) -> None:
         if self.schema_version != "stage2-reference-sizing-plan-v1":
@@ -732,6 +736,22 @@ class ReferenceSizingPlan:
             raise ValueError("draw_end_position_exclusive 必须等于 start+最大候选")
         if type(self.require_terminal_convergence) is not bool:
             raise TypeError("require_terminal_convergence 必须是 bool")
+        final_start = self.final_stream_start_position
+        if final_start is None:
+            final_start = self.draw_start_position
+            object.__setattr__(self, "final_stream_start_position", final_start)
+        if isinstance(final_start, bool) or not isinstance(final_start, int) or final_start < 0:
+            raise ValueError("final_stream_start_position 必须是非负整数")
+        expected_final_end = final_start + counts[-1]
+        final_end = self.final_stream_end_position_exclusive
+        if final_end is None:
+            object.__setattr__(self, "final_stream_end_position_exclusive", expected_final_end)
+        elif (
+            isinstance(final_end, bool)
+            or not isinstance(final_end, int)
+            or final_end != expected_final_end
+        ):
+            raise ValueError("final_stream_end_position_exclusive 必须等于 final_start+最大候选")
         if self.round_manifest_ref is not None and (
             not isinstance(self.round_manifest_ref, str)
             or not self.round_manifest_ref
@@ -771,13 +791,20 @@ class ReferenceSizingPlan:
         }
         # Preserve historical r21 plan hashes; continuation metadata is
         # emitted only for a non-zero/terminal-gated continuation plan.
-        if self.draw_start_position or self.require_terminal_convergence or self.round_manifest_ref:
+        if (
+            self.draw_start_position
+            or self.require_terminal_convergence
+            or self.round_manifest_ref
+            or self.final_stream_start_position
+        ):
             payload.update(
                 {
                     "draw_start_position": self.draw_start_position,
                     "draw_end_position_exclusive": self.draw_end_position_exclusive,
                     "require_terminal_convergence": self.require_terminal_convergence,
                     "round_manifest_ref": self.round_manifest_ref,
+                    "final_stream_start_position": self.final_stream_start_position,
+                    "final_stream_end_position_exclusive": self.final_stream_end_position_exclusive,
                 }
             )
         return payload
@@ -1352,10 +1379,20 @@ class OneShotReferencePlan:
     stream_b: str = "reference_B"
     one_shot: bool = True
     schema_version: str = "stage2-reference-one-shot-plan-v1"
+    # Continuation rounds use v2 to bind the absolute A/B draw interval.
+    stream_a_draw_start_position: int = 0
+    stream_a_draw_end_position_exclusive: int | None = None
+    stream_b_draw_start_position: int = 0
+    stream_b_draw_end_position_exclusive: int | None = None
 
     def __post_init__(self) -> None:
         _require_identifier(self.reference_id, field_name="reference_id")
         _require_sha256(self.sizing_result_hash, field_name="sizing_result_hash")
+        if self.schema_version not in {
+            "stage2-reference-one-shot-plan-v1",
+            "stage2-reference-one-shot-plan-v2",
+        }:
+            raise ValueError("ONE_SHOT_REFERENCE_SCHEMA_UNSUPPORTED")
         if self.sample_count_per_stream <= 0 or self.block_size <= 0:
             raise ValueError("ONE_SHOT_REFERENCE_SAMPLE_COUNTS_INVALID")
         if self.sample_count_per_stream % self.block_size:
@@ -1366,9 +1403,28 @@ class OneShotReferencePlan:
             raise ValueError("ONE_SHOT_REFERENCE_STREAM_NAMES_FROZEN")
         if self.one_shot is not True:
             raise ValueError("ONE_SHOT_REFERENCE_MUST_BE_TRUE")
+        for name in ("stream_a_draw_start_position", "stream_b_draw_start_position"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(f"{name} must be a non-negative integer")
+        for start_name, end_name in (
+            ("stream_a_draw_start_position", "stream_a_draw_end_position_exclusive"),
+            ("stream_b_draw_start_position", "stream_b_draw_end_position_exclusive"),
+        ):
+            start = getattr(self, start_name)
+            end = getattr(self, end_name)
+            expected = start + self.sample_count_per_stream
+            if end is None:
+                object.__setattr__(self, end_name, expected)
+            elif isinstance(end, bool) or not isinstance(end, int) or end != expected:
+                raise ValueError(f"{end_name} must equal start+sample_count_per_stream")
+        if self.schema_version == "stage2-reference-one-shot-plan-v1" and (
+            self.stream_a_draw_start_position or self.stream_b_draw_start_position
+        ):
+            raise ValueError("ONE_SHOT_REFERENCE_V1_PREFIX_ONLY")
 
     def payload_dict(self) -> dict[str, object]:
-        return {
+        payload = {
             "schema_version": self.schema_version,
             "reference_id": self.reference_id,
             "sizing_result_hash": self.sizing_result_hash,
@@ -1379,6 +1435,16 @@ class OneShotReferencePlan:
             "stream_b": self.stream_b,
             "one_shot": True,
         }
+        if self.schema_version == "stage2-reference-one-shot-plan-v2":
+            payload.update(
+                {
+                    "stream_a_draw_start_position": self.stream_a_draw_start_position,
+                    "stream_a_draw_end_position_exclusive": self.stream_a_draw_end_position_exclusive,
+                    "stream_b_draw_start_position": self.stream_b_draw_start_position,
+                    "stream_b_draw_end_position_exclusive": self.stream_b_draw_end_position_exclusive,
+                }
+            )
+        return payload
 
     @property
     def artifact_hash(self) -> str:
@@ -2272,6 +2338,10 @@ class OneShotReferenceRunner:
                 "registry_hash": self.provider.registry_hash,
                 "stream_a_draw_hash": _draw_digest(draws_a),
                 "stream_b_draw_hash": _draw_digest(draws_b),
+                "stream_a_draw_start_position": plan.stream_a_draw_start_position,
+                "stream_a_draw_end_position_exclusive": plan.stream_a_draw_end_position_exclusive,
+                "stream_b_draw_start_position": plan.stream_b_draw_start_position,
+                "stream_b_draw_end_position_exclusive": plan.stream_b_draw_end_position_exclusive,
             }
         )
         total_pairs = plan.sample_count_per_stream // plan.block_size

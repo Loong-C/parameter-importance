@@ -1399,7 +1399,10 @@ def _prepare_cell(root: Path, source: CellInput, *, repo_root: Path | None = Non
             raise G23Blocked("delta_sci:FORMULA_HASH_MISMATCH")
         evidence.identities["sizing_delta_sci_hash"] = delta_hash
         one_shot_plan = cp.get("one_shot_plan")
-        if not isinstance(one_shot_plan, Mapping) or one_shot_plan.get("schema_version") != "stage2-reference-one-shot-plan-v1":
+        if not isinstance(one_shot_plan, Mapping) or one_shot_plan.get("schema_version") not in {
+            "stage2-reference-one-shot-plan-v1",
+            "stage2-reference-one-shot-plan-v2",
+        }:
             raise G23Blocked("one_shot_plan:SCHEMA_REQUIRED")
         selected_candidate = cp.get("selected_sample_count_per_stream")
         selected_one_shot = one_shot_plan.get("sample_count_per_stream")
@@ -1439,6 +1442,10 @@ def _prepare_cell(root: Path, source: CellInput, *, repo_root: Path | None = Non
                 "registry_hash": evidence.identities["registry_hash"],
                 "sizing_draw_hash": sizing_draw_hash,
                 "sizing_stream": "reference_sizing",
+                "draw_start_position": int(plan.get("draw_start_position", 0)),
+                "draw_end_position_exclusive": int(
+                    plan.get("draw_end_position_exclusive", max(plan.get("candidate_sample_counts", [0])))
+                ),
             }
         )
         if sizing_identity_hash != expected_sizing_identity_hash:
@@ -1447,6 +1454,13 @@ def _prepare_cell(root: Path, source: CellInput, *, repo_root: Path | None = Non
             raise G23Blocked("draw_hash:SIZING_FINAL_REUSE")
         if one_shot_plan.get("sizing_stream") != "reference_sizing" or one_shot_plan.get("stream_a") != "reference_A" or one_shot_plan.get("stream_b") != "reference_B":
             raise G23Blocked("one_shot_plan:STREAM_IDENTITY_INVALID")
+        if one_shot_plan.get("schema_version") == "stage2-reference-one-shot-plan-v2":
+            plan_final_start = int(plan.get("final_stream_start_position", plan.get("draw_start_position", 0)))
+            for prefix in ("stream_a", "stream_b"):
+                start = one_shot_plan.get(f"{prefix}_draw_start_position")
+                end = one_shot_plan.get(f"{prefix}_draw_end_position_exclusive")
+                if start != plan_final_start or end != start + int(selected_one_shot):
+                    raise G23Blocked("one_shot_plan:FINAL_SEGMENT_IDENTITY_MISMATCH")
         sizing_expected = {
             "plan_hash": evidence.identities["sizing_plan_hash"],
             "provider_state_digest": evidence.identities["provider_state_digest"],
@@ -1464,6 +1478,10 @@ def _prepare_cell(root: Path, source: CellInput, *, repo_root: Path | None = Non
                 "registry_hash": evidence.identities["registry_hash"],
                 "stream_a_draw_hash": evidence.identities["stream_a_draw_hash"],
                 "stream_b_draw_hash": evidence.identities["stream_b_draw_hash"],
+                "stream_a_draw_start_position": int(one_shot_plan.get("stream_a_draw_start_position", 0)),
+                "stream_a_draw_end_position_exclusive": int(one_shot_plan.get("stream_a_draw_end_position_exclusive", selected_one_shot)),
+                "stream_b_draw_start_position": int(one_shot_plan.get("stream_b_draw_start_position", 0)),
+                "stream_b_draw_end_position_exclusive": int(one_shot_plan.get("stream_b_draw_end_position_exclusive", selected_one_shot)),
             }
         )
         if final_sizing_identity != expected_final_sizing_identity:
@@ -2078,11 +2096,22 @@ def _state_replay_verified(evidence: _CellEvidence) -> bool:
             if not isinstance(raw_boundary, Mapping):
                 raise G23Blocked(f"state_replay.{schema}[{index}]:RNG_STATE_MISSING")
             try:
+                start = int(
+                    sizing_plan_payload.get("draw_start_position", 0)
+                    if schema == "sizing"
+                    else one_shot_plan_payload.get(
+                        "stream_a_draw_start_position" if streams[0] == "reference_A" else "stream_b_draw_start_position",
+                        0,
+                    )
+                )
                 validate_generator_boundary(
                     raw_boundary,
                     sampling=sampling_plans[streams[0]],
                     stream=streams[0],
                     count=count,
+                    # Segment boundaries are absolute stream positions.
+                    # The v1 prefix remains start=0.
+                    start=start,
                     field=f"state_replay.{schema}[{index}].rng_state",
                 )
             except ValueError as error:
@@ -2099,11 +2128,18 @@ def _state_replay_verified(evidence: _CellEvidence) -> bool:
             if not isinstance(boundary, Mapping):
                 raise G23Blocked(f"state_replay.{schema}[{index}].{stream}:RNG_STATE_MISSING")
             try:
+                start = int(
+                    one_shot_plan_payload.get(
+                        "stream_a_draw_start_position" if stream == "reference_A" else "stream_b_draw_start_position",
+                        0,
+                    )
+                )
                 validate_generator_boundary(
                     boundary,
                     sampling=sampling_plans[stream],
                     stream=stream,
                     count=count,
+                    start=start,
                     field=f"state_replay.{schema}[{index}].{stream}",
                 )
             except ValueError as error:

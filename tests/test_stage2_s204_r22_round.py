@@ -16,7 +16,8 @@ if str(OPS) not in sys.path:
 
 from stage2.prepare_s204_r22_round import prepare_r22_round  # noqa: E402
 from param_importance_nlp.experiments.sampling import SamplingPlan, SamplingUniverse  # noqa: E402
-from param_importance_nlp.experiments.stage2_formal import ReferenceSizingPlan  # noqa: E402
+from param_importance_nlp.experiments.stage2_formal import OneShotReferencePlan, ReferenceSizingPlan  # noqa: E402
+from param_importance_nlp.experiments.stage2_g23_contracts import generator_boundary  # noqa: E402
 from param_importance_nlp.contracts.stage23 import validate_stage23_artifact  # noqa: E402
 
 
@@ -124,3 +125,33 @@ def test_r22_reference_plan_serializes_segment_and_terminal_gate() -> None:
     assert payload["draw_start_position"] == 16384
     assert payload["draw_end_position_exclusive"] == 81920
     assert payload["require_terminal_convergence"] is True
+
+
+def test_r22_final_ab_segments_are_disjoint_replayable_and_hash_bound() -> None:
+    sampling = SamplingPlan(
+        universe=SamplingUniverse("r22-ab-universe", tuple(range(32))),
+        stream_seeds={"reference_sizing": 7, "reference_A": 11, "reference_B": 13, "pilot": 17, "confirmatory": 19},
+    )
+    old_a = sampling.draws("reference_A", 16384)
+    old_b = sampling.draws("reference_B", 16384)
+    new_a = sampling.draws("reference_A", 32768, start=16384)
+    new_b = sampling.draws("reference_B", 32768, start=16384)
+    assert {d.draw_id for d in old_a}.isdisjoint(d.draw_id for d in new_a)
+    assert {d.draw_id for d in old_b}.isdisjoint(d.draw_id for d in new_b)
+    assert new_a == sampling.draws("reference_A", 32768, start=16384)
+    assert new_b == sampling.draws("reference_B", 32768, start=16384)
+    boundary = generator_boundary(sampling, "reference_A", 32768, start=16384)
+    assert boundary["start_position"] == 16384
+    assert boundary["end_position_exclusive"] == 49152
+    plan = OneShotReferencePlan(
+        reference_id="stage2-s204-r22-final",
+        sizing_result_hash="a" * 64,
+        sample_count_per_stream=32768,
+        block_size=32,
+        schema_version="stage2-reference-one-shot-plan-v2",
+        stream_a_draw_start_position=16384,
+        stream_b_draw_start_position=16384,
+    )
+    payload = plan.to_dict()
+    validate_stage23_artifact(payload)
+    assert payload["artifact_hash"] == plan.artifact_hash

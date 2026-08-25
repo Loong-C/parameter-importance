@@ -2842,6 +2842,16 @@ def _stage2_reference_plan(
             if value.get("round_manifest_ref") is None
             else str(value["round_manifest_ref"])
         ),
+        final_stream_start_position=(
+            None
+            if value.get("final_stream_start_position") is None
+            else int(value["final_stream_start_position"])
+        ),
+        final_stream_end_position_exclusive=(
+            None
+            if value.get("final_stream_end_position_exclusive") is None
+            else int(value["final_stream_end_position_exclusive"])
+        ),
     )
     if value.get("artifact_hash") != plan.artifact_hash:
         raise _blocked(
@@ -3446,12 +3456,14 @@ def _actual_sampling_state(
     sampling: SamplingPlan,
     stream: str,
     count: int,
+    *,
+    start: int = 0,
 ) -> Mapping[str, object]:
     """Capture real Python generator states and verify the frozen draws."""
 
-    if stream not in STREAM_NAMES or count < 0:
+    if stream not in STREAM_NAMES or count < 0 or start < 0:
         raise ValueError("STAGE2_SAMPLING_STATE_ARGUMENT_INVALID")
-    return generator_boundary(sampling, stream, count)
+    return generator_boundary(sampling, stream, count, start=start)
 
 
 def _available_ram_bytes() -> int | None:
@@ -3919,19 +3931,35 @@ def _run_stage2_reference(
         sizing_result_hash=result.scientific_artifact_hash,
         sample_count_per_stream=final_count,
         block_size=plan.block_size,
+        schema_version=(
+            "stage2-reference-one-shot-plan-v2"
+            if plan.final_stream_start_position
+            else "stage2-reference-one-shot-plan-v1"
+        ),
+        stream_a_draw_start_position=int(plan.final_stream_start_position or 0),
+        stream_b_draw_start_position=int(plan.final_stream_start_position or 0),
     )
     # The final draw manifests are created only after the sizing-derived
     # margin has been atomically published.
-    final_a = sampling.draws("reference_A", final_count)
-    final_b = sampling.draws("reference_B", final_count)
-    final_a_rng_state = _actual_sampling_state(sampling, "reference_A", final_count)
-    final_b_rng_state = _actual_sampling_state(sampling, "reference_B", final_count)
+    final_start = int(plan.final_stream_start_position or 0)
+    final_a = sampling.draws("reference_A", final_count, start=final_start)
+    final_b = sampling.draws("reference_B", final_count, start=final_start)
+    final_a_rng_state = _actual_sampling_state(
+        sampling, "reference_A", final_count, start=final_start
+    )
+    final_b_rng_state = _actual_sampling_state(
+        sampling, "reference_B", final_count, start=final_start
+    )
     final_a_rng_boundaries = tuple(
-        generator_boundary(sampling, "reference_A", index * plan.block_size)
+        generator_boundary(
+            sampling, "reference_A", index * plan.block_size, start=final_start
+        )
         for index in range(final_count // plan.block_size + 1)
     )
     final_b_rng_boundaries = tuple(
-        generator_boundary(sampling, "reference_B", index * plan.block_size)
+        generator_boundary(
+            sampling, "reference_B", index * plan.block_size, start=final_start
+        )
         for index in range(final_count // plan.block_size + 1)
     )
     one_shot = OneShotReferenceRunner(context.provider).run(
@@ -4078,6 +4106,10 @@ def _run_stage2_reference(
                 "registry_hash": one_shot.registry_hash,
                 "stream_a_draw_hash": one_shot.stream_a_draw_hash,
                 "stream_b_draw_hash": one_shot.stream_b_draw_hash,
+                "stream_a_draw_start_position": one_shot_plan.stream_a_draw_start_position,
+                "stream_a_draw_end_position_exclusive": one_shot_plan.stream_a_draw_end_position_exclusive,
+                "stream_b_draw_start_position": one_shot_plan.stream_b_draw_start_position,
+                "stream_b_draw_end_position_exclusive": one_shot_plan.stream_b_draw_end_position_exclusive,
             }
         ),
     }
@@ -4205,12 +4237,16 @@ def _run_stage2_reference(
             },
             "reference_A": {
                 "sampling_plan": sampling.to_dict(),
-                "manifest": sampling.draw_manifest("reference_A", final_count).to_manifest(),
+                "manifest": sampling.draw_manifest(
+                    "reference_A", final_count, start=final_start
+                ).to_manifest(),
                 "actual_state": final_a_rng_state,
             },
             "reference_B": {
                 "sampling_plan": sampling.to_dict(),
-                "manifest": sampling.draw_manifest("reference_B", final_count).to_manifest(),
+                "manifest": sampling.draw_manifest(
+                    "reference_B", final_count, start=final_start
+                ).to_manifest(),
                 "actual_state": final_b_rng_state,
             },
         },
