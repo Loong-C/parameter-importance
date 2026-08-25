@@ -540,7 +540,15 @@ def _mapping_units(mapping: Mapping[str, object], *, matrix_hash: str, mapping_h
     declared_draw_hash = mapping.get("confirmatory_draw_id_hash")
     if declared_draw_count != len(all_draw_ids) or declared_draw_hash != canonical_json_hash(all_draw_ids):
         raise S27PreparationBlocked("confirmatory draw audit hash/count mismatch")
-    if mapping.get("sample_collision_count") != sum(unit.batch_size - len(set(unit.sample_ids)) for unit in output):
+    # S2.6's formal manifest names this aggregate ``sample_id_collision_count``;
+    # accept that frozen producer spelling without inventing a new mapping or
+    # weakening the collision audit.  The legacy alias remains readable for
+    # already-published candidate fixtures.
+    observed_collision_count = mapping.get(
+        "sample_collision_count",
+        mapping.get("sample_id_collision_count"),
+    )
+    if observed_collision_count != sum(unit.batch_size - len(set(unit.sample_ids)) for unit in output):
         raise S27PreparationBlocked("sample reuse audit mismatch")
     if mapping.get("draw_id_unique") is not True or mapping.get("stream") != S27_STREAM:
         raise S27PreparationBlocked("confirmatory mapping uniqueness/stream marker invalid")
