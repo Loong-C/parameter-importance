@@ -680,6 +680,82 @@ class FormalPilotCellRun:
             "scientific_values_masked": True,
         }
 
+    @classmethod
+    def from_mapping(cls, value: Mapping[str, object]) -> "FormalPilotCellRun":
+        """Load one committed cell envelope without unmasking measurements."""
+
+        required = {
+            "schema_version",
+            "scope",
+            "formal_eligible",
+            "qualification_gate_hash",
+            "mapping_id",
+            "mapping_artifact_hash",
+            "mapping_cell_hash",
+            "summary_hash",
+            "measurements",
+            "costs",
+            "scientific_values_masked",
+        }
+        if set(value) != required:
+            raise ValueError("formal cell run fields mismatch")
+        if (
+            value.get("scope") != "formal"
+            or value.get("formal_eligible") is not False
+            or value.get("qualification_gate_hash") is not None
+            or value.get("scientific_values_masked") is not True
+        ):
+            raise ValueError("formal cell run eligibility/masking drift")
+        raw_measurements = value.get("measurements")
+        raw_costs = value.get("costs")
+        if (
+            not isinstance(raw_measurements, list)
+            or not all(isinstance(item, Mapping) for item in raw_measurements)
+            or not isinstance(raw_costs, Mapping)
+        ):
+            raise TypeError("formal cell run measurements/costs must be objects")
+        expected_costs = {
+            "scientific_equal_sample_cost",
+            "isolated_estimator_cost",
+            "online_training_incremental_cost",
+            "cost_io_quiescent",
+        }
+        if set(raw_costs) != expected_costs:
+            raise ValueError("formal cell run cost envelope mismatch")
+        if type(raw_costs["cost_io_quiescent"]) is not bool:
+            raise TypeError("formal cell run cost_io_quiescent must be bool")
+        if any(
+            not isinstance(raw_costs[name], Mapping)
+            for name in (
+                "scientific_equal_sample_cost",
+                "isolated_estimator_cost",
+                "online_training_incremental_cost",
+            )
+        ):
+            raise TypeError("formal cell run cost entries must be objects")
+        parsed_costs = {
+            name: dict(raw_costs[name])  # type: ignore[arg-type]
+            for name in (
+                "scientific_equal_sample_cost",
+                "isolated_estimator_cost",
+                "online_training_incremental_cost",
+            )
+        }
+        result = cls(
+            mapping_id=value["mapping_id"],  # type: ignore[arg-type]
+            mapping_artifact_hash=value["mapping_artifact_hash"],  # type: ignore[arg-type]
+            mapping_cell_hash=value["mapping_cell_hash"],  # type: ignore[arg-type]
+            summary_hash=value["summary_hash"],  # type: ignore[arg-type]
+            measurements=tuple(
+                BlindPilotMeasurement.from_mapping(dict(item))
+                for item in raw_measurements
+            ),
+            costs=parsed_costs,
+            cost_io_quiescent=raw_costs["cost_io_quiescent"],  # type: ignore[arg-type]
+            schema_version=value["schema_version"],  # type: ignore[arg-type]
+        )
+        return result
+
 
 def run_formal_pilot_cell(
     cell: PilotCellMapping,
@@ -688,6 +764,7 @@ def run_formal_pilot_cell(
     provider: FixedStateGradientProvider,
     execution: FormalExecutionEvidence,
     reference: Mapping[str, object],
+    references: Mapping[str, Mapping[str, object]] | None = None,
     reference_hash: str,
     artifact_root: str | Path,
     delta_sci_by_endpoint: Mapping[str, float],
@@ -725,6 +802,7 @@ def run_formal_pilot_cell(
         reference=reference,
         reference_hash=reference_hash,
         artifact_root=root,
+        references=references,
         max_new_units=max_new_units,
     )
     expected = tuple(sorted(mapping.repetition_id for mapping in cell.mappings))
