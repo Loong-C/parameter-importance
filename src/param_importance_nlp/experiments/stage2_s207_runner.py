@@ -17,8 +17,7 @@ terminal unit records.
 
 from __future__ import annotations
 
-from collections import deque
-from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import hashlib
@@ -71,6 +70,8 @@ S27_WAVE_SEAL_SCHEMA = "stage2-s27-wave-seal-v1"
 S27_LAUNCH_SCHEMA = "stage2-s27-detached-launch-v1"
 S27_LAUNCH_STATUS_SCHEMA = "stage2-s27-launch-status-v1"
 S27_RAW_RESULT_SCHEMA = "stage2-s27-raw-result-v1"
+S27_SHARD_PLAN_SCHEMA = "stage2-s27-unit-shard-plan-v1"
+S27_SHARD_SEAL_SCHEMA = "stage2-s27-unit-shard-seal-v1"
 S27_DEFAULT_MAX_ATTEMPTS = 1
 S27_DEFAULT_M2_TOLERANCE = 1e-10
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
@@ -136,6 +137,45 @@ class S27RetryPolicy:
         if self.pre_registered_oom_unit_ids:
             # There is deliberately no implicit smaller-forward implementation.
             raise S27ExecutionBlocked("S27_OOM_RETRY_REQUIRES_EXPLICIT_SMALLER_FORWARD_ADAPTER")
+
+
+@dataclass(frozen=True, slots=True)
+class S27UnitShard:
+    """Deterministic partition of one frozen checkpoint wave.
+
+    A shard owns complete repetitions, never a prefix of a repetition.  The
+    mapping identity hashes are carried in the plan so a worker cannot turn a
+    shard into a draw generator or silently substitute another unit.
+    """
+
+    shard_index: int
+    shard_count: int
+    gpu_uuid: str
+    unit_ids: tuple[str, ...]
+    unit_mapping_hashes: tuple[tuple[str, str], ...]
+
+    def __post_init__(self) -> None:
+        if isinstance(self.shard_index, bool) or not isinstance(self.shard_index, int) or self.shard_index < 0:
+            raise ValueError("S27_SHARD_INDEX_INVALID")
+        if isinstance(self.shard_count, bool) or not isinstance(self.shard_count, int) or self.shard_count <= 0 or self.shard_index >= self.shard_count:
+            raise ValueError("S27_SHARD_COUNT_INVALID")
+        if self.gpu_uuid not in APPROVED_GPU_UUIDS:
+            raise ValueError("S27_SHARD_GPU_UNAPPROVED")
+        if not self.unit_ids or any(not isinstance(unit_id, str) or not _SAFE_COMPONENT.fullmatch(unit_id) for unit_id in self.unit_ids) or len(set(self.unit_ids)) != len(self.unit_ids):
+            raise ValueError("S27_SHARD_UNIT_IDS_INVALID")
+        if tuple(unit_id for unit_id, _ in self.unit_mapping_hashes) != self.unit_ids:
+            raise ValueError("S27_SHARD_UNIT_HASH_ORDER_INVALID")
+        if any(not isinstance(mapping_hash, str) or not _SHA256.fullmatch(mapping_hash) for _, mapping_hash in self.unit_mapping_hashes):
+            raise ValueError("S27_SHARD_MAPPING_HASH_INVALID")
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "shard_index": self.shard_index,
+            "shard_count": self.shard_count,
+            "gpu_uuid": self.gpu_uuid,
+            "unit_ids": list(self.unit_ids),
+            "unit_mapping_hashes": {unit_id: mapping_hash for unit_id, mapping_hash in self.unit_mapping_hashes},
+        }
 
 
 def _safe_ref(root: Path, value: str, *, field: str) -> Path:
@@ -212,6 +252,139 @@ def load_s27_plan(data_root: str | Path, plan_ref: str) -> S27Plan:
         return S27Plan.from_mapping(payload)
     except (TypeError, ValueError) as error:
         raise S27ExecutionBlocked(f"S27_PLAN_INVALID:{error}") from error
+
+
+def partition_s27_units(
+    plan: S27Plan,
+    cell_id: str,
+    *,
+    gpu_uuids: Sequence[str] = APPROVED_GPU_UUIDS,
+) -> tuple[S27UnitShard, ...]:
+    """Split one frozen cell into deterministic contiguous repetition shards."""
+
+    if cell_id not in EXPECTED_CELL_IDS:
+        raise S27ExecutionBlocked(f"S27_SHARD_CELL_UNKNOWN:{cell_id}")
+    cards = tuple(gpu_uuids)
+    if cards != APPROVED_GPU_UUIDS or len(set(cards)) != len(cards):
+        raise S27ExecutionBlocked("S27_SHARD_GPU_ALLOWLIST_DRIFT")
+    expected = tuple(unit for unit in plan.frozen_inputs.units if unit.cell_id == cell_id)
+    if not expected:
+        raise S27ExecutionBlocked(f"S27_SHARD_CELL_EMPTY:{cell_id}")
+    q, remainder = divmod(len(expected), len(cards))
+    shards: list[S27UnitShard] = []
+    offset = 0
+    for shard_index, gpu_uuid in enumerate(cards):
+        count = q + (1 if shard_index < remainder else 0)
+        selected = expected[offset : offset + count]
+        offset += count
+        if not selected:
+            raise S27ExecutionBlocked("S27_SHARD_EMPTY_PARTITION")
+        shards.append(
+            S27UnitShard(
+                shard_index=shard_index,
+                shard_count=len(cards),
+                gpu_uuid=gpu_uuid,
+                unit_ids=tuple(unit.unit_id for unit in selected),
+                unit_mapping_hashes=tuple((unit.unit_id, unit.mapping_hash) for unit in selected),
+            )
+        )
+    if offset != len(expected) or set(item for shard in shards for item in shard.unit_ids) != {unit.unit_id for unit in expected}:
+        raise S27ExecutionBlocked("S27_SHARD_COVERAGE_INTERNAL_ERROR")
+    return tuple(shards)
+
+
+def _shard_plan_path(run_root: Path, cell_id: str) -> Path:
+    return run_root / "wave-shards" / cell_id.replace(":", "__") / "shard-plan.json"
+
+
+def write_s27_shard_plan(
+    data_root: str | Path,
+    plan: S27Plan,
+    run_root: str | Path,
+    *,
+    run_id: str,
+    cell_id: str,
+) -> tuple[S27UnitShard, ...]:
+    """Persist the immutable shard partition before any child is launched."""
+
+    root = Path(data_root).resolve()
+    run = Path(run_root).resolve()
+    try:
+        run.relative_to(root)
+    except ValueError as error:
+        raise S27ExecutionBlocked("S27_SHARD_RUN_ROOT_OUTSIDE_DATA_ROOT") from error
+    shards = partition_s27_units(plan, cell_id)
+    body: dict[str, object] = {
+        "schema_version": S27_SHARD_PLAN_SCHEMA,
+        "run_id": run_id,
+        "plan_hash": plan.artifact_hash,
+        "cell_id": cell_id,
+        "shard_count": len(shards),
+        "expected_unit_ids": [unit.unit_id for unit in plan.frozen_inputs.units if unit.cell_id == cell_id],
+        "shards": [shard.to_dict() for shard in shards],
+    }
+    body["artifact_hash"] = canonical_json_hash(body)
+    _write_once(_shard_plan_path(run, cell_id), body, field=f"S27_SHARD_PLAN:{cell_id}")
+    return shards
+
+
+def load_s27_shard_plan(
+    data_root: str | Path,
+    plan: S27Plan,
+    run_root: str | Path,
+    *,
+    run_id: str,
+    cell_id: str,
+    shard_plan_ref: str | None = None,
+) -> tuple[S27UnitShard, ...]:
+    """Reload and rederive the exact four-card partition; never trust CLI IDs."""
+
+    root = Path(data_root).resolve()
+    run = Path(run_root).resolve()
+    expected_path = _shard_plan_path(run, cell_id).resolve()
+    path = expected_path if shard_plan_ref is None else _safe_ref(root, shard_plan_ref, field=f"S27_SHARD_PLAN_REF:{cell_id}")
+    if path != expected_path:
+        raise S27ExecutionBlocked(f"S27_SHARD_PLAN_REF_MISMATCH:{cell_id}")
+    raw = load_canonical_json(path)
+    if not isinstance(raw, Mapping) or raw.get("schema_version") != S27_SHARD_PLAN_SCHEMA:
+        raise S27ExecutionBlocked(f"S27_SHARD_PLAN_SCHEMA_INVALID:{cell_id}")
+    if raw.get("artifact_hash") != canonical_json_hash({key: item for key, item in raw.items() if key != "artifact_hash"}):
+        raise S27ExecutionBlocked(f"S27_SHARD_PLAN_HASH_INVALID:{cell_id}")
+    if raw.get("run_id") != run_id or raw.get("plan_hash") != plan.artifact_hash or raw.get("cell_id") != cell_id:
+        raise S27ExecutionBlocked(f"S27_SHARD_PLAN_LINEAGE_INVALID:{cell_id}")
+    expected = tuple(unit for unit in plan.frozen_inputs.units if unit.cell_id == cell_id)
+    if raw.get("expected_unit_ids") != [unit.unit_id for unit in expected]:
+        raise S27ExecutionBlocked(f"S27_SHARD_PLAN_EXPECTED_IDS_INVALID:{cell_id}")
+    rows = raw.get("shards")
+    if not isinstance(rows, list) or raw.get("shard_count") != len(APPROVED_GPU_UUIDS) or len(rows) != len(APPROVED_GPU_UUIDS):
+        raise S27ExecutionBlocked(f"S27_SHARD_PLAN_COUNT_INVALID:{cell_id}")
+    by_index: dict[int, S27UnitShard] = {}
+    for row in rows:
+        if not isinstance(row, Mapping) or set(row) != {"shard_index", "shard_count", "gpu_uuid", "unit_ids", "unit_mapping_hashes"}:
+            raise S27ExecutionBlocked(f"S27_SHARD_PLAN_ROW_INVALID:{cell_id}")
+        ids = row.get("unit_ids")
+        hashes = row.get("unit_mapping_hashes")
+        if not isinstance(ids, list) or not isinstance(hashes, Mapping):
+            raise S27ExecutionBlocked(f"S27_SHARD_PLAN_ROW_FIELDS_INVALID:{cell_id}")
+        if set(hashes) != set(ids):
+            raise S27ExecutionBlocked(f"S27_SHARD_PLAN_ROW_HASH_SET_INVALID:{cell_id}")
+        try:
+            shard = S27UnitShard(
+                shard_index=row["shard_index"],
+                shard_count=row["shard_count"],
+                gpu_uuid=row["gpu_uuid"],
+                unit_ids=tuple(ids),
+                unit_mapping_hashes=tuple((unit_id, hashes.get(unit_id)) for unit_id in ids),
+            )
+        except (TypeError, ValueError) as error:
+            raise S27ExecutionBlocked(f"S27_SHARD_PLAN_ROW_INVALID:{cell_id}") from error
+        if shard.shard_index in by_index:
+            raise S27ExecutionBlocked(f"S27_SHARD_PLAN_DUPLICATE_INDEX:{cell_id}")
+        by_index[shard.shard_index] = shard
+    observed = tuple(by_index[index] for index in sorted(by_index)) if set(by_index) == set(range(len(APPROVED_GPU_UUIDS))) else ()
+    if observed != partition_s27_units(plan, cell_id):
+        raise S27ExecutionBlocked(f"S27_SHARD_PLAN_PARTITION_DRIFT:{cell_id}")
+    return observed
 
 
 def load_s27_frozen_mappings(
@@ -978,7 +1151,7 @@ def _attempt_payload(unit: S27MappingUnit, *, attempt_id: str, mapping_hash: str
 
 
 class S27ProductionWorker:
-    """Run one frozen cell on one approved GPU and publish raw terminal units."""
+    """Run one immutable repetition shard on one approved GPU."""
 
     def __init__(
         self,
@@ -994,13 +1167,16 @@ class S27ProductionWorker:
         materialized_input: S27MaterializedCellInput | None = None,
         retry_policy: S27RetryPolicy | None = None,
         m2_tolerance: float = S27_DEFAULT_M2_TOLERANCE,
+        unit_ids: Sequence[str] | None = None,
+        shard_index: int | None = None,
+        shard_count: int | None = None,
     ) -> None:
         self.plan = plan
         self.run_id = run_id
         self.cell = next((item for item in plan.cells if item.cell_id == cell_id), None)
         if self.cell is None:
             raise S27ExecutionBlocked(f"S27_UNKNOWN_CELL:{cell_id}")
-        if gpu_uuid not in APPROVED_GPU_UUIDS or gpu_uuid != self.cell.assigned_gpu_uuid:
+        if gpu_uuid not in APPROVED_GPU_UUIDS:
             raise S27ExecutionBlocked(f"S27_GPU_ASSIGNMENT_INVALID:{cell_id}")
         self.gpu_uuid = gpu_uuid
         self.data_root = Path(data_root).resolve()
@@ -1009,12 +1185,39 @@ class S27ProductionWorker:
         self.request = request
         self.materialized_input = materialized_input
         self.retry_policy = retry_policy or S27RetryPolicy()
+        if unit_ids is None:
+            if shard_index is not None or shard_count is not None:
+                raise S27ExecutionBlocked("S27_SHARD_METADATA_WITHOUT_UNIT_IDS")
+            self.shard_unit_ids: tuple[str, ...] | None = None
+            self.shard_index = None
+            self.shard_count = None
+        else:
+            if shard_index is None or shard_count is None:
+                raise S27ExecutionBlocked("S27_SHARD_METADATA_REQUIRED")
+            self.shard_unit_ids = tuple(unit_ids)
+            try:
+                self.shard_index = int(shard_index)
+                self.shard_count = int(shard_count)
+            except (TypeError, ValueError) as error:
+                raise S27ExecutionBlocked("S27_SHARD_METADATA_INVALID") from error
+            if self.shard_count != len(APPROVED_GPU_UUIDS) or self.shard_index < 0 or self.shard_index >= self.shard_count:
+                raise S27ExecutionBlocked("S27_SHARD_METADATA_INVALID")
+            if not self.shard_unit_ids or len(set(self.shard_unit_ids)) != len(self.shard_unit_ids):
+                raise S27ExecutionBlocked("S27_SHARD_UNIT_IDS_INVALID")
+            expected_ids = {unit.unit_id for unit in plan.frozen_inputs.units if unit.cell_id == cell_id}
+            if not set(self.shard_unit_ids).issubset(expected_ids):
+                raise S27ExecutionBlocked("S27_SHARD_UNIT_ID_OUTSIDE_CELL")
+            if gpu_uuid != APPROVED_GPU_UUIDS[self.shard_index]:
+                raise S27ExecutionBlocked("S27_SHARD_GPU_INDEX_BINDING_INVALID")
+        if unit_ids is None and gpu_uuid != self.cell.assigned_gpu_uuid:
+            raise S27ExecutionBlocked(f"S27_GPU_ASSIGNMENT_INVALID:{cell_id}")
         if not isinstance(m2_tolerance, (int, float)) or isinstance(m2_tolerance, bool) or float(m2_tolerance) < 0:
             raise ValueError("S27_M2_TOLERANCE_INVALID")
         self.m2_tolerance = float(m2_tolerance)
         self.wave_root = self.run_root / "waves" / self.cell.cell_id.replace(":", "__")
         self.raw_root = self.run_root / "raw-units"
         self.attempt_root = self.run_root / "attempts"
+        self.provider_registry_hash: str | None = None
 
     def _unit_path(self, unit_id: str) -> Path:
         return self.raw_root / _unit_file_name(unit_id)
@@ -1074,10 +1277,18 @@ class S27ProductionWorker:
         ):
             raise S27ExecutionBlocked(f"S27_TERMINAL_ATTEMPT_BINDING_MISSING:{record.unit_id}")
 
-    def _load_existing_records(self, reducer: StrictG25Reducer, mappings: Mapping[str, RepetitionMapping]) -> set[str]:
+    def _load_existing_records(
+        self,
+        reducer: StrictG25Reducer,
+        mappings: Mapping[str, RepetitionMapping],
+        *,
+        target_unit_ids: set[str] | None = None,
+    ) -> set[str]:
         done: set[str] = set()
         for unit in self.plan.frozen_inputs.units:
             if unit.cell_id != self.cell.cell_id:
+                continue
+            if target_unit_ids is not None and unit.unit_id not in target_unit_ids:
                 continue
             path = self._unit_path(unit.unit_id)
             raw = _read_json_if_exists(path)
@@ -1133,8 +1344,19 @@ class S27ProductionWorker:
         self.raw_root.mkdir(parents=True, exist_ok=True)
         self.attempt_root.mkdir(parents=True, exist_ok=True)
         mappings = load_s27_frozen_mappings(self.data_root, self.plan, cell_id=self.cell.cell_id)
+        all_cell_unit_ids = {
+            unit.unit_id for unit in self.plan.frozen_inputs.units if unit.cell_id == self.cell.cell_id
+        }
+        target_unit_ids = set(self.shard_unit_ids) if self.shard_unit_ids is not None else all_cell_unit_ids
+        if not target_unit_ids or not target_unit_ids.issubset(all_cell_unit_ids):
+            raise S27ExecutionBlocked("S27_WORKER_TARGET_UNIT_SET_INVALID")
         reducer = StrictG25Reducer(self.plan, run_id=self.run_id)
-        done = self._load_existing_records(reducer, mappings)
+        done = self._load_existing_records(reducer, mappings, target_unit_ids=target_unit_ids)
+        if done == target_unit_ids:
+            # Recovery after a process exit between the last terminal raw
+            # record and the shard/wave seal must not reload a model or create
+            # another attempt.  The immutable records are sufficient to seal.
+            return self._seal_shard(reducer) if self.shard_unit_ids is not None else self._seal_wave(reducer)
         cell_inputs = self.materialized_input
         context: S27ProviderContext | None = None
         provider_error: Exception | None = None
@@ -1151,13 +1373,14 @@ class S27ProductionWorker:
             )
             if context.checkpoint_hash != self.cell.checkpoint_hash:
                 raise S27ExecutionBlocked("S27_PROVIDER_CHECKPOINT_HASH_DRIFT")
+            self.provider_registry_hash = context.registry_hash
         except Exception as error:
             provider_error = error
         if context is None:
             # Provider construction failure still consumes every expected unit
             # as an explicit failed denominator row; no cell is silently skipped.
             for unit in self.plan.frozen_inputs.units:
-                if unit.cell_id != self.cell.cell_id or unit.unit_id in done:
+                if unit.cell_id != self.cell.cell_id or unit.unit_id not in target_unit_ids or unit.unit_id in done:
                     continue
                 provider_attempt_id = f"attempt-provider-{time.time_ns()}"
                 _write_once(
@@ -1176,8 +1399,8 @@ class S27ProductionWorker:
                     reason=f"{type(provider_error).__name__}:{provider_error}",
                 )
                 self._publish_record(reducer, failed)
-            self._seal_wave(reducer)
-            return {"status": "FAILED", "cell_id": self.cell.cell_id, "failed_units": len(mappings), "failure_code": "S27_PROVIDER_BIND_FAILED"}
+            sealed = self._seal_shard(reducer) if self.shard_unit_ids is not None else self._seal_wave(reducer)
+            return {"status": "FAILED", "cell_id": self.cell.cell_id, "failed_units": len(target_unit_ids), "failure_code": "S27_PROVIDER_BIND_FAILED", "seal": sealed}
 
         reference_views = load_s27_reference_views(
             self.data_root,
@@ -1189,7 +1412,7 @@ class S27ProductionWorker:
         audit_provider = _GradientAuditProxy(context.provider)
         wave_runner = RecoverablePairedWaveRunner(audit_provider, execution=context.execution, m2_tolerance=self.m2_tolerance)
         for unit in self.plan.frozen_inputs.units:
-            if unit.cell_id != self.cell.cell_id or unit.unit_id in done:
+            if unit.cell_id != self.cell.cell_id or unit.unit_id not in target_unit_ids or unit.unit_id in done:
                 continue
             mapping = mappings[unit.unit_id]
             attempt_path = self._attempt_path(unit.unit_id)
@@ -1243,31 +1466,70 @@ class S27ProductionWorker:
                     reason=f"{type(error).__name__}:{error}",
                 )
             self._publish_record(reducer, record)
-        return self._seal_wave(reducer)
+        return self._seal_shard(reducer) if self.shard_unit_ids is not None else self._seal_wave(reducer)
 
-    def _seal_wave(self, reducer: StrictG25Reducer) -> dict[str, object]:
-        expected = [unit.unit_id for unit in self.plan.frozen_inputs.units if unit.cell_id == self.cell.cell_id]
-        records = [record for record in reducer.records if record.cell_id == self.cell.cell_id]
-        if {record.unit_id for record in records} != set(expected):
-            raise S27ExecutionBlocked(f"S27_WAVE_EXPECTED_UNITS_MISSING:{self.cell.cell_id}")
-        descriptors = [{"unit_id": record.unit_id, "status": record.status, "attempt_id": record.attempt_id, "unit_artifact_hash": record.artifact_hash} for record in records]
+    def _seal_shard(self, reducer: StrictG25Reducer) -> dict[str, object]:
+        if self.shard_unit_ids is None or self.shard_index is None or self.shard_count is None:
+            raise S27ExecutionBlocked("S27_SHARD_SEAL_METADATA_MISSING")
+        expected = tuple(self.shard_unit_ids)
+        records = tuple(record for record in reducer.records if record.cell_id == self.cell.cell_id)
+        if {record.unit_id for record in records} != set(expected) or len(records) != len(expected):
+            raise S27ExecutionBlocked(f"S27_SHARD_EXPECTED_UNITS_MISSING:{self.cell.cell_id}:{self.shard_index}")
+        records = tuple(sorted(records, key=lambda item: item.unit_id))
+        descriptors = [
+            {
+                "unit_id": record.unit_id,
+                "status": record.status,
+                "attempt_id": record.attempt_id,
+                "unit_artifact_hash": record.artifact_hash,
+            }
+            for record in records
+        ]
         body: dict[str, object] = {
-            "schema_version": S27_WAVE_SEAL_SCHEMA,
+            "schema_version": S27_SHARD_SEAL_SCHEMA,
             "run_id": self.run_id,
             "plan_hash": self.plan.artifact_hash,
             "cell_id": self.cell.cell_id,
+            "shard_index": self.shard_index,
+            "shard_count": self.shard_count,
             "gpu_uuid": self.gpu_uuid,
-            "expected_unit_count": len(expected),
+            "checkpoint_hash": self.cell.checkpoint_hash,
+            "reference_hash": self.cell.reference_hash,
+            "provider_registry_hash": self.provider_registry_hash,
+            "expected_unit_ids": list(expected),
             "completed_unit_count": len(records),
             "failed_unit_count": sum(record.status == "FAILED" for record in records),
             "units": descriptors,
             "sealed": True,
-            "checked_at": _now(),
         }
         body["artifact_hash"] = canonical_json_hash(body)
+        path = self.run_root / "wave-shards" / self.cell.cell_id.replace(":", "__") / f"shard-{self.shard_index:02d}.json"
+        _write_once(path, body, field=f"S27_SHARD_SEAL:{self.cell.cell_id}:{self.shard_index}")
+        return {
+            "status": "SHARD_SEALED",
+            "cell_id": self.cell.cell_id,
+            "shard_index": self.shard_index,
+            "gpu_uuid": self.gpu_uuid,
+            "expected_units": len(expected),
+            "failed_units": body["failed_unit_count"],
+            "shard_seal_ref": _relative_ref(self.data_root, path, field=f"S27_SHARD_SEAL_REF:{self.cell.cell_id}:{self.shard_index}"),
+        }
+
+    def _seal_wave(self, reducer: StrictG25Reducer) -> dict[str, object]:
+        records = tuple(record for record in reducer.records if record.cell_id == self.cell.cell_id)
         path = self.run_root / "wave-seals" / f"{self.cell.cell_id.replace(':', '__')}.json"
+        existing = _read_json_if_exists(path)
+        checked_at = existing.get("checked_at") if isinstance(existing, Mapping) and isinstance(existing.get("checked_at"), str) else None
+        body = build_s27_wave_seal_payload(
+            self.plan,
+            run_id=self.run_id,
+            cell_id=self.cell.cell_id,
+            records=records,
+            gpu_uuids=(self.gpu_uuid,),
+            checked_at=checked_at,
+        )
         _write_once(path, body, field=f"S27_WAVE_SEAL:{self.cell.cell_id}")
-        return {"status": "SEALED", "cell_id": self.cell.cell_id, "wave_seal_ref": _relative_ref(self.data_root, path, field="S27_WAVE_SEAL_REF"), "expected_units": len(expected), "failed_units": body["failed_unit_count"]}
+        return {"status": "SEALED", "cell_id": self.cell.cell_id, "wave_seal_ref": _relative_ref(self.data_root, path, field="S27_WAVE_SEAL_REF"), "expected_units": body["expected_unit_count"], "failed_units": body["failed_unit_count"]}
 
 
 def load_s27_raw_records(data_root: str | Path, plan: S27Plan, run_root: str | Path, *, run_id: str) -> StrictG25Reducer:
@@ -1334,6 +1596,159 @@ def load_s27_raw_records(data_root: str | Path, plan: S27Plan, run_root: str | P
     return reducer
 
 
+def build_s27_wave_seal_payload(
+    plan: S27Plan,
+    *,
+    run_id: str,
+    cell_id: str,
+    records: Sequence[S27RawUnit],
+    gpu_uuids: Sequence[str] = (),
+    checked_at: str | None = None,
+) -> dict[str, object]:
+    """Build the deterministic merged checkpoint-wave seal from raw units."""
+
+    expected = tuple(unit.unit_id for unit in plan.frozen_inputs.units if unit.cell_id == cell_id)
+    observed = tuple(record.unit_id for record in records if record.cell_id == cell_id)
+    if cell_id not in EXPECTED_CELL_IDS or set(observed) != set(expected) or len(observed) != len(expected):
+        raise S27ExecutionBlocked(f"S27_WAVE_MERGE_COVERAGE_INVALID:{cell_id}")
+    cards = tuple(gpu_uuids)
+    if any(card not in APPROVED_GPU_UUIDS for card in cards) or len(set(cards)) != len(cards):
+        raise S27ExecutionBlocked(f"S27_WAVE_MERGE_GPU_INVALID:{cell_id}")
+    ordered = tuple(sorted((record for record in records if record.cell_id == cell_id), key=lambda item: item.unit_id))
+    descriptors = [
+        {
+            "unit_id": record.unit_id,
+            "status": record.status,
+            "attempt_id": record.attempt_id,
+            "unit_artifact_hash": record.artifact_hash,
+        }
+        for record in ordered
+    ]
+    body: dict[str, object] = {
+        "schema_version": S27_WAVE_SEAL_SCHEMA,
+        "run_id": run_id,
+        "plan_hash": plan.artifact_hash,
+        "cell_id": cell_id,
+        "gpu_uuid": cards[0] if len(cards) == 1 else None,
+        "gpu_uuids": list(cards),
+        "expected_unit_count": len(expected),
+        "completed_unit_count": len(ordered),
+        "failed_unit_count": sum(record.status == "FAILED" for record in ordered),
+        "units": descriptors,
+        "sealed": True,
+        "checked_at": checked_at or _now(),
+    }
+    body["artifact_hash"] = canonical_json_hash(body)
+    return body
+
+
+def validate_s27_shard_seals(
+    data_root: str | Path,
+    plan: S27Plan,
+    run_root: str | Path,
+    *,
+    run_id: str,
+    cell_id: str,
+) -> tuple[S27UnitShard, ...]:
+    """Reject overlap, missing shard seals, GPU drift, or raw descriptor drift."""
+
+    root = Path(data_root).resolve()
+    run = Path(run_root).resolve()
+    shards = load_s27_shard_plan(root, plan, run, run_id=run_id, cell_id=cell_id)
+    reducer = load_s27_raw_records(root, plan, run, run_id=run_id)
+    by_unit = {record.unit_id: record for record in reducer.records if record.cell_id == cell_id}
+    observed: set[str] = set()
+    registry_hashes: set[str] = set()
+    missing_registry_for_success = False
+    for shard in shards:
+        path = run / "wave-shards" / cell_id.replace(":", "__") / f"shard-{shard.shard_index:02d}.json"
+        raw = load_canonical_json(path) if path.is_file() else None
+        if (
+            not isinstance(raw, Mapping)
+            or raw.get("schema_version") != S27_SHARD_SEAL_SCHEMA
+            or raw.get("artifact_hash") != canonical_json_hash({key: item for key, item in raw.items() if key != "artifact_hash"})
+            or raw.get("run_id") != run_id
+            or raw.get("plan_hash") != plan.artifact_hash
+            or raw.get("cell_id") != cell_id
+            or raw.get("shard_index") != shard.shard_index
+            or raw.get("shard_count") != shard.shard_count
+            or raw.get("gpu_uuid") != shard.gpu_uuid
+            or raw.get("checkpoint_hash") != next(cell.checkpoint_hash for cell in plan.cells if cell.cell_id == cell_id)
+            or raw.get("reference_hash") != next(cell.reference_hash for cell in plan.cells if cell.cell_id == cell_id)
+            or raw.get("expected_unit_ids") != list(shard.unit_ids)
+            or raw.get("sealed") is not True
+        ):
+            raise S27ExecutionBlocked(f"S27_SHARD_SEAL_INVALID:{cell_id}:{shard.shard_index}")
+        registry_hash = raw.get("provider_registry_hash")
+        if registry_hash is not None:
+            if not isinstance(registry_hash, str) or not _SHA256.fullmatch(registry_hash):
+                raise S27ExecutionBlocked(f"S27_SHARD_REGISTRY_HASH_INVALID:{cell_id}:{shard.shard_index}")
+            registry_hashes.add(registry_hash)
+        descriptors = raw.get("units")
+        if not isinstance(descriptors, list) or len(descriptors) != len(shard.unit_ids) or raw.get("completed_unit_count") != len(descriptors):
+            raise S27ExecutionBlocked(f"S27_SHARD_SEAL_UNIT_COUNT_INVALID:{cell_id}:{shard.shard_index}")
+        descriptor_by_unit: dict[str, Mapping[str, object]] = {}
+        for descriptor in descriptors:
+            if not isinstance(descriptor, Mapping) or not isinstance(descriptor.get("unit_id"), str) or descriptor["unit_id"] in descriptor_by_unit:
+                raise S27ExecutionBlocked(f"S27_SHARD_SEAL_DESCRIPTOR_INVALID:{cell_id}:{shard.shard_index}")
+            descriptor_by_unit[str(descriptor["unit_id"])] = descriptor
+        if set(descriptor_by_unit) != set(shard.unit_ids) or observed.intersection(descriptor_by_unit):
+            raise S27ExecutionBlocked(f"S27_SHARD_SEAL_OVERLAP_OR_COVERAGE_INVALID:{cell_id}:{shard.shard_index}")
+        for unit_id in shard.unit_ids:
+            record = by_unit.get(unit_id)
+            descriptor = descriptor_by_unit.get(unit_id)
+            if record is None or descriptor is None or descriptor.get("status") != record.status or descriptor.get("attempt_id") != record.attempt_id or descriptor.get("unit_artifact_hash") != record.artifact_hash:
+                raise S27ExecutionBlocked(f"S27_SHARD_SEAL_RAW_BINDING_INVALID:{cell_id}:{shard.shard_index}:{unit_id}")
+        if raw.get("failed_unit_count") != sum(by_unit[unit_id].status == "FAILED" for unit_id in shard.unit_ids):
+            raise S27ExecutionBlocked(f"S27_SHARD_SEAL_FAILURE_COUNT_INVALID:{cell_id}:{shard.shard_index}")
+        if registry_hash is None and any(by_unit[unit_id].status == "SUCCESS" for unit_id in shard.unit_ids):
+            missing_registry_for_success = True
+        observed.update(descriptor_by_unit)
+    expected = {unit.unit_id for unit in plan.frozen_inputs.units if unit.cell_id == cell_id}
+    if observed != expected or set(by_unit) != expected:
+        raise S27ExecutionBlocked(f"S27_SHARD_SEAL_GLOBAL_COVERAGE_INVALID:{cell_id}")
+    if len(registry_hashes) > 1 or missing_registry_for_success:
+        raise S27ExecutionBlocked(f"S27_SHARD_PROVIDER_IDENTITY_DRIFT:{cell_id}")
+    return shards
+
+
+def seal_s27_wave(
+    data_root: str | Path,
+    plan: S27Plan,
+    run_root: str | Path,
+    *,
+    run_id: str,
+    cell_id: str,
+    checked_at: str | None = None,
+) -> dict[str, object]:
+    """Atomically merge all four shard seals into one checkpoint-wave seal."""
+
+    root = Path(data_root).resolve()
+    run = Path(run_root).resolve()
+    shards = validate_s27_shard_seals(root, plan, run, run_id=run_id, cell_id=cell_id)
+    reducer = load_s27_raw_records(root, plan, run, run_id=run_id)
+    path = run / "wave-seals" / f"{cell_id.replace(':', '__')}.json"
+    existing = _read_json_if_exists(path)
+    stable_checked_at = existing.get("checked_at") if isinstance(existing, Mapping) and isinstance(existing.get("checked_at"), str) else checked_at
+    body = build_s27_wave_seal_payload(
+        plan,
+        run_id=run_id,
+        cell_id=cell_id,
+        records=reducer.records,
+        gpu_uuids=tuple(shard.gpu_uuid for shard in shards),
+        checked_at=stable_checked_at,
+    )
+    _write_once(path, body, field=f"S27_WAVE_SEAL:{cell_id}")
+    return {
+        "status": "SEALED",
+        "cell_id": cell_id,
+        "wave_seal_ref": _relative_ref(root, path, field=f"S27_WAVE_SEAL_REF:{cell_id}"),
+        "expected_units": body["expected_unit_count"],
+        "failed_units": body["failed_unit_count"],
+        "shard_count": len(shards),
+    }
+
+
 def seal_s27_run(data_root: str | Path, plan: S27Plan, run_root: str | Path, *, run_id: str) -> dict[str, object]:
     """Seal only the complete denominator; no statistics are computed here."""
 
@@ -1342,6 +1757,35 @@ def seal_s27_run(data_root: str | Path, plan: S27Plan, run_root: str | Path, *, 
         seal = Path(run_root).resolve() / "wave-seals" / f"{cell.cell_id.replace(':', '__')}.json"
         if not seal.is_file():
             raise S27ExecutionBlocked(f"S27_WAVE_SEAL_MISSING:{cell.cell_id}")
+        payload = load_canonical_json(seal)
+        if (
+            not isinstance(payload, Mapping)
+            or payload.get("schema_version") != S27_WAVE_SEAL_SCHEMA
+            or payload.get("artifact_hash") != canonical_json_hash({key: item for key, item in payload.items() if key != "artifact_hash"})
+            or payload.get("run_id") != run_id
+            or payload.get("plan_hash") != plan.artifact_hash
+            or payload.get("cell_id") != cell.cell_id
+            or payload.get("sealed") is not True
+        ):
+            raise S27ExecutionBlocked(f"S27_WAVE_SEAL_INVALID:{cell.cell_id}")
+        expected = {unit.unit_id for unit in plan.frozen_inputs.units if unit.cell_id == cell.cell_id}
+        records = {record.unit_id: record for record in reducer.records if record.cell_id == cell.cell_id}
+        descriptors = payload.get("units")
+        if not isinstance(descriptors, list) or len(descriptors) != len(expected):
+            raise S27ExecutionBlocked(f"S27_WAVE_SEAL_UNIT_COUNT_INVALID:{cell.cell_id}")
+        seen_descriptors: set[str] = set()
+        for descriptor in descriptors:
+            if not isinstance(descriptor, Mapping):
+                raise S27ExecutionBlocked(f"S27_WAVE_SEAL_DESCRIPTOR_INVALID:{cell.cell_id}")
+            unit_id = descriptor.get("unit_id")
+            if not isinstance(unit_id, str) or unit_id in seen_descriptors:
+                raise S27ExecutionBlocked(f"S27_WAVE_SEAL_DESCRIPTOR_INVALID:{cell.cell_id}")
+            seen_descriptors.add(unit_id)
+            record = records.get(unit_id)
+            if record is None or descriptor.get("status") != record.status or descriptor.get("attempt_id") != record.attempt_id or descriptor.get("unit_artifact_hash") != record.artifact_hash:
+                raise S27ExecutionBlocked(f"S27_WAVE_SEAL_RAW_BINDING_INVALID:{cell.cell_id}")
+        if seen_descriptors != expected or set(records) != expected:
+            raise S27ExecutionBlocked(f"S27_WAVE_SEAL_COVERAGE_INVALID:{cell.cell_id}")
     return reducer.seal(Path(run_root).resolve() / "sealed")
 
 
@@ -1492,10 +1936,12 @@ def build_s27_worker_command(
     gpu_uuid: str,
     materialization_index_ref: str,
     execution_evidence_ref: str,
+    shard_plan_ref: str | None = None,
+    shard_index: int | None = None,
 ) -> tuple[str, ...]:
     if gpu_uuid not in APPROVED_GPU_UUIDS:
         raise S27ExecutionBlocked("S27_WORKER_COMMAND_UNAPPROVED_GPU")
-    return (
+    command = [
         str(python),
         str(launcher_script),
         "--worker",
@@ -1515,11 +1961,18 @@ def build_s27_worker_command(
         materialization_index_ref,
         "--execution-evidence-ref",
         execution_evidence_ref,
-    )
+    ]
+    if (shard_plan_ref is None) != (shard_index is None):
+        raise S27ExecutionBlocked("S27_WORKER_COMMAND_SHARD_METADATA_INCOMPLETE")
+    if shard_plan_ref is not None and shard_index is not None:
+        if isinstance(shard_index, bool) or not isinstance(shard_index, int) or shard_index < 0 or shard_index >= len(APPROVED_GPU_UUIDS):
+            raise S27ExecutionBlocked("S27_WORKER_COMMAND_SHARD_INDEX_INVALID")
+        command.extend(("--shard-plan-ref", shard_plan_ref, "--shard-index", str(shard_index)))
+    return tuple(command)
 
 
 class S27DetachedLauncher:
-    """Four-slot dynamic queue for the six frozen waves."""
+    """Four-slot within-wave queue for the six frozen checkpoint waves."""
 
     def __init__(
         self,
@@ -1566,123 +2019,126 @@ class S27DetachedLauncher:
         body["artifact_hash"] = canonical_json_hash(body)
         _write_once(self._status_path(), body, field="S27_LAUNCH_STATUS") if status in {"PREPARED", "SEALED"} else write_canonical_json(self._status_path(), body)
 
+    def _run_sharded_wave(self, cell: S27CellPlan) -> dict[str, object]:
+        shards = write_s27_shard_plan(
+            self.data_root,
+            self.plan,
+            self.run_root,
+            run_id=self.run_id,
+            cell_id=cell.cell_id,
+        )
+        shard_plan_path = _shard_plan_path(self.run_root, cell.cell_id)
+        shard_plan_ref = _relative_ref(self.data_root, shard_plan_path, field=f"S27_SHARD_PLAN_REF:{cell.cell_id}")
+        run_root_ref = _relative_ref(self.data_root, self.run_root, field="S27_RUN_ROOT_REF")
+
+        def launch(shard: S27UnitShard) -> dict[str, object]:
+            spec = build_s27_worker_command(
+                python=self.python,
+                launcher_script=self.launcher_script,
+                data_root=self.data_root,
+                plan_ref=self.plan_ref,
+                run_root=run_root_ref,
+                run_id=self.run_id,
+                cell_id=cell.cell_id,
+                gpu_uuid=shard.gpu_uuid,
+                materialization_index_ref=self.materialization_index_ref,
+                execution_evidence_ref=self.execution_evidence_ref,
+                shard_plan_ref=shard_plan_ref,
+                shard_index=shard.shard_index,
+            )
+            log_path = self.run_root / "logs" / f"{cell.cell_id.replace(':', '__')}__shard-{shard.shard_index:02d}.log"
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            env = os.environ.copy()
+            env.update({"CUDA_DEVICE_ORDER": "PCI_BUS_ID", "CUDA_VISIBLE_DEVICES": shard.gpu_uuid, "NVIDIA_VISIBLE_DEVICES": shard.gpu_uuid})
+            try:
+                with log_path.open("ab") as handle:
+                    proc = subprocess.Popen(
+                        spec,
+                        cwd=str(Path(self.launcher_script).resolve().parents[2]),
+                        env=dict(env),
+                        stdin=subprocess.DEVNULL,
+                        stdout=handle,
+                        stderr=subprocess.STDOUT,
+                        start_new_session=True,
+                    )
+                    code = int(proc.wait())
+            except Exception as error:
+                return {
+                    "shard_index": shard.shard_index,
+                    "gpu_uuid": shard.gpu_uuid,
+                    "returncode": None,
+                    "status": "FAILED",
+                    "error": f"{type(error).__name__}:{error}",
+                }
+            return {
+                "shard_index": shard.shard_index,
+                "gpu_uuid": shard.gpu_uuid,
+                "returncode": code,
+                "status": "COMPLETE" if code == 0 else "FAILED",
+                "log_ref": _relative_ref(self.data_root, log_path, field=f"S27_LOG_REF:{cell.cell_id}:{shard.shard_index}"),
+            }
+
+        with ThreadPoolExecutor(max_workers=len(APPROVED_GPU_UUIDS)) as pool:
+            futures = [pool.submit(launch, shard) for shard in shards]
+            outcomes = [future.result() for future in futures]
+        outcomes = sorted(outcomes, key=lambda item: int(item["shard_index"]))
+        if any(item.get("returncode") != 0 for item in outcomes):
+            raise S27ExecutionBlocked(f"S27_SHARD_WORKER_FAILED:{cell.cell_id}")
+        merged = seal_s27_wave(
+            self.data_root,
+            self.plan,
+            self.run_root,
+            run_id=self.run_id,
+            cell_id=cell.cell_id,
+        )
+        return {
+            "cell_id": cell.cell_id,
+            "status": "COMPLETE",
+            "shard_plan_ref": shard_plan_ref,
+            "shard_count": len(shards),
+            "shards": outcomes,
+            "wave_seal": merged,
+        }
+
     def execute(self) -> dict[str, object]:
         waves: dict[str, Mapping[str, object]] = {}
         if self._status_path().exists():
             raise S27ExecutionBlocked("S27_LAUNCH_STATUS_EXISTS_REQUIRES_EXPLICIT_RECOVERY_AUDIT")
         self._publish_status("PREPARED", waves=waves)
-        # The first 14M initialization wave is an explicit quality barrier.  No
-        # 14M early/mid_late or 31M process is even created until its complete
-        # operational conjunction is sealed.
-        quality_cell = self.plan.cells[0]
-        queue = deque((quality_cell,))
-        # The six cells are checkpoint waves, not independent jobs.  The
-        # frozen protocol requires initialization -> early -> mid_late for
-        # 14M, followed by the same three stages for 31M.  Keep a dynamic
-        # approved-GPU queue for detached/recovery semantics, but release only
-        # the next canonical wave after its predecessor has sealed.  This
-        # prevents a 31M child from starting while an earlier 14M wave is
-        # incomplete and makes the ordering auditable in launcher-status.json.
-        next_wave_index = 1
-        running: dict[Future[tuple[str, int, str]], S27CellPlan] = {}
-        # The queue uses each cell's frozen assignment; a card is returned only
-        # after its child exits, so repeated GPU0/GPU1 cells cannot overlap.
-        free = deque(APPROVED_GPU_UUIDS)
         quality_passed = False
-        with ThreadPoolExecutor(max_workers=len(APPROVED_GPU_UUIDS)) as pool:
-            while queue or running:
-                while queue and free:
-                    cell = queue[0]
-                    if cell.assigned_gpu_uuid not in free:
-                        # Preserve frozen assignment and wait for that card.
-                        break
-                    queue.popleft()
-                    gpu = cell.assigned_gpu_uuid
-                    free.remove(gpu)
-                    spec = build_s27_worker_command(
-                        python=self.python,
-                        launcher_script=self.launcher_script,
-                        data_root=self.data_root,
-                        plan_ref=self.plan_ref,
-                        run_root=self.run_root,
-                        run_id=self.run_id,
-                        cell_id=cell.cell_id,
-                        gpu_uuid=gpu,
-                        materialization_index_ref=self.materialization_index_ref,
-                        execution_evidence_ref=self.execution_evidence_ref,
-                    )
-                    log_path = self.run_root / "logs" / f"{cell.cell_id.replace(':', '__')}.log"
-                    log_path.parent.mkdir(parents=True, exist_ok=True)
-                    env = os.environ.copy()
-                    env.update({"CUDA_DEVICE_ORDER": "PCI_BUS_ID", "CUDA_VISIBLE_DEVICES": gpu, "NVIDIA_VISIBLE_DEVICES": gpu})
-                    def _launch(spec: tuple[str, ...] = spec, log_path: Path = log_path, env: Mapping[str, str] = env, cell_id: str = cell.cell_id, gpu: str = gpu) -> tuple[str, int, str]:
-                        with log_path.open("ab") as handle:
-                            proc = subprocess.Popen(spec, cwd=self.launcher_script and str(Path(self.launcher_script).resolve().parents[2]), env=dict(env), stdin=subprocess.DEVNULL, stdout=handle, stderr=subprocess.STDOUT, start_new_session=True)
-                            code = proc.wait()
-                        return cell_id, int(code), _relative_ref(self.data_root, log_path, field="S27_LOG_REF")
-                    future = pool.submit(_launch)
-                    running[future] = cell
-                    self._publish_status("RUNNING", waves=waves)
-                if not running:
-                    if queue:
-                        raise S27ExecutionBlocked("S27_DYNAMIC_QUEUE_FROZEN_GPU_ASSIGNMENT_DEADLOCK")
-                    break
-                done_futures, _ = wait(tuple(running), return_when=FIRST_COMPLETED)
-                for future in done_futures:
-                    cell = running.pop(future)
-                    free.append(cell.assigned_gpu_uuid)
-                    try:
-                        cell_id, code, log_ref = future.result()
-                    except Exception as error:
-                        result = {
-                            "cell_id": cell.cell_id,
-                            "gpu_uuid": cell.assigned_gpu_uuid,
-                            "returncode": None,
-                            "status": "FAILED",
-                            "error": f"{type(error).__name__}:{error}",
-                        }
-                        waves[cell.cell_id] = result
-                        self._publish_status("FAILED", waves=waves, reason=f"S27_CHILD_LAUNCH_FAILED:{cell.cell_id}")
-                        raise S27ExecutionBlocked(f"S27_CHILD_LAUNCH_FAILED:{cell.cell_id}") from error
-                    wave_seal = self.run_root / "wave-seals" / f"{cell.cell_id.replace(':', '__')}.json"
-                    result: dict[str, object] = {"cell_id": cell_id, "gpu_uuid": cell.assigned_gpu_uuid, "returncode": code, "status": "COMPLETE" if code == 0 and wave_seal.is_file() else "FAILED", "log_ref": log_ref}
-                    waves[cell_id] = result
-                    self._publish_status("RUNNING", waves=waves)
-                    if code != 0 or not wave_seal.is_file():
-                        self._publish_status("FAILED", waves=waves, reason=f"S27_WORKER_FAILED:{cell_id}:{code}")
-                        raise S27ExecutionBlocked(f"S27_WORKER_FAILED:{cell_id}:{code}")
-                    if cell is quality_cell:
-                        try:
-                            quality = validate_s27_quality_wave(self.data_root, self.plan, self.run_root, cell_id=cell.cell_id)
-                        except Exception as error:
-                            self._publish_status("FAILED", waves=waves, reason=f"S27_QUALITY_WAVE_BLOCKED:{error}")
-                            raise
-                        waves[cell_id] = {**dict(result), "quality": quality}
-                        quality_passed = True
-                        if next_wave_index < len(self.plan.cells):
-                            queue.append(self.plan.cells[next_wave_index])
-                            next_wave_index += 1
-                        self._publish_status("RUNNING", waves=waves)
-                    else:
-                        try:
-                            reducer = load_s27_raw_records(self.data_root, self.plan, self.run_root, run_id=self.run_id)
-                            failed = sum(record.status == "FAILED" for record in reducer.records)
-                            fraction = failed / self.plan.frozen_inputs.completion_denominator
-                        except Exception as error:
-                            self._publish_status("FAILED", waves=waves, reason=f"S27_FAILURE_ACCOUNTING_BLOCKED:{error}")
-                            raise
-                        if fraction > self.plan.frozen_inputs.max_failure_fraction:
-                            self._publish_status("FAILED", waves=waves, reason="S27_FAILURE_FRACTION_EXCEEDED")
-                            raise S27ExecutionBlocked("S27_FAILURE_FRACTION_EXCEEDED")
-                        if next_wave_index < len(self.plan.cells):
-                            queue.append(self.plan.cells[next_wave_index])
-                            next_wave_index += 1
-        if set(waves) != set(EXPECTED_CELL_IDS):
+        # Checkpoint barriers remain serial and canonical; only independent
+        # repetitions inside the current checkpoint wave use four GPUs.
+        for index, cell in enumerate(self.plan.cells):
+            self._publish_status("RUNNING", waves=waves)
+            try:
+                result = self._run_sharded_wave(cell)
+            except Exception as error:
+                waves[cell.cell_id] = {"cell_id": cell.cell_id, "status": "FAILED", "error": f"{type(error).__name__}:{error}"}
+                self._publish_status("FAILED", waves=waves, reason=f"S27_WAVE_FAILED:{cell.cell_id}")
+                raise
+            waves[cell.cell_id] = result
+            if index == 0:
+                try:
+                    quality = validate_s27_quality_wave(self.data_root, self.plan, self.run_root, cell_id=cell.cell_id)
+                except Exception as error:
+                    self._publish_status("FAILED", waves=waves, reason=f"S27_QUALITY_WAVE_BLOCKED:{error}")
+                    raise
+                waves[cell.cell_id] = {**dict(result), "quality": quality}
+                quality_passed = True
+            try:
+                reducer = load_s27_raw_records(self.data_root, self.plan, self.run_root, run_id=self.run_id)
+                failed = sum(record.status == "FAILED" for record in reducer.records)
+                fraction = failed / self.plan.frozen_inputs.completion_denominator
+            except Exception as error:
+                self._publish_status("FAILED", waves=waves, reason=f"S27_FAILURE_ACCOUNTING_BLOCKED:{error}")
+                raise
+            if fraction > self.plan.frozen_inputs.max_failure_fraction:
+                self._publish_status("FAILED", waves=waves, reason="S27_FAILURE_FRACTION_EXCEEDED")
+                raise S27ExecutionBlocked("S27_FAILURE_FRACTION_EXCEEDED")
+            self._publish_status("RUNNING", waves=waves)
+        if set(waves) != set(EXPECTED_CELL_IDS) or not quality_passed:
             self._publish_status("FAILED", waves=waves, reason="S27_QUEUE_INCOMPLETE")
             raise S27ExecutionBlocked("S27_QUEUE_INCOMPLETE")
-        if not quality_passed:
-            self._publish_status("FAILED", waves=waves, reason="S27_QUALITY_WAVE_NOT_PASSED")
-            raise S27ExecutionBlocked("S27_QUALITY_WAVE_NOT_PASSED")
         try:
             sealed = seal_s27_run(self.data_root, self.plan, self.run_root, run_id=self.run_id)
         except Exception as error:
@@ -1697,23 +2153,32 @@ __all__ = [
     "S27_ATTEMPT_SCHEMA",
     "S27_DEFAULT_MAX_ATTEMPTS",
     "S27_DEFAULT_M2_TOLERANCE",
+    "S27_SHARD_PLAN_SCHEMA",
+    "S27_SHARD_SEAL_SCHEMA",
     "S27DetachedLauncher",
     "S27ExecutionBlocked",
     "S27MaterializedCellInput",
     "S27ProductionWorker",
     "S27ProviderContext",
     "S27RetryPolicy",
+    "S27UnitShard",
     "S27SubprocessSpec",
     "S27_WAVE_SEAL_SCHEMA",
     "build_s27_torch_provider",
+    "build_s27_wave_seal_payload",
     "build_s27_worker_command",
     "load_s27_frozen_mappings",
     "load_s27_materialized_inputs",
     "load_s27_plan",
     "load_s27_raw_records",
     "load_s27_reference_views",
+    "load_s27_shard_plan",
     "normalized_gpu_inventory",
     "nvidia_smi_inventory",
+    "partition_s27_units",
+    "seal_s27_wave",
     "seal_s27_run",
+    "validate_s27_shard_seals",
     "validate_s27_quality_wave",
+    "write_s27_shard_plan",
 ]

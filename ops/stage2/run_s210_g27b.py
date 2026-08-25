@@ -6,6 +6,10 @@ import argparse
 from pathlib import Path
 import sys
 
+_REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
+if str(_REPOSITORY_ROOT / "src") not in sys.path:
+    sys.path.insert(0, str(_REPOSITORY_ROOT / "src"))
+
 from param_importance_nlp.experiments.stage2_s210_g27b import S210G27BBlocked, run_s210_g27b
 
 

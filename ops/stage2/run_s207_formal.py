@@ -44,6 +44,7 @@ from param_importance_nlp.experiments.stage2_s207_runner import (
     load_s27_frozen_mappings,
     load_s27_materialized_inputs,
     load_s27_plan,
+    load_s27_shard_plan,
     normalized_gpu_inventory,
     nvidia_smi_inventory,
 )
@@ -233,6 +234,8 @@ def _preflight(args: argparse.Namespace) -> dict[str, object]:
         "g24b_gate_ref": plan.frozen_inputs.g24b_gate_ref,
         "g24b_gate_hash": plan.frozen_inputs.g24b_gate_hash,
         "cell_count": len(plan.cells),
+        "wave_order": [cell.cell_id for cell in plan.cells],
+        "within_wave_shard_count": len(APPROVED_GPU_UUIDS),
         "expected_unit_count": plan.frozen_inputs.completion_denominator,
         "B": plan.frozen_inputs.batch_size,
         "M": plan.frozen_inputs.microbatch_count,
@@ -257,6 +260,31 @@ def _worker(args: argparse.Namespace) -> dict[str, object]:
         raise S27ExecutionBlocked("S27_WORKER_CELL_UNKNOWN")
     if args.gpu_uuid not in APPROVED_GPU_UUIDS:
         raise S27ExecutionBlocked("S27_WORKER_GPU_UNAPPROVED")
+    if (args.shard_plan_ref is None) != (args.shard_index is None):
+        raise S27ExecutionBlocked("S27_WORKER_SHARD_PLAN_AND_INDEX_REQUIRED")
+    shard_index: int | None = None
+    shard_count: int | None = None
+    shard_unit_ids: tuple[str, ...] | None = None
+    if args.shard_plan_ref is not None and args.shard_index is not None:
+        try:
+            shard_index = int(args.shard_index)
+        except (TypeError, ValueError) as error:
+            raise S27ExecutionBlocked("S27_WORKER_SHARD_INDEX_INVALID") from error
+        shards = load_s27_shard_plan(
+            root,
+            plan,
+            _logical(root, args.run_root, field="run_root"),
+            run_id=args.run_id,
+            cell_id=args.cell_id,
+            shard_plan_ref=args.shard_plan_ref,
+        )
+        if shard_index < 0 or shard_index >= len(shards):
+            raise S27ExecutionBlocked("S27_WORKER_SHARD_INDEX_OUT_OF_RANGE")
+        shard = shards[shard_index]
+        if shard.gpu_uuid != args.gpu_uuid:
+            raise S27ExecutionBlocked("S27_WORKER_SHARD_GPU_BINDING_INVALID")
+        shard_count = shard.shard_count
+        shard_unit_ids = shard.unit_ids
     execution = _load_execution(root, args.execution_evidence_ref)
     execution_g24b = [gate for gate in execution.prerequisite_gates if gate.gate_id == "stage2.G2.4b"]
     if len(execution_g24b) != 1 or execution_g24b[0].artifact_hash != plan.frozen_inputs.g24b_gate_hash:
@@ -265,8 +293,9 @@ def _worker(args: argparse.Namespace) -> dict[str, object]:
     request = _build_request(root, cell_id=args.cell_id, materialization_index_ref=args.materialization_index_ref, execution_evidence_ref=args.execution_evidence_ref)
     run_root = _logical(root, args.run_root, field="run_root")
     cell_status_root = run_root / "waves" / args.cell_id.replace(":", "__")
-    status_store = S27StatusStore(cell_status_root / "status.json", run_id=f"{args.run_id}-{args.cell_id.replace(':', '-')}", plan_hash=plan.artifact_hash)
-    if (cell_status_root / "status.json").exists():
+    status_suffix = "status.json" if shard_index is None else f"shard-{shard_index:02d}-status.json"
+    status_store = S27StatusStore(cell_status_root / status_suffix, run_id=f"{args.run_id}-{args.cell_id.replace(':', '-')}{'' if shard_index is None else f'-shard-{shard_index:02d}'}", plan_hash=plan.artifact_hash)
+    if (cell_status_root / status_suffix).exists():
         status_store.require_recoverable()
     status_store.publish(S27DetachedStatus(status_store.run_id, plan.artifact_hash, "PREPARED", 0, _now()))
     status_store.publish(S27DetachedStatus(status_store.run_id, plan.artifact_hash, "RUNNING", 0, _now(), os.getpid(), args.gpu_uuid, time.time()))
@@ -280,11 +309,14 @@ def _worker(args: argparse.Namespace) -> dict[str, object]:
             run_root=run_root,
             request=request,
             materialized_input=materialized,
+            unit_ids=shard_unit_ids,
+            shard_index=shard_index,
+            shard_count=shard_count,
         ).run()
     except Exception as error:
         status_store.publish(S27DetachedStatus(status_store.run_id, plan.artifact_hash, "FAILED", 1, _now(), terminal_reason=f"{type(error).__name__}:{error}"))
         raise
-    terminal = "SEALED" if result.get("status") == "SEALED" else "FAILED"
+    terminal = "SEALED" if result.get("status") in {"SEALED", "SHARD_SEALED"} else "FAILED"
     status_store.publish(S27DetachedStatus(status_store.run_id, plan.artifact_hash, terminal, 1, _now(), terminal_reason=str(result.get("status"))))
     return result
 
@@ -368,6 +400,8 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--python", type=Path, default=Path(sys.executable))
     parser.add_argument("--gpu-uuid")
     parser.add_argument("--cell-id")
+    parser.add_argument("--shard-plan-ref")
+    parser.add_argument("--shard-index", type=int)
     parser.add_argument("--timeout-seconds", type=float)
     parser.add_argument("--poll-seconds", type=float, default=30.0)
     parser.add_argument("--throughput-sequences-per-second", type=float)

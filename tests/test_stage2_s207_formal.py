@@ -26,6 +26,7 @@ from param_importance_nlp.experiments.stage2_s207_formal import (
     prepare_s27_plan,
     validate_gpu_inventory,
 )
+from param_importance_nlp.experiments.stage2_s207_runner import partition_s27_units
 
 
 def _gate_payload() -> dict[str, object]:
@@ -235,6 +236,37 @@ def test_s27_strict_reducer_seals_only_complete_immutable_denominator(tmp_path: 
     assert GateRecord.from_mapping(gate).gate_id == "stage2.G2.5"
     with pytest.raises(S27G25Blocked):
         reducer.add(_success(records[-1], plan))
+
+
+def test_s27_four_gpu_shards_cover_each_wave_without_overlap() -> None:
+    plan = _plan_for_reducer()
+    cell_id = EXPECTED_CELL_IDS[0]
+    shards = partition_s27_units(plan, cell_id)
+    expected = [unit.unit_id for unit in plan.frozen_inputs.units if unit.cell_id == cell_id]
+    assert tuple(shard.gpu_uuid for shard in shards) == APPROVED_GPU_UUIDS
+    assert tuple(unit_id for shard in shards for unit_id in shard.unit_ids) == tuple(expected)
+    assert len({unit_id for shard in shards for unit_id in shard.unit_ids}) == len(expected)
+    assert all(shard.shard_count == 4 for shard in shards)
+
+
+def test_s27_sharded_merge_has_byte_stable_manifest_vs_unsharded_fixture() -> None:
+    plan = _plan_for_reducer()
+    cell_id = EXPECTED_CELL_IDS[0]
+    records = [_success(unit, plan) for unit in plan.frozen_inputs.units]
+    shards = partition_s27_units(plan, cell_id)
+    by_id = {record.unit_id: record for record in records}
+    unsharded = StrictG25Reducer(plan, run_id="s207-byte-stable")
+    for record in records:
+        unsharded.add(record)
+    sharded = StrictG25Reducer(plan, run_id="s207-byte-stable")
+    for shard in shards:
+        for unit_id in shard.unit_ids:
+            sharded.add(by_id[unit_id])
+    for record in records:
+        if record.cell_id != cell_id:
+            sharded.add(record)
+    assert unsharded._manifest() == sharded._manifest()
+    assert canonical_json_hash(unsharded._manifest()) == canonical_json_hash(sharded._manifest())
 
 
 def test_s27_status_recovery_and_gpu_allowlist_are_fail_closed(tmp_path: Path) -> None:
