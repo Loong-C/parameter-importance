@@ -45,6 +45,10 @@ from .stage2_formal import (
     ReferenceUncertainty,
     _ReferenceShardStore,
     _ReferenceSnapshotStore,
+    _BoundedCheckpointStore,
+    _BoundedMoments,
+    _bounded_moments_digest,
+    estimate_sequence_variance_bounded,
     _moments_from_shards,
     _vector_digest,
     estimate_reference_uncertainty_shards,
@@ -673,6 +677,32 @@ def _load_resume_commits(
     *,
     identities: Mapping[str, object],
 ) -> list[Mapping[str, object]]:
+    bounded_path = resume_root / "bounded-checkpoint"
+    if bounded_path.exists():
+        try:
+            latest, _ = load_tensor_bundle(bounded_path)
+        except (OSError, TypeError, ValueError) as error:
+            raise G23Blocked(f"resume:{schema}:BOUNDED_CHECKPOINT_UNREADABLE") from error
+        if not isinstance(latest, Mapping) or latest.get("checkpoint_schema") != _BoundedCheckpointStore.schema_version:
+            raise G23Blocked(f"resume:{schema}:BOUNDED_CHECKPOINT_SCHEMA")
+        if schema == "stage2-reference-progress-state-v1":
+            candidates = latest.get("candidate_states")
+            if not isinstance(candidates, Mapping) or not candidates:
+                raise G23Blocked(f"resume:{schema}:BOUNDED_CANDIDATES_MISSING")
+            states: list[Mapping[str, object]] = []
+            for raw_count in sorted(candidates, key=lambda value: int(value)):
+                count = int(raw_count)
+                item = candidates[raw_count]
+                if not isinstance(item, Mapping):
+                    raise G23Blocked(f"resume:{schema}:BOUNDED_CANDIDATE_INVALID")
+                state = dict(latest)
+                state.update({"schema_version": schema, "processed_block_pairs": count // int(latest.get("block_size", 32) or 32), "a": item.get("a"), "b": item.get("b"), "shard_refs_a": [], "shard_refs_b": [], "shard_count": 0, "bounded_storage": True})
+                states.append(state)
+            return states
+        state = dict(latest)
+        state["schema_version"] = schema
+        state["bounded_storage"] = True
+        return [state]
     commits_dir = resume_root / "commits"
     if not commits_dir.is_dir():
         raise G23Blocked(f"resume:{schema}:COMMITS_MISSING")
@@ -1132,8 +1162,15 @@ def _validate_capacity_preflight(
         raise G23Blocked("capacity_preflight:FIELDS_INVALID") from error
     if count <= 0 or block_size <= 0 or max_sample <= 0 or max_blocks != max_sample // block_size:
         raise G23Blocked("capacity_preflight:FORMULA_FIELDS_INVALID")
-    expected_shards = max_blocks * 2 * count * 8
-    expected_moments = max_blocks * 4 * count * 8
+    storage_mode = value.get("storage_mode", "raw-shards-v1")
+    if storage_mode == "bounded-online-fp64-v1":
+        expected_shards = 0
+        expected_moments = 25 * count * 8
+    elif storage_mode == "raw-shards-v1":
+        expected_shards = max_blocks * 2 * count * 8
+        expected_moments = max_blocks * 4 * count * 8
+    else:
+        raise G23Blocked("capacity_preflight:STORAGE_MODE_INVALID")
     expected_disk = int((expected_shards + expected_moments) * 1.20 + 64 * 1024**2)
     if value.get("single_copy_shard_bytes") != expected_shards or value.get("snapshot_moment_bytes") != expected_moments or value.get("estimated_disk_bytes") != expected_disk:
         raise G23Blocked("capacity_preflight:FORMULA_MISMATCH")
@@ -1544,9 +1581,9 @@ def _prepare_cell(root: Path, source: CellInput, *, repo_root: Path | None = Non
         evidence.final_state = final_states[-1]
         evidence.final_states = final_states
         evidence.final_root = final_root
-        if int(evidence.final_state.get("processed_block_pairs", 0)) != len(final_states):
+        if not bool(evidence.final_state.get("bounded_storage")) and int(evidence.final_state.get("processed_block_pairs", 0)) != len(final_states):
             raise G23Blocked("final_resume:COMMITTED_LENGTH_MISMATCH")
-        if int(evidence.sizing_states[-1].get("processed_block_pairs", 0)) != len(evidence.sizing_states):
+        if not bool(evidence.sizing_states[-1].get("bounded_storage")) and int(evidence.sizing_states[-1].get("processed_block_pairs", 0)) != len(evidence.sizing_states):
             raise G23Blocked("sizing_resume:COMMITTED_LENGTH_MISMATCH")
     except G23Blocked as error:
         evidence.reasons.append(str(error))
@@ -1797,7 +1834,7 @@ def _delta_sci(
     if any(value <= 0.0 for value in floors_f.values()):
         raise G23Blocked("delta_sci:ABSOLUTE_FLOORS_INVALID")
     if (
-        source.get("source_kind") != "reference_sizing_raw_shards"
+        source.get("source_kind") not in {"reference_sizing_raw_shards", "reference_sizing_bounded_online"}
         or source.get("formula_version") != "stage2-reference-sizing-margin-v1"
         or source.get("formula") != "delta_sci=max(0.10*Delta,0.01*S); a=mu_sizing^2; d=sigma_squared_over_B"
         or source.get("formula_contract_hash") != cp.get("formula_contract_hash")
@@ -1817,14 +1854,20 @@ def _delta_sci(
     if any(count not in state_by_count for count in counts):
         raise G23Blocked("delta_sci:SIZING_CANDIDATE_STATE_MISSING")
     latest = state_by_count[counts[-1]]
-    refs_latest = latest.get("shard_refs_a")
-    if not isinstance(refs_latest, list) or not refs_latest:
-        raise G23Blocked("delta_sci:SIZING_SHARDS_MISSING")
-    store = _ReferenceShardStore(evidence.sizing_root)
-    try:
-        first_vector, _, _ = store.load(refs_latest[0])
-    except (OSError, TypeError, ValueError) as error:
-        raise G23Blocked("delta_sci:SIZING_SHARD_INVALID") from error
+    bounded = source.get("source_kind") == "reference_sizing_bounded_online"
+    if bounded:
+        latest_moments = _BoundedMoments.from_state(latest["a"])  # type: ignore[arg-type]
+        first_vector = latest_moments.g1
+        store = None
+    else:
+        refs_latest = latest.get("shard_refs_a")
+        if not isinstance(refs_latest, list) or not refs_latest:
+            raise G23Blocked("delta_sci:SIZING_SHARDS_MISSING")
+        store = _ReferenceShardStore(evidence.sizing_root)
+        try:
+            first_vector, _, _ = store.load(refs_latest[0])
+        except (OSError, TypeError, ValueError) as error:
+            raise G23Blocked("delta_sci:SIZING_SHARD_INVALID") from error
     layer_groups, module_groups = _group_map(first_vector, evidence)
     computed: dict[str, dict[int, float]] = {endpoint: {} for endpoint in ("model_total", "layer", "module")}
     computed_signal: dict[str, dict[int, float]] = {endpoint: {} for endpoint in computed}
@@ -1832,13 +1875,19 @@ def _delta_sci(
     computed_nodes: list[Mapping[str, object]] = []
     for count in counts:
         state = state_by_count[count]
-        refs = state.get("shard_refs_a")
-        if not isinstance(refs, list) or len(refs) != int(state.get("processed_block_pairs", 0)):
-            raise G23Blocked("delta_sci:SIZING_SHARD_PREFIX_INVALID")
         assumptions = state.get("weighting_assumptions")
         if not isinstance(assumptions, Mapping):
             raise G23Blocked("delta_sci:WEIGHTING_ASSUMPTIONS_MISSING")
-        mean, sigma2 = _sizing_sequence_variance(store, refs, assumptions, block_size)
+        if bounded:
+            moments = _BoundedMoments.from_state(state["a"])  # type: ignore[arg-type]
+            mean = moments.mean()
+            sigma2 = estimate_sequence_variance_bounded(moments, block_size=block_size)
+            refs = []
+        else:
+            refs = state.get("shard_refs_a")
+            if not isinstance(refs, list) or len(refs) != int(state.get("processed_block_pairs", 0)):
+                raise G23Blocked("delta_sci:SIZING_SHARD_PREFIX_INVALID")
+            mean, sigma2 = _sizing_sequence_variance(store, refs, assumptions, block_size)
         a = {name: np.square(mean[name]) for name in mean}
         model_signal = max(abs(float(sum(np.sum(value) for value in a.values()))), floors_f["tau_model"])
         model_noise = abs(float(sum(np.sum(value) for value in sigma2.values()))) / float(count)
@@ -1858,8 +1907,11 @@ def _delta_sci(
             computed[endpoint][count] = delta
             computed_signal[endpoint][count] = signal
             computed_noise[endpoint][count] = noise
-        state_digest = _ReferenceSnapshotStore._state_digest(state)
-        shard_refs_hash = canonical_json_hash([
+        state_digest = (
+            canonical_json_hash({"checkpoint_schema": _BoundedCheckpointStore.schema_version, "plan_hash": plan.get("sizing_plan_hash"), "sample_count": count, "moments_hash": _bounded_moments_digest(moments)})
+            if bounded else _ReferenceSnapshotStore._state_digest(state)
+        )
+        shard_refs_hash = canonical_json_hash([]) if bounded else canonical_json_hash([
             {"shard_hash": ref.get("shard_hash"), "manifest_hash": ref.get("manifest_hash"), "weight": ref.get("weight")}
             for ref in refs if isinstance(ref, Mapping)
         ])

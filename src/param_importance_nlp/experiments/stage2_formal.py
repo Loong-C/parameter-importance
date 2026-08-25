@@ -23,6 +23,7 @@ from dataclasses import dataclass, field
 import hashlib
 import math
 import os
+import shutil
 from pathlib import Path, PurePosixPath
 import re
 import time
@@ -1366,6 +1367,97 @@ def estimate_sequence_variance_shards(
     return {name: value * float(block_size) / total_weight for name, value in result.items()}
 
 
+def _bounded_raw_moment(moment: _BoundedMoments, power: int, name: str) -> np.ndarray:
+    value = getattr(moment, f"p{power}", {}).get(name)
+    if value is None:
+        raise ValueError("REFERENCE_BOUNDED_HIGHER_MOMENTS_MISSING")
+    return value
+
+
+def estimate_sequence_variance_bounded(
+    moment: _BoundedMoments,
+    *,
+    block_size: int,
+) -> Mapping[str, np.ndarray]:
+    if moment.count < 2 or not moment.all_equal_weights:
+        raise ValueError("REFERENCE_BOUNDED_SEQUENCE_VARIANCE_REQUIRES_EQUAL_WEIGHTS")
+    if moment.first_weight is None or moment.first_weight <= 0.0:
+        raise ValueError("REFERENCE_BOUNDED_SEQUENCE_VARIANCE_WEIGHT_MISSING")
+    weight = float(moment.first_weight)
+    result: dict[str, np.ndarray] = {}
+    for name, total in moment.g1.items():
+        sum_x = total / weight
+        mean = sum_x / float(moment.count)
+        centered = moment.p2[name] - 2.0 * mean * sum_x + float(moment.count) * np.square(mean)
+        result[name] = centered * float(block_size) / float(moment.count)
+    return result
+
+
+def estimate_reference_uncertainty_bounded(
+    moments_a: _BoundedMoments,
+    moments_b: _BoundedMoments,
+) -> ReferenceUncertainty:
+    """Exact equal-weight block jackknife from online power sums.
+
+    The formal SamplingPlan uses equal unit weights.  Non-equal weights fail
+    closed rather than silently changing the estimator; legacy rounds retain
+    the shard implementation above.
+    """
+
+    if (
+        moments_a.count < 3
+        or moments_b.count < 3
+        or not moments_a.all_equal_weights
+        or not moments_b.all_equal_weights
+        or moments_a.first_weight is None
+        or moments_b.first_weight is None
+        or moments_a.first_weight != moments_b.first_weight
+    ):
+        raise ValueError("REFERENCE_BOUNDED_UNCERTAINTY_REQUIRES_EQUAL_WEIGHTS")
+    combined = moments_a.combine(moments_b)
+    bias_center = combined.u(assumptions={"weights_exogenous": True, "common_mean_assumption": True})
+    bias_variance: dict[str, np.ndarray] = {}
+    n = float(combined.count)
+    denominator = (n - 1.0) * (n - 2.0)
+    weight = float(combined.first_weight)
+    for name, s1 in combined.g1.items():
+        # g1/g2 retain the weighted U-statistic accumulators.  The higher
+        # power sums and p2 are unweighted, so remove the common unit weight
+        # before applying the equal-weight jackknife identities.
+        s1 = s1 / weight
+        s2 = combined.g2[name] / (weight * weight)
+        s3 = _bounded_raw_moment(combined, 3, name)
+        s4 = _bounded_raw_moment(combined, 4, name)
+        c0 = np.square(s1) - s2
+        c1 = -2.0 * s1
+        c2 = np.full_like(s1, 2.0)
+        sum_q = n * c0 + c1 * s1 + c2 * s2
+        sum_q2 = n * np.square(c0) + np.square(c1) * s2 + np.square(c2) * s4 + 2.0 * c0 * c1 * s1 + 2.0 * c0 * c2 * s2 + 2.0 * c1 * c2 * s3
+        bias_variance[name] = (n - 1.0) / n * (sum_q2 / np.square(denominator) - 2.0 * bias_center[name] * (sum_q / denominator) + n * np.square(bias_center[name]))
+
+    mean_a, mean_b = moments_a.mean(), moments_b.mean()
+    cross_variance: dict[str, np.ndarray] = {}
+    for name in mean_a:
+        sum_a = moments_a.g1[name] / float(moments_a.first_weight)
+        sum_b = moments_b.g1[name] / float(moments_b.first_weight)
+        centered_a = moments_a.p2[name] - 2.0 * mean_a[name] * sum_a + float(moments_a.count) * np.square(mean_a[name])
+        centered_b = moments_b.p2[name] - 2.0 * mean_b[name] * sum_b + float(moments_b.count) * np.square(mean_b[name])
+        cross_variance[name] = np.square(mean_b[name]) * centered_a / (float(moments_a.count) * (moments_a.count - 1.0)) + np.square(mean_a[name]) * centered_b / (float(moments_b.count) * (moments_b.count - 1.0))
+
+    ranking_variance: dict[str, np.ndarray] = {}
+    for name, s1 in combined.g1.items():
+        s1 = s1 / weight
+        mean = s1 / n
+        centered2 = combined.p2[name] - 2.0 * mean * s1 + n * np.square(mean)
+        centered3 = _bounded_raw_moment(combined, 3, name) - 3.0 * mean * combined.p2[name] + 3.0 * np.square(mean) * s1 - n * mean**3
+        centered4 = _bounded_raw_moment(combined, 4, name) - 4.0 * mean * _bounded_raw_moment(combined, 3, name) + 6.0 * np.square(mean) * combined.p2[name] - 4.0 * mean**3 * s1 + n * mean**4
+        d2 = centered2 / np.square(n - 1.0)
+        d3 = centered3 / (n - 1.0) ** 3
+        d4 = centered4 / (n - 1.0) ** 4
+        ranking_variance[name] = (n - 1.0) / n * (4.0 * np.square(mean) * centered2 / np.square(n - 1.0) - 4.0 * mean * centered3 / (n - 1.0) ** 3 + centered4 / (n - 1.0) ** 4)
+    return ReferenceUncertainty(bias_variance, cross_variance, ranking_variance, moments_a.count, moments_b.count)
+
+
 @dataclass(frozen=True, slots=True)
 class OneShotReferencePlan:
     """Frozen final A/B run created only after sizing has selected B_ref."""
@@ -2195,8 +2287,6 @@ class _ReferenceShardStore:
             if self._digest(vector, weight) != digest:
                 raise ValueError("REFERENCE_SHARD_DIGEST_MISMATCH")
         elif state.get("vector_encoding") == self._LEGACY_PACKED_ENCODING:
-            # The first packed implementation was FP64 and used the legacy
-            # logical digest.  Keep those immutable objects readable.
             if self._digest(vector, weight) != digest:
                 raise ValueError("REFERENCE_SHARD_DIGEST_MISMATCH")
         else:
@@ -2223,11 +2313,199 @@ class _ReferenceShardStore:
 
     @staticmethod
     def _digest_from_ref(reference: Mapping[str, object]) -> str:
-        # This check is intentionally only structural.  The content digest is
-        # recomputed by load() after the immutable bundle has been opened.
         value = reference.get("shard_hash")
         return value if isinstance(value, str) else ""
 
+
+class _BoundedMoments:
+    """Online FP64 sufficient statistics used by the append-only r22 round.
+
+    Formal r22 must not create one raw tensor bundle per block.  These
+    statistics are algebraically sufficient for the fixed U statistic,
+    leave-one-block jackknife, and sequence variance when the preregistered
+    equal block weights are used.  The source gradients remain unchanged;
+    only their durable representation is bounded.
+    """
+
+    schema_version = "stage2-reference-bounded-moments-v1"
+
+    def __init__(self, *, include_higher: bool = False) -> None:
+        self.count = 0
+        self.n1 = 0.0
+        self.n2 = 0.0
+        self.first_weight: float | None = None
+        self.all_equal_weights = True
+        self.include_higher = bool(include_higher)
+        self.g1: dict[str, np.ndarray] = {}
+        self.g2: dict[str, np.ndarray] = {}
+        self.p2: dict[str, np.ndarray] = {}
+        self.p3: dict[str, np.ndarray] = {}
+        self.p4: dict[str, np.ndarray] = {}
+
+    def update(self, batch: GradientBatch, expected: Mapping[str, object]) -> None:
+        if batch.weighting_assumptions != dict(expected):
+            raise ValueError("GRADIENT_BATCH_WEIGHTING_CONTRACT_DRIFT")
+        self.update_vector(batch.gradients, float(batch.statistical_weight))
+
+    def update_vector(self, gradients: Mapping[str, object], weight: float) -> None:
+        if not math.isfinite(float(weight)) or float(weight) <= 0.0:
+            raise ValueError("statistical_weight 必须是有限正数")
+        vector = _as_vector(gradients, field_name="reference_gradient")
+        if self.g1:
+            _assert_compatible(self.g1, vector, field_name="reference_gradient")
+        else:
+            self.g1 = {name: np.zeros_like(value, dtype=np.float64) for name, value in vector.items()}
+            self.g2 = {name: np.zeros_like(value, dtype=np.float64) for name, value in vector.items()}
+            self.p2 = {name: np.zeros_like(value, dtype=np.float64) for name, value in vector.items()}
+            if self.include_higher:
+                self.p3 = {name: np.zeros_like(value, dtype=np.float64) for name, value in vector.items()}
+                self.p4 = {name: np.zeros_like(value, dtype=np.float64) for name, value in vector.items()}
+        if self.first_weight is None:
+            self.first_weight = float(weight)
+        elif float(weight) != self.first_weight:
+            self.all_equal_weights = False
+        for name, value in vector.items():
+            x = np.asarray(value, dtype=np.float64)
+            self.g1[name] += float(weight) * x
+            self.g2[name] += float(weight) ** 2 * np.square(x)
+            self.p2[name] += np.square(x)
+            if self.include_higher:
+                self.p3[name] += x * x * x
+                self.p4[name] += np.square(x) * np.square(x)
+        self.count += 1
+        self.n1 += float(weight)
+        self.n2 += float(weight) ** 2
+
+    def mean(self) -> dict[str, np.ndarray]:
+        if self.count <= 0 or self.n1 <= 0:
+            raise ValueError("空充分统计量没有 mean")
+        return {name: value / self.n1 for name, value in self.g1.items()}
+
+    def u(self, *, assumptions: Mapping[str, object]) -> dict[str, np.ndarray]:
+        if self.count < 2:
+            raise ValueError("U reference 至少需要两个 block")
+        denominator = self.n1**2 - self.n2
+        if denominator <= 0 or not math.isfinite(denominator):
+            raise ValueError("U reference 分母必须为有限正数")
+        if not self.all_equal_weights and not (
+            assumptions.get("weights_exogenous") is True
+            and assumptions.get("common_mean_assumption") is True
+        ):
+            raise ValueError("WEIGHTED_REFERENCE_ASSUMPTIONS_NOT_DECLARED")
+        return {name: (np.square(self.g1[name]) - self.g2[name]) / denominator for name in self.g1}
+
+    def combine(self, other: "_BoundedMoments") -> "_BoundedMoments":
+        if not self.g1:
+            return other.copy()
+        if not other.g1:
+            return self.copy()
+        _assert_compatible(self.g1, other.g1, field_name="reference_moments")
+        result = _BoundedMoments(include_higher=self.include_higher or other.include_higher)
+        result.count = self.count + other.count
+        result.n1 = self.n1 + other.n1
+        result.n2 = self.n2 + other.n2
+        result.first_weight = self.first_weight
+        result.all_equal_weights = bool(self.all_equal_weights and other.all_equal_weights and self.first_weight == other.first_weight)
+        result.g1 = {name: self.g1[name] + other.g1[name] for name in self.g1}
+        result.g2 = {name: self.g2[name] + other.g2[name] for name in self.g2}
+        result.p2 = {name: self.p2[name] + other.p2[name] for name in self.p2}
+        names = set(self.p3) | set(other.p3)
+        result.p3 = {
+            name: (self.p3[name] if name in self.p3 else np.zeros_like(other.p3[name]))
+            + (other.p3[name] if name in other.p3 else np.zeros_like(self.p3[name]))
+            for name in names
+        }
+        names = set(self.p4) | set(other.p4)
+        result.p4 = {
+            name: (self.p4[name] if name in self.p4 else np.zeros_like(other.p4[name]))
+            + (other.p4[name] if name in other.p4 else np.zeros_like(self.p4[name]))
+            for name in names
+        }
+        return result
+
+    def copy(self) -> "_BoundedMoments":
+        return self.from_state(self.to_state())
+
+    def to_state(self) -> dict[str, object]:
+        return {
+            "schema_version": self.schema_version,
+            "include_higher": self.include_higher,
+            "count": self.count,
+            "n1": self.n1,
+            "n2": self.n2,
+            "first_weight": self.first_weight,
+            "all_equal_weights": self.all_equal_weights,
+            "g1": {name: np.array(value, dtype=np.float64, copy=True) for name, value in self.g1.items()},
+            "g2": {name: np.array(value, dtype=np.float64, copy=True) for name, value in self.g2.items()},
+            "p2": {name: np.array(value, dtype=np.float64, copy=True) for name, value in self.p2.items()},
+            "p3": {name: np.array(value, dtype=np.float64, copy=True) for name, value in self.p3.items()},
+            "p4": {name: np.array(value, dtype=np.float64, copy=True) for name, value in self.p4.items()},
+        }
+
+    @classmethod
+    def from_state(cls, state: Mapping[str, object]) -> "_BoundedMoments":
+        if state.get("schema_version") != cls.schema_version:
+            raise ValueError("REFERENCE_BOUNDED_MOMENTS_SCHEMA_MISMATCH")
+        result = cls(include_higher=bool(state.get("include_higher")))
+        result.count = int(state["count"])
+        result.n1 = float(state["n1"])
+        result.n2 = float(state["n2"])
+        result.first_weight = None if state.get("first_weight") is None else float(state["first_weight"])
+        result.all_equal_weights = bool(state["all_equal_weights"])
+        for field_name in ("g1", "g2", "p2", "p3", "p4"):
+            raw = state.get(field_name, {})
+            if not isinstance(raw, Mapping):
+                raise ValueError("REFERENCE_BOUNDED_MOMENTS_TENSORS_INVALID")
+            setattr(result, field_name, _as_vector(raw, field_name=f"reference_bounded.{field_name}") if raw else {})
+        _assert_compatible(result.g1, result.g2, field_name="reference_bounded_moments")
+        return result
+
+
+def _bounded_moments_digest(moment: _BoundedMoments) -> str:
+    return canonical_json_hash({
+        "schema_version": _BoundedMoments.schema_version,
+        "count": moment.count,
+        "n1": moment.n1,
+        "n2": moment.n2,
+        "g1_hash": _vector_digest(moment.g1) if moment.g1 else None,
+        "g2_hash": _vector_digest(moment.g2) if moment.g2 else None,
+        "p2_hash": _vector_digest(moment.p2) if moment.p2 else None,
+        "p3_hash": _vector_digest(moment.p3) if moment.p3 else None,
+        "p4_hash": _vector_digest(moment.p4) if moment.p4 else None,
+    })
+
+class _BoundedCheckpointStore:
+    """One atomically replaced tensor checkpoint; no per-block raw shards."""
+
+    schema_version = "stage2-reference-bounded-checkpoint-v1"
+
+    def __init__(self, root: str | Path) -> None:
+        self.root = Path(root)
+        self.path = self.root / "bounded-checkpoint"
+        self.root.mkdir(parents=True, exist_ok=True)
+
+    def __enter__(self) -> "_BoundedCheckpointStore":
+        return self
+
+    def __exit__(self, *_args: object) -> None:
+        return None
+
+    def latest(self) -> Mapping[str, object] | None:
+        if not self.path.exists():
+            return None
+        state, _ = load_tensor_bundle(self.path)
+        if not isinstance(state, Mapping) or state.get("checkpoint_schema") != self.schema_version:
+            raise ValueError("REFERENCE_BOUNDED_CHECKPOINT_INVALID")
+        return state
+
+    def publish(self, sequence: int, state: Mapping[str, object]) -> None:
+        payload = dict(state)
+        payload["checkpoint_schema"] = self.schema_version
+        tmp = self.root / f"bounded-checkpoint.tmp-{sequence}-{time.time_ns()}"
+        publish_tensor_bundle(tmp, payload)
+        if self.path.exists():
+            shutil.rmtree(self.path)
+        os.replace(tmp, self.path)
 
 def _moments_from_shards(
     store: _ReferenceShardStore,
@@ -2302,6 +2580,7 @@ class OneShotReferenceRunner:
         rng_boundaries_a: Sequence[Mapping[str, object]] | None = None,
         rng_boundaries_b: Sequence[Mapping[str, object]] | None = None,
         require_rng_boundaries: bool = False,
+        bounded_storage: bool = False,
     ) -> OneShotReferenceResult:
         if max_new_block_pairs is not None and max_new_block_pairs <= 0:
             raise ValueError("max_new_block_pairs 必须为正整数或 null")
@@ -2352,12 +2631,14 @@ class OneShotReferenceRunner:
         if rng_boundaries_b is not None and len(rng_boundaries_b) < total_pairs + 1:
             raise ValueError("ONE_SHOT_REFERENCE_RNG_BOUNDARIES_B_INCOMPLETE")
         processed_pairs = 0
-        moments_a, moments_b = _GradientMoments(), _GradientMoments()
+        moments_a = _BoundedMoments(include_higher=bounded_storage) if bounded_storage else _GradientMoments()
+        moments_b = _BoundedMoments(include_higher=bounded_storage) if bounded_storage else _GradientMoments()
         root = Path(artifact_root)
-        shard_store = _ReferenceShardStore(root)
+        shard_store = None if bounded_storage else _ReferenceShardStore(root)
         shard_refs_a: list[Mapping[str, object]] = []
         shard_refs_b: list[Mapping[str, object]] = []
-        with _ReferenceSnapshotStore(root) as store:
+        checkpoint_store = _BoundedCheckpointStore(root) if bounded_storage else _ReferenceSnapshotStore(root)
+        with checkpoint_store as store:
             restored = store.latest()
             if restored is not None:
                 if restored.get("plan_hash") != plan.artifact_hash:
@@ -2382,8 +2663,8 @@ class OneShotReferenceRunner:
                     }
                     if restored.get("rng_state") != expected_rng or restored.get("rng_state_digest") != boundary_digest(expected_rng):
                         raise ValueError("ONE_SHOT_REFERENCE_RESUME_RNG_STATE_MISMATCH")
-                moments_a = _GradientMoments.from_state(restored["a"])  # type: ignore[arg-type]
-                moments_b = _GradientMoments.from_state(restored["b"])  # type: ignore[arg-type]
+                moments_a = (_BoundedMoments.from_state(restored["a"]) if bounded_storage else _GradientMoments.from_state(restored["a"]))  # type: ignore[arg-type]
+                moments_b = (_BoundedMoments.from_state(restored["b"]) if bounded_storage else _GradientMoments.from_state(restored["b"]))  # type: ignore[arg-type]
                 raw_a, raw_b = restored.get("shard_refs_a"), restored.get("shard_refs_b")
                 if not isinstance(raw_a, list) or not isinstance(raw_b, list):
                     raise ValueError("ONE_SHOT_REFERENCE_RESUME_SHARD_REFS_MISSING")
@@ -2391,19 +2672,18 @@ class OneShotReferenceRunner:
                 shard_refs_b = [dict(item) for item in raw_b if isinstance(item, Mapping)]
                 if len(shard_refs_a) != processed_pairs or len(shard_refs_b) != processed_pairs:
                     raise ValueError("ONE_SHOT_REFERENCE_RESUME_SHARD_COUNT_MISMATCH")
-                rebuilt_a = _moments_from_shards(shard_store, shard_refs_a, assumptions)
-                rebuilt_b = _moments_from_shards(shard_store, shard_refs_b, assumptions)
-                # ndarray equality is not safe; compare each sufficient
-                # statistic with strict tolerances before resuming.
-                comparisons = [(rebuilt_a, moments_a, "a")]
-                if shard_refs_b:
-                    comparisons.append((rebuilt_b, moments_b, "b"))
-                for rebuilt, saved, label in comparisons:
-                    if rebuilt.count != saved.count or not math.isclose(rebuilt.n1, saved.n1, rel_tol=0.0, abs_tol=1e-12) or not math.isclose(rebuilt.n2, saved.n2, rel_tol=0.0, abs_tol=1e-12):
-                        raise ValueError(f"ONE_SHOT_REFERENCE_RESUME_{label.upper()}_MOMENTS_DRIFT")
-                    _assert_compatible(rebuilt.g1, saved.g1, field_name="reference_resume_moments")
-                    if any(not np.array_equal(rebuilt.g1[name], saved.g1[name]) or not np.array_equal(rebuilt.g2[name], saved.g2[name]) for name in rebuilt.g1):
-                        raise ValueError(f"ONE_SHOT_REFERENCE_RESUME_{label.upper()}_MOMENTS_DRIFT")
+                if not bounded_storage:
+                    rebuilt_a = _moments_from_shards(shard_store, shard_refs_a, assumptions)
+                    rebuilt_b = _moments_from_shards(shard_store, shard_refs_b, assumptions)
+                    # ndarray equality is not safe; compare each sufficient
+                    # statistic with strict tolerances before resuming.
+                    comparisons = [(rebuilt_a, moments_a, "a"), (rebuilt_b, moments_b, "b")]
+                    for rebuilt, saved, label in comparisons:
+                        if rebuilt.count != saved.count or not math.isclose(rebuilt.n1, saved.n1, rel_tol=0.0, abs_tol=1e-12) or not math.isclose(rebuilt.n2, saved.n2, rel_tol=0.0, abs_tol=1e-12):
+                            raise ValueError(f"ONE_SHOT_REFERENCE_RESUME_{label.upper()}_MOMENTS_DRIFT")
+                        _assert_compatible(rebuilt.g1, saved.g1, field_name="reference_resume_moments")
+                        if any(not np.array_equal(rebuilt.g1[name], saved.g1[name]) or not np.array_equal(rebuilt.g2[name], saved.g2[name]) for name in rebuilt.g1):
+                            raise ValueError(f"ONE_SHOT_REFERENCE_RESUME_{label.upper()}_MOMENTS_DRIFT")
 
             new_pairs = 0
             while processed_pairs < total_pairs:
@@ -2415,12 +2695,9 @@ class OneShotReferenceRunner:
                 batch_b = self.provider.gradient(draws_b[start:stop])
                 moments_a.update(batch_a, assumptions)
                 moments_b.update(batch_b, assumptions)
-                shard_refs_a.append(
-                    shard_store.publish(batch_a.gradients, float(batch_a.statistical_weight))
-                )
-                shard_refs_b.append(
-                    shard_store.publish(batch_b.gradients, float(batch_b.statistical_weight))
-                )
+                if not bounded_storage:
+                    shard_refs_a.append(shard_store.publish(batch_a.gradients, float(batch_a.statistical_weight)))
+                    shard_refs_b.append(shard_store.publish(batch_b.gradients, float(batch_b.statistical_weight)))
                 self.provider.assert_unchanged(provider_state)
                 processed_pairs += 1
                 new_pairs += 1
@@ -2434,6 +2711,7 @@ class OneShotReferenceRunner:
                     "stream_a_draw_hash": _draw_digest(draws_a),
                     "stream_b_draw_hash": _draw_digest(draws_b),
                     "processed_block_pairs": processed_pairs,
+                    "block_size": plan.block_size,
                     "a": moments_a.to_state(),
                     "b": moments_b.to_state(),
                     "shard_refs_a": list(shard_refs_a),
@@ -2460,7 +2738,8 @@ class OneShotReferenceRunner:
                         else ""
                     ),
                 }
-                store.publish(processed_pairs, state)
+                if not bounded_storage or processed_pairs == total_pairs:
+                    store.publish(processed_pairs, state)
             # A partial state is itself a valid recoverable boundary, but it is
             # never emitted as a final reference manifest.
             if processed_pairs < total_pairs:
@@ -2489,8 +2768,10 @@ class OneShotReferenceRunner:
         cross = {name: mean_a[name] * mean_b[name] for name in mean_a}
         merged_mean = moments_a.combine(moments_b).mean()
         ranking = {name: np.square(value) for name, value in merged_mean.items()}
-        uncertainty = estimate_reference_uncertainty_shards(
-            shard_store, shard_refs_a, shard_refs_b, assumptions
+        uncertainty = (
+            estimate_reference_uncertainty_bounded(moments_a, moments_b)
+            if bounded_storage
+            else estimate_reference_uncertainty_shards(shard_store, shard_refs_a, shard_refs_b, assumptions)
         )
         return OneShotReferenceResult(
             plan_hash=plan.artifact_hash,
@@ -2503,8 +2784,10 @@ class OneShotReferenceRunner:
             ranking_reference=ranking,
             uncertainty=uncertainty,
             weighting_assumptions=assumptions,
-            sequence_variance=estimate_sequence_variance_shards(
-                shard_store, shard_refs_a + shard_refs_b, block_size=plan.block_size
+            sequence_variance=(
+                estimate_sequence_variance_bounded(moments_a.combine(moments_b), block_size=plan.block_size)
+                if bounded_storage
+                else estimate_sequence_variance_shards(shard_store, shard_refs_a + shard_refs_b, block_size=plan.block_size)
             ),
             stream_a_draw_hash=_draw_digest(draws_a),
             stream_b_draw_hash=_draw_digest(draws_b),
@@ -2536,6 +2819,7 @@ class StreamingReferenceSizer:
         draws_sizing: Sequence[object] | None = None,
         rng_boundaries: Sequence[Mapping[str, object]] | None = None,
         require_rng_boundaries: bool = False,
+        bounded_storage: bool = False,
     ) -> ReferenceSizingResult:
         if plan.scope == "formal":
             plan.execution.require_for_stage(2)
@@ -2597,12 +2881,15 @@ class StreamingReferenceSizer:
         selected: int | None = None
         last_bias: dict[str, np.ndarray] | None = None
         last_bias_block_pairs = 0
-        moments_a, moments_b = _GradientMoments(), _GradientMoments()
-        shard_store = _ReferenceShardStore(artifact_root)
+        moments_a = _BoundedMoments() if bounded_storage else _GradientMoments()
+        moments_b = _BoundedMoments() if bounded_storage else _GradientMoments()
+        shard_store = None if bounded_storage else _ReferenceShardStore(artifact_root)
         shard_refs_a: list[Mapping[str, object]] = []
         shard_refs_b: list[Mapping[str, object]] = []
+        candidate_states: dict[str, Mapping[str, object]] = {}
 
-        with _ReferenceSnapshotStore(artifact_root) as store:
+        checkpoint_store = _BoundedCheckpointStore(artifact_root) if bounded_storage else _ReferenceSnapshotStore(artifact_root)
+        with checkpoint_store as store:
             restored = store.latest()
             if restored is not None:
                 if restored.get("plan_hash") != plan.artifact_hash:
@@ -2625,8 +2912,8 @@ class StreamingReferenceSizer:
                 streak = int(restored["convergence_streak"])
                 selected_value = restored["selected_sample_count_per_stream"]
                 selected = None if selected_value is None else int(selected_value)
-                moments_a = _GradientMoments.from_state(restored["a"])  # type: ignore[arg-type]
-                moments_b = _GradientMoments.from_state(restored["b"])  # type: ignore[arg-type]
+                moments_a = (_BoundedMoments.from_state(restored["a"]) if bounded_storage else _GradientMoments.from_state(restored["a"]))  # type: ignore[arg-type]
+                moments_b = (_BoundedMoments.from_state(restored["b"]) if bounded_storage else _GradientMoments.from_state(restored["b"]))  # type: ignore[arg-type]
                 raw_a, raw_b = restored.get("shard_refs_a"), restored.get("shard_refs_b")
                 if not isinstance(raw_a, list) or not isinstance(raw_b, list):
                     raise ValueError("REFERENCE_RESUME_SHARD_REFS_MISSING")
@@ -2635,17 +2922,21 @@ class StreamingReferenceSizer:
                 expected_b_refs = 0 if draws_sizing is not None else processed_pairs
                 if len(shard_refs_a) != processed_pairs or len(shard_refs_b) != expected_b_refs:
                     raise ValueError("REFERENCE_RESUME_SHARD_COUNT_MISMATCH")
-                rebuilt_a = _moments_from_shards(shard_store, shard_refs_a, assumptions)
-                rebuilt_b = _moments_from_shards(shard_store, shard_refs_b, assumptions) if shard_refs_b else _GradientMoments()
-                comparisons = [(rebuilt_a, moments_a, "a")]
-                if shard_refs_b:
-                    comparisons.append((rebuilt_b, moments_b, "b"))
-                for rebuilt, saved, label in comparisons:
-                    if rebuilt.count != saved.count or not math.isclose(rebuilt.n1, saved.n1, rel_tol=0.0, abs_tol=1e-12) or not math.isclose(rebuilt.n2, saved.n2, rel_tol=0.0, abs_tol=1e-12):
-                        raise ValueError(f"REFERENCE_RESUME_{label.upper()}_MOMENTS_DRIFT")
-                    _assert_compatible(rebuilt.g1, saved.g1, field_name="reference_resume_moments")
-                    if any(not np.array_equal(rebuilt.g1[name], saved.g1[name]) or not np.array_equal(rebuilt.g2[name], saved.g2[name]) for name in rebuilt.g1):
-                        raise ValueError(f"REFERENCE_RESUME_{label.upper()}_MOMENTS_DRIFT")
+                if not bounded_storage:
+                    rebuilt_a = _moments_from_shards(shard_store, shard_refs_a, assumptions)
+                    rebuilt_b = _moments_from_shards(shard_store, shard_refs_b, assumptions) if shard_refs_b else _GradientMoments()
+                    comparisons = [(rebuilt_a, moments_a, "a")]
+                    if shard_refs_b:
+                        comparisons.append((rebuilt_b, moments_b, "b"))
+                    for rebuilt, saved, label in comparisons:
+                        if rebuilt.count != saved.count or not math.isclose(rebuilt.n1, saved.n1, rel_tol=0.0, abs_tol=1e-12) or not math.isclose(rebuilt.n2, saved.n2, rel_tol=0.0, abs_tol=1e-12):
+                            raise ValueError(f"REFERENCE_RESUME_{label.upper()}_MOMENTS_DRIFT")
+                        _assert_compatible(rebuilt.g1, saved.g1, field_name="reference_resume_moments")
+                        if any(not np.array_equal(rebuilt.g1[name], saved.g1[name]) or not np.array_equal(rebuilt.g2[name], saved.g2[name]) for name in rebuilt.g1):
+                            raise ValueError(f"REFERENCE_RESUME_{label.upper()}_MOMENTS_DRIFT")
+                raw_candidates = restored.get("candidate_states", {})
+                if bounded_storage and isinstance(raw_candidates, Mapping):
+                    candidate_states = {str(key): value for key, value in raw_candidates.items() if isinstance(value, Mapping)}
                 raw_points = restored["points"]
                 if not isinstance(raw_points, list):
                     raise ValueError("REFERENCE_RESUME_POINTS_NOT_ARRAY")
@@ -2673,21 +2964,13 @@ class StreamingReferenceSizer:
                     (draws_sizing if draws_sizing is not None else draws_a)[start:stop]
                 )
                 moments_a.update(batch_a, assumptions)
-                shard_refs_a.append(
-                    shard_store.publish(
-                        batch_a.gradients,
-                        float(batch_a.statistical_weight),
-                    )
-                )
+                if not bounded_storage:
+                    shard_refs_a.append(shard_store.publish(batch_a.gradients, float(batch_a.statistical_weight)))
                 if draws_sizing is None:
                     batch_b = self.provider.gradient(draws_b[start:stop])
                     moments_b.update(batch_b, assumptions)
-                    shard_refs_b.append(
-                        shard_store.publish(
-                            batch_b.gradients,
-                            float(batch_b.statistical_weight),
-                        )
-                    )
+                    if not bounded_storage:
+                        shard_refs_b.append(shard_store.publish(batch_b.gradients, float(batch_b.statistical_weight)))
                 else:
                     # The single sizing stream has no B endpoint.  Keep an
                     # empty ref list rather than materialising zero vectors.
@@ -2742,6 +3025,8 @@ class StreamingReferenceSizer:
                     last_bias_block_pairs = processed_pairs
                     if selected is None and streak >= plan.required_consecutive:
                         selected = sample_count
+                    if bounded_storage:
+                        candidate_states[str(sample_count)] = {"a": moments_a.to_state(), "b": moments_b.to_state()}
                 state: dict[str, object] = {
                     "schema_version": "stage2-reference-progress-state-v1",
                     "plan_hash": plan.artifact_hash,
@@ -2749,6 +3034,7 @@ class StreamingReferenceSizer:
                     "registry_hash": self.provider.registry_hash,
                     "weighting_assumptions": assumptions,
                     "processed_block_pairs": processed_pairs,
+                    "block_size": plan.block_size,
                     "convergence_streak": streak,
                     "selected_sample_count_per_stream": selected,
                     "points": [point.to_dict() for point in points],
@@ -2762,6 +3048,7 @@ class StreamingReferenceSizer:
                     "sizing_stream": draws_sizing is not None,
                     "sizing_draw_hash": sizing_draw_hash,
                     "sizing_identity_hash": sizing_identity_hash,
+                    "candidate_states": candidate_states,
                     "rng_state": (
                         dict(rng_boundaries[processed_pairs])
                         if rng_boundaries is not None
@@ -2773,7 +3060,8 @@ class StreamingReferenceSizer:
                         else ""
                     ),
                 }
-                store.publish(processed_pairs, state)
+                if not bounded_storage or sample_count in plan.candidate_sample_counts:
+                    store.publish(processed_pairs, state)
 
         if processed_pairs <= 0:
             raise RuntimeError("REFERENCE_SIZING_NO_COMMITTED_BLOCKS")

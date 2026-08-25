@@ -173,6 +173,10 @@ from .stage2_formal import (
     StreamingReferenceSizer,
     _ReferenceSnapshotStore,
     _ReferenceShardStore,
+    _BoundedCheckpointStore,
+    _BoundedMoments,
+    _bounded_moments_digest,
+    estimate_sequence_variance_bounded,
     _moments_from_shards,
     _draw_digest,
 )
@@ -3203,6 +3207,18 @@ def _derive_sizing_delta_sci(
 ) -> Mapping[str, object]:
     """Derive and freeze all candidate margins from sizing shards before A/B."""
 
+    if _BoundedCheckpointStore(sizing_root).latest() is not None:
+        return _derive_sizing_delta_sci_bounded(
+            root=root,
+            sizing_root=sizing_root,
+            plan=plan,
+            parameter_registry=parameter_registry,
+            formula_contract=formula_contract,
+            formula_contract_hash=formula_contract_hash,
+            provider=provider,
+            sizing_result_hash=sizing_result_hash,
+        )
+
     commits = sorted((sizing_root / "commits").glob("*.json"))
     if not commits:
         raise _blocked(BlockerCode.CONTRACT_UNFROZEN, "stage2_reference_sizing", "sizing commits missing", retryable=False)
@@ -3452,6 +3468,91 @@ def _trusted_stage2_provenance(*, require_clean: bool) -> Mapping[str, object]:
     }
 
 
+def _derive_sizing_delta_sci_bounded(
+    *,
+    root: Path,
+    sizing_root: Path,
+    plan: ReferenceSizingPlan,
+    parameter_registry: Mapping[str, object],
+    formula_contract: Mapping[str, object],
+    formula_contract_hash: str,
+    provider: FixedStateGradientProvider,
+    sizing_result_hash: str,
+) -> Mapping[str, object]:
+    """Derive the identical preregistered margin from bounded moments."""
+
+    checkpoint = _BoundedCheckpointStore(sizing_root).latest()
+    if not isinstance(checkpoint, Mapping):
+        raise _blocked(BlockerCode.CONTRACT_UNFROZEN, "stage2_reference_sizing", "bounded sizing checkpoint missing", retryable=False)
+    raw_candidates = checkpoint.get("candidate_states")
+    if not isinstance(raw_candidates, Mapping) or any(str(count) not in raw_candidates for count in plan.candidate_sample_counts):
+        raise _blocked(BlockerCode.CONTRACT_UNFROZEN, "stage2_reference_sizing", "bounded sizing candidate state missing", retryable=False)
+    candidates = {count: _BoundedMoments.from_state(raw_candidates[str(count)]["a"]) for count in plan.candidate_sample_counts}  # type: ignore[index]
+    names = tuple(sorted(candidates[plan.candidate_sample_counts[-1]].g1))
+    layer_groups, module_groups = _sizing_groups(parameter_registry, names)
+    precision = formula_contract.get("equivalence_and_precision")
+    if not isinstance(precision, Mapping) or not isinstance(precision.get("absolute_floors"), Mapping):
+        raise _blocked(BlockerCode.CONTRACT_UNFROZEN, "stage2_preregistration", "absolute floors missing", retryable=False)
+    floors = precision["absolute_floors"]
+    delta_by_endpoint: dict[str, dict[str, float]] = {endpoint: {} for endpoint in ("model_total", "layer", "module")}
+    signal_by_endpoint: dict[str, dict[str, float]] = {endpoint: {} for endpoint in delta_by_endpoint}
+    noise_by_endpoint: dict[str, dict[str, float]] = {endpoint: {} for endpoint in delta_by_endpoint}
+    nodes: list[dict[str, object]] = []
+    for count in plan.candidate_sample_counts:
+        moments = candidates[count]
+        mean = moments.mean()
+        sigma2 = estimate_sequence_variance_bounded(moments, block_size=plan.block_size)
+        a = {name: np.square(mean[name]) for name in names}
+        model_s = max(abs(float(sum(np.sum(value) for value in a.values()))), float(floors["tau_model"]))
+        model_d = abs(float(sum(np.sum(value) for value in sigma2.values()))) / float(count)
+        layer_a = [float(sum(np.sum(a[name]) for name in group)) for group in layer_groups.values()]
+        layer_d = [float(sum(np.sum(sigma2[name]) for name in group)) / float(count) for group in layer_groups.values()]
+        module_a = [float(sum(np.sum(a[name]) for name in group)) for group in module_groups.values()]
+        module_d = [float(sum(np.sum(sigma2[name]) for name in group)) / float(count) for group in module_groups.values()]
+        endpoint_values = {
+            "model_total": (max(abs(model_s), float(floors["tau_model"])), abs(model_d)),
+            "layer": (max(float(sum(abs(value) for value in layer_a)), float(floors["tau_layer"])), float(sum(abs(value) for value in layer_d))),
+            "module": (max(float(sum(abs(value) for value in module_a)), float(floors["tau_module"])), float(sum(abs(value) for value in module_d))),
+        }
+        for endpoint, (signal, noise) in endpoint_values.items():
+            delta = _sizing_delta_sci(signal, noise)
+            signal_by_endpoint[endpoint][str(count)] = signal
+            noise_by_endpoint[endpoint][str(count)] = noise
+            delta_by_endpoint[endpoint][str(count)] = delta
+        nodes.append({
+            "sample_count": count,
+            "state_digest": canonical_json_hash({"checkpoint_schema": _BoundedCheckpointStore.schema_version, "plan_hash": plan.artifact_hash, "sample_count": count, "moments_hash": _bounded_moments_digest(moments)}),
+            "shard_refs_hash": canonical_json_hash([]),
+            "mean_hash": _vector_digest(mean),
+            "sequence_variance_hash": _vector_digest(sigma2),
+        })
+    body: dict[str, object] = {
+        "schema_version": "stage2-reference-delta-sci-v2",
+        "source_kind": "reference_sizing_bounded_online",
+        "formula_contract_hash": formula_contract_hash,
+        "formula_version": "stage2-reference-sizing-margin-v1",
+        "formula": "delta_sci=max(0.10*Delta,0.01*S); a=mu_sizing^2; d=sigma_squared_over_B",
+        "absolute_floors": dict(floors), "reference_id": plan.reference_id,
+        "sizing_result_hash": sizing_result_hash, "sizing_plan_hash": plan.artifact_hash,
+        "candidate_sample_counts": list(plan.candidate_sample_counts),
+        "delta_sci_by_endpoint": delta_by_endpoint, "signal_scale_by_endpoint": signal_by_endpoint,
+        "noise_scale_by_endpoint": noise_by_endpoint, "sizing_nodes": nodes,
+        "registry_hash": provider.registry_hash,
+    }
+    body["artifact_hash"] = canonical_json_hash(body)
+    derived_dir = sizing_root / "derived"
+    derived_dir.mkdir(parents=True, exist_ok=True)
+    path = derived_dir / "delta-sci.json"
+    if path.exists() and load_canonical_json(path) != body:
+        raise _blocked(BlockerCode.CONTRACT_UNFROZEN, "stage2_reference_delta_sci", "bounded sizing-derived artifact drift", retryable=False)
+    if not path.exists():
+        write_canonical_json(path, body)
+    loaded = load_canonical_json(path)
+    if loaded != body:
+        raise _blocked(BlockerCode.CONTRACT_UNFROZEN, "stage2_reference_delta_sci", "bounded sizing-derived artifact drift", retryable=False)
+    return {"source_ref": path.relative_to(root).as_posix(), "source_hash": body["artifact_hash"], "source_artifact_hash": body["artifact_hash"], **body}
+
+
 def _actual_sampling_state(
     sampling: SamplingPlan,
     stream: str,
@@ -3535,17 +3636,20 @@ def _reference_capacity_preflight(
             retryable=False,
         )
     max_blocks = int(plan.candidate_sample_counts[-1] // plan.block_size)
-    # Sizing and one-shot are retained until the task result is published.  A
-    # block is one FP64 vector plus a small manifest; moments are two FP64
-    # vectors per stream per commit.  No B/parameter/sample reduction is used.
-    shard_bytes = max_blocks * 2 * parameter_count * 8
-    snapshot_moment_bytes = max_blocks * 4 * parameter_count * 8
+    # r22 formal uses bounded online FP64 moments: no raw per-block shard is
+    # retained.  The 25-vector bound covers sizing current+candidate prefixes,
+    # final A/B higher moments, and published result/diagnostic vectors.  The
+    # legacy formula remains for historical r17-r21 plans.
+    bounded = bool(plan.require_terminal_convergence)
+    shard_bytes = 0 if bounded else max_blocks * 2 * parameter_count * 8
+    snapshot_moment_bytes = (25 * parameter_count * 8) if bounded else max_blocks * 4 * parameter_count * 8
     estimated_disk = int((shard_bytes + snapshot_moment_bytes) * 1.20 + 64 * 1024**2)
     free_disk = shutil.disk_usage(output_root).free
     available_ram = _available_ram_bytes()
     peak_ram = int(3 * parameter_count * 8 + 64 * 1024**2)
     capacity = {
         "schema_version": "stage2-reference-capacity-preflight-v1",
+        "storage_mode": "bounded-online-fp64-v1" if bounded else "raw-shards-v1",
         "parameter_count": parameter_count,
         "candidate_max_sample_count_per_stream": int(plan.candidate_sample_counts[-1]),
         "block_size": plan.block_size,
@@ -3871,6 +3975,7 @@ def _run_stage2_reference(
         artifact_root=store.root / "resume" / "reference-sizing",
         rng_boundaries=sizing_rng_boundaries,
         require_rng_boundaries=request.config.run_intent == "formal",
+        bounded_storage=request.config.run_intent == "formal" and plan.require_terminal_convergence,
     )
     terminal_point = result.points[-1] if result.points else None
     terminal_pass = bool(
@@ -3971,6 +4076,7 @@ def _run_stage2_reference(
         rng_boundaries_a=final_a_rng_boundaries,
         rng_boundaries_b=final_b_rng_boundaries,
         require_rng_boundaries=request.config.run_intent == "formal",
+        bounded_storage=request.config.run_intent == "formal" and plan.require_terminal_convergence,
     )
     if one_shot.status != "COMPLETE":
         raise _blocked(
@@ -3990,6 +4096,7 @@ def _run_stage2_reference(
         rng_boundaries_a=final_a_rng_boundaries,
         rng_boundaries_b=final_b_rng_boundaries,
         require_rng_boundaries=request.config.run_intent == "formal",
+        bounded_storage=request.config.run_intent == "formal" and plan.require_terminal_convergence,
     )
     if replay.status != "COMPLETE" or replay.artifact_hash != one_shot.artifact_hash:
         raise _blocked(
