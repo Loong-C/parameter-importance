@@ -75,6 +75,63 @@ _FORMAL_BASE_REVISIONS = {
     "pythia-14m": "56079904bb80b7f36d3b794089f146e7a4d6efae",
     "pythia-31m-deduped": "73628c85dd9d12d43c07be77ebcf10cef5fd9660",
 }
+_EXECUTION_COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
+
+
+def _repository_root() -> Path:
+    """Return the repository containing this launcher, never DATA_ROOT."""
+
+    return Path(__file__).resolve().parents[2]
+
+
+def _validate_execution_lineage(execution_commit: object) -> dict[str, Any]:
+    """Fail closed unless this launcher runs from the exact clean detached HEAD.
+
+    This is the S2.4 launcher execution identity.  It deliberately does not
+    inspect or overwrite ``FormalExecutionEvidence.metadata.execution_commit``
+    from the upstream authorization producer.
+    """
+
+    if not isinstance(execution_commit, str) or _EXECUTION_COMMIT_RE.fullmatch(execution_commit) is None:
+        raise ValueError("S2.4 execution_commit must be exactly 40 lowercase hex characters")
+    repository = _repository_root()
+    head = subprocess.run(
+        ["git", "-C", str(repository), "rev-parse", "--verify", "HEAD"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if head.returncode != 0 or head.stdout.strip() != execution_commit:
+        raise ValueError(
+            f"S2.4 EXECUTION_COMMIT_HEAD_MISMATCH:{head.stdout.strip() or '<unavailable>'}"
+        )
+    branch = subprocess.run(
+        ["git", "-C", str(repository), "symbolic-ref", "--quiet", "--short", "HEAD"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if branch.returncode == 0 and branch.stdout.strip():
+        raise ValueError(f"S2.4 EXECUTION_COMMIT_REQUIRES_DETACHED_HEAD:{branch.stdout.strip()}")
+    if branch.returncode not in {0, 1}:
+        raise ValueError("S2.4 EXECUTION_COMMIT_DETACHED_STATE_UNAVAILABLE")
+    status = subprocess.run(
+        ["git", "-C", str(repository), "status", "--porcelain=v1", "--untracked-files=all"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if status.returncode != 0:
+        raise ValueError("S2.4 EXECUTION_COMMIT_WORKTREE_STATE_UNAVAILABLE")
+    if status.stdout.strip():
+        raise ValueError("S2.4 EXECUTION_COMMIT_WORKTREE_NOT_CLEAN")
+    return {
+        "role": "stage2.04_s204_launcher_execution",
+        "execution_commit": execution_commit,
+        "repository": repository.as_posix(),
+        "detached": True,
+        "worktree_clean": True,
+    }
 
 
 def _formal_logical_identity(checkpoint: Mapping[str, Any]) -> dict[str, str]:
@@ -1195,6 +1252,7 @@ def execute_with_task_runtime(
     cuda_visible_devices: str,
     cell_id: str | None,
     heartbeat_seconds: float,
+    execution_commit: str | None = None,
 ) -> list[dict[str, Any]]:
     """Delegate formal work to the existing strict TaskRuntime chain.
 
@@ -1219,6 +1277,7 @@ def execute_with_task_runtime(
         raise ValueError("formal execute requires --cell-id; aggregate six independent cell processes")
     if not math.isfinite(heartbeat_seconds) or heartbeat_seconds <= 0:
         raise ValueError("heartbeat_seconds must be finite and positive")
+    execution_lineage = _validate_execution_lineage(execution_commit)
     gpu_smoke = _validate_gpu_smoke_artifact(plan, data_root)
     selected_gpu_uuid, gpu_inventory, gpu_inventory_hash = _bind_gpu(visible_tokens[0])
     # UUID is the process boundary; physical indices are only an input selector.
@@ -1257,6 +1316,8 @@ def execute_with_task_runtime(
                 event_path,
                 {
                     "event": "STARTED",
+                    "execution_commit": execution_lineage["execution_commit"],
+                    "execution_lineage": dict(execution_lineage),
                     "status": "IN_PROGRESS",
                     "cell_id": current_cell_id,
                     "attempt_id": attempt_id,
@@ -1289,6 +1350,8 @@ def execute_with_task_runtime(
                 status = "COMPLETE" if result.status is TaskRunStatus.PASS else result.status.value
                 final_status_payload = {
                     "schema_version": "stage2-s204-cell-final-status-v3",
+                    "execution_commit": execution_lineage["execution_commit"],
+                    "execution_lineage": dict(execution_lineage),
                     "cell_id": current_cell_id,
                     "attempt_id": attempt_id,
                     "run_kind": run_kind,
@@ -1347,6 +1410,8 @@ def execute_with_task_runtime(
         results.append(
             {
                 "cell_id": current_cell_id,
+                "execution_commit": execution_lineage["execution_commit"],
+                "execution_lineage": dict(execution_lineage),
                 "attempt_id": attempt_id,
                 "run_kind": run_kind,
                 "gpu_inventory_sha256": gpu_inventory_hash,
@@ -1370,6 +1435,7 @@ def aggregate_g23(
     output_root: Path,
     data_root: Path,
     metrics_path: Path | None,
+    execution_commit: str | None = None,
 ) -> tuple[str, str, Path]:
     """Collect six immutable cell results and invoke the downstream evaluator hook.
 
@@ -1380,6 +1446,7 @@ def aggregate_g23(
 
     data_root = data_root.resolve()
     output_root = output_root.resolve()
+    execution_lineage = _validate_execution_lineage(execution_commit)
 
     from param_importance_nlp.contracts.config_v2 import ResolvedConfigV2
     from param_importance_nlp.runtime import TaskRunResult, TaskRunStatus
@@ -1502,6 +1569,8 @@ def aggregate_g23(
             output_root,
             {
                 "schema_version": "stage2-g23-aggregate-preflight-v1",
+                "execution_commit": execution_lineage["execution_commit"],
+                "execution_lineage": dict(execution_lineage),
                 "status": "BLOCKED",
                 "formal_eligible": False,
                 "reasons": reasons,
@@ -1523,6 +1592,8 @@ def aggregate_g23(
     )
     summary = {
         "schema_version": "stage2-s204-formal-run-summary-v3",
+        "execution_commit": execution_lineage["execution_commit"],
+        "execution_lineage": dict(execution_lineage),
         "status": "COMPLETE" if gate_status == "PASS" else "BLOCKED_OR_NOT_QUALIFIED",
         "g2_3_gate": gate_status,
         "g2_3_gate_artifact_hash": gate_hash,
@@ -1550,6 +1621,10 @@ def _parser() -> argparse.ArgumentParser:
     mode.add_argument("--execute", action="store_true", help="run one real offline HF fixed-state reference cell")
     mode.add_argument("--aggregate", action="store_true", help="aggregate six immutable cells and evaluate G2.3")
     parser.add_argument("--data-root", type=Path, help="server DATA_ROOT; required by --execute/--aggregate")
+    parser.add_argument(
+        "--execution-commit",
+        help="required for execute/aggregate: exact clean detached launcher repository HEAD",
+    )
     parser.add_argument(
         "--runtime-config",
         type=Path,
@@ -1605,6 +1680,8 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(plan, ensure_ascii=False, sort_keys=True, indent=2))
         print(f"plan_path={output}")
         if args.execute:
+            if args.execution_commit is None:
+                raise ValueError("--execute requires --execution-commit")
             if args.data_root is None or args.runtime_environment is None:
                 raise ValueError("--execute requires --data-root and --runtime-environment")
             if args.cell_id is None or len(args.runtime_config) != 1:
@@ -1618,11 +1695,14 @@ def main(argv: list[str] | None = None) -> int:
                 cuda_visible_devices=args.cuda_visible_devices,
                 cell_id=args.cell_id,
                 heartbeat_seconds=args.heartbeat_seconds,
+                execution_commit=args.execution_commit,
             )
             print(json.dumps({"mode": "execute", "cells": results}, ensure_ascii=False, sort_keys=True))
             if not all(item["status"] == "COMPLETE" for item in results):
                 return 3
         elif args.aggregate:
+            if args.execution_commit is None:
+                raise ValueError("--aggregate requires --execution-commit")
             if args.data_root is None:
                 raise ValueError("--aggregate requires --data-root")
             if args.cell_id is not None or args.runtime_config or args.runtime_environment is not None:
@@ -1632,6 +1712,7 @@ def main(argv: list[str] | None = None) -> int:
                 output_root=args.output_root,
                 data_root=args.data_root,
                 metrics_path=args.g23_metrics,
+                execution_commit=args.execution_commit,
             )
             print(
                 json.dumps(
