@@ -1428,7 +1428,7 @@ def _formal_provider(request: TaskExecutionRequest, root: Path) -> _ProviderCont
         )
         model.module.to(torch.device(str(runtime["device"])))
         model.module.eval()
-        if any(parameter.dtype is not torch.float32 for parameter in model.module.parameters()):
+        if any(parameter.dtype != torch.float32 for parameter in model.module.parameters()):
             raise ValueError("FORMAL_MAIN_GRADIENT_MODEL_DTYPE_NOT_FLOAT32")
         if task_type == "causal_lm":
             if data_asset.storage_kind != "pythia_mmap_shards":
