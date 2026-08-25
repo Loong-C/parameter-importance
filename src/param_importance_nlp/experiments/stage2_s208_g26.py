@@ -868,6 +868,8 @@ def analyze_s208_g26(
         raise S28G26Blocked("raw_manifest:SIX_PRIMARY_CELLS_REQUIRED")
     matrix_payload = _load(matrix, field="matrix")
     matrix_hash = _verify_hash(matrix_payload, field="matrix")
+    if matrix_payload.get("preregistration_hash") not in (None, prereg.get("preregistration_hash")):
+        raise S28G26Blocked("matrix:PREREGISTRATION_HASH_MISMATCH")
     if manifest.get("matrix_hash") not in (None, matrix_hash):
         raise S28G26Blocked("raw_manifest:MATRIX_HASH_MISMATCH")
     if matrix_payload.get("status") not in ("FORMAL_FROZEN", "FROZEN") or matrix_payload.get("formal_eligible") is not True:
@@ -955,7 +957,10 @@ def analyze_s208_g26(
     gate_body["artifact_hash"] = canonical_json_hash({key: value for key, value in gate_body.items() if key != "artifact_hash"})
     quality_payload = {"schema_version": "stage2-s208-quality-gates-v1", "gate_id": "stage2.G2.6", "status": gate_status, "gates": quality_records, "formal_eligible": quality_pass, "artifact_hash": ""}
     quality_payload["artifact_hash"] = canonical_json_hash({key: value for key, value in quality_payload.items() if key != "artifact_hash"})
-    analysis = {"schema_version": S28_ANALYSIS_SCHEMA, "analysis_id": "REPLACE_WITH_ANALYSIS_ID", "status": gate_status, "quality_gates": quality_payload, "hypothesis_decisions": decisions, "confirmatory_family_decisions": family_payload, "statistics_long_table": long_rows, "statistics_summary": summaries, "raw_calibration": raw_calibration_rows, "input_audit": audit, "lineage_manifest": lineage, "g2_6_gate": gate_body}
+    analysis_id = Path(output_root).name if output_root is not None else "in_memory_validation"
+    if not analysis_id or analysis_id in {".", ".."}:
+        raise S28G26Blocked("ANALYSIS_ID_REQUIRED")
+    analysis = {"schema_version": S28_ANALYSIS_SCHEMA, "analysis_id": analysis_id, "status": gate_status, "quality_gates": quality_payload, "hypothesis_decisions": decisions, "confirmatory_family_decisions": family_payload, "statistics_long_table": long_rows, "statistics_summary": summaries, "raw_calibration": raw_calibration_rows, "input_audit": audit, "lineage_manifest": lineage, "g2_6_gate": gate_body}
     output_files: list[str] = []
     if output_root is not None:
         destination = Path(output_root)
