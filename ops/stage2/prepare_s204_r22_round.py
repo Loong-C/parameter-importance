@@ -32,7 +32,7 @@ _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 
 
 def _canonical_hash(value: Mapping[str, Any]) -> str:
-    body = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    body = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n"
     return hashlib.sha256(body.encode("utf-8")).hexdigest()
 
 
