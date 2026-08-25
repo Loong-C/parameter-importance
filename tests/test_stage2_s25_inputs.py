@@ -10,7 +10,12 @@ from param_importance_nlp.contracts.stage23 import FormalExecutionEvidence
 from param_importance_nlp.contracts.status import GateRecord, GateStatus
 from param_importance_nlp.experiments.preregistration import build_stage2_preregistration
 from param_importance_nlp.experiments.sampling import SamplingPlan, SamplingUniverse
-from param_importance_nlp.experiments.stage2_s25_formal import _experiment_plan_entries, _make_mappings
+from param_importance_nlp.experiments.stage2_s25_formal import (
+    S25ExecutionBlocked,
+    S25FormalRunner,
+    _experiment_plan_entries,
+    _make_mappings,
+)
 from param_importance_nlp.experiments.stage2_s25_inputs import (
     S205InputBlocked,
     build_s205_formal_inputs,
@@ -152,3 +157,24 @@ def test_materializer_is_append_only_and_idempotent(tmp_path: Path) -> None:
     tampered = {"schema_version": "tampered"}
     write_canonical_json(index, tampered)
     assert materialize_main(argv) == 3
+
+
+def test_runner_rejects_sweep_bound_to_other_formal_execution(tmp_path: Path) -> None:
+    prereg_ref, sampling_ref, execution_ref, sampling = _formal_fixture(tmp_path)
+    _direct, sweep = build_s205_formal_inputs(
+        tmp_path,
+        preregistration_ref=prereg_ref,
+        sampling_plan_ref=sampling_ref,
+        formal_execution_ref=execution_ref,
+    )
+    with pytest.raises(S25ExecutionBlocked, match="FORMAL_EXECUTION_MISMATCH"):
+        S25FormalRunner(
+            data_root=tmp_path,
+            rebind_plan={
+                "formal_execution_hash": "0" * 64,
+                "formal_execution_ref": execution_ref,
+            },
+            experiment_plan=sweep,
+            sampling_plan=sampling,
+            artifact_root=tmp_path / "output",
+        )
