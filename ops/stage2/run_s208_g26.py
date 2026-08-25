@@ -8,6 +8,7 @@ import sys
 
 from param_importance_nlp.contracts.jsonio import load_canonical_json
 from param_importance_nlp.experiments.stage2_s208_runner import run_s208_g26_production
+from param_importance_nlp.experiments.stage2_s208_production import S208ProductionBlocked
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -51,7 +52,7 @@ def main(argv: list[str] | None = None) -> int:
             bootstrap_replicates=args.bootstrap_replicates,
             bootstrap_seed=args.bootstrap_seed,
         )
-    except (OSError, TypeError, ValueError) as error:
+    except (S208ProductionBlocked, OSError, TypeError, ValueError) as error:
         print(f"S2.8/G2.6 BLOCKED: {error}", file=sys.stderr)
         return 2
     print(f"S2.8/G2.6 {result['status']}; outputs={len(result['output_files'])}")

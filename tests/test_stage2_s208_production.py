@@ -13,6 +13,7 @@ from param_importance_nlp.experiments.stage2_s208_production import (
     load_s208_reference_bundle,
 )
 from param_importance_nlp.experiments.stage2_s208_g26 import S28G26Blocked, _read_raw_payload
+from param_importance_nlp.experiments.stage2_s208_runner import _validate_production_paths
 from param_importance_nlp.runtime.tensor_bundle import publish_tensor_bundle
 
 
@@ -203,3 +204,27 @@ def test_raw_bundle_requires_explicit_scratch_and_never_writes_sealed_parent(tmp
     assert loaded["vectors"]
     assert not (raw_parent / ".s208-memmap").exists()
     assert (scratch / "raw").is_dir()
+
+
+def test_production_paths_require_new_data_root_namespaces(tmp_path: Path) -> None:
+    data_root = tmp_path / "data"
+    data_root.mkdir()
+    scratch = data_root / "tmp" / "stage2" / "s208" / "run-1"
+    output = data_root / "results" / "stage2" / "derived" / "run-1"
+    root, validated_scratch, validated_output = _validate_production_paths(data_root, scratch, output)
+    assert root == data_root.resolve()
+    assert validated_scratch == scratch.resolve()
+    assert validated_output == output.resolve()
+
+    with pytest.raises(S208ProductionBlocked, match="memmap_root:OUTSIDE_REQUIRED_BOUNDARY"):
+        _validate_production_paths(data_root, data_root / "sealed" / "scratch", output)
+    with pytest.raises(S208ProductionBlocked, match="output_root:OUTSIDE_REQUIRED_BOUNDARY"):
+        _validate_production_paths(data_root, scratch, data_root / "evidence" / "stage2" / "run-1")
+
+    scratch.mkdir(parents=True)
+    with pytest.raises(S208ProductionBlocked, match="memmap_root:NAMESPACE_ALREADY_EXISTS"):
+        _validate_production_paths(data_root, scratch, output)
+    scratch.rmdir()
+    output.mkdir(parents=True)
+    with pytest.raises(S208ProductionBlocked, match="output_root:NAMESPACE_ALREADY_EXISTS"):
+        _validate_production_paths(data_root, scratch, output)
