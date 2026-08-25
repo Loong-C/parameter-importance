@@ -95,8 +95,8 @@ def _make_provider(cell: str) -> SyntheticGradientProvider:
     # provider still supplies the actual state and registry hashes.
     table = {
         sample_id: {
-            "layer0.weight": np.asarray([10.0 + sample_id * 1.0e-2, 9.0 + sample_id * 1.0e-2]),
-            "layer1.weight": np.asarray([20.0 + sample_id * 1.0e-2, 19.0 + sample_id * 1.0e-2]),
+            "layer0.weight": np.asarray([10.0 + sample_id * 1.0e-4, 9.0 + sample_id * 1.0e-4]),
+            "layer1.weight": np.asarray([20.0 + sample_id * 1.0e-4, 19.0 + sample_id * 1.0e-4]),
         }
         for sample_id in range(8)
     }
