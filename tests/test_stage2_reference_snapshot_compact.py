@@ -12,11 +12,12 @@ from param_importance_nlp.experiments.sampling import SamplingPlan, SamplingUniv
 from param_importance_nlp.experiments.stage2_formal import (
     ReferenceSizingPlan,
     StreamingReferenceSizer,
+    _GradientMoments,
     _ReferenceShardStore,
     _ReferenceSnapshotStore,
     _vector_digest,
 )
-from param_importance_nlp.providers import SyntheticGradientProvider
+from param_importance_nlp.providers import GradientBatch, SyntheticGradientProvider
 from param_importance_nlp.runtime.tensor_bundle import load_tensor_bundle
 from param_importance_nlp.runtime.tensor_bundle import publish_tensor_bundle
 
@@ -50,6 +51,36 @@ def _draws(stream: str, count: int):
 
 def _plan() -> ReferenceSizingPlan:
     return ReferenceSizingPlan("compact-reference", (1, 2, 3), 1, 1e6, 1)
+
+
+class _Float32Provider:
+    registry_hash = "c" * 64
+    parameter_names = ("p",)
+    fixed_state_id = "compact-fp32"
+    statistical_unit = "compact-smoke"
+    weight_unit = "draws"
+    sampling_design = "fixed_disjoint"
+    weights_exogenous = True
+    common_mean_assumption = True
+
+    def state_digest(self) -> str:
+        return "d" * 64
+
+    def assert_unchanged(self, expected_digest: str) -> None:
+        if expected_digest != self.state_digest():
+            raise RuntimeError("FP32_PROVIDER_STATE_DRIFT")
+
+    def gradient(self, draws) -> GradientBatch:
+        return GradientBatch(
+            gradients={"p": np.array([1.25, -2.5], dtype=np.float32)},
+            statistical_weight=float(len(draws)),
+            statistical_unit=self.statistical_unit,
+            weight_unit=self.weight_unit,
+            sampling_design=self.sampling_design,
+            weights_exogenous=True,
+            common_mean_assumption=True,
+            sample_ids=tuple(getattr(draw, "sample_id", draw) for draw in draws),
+        )
 
 
 def test_snapshot_object_stores_hashes_and_shard_refs_only(tmp_path: Path) -> None:
@@ -116,6 +147,53 @@ def test_shard_pack_roundtrip_uses_one_tensor_and_reads_legacy_bundle(tmp_path: 
     assert legacy_weight == 4.0
     for name in legacy_restored:
         np.testing.assert_array_equal(legacy_restored[name], vector[name])
+
+
+def test_fp32_shard_preserves_source_dtype_and_fp64_moment_semantics(tmp_path: Path) -> None:
+    store = _ReferenceShardStore(tmp_path / "fp32")
+    vector = {
+        "a.bias": np.array([1.25, -2.5], dtype=np.float32),
+        "z.weight": np.arange(6, dtype=np.float32).reshape(2, 3),
+    }
+    reference = store.publish(vector, 2.0)
+    state, bundle = load_tensor_bundle(tmp_path / "fp32" / str(reference["shard_ref"]))
+    assert state["source_dtype"] == np.dtype(np.float32).str
+    assert state["vector_packed"].dtype == np.dtype(np.float32)
+    assert bundle.tensor_count == 1
+    restored, weight, _ = store.load(reference)
+    assert all(array.dtype == np.dtype(np.float64) for array in restored.values())
+
+    direct = _GradientMoments()
+    roundtrip = _GradientMoments()
+    direct.update_vector(vector, weight, {})
+    roundtrip.update_vector(restored, weight, {})
+    for name in direct.g1:
+        np.testing.assert_array_equal(direct.g1[name], roundtrip.g1[name])
+        np.testing.assert_array_equal(direct.g2[name], roundtrip.g2[name])
+
+    with pytest.raises(ValueError, match="REFERENCE_SHARD_MIXED_SOURCE_DTYPES"):
+        store.publish(
+            {"a.bias": vector["a.bias"], "z.weight": vector["z.weight"].astype(np.float64)},
+            1.0,
+        )
+
+
+def test_streaming_sizer_passes_raw_fp32_gradients_to_shard_store(tmp_path: Path) -> None:
+    provider = _Float32Provider()
+    root = tmp_path / "streaming-fp32"
+    StreamingReferenceSizer(provider).run(
+        _plan(),
+        draws_a=_draws("reference_A", 3),
+        draws_b=_draws("reference_B", 3),
+        artifact_root=root,
+    )
+    commit = load_canonical_json(root / "commits" / "00000003.json")
+    state, _ = load_tensor_bundle(root / str(commit["object_ref"]))
+    reference = state["shard_refs_a"][0]
+    shard_state, shard_bundle = load_tensor_bundle(root / str(reference["shard_ref"]))
+    assert shard_state["source_dtype"] == np.dtype(np.float32).str
+    assert shard_state["vector_packed"].dtype == np.dtype(np.float32)
+    assert shard_bundle.tensor_count == 1
 
 
 def test_compact_resume_reconstructs_exact_reference(tmp_path: Path) -> None:

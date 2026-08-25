@@ -352,6 +352,64 @@ def _as_vector(value: object, *, field_name: str = "vector") -> dict[str, np.nda
     return {name: result[name] for name in sorted(result)}
 
 
+def _as_storage_array(value: object, *, field_name: str) -> np.ndarray:
+    """Copy a gradient while retaining its FP32/FP64 source dtype.
+
+    Formal providers emit floating gradients.  Keeping that source dtype in
+    the immutable shard halves storage for the FP32 contract; all consumers
+    still call ``_as_vector`` before FP64 accumulation.  Non-floating legacy
+    inputs retain the previous safe FP64 normalization.
+    """
+
+    if hasattr(value, "detach"):
+        value = value.detach()  # type: ignore[union-attr]
+    if hasattr(value, "cpu"):
+        value = value.cpu()  # type: ignore[union-attr]
+    if hasattr(value, "numpy"):
+        value = value.numpy()  # type: ignore[union-attr]
+    raw = np.asarray(value)
+    if raw.dtype.kind == "f" and raw.dtype.itemsize in {4, 8}:
+        array = np.array(raw, dtype=raw.dtype, copy=True, order="C")
+    else:
+        array = _as_array(raw, field_name=field_name)
+    if not np.all(np.isfinite(array)):
+        raise ValueError(f"{field_name} 包含 NaN/Inf")
+    return array
+
+
+def _as_storage_vector(
+    value: object, *, field_name: str = "vector"
+) -> dict[str, np.ndarray]:
+    if not hasattr(value, "items"):
+        raise TypeError(f"{field_name} 必须是 parameter-name -> tensor mapping")
+    result: dict[str, np.ndarray] = {}
+    for raw_name, item in value.items():  # type: ignore[union-attr]
+        name = str(raw_name)
+        if not name or name in result:
+            raise ValueError(f"{field_name} 包含空名称或重复参数名")
+        result[name] = _as_storage_array(item, field_name=f"{field_name}.{name}")
+    if not result:
+        raise ValueError(f"{field_name} 不能为空")
+    return {name: result[name] for name in sorted(result)}
+
+
+def _storage_vector_digest_parsed(value: Mapping[str, np.ndarray]) -> str:
+    digest = hashlib.sha256()
+    for name, array in value.items():
+        digest.update(len(name.encode("utf-8")).to_bytes(8, "big"))
+        digest.update(name.encode("utf-8"))
+        digest.update(array.dtype.str.encode("ascii"))
+        digest.update(canonical_json_hash(list(array.shape)).encode("ascii"))
+        digest.update(array.tobytes(order="C"))
+    return digest.hexdigest()
+
+
+def _storage_vector_digest(value: Mapping[str, object]) -> str:
+    """Hash names, shapes, source dtypes and raw bytes before FP64 casting."""
+
+    return _storage_vector_digest_parsed(_as_storage_vector(value))
+
+
 def _copy_vector(value: Mapping[str, object]) -> Mapping[str, np.ndarray]:
     copied: dict[str, np.ndarray] = {}
     for name, item in _as_vector(value).items():
@@ -1390,6 +1448,42 @@ class _ReferenceSnapshotStore:
         self.close()
 
     @staticmethod
+    def _shard_moment_hash(
+        references: Sequence[Mapping[str, object]], moment: str
+    ) -> str:
+        return canonical_json_hash(
+            {
+                "schema_version": "stage2-reference-moment-shard-identity-v1",
+                "moment": moment,
+                "references": [dict(reference) for reference in references],
+            }
+        )
+
+    @staticmethod
+    def _shard_last_bias_hash(state: Mapping[str, object]) -> str:
+        raw_a = state.get("shard_refs_a")
+        raw_b = state.get("shard_refs_b")
+        if not isinstance(raw_a, list) or not isinstance(raw_b, list):
+            raise ValueError("REFERENCE_LAST_BIAS_SHARD_REFS_INVALID")
+        pairs = int(state.get("last_bias_block_pairs", 0))
+        sizing_stream = bool(state.get("sizing_stream") is True)
+        if pairs <= 0 or pairs > len(raw_a) or (not sizing_stream and pairs > len(raw_b)):
+            raise ValueError("REFERENCE_LAST_BIAS_PREFIX_INVALID")
+        refs_a = [dict(item) for item in raw_a[:pairs] if isinstance(item, Mapping)]
+        refs_b = [dict(item) for item in raw_b[:pairs] if isinstance(item, Mapping)]
+        if len(refs_a) != pairs or (not sizing_stream and len(refs_b) != pairs):
+            raise ValueError("REFERENCE_LAST_BIAS_SHARD_REFS_INVALID")
+        return canonical_json_hash(
+            {
+                "schema_version": "stage2-reference-last-bias-shard-identity-v1",
+                "sizing_stream": sizing_stream,
+                "block_pairs": pairs,
+                "references_a": refs_a,
+                "references_b": refs_b,
+            }
+        )
+
+    @staticmethod
     def _state_digest(state: Mapping[str, object]) -> str:
         a = state["a"]
         b = state["b"]
@@ -1407,11 +1501,35 @@ class _ReferenceSnapshotStore:
                 "snapshot_encoding",
             }
         }
+        moment_mode = state.get("moment_hash_mode")
+        raw_refs = {
+            "a": state.get("shard_refs_a"),
+            "b": state.get("shard_refs_b"),
+        }
         for prefix, moments in (("a", a), ("b", b)):
+            references = raw_refs[prefix]
+            if moment_mode == "shard_refs-v1" and (
+                not isinstance(references, list)
+                or any(not isinstance(item, Mapping) for item in references)
+            ):
+                raise ValueError("REFERENCE_MOMENT_SHARD_REFS_INVALID")
             for name in ("g1", "g2"):
                 value = moments.get(name)
                 hash_value = moments.get(f"{name}_hash")
-                if isinstance(value, Mapping):
+                if (
+                    moment_mode == "shard_refs-v1"
+                    and isinstance(references, list)
+                    and (
+                        (isinstance(value, Mapping) and bool(value))
+                        or hash_value is not None
+                    )
+                ):
+                    payload[f"{prefix}_{name}_hash"] = (
+                        _ReferenceSnapshotStore._shard_moment_hash(
+                            [dict(item) for item in references], name
+                        )
+                    )
+                elif isinstance(value, Mapping):
                     payload[f"{prefix}_{name}_hash"] = (
                         _vector_digest(value) if value else None
                     )
@@ -1423,11 +1541,17 @@ class _ReferenceSnapshotStore:
         if not isinstance(last, Mapping):
             raise ValueError("REFERENCE_LAST_BIAS_STATE_NOT_MAPPING")
         last_hash = last.get("vector_hash")
-        payload["last_bias_hash"] = (
-            _vector_digest(last)
-            if "vector_hash" not in last and last
-            else last_hash
+        has_last = last_hash is not None or any(
+            key != "vector_hash" for key in last
         )
+        if moment_mode == "shard_refs-v1" and has_last:
+            payload["last_bias_hash"] = _ReferenceSnapshotStore._shard_last_bias_hash(state)
+        else:
+            payload["last_bias_hash"] = (
+                _vector_digest(last)
+                if "vector_hash" not in last and last
+                else last_hash
+            )
         for key in ("blocks_a", "blocks_b"):
             blocks = state.get(key, [])
             if not isinstance(blocks, list):
@@ -1437,8 +1561,12 @@ class _ReferenceSnapshotStore:
             )
         return canonical_json_hash(payload)
 
-    @staticmethod
-    def _compact_moments(state: Mapping[str, object]) -> dict[str, object]:
+    @classmethod
+    def _compact_moments(
+        cls,
+        state: Mapping[str, object],
+        references: Sequence[Mapping[str, object]] | None = None,
+    ) -> dict[str, object]:
         required = {
             "count",
             "n1",
@@ -1453,30 +1581,54 @@ class _ReferenceSnapshotStore:
         g1, g2 = state["g1"], state["g2"]
         if not isinstance(g1, Mapping) or not isinstance(g2, Mapping):
             raise TypeError("REFERENCE_MOMENTS_TENSORS_NOT_MAPPINGS")
-        return {
+        compact = {
             "count": int(state["count"]),
             "n1": float(state["n1"]),
             "n2": float(state["n2"]),
             "first_weight": state["first_weight"],
             "all_equal_weights": bool(state["all_equal_weights"]),
-            "g1_hash": _vector_digest(g1) if g1 else None,
-            "g2_hash": _vector_digest(g2) if g2 else None,
+            "g1_hash": (
+                cls._shard_moment_hash(references or [], "g1")
+                if g1 and references is not None
+                else (_vector_digest(g1) if g1 else None)
+            ),
+            "g2_hash": (
+                cls._shard_moment_hash(references or [], "g2")
+                if g2 and references is not None
+                else (_vector_digest(g2) if g2 else None)
+            ),
         }
+        if references is not None:
+            compact["moment_hash_mode"] = "shard_refs-v1"
+        return compact
 
     @classmethod
     def _compact_state(cls, state: Mapping[str, object]) -> dict[str, object]:
         """Drop cumulative arrays; immutable block shards remain the source of truth."""
 
         compact = dict(state)
-        compact["a"] = cls._compact_moments(state["a"])  # type: ignore[arg-type]
-        compact["b"] = cls._compact_moments(state["b"])  # type: ignore[arg-type]
+        raw_a_refs = state.get("shard_refs_a")
+        raw_b_refs = state.get("shard_refs_b")
+        if not isinstance(raw_a_refs, list) or not isinstance(raw_b_refs, list):
+            raise ValueError("REFERENCE_MOMENT_SHARD_REFS_INVALID")
+        refs_a = [dict(item) for item in raw_a_refs if isinstance(item, Mapping)]
+        refs_b = [dict(item) for item in raw_b_refs if isinstance(item, Mapping)]
+        if len(refs_a) != len(raw_a_refs) or len(refs_b) != len(raw_b_refs):
+            raise ValueError("REFERENCE_MOMENT_SHARD_REFS_INVALID")
+        compact["a"] = cls._compact_moments(state["a"], refs_a)  # type: ignore[arg-type]
+        compact["b"] = cls._compact_moments(state["b"], refs_b)  # type: ignore[arg-type]
         last = state.get("last_bias", {})
         if not isinstance(last, Mapping):
             raise ValueError("REFERENCE_LAST_BIAS_STATE_NOT_MAPPING")
         compact["last_bias"] = {
-            "vector_hash": _vector_digest(last) if last else None,
+            "vector_hash": (
+                cls._shard_last_bias_hash(compact)
+                if last
+                else None
+            ),
         }
         compact["snapshot_encoding"] = cls._COMPACT_ENCODING
+        compact["moment_hash_mode"] = "shard_refs-v1"
         return compact
 
     @classmethod
@@ -1511,7 +1663,13 @@ class _ReferenceSnapshotStore:
                     raise ValueError(f"REFERENCE_RESUME_{name.upper()}_MOMENTS_DRIFT")
             for field_name in ("g1", "g2"):
                 expected = raw.get(f"{field_name}_hash")
-                actual = _vector_digest(rebuilt[field_name]) if rebuilt[field_name] else None
+                if not rebuilt[field_name]:
+                    actual = None
+                elif raw.get("moment_hash_mode") == "shard_refs-v1":
+                    references = references_a if name == "a" else references_b
+                    actual = cls._shard_moment_hash(references, field_name)
+                else:
+                    actual = _vector_digest(rebuilt[field_name])
                 if expected != actual:
                     raise ValueError(f"REFERENCE_RESUME_{name.upper()}_MOMENTS_DRIFT")
 
@@ -1542,7 +1700,10 @@ class _ReferenceSnapshotStore:
                     shard_store, references_b[:last_pairs], assumptions
                 )
                 last_bias = _reference_vectors(prefix_a, prefix_b, assumptions)[0]
-            if _vector_digest(last_bias) != expected_last_hash:
+            if state.get("moment_hash_mode") == "shard_refs-v1":
+                if cls._shard_last_bias_hash(state) != expected_last_hash:
+                    raise ValueError("REFERENCE_RESUME_LAST_BIAS_DRIFT")
+            elif _vector_digest(last_bias) != expected_last_hash:
                 raise ValueError("REFERENCE_RESUME_LAST_BIAS_DRIFT")
             materialized["last_bias"] = last_bias
         materialized.pop("snapshot_encoding", None)
@@ -1623,32 +1784,45 @@ class _ReferenceShardStore:
 
     SCHEMA = "stage2-reference-block-shard-v1"
     REF_SCHEMA = "stage2-reference-block-shard-ref-v1"
-    _PACKED_ENCODING = "flat-f64-layout-v1"
+    _LEGACY_PACKED_ENCODING = "flat-f64-layout-v1"
+    _PACKED_ENCODING = "flat-source-float-layout-v2"
 
     def __init__(self, root: str | Path) -> None:
         self.root = Path(root)
         self.shards = self.root / "shards"
         self.shards.mkdir(parents=True, exist_ok=True)
 
+    @staticmethod
+    def _uniform_source_dtype(vector: Mapping[str, np.ndarray]) -> str:
+        dtypes = {array.dtype.str for array in vector.values()}
+        if len(dtypes) != 1:
+            raise ValueError("REFERENCE_SHARD_MIXED_SOURCE_DTYPES")
+        dtype = next(iter(dtypes))
+        if dtype not in {np.dtype(np.float32).str, np.dtype(np.float64).str}:
+            raise ValueError("REFERENCE_SHARD_SOURCE_DTYPE_UNSUPPORTED")
+        return dtype
+
     @classmethod
     def _pack_vector(
         cls, vector: Mapping[str, object]
-    ) -> tuple[np.ndarray, list[dict[str, object]]]:
+    ) -> tuple[np.ndarray, list[dict[str, object]], str, str]:
         """Pack a canonical parameter mapping into one immutable tensor.
 
         The logical vector remains the sorted name -> shape mapping used by all
         estimators.  Only the bundle representation changes: one contiguous
-        FP64 tensor plus a canonical layout table replaces one tensor file per
-        parameter.  Keeping the layout in the JSON state makes the packing
-        self-describing and allows exact reconstruction without a model object.
+        source-FP32/FP64 tensor plus a canonical layout table replaces one
+        tensor file per parameter.  Keeping the layout and raw source hash in
+        the JSON state makes packing self-describing and tamper-evident without
+        requiring a model object.
         """
 
-        parsed = _as_vector(vector, field_name="reference_shard.vector")
+        parsed = _as_storage_vector(vector, field_name="reference_shard.vector")
+        source_dtype = cls._uniform_source_dtype(parsed)
         layout: list[dict[str, object]] = []
         flattened: list[np.ndarray] = []
         offset = 0
         for name, array in parsed.items():
-            contiguous = np.ascontiguousarray(array, dtype=np.float64).reshape(-1)
+            contiguous = np.ascontiguousarray(array).reshape(-1)
             length = int(contiguous.size)
             layout.append(
                 {
@@ -1662,10 +1836,59 @@ class _ReferenceShardStore:
             flattened.append(contiguous)
             offset += length
         if flattened:
-            packed = np.concatenate(flattened).astype(np.float64, copy=False)
+            packed = np.concatenate(flattened).astype(np.dtype(source_dtype), copy=False)
         else:  # pragma: no cover - _as_vector rejects an empty mapping
-            packed = np.empty(0, dtype=np.float64)
-        return np.ascontiguousarray(packed), layout
+            packed = np.empty(0, dtype=np.dtype(source_dtype))
+        return (
+            np.ascontiguousarray(packed),
+            layout,
+            source_dtype,
+            _storage_vector_digest_parsed(parsed),
+        )
+
+    @staticmethod
+    def _layout_for_vector(
+        vector: Mapping[str, np.ndarray]
+    ) -> list[dict[str, object]]:
+        layout: list[dict[str, object]] = []
+        offset = 0
+        for name, array in vector.items():
+            contiguous = np.ascontiguousarray(array)
+            length = int(contiguous.size)
+            layout.append(
+                {
+                    "name": name,
+                    "shape": [int(value) for value in contiguous.shape],
+                    "offset": offset,
+                    "length": length,
+                    "dtype": contiguous.dtype.str,
+                }
+            )
+            offset += length
+        return layout
+
+    @classmethod
+    def _packed_digest(
+        cls,
+        vector: Mapping[str, np.ndarray],
+        weight: float,
+        *,
+        source_dtype: str,
+        source_hash: str,
+        source_layout_hash: str,
+        vector_hash: str | None = None,
+    ) -> str:
+        return canonical_json_hash(
+            {
+                "schema_version": cls.SCHEMA,
+                "vector_encoding": cls._PACKED_ENCODING,
+                "vector_hash": vector_hash if vector_hash is not None else _vector_digest(vector),
+                "source_dtype": source_dtype,
+                "source_hash": source_hash,
+                "source_layout_hash": source_layout_hash,
+                "weight": float(weight),
+            }
+        )
 
     @classmethod
     def _unpack_vector(
@@ -1684,13 +1907,19 @@ class _ReferenceShardStore:
                 raise ValueError("REFERENCE_SHARD_VECTOR_ENCODING_MIXED")
             return _as_vector(state.get("vector"), field_name="reference_shard.vector")
 
-        if state.get("vector_encoding") != cls._PACKED_ENCODING:
+        encoding = state.get("vector_encoding")
+        if encoding not in {cls._LEGACY_PACKED_ENCODING, cls._PACKED_ENCODING}:
             raise ValueError("REFERENCE_SHARD_VECTOR_ENCODING_INVALID")
         raw_packed = state.get("vector_packed")
         raw_layout = state.get("vector_layout")
-        packed = _as_array(raw_packed, field_name="reference_shard.vector_packed")
+        packed = _as_storage_array(raw_packed, field_name="reference_shard.vector_packed")
         if packed.ndim != 1:
             raise ValueError("REFERENCE_SHARD_PACKED_VECTOR_NOT_FLAT")
+        if packed.dtype.str not in {
+            np.dtype(np.float32).str,
+            np.dtype(np.float64).str,
+        }:
+            raise ValueError("REFERENCE_SHARD_PACKED_VECTOR_DTYPE_INVALID")
         if not isinstance(raw_layout, list) or not raw_layout:
             raise ValueError("REFERENCE_SHARD_VECTOR_LAYOUT_INVALID")
 
@@ -1728,14 +1957,14 @@ class _ReferenceShardStore:
             ):
                 raise ValueError("REFERENCE_SHARD_VECTOR_LAYOUT_RANGE_INVALID")
             dtype = entry.get("dtype")
-            if dtype != np.dtype(np.float64).str or packed.dtype.str != dtype:
+            if dtype != packed.dtype.str:
                 raise ValueError("REFERENCE_SHARD_VECTOR_LAYOUT_DTYPE_INVALID")
             end = offset + length
             if end > int(packed.size):
                 raise ValueError("REFERENCE_SHARD_VECTOR_LAYOUT_RANGE_INVALID")
             result[name] = np.array(
                 packed[offset:end].reshape(tuple(shape)),
-                dtype=np.float64,
+                dtype=packed.dtype,
                 copy=True,
                 order="C",
             )
@@ -1757,31 +1986,59 @@ class _ReferenceShardStore:
     def publish(self, vector: Mapping[str, object], weight: float) -> dict[str, object]:
         if not math.isfinite(float(weight)) or float(weight) <= 0.0:
             raise ValueError("REFERENCE_SHARD_WEIGHT_INVALID")
+        packed, layout, source_dtype, source_hash = self._pack_vector(vector)
         parsed = _as_vector(vector, field_name="reference_shard.vector")
-        digest = self._digest(parsed, float(weight))
+        vector_hash = _vector_digest(parsed)
+        source_layout_hash = canonical_json_hash(layout)
+        digest = self._packed_digest(
+            parsed,
+            float(weight),
+            source_dtype=source_dtype,
+            source_hash=source_hash,
+            source_layout_hash=source_layout_hash,
+            vector_hash=vector_hash,
+        )
         path = self.shards / digest
-        packed, layout = self._pack_vector(parsed)
         state = {
             "schema_version": self.SCHEMA,
             "vector_encoding": self._PACKED_ENCODING,
             "vector_packed": packed,
             "vector_layout": layout,
+            "source_dtype": source_dtype,
+            "source_hash": source_hash,
+            "source_layout_hash": source_layout_hash,
             "weight": float(weight),
-            "vector_hash": _vector_digest(parsed),
+            "vector_hash": vector_hash,
             "shard_hash": digest,
         }
         if path.exists():
             restored, bundle = load_tensor_bundle(path)
             if not isinstance(restored, Mapping):
                 raise ValueError("REFERENCE_SHARD_IDENTITY_COLLISION")
-            loaded_vector = self._unpack_vector(restored)
+            loaded_storage = self._unpack_vector(restored)
+            loaded_vector = _as_vector(loaded_storage, field_name="reference_shard.vector")
+            loaded_vector_hash = _vector_digest(loaded_vector)
             loaded_weight = float(restored.get("weight"))
+            loaded_layout_hash = canonical_json_hash(self._layout_for_vector(loaded_storage))
             if (
                 restored.get("schema_version") != self.SCHEMA
-                or restored.get("vector_hash") != _vector_digest(loaded_vector)
+                or restored.get("vector_encoding") != self._PACKED_ENCODING
+                or restored.get("source_dtype") != source_dtype
+                or restored.get("source_hash") != _storage_vector_digest_parsed(loaded_storage)
+                or restored.get("source_layout_hash") != loaded_layout_hash
+                or restored.get("vector_hash") != loaded_vector_hash
                 or restored.get("shard_hash") != digest
                 or loaded_weight != float(weight)
-                or _vector_digest(loaded_vector) != _vector_digest(parsed)
+                or loaded_vector_hash != vector_hash
+                or self._packed_digest(
+                    loaded_vector,
+                    loaded_weight,
+                    source_dtype=source_dtype,
+                    source_hash=str(restored.get("source_hash")),
+                    source_layout_hash=loaded_layout_hash,
+                    vector_hash=loaded_vector_hash,
+                )
+                != digest
             ):
                 raise ValueError("REFERENCE_SHARD_IDENTITY_COLLISION")
         else:
@@ -1816,14 +2073,42 @@ class _ReferenceShardStore:
             raise ValueError("REFERENCE_SHARD_SCHEMA_INVALID")
         if bundle.manifest_sha256 != reference.get("manifest_hash"):
             raise ValueError("REFERENCE_SHARD_MANIFEST_MISMATCH")
-        vector = self._unpack_vector(state)
+        storage_vector = self._unpack_vector(state)
+        vector = _as_vector(storage_vector, field_name="reference_shard.vector")
+        vector_hash = _vector_digest(vector)
         weight = float(state.get("weight"))
         if not math.isfinite(weight) or weight <= 0.0 or weight != float(reference.get("weight")):
             raise ValueError("REFERENCE_SHARD_WEIGHT_MISMATCH")
-        if state.get("vector_hash") != _vector_digest(vector) or state.get("shard_hash") != digest:
+        if state.get("vector_hash") != vector_hash or state.get("shard_hash") != digest:
             raise ValueError("REFERENCE_SHARD_CONTENT_HASH_MISMATCH")
-        if self._digest(vector, weight) != digest:
-            raise ValueError("REFERENCE_SHARD_DIGEST_MISMATCH")
+        if "vector" in state:
+            if self._digest(vector, weight) != digest:
+                raise ValueError("REFERENCE_SHARD_DIGEST_MISMATCH")
+        elif state.get("vector_encoding") == self._LEGACY_PACKED_ENCODING:
+            # The first packed implementation was FP64 and used the legacy
+            # logical digest.  Keep those immutable objects readable.
+            if self._digest(vector, weight) != digest:
+                raise ValueError("REFERENCE_SHARD_DIGEST_MISMATCH")
+        else:
+            source_dtype = state.get("source_dtype")
+            source_hash = state.get("source_hash")
+            source_layout_hash = state.get("source_layout_hash")
+            if (
+                source_dtype != self._uniform_source_dtype(storage_vector)
+                or source_hash != _storage_vector_digest_parsed(storage_vector)
+                or source_layout_hash
+                != canonical_json_hash(self._layout_for_vector(storage_vector))
+            ):
+                raise ValueError("REFERENCE_SHARD_SOURCE_HASH_MISMATCH")
+            if self._packed_digest(
+                vector,
+                weight,
+                source_dtype=str(source_dtype),
+                source_hash=str(source_hash),
+                source_layout_hash=str(source_layout_hash),
+                vector_hash=vector_hash,
+            ) != digest:
+                raise ValueError("REFERENCE_SHARD_DIGEST_MISMATCH")
         return vector, weight, digest
 
     @staticmethod
@@ -2014,12 +2299,14 @@ class OneShotReferenceRunner:
                 stop = start + plan.block_size
                 batch_a = self.provider.gradient(draws_a[start:stop])
                 batch_b = self.provider.gradient(draws_b[start:stop])
-                vector_a = _as_vector(batch_a.gradients, field_name="reference_A.block")
-                vector_b = _as_vector(batch_b.gradients, field_name="reference_B.block")
                 moments_a.update(batch_a, assumptions)
                 moments_b.update(batch_b, assumptions)
-                shard_refs_a.append(shard_store.publish(vector_a, float(batch_a.statistical_weight)))
-                shard_refs_b.append(shard_store.publish(vector_b, float(batch_b.statistical_weight)))
+                shard_refs_a.append(
+                    shard_store.publish(batch_a.gradients, float(batch_a.statistical_weight))
+                )
+                shard_refs_b.append(
+                    shard_store.publish(batch_b.gradients, float(batch_b.statistical_weight))
+                )
                 self.provider.assert_unchanged(provider_state)
                 processed_pairs += 1
                 new_pairs += 1
@@ -2263,7 +2550,7 @@ class StreamingReferenceSizer:
                 moments_a.update(batch_a, assumptions)
                 shard_refs_a.append(
                     shard_store.publish(
-                        _as_vector(batch_a.gradients, field_name="sizing.blocks_a"),
+                        batch_a.gradients,
                         float(batch_a.statistical_weight),
                     )
                 )
@@ -2272,7 +2559,7 @@ class StreamingReferenceSizer:
                     moments_b.update(batch_b, assumptions)
                     shard_refs_b.append(
                         shard_store.publish(
-                            _as_vector(batch_b.gradients, field_name="sizing.blocks_b"),
+                            batch_b.gradients,
                             float(batch_b.statistical_weight),
                         )
                     )
