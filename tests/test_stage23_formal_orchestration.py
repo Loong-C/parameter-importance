@@ -260,6 +260,13 @@ def test_streaming_reference_sizing_resumes_from_authoritative_block_commit(
     )
     assert resumed.converged and uninterrupted.converged
     assert resumed.selected_sample_count_per_stream == 8
+    # Convergence freezes the first eligible B, but sizing must still publish
+    # every pre-registered candidate prefix for the S2.4 delta_sci contract.
+    assert resumed.processed_sample_count_per_stream == 12
+    assert {
+        int(path.stem)
+        for path in interrupted_root.joinpath("commits").glob("*.json")
+    } >= {2, 4, 6}
     assert resumed.resumed_from_block_pairs == 2
     assert validate_stage23_artifact(resumed.to_dict()).artifact_hash == (
         resumed.artifact_hash

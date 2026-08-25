@@ -1985,7 +1985,11 @@ class StreamingReferenceSizer:
             resumed_from = processed_pairs
             new_pairs = 0
             total_pairs = maximum // plan.block_size
-            while processed_pairs < total_pairs and selected is None:
+            # Continue through the complete pre-registered ladder even after
+            # convergence.  The first converged candidate remains the frozen
+            # selection, while later candidate prefixes are required by S2.4
+            # to derive delta_sci(B) for every candidate before final A/B.
+            while processed_pairs < total_pairs:
                 if max_new_block_pairs is not None and new_pairs >= max_new_block_pairs:
                     break
                 start = processed_pairs * plan.block_size
@@ -2060,7 +2064,7 @@ class StreamingReferenceSizer:
                     )
                     points.append(point)
                     last_bias = bias
-                    if streak >= plan.required_consecutive:
+                    if selected is None and streak >= plan.required_consecutive:
                         selected = sample_count
                 state: dict[str, object] = {
                     "schema_version": "stage2-reference-progress-state-v1",
