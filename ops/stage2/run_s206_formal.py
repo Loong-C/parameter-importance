@@ -25,6 +25,7 @@ if str(_REPOSITORY_ROOT / "src") not in sys.path:
     sys.path.insert(0, str(_REPOSITORY_ROOT / "src"))
 
 from param_importance_nlp.contracts.jsonio import load_canonical_json, write_canonical_json
+from param_importance_nlp.contracts.stage23 import FormalExecutionEvidence
 from param_importance_nlp.experiments.stage2_s206_formal import (
     ANCHOR_IDS,
     APPROVED_GPU_UUIDS,
@@ -35,8 +36,12 @@ from param_importance_nlp.experiments.stage2_s206_formal import (
     S206PreparationBlocked,
     GlobalPilotMappingManifest,
     BlindPilotMeasurement,
+    build_g24b_gate,
+    build_formal_cell_specs,
     build_global_pilot_mapping,
+    qualify_formal_matrix,
     reduce_blinded_pilot,
+    run_formal_pilot_cell,
     strict_preflight,
 )
 from param_importance_nlp.experiments.stage2_pilot import CostSemantics
@@ -222,8 +227,26 @@ def _run_anchor(
     return records
 
 
+def _load_formal_execution(args: argparse.Namespace) -> FormalExecutionEvidence:
+    """Load the explicit formal authorization consumed by every child cell."""
+
+    if not args.execution_evidence_ref:
+        raise S206PreparationBlocked("EXECUTE_REQUIRES_FORMAL_EXECUTION_EVIDENCE")
+    path = _logical(args.data_root.resolve(), args.execution_evidence_ref, field="execution_evidence_ref")
+    value = load_canonical_json(path)
+    if not isinstance(value, Mapping):
+        raise S206PreparationBlocked("EXECUTION_EVIDENCE_NOT_OBJECT")
+    try:
+        execution = FormalExecutionEvidence.from_mapping(dict(value))
+        execution.require_for_stage(2)
+    except (TypeError, ValueError, S206PreparationBlocked) as error:
+        raise S206PreparationBlocked(f"EXECUTION_EVIDENCE_INVALID:{error}") from error
+    return execution
+
+
 def _execute(args: argparse.Namespace) -> dict[str, object]:
     preflight = _preflight(args)
+    execution = _load_formal_execution(args)
     root = args.data_root.resolve()
     operations = _logical(root, args.operations_root, field="operations_root")
     operations.mkdir(parents=True, exist_ok=True)
@@ -247,7 +270,26 @@ def _execute(args: argparse.Namespace) -> dict[str, object]:
     else:
         mapping_output.parent.mkdir(parents=True, exist_ok=True)
         write_canonical_json(mapping_output, mapping.to_dict())
-    _write_status(output, {"run_id": args.run_id, "stage": "PREFLIGHT_PASS", "formal_eligible": True, "preflight": preflight, "pilot_mapping_ref": str(mapping_output), "pilot_mapping_hash": mapping.artifact_hash, "completed_cells": []})
+    cell_plan_dir = operations / "cell-plans"
+    cell_specs = build_formal_cell_specs(
+        mapping,
+        execution,
+        config_root=args.config_root,
+        environment_root=args.environment_root,
+        result_root=args.result_root,
+    )
+    cell_plan_refs: list[str] = []
+    for spec in cell_specs:
+        plan_path = cell_plan_dir / f"{spec.cell_id}.json"
+        plan_payload = spec.to_dict()
+        if plan_path.exists():
+            if load_canonical_json(plan_path) != plan_payload:
+                raise S206PreparationBlocked(f"CELL_PLAN_CONFLICT:{spec.cell_id}")
+        else:
+            plan_path.parent.mkdir(parents=True, exist_ok=True)
+            write_canonical_json(plan_path, plan_payload)
+        cell_plan_refs.append(str(plan_path))
+    _write_status(output, {"run_id": args.run_id, "stage": "PREFLIGHT_PASS", "formal_eligible": True, "preflight": preflight, "execution_evidence_hash": execution.artifact_hash, "pilot_mapping_ref": str(mapping_output), "pilot_mapping_hash": mapping.artifact_hash, "cell_plan_refs": cell_plan_refs, "completed_cells": []})
     records: list[dict[str, object]] = []
     try:
         # Wave A occupies the four approved cards.  Wave B starts only after
@@ -259,8 +301,8 @@ def _execute(args: argparse.Namespace) -> dict[str, object]:
             }
             for future in as_completed(futures):
                 records.extend(future.result())
-                _write_status(output, {"run_id": args.run_id, "stage": "WAVE_A_RUNNING", "formal_eligible": True, "preflight": preflight, "pilot_mapping_ref": str(mapping_output), "pilot_mapping_hash": mapping.artifact_hash, "completed_cells": records})
-        _write_status(output, {"run_id": args.run_id, "stage": "WAVE_A_COMPLETE", "formal_eligible": True, "preflight": preflight, "pilot_mapping_ref": str(mapping_output), "pilot_mapping_hash": mapping.artifact_hash, "completed_cells": records})
+                _write_status(output, {"run_id": args.run_id, "stage": "WAVE_A_RUNNING", "formal_eligible": True, "preflight": preflight, "execution_evidence_hash": execution.artifact_hash, "pilot_mapping_ref": str(mapping_output), "pilot_mapping_hash": mapping.artifact_hash, "cell_plan_refs": cell_plan_refs, "completed_cells": records})
+        _write_status(output, {"run_id": args.run_id, "stage": "WAVE_A_COMPLETE", "formal_eligible": True, "preflight": preflight, "execution_evidence_hash": execution.artifact_hash, "pilot_mapping_ref": str(mapping_output), "pilot_mapping_hash": mapping.artifact_hash, "cell_plan_refs": cell_plan_refs, "completed_cells": records})
         with ThreadPoolExecutor(max_workers=2) as pool:
             futures = {
                 pool.submit(_run_anchor, args=args, anchor_id=anchor_id, gpu_uuid=CELL_GPU_BINDINGS[anchor_id], status_root=operations): anchor_id
@@ -268,11 +310,11 @@ def _execute(args: argparse.Namespace) -> dict[str, object]:
             }
             for future in as_completed(futures):
                 records.extend(future.result())
-                _write_status(output, {"run_id": args.run_id, "stage": "WAVE_B_RUNNING", "formal_eligible": True, "preflight": preflight, "pilot_mapping_ref": str(mapping_output), "pilot_mapping_hash": mapping.artifact_hash, "completed_cells": records})
+                _write_status(output, {"run_id": args.run_id, "stage": "WAVE_B_RUNNING", "formal_eligible": True, "preflight": preflight, "execution_evidence_hash": execution.artifact_hash, "pilot_mapping_ref": str(mapping_output), "pilot_mapping_hash": mapping.artifact_hash, "cell_plan_refs": cell_plan_refs, "completed_cells": records})
     except Exception as error:
-        _write_status(output, {"run_id": args.run_id, "stage": "BLOCKED_EXECUTION", "formal_eligible": False, "preflight": preflight, "pilot_mapping_ref": str(mapping_output), "pilot_mapping_hash": mapping.artifact_hash, "completed_cells": records, "reason": f"{type(error).__name__}:{error}"})
+        _write_status(output, {"run_id": args.run_id, "stage": "BLOCKED_EXECUTION", "formal_eligible": False, "preflight": preflight, "execution_evidence_hash": execution.artifact_hash, "pilot_mapping_ref": str(mapping_output), "pilot_mapping_hash": mapping.artifact_hash, "cell_plan_refs": cell_plan_refs, "completed_cells": records, "reason": f"{type(error).__name__}:{error}"})
         raise
-    _write_status(output, {"run_id": args.run_id, "stage": "PILOT_COMPLETE", "formal_eligible": True, "preflight": preflight, "pilot_mapping_ref": str(mapping_output), "pilot_mapping_hash": mapping.artifact_hash, "completed_cells": records, "expected_cell_count": 24, "confirmatory_draws_generated": False})
+    _write_status(output, {"run_id": args.run_id, "stage": "PILOT_COMPLETE", "formal_eligible": True, "preflight": preflight, "execution_evidence_hash": execution.artifact_hash, "pilot_mapping_ref": str(mapping_output), "pilot_mapping_hash": mapping.artifact_hash, "cell_plan_refs": cell_plan_refs, "completed_cells": records, "expected_cell_count": 24, "confirmatory_draws_generated": False})
     return load_canonical_json(output)  # type: ignore[return-value]
 
 
@@ -308,6 +350,126 @@ def _reduce(args: argparse.Namespace) -> dict[str, object]:
     return report.to_dict()
 
 
+def _synthetic_cell(args: argparse.Namespace) -> dict[str, object]:
+    """Direct bridge entry point used for a deterministic formal-cell smoke test."""
+
+    root = args.data_root.resolve()
+    # Keep the direct bridge under the same G2.3/G2.4a and approved-GPU
+    # preflight as the long-running launcher; synthetic execution is not a
+    # bypass around those gates.
+    _preflight(args)
+    required = (
+        args.pilot_mapping_ref,
+        args.execution_evidence_ref,
+        args.cell_artifact_root,
+        args.cell_output,
+        args.reference_json,
+        args.cell_sizing_ref,
+    )
+    if not all(required) or args.cell_anchor is None or args.cell_batch_size is None:
+        raise S206PreparationBlocked("SYNTHETIC_CELL_REQUIRES_MAPPING_EXECUTION_CELL_AND_SIZING_INPUTS")
+    mapping_path = _logical(root, args.pilot_mapping_ref, field="pilot_mapping_ref")
+    mapping_value = load_canonical_json(mapping_path)
+    if not isinstance(mapping_value, Mapping):
+        raise S206PreparationBlocked("SYNTHETIC_CELL_MAPPING_NOT_OBJECT")
+    mapping = GlobalPilotMappingManifest.from_mapping(dict(mapping_value))
+    execution = _load_formal_execution(args)
+    try:
+        cell = next(
+            item for item in mapping.cells
+            if item.anchor_id == args.cell_anchor and item.batch_size == args.cell_batch_size
+        )
+    except StopIteration as error:
+        raise S206PreparationBlocked("SYNTHETIC_CELL_NOT_IN_MAPPING") from error
+    reference_value = load_canonical_json(_logical(root, args.reference_json, field="reference_json"))
+    sizing_value = load_canonical_json(_logical(root, args.cell_sizing_ref, field="cell_sizing_ref"))
+    if not isinstance(reference_value, Mapping) or not isinstance(sizing_value, Mapping):
+        raise S206PreparationBlocked("SYNTHETIC_CELL_REFERENCE_OR_SIZING_NOT_OBJECT")
+    delta = sizing_value.get("delta_sci_by_endpoint")
+    half_width = sizing_value.get("reference_half_width_by_endpoint")
+    if not isinstance(delta, Mapping) or not isinstance(half_width, Mapping):
+        raise S206PreparationBlocked("SYNTHETIC_CELL_SIZING_FIELDS_REQUIRED")
+    try:
+        from param_importance_nlp.experiments.stage2_formal import _vector_digest
+        from param_importance_nlp.providers.synthetic import SyntheticGradientProvider
+
+        shapes = {
+            str(name): tuple(len(value) if isinstance(value, list) else 1 for _ in [0])
+            for name, value in reference_value.items()
+        }
+        # The synthetic bridge is intentionally limited to flat vectors.  A
+        # production provider must be supplied through run_formal_pilot_cell.
+        if any(not isinstance(value, list) or not value for value in reference_value.values()):
+            raise ValueError("synthetic reference vectors must be non-empty lists")
+        provider = SyntheticGradientProvider.from_location_scale(
+            parameter_shapes=shapes,
+            sample_count=int(args.synthetic_sample_count),
+            seed=int(args.synthetic_seed),
+        )
+        reference_hash = str(args.reference_hash) if args.reference_hash else _vector_digest(reference_value)
+        result = run_formal_pilot_cell(
+            cell,
+            mapping=mapping,
+            provider=provider,
+            execution=execution,
+            reference=reference_value,
+            reference_hash=reference_hash,
+            artifact_root=_logical(root, args.cell_artifact_root, field="cell_artifact_root"),
+            delta_sci_by_endpoint=dict(delta),
+            reference_half_width_by_endpoint=dict(half_width),
+            resource_within_budget=True,
+            cost_io_quiescent=True,
+        )
+    except (TypeError, ValueError, KeyError) as error:
+        raise S206PreparationBlocked(f"SYNTHETIC_CELL_BRIDGE_INVALID:{error}") from error
+    output = _logical(root, args.cell_output, field="cell_output")
+    output.parent.mkdir(parents=True, exist_ok=True)
+    write_canonical_json(output, result.to_dict())
+    return result.to_dict()
+
+
+def _qualify(args: argparse.Namespace) -> dict[str, object]:
+    root = args.data_root.resolve()
+    if not args.pilot_mapping_ref or not args.measurements_ref or not args.costs_ref or not args.execution_evidence_ref or not args.matrix_output or not args.gate_output:
+        raise S206PreparationBlocked("QUALIFY_REQUIRES_REDUCER_INPUTS_EXECUTION_AND_OUTPUTS")
+    mapping_path = _logical(root, args.pilot_mapping_ref, field="pilot_mapping_ref")
+    measurements_path = _logical(root, args.measurements_ref, field="measurements_ref")
+    costs_path = _logical(root, args.costs_ref, field="costs_ref")
+    execution_path = _logical(root, args.execution_evidence_ref, field="execution_evidence_ref")
+    matrix_path = _logical(root, args.matrix_output, field="matrix_output")
+    gate_path = _logical(root, args.gate_output, field="gate_output")
+    raw_mapping = load_canonical_json(mapping_path)
+    raw_measurements = load_canonical_json(measurements_path)
+    raw_costs = load_canonical_json(costs_path)
+    raw_execution = load_canonical_json(execution_path)
+    if not all(isinstance(value, Mapping) for value in (raw_mapping, raw_costs, raw_execution)):
+        raise S206PreparationBlocked("QUALIFY_INPUT_OBJECT_REQUIRED")
+    measurement_values = raw_measurements.get("measurements") if isinstance(raw_measurements, Mapping) else raw_measurements
+    if not isinstance(measurement_values, list) or not all(isinstance(item, Mapping) for item in measurement_values):
+        raise S206PreparationBlocked("QUALIFY_MEASUREMENTS_ARRAY_REQUIRED")
+    costs = CostSemantics(
+        scientific_equal_sample_cost=dict(raw_costs["scientific_equal_sample_cost"]),  # type: ignore[index]
+        isolated_estimator_cost=dict(raw_costs["isolated_estimator_cost"]),  # type: ignore[index]
+        online_training_incremental_cost=dict(raw_costs["online_training_incremental_cost"]),  # type: ignore[index]
+        cost_io_quiescent=raw_costs["cost_io_quiescent"],  # type: ignore[index]
+    )
+    mapping = GlobalPilotMappingManifest.from_mapping(dict(raw_mapping))
+    report = reduce_blinded_pilot(
+        mapping,
+        tuple(BlindPilotMeasurement.from_mapping(dict(item)) for item in measurement_values),
+        cost_semantics=costs,
+    )
+    execution = FormalExecutionEvidence.from_mapping(dict(raw_execution))
+    refs = tuple(args.evidence_ref or (args.measurements_ref, args.pilot_mapping_ref, args.execution_evidence_ref))
+    gate = build_g24b_gate(report, execution, evidence_refs=refs)
+    matrix = qualify_formal_matrix(report, execution, gate, freeze_id=args.freeze_id)
+    gate_path.parent.mkdir(parents=True, exist_ok=True)
+    matrix_path.parent.mkdir(parents=True, exist_ok=True)
+    write_canonical_json(gate_path, gate.to_dict())
+    write_canonical_json(matrix_path, matrix.to_dict())
+    return {"status": "FORMAL_FROZEN", "formal_eligible": True, "gate_ref": str(gate_path), "matrix_ref": str(matrix_path), "gate": gate.to_dict(), "matrix": matrix.to_dict()}
+
+
 def _wait(args: argparse.Namespace) -> int:
     status_path = _logical(args.data_root.resolve(), f"{args.operations_root}/status.json", field="status")
     deadline = None if args.timeout_seconds is None else time.monotonic() + args.timeout_seconds
@@ -323,13 +485,62 @@ def _wait(args: argparse.Namespace) -> int:
         time.sleep(args.poll_seconds)
 
 
+def _detach(args: argparse.Namespace) -> int:
+    """Re-exec the exact execute command in a new session and return its PID."""
+
+    if not args.execute:
+        raise S206PreparationBlocked("DETACH_REQUIRES_EXECUTE")
+    operations = _logical(args.data_root.resolve(), args.operations_root, field="operations_root")
+    operations.mkdir(parents=True, exist_ok=True)
+    log_path = operations / "launcher.log"
+    pid_path = operations / "launcher.pid.json"
+    if pid_path.exists():
+        try:
+            existing = load_canonical_json(pid_path)
+        except (OSError, TypeError, ValueError):
+            existing = None
+        if isinstance(existing, Mapping) and isinstance(existing.get("pid"), int):
+            try:
+                os.kill(int(existing["pid"]), 0)
+            except OSError:
+                pass
+            else:
+                raise S206PreparationBlocked(f"DETACHED_LAUNCH_ALREADY_RUNNING:{existing['pid']}")
+    child_argv = [item for item in sys.argv[1:] if item != "--detach"]
+    with log_path.open("ab") as handle:
+        process = subprocess.Popen(
+            [str(args.python), str(Path(__file__).resolve()), *child_argv],
+            cwd=args.repository.resolve(),
+            stdin=subprocess.DEVNULL,
+            stdout=handle,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+            close_fds=True,
+        )
+    payload = {
+        "schema_version": "stage2-s206-detached-launch-v1",
+        "pid": int(process.pid),
+        "run_id": args.run_id,
+        "operations_root": str(operations),
+        "log_ref": str(log_path),
+        "status_ref": str(operations / "status.json"),
+        "recovery_command": "--wait",
+        "confirmatory_draws_generated": False,
+    }
+    write_canonical_json(pid_path, payload)
+    print(json.dumps(payload, ensure_ascii=False, sort_keys=True, indent=2))
+    return 0
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Strict detached S2.6/G2.4b pilot launcher")
     action = parser.add_mutually_exclusive_group(required=True)
     action.add_argument("--preflight", action="store_true")
     action.add_argument("--execute", action="store_true")
     action.add_argument("--reduce", action="store_true")
+    action.add_argument("--qualify", action="store_true")
     action.add_argument("--wait", action="store_true")
+    action.add_argument("--synthetic-cell", action="store_true")
     parser.add_argument("--data-root", type=Path, required=True)
     parser.add_argument("--repository", type=Path, default=_REPOSITORY_ROOT)
     parser.add_argument("--s204-root", required=True)
@@ -348,15 +559,36 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--measurements-ref")
     parser.add_argument("--costs-ref")
     parser.add_argument("--report-output")
+    parser.add_argument("--execution-evidence-ref")
+    parser.add_argument("--matrix-output")
+    parser.add_argument("--gate-output")
+    parser.add_argument("--freeze-id", default="s206-formal-matrix-freeze")
+    parser.add_argument("--evidence-ref", action="append", default=[])
     parser.add_argument("--python", type=Path, default=Path(sys.executable))
     parser.add_argument("--timeout-seconds", type=float)
     parser.add_argument("--poll-seconds", type=float, default=60.0)
+    parser.add_argument("--detach", action="store_true", help="detach --execute and return a PID")
+    parser.add_argument("--cell-anchor")
+    parser.add_argument("--cell-batch-size", type=int)
+    parser.add_argument("--cell-artifact-root")
+    parser.add_argument("--cell-output")
+    parser.add_argument("--reference-json")
+    parser.add_argument("--reference-hash")
+    parser.add_argument("--cell-sizing-ref")
+    parser.add_argument("--synthetic-sample-count", type=int, default=4096)
+    parser.add_argument("--synthetic-seed", type=int, default=0)
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     try:
+        if args.detach:
+            return _detach(args)
+        if args.synthetic_cell:
+            result = _synthetic_cell(args)
+            print(json.dumps(result, ensure_ascii=False, sort_keys=True, indent=2))
+            return 0
         if args.wait:
             return _wait(args)
         if args.reduce:
@@ -365,6 +597,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                 output = args.plan_output.resolve()
                 output.parent.mkdir(parents=True, exist_ok=True)
                 write_canonical_json(output, result)
+            print(json.dumps(result, ensure_ascii=False, sort_keys=True, indent=2))
+            return 0
+        if args.qualify:
+            result = _qualify(args)
             print(json.dumps(result, ensure_ascii=False, sort_keys=True, indent=2))
             return 0
         if args.execute and not all((args.config_root, args.environment_root, args.result_root)):

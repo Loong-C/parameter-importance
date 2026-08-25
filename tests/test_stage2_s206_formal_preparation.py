@@ -17,12 +17,16 @@ from param_importance_nlp.experiments.stage2_s206_formal import (
     S206PreflightSpec,
     S206PreparationBlocked,
     build_formal_confirmatory_mapping,
+    build_formal_cell_specs,
     build_g24b_gate,
     build_global_pilot_mapping,
     qualify_formal_matrix,
     reduce_blinded_pilot,
+    run_formal_pilot_cell,
     strict_preflight,
 )
+from param_importance_nlp.experiments.stage2_formal import _vector_digest
+from param_importance_nlp.providers.synthetic import SyntheticGradientProvider
 from param_importance_nlp.experiments.stage2_pilot import CostSemantics
 
 
@@ -101,6 +105,41 @@ def test_global_mapping_is_24_cells_and_disjoint() -> None:
     assert mapping.cells[-1].stream_end == 144_000
     assert len(mapping.pilot_draw_ids) == len(set(mapping.pilot_draw_ids))
     assert mapping.to_dict()["confirmatory_draws_generated"] is False
+
+
+def test_formal_cell_bridge_executes_synthetic_slice_and_masks_science(tmp_path: Path) -> None:
+    mapping = build_global_pilot_mapping(_sampling())
+    execution = _execution()
+    specs = build_formal_cell_specs(mapping, execution)
+    assert len(specs) == 24
+    assert specs[0].gpu_uuid == APPROVED_GPU_UUIDS[0]
+    assert specs[-1].gpu_uuid == APPROVED_GPU_UUIDS[1]
+
+    provider = SyntheticGradientProvider.from_location_scale(
+        parameter_shapes={"p": (1,)},
+        sample_count=1024,
+        seed=17,
+    )
+    cell = mapping.cells[0]
+    reference = provider.gradient(cell.mappings[0].draws).gradients
+    run = run_formal_pilot_cell(
+        cell,
+        mapping=mapping,
+        provider=provider,
+        execution=execution,
+        reference=reference,
+        reference_hash=_vector_digest(reference),
+        artifact_root=tmp_path / "cell-artifacts",
+        delta_sci_by_endpoint={"bias": 0.1, "nmse": 0.1, "rank": 0.1},
+        reference_half_width_by_endpoint={"bias": 0.01, "nmse": 0.01, "rank": 0.01},
+        resource_within_budget=True,
+        cost_io_quiescent=True,
+    )
+    assert len(run.measurements) == 5
+    assert all(item.operational_ready for item in run.measurements)
+    assert len({tuple(sorted(item.variance_by_endpoint.items())) for item in run.measurements}) == 5
+    assert run.costs["scientific_equal_sample_cost"]["gradient_evaluations"] == 1600
+    assert run.to_dict()["scientific_values_masked"] is True
 
 
 def test_blinded_reducer_selects_operational_pair_only() -> None:

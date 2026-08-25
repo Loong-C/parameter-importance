@@ -3,14 +3,16 @@
 This module is intentionally separate from the existing TaskRuntime runner.  It
 prepares the 24-cell pilot schedule, gives each cell a disjoint interval in the
 single frozen ``pilot`` stream, reduces only operational/blinded fields, and
-binds a formal matrix to a newly issued G2.4b GateRecord.  It never calls a
-provider and never creates confirmatory draws during pilot reduction.
+binds a formal matrix to a newly issued G2.4b GateRecord.  Mapping/reduction
+helpers never call a provider; the explicit ``run_formal_pilot_cell`` bridge is
+the only execution entry point and never creates confirmatory draws.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
+import math
 import re
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
@@ -23,6 +25,8 @@ from ..contracts.stage23 import (
     require_accepted_gate,
 )
 from ..contracts.status import GateRecord, GateStatus
+from ..providers import FixedStateGradientProvider
+from ..runtime.tensor_bundle import load_tensor_bundle
 from .sampling import (
     CANDIDATE_BATCH_SIZES,
     CANDIDATE_MICROBATCH_COUNTS,
@@ -38,6 +42,7 @@ from .stage2_pilot import (
     required_repetitions,
     scan_candidates,
 )
+from .stage2_formal import RecoverablePairedWaveRunner
 
 
 GLOBAL_PILOT_MAPPING_SCHEMA = "stage2-formal-global-pilot-mapping-v1"
@@ -45,6 +50,8 @@ BLINDED_PILOT_REPORT_SCHEMA = "stage2-formal-blinded-pilot-report-v1"
 FORMAL_MATRIX_SCHEMA = "stage2-formal-pilot-matrix-freeze-v1"
 G24B_GATE_SCHEMA = "stage2-g24b-gate-v1"
 FORMAL_CONFIRMATORY_MAPPING_SCHEMA = "stage2-formal-confirmatory-mapping-v1"
+FORMAL_CELL_PLAN_SCHEMA = "stage2-formal-pilot-cell-plan-v1"
+FORMAL_CELL_RUN_SCHEMA = "stage2-formal-pilot-cell-run-v1"
 
 PILOT_REPETITIONS = 50
 PILOT_M_VALUES = (2, 4, 8, 16, 32)
@@ -339,6 +346,460 @@ def build_global_pilot_mapping(
         mapping_id=mapping_id,
         sampling_plan_hash=sampling.digest,
         cells=tuple(cells),
+    )
+
+
+def _cell_hash(cell: PilotCellMapping) -> str:
+    """Hash a cell slice without adding a second draw identity."""
+
+    return canonical_json_hash(cell.to_dict())
+
+
+def _logical_cell_ref(value: str, field: str) -> str:
+    """Validate a relative ref used by the formal cell config bridge."""
+
+    if (
+        not isinstance(value, str)
+        or not value
+        or value.startswith(("/", "\\"))
+        or "\\" in value
+        or any(part in {"", ".", ".."} for part in Path(value).parts)
+    ):
+        raise ValueError(f"{field} must be a safe relative reference")
+    return value
+
+
+@dataclass(frozen=True, slots=True)
+class FormalPilotCellSpec:
+    """The minimal formal config produced from one frozen mapping slice.
+
+    This is deliberately a data-only bridge.  It describes exactly what a
+    generic task handler must consume, but does not create draws, references,
+    or confirmatory artifacts.  ``mapping_cell_hash`` binds the config to the
+    immutable 50-repetition slice rather than to a mutable config directory.
+    """
+
+    mapping_id: str
+    mapping_artifact_hash: str
+    mapping_cell_hash: str
+    anchor_id: str
+    batch_size: int
+    repetitions: int
+    stream_start: int
+    stream_end: int
+    microbatch_counts: tuple[int, ...]
+    gpu_uuid: str
+    execution_evidence_hash: str
+    config_ref: str
+    environment_ref: str
+    result_ref: str
+    schema_version: str = FORMAL_CELL_PLAN_SCHEMA
+
+    def __post_init__(self) -> None:
+        _safe_id(self.mapping_id, "mapping_id")
+        for field, value in (
+            ("mapping_artifact_hash", self.mapping_artifact_hash),
+            ("mapping_cell_hash", self.mapping_cell_hash),
+            ("execution_evidence_hash", self.execution_evidence_hash),
+        ):
+            _hash(value, field)
+        if self.schema_version != FORMAL_CELL_PLAN_SCHEMA:
+            raise ValueError("formal cell plan schema mismatch")
+        if self.anchor_id not in ANCHOR_IDS or self.batch_size not in PILOT_B_VALUES:
+            raise ValueError("formal cell plan anchor/B is not preregistered")
+        if self.repetitions != PILOT_REPETITIONS or self.stream_start < 0:
+            raise ValueError("formal cell plan repetition/stream contract mismatch")
+        if self.stream_end != self.stream_start + self.repetitions * self.batch_size:
+            raise ValueError("formal cell plan stream interval mismatch")
+        if self.microbatch_counts != PILOT_M_VALUES:
+            raise ValueError("formal cell plan M contract mismatch")
+        if self.gpu_uuid not in APPROVED_GPU_UUIDS:
+            raise ValueError("formal cell plan GPU is not approved")
+        for field, value in (
+            ("config_ref", self.config_ref),
+            ("environment_ref", self.environment_ref),
+            ("result_ref", self.result_ref),
+        ):
+            _logical_cell_ref(value, field)
+
+    @property
+    def cell_id(self) -> str:
+        return _cell_component(self.anchor_id, self.batch_size)
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "schema_version": self.schema_version,
+            "scope": "formal",
+            "formal_eligible": False,
+            "qualification_gate_hash": None,
+            "mapping_id": self.mapping_id,
+            "mapping_artifact_hash": self.mapping_artifact_hash,
+            "mapping_cell_hash": self.mapping_cell_hash,
+            "cell_id": self.cell_id,
+            "anchor_id": self.anchor_id,
+            "batch_size": self.batch_size,
+            "repetitions": self.repetitions,
+            "stream": PILOT_STREAM,
+            "stream_start": self.stream_start,
+            "stream_end": self.stream_end,
+            "microbatch_counts": list(self.microbatch_counts),
+            "gpu_uuid": self.gpu_uuid,
+            "execution_evidence_hash": self.execution_evidence_hash,
+            "config_ref": self.config_ref,
+            "environment_ref": self.environment_ref,
+            "result_ref": self.result_ref,
+        }
+
+
+def build_formal_cell_specs(
+    mapping: GlobalPilotMappingManifest,
+    execution: FormalExecutionEvidence,
+    *,
+    config_root: str = "s206/formal/configs",
+    environment_root: str = "s206/formal/environments",
+    result_root: str = "s206/formal/results",
+) -> tuple[FormalPilotCellSpec, ...]:
+    """Produce the 24 strict task configs from the global pilot manifest.
+
+    The returned refs are logical relative refs.  A deployment may materialize
+    them under DATA_ROOT, but cannot substitute a different mapping slice or
+    GPU without changing the resulting hashes and failing preflight.
+    """
+
+    if not isinstance(mapping, GlobalPilotMappingManifest):
+        raise TypeError("mapping must be a GlobalPilotMappingManifest")
+    execution.require_for_stage(2)
+    _logical_cell_ref(config_root, "config_root")
+    _logical_cell_ref(environment_root, "environment_root")
+    _logical_cell_ref(result_root, "result_root")
+    specs: list[FormalPilotCellSpec] = []
+    for cell in mapping.cells:
+        component = _cell_component(cell.anchor_id, cell.batch_size)
+        specs.append(
+            FormalPilotCellSpec(
+                mapping_id=mapping.mapping_id,
+                mapping_artifact_hash=mapping.artifact_hash,
+                mapping_cell_hash=_cell_hash(cell),
+                anchor_id=cell.anchor_id,
+                batch_size=cell.batch_size,
+                repetitions=cell.repetitions,
+                stream_start=cell.stream_start,
+                stream_end=cell.stream_end,
+                microbatch_counts=PILOT_M_VALUES,
+                gpu_uuid=CELL_GPU_BINDINGS[cell.anchor_id],
+                execution_evidence_hash=execution.artifact_hash,
+                config_ref=f"{config_root}/{component}.json",
+                environment_ref=f"{environment_root}/{component}.json",
+                result_ref=f"{result_root}/{component}.json",
+            )
+        )
+    return tuple(specs)
+
+
+def _finite_number(value: object) -> bool:
+    try:
+        return math.isfinite(float(value))
+    except (TypeError, ValueError, OverflowError):
+        return False
+
+
+def _wave_artifact_checks(
+    artifact_root: Path,
+    expected_unit_ids: Sequence[str],
+    *,
+    m2_tolerance: float,
+) -> tuple[bool, bool, bool, bool]:
+    """Check only operational properties of committed paired-wave artifacts."""
+
+    commits = artifact_root / "commits"
+    state_ok = True
+    m2_ok = True
+    finite_ok = True
+    registry_hash: str | None = None
+    for unit_id in expected_unit_ids:
+        commit_path = commits / f"{unit_id}.json"
+        if not commit_path.is_file():
+            return False, False, False, False
+        commit = load_canonical_json(commit_path)
+        if not isinstance(commit, Mapping):
+            return False, False, False, False
+        relative = Path(str(commit.get("object_ref", "")))
+        if relative.is_absolute() or ".." in relative.parts:
+            return False, False, False, False
+        try:
+            state, _bundle = load_tensor_bundle(artifact_root / relative)
+        except (OSError, TypeError, ValueError):
+            return False, False, False, False
+        if not isinstance(state, Mapping):
+            return False, False, False, False
+        current_registry = str(state.get("registry_hash"))
+        if registry_hash is None:
+            registry_hash = current_registry
+        elif current_registry != registry_hash:
+            state_ok = False
+        if state.get("state_digest") != state.get("state_digest_after"):
+            state_ok = False
+        if state.get("rng_state_before_digest") != state.get("rng_state_after_digest"):
+            state_ok = False
+        m2_error = state.get("m2_double_max_abs_error")
+        if not _finite_number(m2_error) or float(m2_error) > m2_tolerance:
+            m2_ok = False
+        for field in (
+            "gradient_evaluations",
+            "gradient_seconds",
+            "formula_seconds",
+            "wall_seconds",
+            "sample_budget",
+            "statistical_weight",
+        ):
+            if not _finite_number(state.get(field)):
+                finite_ok = False
+        diagnostics = state.get("microbatch_diagnostics")
+        if not isinstance(diagnostics, (list, tuple)) or not diagnostics:
+            finite_ok = False
+        else:
+            for diagnostic in diagnostics:
+                if not isinstance(diagnostic, Mapping) or any(
+                    not _finite_number(diagnostic.get(field))
+                    for field in ("token_count", "gradient_norm")
+                ):
+                    finite_ok = False
+    return state_ok, m2_ok, finite_ok, registry_hash is not None
+
+
+def _wave_sizing_variances(
+    artifact_root: Path,
+    expected_unit_ids: Sequence[str],
+    *,
+    microbatch_counts: Sequence[int],
+) -> dict[int, dict[str, float]]:
+    """Derive per-M endpoint variances from committed repetition summaries.
+
+    The scalar summaries are read only inside the bridge and are reduced to
+    variances; no per-repetition value, mean, sign, or direction is returned
+    in the blinded measurement artifact.  This prevents a caller from
+    accidentally reusing one M's variance/R for every M.
+    """
+
+    values: dict[int, dict[str, list[float]]] = {
+        int(m): {"bias": [], "nmse": [], "rank": []}
+        for m in microbatch_counts
+    }
+    commits = artifact_root / "commits"
+    for unit_id in expected_unit_ids:
+        commit = load_canonical_json(commits / f"{unit_id}.json")
+        if not isinstance(commit, Mapping):
+            raise S206PreparationBlocked("FORMAL_CELL_COMMIT_NOT_OBJECT")
+        relative = Path(str(commit.get("object_ref", "")))
+        if relative.is_absolute() or ".." in relative.parts:
+            raise S206PreparationBlocked("FORMAL_CELL_OBJECT_PATH_ESCAPE")
+        state, _bundle = load_tensor_bundle(artifact_root / relative)
+        if not isinstance(state, Mapping) or not isinstance(state.get("metrics"), Mapping):
+            raise S206PreparationBlocked("FORMAL_CELL_METRICS_MISSING")
+        metrics = state["metrics"]
+        for m in microbatch_counts:
+            method = metrics.get(f"u_m{m}")
+            if not isinstance(method, Mapping):
+                raise S206PreparationBlocked(f"FORMAL_CELL_M{m}_SUMMARY_MISSING")
+            ranking = method.get("reference_metrics")
+            ranking = ranking.get("ranking") if isinstance(ranking, Mapping) else None
+            endpoint_values = {
+                "bias": method.get("signed_error_sum"),
+                "nmse": method.get("squared_error_sum"),
+                "rank": ranking.get("top_k_overlap") if isinstance(ranking, Mapping) else None,
+            }
+            for endpoint, value in endpoint_values.items():
+                if not _finite_number(value):
+                    raise S206PreparationBlocked(f"FORMAL_CELL_{endpoint.upper()}_SUMMARY_NONFINITE")
+                values[int(m)][endpoint].append(float(value))
+    result: dict[int, dict[str, float]] = {}
+    for m, endpoints in values.items():
+        if any(len(bucket) < 2 for bucket in endpoints.values()):
+            raise S206PreparationBlocked(f"FORMAL_CELL_M{m}_SIZING_REPETITIONS_INCOMPLETE")
+        result[m] = {}
+        for endpoint, bucket in endpoints.items():
+            mean = sum(bucket) / len(bucket)
+            variance = sum((value - mean) ** 2 for value in bucket) / (len(bucket) - 1)
+            if not _finite_number(variance) or variance < 0:
+                raise S206PreparationBlocked(f"FORMAL_CELL_M{m}_{endpoint.upper()}_VARIANCE_INVALID")
+            result[m][endpoint] = variance
+    return result
+
+
+@dataclass(frozen=True, slots=True)
+class FormalPilotCellRun:
+    """Blinded operational output for one executed anchor/B slice."""
+
+    mapping_id: str
+    mapping_artifact_hash: str
+    mapping_cell_hash: str
+    summary_hash: str
+    measurements: tuple["BlindPilotMeasurement", ...]
+    costs: Mapping[str, Mapping[str, object]]
+    cost_io_quiescent: bool
+    schema_version: str = FORMAL_CELL_RUN_SCHEMA
+
+    def __post_init__(self) -> None:
+        _safe_id(self.mapping_id, "mapping_id")
+        for field, value in (
+            ("mapping_artifact_hash", self.mapping_artifact_hash),
+            ("mapping_cell_hash", self.mapping_cell_hash),
+            ("summary_hash", self.summary_hash),
+        ):
+            _hash(value, field)
+        if self.schema_version != FORMAL_CELL_RUN_SCHEMA:
+            raise ValueError("formal cell run schema mismatch")
+        if len(self.measurements) != len(PILOT_M_VALUES):
+            raise ValueError("formal cell run must emit one row per preregistered M")
+        if set(self.costs) != {
+            "scientific_equal_sample_cost",
+            "isolated_estimator_cost",
+            "online_training_incremental_cost",
+        }:
+            raise ValueError("formal cell run costs are incomplete")
+
+    @property
+    def operational_costs(self) -> dict[str, object]:
+        return {
+            **{name: dict(values) for name, values in self.costs.items()},
+            "cost_io_quiescent": self.cost_io_quiescent,
+        }
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "schema_version": self.schema_version,
+            "scope": "formal",
+            "formal_eligible": False,
+            "qualification_gate_hash": None,
+            "mapping_id": self.mapping_id,
+            "mapping_artifact_hash": self.mapping_artifact_hash,
+            "mapping_cell_hash": self.mapping_cell_hash,
+            "summary_hash": self.summary_hash,
+            "measurements": [item.to_dict() for item in self.measurements],
+            "costs": self.operational_costs,
+            "scientific_values_masked": True,
+        }
+
+
+def run_formal_pilot_cell(
+    cell: PilotCellMapping,
+    *,
+    mapping: GlobalPilotMappingManifest,
+    provider: FixedStateGradientProvider,
+    execution: FormalExecutionEvidence,
+    reference: Mapping[str, object],
+    reference_hash: str,
+    artifact_root: str | Path,
+    delta_sci_by_endpoint: Mapping[str, float],
+    reference_half_width_by_endpoint: Mapping[str, float],
+    resource_within_budget: bool,
+    cost_io_quiescent: bool,
+    m2_tolerance: float = 1e-10,
+    max_new_units: int | None = None,
+) -> FormalPilotCellRun:
+    """Run one formal pilot cell through the recoverable paired estimator.
+
+    Scientific vectors are consumed only inside the existing runner's private
+    artifact boundary.  This function emits operational checks, per-M sizing
+    variances derived from committed repetition summaries, and costs; it never
+    returns means/effects or creates a confirmatory draw.  A real formal
+    execution still requires the caller's
+    G2.3/G2.4a evidence via ``FormalExecutionEvidence``.
+    """
+
+    if cell not in mapping.cells:
+        raise S206PreparationBlocked("FORMAL_CELL_NOT_IN_GLOBAL_PILOT_MAPPING")
+    execution.require_for_stage(2)
+    if not isinstance(provider, FixedStateGradientProvider):
+        raise TypeError("provider must implement FixedStateGradientProvider")
+    if not isinstance(m2_tolerance, (int, float)) or not math.isfinite(float(m2_tolerance)) or m2_tolerance < 0:
+        raise ValueError("m2_tolerance must be a non-negative finite number")
+    root = Path(artifact_root)
+    summary = RecoverablePairedWaveRunner(
+        provider,
+        execution=execution,
+        m2_tolerance=float(m2_tolerance),
+    ).run(
+        wave_id=f"s206-{cell.anchor_id.replace('.', '-')}-b{cell.batch_size:03d}",
+        mappings=cell.mappings,
+        reference=reference,
+        reference_hash=reference_hash,
+        artifact_root=root,
+        max_new_units=max_new_units,
+    )
+    expected = tuple(sorted(mapping.repetition_id for mapping in cell.mappings))
+    if tuple(summary.expected_unit_ids) != expected or not summary.complete:
+        raise S206PreparationBlocked("FORMAL_CELL_INCOMPLETE")
+    state_transitions = summary.replay_evidence.get("state_transitions")
+    replay_ok = isinstance(state_transitions, Mapping) and all(
+        isinstance(state_transitions.get(unit_id), Mapping)
+        and state_transitions[unit_id].get("before") == state_transitions[unit_id].get("after")
+        and state_transitions[unit_id].get("rng_before") == state_transitions[unit_id].get("rng_after")
+        for unit_id in expected
+    )
+    state_ok, m2_ok, finite_ok, registry_ok = _wave_artifact_checks(
+        root,
+        expected,
+        m2_tolerance=float(m2_tolerance),
+    )
+    state_unchanged = bool(replay_ok and state_ok)
+    m2_equivalent = bool(m2_ok)
+    finite = bool(finite_ok)
+    mean_gradient_consistent = bool(
+        registry_ok
+        and summary.weighting_assumptions.get("statistical_unit")
+        and summary.weighting_assumptions.get("weight_unit")
+        and summary.weighting_assumptions.get("sampling_design")
+    )
+    costs = {name: dict(values) for name, values in summary.cost_statistics.items()}
+    scientific_cost = costs.get("scientific_equal_sample_cost", {})
+    wall_seconds = scientific_cost.get("wall_seconds")
+    formula_seconds = scientific_cost.get("formula_seconds")
+    if not _finite_number(wall_seconds) or float(wall_seconds) <= 0 or not _finite_number(formula_seconds):
+        finite = False
+        overhead = 0.0
+    else:
+        overhead = float(formula_seconds) / float(wall_seconds)
+        if not 0 <= overhead <= 1:
+            finite = False
+            overhead = 0.0
+    storage_bytes = sum(path.stat().st_size for path in root.rglob("*") if path.is_file())
+    gpu_hours = 0.0 if not _finite_number(wall_seconds) else float(wall_seconds) / 3600.0
+    variance_by_m = _wave_sizing_variances(
+        root,
+        expected,
+        microbatch_counts=PILOT_M_VALUES,
+    )
+    measurements = tuple(
+        BlindPilotMeasurement(
+            anchor_id=cell.anchor_id,
+            batch_size=cell.batch_size,
+            microbatch_count=microbatch_count,
+            repetitions=PILOT_REPETITIONS,
+            anchors_runnable=bool(summary.complete),
+            finite=finite,
+            state_unchanged=state_unchanged,
+            m2_equivalent=m2_equivalent,
+            mean_gradient_consistent=mean_gradient_consistent,
+            aggregation_overhead_ratio=overhead,
+            variance_by_endpoint=variance_by_m[microbatch_count],
+            delta_sci_by_endpoint=dict(delta_sci_by_endpoint),
+            reference_half_width_by_endpoint=dict(reference_half_width_by_endpoint),
+            storage_bytes=storage_bytes,
+            gpu_hours=gpu_hours,
+            resource_within_budget=resource_within_budget,
+            cost_io_quiescent=cost_io_quiescent,
+        )
+        for microbatch_count in PILOT_M_VALUES
+    )
+    return FormalPilotCellRun(
+        mapping_id=mapping.mapping_id,
+        mapping_artifact_hash=mapping.artifact_hash,
+        mapping_cell_hash=_cell_hash(cell),
+        summary_hash=summary.artifact_hash,
+        measurements=measurements,
+        costs=costs,
+        cost_io_quiescent=cost_io_quiescent,
     )
 
 
@@ -1078,6 +1539,8 @@ __all__ = [
     "CONFIRMATORY_STREAM",
     "EXCLUDED_PCI",
     "FORMAL_CONFIRMATORY_MAPPING_SCHEMA",
+    "FORMAL_CELL_PLAN_SCHEMA",
+    "FORMAL_CELL_RUN_SCHEMA",
     "FORMAL_MATRIX_SCHEMA",
     "G24B_GATE_SCHEMA",
     "GLOBAL_PILOT_MAPPING_SCHEMA",
@@ -1087,6 +1550,8 @@ __all__ = [
     "FormalConfirmatoryCellMapping",
     "FormalConfirmatoryMappingManifest",
     "FormalMatrixFreeze",
+    "FormalPilotCellSpec",
+    "FormalPilotCellRun",
     "PilotCellMapping",
     "PILOT_B_VALUES",
     "PILOT_M_VALUES",
@@ -1095,9 +1560,11 @@ __all__ = [
     "S206PreparationBlocked",
     "build_formal_confirmatory_mapping",
     "build_global_pilot_mapping",
+    "build_formal_cell_specs",
     "build_g24b_gate",
     "qualify_formal_matrix",
     "reduce_blinded_pilot",
+    "run_formal_pilot_cell",
     "strict_preflight",
     "validate_gpu_inventory",
 ]
