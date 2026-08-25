@@ -10,9 +10,11 @@ from param_importance_nlp.contracts.status import GateRecord, GateStatus
 from param_importance_nlp.experiments.sampling import SamplingPlan, SamplingUniverse
 from param_importance_nlp.experiments.stage2_s206_formal import (
     ANCHOR_IDS,
+    APPROVED_GPU_BINDINGS,
     APPROVED_GPU_UUIDS,
     CELL_GPU_BINDINGS,
     EXCLUDED_PCI,
+    EXCLUDED_UUID,
     BlindPilotMeasurement,
     S206PreflightSpec,
     S206PreparationBlocked,
@@ -28,6 +30,49 @@ from param_importance_nlp.experiments.stage2_s206_formal import (
 from param_importance_nlp.experiments.stage2_formal import _vector_digest
 from param_importance_nlp.providers.synthetic import SyntheticGradientProvider
 from param_importance_nlp.experiments.stage2_pilot import CostSemantics
+
+
+def _live_gpu_inventory() -> list[dict[str, object]]:
+    rows: list[dict[str, object]] = []
+    for pci, uuid in APPROVED_GPU_BINDINGS:
+        rows.append(
+            {
+                "uuid": uuid,
+                "pci_bus_id": pci,
+                "memory_used_mib": 0,
+                "memory_total_mib": 81920,
+                "utilization_gpu_percent": 0,
+                "ecc_uncorrected_volatile": 0,
+                "ecc_uncorrected_aggregate": 0,
+                "gpu_recovery_action": "None",
+            }
+        )
+    rows.append(
+        {
+            "uuid": EXCLUDED_UUID,
+            "pci_bus_id": EXCLUDED_PCI,
+            "memory_used_mib": 0,
+            "memory_total_mib": 81920,
+            "utilization_gpu_percent": 0,
+            "ecc_uncorrected_volatile": 113,
+            "ecc_uncorrected_aggregate": 179,
+            "gpu_recovery_action": "None",
+        }
+    )
+    for index, pci in enumerate(("0000:4F:00.0", "0000:51:00.0", "0000:57:00.0")):
+        rows.append(
+            {
+                "uuid": f"GPU-test-extra-{index}",
+                "pci_bus_id": pci,
+                "memory_used_mib": 0,
+                "memory_total_mib": 81920,
+                "utilization_gpu_percent": 0,
+                "ecc_uncorrected_volatile": 0,
+                "ecc_uncorrected_aggregate": 0,
+                "gpu_recovery_action": "None",
+            }
+        )
+    return rows
 
 
 def _sampling() -> SamplingPlan:
@@ -245,7 +290,7 @@ def _write_upstream_fixture(root: Path) -> tuple[str, str, str]:
 
 def test_strict_preflight_requires_all_upstream_cells_and_approved_gpus(tmp_path: Path) -> None:
     s204_root, g23_ref, g24a_ref = _write_upstream_fixture(tmp_path)
-    inventory = [{"uuid": uuid, "pci_bus_id": f"0000:{index + 53:02X}:00.0"} for index, uuid in enumerate(APPROVED_GPU_UUIDS)]
+    inventory = _live_gpu_inventory()
     result = strict_preflight(
         S206PreflightSpec(tmp_path, s204_root, g23_ref, g24a_ref),
         gpu_inventory=inventory,
@@ -253,6 +298,6 @@ def test_strict_preflight_requires_all_upstream_cells_and_approved_gpus(tmp_path
     assert result["status"] == "READY"
     assert result["confirmatory_draws_generated"] is False
     bad = list(inventory)
-    bad[0] = {"uuid": bad[0]["uuid"], "pci_bus_id": EXCLUDED_PCI}
+    bad[0] = {**bad[0], "pci_bus_id": EXCLUDED_PCI}
     with pytest.raises(S206PreparationBlocked, match="EXCLUDED"):
         strict_preflight(S206PreflightSpec(tmp_path, s204_root, g23_ref, g24a_ref), gpu_inventory=bad)

@@ -18,6 +18,10 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
 from ..contracts.errors import FormalRunRejected
+from ..contracts.g21_formal_handoff import (
+    ALLOWED_DEVICES as APPROVED_GPU_BINDINGS,
+    EXCLUDED_UUID,
+)
 from ..contracts.jsonio import canonical_json_hash, load_canonical_json
 from ..contracts.stage23 import (
     ArtifactQualification,
@@ -66,6 +70,8 @@ APPROVED_GPU_UUIDS = (
     "GPU-9b2b2a3b-3547-187f-ca29-2c02624e2e4f",
 )
 EXCLUDED_PCI = "0000:50:00.0"
+GPU_INVENTORY_SCHEMA = "stage2-s206-gpu-inventory-v1"
+LIVE_GPU_INVENTORY_COUNT = 8
 
 CELL_GPU_BINDINGS = {
     ANCHOR_IDS[0]: APPROVED_GPU_UUIDS[0],
@@ -1221,6 +1227,7 @@ def build_g24b_gate(
     execution: FormalExecutionEvidence,
     *,
     evidence_refs: Sequence[str],
+    gpu_inventory_identity: Mapping[str, object] | None = None,
     checked_at: datetime | None = None,
 ) -> GateRecord:
     """Create the single-writer G2.4b GateRecord, never an implicit PASS."""
@@ -1242,13 +1249,21 @@ def build_g24b_gate(
     if not refs:
         reasons.append("G24B_EVIDENCE_REFS_MISSING")
     now = (checked_at or datetime.now(timezone.utc)).isoformat()
+    inventory_measured = {}
+    if gpu_inventory_identity is not None:
+        for field in ("source_ref", "artifact_hash", "source_sha256"):
+            value = gpu_inventory_identity.get(field)
+            if not isinstance(value, str) or not value:
+                reasons.append(f"G24B_GPU_INVENTORY_{field.upper()}_MISSING")
+            else:
+                inventory_measured[f"gpu_inventory_{field}"] = value
     if reasons:
         return GateRecord(
             gate_id="stage2.G2.4b",
             stage=2,
             status=GateStatus.BLOCKED,
             checked_at=now,
-            measured={"pilot_report_hash": report.artifact_hash},
+            measured={"pilot_report_hash": report.artifact_hash, **inventory_measured},
             threshold={"required_status": "READY_FOR_QUALIFICATION"},
             evidence_refs=refs or ("s206-preparation-blocked",),
             reasons=tuple(reasons),
@@ -1267,6 +1282,7 @@ def build_g24b_gate(
             "selected_batch_size": selected.batch_size,
             "selected_microbatch_count": selected.microbatch_count,
             "required_repetitions": selected.r_required,
+            **inventory_measured,
         },
         threshold={
             "anchor_count": len(ANCHOR_IDS),
@@ -1541,26 +1557,141 @@ def _validate_s204_root(root: Path) -> None:
             raise S206PreparationBlocked(f"S204_ARTIFACT_SET_INVALID:{component}")
 
 
-def validate_gpu_inventory(inventory: Sequence[Mapping[str, object]]) -> dict[str, object]:
-    """Validate a normalized nvidia-smi inventory without selecting devices."""
+def _canonical_pci(value: object) -> str:
+    text = str(value).strip().upper()
+    match = re.fullmatch(r"(?:[0-9A-F]{4}|[0-9A-F]{8}):([0-9A-F]{2}):([0-9A-F]{2})\.([0-9])", text)
+    if match is None:
+        raise S206PreparationBlocked("GPU_INVENTORY_PCI_INVALID")
+    return f"0000:{match.group(1)}:{match.group(2)}.{match.group(3)}"
 
-    by_uuid = {str(item.get("uuid")): item for item in inventory}
-    missing = [uuid for uuid in APPROVED_GPU_UUIDS if uuid not in by_uuid]
-    if missing:
-        raise S206PreparationBlocked(f"APPROVED_GPU_MISSING:{','.join(missing)}")
-    for item in inventory:
-        uuid = str(item.get("uuid"))
-        pci = str(item.get("pci_bus_id", "")).lower()
-        if uuid in APPROVED_GPU_UUIDS and pci == EXCLUDED_PCI.lower():
-            raise S206PreparationBlocked("APPROVED_GPU_BOUND_TO_EXCLUDED_PCI")
-        if uuid == "GPU-dc6cfc60-41dd-7bcf-ed09-b7deb5be342c" or pci == EXCLUDED_PCI.lower():
-            if uuid in CELL_GPU_BINDINGS.values():
-                raise S206PreparationBlocked("EXCLUDED_GPU_SELECTED")
+
+def normalize_gpu_inventory(
+    inventory: Sequence[Mapping[str, object]],
+) -> list[dict[str, object]]:
+    """Normalize current ``rows`` and the supported legacy GPU wire fields.
+
+    The original row is retained verbatim and canonical health aliases are
+    added.  This is intentional: the excluded card's 113/179 ECC facts must
+    remain auditable even though that device is never schedulable.
+    """
+
+    normalized: list[dict[str, object]] = []
+    aliases = {
+        "memory_used_mib": ("memory_used_mib", "memory_used", "memory.used"),
+        "memory_total_mib": ("memory_total_mib", "memory_total", "memory.total"),
+        "utilization_gpu_percent": (
+            "utilization_gpu_percent",
+            "utilization_percent",
+            "utilization_gpu",
+            "utilization.gpu",
+        ),
+        "ecc_uncorrected_volatile": (
+            "ecc_uncorrected_volatile",
+            "ecc_volatile_uncorrected",
+            "ecc.errors.uncorrected.volatile.total",
+        ),
+        "ecc_uncorrected_aggregate": (
+            "ecc_uncorrected_aggregate",
+            "ecc_aggregate_uncorrected",
+            "ecc.errors.uncorrected.aggregate.total",
+        ),
+        "gpu_recovery_action": ("gpu_recovery_action", "recovery_action"),
+    }
+    for raw in inventory:
+        if not isinstance(raw, Mapping):
+            raise S206PreparationBlocked("GPU_INVENTORY_ROW_INVALID")
+        row = dict(raw)
+        uuid = str(row.get("uuid", "")).strip()
+        if not uuid:
+            raise S206PreparationBlocked("GPU_INVENTORY_UUID_MISSING")
+        if not uuid.upper().startswith("GPU-"):
+            uuid = "GPU-" + uuid
+        pci = _canonical_pci(row.get("pci_bus_id", row.get("pci", "")))
+        row["uuid"] = uuid
+        row["pci_bus_id"] = pci
+        for canonical, names in aliases.items():
+            found = next((row[name] for name in names if name in row), None)
+            if found is None:
+                raise S206PreparationBlocked(f"GPU_INVENTORY_HEALTH_FIELD_MISSING:{canonical}")
+            row[canonical] = found
+        normalized.append(row)
+    return normalized
+
+
+def validate_gpu_inventory(
+    inventory: Sequence[Mapping[str, object]],
+    *,
+    compute_apps: Sequence[Mapping[str, object]] = (),
+) -> dict[str, object]:
+    """Validate the complete live identity set and approved-card health.
+
+    Exactly eight live rows are required.  Four approved cards and the known
+    excluded card are checked as a bidirectional PCI/UUID mapping; the other
+    three live cards are retained in the inventory but cannot be scheduled.
+    """
+
+    rows = normalize_gpu_inventory(inventory)
+    if len(rows) != LIVE_GPU_INVENTORY_COUNT:
+        raise S206PreparationBlocked(
+            f"GPU_INVENTORY_LIVE_CARD_COUNT_INVALID:{len(rows)}"
+        )
+    uuids = [str(item["uuid"]).casefold() for item in rows]
+    pcis = [str(item["pci_bus_id"]).casefold() for item in rows]
+    approved = {uuid.casefold() for uuid in APPROVED_GPU_UUIDS}
+    for uuid, pci in zip(uuids, pcis):
+        if uuid in approved and pci == EXCLUDED_PCI.casefold():
+            raise S206PreparationBlocked("GPU_INVENTORY_APPROVED_BOUND_TO_EXCLUDED_PCI")
+        if uuid == EXCLUDED_UUID.casefold() and pci != EXCLUDED_PCI.casefold():
+            raise S206PreparationBlocked("GPU_INVENTORY_EXCLUDED_IDENTITY_DRIFT")
+    if len(set(uuids)) != len(rows):
+        raise S206PreparationBlocked("GPU_INVENTORY_DUPLICATE_UUID")
+    if len(set(pcis)) != len(rows):
+        raise S206PreparationBlocked("GPU_INVENTORY_DUPLICATE_PCI")
+    expected = {pci.casefold(): uuid.casefold() for pci, uuid in APPROVED_GPU_BINDINGS}
+    expected[EXCLUDED_PCI.casefold()] = EXCLUDED_UUID.casefold()
+    observed = {pci: uuid for pci, uuid in zip(pcis, uuids) if pci in expected}
+    if observed != expected:
+        raise S206PreparationBlocked("GPU_INVENTORY_APPROVED_OR_EXCLUDED_IDENTITY_DRIFT")
+    by_uuid = {uuid: row for uuid, row in zip(uuids, rows)}
+    apps_by_uuid: dict[str, list[dict[str, object]]] = {}
+    for raw_app in compute_apps:
+        if not isinstance(raw_app, Mapping):
+            raise S206PreparationBlocked("GPU_INVENTORY_COMPUTE_APP_INVALID")
+        app = dict(raw_app)
+        app_uuid = str(app.get("gpu_uuid", app.get("uuid", ""))).strip()
+        if not app_uuid:
+            raise S206PreparationBlocked("GPU_INVENTORY_COMPUTE_APP_UUID_MISSING")
+        if not app_uuid.upper().startswith("GPU-"):
+            app_uuid = "GPU-" + app_uuid
+        app["gpu_uuid"] = app_uuid
+        apps_by_uuid.setdefault(app_uuid.casefold(), []).append(app)
+    for uuid in approved:
+        row = by_uuid[uuid]
+        if apps_by_uuid.get(uuid):
+            raise S206PreparationBlocked("GPU_INVENTORY_APPROVED_CARD_NOT_IDLE")
+        try:
+            memory_used = float(row["memory_used_mib"])
+            memory_total = float(row["memory_total_mib"])
+            utilization = float(row["utilization_gpu_percent"])
+            ecc_volatile = float(row["ecc_uncorrected_volatile"])
+            ecc_aggregate = float(row["ecc_uncorrected_aggregate"])
+        except (KeyError, TypeError, ValueError) as error:
+            raise S206PreparationBlocked("GPU_INVENTORY_APPROVED_HEALTH_INVALID") from error
+        if memory_total <= 0 or memory_used != 0 or utilization != 0:
+            raise S206PreparationBlocked("GPU_INVENTORY_APPROVED_CARD_NOT_IDLE")
+        if ecc_volatile != 0 or ecc_aggregate != 0:
+            raise S206PreparationBlocked("GPU_INVENTORY_APPROVED_CARD_ECC_NOT_CLEAN")
+        recovery = str(row["gpu_recovery_action"]).strip().casefold()
+        if recovery not in {"none", "0", "n/a", "na"}:
+            raise S206PreparationBlocked("GPU_INVENTORY_APPROVED_CARD_RECOVERY_NOT_CLEAN")
     return {
         "approved_gpu_uuids": list(APPROVED_GPU_UUIDS),
+        "excluded_gpu_uuid": EXCLUDED_UUID,
         "excluded_pci": EXCLUDED_PCI,
-        "inventory_count": len(inventory),
+        "inventory_count": len(rows),
         "selected_bindings": dict(CELL_GPU_BINDINGS),
+        "inventory": rows,
+        "compute_apps": [dict(item) for item in compute_apps],
     }
 
 
@@ -1576,6 +1707,7 @@ def strict_preflight(
     spec: S206PreflightSpec,
     *,
     gpu_inventory: Sequence[Mapping[str, object]],
+    gpu_compute_apps: Sequence[Mapping[str, object]] = (),
 ) -> dict[str, object]:
     """Fail closed before any formal S2.6 process is started."""
 
@@ -1590,7 +1722,7 @@ def strict_preflight(
     except ValueError as error:
         raise S206PreparationBlocked("s204_root:PATH_ESCAPE") from error
     _validate_s204_root(s204_root)
-    gpu = validate_gpu_inventory(gpu_inventory)
+    gpu = validate_gpu_inventory(gpu_inventory, compute_apps=gpu_compute_apps)
     return {
         "schema_version": "stage2-s206-formal-preflight-v1",
         "status": "READY",
@@ -1611,11 +1743,15 @@ def strict_preflight(
 
 __all__ = [
     "APPROVED_GPU_UUIDS",
+    "APPROVED_GPU_BINDINGS",
     "ANCHOR_IDS",
     "BLINDED_PILOT_REPORT_SCHEMA",
     "CELL_GPU_BINDINGS",
     "CONFIRMATORY_STREAM",
     "EXCLUDED_PCI",
+    "EXCLUDED_UUID",
+    "GPU_INVENTORY_SCHEMA",
+    "LIVE_GPU_INVENTORY_COUNT",
     "FORMAL_CONFIRMATORY_MAPPING_SCHEMA",
     "FORMAL_CELL_PLAN_SCHEMA",
     "FORMAL_CELL_RUN_SCHEMA",
@@ -1644,5 +1780,6 @@ __all__ = [
     "reduce_blinded_pilot",
     "run_formal_pilot_cell",
     "strict_preflight",
+    "normalize_gpu_inventory",
     "validate_gpu_inventory",
 ]

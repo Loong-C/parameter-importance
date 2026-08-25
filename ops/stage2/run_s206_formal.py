@@ -13,6 +13,7 @@ import argparse
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
+import hashlib
 import json
 import math
 import os
@@ -39,6 +40,7 @@ from param_importance_nlp.experiments.stage2_s206_formal import (
     APPROVED_GPU_UUIDS,
     CELL_GPU_BINDINGS,
     EXCLUDED_PCI,
+    GPU_INVENTORY_SCHEMA,
     PILOT_B_VALUES,
     PILOT_REPETITIONS,
     S206PreflightSpec,
@@ -53,6 +55,7 @@ from param_importance_nlp.experiments.stage2_s206_formal import (
     reduce_blinded_pilot,
     run_formal_pilot_cell,
     strict_preflight,
+    normalize_gpu_inventory,
 )
 from param_importance_nlp.experiments.stage2_pilot import CostSemantics
 from param_importance_nlp.experiments.sampling import SamplingPlan
@@ -111,44 +114,87 @@ def _logical(root: Path, value: str, *, field: str) -> Path:
     return result
 
 
-def _load_inventory(path: Path | None) -> list[dict[str, object]]:
-    if path is not None:
-        value = load_canonical_json(path.resolve())
-        if isinstance(value, Mapping) and isinstance(value.get("gpus"), list):
-            rows = value["gpus"]
-        else:
-            rows = value
-        if not isinstance(rows, list) or not all(isinstance(row, Mapping) for row in rows):
-            raise S206PreparationBlocked("GPU_INVENTORY_JSON_INVALID")
-        return [dict(row) for row in rows]
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _load_inventory_snapshot(
+    path: Path | None,
+    *,
+    data_root: Path | None = None,
+) -> tuple[list[dict[str, object]], dict[str, object]]:
+    """Load the hash-bound inventory artifact used by every formal path."""
+
+    if path is None:
+        raise S206PreparationBlocked("GPU_INVENTORY_JSON_REQUIRED")
+    resolved = path.resolve()
+    expected_source_ref: str | None = None
+    if data_root is not None:
+        root = data_root.resolve()
+        try:
+            expected_source_ref = resolved.relative_to(root).as_posix()
+        except ValueError as error:
+            raise S206PreparationBlocked("GPU_INVENTORY_PATH_OUTSIDE_DATA_ROOT") from error
     try:
-        completed = subprocess.run(
-            [
-                "nvidia-smi",
-                "--query-gpu=uuid,pci.bus_id,memory.used,utilization.gpu",
-                "--format=csv,noheader,nounits",
-            ],
-            check=True,
-            capture_output=True,
-            text=True,
-        )
-    except (OSError, subprocess.CalledProcessError) as error:
-        raise S206PreparationBlocked(f"GPU_INVENTORY_UNAVAILABLE:{type(error).__name__}") from error
-    rows: list[dict[str, object]] = []
-    for line in completed.stdout.splitlines():
-        parts = [item.strip() for item in line.split(",")]
-        if len(parts) < 4:
-            continue
-        rows.append(
-            {
-                "uuid": parts[0],
-                "pci_bus_id": parts[1],
-                "memory_used_mib": int(parts[2]) if parts[2].isdigit() else parts[2],
-                "utilization_gpu": int(parts[3]) if parts[3].isdigit() else parts[3],
-            }
-        )
-    if not rows:
-        raise S206PreparationBlocked("GPU_INVENTORY_EMPTY")
+        value = load_canonical_json(resolved)
+    except (OSError, TypeError, ValueError) as error:
+        raise S206PreparationBlocked("GPU_INVENTORY_JSON_INVALID") from error
+    if not isinstance(value, Mapping):
+        raise S206PreparationBlocked("GPU_INVENTORY_JSON_ENVELOPE_REQUIRED")
+    if value.get("schema_version") != GPU_INVENTORY_SCHEMA:
+        raise S206PreparationBlocked("GPU_INVENTORY_SCHEMA_INVALID")
+    rows = value.get("rows")
+    if rows is None:
+        # ``gpus`` was the older supported wire key.  It remains accepted only
+        # inside the same hash-bound envelope; raw lists are not formal input.
+        rows = value.get("gpus")
+    if not isinstance(rows, list) or not all(isinstance(row, Mapping) for row in rows):
+        raise S206PreparationBlocked("GPU_INVENTORY_JSON_ROWS_REQUIRED")
+    source_ref = value.get("source_ref")
+    artifact_hash = value.get("artifact_hash")
+    if not isinstance(source_ref, str) or not source_ref:
+        raise S206PreparationBlocked("GPU_INVENTORY_SOURCE_REF_REQUIRED")
+    if expected_source_ref is not None and source_ref != expected_source_ref:
+        raise S206PreparationBlocked("GPU_INVENTORY_SOURCE_REF_PATH_MISMATCH")
+    if not isinstance(artifact_hash, str) or len(artifact_hash) != 64 or any(
+        char not in "0123456789abcdef" for char in artifact_hash
+    ):
+        raise S206PreparationBlocked("GPU_INVENTORY_ARTIFACT_HASH_REQUIRED")
+    body = {key: item for key, item in value.items() if key != "artifact_hash"}
+    if canonical_json_hash(body) != artifact_hash:
+        raise S206PreparationBlocked("GPU_INVENTORY_ARTIFACT_HASH_MISMATCH")
+    declared_source_sha = value.get("source_sha256")
+    source_sha = _file_sha256(resolved)
+    if declared_source_sha is not None:
+        if not isinstance(declared_source_sha, str) or declared_source_sha != source_sha:
+            raise S206PreparationBlocked("GPU_INVENTORY_SOURCE_SHA256_MISMATCH")
+    if "compute_apps" not in value:
+        raise S206PreparationBlocked("GPU_INVENTORY_COMPUTE_APPS_REQUIRED")
+    apps = value["compute_apps"]
+    if not isinstance(apps, list) or not all(isinstance(item, Mapping) for item in apps):
+        raise S206PreparationBlocked("GPU_INVENTORY_COMPUTE_APPS_INVALID")
+    try:
+        normalized = normalize_gpu_inventory(rows)
+    except (TypeError, ValueError) as error:
+        raise S206PreparationBlocked("GPU_INVENTORY_JSON_INVALID") from error
+    return normalized, {
+        "source_ref": source_ref,
+        "artifact_hash": artifact_hash,
+        "source_sha256": source_sha,
+        "path": str(resolved),
+        "schema_version": str(value.get("schema_version", "")),
+        "compute_apps": [dict(item) for item in apps],  # type: ignore[list-item]
+    }
+
+
+def _load_inventory(path: Path | None) -> list[dict[str, object]]:
+    """Compatibility wrapper returning rows while retaining strict loading."""
+
+    rows, _identity = _load_inventory_snapshot(path)
     return rows
 
 
@@ -159,7 +205,10 @@ def _write_status(path: Path, payload: Mapping[str, object]) -> None:
 
 def _preflight(args: argparse.Namespace) -> dict[str, object]:
     root = args.data_root.resolve()
-    inventory = _load_inventory(args.gpu_inventory_json)
+    inventory, inventory_identity = _load_inventory_snapshot(
+        args.gpu_inventory_json,
+        data_root=root,
+    )
     result = strict_preflight(
         S206PreflightSpec(
             data_root=root,
@@ -168,6 +217,7 @@ def _preflight(args: argparse.Namespace) -> dict[str, object]:
             g24a_ref=args.g24a_evaluation,
         ),
         gpu_inventory=inventory,
+        gpu_compute_apps=inventory_identity["compute_apps"] or (),  # type: ignore[arg-type]
     )
     if tuple(result["gpu"]["approved_gpu_uuids"]) != APPROVED_GPU_UUIDS:  # type: ignore[index]
         raise S206PreparationBlocked("APPROVED_GPU_BINDING_DRIFT")
@@ -178,6 +228,28 @@ def _preflight(args: argparse.Namespace) -> dict[str, object]:
         "approved_gpu_uuids": list(APPROVED_GPU_UUIDS),
         "cell_gpu_bindings": dict(CELL_GPU_BINDINGS),
     }
+    gpu = result["gpu"]
+    if not isinstance(gpu, dict):
+        raise S206PreparationBlocked("GPU_INVENTORY_VALIDATION_RESULT_INVALID")
+    gpu.update(
+        {
+            "inventory_source_ref": inventory_identity["source_ref"],
+            "inventory_artifact_hash": inventory_identity["artifact_hash"],
+            "inventory_source_sha256": inventory_identity["source_sha256"],
+            "inventory_path": inventory_identity["path"],
+            "inventory_schema_version": inventory_identity["schema_version"] or GPU_INVENTORY_SCHEMA,
+        }
+    )
+    result["gpu_inventory_identity"] = {
+        "source_ref": inventory_identity["source_ref"],
+        "artifact_hash": inventory_identity["artifact_hash"],
+        "source_sha256": inventory_identity["source_sha256"],
+        "path": inventory_identity["path"],
+    }
+    result["gpu_inventory_ref"] = inventory_identity["source_ref"]
+    result["gpu_inventory_artifact_hash"] = inventory_identity["artifact_hash"]
+    result["gpu_inventory_source_sha256"] = inventory_identity["source_sha256"]
+    result["preflight_artifact_hash"] = canonical_json_hash(result)
     return result
 
 
@@ -1294,8 +1366,7 @@ def _production_execute(args: argparse.Namespace) -> dict[str, object]:
             "--cell-artifact-root", cell_artifact, "--cell-output", cell_output,
             "--cell-gpu-uuid", gpu_uuid,
         ]
-        if args.gpu_inventory_json is not None:
-            command.extend(["--gpu-inventory-json", str(args.gpu_inventory_json.resolve())])
+        command.extend(["--gpu-inventory-json", str(args.gpu_inventory_json.resolve())])
         if args.resource_within_budget:
             command.append("--resource-within-budget")
         if args.cost_io_quiescent:
@@ -1332,6 +1403,11 @@ def _production_execute(args: argparse.Namespace) -> dict[str, object]:
                 "pilot_mapping_hash": mapping.artifact_hash,
                 "approved_gpu_uuids": list(APPROVED_GPU_UUIDS),
                 "excluded_pci": EXCLUDED_PCI,
+                "gpu_inventory_ref": preflight["gpu_inventory_ref"],
+                "gpu_inventory_artifact_hash": preflight["gpu_inventory_artifact_hash"],
+                "gpu_inventory_source_sha256": preflight["gpu_inventory_source_sha256"],
+                "gpu_inventory_path": preflight["gpu"]["inventory_path"],  # type: ignore[index]
+                "preflight_artifact_hash": preflight["preflight_artifact_hash"],
                 "retry_policy_ref": args.retry_policy_ref,
                 "retry_policy_hash": retry_policy_hash,
                 "completed_cells": list(records),
@@ -1507,9 +1583,19 @@ def _production_execute(args: argparse.Namespace) -> dict[str, object]:
         str(measurements_path),
         str(costs_path),
         str(args.execution_evidence_ref),
+        (
+            f"{preflight['gpu_inventory_ref']}::artifact_sha256="
+            f"{preflight['gpu_inventory_artifact_hash']}::source_sha256="
+            f"{preflight['gpu_inventory_source_sha256']}"
+        ),
     )
     if report.status != "READY_FOR_QUALIFICATION":
-        gate = build_g24b_gate(report, execution, evidence_refs=evidence_refs)
+        gate = build_g24b_gate(
+            report,
+            execution,
+            evidence_refs=evidence_refs,
+            gpu_inventory_identity=preflight["gpu_inventory_identity"],  # type: ignore[arg-type]
+        )
         gate_path = _logical(
             root,
             args.gate_output or f"{args.operations_root}/g2.4b-gate.json",
@@ -1529,7 +1615,12 @@ def _production_execute(args: argparse.Namespace) -> dict[str, object]:
             "report": report.to_dict(),
             "gate": gate.to_dict(),
         }
-    gate = build_g24b_gate(report, execution, evidence_refs=evidence_refs)
+    gate = build_g24b_gate(
+        report,
+        execution,
+        evidence_refs=evidence_refs,
+        gpu_inventory_identity=preflight["gpu_inventory_identity"],  # type: ignore[arg-type]
+    )
     matrix = qualify_formal_matrix(report, execution, gate, freeze_id=args.freeze_id)
     confirmatory = build_formal_confirmatory_mapping(
         matrix,
@@ -1567,6 +1658,11 @@ def _production_execute(args: argparse.Namespace) -> dict[str, object]:
         "confirmatory_mapping_hash": confirmatory.artifact_hash,
         "pilot_mapping_hash": mapping.artifact_hash,
         "execution_evidence_hash": execution.artifact_hash,
+        "gpu_inventory_ref": preflight["gpu_inventory_ref"],
+        "gpu_inventory_artifact_hash": preflight["gpu_inventory_artifact_hash"],
+        "gpu_inventory_source_sha256": preflight["gpu_inventory_source_sha256"],
+        "gpu_inventory_path": preflight["gpu"]["inventory_path"],  # type: ignore[index]
+        "preflight_artifact_hash": preflight["preflight_artifact_hash"],
         "cost_semantics_ref": args.cost_semantics_ref,
         "cost_semantics_hash": str(cost_source["artifact_hash"]),
         "retry_policy_ref": args.retry_policy_ref,
@@ -1769,6 +1865,43 @@ def _qualify(args: argparse.Namespace) -> dict[str, object]:
     return {"status": "FORMAL_FROZEN", "formal_eligible": True, "gate_ref": str(gate_path), "matrix_ref": str(matrix_path), "gate": gate.to_dict(), "matrix": matrix.to_dict()}
 
 
+def _verify_status_inventory_identity(
+    value: Mapping[str, object],
+    *,
+    data_root: Path,
+) -> None:
+    required = (
+        "gpu_inventory_path",
+        "gpu_inventory_ref",
+        "gpu_inventory_artifact_hash",
+        "gpu_inventory_source_sha256",
+        "preflight_artifact_hash",
+    )
+    if any(key not in value for key in required):
+        raise S206PreparationBlocked("STATUS_GPU_INVENTORY_IDENTITY_MISSING")
+    _rows, identity = _load_inventory_snapshot(
+        Path(str(value["gpu_inventory_path"])),
+        data_root=data_root,
+    )
+    if (
+        identity["source_ref"] != value["gpu_inventory_ref"]
+        or identity["artifact_hash"] != value["gpu_inventory_artifact_hash"]
+        or identity["source_sha256"] != value["gpu_inventory_source_sha256"]
+    ):
+        raise S206PreparationBlocked("STATUS_GPU_INVENTORY_IDENTITY_DRIFT")
+    preflight = value.get("preflight")
+    if not isinstance(preflight, Mapping):
+        raise S206PreparationBlocked("STATUS_PREFLIGHT_IDENTITY_MISSING")
+    declared = preflight.get("preflight_artifact_hash")
+    body = {key: item for key, item in preflight.items() if key != "preflight_artifact_hash"}
+    if (
+        not isinstance(declared, str)
+        or value["preflight_artifact_hash"] != declared
+        or canonical_json_hash(body) != declared
+    ):
+        raise S206PreparationBlocked("STATUS_PREFLIGHT_IDENTITY_DRIFT")
+
+
 def _wait(args: argparse.Namespace) -> int:
     status_path = _logical(args.data_root.resolve(), f"{args.operations_root}/status.json", field="status")
     deadline = None if args.timeout_seconds is None else time.monotonic() + args.timeout_seconds
@@ -1783,6 +1916,10 @@ def _wait(args: argparse.Namespace) -> int:
                     "PILOT_BLOCKED",
                     "BLOCKED_EXECUTION",
                 }:
+                    _verify_status_inventory_identity(
+                        value,
+                        data_root=args.data_root.resolve(),
+                    )
                     return 0 if value.get("stage") == "G2.4B_PASS_MATRIX_FROZEN" else 3
         if deadline is not None and time.monotonic() >= deadline:
             return 4
@@ -1794,6 +1931,9 @@ def _detach(args: argparse.Namespace) -> int:
 
     if not args.execute:
         raise S206PreparationBlocked("DETACH_REQUIRES_EXECUTE")
+    # Validate all immutable gates and the inventory identity before spawning
+    # anything.  The child repeats this check immediately before scheduling.
+    preflight = _preflight(args)
     operations = _logical(args.data_root.resolve(), args.operations_root, field="operations_root")
     operations.mkdir(parents=True, exist_ok=True)
     log_path = operations / "launcher.log"
@@ -1828,6 +1968,11 @@ def _detach(args: argparse.Namespace) -> int:
         "operations_root": str(operations),
         "log_ref": str(log_path),
         "status_ref": str(operations / "status.json"),
+        "gpu_inventory_ref": preflight["gpu_inventory_ref"],
+        "gpu_inventory_artifact_hash": preflight["gpu_inventory_artifact_hash"],
+        "gpu_inventory_source_sha256": preflight["gpu_inventory_source_sha256"],
+        "gpu_inventory_path": preflight["gpu"]["inventory_path"],  # type: ignore[index]
+        "preflight_artifact_hash": preflight["preflight_artifact_hash"],
         "recovery_command": "--wait",
         "confirmatory_draws_generated": False,
     }
@@ -1901,6 +2046,8 @@ def _parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     try:
+        if (args.preflight or args.execute or args.detach) and args.gpu_inventory_json is None:
+            raise S206PreparationBlocked("GPU_INVENTORY_JSON_REQUIRED")
         if args.detach:
             return _detach(args)
         if args.synthetic_cell:

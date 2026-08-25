@@ -27,7 +27,11 @@ from param_importance_nlp.contracts.jsonio import write_canonical_json
 from param_importance_nlp.experiments.sampling import SamplingPlan, SamplingUniverse
 from param_importance_nlp.experiments.stage2_s206_formal import (
     ANCHOR_IDS,
+    APPROVED_GPU_BINDINGS,
     APPROVED_GPU_UUIDS,
+    EXCLUDED_PCI,
+    EXCLUDED_UUID,
+    GPU_INVENTORY_SCHEMA,
     GlobalPilotMappingManifest,
     build_global_pilot_mapping,
 )
@@ -38,6 +42,56 @@ from param_importance_nlp.runtime.tensor_bundle import publish_tensor_bundle
 
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def _write_gpu_inventory(path: Path) -> None:
+    rows: list[dict[str, object]] = []
+    for pci, uuid in APPROVED_GPU_BINDINGS:
+        rows.append(
+            {
+                "uuid": uuid,
+                "pci_bus_id": pci,
+                "memory_used_mib": 0,
+                "memory_total_mib": 81920,
+                "utilization_gpu_percent": 0,
+                "ecc_uncorrected_volatile": 0,
+                "ecc_uncorrected_aggregate": 0,
+                "gpu_recovery_action": "None",
+            }
+        )
+    rows.append(
+        {
+            "uuid": EXCLUDED_UUID,
+            "pci_bus_id": EXCLUDED_PCI,
+            "memory_used_mib": 0,
+            "memory_total_mib": 81920,
+            "utilization_gpu_percent": 0,
+            "ecc_uncorrected_volatile": 113,
+            "ecc_uncorrected_aggregate": 179,
+            "gpu_recovery_action": "None",
+        }
+    )
+    for index, pci in enumerate(("0000:4F:00.0", "0000:51:00.0", "0000:57:00.0")):
+        rows.append(
+            {
+                "uuid": f"GPU-test-extra-{index}",
+                "pci_bus_id": pci,
+                "memory_used_mib": 0,
+                "memory_total_mib": 81920,
+                "utilization_gpu_percent": 0,
+                "ecc_uncorrected_volatile": 0,
+                "ecc_uncorrected_aggregate": 0,
+                "gpu_recovery_action": "None",
+            }
+        )
+    payload: dict[str, object] = {
+        "schema_version": GPU_INVENTORY_SCHEMA,
+        "source_ref": "evidence/gpu-inventory.json",
+        "rows": rows,
+        "compute_apps": [],
+    }
+    payload["artifact_hash"] = canonical_json_hash(payload)
+    write_canonical_json(path, payload)
 
 
 def _s204_config() -> ResolvedConfigV2:
@@ -191,6 +245,11 @@ def test_retry_policy_is_required_and_hash_bound_when_retries_enabled(tmp_path: 
 
 
 def test_detached_wait_recovers_final_g24b_freeze(tmp_path: Path) -> None:
+    inventory_path = tmp_path / "evidence/gpu-inventory.json"
+    _write_gpu_inventory(inventory_path)
+    _rows, identity = launcher._load_inventory_snapshot(inventory_path)
+    preflight = {"status": "READY"}
+    preflight["preflight_artifact_hash"] = canonical_json_hash(preflight)
     write_canonical_json(
         tmp_path / "operations/s206/status.json",
         {
@@ -198,6 +257,12 @@ def test_detached_wait_recovers_final_g24b_freeze(tmp_path: Path) -> None:
             "stage": "G2.4B_PASS_MATRIX_FROZEN",
             "formal_eligible": True,
             "confirmatory_draws_generated": False,
+            "preflight": preflight,
+            "preflight_artifact_hash": preflight["preflight_artifact_hash"],
+            "gpu_inventory_path": str(inventory_path.resolve()),
+            "gpu_inventory_ref": identity["source_ref"],
+            "gpu_inventory_artifact_hash": identity["artifact_hash"],
+            "gpu_inventory_source_sha256": identity["source_sha256"],
         },
     )
     result = launcher._wait(
@@ -294,11 +359,7 @@ def test_production_cell_uses_candidate_bundle_and_emits_blinded_pilot_only(
     }
     g24a["artifact_hash"] = canonical_json_hash(g24a)
     write_canonical_json(root / "evidence/g24a.json", g24a)
-    inventory = [
-        {"uuid": uuid, "pci_bus_id": f"0000:{index + 53:02X}:00.0"}
-        for index, uuid in enumerate(APPROVED_GPU_UUIDS)
-    ]
-    write_canonical_json(root / "evidence/gpu-inventory.json", inventory)
+    _write_gpu_inventory(root / "evidence/gpu-inventory.json")
 
     source_config = _s204_config()
     config_ref = "prepared/config.json"
