@@ -1650,7 +1650,13 @@ def _parser() -> argparse.ArgumentParser:
         f"PCI {EXCLUDED_PCI} is excluded",
     )
     parser.add_argument("--heartbeat-seconds", type=float, default=30.0)
-    parser.add_argument("--candidate-sizes", type=int, nargs="+", default=list(DEFAULT_CANDIDATES))
+    parser.add_argument(
+        "--candidate-sizes",
+        type=int,
+        nargs="+",
+        default=None,
+        help="explicit sizing nodes; required for --execute/--aggregate",
+    )
     parser.add_argument("--block-size", type=int, default=DEFAULT_BLOCK_SIZE)
     parser.add_argument("--per-sequence-seconds", type=float, default=0.25)
     return parser
@@ -1659,6 +1665,9 @@ def _parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     try:
+        if (args.execute or args.aggregate) and args.candidate_sizes is None:
+            raise ValueError("--execute/--aggregate require explicit --candidate-sizes")
+        candidate_sizes = tuple(DEFAULT_CANDIDATES if args.candidate_sizes is None else args.candidate_sizes)
         if args.execute or args.aggregate:
             if args.execution_commit is None:
                 raise ValueError(f"--{'execute' if args.execute else 'aggregate'} requires --execution-commit")
@@ -1676,7 +1685,7 @@ def main(argv: list[str] | None = None) -> int:
             assets,
             data,
             output_root=args.output_root,
-            candidates=tuple(args.candidate_sizes),
+            candidates=candidate_sizes,
             block_size=args.block_size,
             per_sequence_seconds=args.per_sequence_seconds,
         )

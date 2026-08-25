@@ -22,6 +22,7 @@ from ops.stage2.run_s204_formal import (
     G21_ARTIFACT,
     build_plan,
     execute_with_task_runtime,
+    main,
 )
 from param_importance_nlp.experiments import (
     AssetResolutionManifest,
@@ -114,6 +115,31 @@ def test_plan_only_is_six_cell_and_does_not_freeze_b_ref(
     assert plan["b_ref_status"] == "UNFROZEN_UNTIL_INDEPENDENT_SIZING_PASS"
     assert all(cell["final_sample_count_per_stream"] == "UNFROZEN" for cell in plan["cells"])
     assert all(tmp_path.as_posix() in cell["progress_path"] for cell in plan["cells"])
+
+
+@pytest.mark.parametrize("mode", ("--execute", "--aggregate"))
+def test_runtime_modes_require_explicit_candidate_sizes(
+    tmp_path: Path, mode: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    result = main(
+        [
+            "--g21-evidence",
+            str(tmp_path / "g21.json"),
+            "--asset-resolution",
+            str(tmp_path / "assets.json"),
+            "--data-range",
+            str(tmp_path / "data.json"),
+            "--output-root",
+            str(tmp_path / "output"),
+            mode,
+            "--data-root",
+            str(tmp_path),
+            "--execution-commit",
+            "a" * 40,
+        ]
+    )
+    assert result == 3
+    assert "require explicit --candidate-sizes" in capsys.readouterr().err
 
 
 def test_plan_rejects_missing_failed_gpu_exclusion(tmp_path: Path) -> None:

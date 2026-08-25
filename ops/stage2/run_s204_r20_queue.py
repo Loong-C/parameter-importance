@@ -9,6 +9,7 @@ retried; another pending cell may still use the newly idle GPU.
 from __future__ import annotations
 
 import argparse
+from dataclasses import dataclass
 from datetime import datetime, timezone
 import hashlib
 import json
@@ -20,6 +21,8 @@ import threading
 import time
 from typing import Any, Mapping, Sequence
 
+from param_importance_nlp.runtime import load_committed_task_artifact
+
 
 APPROVED_GPU_UUIDS = (
     "GPU-180ff767-885a-7dc9-c8a9-921d65a01bbd",
@@ -30,11 +33,329 @@ APPROVED_GPU_UUIDS = (
 EXCLUDED_GPU_UUID = "GPU-dc6cfc60-41dd-7bcf-ed09-b7deb5be342c"
 EXCLUDED_PCI = "0000:50:00.0"
 RUN_NAME = "formal-r20-g3-v5"
+EXPECTED_CANDIDATE_SAMPLE_COUNTS = (131072, 262144)
+EXPECTED_BLOCK_SIZE = 32
+EXPECTED_SEGMENT_START_POSITION = 81920
+EXPECTED_SEGMENT_END_POSITION_EXCLUSIVE = 344064
+
+
+@dataclass(frozen=True, slots=True)
+class _SizingBinding:
+    candidate_sizes: tuple[int, int]
+    amendment_ref: str
+    amendment_artifact_hash: str
+    block_size: int
+    segment_start_position: int
+    segment_end_position_exclusive: int
+    convergence_tolerance: float
+    normalized_l1_threshold: float
+    required_consecutive: int
+    complete_all_candidates: bool
+    optional_stopping: bool
+    resume_ref: str | None
+    reuse_prior_sizing_prefix: bool
 
 
 def _hash(value: Mapping[str, Any]) -> str:
     body = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(body.encode("utf-8")).hexdigest()
+
+
+def _canonical_artifact_hash(value: Mapping[str, Any]) -> str:
+    """Hash the canonical JSON wire bytes used by committed task artifacts."""
+
+    body = json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ) + "\n"
+    return hashlib.sha256(body.encode("utf-8")).hexdigest()
+
+
+def _normalize_candidate_sizes(values: Sequence[int]) -> tuple[int, int]:
+    """Require an explicit, strictly increasing two-node sizing contract."""
+
+    try:
+        normalized = tuple(int(value) for value in values)
+    except (TypeError, ValueError) as error:
+        raise ValueError("candidate sizes must be positive integers") from error
+    if len(normalized) != 2 or any(value <= 0 for value in normalized):
+        raise ValueError("r20 queue requires exactly two positive --candidate-sizes values")
+    if normalized[0] >= normalized[1]:
+        raise ValueError("--candidate-sizes must be strictly increasing")
+    return normalized
+
+
+def _load_mapping(path: Path, *, label: str) -> dict[str, Any]:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise ValueError(f"{label} cannot be loaded: {path}") from error
+    if not isinstance(value, dict):
+        raise ValueError(f"{label} must be a JSON object: {path}")
+    return value
+
+
+def _load_hash_bound_artifact(path: Path, *, label: str) -> dict[str, Any]:
+    value = _load_mapping(path, label=label)
+    return _verify_hash_bound_mapping(value, label=label)
+
+
+def _verify_hash_bound_mapping(value: Mapping[str, Any], *, label: str) -> dict[str, Any]:
+    declared = value.get("artifact_hash")
+    body = {key: item for key, item in value.items() if key != "artifact_hash"}
+    if not isinstance(declared, str) or _canonical_artifact_hash(body) != declared:
+        raise ValueError(f"{label} artifact_hash is invalid")
+    return dict(value)
+
+
+def _resolve_data_ref(data_root: Path, raw_ref: object, *, label: str) -> Path:
+    if not isinstance(raw_ref, str) or not raw_ref:
+        raise ValueError(f"{label} must be a non-empty workspace-relative ref")
+    root = data_root.resolve()
+    candidate = Path(raw_ref)
+    if not candidate.is_absolute():
+        candidate = root / candidate
+    resolved = candidate.resolve()
+    try:
+        resolved.relative_to(root)
+    except ValueError as error:
+        raise ValueError(f"{label} escapes data root: {raw_ref!r}") from error
+    return resolved
+
+
+def _candidate_sizes_from_bound_plans(
+    data_root: Path,
+    environments: Mapping[str, Path],
+    requested: Sequence[int],
+) -> _SizingBinding:
+    """Cross-check CLI nodes against every bound plan and its amendment.
+
+    The CLI is only a selector.  A queue may proceed only when every formal
+    environment's committed sizing plan and its round amendment agree with
+    the selector, so an old default cannot silently become an r23 launch.
+    """
+
+    candidate_sizes = _normalize_candidate_sizes(requested)
+    observed: set[tuple[int, int]] = set()
+    amendment_refs: set[str] = set()
+    amendment_hashes: set[str] = set()
+    binding: _SizingBinding | None = None
+    for cell_id, environment_path in sorted(environments.items()):
+        environment = _load_mapping(environment_path, label=f"runtime environment {cell_id}")
+        evidence_refs = environment.get("evidence_refs")
+        if not isinstance(evidence_refs, Mapping):
+            raise ValueError(f"runtime environment {cell_id} has no evidence_refs")
+        sizing_ref = evidence_refs.get("stage2_reference_sizing_plan")
+        sizing_path = _resolve_data_ref(
+            data_root,
+            sizing_ref,
+            label=f"{cell_id}.stage2_reference_sizing_plan",
+        )
+        sizing_commit_ref = sizing_path.relative_to(data_root.resolve()).as_posix()
+        try:
+            loaded_plan = load_committed_task_artifact(
+                data_root,
+                sizing_commit_ref,
+                require_formal=True,
+            )
+        except (OSError, TypeError, ValueError) as error:
+            raise ValueError(f"sizing plan {cell_id} TaskArtifact commit is invalid") from error
+        if loaded_plan.identity.artifact_kind != "reference_sizing_plan":
+            raise ValueError(f"sizing plan {cell_id} TaskArtifact kind is invalid")
+        plan = _verify_hash_bound_mapping(loaded_plan.payload, label=f"sizing plan {cell_id}")
+        if plan.get("schema_version") != "stage2-reference-sizing-plan-v1":
+            raise ValueError(f"sizing plan {cell_id} schema is not formal v1")
+        raw_plan_sizes = plan.get("candidate_sample_counts")
+        if not isinstance(raw_plan_sizes, list):
+            raise ValueError(f"sizing plan {cell_id} has no candidate_sample_counts")
+        try:
+            plan_sizes = _normalize_candidate_sizes(raw_plan_sizes)
+        except ValueError as error:
+            raise ValueError(f"sizing plan {cell_id} candidate_sample_counts invalid") from error
+        if plan_sizes != candidate_sizes:
+            raise ValueError(
+                f"candidate sizes drift for {cell_id}: CLI={list(candidate_sizes)} plan={list(plan_sizes)}"
+            )
+        plan_contract = (
+            plan.get("convergence_tolerance"),
+            plan.get("required_consecutive"),
+            plan.get("require_terminal_convergence"),
+        )
+        expected_plan_contract = (0.02, 1, True)
+        if plan_contract != expected_plan_contract:
+            raise ValueError(
+                f"sizing plan {cell_id} convergence contract drift: "
+                f"observed={plan_contract} expected={expected_plan_contract}"
+            )
+        if plan.get("block_size") != EXPECTED_BLOCK_SIZE:
+            raise ValueError(f"sizing plan {cell_id} block_size is not {EXPECTED_BLOCK_SIZE}")
+        plan_segment = (
+            plan.get("draw_start_position"),
+            plan.get("draw_end_position_exclusive"),
+            plan.get("final_stream_start_position"),
+            plan.get("final_stream_end_position_exclusive"),
+        )
+        expected_segment = (
+            EXPECTED_SEGMENT_START_POSITION,
+            EXPECTED_SEGMENT_END_POSITION_EXCLUSIVE,
+            EXPECTED_SEGMENT_START_POSITION,
+            EXPECTED_SEGMENT_END_POSITION_EXCLUSIVE,
+        )
+        if plan_segment != expected_segment:
+            raise ValueError(
+                f"sizing plan {cell_id} segment drift: observed={plan_segment} expected={expected_segment}"
+            )
+        amendment_ref = plan.get("round_manifest_ref")
+        amendment_path = _resolve_data_ref(
+            data_root,
+            amendment_ref,
+            label=f"{cell_id}.round_manifest_ref",
+        )
+        amendment_relative_ref = amendment_path.relative_to(data_root.resolve()).as_posix()
+        amendment_refs.add(amendment_relative_ref)
+        amendment = _load_hash_bound_artifact(amendment_path, label=f"round amendment {cell_id}")
+        declared_amendment_hash = amendment.get("artifact_hash")
+        if not isinstance(declared_amendment_hash, str):
+            raise ValueError(f"round amendment {cell_id} artifact_hash is missing")
+        amendment_hashes.add(declared_amendment_hash)
+        if amendment.get("schema_version") != "stage2-reference-sizing-amendment-v1":
+            raise ValueError(f"round amendment {cell_id} schema is not amendment v1")
+        if amendment.get("round_id") != "r23" or amendment.get("amendment_id") != "r23-amend-r1":
+            raise ValueError(f"round amendment {cell_id} is not the r23-amend-r1 contract")
+        sizing = amendment.get("sizing")
+        if not isinstance(sizing, Mapping):
+            raise ValueError(f"round amendment {cell_id} has no sizing object")
+        amendment_contract = (
+            sizing.get("normalized_l1_threshold"),
+            sizing.get("required_consecutive"),
+            sizing.get("complete_all_candidates"),
+            sizing.get("optional_stopping"),
+            sizing.get("block_size"),
+            sizing.get("resume_ref"),
+            sizing.get("reuse_prior_sizing_prefix"),
+        )
+        expected_amendment_contract = (0.02, 1, True, False, EXPECTED_BLOCK_SIZE, None, False)
+        if amendment_contract != expected_amendment_contract:
+            raise ValueError(
+                f"round amendment {cell_id} sizing contract drift: "
+                f"observed={amendment_contract} expected={expected_amendment_contract}"
+            )
+        amendment_segment = (
+            sizing.get("segment_start_position"),
+            sizing.get("segment_end_position_exclusive"),
+            sizing.get("prior_consumed_end_position"),
+        )
+        expected_amendment_segment = (
+            EXPECTED_SEGMENT_START_POSITION,
+            EXPECTED_SEGMENT_END_POSITION_EXCLUSIVE,
+            EXPECTED_SEGMENT_START_POSITION,
+        )
+        if amendment_segment != expected_amendment_segment:
+            raise ValueError(
+                f"round amendment {cell_id} segment drift: observed={amendment_segment} "
+                f"expected={expected_amendment_segment}"
+            )
+        amendment_streams = sizing.get("final_stream_segments")
+        if not isinstance(amendment_streams, Mapping):
+            raise ValueError(f"round amendment {cell_id} final_stream_segments are missing")
+        for stream_name in ("reference_A", "reference_B"):
+            stream_segment = amendment_streams.get(stream_name)
+            if not isinstance(stream_segment, Mapping) or (
+                stream_segment.get("start_position") != EXPECTED_SEGMENT_START_POSITION
+                or stream_segment.get("end_position_exclusive") != EXPECTED_SEGMENT_END_POSITION_EXCLUSIVE
+            ):
+                raise ValueError(f"round amendment {cell_id} {stream_name} segment drift")
+        raw_amendment_sizes = sizing.get("candidate_sample_counts")
+        if not isinstance(raw_amendment_sizes, list):
+            raise ValueError(f"round amendment {cell_id} has no candidate_sample_counts")
+        try:
+            amendment_sizes = _normalize_candidate_sizes(raw_amendment_sizes)
+        except ValueError as error:
+            raise ValueError(f"round amendment {cell_id} candidate_sample_counts invalid") from error
+        if amendment_sizes != EXPECTED_CANDIDATE_SAMPLE_COUNTS:
+            raise ValueError(
+                f"round amendment {cell_id} candidate_sample_counts are not "
+                f"{list(EXPECTED_CANDIDATE_SAMPLE_COUNTS)}"
+            )
+        if amendment_sizes != plan_sizes:
+            raise ValueError(
+                f"sizing plan/amendment drift for {cell_id}: plan={list(plan_sizes)} "
+                f"amendment={list(amendment_sizes)}"
+            )
+        current_binding = _SizingBinding(
+            candidate_sizes=plan_sizes,
+            amendment_ref=amendment_relative_ref,
+            amendment_artifact_hash=declared_amendment_hash,
+            block_size=EXPECTED_BLOCK_SIZE,
+            segment_start_position=EXPECTED_SEGMENT_START_POSITION,
+            segment_end_position_exclusive=EXPECTED_SEGMENT_END_POSITION_EXCLUSIVE,
+            convergence_tolerance=float(plan_contract[0]),
+            normalized_l1_threshold=float(amendment_contract[0]),
+            required_consecutive=int(plan_contract[1]),
+            complete_all_candidates=bool(amendment_contract[2]),
+            optional_stopping=bool(amendment_contract[3]),
+            resume_ref=amendment_contract[5],
+            reuse_prior_sizing_prefix=bool(amendment_contract[6]),
+        )
+        if binding is not None and current_binding != binding:
+            raise ValueError(f"six-cell sizing bindings disagree for {cell_id}")
+        binding = current_binding
+        observed.add(plan_sizes)
+    if len(observed) != 1:
+        raise ValueError(f"six-cell sizing plans disagree: {sorted(observed)}")
+    if len(amendment_refs) != 1:
+        raise ValueError(f"six-cell sizing plans disagree on round_manifest_ref: {sorted(amendment_refs)}")
+    if len(amendment_hashes) != 1:
+        raise ValueError(f"six-cell sizing plans disagree on amendment artifact_hash: {sorted(amendment_hashes)}")
+    if binding is None:
+        raise ValueError("six-cell sizing plans are missing")
+    return binding
+
+
+def _queue_manifest(
+    *,
+    run_id: str,
+    execution_commit: str,
+    sizing_binding: _SizingBinding,
+    order: Sequence[str],
+    estimates: Mapping[str, float],
+    cells: Mapping[str, Path],
+    python: str,
+    output_root: Path,
+) -> dict[str, Any]:
+    """Build the immutable queue identity, including the sizing selector."""
+
+    return {
+        "schema_version": "stage2-s204-r20-queue-v1",
+        "run_name": RUN_NAME,
+        "run_id": run_id,
+        "execution_commit": execution_commit,
+        "approved_gpu_uuids": list(APPROVED_GPU_UUIDS),
+        "excluded_gpu_uuid": EXCLUDED_GPU_UUID,
+        "excluded_pci": EXCLUDED_PCI,
+        "candidate_sample_counts": list(sizing_binding.candidate_sizes),
+        "round_amendment_ref": sizing_binding.amendment_ref,
+        "round_amendment_artifact_hash": sizing_binding.amendment_artifact_hash,
+        "block_size": sizing_binding.block_size,
+        "segment_start_position": sizing_binding.segment_start_position,
+        "segment_end_position_exclusive": sizing_binding.segment_end_position_exclusive,
+        "convergence_tolerance": sizing_binding.convergence_tolerance,
+        "normalized_l1_threshold": sizing_binding.normalized_l1_threshold,
+        "required_consecutive": sizing_binding.required_consecutive,
+        "complete_all_candidates": sizing_binding.complete_all_candidates,
+        "optional_stopping": sizing_binding.optional_stopping,
+        "resume_ref": sizing_binding.resume_ref,
+        "reuse_prior_sizing_prefix": sizing_binding.reuse_prior_sizing_prefix,
+        "cell_order_lpt": list(order),
+        "cell_estimates_seconds": dict(estimates),
+        "cell_configs": {cell: path.as_posix() for cell, path in cells.items()},
+        "python": python,
+        "retry_policy": "none",
+        "output_root": output_root.as_posix(),
+    }
 
 
 def _append(path: Path, payload: Mapping[str, Any]) -> None:
@@ -149,10 +470,12 @@ def _child_command(
     data_root: Path,
     output_root: Path,
     runtime_environment: Path,
+    candidate_sizes: Sequence[int],
     heartbeat_seconds: float,
 ) -> list[str]:
     if gpu_uuid not in APPROVED_GPU_UUIDS or gpu_uuid == EXCLUDED_GPU_UUID:
         raise ValueError(f"GPU is not an approved r20 UUID: {gpu_uuid}")
+    normalized_candidate_sizes = _normalize_candidate_sizes(candidate_sizes)
     return [
         python,
         str(launcher),
@@ -178,6 +501,10 @@ def _child_command(
         gpu_uuid,
         "--heartbeat-seconds",
         str(heartbeat_seconds),
+        "--candidate-sizes",
+        *(str(value) for value in normalized_candidate_sizes),
+        "--block-size",
+        str(EXPECTED_BLOCK_SIZE),
         "--execute",
     ]
 
@@ -189,6 +516,12 @@ def run_queue(args: argparse.Namespace) -> int:
         raise ValueError("--execution-commit must be 40 lowercase hexadecimal characters")
     cells = _parse_cell_config(args.cell_config)
     environments = _parse_cell_environment(args.runtime_environment, cells)
+    sizing_binding = _candidate_sizes_from_bound_plans(
+        Path(args.data_root).resolve(),
+        environments,
+        args.candidate_sizes,
+    )
+    candidate_sizes = sizing_binding.candidate_sizes
     estimates = _parse_estimates(args.cell_estimate, cells)
     order = lpt_order(estimates)
     # Do not use Path.resolve(): the formal venv's ``python`` may be a
@@ -204,21 +537,16 @@ def run_queue(args: argparse.Namespace) -> int:
     queue_root = Path(args.queue_root).resolve() / RUN_NAME / run_id
     queue_root.mkdir(parents=True, exist_ok=False)
     event_path = queue_root / "queue-events.jsonl"
-    manifest = {
-        "schema_version": "stage2-s204-r20-queue-v1",
-        "run_name": RUN_NAME,
-        "run_id": run_id,
-        "execution_commit": args.execution_commit,
-        "approved_gpu_uuids": list(APPROVED_GPU_UUIDS),
-        "excluded_gpu_uuid": EXCLUDED_GPU_UUID,
-        "excluded_pci": EXCLUDED_PCI,
-        "cell_order_lpt": list(order),
-        "cell_estimates_seconds": estimates,
-        "cell_configs": {cell: path.as_posix() for cell, path in cells.items()},
-        "python": python,
-        "retry_policy": "none",
-        "output_root": output_root.as_posix(),
-    }
+    manifest = _queue_manifest(
+        run_id=run_id,
+        execution_commit=args.execution_commit,
+        sizing_binding=sizing_binding,
+        order=order,
+        estimates=estimates,
+        cells=cells,
+        python=python,
+        output_root=output_root,
+    )
     _publish_once(queue_root / "queue-manifest.json", manifest)
     _append(event_path, {"event": "QUEUE_STARTED", "run_id": run_id, **manifest})
 
@@ -271,6 +599,7 @@ def run_queue(args: argparse.Namespace) -> int:
                     data_root=Path(args.data_root).resolve(),
                     output_root=output_root,
                     runtime_environment=environments[cell_id],
+                    candidate_sizes=candidate_sizes,
                     heartbeat_seconds=args.child_heartbeat_seconds,
                 )
                 stdout = (cell_root / "stdout.log").open("x", encoding="utf-8")
@@ -383,6 +712,13 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--s204-launcher", type=Path, default=Path(__file__).with_name("run_s204_formal.py"))
     parser.add_argument("--python", default=sys.executable)
+    parser.add_argument(
+        "--candidate-sizes",
+        type=int,
+        nargs="+",
+        required=True,
+        help="exactly two explicit sizing nodes; must match every bound plan and amendment",
+    )
     parser.add_argument("--run-id")
     parser.add_argument("--child-heartbeat-seconds", type=float, default=30.0)
     parser.add_argument("--heartbeat-seconds", type=float, default=30.0)
