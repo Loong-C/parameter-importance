@@ -104,6 +104,12 @@ def _parse_cell_environment(values: Sequence[str], cells: Mapping[str, Path]) ->
     return result
 
 
+def _absolute_without_resolving(path: str | os.PathLike[str]) -> str:
+    """Make a launcher path absolute while preserving symlink spelling."""
+
+    return os.path.abspath(os.fspath(path))
+
+
 def lpt_order(cell_estimates: Mapping[str, float]) -> tuple[str, ...]:
     """Return deterministic longest-processing-time-first cell order."""
 
@@ -185,7 +191,11 @@ def run_queue(args: argparse.Namespace) -> int:
     environments = _parse_cell_environment(args.runtime_environment, cells)
     estimates = _parse_estimates(args.cell_estimate, cells)
     order = lpt_order(estimates)
-    python = str(Path(args.python).resolve())
+    # Do not use Path.resolve(): the formal venv's ``python`` may be a
+    # symlink, and resolving it can escape the venv into a system interpreter
+    # without the approved dependencies.  The lexical absolute path is also
+    # recorded in the manifest and each immutable cell PID command.
+    python = _absolute_without_resolving(args.python)
     launcher = Path(args.s204_launcher).resolve()
     output_root = Path(args.output_root).resolve()
     if RUN_NAME not in output_root.parts:
@@ -205,6 +215,7 @@ def run_queue(args: argparse.Namespace) -> int:
         "cell_order_lpt": list(order),
         "cell_estimates_seconds": estimates,
         "cell_configs": {cell: path.as_posix() for cell, path in cells.items()},
+        "python": python,
         "retry_policy": "none",
         "output_root": output_root.as_posix(),
     }

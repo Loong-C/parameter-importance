@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import os
 
 import pytest
 
@@ -10,6 +11,7 @@ from ops.stage2.run_s204_r20_queue import (
     APPROVED_GPU_UUIDS,
     EXCLUDED_GPU_UUID,
     _child_command,
+    _absolute_without_resolving,
     _parse_cell_config,
     _parse_cell_environment,
     lpt_order,
@@ -73,3 +75,14 @@ def test_runtime_environment_is_bound_one_to_one_to_cell() -> None:
     assert set(environments) == set(cells)
     with pytest.raises(ValueError, match="one runtime environment per cell"):
         _parse_cell_environment(values[:-1], cells)
+
+
+def test_python_path_keeps_venv_symlink_spelling(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # Simulate a venv/bin/python symlink whose target is the system interpreter;
+    # this remains portable on hosts where creating symlinks needs privileges.
+    venv_python = tmp_path / "venv" / "bin" / "python"
+    system_python = tmp_path / "system-python"
+    monkeypatch.setattr(Path, "resolve", lambda _self: system_python)
+    observed = _absolute_without_resolving(venv_python)
+    assert observed == os.path.abspath(os.fspath(venv_python))
+    assert observed != os.path.abspath(os.fspath(system_python))
