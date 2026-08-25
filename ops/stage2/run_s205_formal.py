@@ -26,7 +26,7 @@ _REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 if str(_REPOSITORY_ROOT / "src") not in sys.path:
     sys.path.insert(0, str(_REPOSITORY_ROOT / "src"))
 
-from param_importance_nlp.contracts.jsonio import load_canonical_json, write_canonical_json
+from param_importance_nlp.contracts.jsonio import canonical_json_hash, load_canonical_json, write_canonical_json
 from param_importance_nlp.experiments.stage2_s25_formal import (
     APPROVED_GPU_UUIDS,
     EXPECTED_CELL_IDS,
@@ -99,6 +99,57 @@ def _write_status(path: Path, payload: Mapping[str, object]) -> None:
     write_canonical_json(path, value)
 
 
+_S205_GATE_REQUIREMENTS = (
+    "same_total_sample_pool_B_for_raw_u_double",
+    "disjoint_double_halves_each_B_over_2",
+    "m2_u_equals_double_with_stage1_tolerance",
+    "complete_batch_mean_gradient_invariant_across_M",
+    "signed_u_and_double_outputs_not_clamped",
+    "gradient_formula_sample_token_and_memory_costs_recorded",
+    "state_summary_unchanged_before_after",
+    "failure_retry_replays_same_mapping_and_atomic_publish",
+    "streaming_reducer_matches_offline_recompute",
+    "concurrent_retry_deduplication_and_deterministic_reduction",
+    "reference_topk_and_cross_M_summaries_retained_before_release",
+)
+
+
+def _write_once(path: Path, payload: Mapping[str, object]) -> None:
+    if path.exists():
+        existing = load_canonical_json(path)
+        if existing != dict(payload):
+            raise S25ExecutionBlocked(f"S205_OUTPUT_CONFLICT:{path}")
+        return
+    write_canonical_json(path, dict(payload))
+
+
+def _gate_only(args: argparse.Namespace) -> dict[str, object]:
+    """Publish plan-independent runner readiness without running data."""
+
+    root = args.data_root.resolve()
+    plan = load_s25_rebind_plan(root, args.s205_rebind_ref)
+    operations = _logical(root, args.operations_root, field="operations_root", allow_missing=True)
+    operations.mkdir(parents=True, exist_ok=True)
+    payload: dict[str, object] = {
+        "schema_version": "stage2-s205-runner-gate-readiness-v1",
+        "gate_id": "stage2.G2.4a",
+        "status": "READY_CONTROL_PLANE",
+        "formal_eligible": False,
+        "execution_allowed": False,
+        "b_m_r_bound": False,
+        "experiment_plan_required_for_data_execution": True,
+        "gate_requirements": list(_S205_GATE_REQUIREMENTS),
+        "rebind_ref": str(plan.get("_rebind_ref", args.s205_rebind_ref)),
+        "rebind_hash": plan.get("artifact_hash"),
+        "g23_evaluation_ref": plan.get("_g23_ref"),
+        "g23_evaluation_hash": plan.get("g23_evaluation_hash"),
+        "reason": "S205_DATA_EXECUTION_DEFERRED_UNTIL_FROZEN_EXPERIMENT_PLAN",
+    }
+    payload["artifact_hash"] = canonical_json_hash(payload)
+    _write_once(operations / "g2.4a-runner-readiness.json", payload)
+    return payload
+
+
 class _S205DynamicLPTQueue:
     """Deterministic four-GPU queue for the six frozen S2.5 cells."""
 
@@ -152,6 +203,8 @@ class _S205DynamicLPTQueue:
 
 
 def _preflight(args: argparse.Namespace) -> dict[str, object]:
+    if not args.sampling_plan_ref or not args.experiment_plan_ref or not args.artifact_root:
+        raise S25ExecutionBlocked("S205_FORMAL_PLAN_REFS_REQUIRED")
     root = args.data_root.resolve()
     plan = load_s25_rebind_plan(root, args.s205_rebind_ref)
     if args.artifact_root != plan.get("s205_output_root"):
@@ -313,13 +366,14 @@ def _parser() -> argparse.ArgumentParser:
     action.add_argument("--preflight", action="store_true")
     action.add_argument("--execute", action="store_true")
     action.add_argument("--worker", action="store_true")
+    action.add_argument("--gate-only", action="store_true")
     action.add_argument("--status", action="store_true")
     action.add_argument("--wait", action="store_true")
     parser.add_argument("--data-root", type=Path, required=True)
     parser.add_argument("--s205-rebind-ref", required=True)
-    parser.add_argument("--sampling-plan-ref", required=True)
-    parser.add_argument("--experiment-plan-ref", required=True)
-    parser.add_argument("--artifact-root", required=True)
+    parser.add_argument("--sampling-plan-ref")
+    parser.add_argument("--experiment-plan-ref")
+    parser.add_argument("--artifact-root")
     parser.add_argument("--operations-root", required=True)
     parser.add_argument("--run-id", default="s205-formal-g24a")
     parser.add_argument("--gpu-inventory-json", type=Path)
@@ -339,6 +393,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             return _status(args, wait=False)
         if args.wait:
             return _status(args, wait=True)
+        if args.gate_only:
+            print(json.dumps(_gate_only(args), ensure_ascii=False, sort_keys=True, indent=2))
+            return 0
         if args.preflight:
             print(json.dumps(_preflight(args), ensure_ascii=False, sort_keys=True, indent=2))
             return 0

@@ -30,7 +30,7 @@ from param_importance_nlp.experiments.stage2_s25_formal import (
 )
 from param_importance_nlp.experiments.sampling import SamplingPlan, SamplingUniverse
 from param_importance_nlp.experiments.stage2_formal import FormalExperimentPlan
-from ops.stage2.run_s205_formal import _S205DynamicLPTQueue
+from ops.stage2.run_s205_formal import _S205DynamicLPTQueue, _gate_only
 
 
 G3_REF = "evidence/stage0/tasks/g3-v5/commits/asset_resolution.json"
@@ -437,3 +437,35 @@ def test_s205_dynamic_lpt_queue_no_wave_barrier_and_no_overlap() -> None:
     assert [cell_id for cell_id, _ in dispatches] == list(dict.fromkeys(cell_id for cell_id, _ in dispatches))
     assert {cell_id for cell_id, _ in dispatches} == set(EXPECTED_CELL_IDS)
     assert {gpu_uuid for _, gpu_uuid in dispatches} <= set(APPROVED_GPU_UUIDS)
+
+
+def test_s205_gate_only_readiness_never_binds_or_runs_b_m_r(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import argparse
+
+    import ops.stage2.run_s205_formal as launcher
+
+    monkeypatch.setattr(
+        launcher,
+        "load_s25_rebind_plan",
+        lambda _root, _ref: {
+            "_rebind_ref": "evidence/stage2/s205-rebind.json",
+            "artifact_hash": "a" * 64,
+            "_g23_ref": "evidence/stage2/g23/evaluation.json",
+            "g23_evaluation_hash": "b" * 64,
+        },
+    )
+    args = argparse.Namespace(
+        data_root=tmp_path,
+        s205_rebind_ref="evidence/stage2/s205-rebind.json",
+        operations_root="operations/stage2/s205-gate-only",
+    )
+    payload = _gate_only(args)
+    assert payload["status"] == "READY_CONTROL_PLANE"
+    assert payload["formal_eligible"] is False
+    assert payload["execution_allowed"] is False
+    assert payload["b_m_r_bound"] is False
+    assert payload["experiment_plan_required_for_data_execution"] is True
+    assert not (tmp_path / "operations/stage2/s205-gate-only" / "status.json").exists()
+    assert (tmp_path / "operations/stage2/s205-gate-only" / "g2.4a-runner-readiness.json").is_file()
