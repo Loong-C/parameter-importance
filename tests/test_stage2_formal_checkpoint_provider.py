@@ -152,7 +152,6 @@ def _publish_selected_cell(
         "model_id": model_id,
         "training_stage": stage,
         "registry_hash": "a" * 64,
-        "config_hash": source_config_hash,
         "source_s203_manifest_ref": registry_source_ref,
         "source_s203_manifest_sha256": hashlib.sha256(
             (root / registry_source_ref).read_bytes()

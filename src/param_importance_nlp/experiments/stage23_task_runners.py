@@ -1628,7 +1628,6 @@ def _load_formal_selected_checkpoint(
         or registry.get("model_id") != model_id
         or registry.get("training_stage") != row["training_stage"]
         or registry.get("registry_hash") != registry_hash
-        or registry.get("config_hash") != source_config_hash
     ):
         raise ValueError("FORMAL_CHECKPOINT_REGISTRY_IDENTITY_MISMATCH")
     selected_root = _validate_formal_checkpoint_root(
