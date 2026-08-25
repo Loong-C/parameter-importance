@@ -931,6 +931,29 @@ class S25FormalRunner:
     artifact_root: Path
     m2_tolerance: float = S25_M2_TOLERANCE
 
+    def __post_init__(self) -> None:
+        expected_execution = self.rebind_plan.get("formal_execution_hash")
+        expected_ref = self.rebind_plan.get("formal_execution_ref")
+        if not isinstance(expected_execution, str) or not isinstance(expected_ref, str):
+            raise S25ExecutionBlocked("S205_REBIND_FORMAL_EXECUTION_BINDING_MISSING")
+        if self.experiment_plan.get("schema_version") == S205_SWEEP_SCHEMA:
+            validated = validate_s205_development_sweep(
+                self.experiment_plan,
+                sampling=self.sampling_plan,
+            )
+            execution_hash = validated.get("execution_evidence_hash")
+            refs = validated.get("source_artifact_refs")
+        else:
+            from .stage2_formal import FormalExperimentPlan
+
+            parsed = FormalExperimentPlan.from_mapping(self.experiment_plan)
+            if parsed.sampling_plan_hash != self.sampling_plan.digest:
+                raise S25ExecutionBlocked("S205_EXPERIMENT_SAMPLING_HASH_MISMATCH")
+            execution_hash = parsed.execution_evidence_hash
+            refs = list(parsed.source_artifact_refs)
+        if execution_hash != expected_execution or not isinstance(refs, list) or expected_ref not in refs:
+            raise S25ExecutionBlocked("S205_EXPERIMENT_FORMAL_EXECUTION_MISMATCH")
+
     def run_cell(self, cell_id: str) -> dict[str, object]:
         if cell_id not in EXPECTED_CELL_IDS:
             raise S25ExecutionBlocked("S205_CELL_UNKNOWN")
@@ -1111,6 +1134,8 @@ def preflight_s25(
         pilot_draw_count = experiment["pilot_draw_count"]
         candidate_batch_sizes = experiment["candidate_batch_sizes"]
         candidate_microbatch_counts = experiment["candidate_microbatch_counts"]
+        execution_hash = experiment["execution_evidence_hash"]
+        source_refs = experiment["source_artifact_refs"]
     else:
         from .stage2_formal import FormalExperimentPlan
 
@@ -1120,6 +1145,14 @@ def preflight_s25(
         pilot_draw_count = parsed.batch_size * parsed.repetitions
         candidate_batch_sizes = [parsed.batch_size]
         candidate_microbatch_counts = list(parsed.microbatch_counts)
+        execution_hash = parsed.execution_evidence_hash
+        source_refs = list(parsed.source_artifact_refs)
+    if (
+        execution_hash != rebind.get("formal_execution_hash")
+        or not isinstance(source_refs, list)
+        or rebind.get("formal_execution_ref") not in source_refs
+    ):
+        raise S25ExecutionBlocked("S205_EXPERIMENT_FORMAL_EXECUTION_MISMATCH")
     return {
         "schema_version": "stage2-s205-formal-preflight-v1",
         "status": "READY",

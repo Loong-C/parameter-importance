@@ -390,8 +390,12 @@ def test_s25_preflight_is_read_only_and_binds_sampling_plan(tmp_path: Path) -> N
         microbatch_counts=(2, 4),
         repetitions=2,
         sampling_plan_hash=sampling.digest,
-        execution_evidence_hash="f" * 64,
-        source_artifact_refs=("evidence/stage2/s2.2.json", "evidence/stage2/s2.3.json"),
+        execution_evidence_hash=rebind["formal_execution_hash"],
+        source_artifact_refs=(
+            "evidence/stage2/s2.2.json",
+            "evidence/stage2/s2.3.json",
+            rebind["formal_execution_ref"],
+        ),
         selection_basis="preregistered_development",
     )
     plan_path = tmp_path / "evidence/stage2/experiment-plan.json"
