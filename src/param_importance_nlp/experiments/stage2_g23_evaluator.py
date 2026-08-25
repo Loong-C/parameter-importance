@@ -2066,7 +2066,7 @@ def _delta_sci(
             computed_signal[endpoint][count] = signal
             computed_noise[endpoint][count] = noise
         state_digest = (
-            canonical_json_hash({"checkpoint_schema": _BoundedCheckpointStore.schema_version, "plan_hash": plan.get("sizing_plan_hash"), "sample_count": count, "moments_hash": _bounded_moments_digest(moments)})
+            canonical_json_hash({"checkpoint_schema": _BoundedCheckpointStore.schema_version, "plan_hash": plan.get("artifact_hash"), "sample_count": count, "moments_hash": _bounded_moments_digest(moments)})
             if bounded else _ReferenceSnapshotStore._state_digest(state)
         )
         shard_refs_hash = canonical_json_hash([]) if bounded else canonical_json_hash([
