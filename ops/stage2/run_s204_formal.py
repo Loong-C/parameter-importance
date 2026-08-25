@@ -1659,6 +1659,13 @@ def _parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     try:
+        if args.execute or args.aggregate:
+            if args.execution_commit is None:
+                raise ValueError(f"--{'execute' if args.execute else 'aggregate'} requires --execution-commit")
+            # Validate before loading/publishing a plan or entering TaskRuntime;
+            # the cell/aggregate records must never be produced by a dirty or
+            # attached checkout.
+            _validate_execution_lineage(args.execution_commit)
         g21_root = args.data_root if (args.execute or args.aggregate) else None
         # Always consume the canonical formal handoff loader.  In execute and
         # aggregate mode it additionally re-hashes the bound raw smoke report.

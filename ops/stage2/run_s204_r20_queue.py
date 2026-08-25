@@ -164,6 +164,9 @@ def run_queue(args: argparse.Namespace) -> int:
     order = lpt_order(estimates)
     python = str(Path(args.python).resolve())
     launcher = Path(args.s204_launcher).resolve()
+    output_root = Path(args.output_root).resolve()
+    if RUN_NAME not in output_root.parts:
+        raise ValueError(f"r20 output root must be under a {RUN_NAME} directory")
     run_id = args.run_id or datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     queue_root = Path(args.queue_root).resolve() / RUN_NAME / run_id
     queue_root.mkdir(parents=True, exist_ok=False)
@@ -180,7 +183,7 @@ def run_queue(args: argparse.Namespace) -> int:
         "cell_estimates_seconds": estimates,
         "cell_configs": {cell: path.as_posix() for cell, path in cells.items()},
         "retry_policy": "none",
-        "output_root": Path(args.output_root).resolve().as_posix(),
+        "output_root": output_root.as_posix(),
     }
     _publish_once(queue_root / "queue-manifest.json", manifest)
     _append(event_path, {"event": "QUEUE_STARTED", "run_id": run_id, **manifest})
@@ -232,7 +235,7 @@ def run_queue(args: argparse.Namespace) -> int:
                     asset_resolution=Path(args.asset_resolution).resolve(),
                     data_range=Path(args.data_range).resolve(),
                     data_root=Path(args.data_root).resolve(),
-                    output_root=Path(args.output_root).resolve(),
+                    output_root=output_root,
                     runtime_environment=Path(args.runtime_environment).resolve(),
                     heartbeat_seconds=args.child_heartbeat_seconds,
                 )
@@ -244,7 +247,18 @@ def run_queue(args: argparse.Namespace) -> int:
                     stdout=stdout,
                     stderr=stderr,
                     start_new_session=True,
-                    env={**os.environ, "CUDA_VISIBLE_DEVICES": gpu_uuid},
+                    env={
+                        **os.environ,
+                        "CUDA_VISIBLE_DEVICES": gpu_uuid,
+                        "PYTHONPATH": os.pathsep.join(
+                            item
+                            for item in (
+                                str(launcher.parents[2] / "src"),
+                                os.environ.get("PYTHONPATH", ""),
+                            )
+                            if item
+                        ),
+                    },
                     text=True,
                 )
                 stdout.close()
