@@ -176,6 +176,12 @@ def test_formal_batch_is_capped_at_public_block_size(monkeypatch: pytest.MonkeyP
     provider.gradient(_draws(33))
     assert len(calls) == 5  # 33 draws exceed the 32-draw formal cap
     assert provider._FORMAL_BATCH_MAX_DRAWS == 32
+    assert provider._FORMAL_BATCH_MAX_GRAPH_DRAWS == 4
+
+
+def test_formal_graph_chunk_cannot_be_configured_above_memory_cap() -> None:
+    with pytest.raises(ValueError, match="FORMAL_BATCH_CHUNK_SIZE_INVALID"):
+        _provider(_TinyPythia(), _resolver(), batched=True, formal_chunk_size=5)
 
 
 def test_preregistration_and_formal_runner_bind_fp32_main_gradients() -> None:

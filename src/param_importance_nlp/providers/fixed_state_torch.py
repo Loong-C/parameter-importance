@@ -535,6 +535,11 @@ class TorchFixedStateGradientProvider:
     # adapters (including custom modules with stochastic forwards) use the
     # generic bounded path below.
     _FORMAL_BATCH_MAX_DRAWS = 32
+    # Pythia's vocabulary projection makes graph memory scale sharply with
+    # this dimension.  Four sequences is the measured worst-case contract on
+    # the formal 31M path; larger values must be rejected rather than silently
+    # turning the opt-in feature into the old multi-GB graph.
+    _FORMAL_BATCH_MAX_GRAPH_DRAWS = 4
     _FORMAL_RESOLVER_MODULE = "param_importance_nlp.providers.pythia_mmap"
     _FORMAL_RESOLVER_NAME = "PythiaMMapFrozenSampleResolver"
     _FORMAL_METADATA_VERSION = "pythia-mmap-frozen-sample-metadata-v1"
@@ -570,7 +575,7 @@ class TorchFixedStateGradientProvider:
             raise ValueError("FIXED_STATE_FORMAL_BATCHED_REQUIRES_FLOAT32_OUTPUT")
         if isinstance(formal_batch_chunk_size, bool) or not isinstance(
             formal_batch_chunk_size, int
-        ) or not 0 < formal_batch_chunk_size <= self._FORMAL_BATCH_MAX_DRAWS:
+        ) or not 0 < formal_batch_chunk_size <= self._FORMAL_BATCH_MAX_GRAPH_DRAWS:
             raise ValueError("FIXED_STATE_FORMAL_BATCH_CHUNK_SIZE_INVALID")
         for field_name in (
             "resolver_id",
