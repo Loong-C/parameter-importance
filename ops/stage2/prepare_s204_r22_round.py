@@ -27,7 +27,7 @@ SEGMENT_END_POSITION_EXCLUSIVE = SEGMENT_START_POSITION + CANDIDATE_SAMPLE_COUNT
 BLOCK_SIZE = 32
 NORMALIZED_L1_THRESHOLD = 0.02
 REQUIRED_CONSECUTIVE = 1
-FINAL_REFERENCE_PLAN_SCHEMA = "schemas/shared/stage2-reference-one-shot-plan-v1.json"
+FINAL_REFERENCE_PLAN_SCHEMA = "schemas/shared/stage2-reference-one-shot-plan-v2.json"
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 
 
@@ -86,6 +86,12 @@ def validate_r22_round(value: Mapping[str, Any]) -> None:
         raise ValueError("S204_R22_SEGMENT_END_INVALID")
     if sizing.get("prior_consumed_end_position") != SEGMENT_START_POSITION:
         raise ValueError("S204_R22_PRIOR_SEGMENT_BOUNDARY_INVALID")
+    final_segments = sizing.get("final_stream_segments")
+    if final_segments != {
+        "reference_A": {"start_position": SEGMENT_START_POSITION, "end_position_exclusive": SEGMENT_END_POSITION_EXCLUSIVE},
+        "reference_B": {"start_position": SEGMENT_START_POSITION, "end_position_exclusive": SEGMENT_END_POSITION_EXCLUSIVE},
+    }:
+        raise ValueError("S204_R22_FINAL_STREAM_SEGMENTS_INVALID")
     if value.get("new_draws_before_freeze") is not False:
         raise ValueError("S204_R22_FREEZE_REQUIRED_BEFORE_DRAWS")
     if value.get("final_reference_created") is not False:
@@ -133,6 +139,10 @@ def prepare_r22_round(value: Mapping[str, Any]) -> dict[str, Any]:
             "start": SEGMENT_START_POSITION,
             "end_exclusive": SEGMENT_END_POSITION_EXCLUSIVE,
             "prior_r21_prefix_is_read_only": True,
+        },
+        "final_stream_segments": {
+            "reference_A": {"start_position": SEGMENT_START_POSITION, "end_position_exclusive": SEGMENT_END_POSITION_EXCLUSIVE},
+            "reference_B": {"start_position": SEGMENT_START_POSITION, "end_position_exclusive": SEGMENT_END_POSITION_EXCLUSIVE},
         },
         "r21_output_is_read_only": True,
         "claim_scope": "r22_segment_only_no_pooling_with_r21",

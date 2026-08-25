@@ -19,7 +19,7 @@
     "prior_round_ref": {"type": "string", "minLength": 1},
     "sizing": {
       "type": "object", "additionalProperties": false,
-      "required": ["stream", "seed_namespace", "seed_namespace_mode", "parent_sampling_plan_hash", "candidate_sample_counts", "block_size", "normalized_l1_threshold", "required_consecutive", "complete_all_candidates", "optional_stopping", "reuse_prior_sizing_prefix", "segment_start_position", "segment_end_position_exclusive", "prior_consumed_end_position"],
+      "required": ["stream", "seed_namespace", "seed_namespace_mode", "parent_sampling_plan_hash", "candidate_sample_counts", "block_size", "normalized_l1_threshold", "required_consecutive", "complete_all_candidates", "optional_stopping", "reuse_prior_sizing_prefix", "segment_start_position", "segment_end_position_exclusive", "prior_consumed_end_position", "final_stream_segments"],
       "properties": {
         "stream": {"const": "reference_sizing"},
         "seed_namespace": {"type": "string", "minLength": 1},
@@ -34,12 +34,20 @@
         "reuse_prior_sizing_prefix": {"const": false},
         "segment_start_position": {"const": 16384},
         "segment_end_position_exclusive": {"const": 81920},
-        "prior_consumed_end_position": {"const": 16384}
+        "prior_consumed_end_position": {"const": 16384},
+        "final_stream_segments": {
+          "type": "object", "additionalProperties": false,
+          "required": ["reference_A", "reference_B"],
+          "properties": {
+            "reference_A": {"const": {"start_position": 16384, "end_position_exclusive": 81920}},
+            "reference_B": {"const": {"start_position": 16384, "end_position_exclusive": 81920}}
+          }
+        }
       }
     },
     "new_draws_before_freeze": {"const": false},
     "final_reference_created": {"const": false},
-    "final_reference_plan_schema": {"const": "schemas/shared/stage2-reference-one-shot-plan-v1.json"},
+    "final_reference_plan_schema": {"const": "schemas/shared/stage2-reference-one-shot-plan-v2.json"},
     "continuation_control": {"const": "precommitted_disjoint_segment_no_pooling_with_r21"},
     "output_namespace": {"type": "string", "pattern": "^.*r22.*$"},
     "status": {"const": "FROZEN_BEFORE_NEW_SIZING_DRAWS"},

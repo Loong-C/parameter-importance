@@ -44,10 +44,14 @@ def _round() -> dict[str, object]:
             "segment_start_position": 16384,
             "segment_end_position_exclusive": 81920,
             "prior_consumed_end_position": 16384,
+            "final_stream_segments": {
+                "reference_A": {"start_position": 16384, "end_position_exclusive": 81920},
+                "reference_B": {"start_position": 16384, "end_position_exclusive": 81920},
+            },
         },
         "new_draws_before_freeze": False,
         "final_reference_created": False,
-        "final_reference_plan_schema": "schemas/shared/stage2-reference-one-shot-plan-v1.json",
+        "final_reference_plan_schema": "schemas/shared/stage2-reference-one-shot-plan-v2.json",
         "continuation_control": "precommitted_disjoint_segment_no_pooling_with_r21",
         "output_namespace": "evidence/stage2/s204/formal-r22-g3-v5",
         "amendment": {
