@@ -11,6 +11,7 @@ from ops.stage2.run_s206_formal import (
     _derive_s206_config,
     _load_cost_source,
     _load_retry_policy,
+    _production_lpt_jobs,
     _validate_s204_reference_candidate,
 )
 from param_importance_nlp.cli import _load_mapping
@@ -208,6 +209,24 @@ def test_detached_wait_recovers_final_g24b_freeze(tmp_path: Path) -> None:
         )
     )
     assert result == 0
+
+
+def test_production_queue_is_deterministic_lpt_by_frozen_draw_work() -> None:
+    jobs = _production_lpt_jobs()
+    assert len(jobs) == len(ANCHOR_IDS) * 4
+    assert set(jobs) == {
+        (anchor_id, batch_size)
+        for anchor_id in ANCHOR_IDS
+        for batch_size in (32, 64, 128, 256)
+    }
+    # No measured 31M multiplier is available yet; all six B=256 cells must
+    # precede every smaller work unit, with anchor order as deterministic tie
+    # breaker.  This is the LPT queue consumed by the dynamic four-GPU loop.
+    assert jobs[: len(ANCHOR_IDS)] == tuple((anchor_id, 256) for anchor_id in ANCHOR_IDS)
+    assert [50 * batch_size for _anchor_id, batch_size in jobs] == sorted(
+        (50 * batch_size for _anchor_id, batch_size in jobs),
+        reverse=True,
+    )
 
 
 def test_production_cell_uses_candidate_bundle_and_emits_blinded_pilot_only(

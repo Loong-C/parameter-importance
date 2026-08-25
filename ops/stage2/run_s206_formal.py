@@ -40,6 +40,7 @@ from param_importance_nlp.experiments.stage2_s206_formal import (
     CELL_GPU_BINDINGS,
     EXCLUDED_PCI,
     PILOT_B_VALUES,
+    PILOT_REPETITIONS,
     S206PreflightSpec,
     S206PreparationBlocked,
     GlobalPilotMappingManifest,
@@ -65,6 +66,35 @@ from param_importance_nlp.runtime.tensor_bundle import load_tensor_bundle
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _production_lpt_jobs() -> tuple[tuple[str, int], ...]:
+    """Return the deterministic LPT order for the frozen pilot work units.
+
+    No 31M provider-smoke multiplier is committed yet, so the only approved
+    work estimate is the preregistered draw count ``50 * B``.  If a measured
+    multiplier is later bound into the formal handoff, it must be added as a
+    separately hashed input; this function intentionally does not infer one
+    from scientific results or uncommitted timing.
+    """
+
+    jobs = tuple(
+        (anchor_id, batch_size)
+        for anchor_id in ANCHOR_IDS
+        for batch_size in PILOT_B_VALUES
+    )
+    anchor_order = {anchor_id: index for index, anchor_id in enumerate(ANCHOR_IDS)}
+    batch_order = {batch_size: index for index, batch_size in enumerate(PILOT_B_VALUES)}
+    return tuple(
+        sorted(
+            jobs,
+            key=lambda job: (
+                -(PILOT_REPETITIONS * job[1]),
+                anchor_order[job[0]],
+                batch_order[job[1]],
+            ),
+        )
+    )
 
 
 def _logical(root: Path, value: str, *, field: str) -> Path:
@@ -1233,11 +1263,12 @@ def _production_execute(args: argparse.Namespace) -> dict[str, object]:
     operations = _logical(root, args.operations_root, field="operations_root")
     operations.mkdir(parents=True, exist_ok=True)
     status_path = operations / "status.json"
-    jobs = deque(
-        (anchor_id, batch_size)
-        for anchor_id in ANCHOR_IDS
-        for batch_size in PILOT_B_VALUES
-    )
+    ordered_jobs = _production_lpt_jobs()
+    jobs = deque(ordered_jobs)
+    expected_work = {
+        f"{anchor_id}:B{batch_size}": PILOT_REPETITIONS * batch_size
+        for anchor_id, batch_size in ordered_jobs
+    }
     attempts: dict[tuple[str, int], int] = {}
     active: dict[int, tuple[subprocess.Popen[bytes], tuple[str, int], str, Path]] = {}
     free_gpus = list(APPROVED_GPU_UUIDS)
@@ -1312,7 +1343,13 @@ def _production_execute(args: argparse.Namespace) -> dict[str, object]:
 
     status(
         "PREFLIGHT_PASS",
-        queue_mode="dynamic_four_gpu",
+        queue_mode="dynamic_four_gpu_lpt_draw_work",
+        queue_order=[
+            {"anchor_id": anchor_id, "batch_size": batch_size}
+            for anchor_id, batch_size in ordered_jobs
+        ],
+        queue_work_units=expected_work,
+        queue_work_multiplier_source="none_available_uses_frozen_50_times_B",
         s205_rebind_hash=canonical_json_hash(s205_plan),
         retry_policy_ref=args.retry_policy_ref,
         retry_policy_hash=retry_policy_hash,
@@ -1321,8 +1358,9 @@ def _production_execute(args: argparse.Namespace) -> dict[str, object]:
     try:
         while jobs or active:
             while jobs and free_gpus:
-                # FIFO work is dynamically assigned to whichever approved
-                # UUID has just become free; no card is ever shared.
+                # LPT order is dynamically assigned to whichever approved UUID
+                # has just become free; no card is ever shared.  The ordered
+                # queue starts B=256 work first, preventing a large-cell tail.
                 job = jobs.popleft()
                 gpu_uuid = free_gpus.pop(0)
                 launch(job[0], job[1], gpu_uuid)
