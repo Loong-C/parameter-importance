@@ -152,7 +152,6 @@ def _build_cell(
     # per-cell provider state is distinct, but the data/tokenizer identity is
     # intentionally shared and therefore the manifest hash is common too.
     data_range_hash = canonical_json_hash({"dataset_id": "fixture-data", "range": [0, 8]})
-    checkpoint_hash = canonical_json_hash({"cell_id": cell, "provider_state_digest": provider.state_digest()})
     model_asset_id = f"{cell}-model-asset"
     model_revision = f"revision-{provider.state_digest()[:16]}"
     checkpoint_id = f"checkpoint-{cell}"
@@ -172,13 +171,25 @@ def _build_cell(
         row_provider = _make_provider(row_cell)
         row_config_hash = canonical_json_hash({**config_body, "cell_id": row_cell, "model_id": row_cell.split(":", 1)[0], "training_stage": row_cell.split(":", 1)[1], "fixed_state_id": row_provider.fixed_state_id})
         row_data_hash = data_range_hash
+        row_revision = f"revision-{row_provider.state_digest()[:16]}"
+        row_checkpoint_manifest = {
+            "schema": "parameter-importance-model-manifest-v1",
+            "cell_id": row_cell,
+            "model_id": row_cell.split(":", 1)[0],
+            "revision": row_revision,
+        }
+        row_checkpoint_hash = canonical_json_hash(row_checkpoint_manifest)
+        row_checkpoint_root_ref = f"assets/checkpoints/{row_cell}"
         manifest["checkpoints"].append({
             "cell_id": row_cell,
             "model_id": row_cell.split(":", 1)[0],
             "training_stage": row_cell.split(":", 1)[1],
             "checkpoint_id": f"checkpoint-{row_cell}",
-            "checkpoint_hash": canonical_json_hash({"cell_id": row_cell, "provider_state_digest": row_provider.state_digest()}),
-            "checkpoint_revision": f"revision-{row_provider.state_digest()[:16]}",
+            "checkpoint_hash": row_checkpoint_hash,
+            "checkpoint_revision": row_revision,
+            "checkpoint_root_ref": row_checkpoint_root_ref,
+            "checkpoint_manifest_ref": f"{row_checkpoint_root_ref}/manifest.json",
+            "checkpoint_manifest": row_checkpoint_manifest,
             "registry_hash": row_provider.registry_hash,
             "config_hash": row_config_hash,
         })
@@ -251,7 +262,15 @@ def _build_cell(
         "s23_asset_resolution": {"schema_version": "stage2-task-asset-resolution-v1", "scope": "formal", "six_cell_manifest_hash": manifest["manifest_hash"], "producer_commit": head},
         "s23_six_cell_manifest": manifest,
         "resolved_config": {"schema_version": "resolved-config-v2", "task_id": "stage2.04_reference_target", "config_hash": config_hash, "cell_id": cell},
-        "checkpoint_manifest": {"schema_version": "checkpoint-manifest-v1", **{key: row[key] for key in ("checkpoint_id", "checkpoint_hash", "checkpoint_revision", "config_hash", "registry_hash", "cell_id", "model_id", "training_stage")}},
+        "checkpoint_manifest": {
+            "schema_version": "checkpoint-manifest-v1",
+            "checkpoint_id": row["checkpoint_id"],
+            "model_id": row["model_id"],
+            "revision": row["checkpoint_revision"],
+            "checkpoint_manifest": row["checkpoint_manifest"],
+            "source_manifest_ref": row["checkpoint_manifest_ref"],
+            "source_manifest_sha256": row["checkpoint_hash"],
+        },
         "model_manifest": {"schema_version": "model-manifest-v1", "asset_id": model_asset_id, "revision": model_revision, "model_id": row["model_id"], "training_stage": row["training_stage"], "parameter_count": 4},
         "data_manifest": {"schema_version": "data-manifest-v1", "asset_id": "fixture-data", "revision": f"data-{data_range_hash[:16]}", "dataset_id": "fixture-data", "data_range_hash": data_range_hash},
         "tokenizer_manifest": {"schema_version": "tokenizer-manifest-v1", "asset_id": "fixture-tokenizer", "revision": f"tokenizer-{data_range_hash[:16]}", "checkpoint_id": row["checkpoint_id"]},
@@ -693,7 +712,23 @@ def _build_cell(
         "final_streams": ["reference_A", "reference_B"],
         "final_sample_count_per_stream": 4,
         "reference_uncertainty": uncertainty.to_dict(),
-        "provider": {"fixed_state_id": provider.fixed_state_id, "provider_state_digest": provider.state_digest(), "registry_hash": provider.registry_hash, "parameter_names": list(provider.parameter_names)},
+        "provider": {
+            "fixed_state_id": provider.fixed_state_id,
+            "provider_state_digest": provider.state_digest(),
+            "registry_hash": provider.registry_hash,
+            "parameter_names": list(provider.parameter_names),
+            "checkpoint_identity": {
+                "model_id": row["model_id"],
+                "training_stage": row["training_stage"],
+                "checkpoint_id": row["checkpoint_id"],
+                "revision": row["checkpoint_revision"],
+                "root_ref": row["checkpoint_root_ref"],
+                "manifest_ref": row["checkpoint_manifest_ref"],
+                "manifest_sha256": row["checkpoint_hash"],
+                "registry_hash": row["registry_hash"],
+                "config_hash": row["config_hash"],
+            },
+        },
         "sampling_plan_hash": sampling.digest,
         "recovery_semantics": "authoritative_block_pair_commits",
         "reference_protocol": "authoritative_sizing_and_one_shot_block_pair_commits",
