@@ -240,7 +240,17 @@ def _build_cell(
         execution=FormalExecutionEvidence("local_fixture", metadata={"cell_id": cell, "fixture": "real-task-artifacts"}),
     )
     plan = plan_obj.to_dict()
-    sizing_identity_hash = canonical_json_hash({"plan_hash": plan["artifact_hash"], "provider_state_digest": provider.state_digest(), "registry_hash": provider.registry_hash, "sizing_draw_hash": sizing_draw_hash, "sizing_stream": "reference_sizing"})
+    sizing_identity_hash = canonical_json_hash(
+        {
+            "plan_hash": plan["artifact_hash"],
+            "provider_state_digest": provider.state_digest(),
+            "registry_hash": provider.registry_hash,
+            "sizing_draw_hash": sizing_draw_hash,
+            "sizing_stream": "reference_sizing",
+            "draw_start_position": 0,
+            "draw_end_position_exclusive": 4,
+        }
+    )
     final_plan_body = {
         "schema_version": "stage2-reference-one-shot-plan-v1",
         "reference_id": plan["reference_id"],
@@ -411,7 +421,19 @@ def _build_cell(
     )
     final_plan_body["sizing_result_hash"] = sizing_result_hash
     final_plan = _hashed(final_plan_body)
-    sizing_result_identity_hash = canonical_json_hash({"sizing_result_hash": sizing_result_hash, "provider_state_digest": provider.state_digest(), "registry_hash": provider.registry_hash, "stream_a_draw_hash": draw_a_hash, "stream_b_draw_hash": draw_b_hash})
+    sizing_result_identity_hash = canonical_json_hash(
+        {
+            "sizing_result_hash": sizing_result_hash,
+            "provider_state_digest": provider.state_digest(),
+            "registry_hash": provider.registry_hash,
+            "stream_a_draw_hash": draw_a_hash,
+            "stream_b_draw_hash": draw_b_hash,
+            "stream_a_draw_start_position": 0,
+            "stream_a_draw_end_position_exclusive": 4,
+            "stream_b_draw_start_position": 0,
+            "stream_b_draw_end_position_exclusive": 4,
+        }
+    )
     for sequence in range(1, 5):
         moments_a = _moments_from_shards(final_store, final_refs_a[:sequence], assumptions)
         moments_b = _moments_from_shards(final_store, final_refs_b[:sequence], assumptions)
