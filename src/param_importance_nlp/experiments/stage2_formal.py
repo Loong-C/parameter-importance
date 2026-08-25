@@ -1415,7 +1415,7 @@ class _ReferenceSnapshotStore:
                     payload[f"{prefix}_{name}_hash"] = (
                         _vector_digest(value) if value else None
                     )
-                elif hash_value is None:
+                elif f"{name}_hash" not in moments:
                     raise ValueError("REFERENCE_MOMENTS_STATE_HASH_MISSING")
                 else:
                     payload[f"{prefix}_{name}_hash"] = hash_value
@@ -1551,9 +1551,13 @@ class _ReferenceSnapshotStore:
         return materialized
 
     def publish(self, sequence: int, state: Mapping[str, object]) -> None:
-        state_digest = self._state_digest(state)
-        object_path = self.objects / state_digest
+        # Hash each cumulative array once while constructing the compact
+        # representation; hashing the full moments first and then hashing them
+        # again through the compact representation doubled the dominant CPU
+        # cost on the 31M-parameter smoke.
         compact_state = self._compact_state(state)
+        state_digest = self._state_digest(compact_state)
+        object_path = self.objects / state_digest
         if not object_path.exists():
             bundle = publish_tensor_bundle(object_path, compact_state)
         else:
