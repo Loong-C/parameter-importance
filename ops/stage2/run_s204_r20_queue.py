@@ -82,6 +82,28 @@ def _parse_cell_config(values: Sequence[str]) -> dict[str, Path]:
     return result
 
 
+def _parse_cell_environment(values: Sequence[str], cells: Mapping[str, Path]) -> dict[str, Path]:
+    """Parse the immutable per-cell TaskRuntimeEnvironment refs.
+
+    A base environment is insufficient for formal S2.4: each cell carries a
+    distinct sizing-plan, parameter-registry, and delta-sci binding.  Requiring
+    the six explicit mappings prevents a queue launch from silently applying
+    one cell's evidence to another cell.
+    """
+
+    result: dict[str, Path] = {}
+    for value in values:
+        if "=" not in value:
+            raise ValueError(f"--runtime-environment must be CELL=PATH: {value!r}")
+        cell_id, raw_path = value.split("=", 1)
+        if cell_id not in cells or not raw_path or cell_id in result:
+            raise ValueError(f"invalid or duplicate --runtime-environment: {value!r}")
+        result[cell_id] = Path(raw_path).resolve()
+    if set(result) != set(cells):
+        raise ValueError("r20 queue requires exactly one runtime environment per cell")
+    return result
+
+
 def lpt_order(cell_estimates: Mapping[str, float]) -> tuple[str, ...]:
     """Return deterministic longest-processing-time-first cell order."""
 
@@ -160,6 +182,7 @@ def run_queue(args: argparse.Namespace) -> int:
     if len(args.execution_commit) != 40 or any(c not in "0123456789abcdef" for c in args.execution_commit):
         raise ValueError("--execution-commit must be 40 lowercase hexadecimal characters")
     cells = _parse_cell_config(args.cell_config)
+    environments = _parse_cell_environment(args.runtime_environment, cells)
     estimates = _parse_estimates(args.cell_estimate, cells)
     order = lpt_order(estimates)
     python = str(Path(args.python).resolve())
@@ -236,7 +259,7 @@ def run_queue(args: argparse.Namespace) -> int:
                     data_range=Path(args.data_range).resolve(),
                     data_root=Path(args.data_root).resolve(),
                     output_root=output_root,
-                    runtime_environment=Path(args.runtime_environment).resolve(),
+                    runtime_environment=environments[cell_id],
                     heartbeat_seconds=args.child_heartbeat_seconds,
                 )
                 stdout = (cell_root / "stdout.log").open("x", encoding="utf-8")
@@ -341,7 +364,12 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--data-root", type=Path, required=True)
     parser.add_argument("--output-root", type=Path, required=True)
     parser.add_argument("--queue-root", type=Path, required=True)
-    parser.add_argument("--runtime-environment", type=Path, required=True)
+    parser.add_argument(
+        "--runtime-environment",
+        action="append",
+        required=True,
+        help="CELL=per-cell TaskRuntimeEnvironment JSON (exactly six)",
+    )
     parser.add_argument("--s204-launcher", type=Path, default=Path(__file__).with_name("run_s204_formal.py"))
     parser.add_argument("--python", default=sys.executable)
     parser.add_argument("--run-id")

@@ -10,6 +10,8 @@ from ops.stage2.run_s204_r20_queue import (
     APPROVED_GPU_UUIDS,
     EXCLUDED_GPU_UUID,
     _child_command,
+    _parse_cell_config,
+    _parse_cell_environment,
     lpt_order,
 )
 
@@ -55,3 +57,19 @@ def test_child_command_rejects_excluded_or_unknown_gpu() -> None:
     assert "--execution-commit" in command
     assert command[command.index("--cuda-visible-devices") + 1] == APPROVED_GPU_UUIDS[0]
     assert "--execute" in command and "--cell-id" in command
+
+
+def test_runtime_environment_is_bound_one_to_one_to_cell() -> None:
+    values = [
+        "cell-a=/tmp/a.json",
+        "cell-b=/tmp/b.json",
+        "cell-c=/tmp/c.json",
+        "cell-d=/tmp/d.json",
+        "cell-e=/tmp/e.json",
+        "cell-f=/tmp/f.json",
+    ]
+    cells = _parse_cell_config([f"{cell}=/{cell}.json" for cell in ("cell-a", "cell-b", "cell-c", "cell-d", "cell-e", "cell-f")])
+    environments = _parse_cell_environment(values, cells)
+    assert set(environments) == set(cells)
+    with pytest.raises(ValueError, match="one runtime environment per cell"):
+        _parse_cell_environment(values[:-1], cells)
