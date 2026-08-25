@@ -33,6 +33,7 @@ from typing import Any, Callable, Mapping, Protocol, Sequence
 import numpy as np
 
 from ..contracts.jsonio import canonical_json_hash, load_canonical_json, write_canonical_json
+from ..contracts.g21_formal_handoff import ALLOWED_DEVICES as APPROVED_GPU_BINDINGS
 from ..contracts.stage23 import FormalExecutionEvidence
 from ..contracts.status import GateRecord, GateStatus
 from ..core.registry import ParameterRegistry
@@ -52,6 +53,7 @@ from ..experiments.sampling import RepetitionMapping
 from .stage2_s204_ids import EXPECTED_CELL_IDS
 from .stage2_s207_formal import (
     APPROVED_GPU_UUIDS,
+    EXCLUDED_GPU_UUID,
     EXCLUDED_PCI,
     S27CellPlan,
     S27G25Blocked,
@@ -74,12 +76,263 @@ S27_SHARD_PLAN_SCHEMA = "stage2-s27-unit-shard-plan-v1"
 S27_SHARD_SEAL_SCHEMA = "stage2-s27-unit-shard-seal-v1"
 S27_DEFAULT_MAX_ATTEMPTS = 1
 S27_DEFAULT_M2_TOLERANCE = 1e-10
+S27_GPU_INVENTORY_SCHEMA = "stage2-s206-gpu-inventory-v1"
+S27_LIVE_GPU_COUNT = 8
+S27_INVENTORY_HEALTH_ALIASES = {
+    "memory_used_mib": ("memory_used_mib", "memory_used", "memory.used"),
+    "memory_total_mib": ("memory_total_mib", "memory_total", "memory.total"),
+    "utilization_gpu_percent": (
+        "utilization_gpu_percent",
+        "utilization_percent",
+        "utilization_gpu",
+        "utilization.gpu",
+    ),
+    "ecc_uncorrected_volatile": (
+        "ecc_uncorrected_volatile",
+        "ecc_volatile_uncorrected",
+        "ecc.errors.uncorrected.volatile.total",
+    ),
+    "ecc_uncorrected_aggregate": (
+        "ecc_uncorrected_aggregate",
+        "ecc_aggregate_uncorrected",
+        "ecc.errors.uncorrected.aggregate.total",
+    ),
+    "temperature_c": ("temperature_c", "temperature_gpu_c", "temperature.gpu"),
+    "row_remap_status": ("row_remap_status", "row_remap", "row_remap_pending"),
+    "gpu_recovery_action": ("gpu_recovery_action", "recovery_action"),
+}
+_S27_CLEAN_VALUES = {"none", "0", "clean", "false", "not_pending", "not-pending", "n/a", "na"}
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _SAFE_COMPONENT = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,159}$")
 
 
 class S27ExecutionBlocked(RuntimeError):
     """Raised when a production input or recovery boundary is not safe."""
+
+
+def _s27_canonical_uuid(value: object, *, field: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise S27ExecutionBlocked(f"{field}:UUID_REQUIRED")
+    text = value.strip()
+    if not text.upper().startswith("GPU-"):
+        text = "GPU-" + text
+    return text
+
+
+def _s27_canonical_pci(value: object, *, field: str) -> str:
+    if not isinstance(value, str):
+        raise S27ExecutionBlocked(f"{field}:PCI_REQUIRED")
+    match = re.fullmatch(
+        r"(?:[0-9A-F]{4}|[0-9A-F]{8}):([0-9A-F]{2}):([0-9A-F]{2})\.([0-9])",
+        value.strip().upper(),
+    )
+    if match is None:
+        raise S27ExecutionBlocked(f"{field}:PCI_INVALID")
+    return f"0000:{match.group(1)[-4:]}:{match.group(2)}.{match.group(3)}"
+
+
+def _s27_finite_number(value: object, *, field: str) -> float:
+    try:
+        result = float(value)
+    except (TypeError, ValueError) as error:
+        raise S27ExecutionBlocked(f"{field}:NUMBER_REQUIRED") from error
+    if not np.isfinite(result):
+        raise S27ExecutionBlocked(f"{field}:NONFINITE")
+    return result
+
+
+def validate_s27_gpu_inventory(
+    inventory: Sequence[Mapping[str, object]],
+    *,
+    compute_apps: Sequence[Mapping[str, object]],
+) -> dict[str, object]:
+    """Validate the complete hash-bound live GPU identity/health snapshot.
+
+    S2.7 runs after a potentially long S2.6 preparation interval.  A bound
+    G2.4b Gate therefore cannot substitute for this launch-time check: the
+    eight-card identity set, approved-card health, excluded-card ECC facts,
+    row-remap state, temperature, and compute-app list must all be present in
+    the same immutable envelope.
+    """
+
+    if not isinstance(inventory, Sequence) or isinstance(inventory, (str, bytes)):
+        raise S27ExecutionBlocked("GPU_INVENTORY_ROWS_REQUIRED")
+    if len(inventory) != S27_LIVE_GPU_COUNT:
+        raise S27ExecutionBlocked(f"GPU_INVENTORY_LIVE_CARD_COUNT_INVALID:{len(inventory)}")
+    if not isinstance(compute_apps, Sequence) or isinstance(compute_apps, (str, bytes)):
+        raise S27ExecutionBlocked("GPU_INVENTORY_COMPUTE_APPS_REQUIRED")
+
+    approved = {uuid.casefold() for uuid in APPROVED_GPU_UUIDS}
+    expected = {
+        pci.casefold(): uuid.casefold()
+        for pci, uuid in APPROVED_GPU_BINDINGS
+    }
+    expected[EXCLUDED_PCI.casefold()] = EXCLUDED_GPU_UUID.casefold()
+    rows: list[dict[str, object]] = []
+    seen_uuid: set[str] = set()
+    seen_pci: set[str] = set()
+    for index, source in enumerate(inventory):
+        if not isinstance(source, Mapping):
+            raise S27ExecutionBlocked(f"GPU_INVENTORY_ROW_INVALID:{index}")
+        row = dict(source)
+        uuid = _s27_canonical_uuid(row.get("uuid", row.get("gpu_uuid")), field=f"gpu[{index}]")
+        pci = _s27_canonical_pci(row.get("pci_bus_id", row.get("pci")), field=f"gpu[{index}]")
+        uuid_key = uuid.casefold()
+        pci_key = pci.casefold()
+        if uuid_key in seen_uuid:
+            raise S27ExecutionBlocked("GPU_INVENTORY_DUPLICATE_UUID")
+        if pci_key in seen_pci:
+            raise S27ExecutionBlocked("GPU_INVENTORY_DUPLICATE_PCI")
+        seen_uuid.add(uuid_key)
+        seen_pci.add(pci_key)
+        row["uuid"] = uuid
+        row["pci_bus_id"] = pci
+        for canonical, aliases in S27_INVENTORY_HEALTH_ALIASES.items():
+            found = next((row[name] for name in aliases if name in row), None)
+            if found is None:
+                raise S27ExecutionBlocked(f"GPU_INVENTORY_HEALTH_FIELD_MISSING:{canonical}")
+            row[canonical] = found
+        # Require numeric evidence for every card, including the quarantined
+        # card; only approved-card values are subject to clean-health gates.
+        for field in (
+            "memory_used_mib",
+            "memory_total_mib",
+            "utilization_gpu_percent",
+            "ecc_uncorrected_volatile",
+            "ecc_uncorrected_aggregate",
+            "temperature_c",
+        ):
+            row[field] = _s27_finite_number(row[field], field=f"gpu[{index}].{field}")
+        rows.append(row)
+
+    observed = {
+        str(row["pci_bus_id"]).casefold(): str(row["uuid"]).casefold()
+        for row in rows
+        if str(row["pci_bus_id"]).casefold() in expected
+    }
+    if observed != expected:
+        raise S27ExecutionBlocked("GPU_INVENTORY_APPROVED_OR_EXCLUDED_IDENTITY_DRIFT")
+
+    apps_by_uuid: dict[str, list[dict[str, object]]] = {}
+    live_uuids = {str(row["uuid"]).casefold() for row in rows}
+    for index, source in enumerate(compute_apps):
+        if not isinstance(source, Mapping):
+            raise S27ExecutionBlocked(f"GPU_INVENTORY_COMPUTE_APP_INVALID:{index}")
+        app = dict(source)
+        app_uuid = _s27_canonical_uuid(app.get("gpu_uuid", app.get("uuid")), field=f"compute_app[{index}]")
+        if app_uuid.casefold() not in live_uuids:
+            raise S27ExecutionBlocked("GPU_INVENTORY_COMPUTE_APP_GPU_UNKNOWN")
+        app["gpu_uuid"] = app_uuid
+        apps_by_uuid.setdefault(app_uuid.casefold(), []).append(app)
+
+    for row in rows:
+        uuid_key = str(row["uuid"]).casefold()
+        if uuid_key not in approved:
+            continue
+        if apps_by_uuid.get(uuid_key):
+            raise S27ExecutionBlocked("GPU_INVENTORY_APPROVED_CARD_NOT_IDLE")
+        if (
+            float(row["memory_total_mib"]) <= 0
+            or float(row["memory_used_mib"]) != 0
+            or float(row["utilization_gpu_percent"]) != 0
+        ):
+            raise S27ExecutionBlocked("GPU_INVENTORY_APPROVED_CARD_NOT_IDLE")
+        if float(row["ecc_uncorrected_volatile"]) != 0 or float(row["ecc_uncorrected_aggregate"]) != 0:
+            raise S27ExecutionBlocked("GPU_INVENTORY_APPROVED_CARD_ECC_NOT_CLEAN")
+        if float(row["temperature_c"]) < 0 or float(row["temperature_c"]) >= 85:
+            raise S27ExecutionBlocked("GPU_INVENTORY_APPROVED_CARD_TEMPERATURE_INVALID")
+        if str(row["row_remap_status"]).strip().casefold() not in _S27_CLEAN_VALUES:
+            raise S27ExecutionBlocked("GPU_INVENTORY_APPROVED_ROW_REMAP_NOT_CLEAN")
+        if str(row["gpu_recovery_action"]).strip().casefold() not in _S27_CLEAN_VALUES:
+            raise S27ExecutionBlocked("GPU_INVENTORY_APPROVED_CARD_RECOVERY_NOT_CLEAN")
+
+    return {
+        "schema_version": S27_GPU_INVENTORY_SCHEMA,
+        "approved_gpu_uuids": list(APPROVED_GPU_UUIDS),
+        "excluded_gpu_uuid": EXCLUDED_GPU_UUID,
+        "excluded_pci": EXCLUDED_PCI,
+        "inventory_count": len(rows),
+        "inventory": rows,
+        "compute_apps": [dict(item) for item in compute_apps],
+    }
+
+
+def _s27_inventory_path(root: Path, path: str | Path) -> Path:
+    resolved_root = root.resolve()
+    resolved = Path(path).resolve()
+    try:
+        resolved.relative_to(resolved_root)
+    except ValueError as error:
+        raise S27ExecutionBlocked("GPU_INVENTORY_PATH_OUTSIDE_DATA_ROOT") from error
+    return resolved
+
+
+def _s27_file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def load_s27_gpu_inventory_envelope(
+    path: str | Path | None,
+    *,
+    data_root: str | Path,
+) -> tuple[dict[str, object], dict[str, object]]:
+    """Load only the hash-bound S2.6 inventory envelope; reject raw/legacy input."""
+
+    if path is None:
+        raise S27ExecutionBlocked("GPU_INVENTORY_JSON_REQUIRED")
+    root = Path(data_root).resolve()
+    resolved = _s27_inventory_path(root, path)
+    expected_source_ref = resolved.relative_to(root).as_posix()
+    try:
+        value = load_canonical_json(resolved)
+    except (OSError, TypeError, ValueError) as error:
+        raise S27ExecutionBlocked("GPU_INVENTORY_JSON_INVALID") from error
+    if not isinstance(value, Mapping):
+        raise S27ExecutionBlocked("GPU_INVENTORY_ENVELOPE_REQUIRED")
+    payload = dict(value)
+    if payload.get("schema_version") != S27_GPU_INVENTORY_SCHEMA:
+        raise S27ExecutionBlocked("GPU_INVENTORY_SCHEMA_INVALID")
+    source_ref = payload.get("source_ref")
+    if not isinstance(source_ref, str) or not source_ref or "\\" in source_ref:
+        raise S27ExecutionBlocked("GPU_INVENTORY_SOURCE_REF_REQUIRED")
+    if source_ref != expected_source_ref:
+        raise S27ExecutionBlocked("GPU_INVENTORY_SOURCE_REF_PATH_MISMATCH")
+    rows = payload.get("rows")
+    apps = payload.get("compute_apps")
+    if not isinstance(rows, list) or not all(isinstance(item, Mapping) for item in rows):
+        raise S27ExecutionBlocked("GPU_INVENTORY_ROWS_REQUIRED")
+    if not isinstance(apps, list) or not all(isinstance(item, Mapping) for item in apps):
+        raise S27ExecutionBlocked("GPU_INVENTORY_COMPUTE_APPS_REQUIRED")
+    artifact_hash = payload.get("artifact_hash")
+    if not isinstance(artifact_hash, str) or _SHA256.fullmatch(artifact_hash) is None:
+        raise S27ExecutionBlocked("GPU_INVENTORY_ARTIFACT_HASH_REQUIRED")
+    body = {key: item for key, item in payload.items() if key != "artifact_hash"}
+    if canonical_json_hash(body) != artifact_hash:
+        raise S27ExecutionBlocked("GPU_INVENTORY_ARTIFACT_HASH_MISMATCH")
+    source_sha = _s27_file_sha256(resolved)
+    declared_source_sha = payload.get("source_sha256")
+    if declared_source_sha is not None and declared_source_sha != source_sha:
+        raise S27ExecutionBlocked("GPU_INVENTORY_SOURCE_SHA256_MISMATCH")
+    summary = validate_s27_gpu_inventory(rows, compute_apps=apps)
+    identity = {
+        "source_ref": source_ref,
+        "artifact_hash": artifact_hash,
+        "source_sha256": source_sha,
+        "schema_version": S27_GPU_INVENTORY_SCHEMA,
+    }
+    summary.update(
+        {
+            "inventory_source_ref": source_ref,
+            "inventory_artifact_hash": artifact_hash,
+            "inventory_source_sha256": source_sha,
+            "inventory_schema_version": S27_GPU_INVENTORY_SCHEMA,
+        }
+    )
+    return summary, identity
 
 
 class S27ProviderFactory(Protocol):
@@ -2021,7 +2274,7 @@ class S27DetachedLauncher:
         self.launcher_script = str(launcher_script)
         self.materialization_index_ref = materialization_index_ref
         self.execution_evidence_ref = execution_evidence_ref
-        normalized_gpu_inventory(approved_inventory)
+        validate_s27_gpu_inventory(approved_inventory, compute_apps=())
         self.run_root.mkdir(parents=True, exist_ok=True)
         if self.run_root.is_relative_to(self.data_root) is False:
             raise S27ExecutionBlocked("S27_RUN_ROOT_OUTSIDE_DATA_ROOT")
@@ -2182,6 +2435,8 @@ __all__ = [
     "S27_SHARD_SEAL_SCHEMA",
     "S27DetachedLauncher",
     "S27ExecutionBlocked",
+    "S27_GPU_INVENTORY_SCHEMA",
+    "S27_LIVE_GPU_COUNT",
     "S27MaterializedCellInput",
     "S27ProductionWorker",
     "S27ProviderContext",
@@ -2193,6 +2448,7 @@ __all__ = [
     "build_s27_wave_seal_payload",
     "build_s27_worker_command",
     "load_s27_frozen_mappings",
+    "load_s27_gpu_inventory_envelope",
     "load_s27_materialized_inputs",
     "load_s27_plan",
     "load_s27_raw_records",
@@ -2204,6 +2460,7 @@ __all__ = [
     "seal_s27_wave",
     "seal_s27_run",
     "validate_s27_shard_seals",
+    "validate_s27_gpu_inventory",
     "validate_s27_quality_wave",
     "write_s27_shard_plan",
 ]

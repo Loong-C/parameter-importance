@@ -45,8 +45,7 @@ from param_importance_nlp.experiments.stage2_s207_runner import (
     load_s27_materialized_inputs,
     load_s27_plan,
     load_s27_shard_plan,
-    normalized_gpu_inventory,
-    nvidia_smi_inventory,
+    load_s27_gpu_inventory_envelope,
 )
 from param_importance_nlp.contracts.task_catalog import DEFAULT_TASK_CATALOG
 from param_importance_nlp.runtime.task_runtime import TaskExecutionRequest, TaskRuntimeEnvironment
@@ -70,13 +69,13 @@ def _logical(root: Path, value: str, *, field: str) -> Path:
     return result
 
 
-def _load_inventory(path: Path | None) -> list[dict[str, object]]:
+def _load_inventory(path: Path | None, *, data_root: Path) -> list[dict[str, object]]:
     if path is None:
-        return nvidia_smi_inventory()
-    value = load_canonical_json(path.resolve())
-    rows = value.get("gpus") if isinstance(value, Mapping) else value
+        raise S27ExecutionBlocked("S27_GPU_INVENTORY_JSON_REQUIRED")
+    summary, _identity = load_s27_gpu_inventory_envelope(path, data_root=data_root)
+    rows = summary.get("inventory")
     if not isinstance(rows, list) or not all(isinstance(item, Mapping) for item in rows):
-        raise S27ExecutionBlocked("S27_GPU_INVENTORY_JSON_INVALID")
+        raise S27ExecutionBlocked("S27_GPU_INVENTORY_VALIDATION_INVALID")
     return [dict(item) for item in rows]
 
 
@@ -201,8 +200,10 @@ def _preflight(args: argparse.Namespace) -> dict[str, object]:
     materialized = load_s27_materialized_inputs(root, args.materialization_index_ref)
     if set(materialized) != set(plan.cells[i].cell_id for i in range(len(plan.cells))):
         raise S27ExecutionBlocked("S27_MATERIALIZATION_CELL_SET_MISMATCH")
-    inventory = _load_inventory(args.gpu_inventory_json)
-    gpu = normalized_gpu_inventory(inventory)
+    gpu, _inventory_identity = load_s27_gpu_inventory_envelope(
+        args.gpu_inventory_json,
+        data_root=root,
+    )
     execution = _load_execution(root, args.execution_evidence_ref)
     execution_g24b = [gate for gate in execution.prerequisite_gates if gate.gate_id == "stage2.G2.4b"]
     if len(execution_g24b) != 1 or execution_g24b[0].artifact_hash != plan.frozen_inputs.g24b_gate_hash:
@@ -433,7 +434,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         # --execute is the only foreground launcher mode.  It repeats the
         # read-only preflight immediately before creating a child process.
         _preflight(args)
-        inventory = _load_inventory(args.gpu_inventory_json)
+        inventory = _load_inventory(args.gpu_inventory_json, data_root=args.data_root)
         result = S27DetachedLauncher(
             data_root=args.data_root,
             plan_ref=args.plan_ref,
