@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from param_importance_nlp.contracts.jsonio import canonical_json_hash, write_canonical_json
+from param_importance_nlp.contracts.jsonio import canonical_json_hash, load_canonical_json, write_canonical_json
 from param_importance_nlp.contracts.stage23 import FormalExecutionEvidence
 from param_importance_nlp.contracts.status import GateRecord, GateStatus
 from param_importance_nlp.experiments.preregistration import build_stage2_preregistration
@@ -23,6 +23,8 @@ from param_importance_nlp.experiments.stage2_s25_inputs import (
 )
 from param_importance_nlp.runtime.task_artifacts import TaskArtifactStore
 from ops.stage2.materialize_s205_formal_inputs import main as materialize_main
+from ops.stage2.run_s205_formal import _inventory, _load_materialization_index, _parser, _validate_inventory
+from param_importance_nlp.contracts.g21_formal_handoff import ALLOWED_DEVICES, EXCLUDED_PCI, EXCLUDED_UUID
 
 
 def _sampling() -> SamplingPlan:
@@ -157,6 +159,126 @@ def test_materializer_is_append_only_and_idempotent(tmp_path: Path) -> None:
     tampered = {"schema_version": "tampered"}
     write_canonical_json(index, tampered)
     assert materialize_main(argv) == 3
+
+
+def test_launcher_revalidates_materialized_input_index_source_closure(tmp_path: Path) -> None:
+    prereg_ref, sampling_ref, execution_ref, _sampling_plan = _formal_fixture(tmp_path)
+    output_ref = "evidence/stage2/s205/inputs/index-closure"
+    assert materialize_main([
+        "--data-root", str(tmp_path),
+        "--preregistration-ref", prereg_ref,
+        "--sampling-plan-task-ref", sampling_ref,
+        "--formal-execution-ref", execution_ref,
+        "--output-root", output_ref,
+    ]) == 0
+    index_ref = f"{output_ref}/index.json"
+    loaded = _load_materialization_index(tmp_path, index_ref)
+    assert loaded["status"] == "FROZEN"
+    sampling = load_canonical_json(tmp_path / str(loaded["sampling_plan_ref"]))
+    assert isinstance(sampling, dict)
+    sampling["unapproved_extra"] = True
+    write_canonical_json(tmp_path / str(loaded["sampling_plan_ref"]), sampling)
+    with pytest.raises(Exception, match="S205_INPUT_INDEX"):
+        _load_materialization_index(tmp_path, index_ref)
+
+
+def test_launcher_gpu_inventory_requires_complete_clean_s206_snapshot() -> None:
+    rows = [
+        {
+            "pci_bus_id": pci,
+            "uuid": uuid,
+            "memory_used_mib": "0",
+            "memory_total_mib": "40960",
+            "utilization_gpu_percent": "0",
+            "ecc_uncorrected_volatile": "0",
+            "ecc_uncorrected_aggregate": "0",
+            "gpu_recovery_action": "None",
+        }
+        for pci, uuid in ALLOWED_DEVICES
+    ]
+    rows.extend(
+        {
+            "pci_bus_id": EXCLUDED_PCI,
+            "uuid": EXCLUDED_UUID,
+            "memory_used_mib": "0",
+            "memory_total_mib": "40960",
+            "utilization_gpu_percent": "0",
+            "ecc_uncorrected_volatile": "0",
+            "ecc_uncorrected_aggregate": "0",
+            "gpu_recovery_action": "None",
+        }
+        for _ in range(1)
+    )
+    rows.extend(
+        {
+            "pci_bus_id": f"0000:{bus}:00.0",
+            "uuid": f"GPU-other-{bus}",
+            "memory_used_mib": "0",
+            "memory_total_mib": "40960",
+            "utilization_gpu_percent": "0",
+            "ecc_uncorrected_volatile": "0",
+            "ecc_uncorrected_aggregate": "0",
+            "gpu_recovery_action": "None",
+        }
+        for bus in ("51", "52", "54")
+    )
+    result = _validate_inventory(rows)
+    assert result["inventory_count"] == 8
+    rows[0]["memory_used_mib"] = "1"
+    with pytest.raises(Exception, match="S205_GPU_INVENTORY"):
+        _validate_inventory(rows)
+
+
+def test_launcher_accepts_only_hash_bound_gpu_inventory_envelope(tmp_path: Path) -> None:
+    rows = [
+        {
+            "pci_bus_id": pci,
+            "uuid": uuid,
+            "memory_used_mib": "0",
+            "memory_total_mib": "40960",
+            "utilization_gpu_percent": "0",
+            "ecc_uncorrected_volatile": "0",
+            "ecc_uncorrected_aggregate": "0",
+            "gpu_recovery_action": "None",
+        }
+        for pci, uuid in ALLOWED_DEVICES
+    ]
+    rows += [{
+        "pci_bus_id": EXCLUDED_PCI,
+        "uuid": EXCLUDED_UUID,
+        "memory_used_mib": "0", "memory_total_mib": "40960",
+        "utilization_gpu_percent": "0", "ecc_uncorrected_volatile": "0",
+        "ecc_uncorrected_aggregate": "0", "gpu_recovery_action": "None",
+    }]
+    rows += [{
+        "pci_bus_id": f"0000:{bus}:00.0", "uuid": f"GPU-other-{bus}",
+        "memory_used_mib": "0", "memory_total_mib": "40960",
+        "utilization_gpu_percent": "0", "ecc_uncorrected_volatile": "0",
+        "ecc_uncorrected_aggregate": "0", "gpu_recovery_action": "None",
+    } for bus in ("51", "52", "54")]
+    path = tmp_path / "gpu-inventory.json"
+    value = {
+        "schema_version": "stage2-s206-gpu-inventory-v1",
+        "source_ref": "gpu-inventory.json",
+        "rows": rows,
+        "compute_apps": [],
+    }
+    value["artifact_hash"] = canonical_json_hash(value)
+    write_canonical_json(path, value)
+    assert len(_inventory(path, data_root=tmp_path)) == 8
+    value["rows"][0]["memory_used_mib"] = "1"
+    write_canonical_json(path, value)
+    with pytest.raises(Exception, match="S205_GPU_INVENTORY_ARTIFACT_HASH_MISMATCH"):
+        _inventory(path, data_root=tmp_path)
+
+
+def test_launcher_detach_and_resume_are_execute_modifiers() -> None:
+    args = _parser().parse_args([
+        "--execute", "--detach", "--resume", "--data-root", "root",
+        "--s205-rebind-ref", "rebind.json", "--input-index-ref", "inputs/index.json",
+        "--artifact-root", "out", "--operations-root", "ops",
+    ])
+    assert args.execute is True and args.detach is True and args.resume is True
 
 
 def test_runner_rejects_sweep_bound_to_other_formal_execution(tmp_path: Path) -> None:
