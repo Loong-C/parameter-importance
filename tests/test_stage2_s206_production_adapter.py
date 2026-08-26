@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 from types import SimpleNamespace
 import hashlib
+import sys
 
 import numpy as np
 import pytest
@@ -343,23 +344,25 @@ def test_detached_wait_recovers_final_g24b_freeze(tmp_path: Path) -> None:
     write_canonical_json(tmp_path / execution_ref, execution)
     preflight = {"status": "READY"}
     preflight["preflight_artifact_hash"] = canonical_json_hash(preflight)
+    status_payload: dict[str, object] = {
+        "schema_version": "stage2-s206-formal-detached-status-v1",
+        "stage": "G2.4B_PASS_MATRIX_FROZEN",
+        "formal_eligible": True,
+        "confirmatory_draws_generated": False,
+        "preflight": preflight,
+        "preflight_artifact_hash": preflight["preflight_artifact_hash"],
+        "gpu_inventory_path": identity["artifact_ref"],
+        "gpu_inventory_ref": identity["artifact_ref"],
+        "gpu_inventory_source_ref": identity["source_ref"],
+        "gpu_inventory_artifact_hash": identity["artifact_hash"],
+        "gpu_inventory_source_sha256": identity["source_sha256"],
+        "execution_evidence_ref": execution_ref,
+        "execution_evidence_hash": execution["artifact_hash"],
+    }
+    status_payload["artifact_hash"] = canonical_json_hash(status_payload)
     write_canonical_json(
         tmp_path / "operations/s206/status.json",
-        {
-            "schema_version": "stage2-s206-formal-detached-status-v1",
-            "stage": "G2.4B_PASS_MATRIX_FROZEN",
-            "formal_eligible": True,
-            "confirmatory_draws_generated": False,
-            "preflight": preflight,
-            "preflight_artifact_hash": preflight["preflight_artifact_hash"],
-            "gpu_inventory_path": str(inventory_path.resolve()),
-            "gpu_inventory_ref": identity["artifact_ref"],
-            "gpu_inventory_source_ref": identity["source_ref"],
-            "gpu_inventory_artifact_hash": identity["artifact_hash"],
-            "gpu_inventory_source_sha256": identity["source_sha256"],
-            "execution_evidence_ref": execution_ref,
-            "execution_evidence_hash": execution["artifact_hash"],
-        },
+        status_payload,
     )
     result = launcher._wait(
         SimpleNamespace(
@@ -383,8 +386,22 @@ def test_detached_wait_recovers_final_g24b_freeze(tmp_path: Path) -> None:
     status_path = tmp_path / "operations/s206/status.json"
     status_value = load_canonical_json(status_path)
     assert isinstance(status_value, dict)
+    status_value["formal_eligible"] = False
+    # Keep the old hash: wait must reject the stage tamper before displaying it.
+    write_canonical_json(status_path, status_value)
+    with pytest.raises(S206PreparationBlocked, match="STATUS_ARTIFACT_HASH_MISMATCH"):
+        launcher._wait(
+            SimpleNamespace(
+                data_root=tmp_path,
+                operations_root="operations/s206",
+                timeout_seconds=0,
+                poll_seconds=0.01,
+            )
+        )
+    status_value = dict(status_payload)
+    status_value.pop("artifact_hash", None)
     status_value.pop("execution_evidence_ref", None)
-    status_value["execution_evidence_hash"] = "a" * 64
+    status_value["artifact_hash"] = canonical_json_hash(status_value)
     write_canonical_json(status_path, status_value)
     with pytest.raises(S206PreparationBlocked, match="STATUS_EXECUTION_EVIDENCE_IDENTITY_MISSING"):
         launcher._wait(
@@ -393,6 +410,10 @@ def test_detached_wait_recovers_final_g24b_freeze(tmp_path: Path) -> None:
                 operations_root="operations/s206",
                 timeout_seconds=0,
                 poll_seconds=0.01,
+                execution_evidence_ref=execution_ref,
+                g23_evaluation=g23_ref,
+                g24a_evaluation=g24a_ref,
+                s205_rebind_ref=s205_ref,
             )
         )
     assert launcher.main(
@@ -410,6 +431,121 @@ def test_detached_wait_recovers_final_g24b_freeze(tmp_path: Path) -> None:
             "operations/s206",
         ]
     ) == 3
+
+
+def _detached_test_args(tmp_path: Path) -> tuple[SimpleNamespace, dict[str, object], FormalExecutionEvidence]:
+    inventory_ref = "evidence/gpu-inventory.json"
+    preflight = {
+        "gpu_inventory_ref": inventory_ref,
+        "gpu_inventory_source_ref": "evidence/gpu-inventory.capture.txt",
+        "gpu_inventory_artifact_hash": "a" * 64,
+        "gpu_inventory_source_sha256": "b" * 64,
+        "preflight_artifact_hash": "c" * 64,
+        "gpu": {"inventory_path": inventory_ref},
+    }
+    args = SimpleNamespace(
+        execute=True,
+        data_root=tmp_path,
+        operations_root="operations/s206",
+        repository=ROOT,
+        python=Path(sys.executable),
+        run_id="detach-test",
+        execution_evidence_ref="evidence/execution.json",
+        g23_evaluation="evidence/g23.json",
+        g24a_evaluation="evidence/g24a.json",
+        s205_rebind_ref="evidence/s205-rebind.json",
+        s204_root="evidence/s204",
+    )
+    return args, preflight, _execution()
+
+
+def test_detach_uses_append_only_attempts_and_blocks_live_receipts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    args, preflight, execution = _detached_test_args(tmp_path)
+    monkeypatch.setattr(launcher, "_preflight", lambda _args: preflight)
+    monkeypatch.setattr(launcher, "_load_formal_execution", lambda _args: execution)
+    monkeypatch.setattr(launcher.sys, "argv", ["run_s206_formal.py", "--execute", "--detach"])
+    pids = iter((50101, 50102, 50103))
+
+    class FakeProcess:
+        def __init__(self) -> None:
+            self.pid = next(pids)
+
+        def terminate(self) -> None:
+            return None
+
+    monkeypatch.setattr(launcher.subprocess, "Popen", lambda *_args, **_kwargs: FakeProcess())
+    monkeypatch.setattr(launcher.os, "kill", lambda *_args, **_kwargs: None)
+    assert launcher._detach(args) == 0
+    attempts = tmp_path / "operations/s206/attempts"
+    receipts = sorted(attempts.glob("*/launcher.pid.json"))
+    assert len(receipts) == 1
+    assert not (tmp_path / "operations/s206/launcher.pid.json").exists()
+    first = load_canonical_json(receipts[0])
+    assert isinstance(first, dict)
+    assert first["artifact_hash"] == canonical_json_hash(
+        {key: value for key, value in first.items() if key != "artifact_hash"}
+    )
+    for field in (
+        "attempt_ref",
+        "operations_root",
+        "log_ref",
+        "status_ref",
+        "gpu_inventory_ref",
+        "gpu_inventory_source_ref",
+        "gpu_inventory_path",
+        "execution_evidence_ref",
+    ):
+        ref = first[field]
+        assert isinstance(ref, str) and not Path(ref).is_absolute() and "\\" not in ref
+
+    # A valid stale receipt is retained and does not get overwritten.
+    monkeypatch.setattr(launcher.os, "kill", lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError()))
+    assert launcher._detach(args) == 0
+    receipts = sorted(attempts.glob("*/launcher.pid.json"))
+    assert len(receipts) == 2
+    assert receipts[0] != receipts[1]
+
+    # A live PID in any retained attempt blocks another detached launch.
+    monkeypatch.setattr(launcher.os, "kill", lambda *_args, **_kwargs: None)
+    with pytest.raises(S206PreparationBlocked, match="DETACHED_LAUNCH_ALREADY_RUNNING"):
+        launcher._detach(args)
+
+    # Receipt tamper is rejected before PID liveness is consulted.
+    tampered = load_canonical_json(receipts[1])
+    assert isinstance(tampered, dict)
+    tampered["pid"] = 50199
+    write_canonical_json(receipts[1], tampered)
+    monkeypatch.setattr(launcher.os, "kill", lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError()))
+    with pytest.raises(S206PreparationBlocked, match="DETACHED_ATTEMPT_RECEIPT_HASH_MISMATCH"):
+        launcher._detach(args)
+
+
+@pytest.mark.parametrize("malformation", ["broken_symlink", "nonregular", "invalid_json"])
+def test_detach_rejects_malformed_attempt_receipts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    malformation: str,
+) -> None:
+    args, preflight, execution = _detached_test_args(tmp_path)
+    monkeypatch.setattr(launcher, "_preflight", lambda _args: preflight)
+    monkeypatch.setattr(launcher, "_load_formal_execution", lambda _args: execution)
+    attempt_dir = tmp_path / "operations/s206/attempts/bad-attempt"
+    attempt_dir.mkdir(parents=True)
+    receipt = attempt_dir / "launcher.pid.json"
+    if malformation == "broken_symlink":
+        try:
+            receipt.symlink_to("missing-receipt.json")
+        except OSError:
+            pytest.skip("symlink creation is unavailable on this host")
+    elif malformation == "nonregular":
+        receipt.mkdir()
+    else:
+        receipt.write_text("{not-json", encoding="utf-8")
+    with pytest.raises(S206PreparationBlocked):
+        launcher._detach(args)
 
 
 def test_production_queue_is_deterministic_lpt_by_frozen_draw_work() -> None:
