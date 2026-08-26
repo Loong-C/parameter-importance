@@ -573,6 +573,14 @@ def _load_s205_rebind(args: argparse.Namespace) -> tuple[dict[str, object], dict
     _path, plan = _load_object_ref(root, args.s205_rebind_ref, field="s205_rebind_ref")
     if plan.get("schema_version") != "stage2-s205-rebind-plan-v1" or plan.get("status") != "READY" or plan.get("formal_eligible") is not True:
         raise S206PreparationBlocked("S205_REBIND_READY_FORMAL_REQUIRED")
+    g23_path, g23 = _load_object_ref(root, args.g23_evaluation, field="g23_evaluation")
+    expected_g23_ref = g23_path.relative_to(root).as_posix()
+    expected_g23_hash = g23.get("artifact_hash")
+    if (
+        plan.get("g23_evaluation_ref") != expected_g23_ref
+        or plan.get("g23_evaluation_hash") != expected_g23_hash
+    ):
+        raise S206PreparationBlocked("S205_REBIND_G23_EVALUATION_BINDING_INVALID")
     rows = plan.get("cells")
     if not isinstance(rows, list) or len(rows) != len(ANCHOR_IDS):
         raise S206PreparationBlocked("S205_REBIND_SIX_CELL_ROWS_REQUIRED")
