@@ -4,6 +4,10 @@
 the sealed S2.7 manifest.  ``--preflight`` re-reads every producer artifact,
 GPU inventory, and I/O evidence.  ``--execute`` is the sole mode allowed to
 start a profiler worker; the worker command must emit actual measured rows.
+For ``scientific_equal_sample_cost``, one invocation receives
+``S29_METHOD=shared`` and must emit a
+``stage2-s209-g27a-shared-paired-run-v1`` envelope containing all three
+methods and the hash-bound shared-pool artifact.
 ``--detach``/``--status``/``--wait`` are control-plane operations and never
 invent a result when a profiler or prerequisite is missing.
 """

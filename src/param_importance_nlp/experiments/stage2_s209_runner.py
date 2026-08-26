@@ -2,10 +2,13 @@
 
 The S2.9 reducer is intentionally a pure consumer.  This module supplies the
 missing execution boundary: it binds the frozen G2.4b matrix and sealed S2.7
-manifest, validates a live UUID inventory and I/O observation, and executes a
-profiler worker for each missing measurement.  A worker must return measured
-wall/phase/memory counters; this control plane never invents a timing,
-throughput, or memory value.
+manifest, validates a live UUID inventory and I/O observation, and executes
+workers for missing measurements.  The scientific equal-sample semantic is a
+single serial paired worker per anchor/repetition; that worker must return all
+three method rows plus a hash-bound shared sample/gradient-pool envelope.
+Method-only semantics remain one worker per method.  A worker must return
+measured wall/phase/memory counters; this control plane never invents a
+timing, throughput, or memory value.
 
 The runner is detached-friendly and resumable at terminal measurement files.
 Every attempt and failure is retained.  A reducer report and its G2.7a gate are
@@ -36,6 +39,8 @@ from .stage2_s209_g27a import (
     S29_COUNT_FIELDS,
     S29_COST_SEMANTICS,
     S29_METHODS,
+    S29_SHARED_POOL_SCHEMA,
+    S29_SHARED_RUN_SCHEMA,
     S29_TIMING_FIELDS,
     S29FrozenInputs,
     S29_G25_GATE_ID,
@@ -43,6 +48,7 @@ from .stage2_s209_g27a import (
     bind_s209_inputs,
     prepare_s209_measurement_plan,
     run_s209_g27a,
+    shared_paired_run_identity,
 )
 
 
@@ -54,6 +60,7 @@ S29_IO_SCHEMA = "stage2-s209-g27a-io-quiescence-v1"
 S29_INVENTORY_SCHEMA = "stage2-s209-g27a-gpu-inventory-v1"
 S29_CAPACITY_SCHEMA = "stage2-s209-g27a-capacity-v1"
 S29_ULIMIT_SCHEMA = "stage2-s209-g27a-ulimit-v1"
+S29_SHARED_POOL_REF_PREFIX = "shared-pools/"
 S29_ACCEPTED_INVENTORY_SCHEMAS = frozenset({
     S29_INVENTORY_SCHEMA,
     "stage2-s206-gpu-inventory-v1",
@@ -777,9 +784,11 @@ class S29ProfilerExecutor(Protocol):
 def subprocess_profiler_executor(command: Sequence[str]) -> S29ProfilerExecutor:
     """Build an executor for a real profiler process.
 
-    The child must print one JSON object (or ``{"row": object}``) to stdout.
-    All required measurements are validated downstream; an absent field is a
-    hard failure, never replaced with a model/default estimate.
+    The child must print one JSON object (or ``{"row": object}``) to stdout;
+    the shared scientific action may instead return a ``{"rows": [...]}``
+    paired-run envelope.  All required measurements are validated downstream;
+    an absent field is a hard failure, never replaced with a model/default
+    estimate.
     """
 
     if not command or any(not isinstance(item, str) or not item for item in command):
@@ -800,6 +809,10 @@ def subprocess_profiler_executor(command: Sequence[str]) -> S29ProfilerExecutor:
             raise S29RunnerBlocked("PROFILER_OUTPUT_JSON_REQUIRED") from error
         if not isinstance(decoded, Mapping):
             raise S29RunnerBlocked("PROFILER_OUTPUT_OBJECT_REQUIRED")
+        if isinstance(decoded.get("rows"), list):
+            result = dict(decoded)
+            result["profiler_process_wall_seconds"] = elapsed
+            return result
         result = decoded.get("row", decoded)
         if not isinstance(result, Mapping):
             raise S29RunnerBlocked("PROFILER_OUTPUT_ROW_REQUIRED")
@@ -808,6 +821,190 @@ def subprocess_profiler_executor(command: Sequence[str]) -> S29ProfilerExecutor:
         return row
 
     return execute
+
+
+def _validate_shared_pool(
+    pool: Mapping[str, Any],
+    *,
+    task: Mapping[str, Any],
+    frozen: S29FrozenInputs,
+) -> dict[str, Any]:
+    """Validate the worker's immutable sample/gradient-pool declaration."""
+
+    if not isinstance(pool, Mapping):
+        raise S29RunnerBlocked("PROFILER_SHARED_POOL_OBJECT_REQUIRED")
+    value = dict(pool)
+    _finite_json(value, field="profiler_shared_pool")
+    required = {
+        "schema_version",
+        "paired_run_id",
+        "paired_run_identity_hash",
+        "measurement_plan_hash",
+        "matrix_hash",
+        "raw_manifest_hash",
+        "source_raw_run_id",
+        "anchor_id",
+        "repetition",
+        "gpu_uuid",
+        "device_count",
+        "batch_size",
+        "microbatch_count",
+        "method_order",
+        "pool_id",
+        "sample_mapping_hash",
+        "gradient_pool_hash",
+        "sequence_count",
+        "token_count",
+        "backward_count",
+        "cost_io_quiescent",
+        "shared_pool_ref",
+        "artifact_hash",
+    }
+    missing = sorted(required - set(value))
+    if missing:
+        raise S29RunnerBlocked("PROFILER_SHARED_POOL_FIELD_MISSING:" + ",".join(missing))
+    if value["schema_version"] != S29_SHARED_POOL_SCHEMA:
+        raise S29RunnerBlocked("PROFILER_SHARED_POOL_SCHEMA_INVALID")
+    declared = _sha(value["artifact_hash"], field="profiler_shared_pool.artifact_hash")
+    if canonical_json_hash({key: item for key, item in value.items() if key != "artifact_hash"}) != declared:
+        raise S29RunnerBlocked("PROFILER_SHARED_POOL_HASH_MISMATCH")
+    expected_pair = shared_paired_run_identity(
+        run_id=str(task["run_id"]),
+        measurement_plan_hash=str(task["measurement_plan_hash"]),
+        matrix_hash=frozen.matrix_hash,
+        raw_manifest_hash=frozen.raw_manifest_hash,
+        source_raw_run_id=frozen.raw_run_id,
+        anchor_id=str(task["anchor_id"]),
+        repetition=int(task["repetition"]),
+        gpu_uuid=str(task["gpu_uuid"]),
+        device_count=int(task["device_count"]),
+        method_order=task["shared_method_order"],
+    )
+    expected = {
+        "paired_run_id": expected_pair["paired_run_id"],
+        "paired_run_identity_hash": expected_pair["paired_run_identity_hash"],
+        "measurement_plan_hash": task["measurement_plan_hash"],
+        "matrix_hash": frozen.matrix_hash,
+        "raw_manifest_hash": frozen.raw_manifest_hash,
+        "source_raw_run_id": frozen.raw_run_id,
+        "anchor_id": task["anchor_id"],
+        "repetition": task["repetition"],
+        "gpu_uuid": task["gpu_uuid"],
+        "device_count": task["device_count"],
+        "batch_size": frozen.batch_size,
+        "microbatch_count": frozen.microbatch_count,
+        "method_order": task["shared_method_order"],
+        "shared_pool_ref": task["shared_pool_ref"],
+        "cost_io_quiescent": True,
+    }
+    for name, expected_value in expected.items():
+        if value.get(name) != expected_value:
+            raise S29RunnerBlocked(f"PROFILER_SHARED_POOL_IDENTITY_DRIFT:{name}")
+    _sha(value["pool_id"], field="profiler_shared_pool.pool_id")
+    _sha(value["sample_mapping_hash"], field="profiler_shared_pool.sample_mapping_hash")
+    _sha(value["gradient_pool_hash"], field="profiler_shared_pool.gradient_pool_hash")
+    for name in ("sequence_count", "token_count", "backward_count"):
+        if isinstance(value[name], bool) or not isinstance(value[name], int) or value[name] <= 0:
+            raise S29RunnerBlocked(f"PROFILER_SHARED_POOL_COUNT_INVALID:{name}")
+    return value
+
+
+def _validate_shared_bundle(
+    bundle: Mapping[str, Any],
+    *,
+    tasks: Sequence[Mapping[str, Any]],
+    frozen: S29FrozenInputs,
+    io_evidence: Mapping[str, Any],
+    inventory_identity: Mapping[str, Any],
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Validate one worker invocation containing all three pooled methods."""
+
+    if not isinstance(bundle, Mapping):
+        raise S29RunnerBlocked("PROFILER_SHARED_RUN_OBJECT_REQUIRED")
+    value = dict(bundle)
+    if value.get("schema_version") != S29_SHARED_RUN_SCHEMA or value.get("semantic") != "scientific_equal_sample_cost":
+        raise S29RunnerBlocked("PROFILER_SHARED_RUN_SCHEMA_INVALID")
+    if len(tasks) != len(S29_METHODS):
+        raise S29RunnerBlocked("PROFILER_SHARED_TASK_GROUP_INVALID")
+    by_method = {str(task.get("method")): task for task in tasks}
+    if set(by_method) != set(S29_METHODS):
+        raise S29RunnerBlocked("PROFILER_SHARED_TASK_METHOD_SET_INVALID")
+    first_task = tasks[0]
+    common_task_fields = (
+        "paired_run_id",
+        "paired_run_identity_hash",
+        "run_id",
+        "measurement_plan_hash",
+        "anchor_id",
+        "repetition",
+        "gpu_uuid",
+        "device_count",
+        "shared_method_order",
+    )
+    for task in tasks[1:]:
+        if any(task.get(name) != first_task.get(name) for name in common_task_fields):
+            raise S29RunnerBlocked("PROFILER_SHARED_TASK_IDENTITY_DRIFT")
+    expected_pair = shared_paired_run_identity(
+        run_id=str(first_task["run_id"]),
+        measurement_plan_hash=str(first_task["measurement_plan_hash"]),
+        matrix_hash=frozen.matrix_hash,
+        raw_manifest_hash=frozen.raw_manifest_hash,
+        source_raw_run_id=frozen.raw_run_id,
+        anchor_id=str(first_task["anchor_id"]),
+        repetition=int(first_task["repetition"]),
+        gpu_uuid=str(first_task["gpu_uuid"]),
+        device_count=int(first_task["device_count"]),
+        method_order=first_task["shared_method_order"],
+    )
+    for name, expected_value in {
+        "paired_run_id": expected_pair["paired_run_id"],
+        "paired_run_identity_hash": expected_pair["paired_run_identity_hash"],
+        "run_id": first_task["run_id"],
+        "measurement_plan_hash": first_task["measurement_plan_hash"],
+        "anchor_id": first_task["anchor_id"],
+        "repetition": first_task["repetition"],
+        "gpu_uuid": first_task["gpu_uuid"],
+        "device_count": first_task["device_count"],
+        "method_order": first_task["shared_method_order"],
+        "methods": list(S29_METHODS),
+    }.items():
+        if value.get(name) != expected_value:
+            raise S29RunnerBlocked(f"PROFILER_SHARED_RUN_IDENTITY_DRIFT:{name}")
+    pool = _validate_shared_pool(value.get("shared_pool"), task=first_task, frozen=frozen)
+    rows = value.get("rows")
+    if not isinstance(rows, list) or len(rows) != len(S29_METHODS) or any(not isinstance(row, Mapping) for row in rows):
+        raise S29RunnerBlocked("PROFILER_SHARED_RUN_ROWS_REQUIRED")
+    normalized: list[dict[str, Any]] = []
+    seen_methods: set[str] = set()
+    for raw_row in rows:
+        method = raw_row.get("method")
+        if not isinstance(method, str) or method not in by_method or method in seen_methods:
+            raise S29RunnerBlocked("PROFILER_SHARED_RUN_METHOD_SET_INVALID")
+        seen_methods.add(method)
+        method_task = dict(by_method[method])
+        method_task.update(
+            {
+                "shared_pool_id": pool["pool_id"],
+                "shared_pool_artifact_hash": pool["artifact_hash"],
+                "shared_pool_ref": pool["shared_pool_ref"],
+                "shared_sample_mapping_hash": pool["sample_mapping_hash"],
+                "shared_gradient_pool_hash": pool["gradient_pool_hash"],
+                "shared_sample_sequence_count": pool["sequence_count"],
+                "shared_sample_token_count": pool["token_count"],
+            }
+        )
+        normalized.append(
+            _validate_measured_row(
+                raw_row,
+                task=method_task,
+                frozen=frozen,
+                io_evidence=io_evidence,
+                inventory_identity=inventory_identity,
+            )
+        )
+    if seen_methods != set(S29_METHODS):
+        raise S29RunnerBlocked("PROFILER_SHARED_RUN_METHOD_SET_INVALID")
+    return normalized, pool
 
 
 def _validate_measured_row(
@@ -885,6 +1082,62 @@ def _validate_measured_row(
     output["cost_io_quiescent"] = io_evidence.get("cost_io_quiescent") is True
     output["io_evidence_hash"] = str(io_evidence["artifact_hash"])
     output["health_ok"] = output.get("health_ok") is True
+    if semantic == "scientific_equal_sample_cost":
+        shared_fields = (
+            "paired_run_id",
+            "paired_run_identity_hash",
+            "measurement_plan_hash",
+            "shared_pool_id",
+            "shared_pool_artifact_hash",
+            "shared_pool_ref",
+            "shared_sample_mapping_hash",
+            "shared_gradient_pool_hash",
+            "shared_method_order",
+            "shared_method_index",
+            "shared_sample_sequence_count",
+            "shared_sample_token_count",
+        )
+        for name in shared_fields:
+            if name not in row:
+                raise S29RunnerBlocked(f"PROFILER_SHARED_FIELD_MISSING:{name}")
+            if name in task and row[name] != task[name]:
+                raise S29RunnerBlocked(f"PROFILER_SHARED_IDENTITY_DRIFT:{name}")
+        _safe_id(output["paired_run_id"], field="paired_run_id")
+        _sha(output["paired_run_identity_hash"], field="paired_run_identity_hash")
+        _sha(output["measurement_plan_hash"], field="measurement_plan_hash")
+        _sha(output["shared_pool_id"], field="shared_pool_id")
+        _sha(output["shared_pool_artifact_hash"], field="shared_pool_artifact_hash")
+        _sha(output["shared_sample_mapping_hash"], field="shared_sample_mapping_hash")
+        _sha(output["shared_gradient_pool_hash"], field="shared_gradient_pool_hash")
+        if not re.fullmatch(r"shared-pools/[A-Za-z0-9][A-Za-z0-9._:-]{0,159}\.json", str(output["shared_pool_ref"])):
+            raise S29RunnerBlocked("PROFILER_SHARED_POOL_REF_INVALID")
+        order = output["shared_method_order"]
+        if not isinstance(order, list) or len(order) != len(S29_METHODS) or len(set(order)) != len(S29_METHODS) or set(order) != set(S29_METHODS):
+            raise S29RunnerBlocked("PROFILER_SHARED_METHOD_ORDER_INVALID")
+        index = output["shared_method_index"]
+        if isinstance(index, bool) or not isinstance(index, int) or index < 0 or index >= len(S29_METHODS) or order[index] != method:
+            raise S29RunnerBlocked("PROFILER_SHARED_METHOD_INDEX_INVALID")
+        for name in ("shared_sample_sequence_count", "shared_sample_token_count"):
+            if isinstance(output[name], bool) or not isinstance(output[name], int) or output[name] <= 0:
+                raise S29RunnerBlocked(f"PROFILER_SHARED_SAMPLE_COUNT_INVALID:{name}")
+        if output["sequence_count"] != output["shared_sample_sequence_count"] or output["token_count"] != output["shared_sample_token_count"]:
+            raise S29RunnerBlocked("PROFILER_SHARED_SAMPLE_COUNT_MISMATCH")
+        expected_pair = shared_paired_run_identity(
+            run_id=str(task["run_id"]),
+            measurement_plan_hash=str(output["measurement_plan_hash"]),
+            matrix_hash=frozen.matrix_hash,
+            raw_manifest_hash=frozen.raw_manifest_hash,
+            source_raw_run_id=frozen.raw_run_id,
+            anchor_id=str(task["anchor_id"]),
+            repetition=int(task["repetition"]),
+            gpu_uuid=str(task["gpu_uuid"]),
+            device_count=int(task["device_count"]),
+            method_order=order,
+        )
+        if output["paired_run_id"] != expected_pair["paired_run_id"] or output["paired_run_identity_hash"] != expected_pair["paired_run_identity_hash"]:
+            raise S29RunnerBlocked("PROFILER_SHARED_PAIRED_RUN_IDENTITY_MISMATCH")
+        if output["cost_io_quiescent"] is not True:
+            raise S29RunnerBlocked("PROFILER_SHARED_IO_NOT_QUIESCENT")
     # Require every phase/counter and all three memory views from the child.
     for name in S29_TIMING_FIELDS + ("wall_seconds", "allocated_peak_bytes", "reserved_peak_bytes", "device_peak_bytes"):
         if name not in row:
@@ -921,6 +1174,11 @@ def _task_list(preflight: S29Preflight, *, run_id: str) -> list[dict[str, Any]]:
     rows = preflight.measurement_plan.get("rows")
     if not isinstance(rows, list) or not rows:
         raise S29RunnerBlocked("MEASUREMENT_PLAN_ROWS_REQUIRED")
+    frozen = getattr(preflight, "frozen", None)
+    if frozen is None:
+        raise S29RunnerBlocked("SHARED_PAIRED_FROZEN_INPUTS_REQUIRED")
+    measurement_plan_hash = str(getattr(preflight, "plan_hash", preflight.measurement_plan.get("artifact_hash", "")))
+    _sha(measurement_plan_hash, field="measurement_plan_hash")
     tasks: list[dict[str, Any]] = []
     # The prepared plan is the sole source of anchor/repetition/order identity
     # for every semantic.  Synthetic IDs or hard-coded 2x2 loops would allow a
@@ -938,8 +1196,20 @@ def _task_list(preflight: S29Preflight, *, run_id: str) -> list[dict[str, Any]]:
             order = source.get("method_order")
             if not isinstance(order, list) or len(order) != len(S29_METHODS) or len(set(order)) != len(S29_METHODS) or set(order) != set(S29_METHODS):
                 raise S29RunnerBlocked("MEASUREMENT_PLAN_METHOD_ORDER_INVALID")
+            shared_identity = shared_paired_run_identity(
+                run_id=run_id,
+                measurement_plan_hash=measurement_plan_hash,
+                matrix_hash=str(frozen.matrix_hash),
+                raw_manifest_hash=str(frozen.raw_manifest_hash),
+                source_raw_run_id=str(frozen.raw_run_id),
+                anchor_id=anchor,
+                repetition=repetition,
+                gpu_uuid=APPROVED_GPU_UUIDS[0],
+                device_count=1,
+                method_order=order,
+            )
             for method in order:
-                tasks.append({
+                task = {
                     "semantic": semantic,
                     "method": str(method),
                     "anchor_id": anchor,
@@ -947,7 +1217,19 @@ def _task_list(preflight: S29Preflight, *, run_id: str) -> list[dict[str, Any]]:
                     "run_id": run_id,
                     "gpu_uuid": APPROVED_GPU_UUIDS[0],
                     "device_count": 1,
-                })
+                }
+                if semantic == S29_COST_SEMANTICS[0]:
+                    task.update(
+                        {
+                            "paired_run_id": shared_identity["paired_run_id"],
+                            "paired_run_identity_hash": shared_identity["paired_run_identity_hash"],
+                            "measurement_plan_hash": measurement_plan_hash,
+                            "shared_method_order": list(order),
+                            "shared_method_index": order.index(method),
+                            "shared_pool_ref": f"{S29_SHARED_POOL_REF_PREFIX}{shared_identity['paired_run_id']}.json",
+                        }
+                    )
+                tasks.append(task)
     return tasks
 
 
@@ -1004,6 +1286,169 @@ class S29ProfilerRunner:
 
     def _failure_path(self, task: Mapping[str, Any]) -> Path:
         return self.failure_root / f"{self._task_key(task)}.json"
+
+    def _shared_pool_path(self, task: Mapping[str, Any]) -> Path:
+        reference = str(task["shared_pool_ref"])
+        logical = PurePosixPath(reference)
+        if (
+            not reference.startswith(S29_SHARED_POOL_REF_PREFIX)
+            or "\\" in reference
+            or logical.is_absolute()
+            or any(part in {"", ".", ".."} for part in logical.parts)
+        ):
+            raise S29RunnerBlocked("SHARED_POOL_REF_INVALID")
+        path = (self.run_root / Path(*logical.parts)).resolve()
+        try:
+            path.relative_to(self.run_root.resolve())
+        except ValueError as error:
+            raise S29RunnerBlocked("SHARED_POOL_REF_PATH_ESCAPE") from error
+        return path
+
+    def _run_root_ref(self) -> str | None:
+        """Return the run-root path relative to DATA_ROOT when available."""
+
+        data_root = getattr(self.preflight, "root", None)
+        if data_root is None:
+            return None
+        try:
+            relative = self.run_root.relative_to(Path(data_root).resolve())
+        except ValueError:
+            return None
+        return relative.as_posix() if relative.parts else "."
+
+    def _shared_evidence_ref(self, reference: str) -> str:
+        """Qualify a run-root-relative pool ref for a DATA_ROOT gate."""
+
+        run_root_ref = self._run_root_ref()
+        if run_root_ref in {None, "."}:
+            return reference
+        return f"{run_root_ref}/{reference}"
+
+    def _shared_environment(self, task: Mapping[str, Any]) -> dict[str, str]:
+        return {
+            "S29_RUN_ID": self.run_id,
+            "S29_PLAN_HASH": self.preflight.plan_hash,
+            "S29_SEMANTIC": "scientific_equal_sample_cost",
+            "S29_METHOD": "shared",
+            "S29_ANCHOR_ID": str(task["anchor_id"]),
+            "S29_REPETITION": str(task["repetition"]),
+            "S29_GPU_UUIDS": str(task["gpu_uuid"]),
+            "CUDA_VISIBLE_DEVICES": str(task["gpu_uuid"]),
+            "S29_SHARED_RUN_SCHEMA": S29_SHARED_RUN_SCHEMA,
+            "S29_SHARED_POOL_SCHEMA": S29_SHARED_POOL_SCHEMA,
+            "S29_PAIRED_RUN_ID": str(task["paired_run_id"]),
+            "S29_PAIRED_RUN_IDENTITY_HASH": str(task["paired_run_identity_hash"]),
+            "S29_SHARED_METHOD_ORDER": json.dumps(task["shared_method_order"], separators=(",", ":")),
+            "S29_SHARED_POOL_REF": str(task["shared_pool_ref"]),
+        }
+
+    def _shared_manifest(self, rows: Iterable[Mapping[str, Any]]) -> list[dict[str, Any]]:
+        grouped: dict[str, list[Mapping[str, Any]]] = {}
+        for row in rows:
+            if row.get("semantic") == "scientific_equal_sample_cost":
+                grouped.setdefault(str(row["paired_run_id"]), []).append(row)
+        fields = (
+            "paired_run_id",
+            "paired_run_identity_hash",
+            "measurement_plan_hash",
+            "anchor_id",
+            "repetition",
+            "gpu_uuid",
+            "device_count",
+            "shared_pool_id",
+            "shared_pool_artifact_hash",
+            "shared_pool_ref",
+            "shared_sample_mapping_hash",
+            "shared_gradient_pool_hash",
+            "shared_method_order",
+            "shared_sample_sequence_count",
+            "shared_sample_token_count",
+        )
+        manifest: list[dict[str, Any]] = []
+        for paired_run_id, group in sorted(grouped.items()):
+            if len(group) != len(S29_METHODS):
+                raise S29RunnerBlocked(f"SHARED_PAIRED_METHOD_SET_INVALID:{paired_run_id}")
+            first = group[0]
+            if any(row.get(field) != first.get(field) for row in group[1:] for field in fields):
+                raise S29RunnerBlocked(f"SHARED_PAIRED_IDENTITY_DRIFT:{paired_run_id}")
+            manifest.append({field: (list(first[field]) if field == "shared_method_order" else first[field]) for field in fields})
+        return manifest
+
+    def _run_shared_group(
+        self,
+        tasks: Sequence[Mapping[str, Any]],
+        *,
+        completed: dict[str, dict[str, Any]],
+    ) -> None:
+        """Run one serial worker and atomically publish all three method rows."""
+
+        if len(tasks) != len(S29_METHODS):
+            raise S29RunnerBlocked("SHARED_PAIRED_TASK_GROUP_INVALID")
+        task_by_method = {str(task["method"]): task for task in tasks}
+        if set(task_by_method) != set(S29_METHODS):
+            raise S29RunnerBlocked("SHARED_PAIRED_TASK_METHOD_SET_INVALID")
+        keys = [self._task_key(task) for task in tasks]
+        if all(key in completed for key in keys):
+            return
+        if any(key in completed for key in keys):
+            raise S29RunnerBlocked("SHARED_PAIRED_PARTIAL_COMPLETION")
+        attempts: list[tuple[Mapping[str, Any], dict[str, Any]]] = []
+        for task, key in zip(tasks, keys):
+            attempt = self._attempt_path(task)
+            if attempt.exists():
+                previous = _load_object(attempt, field=f"attempt.{key}")
+                if previous.get("status") == "RUNNING":
+                    raise S29RunnerBlocked(f"SHARED_PAIRED_INTERRUPTED_ATTEMPT:{key}")
+                if previous.get("status") in {"FAILED", "SUCCEEDED"}:
+                    raise S29RunnerBlocked(f"SHARED_PAIRED_ATTEMPT_NOT_REPLAYABLE:{key}")
+                raise S29RunnerBlocked(f"ATTEMPT_LEDGER_INVALID:{key}")
+            payload: dict[str, Any] = {
+                "schema_version": S29_ATTEMPT_SCHEMA,
+                "run_id": self.run_id,
+                "plan_hash": self.preflight.plan_hash,
+                "task": dict(task),
+                "status": "RUNNING",
+                "started_at": _now(),
+            }
+            payload["artifact_hash"] = canonical_json_hash(payload)
+            _write_once(attempt, payload, field=f"attempt.{key}")
+            attempts.append((task, payload))
+        try:
+            bundle = self.profiler(tasks[0], environment=self._shared_environment(tasks[0]))
+            normalized, pool = _validate_shared_bundle(
+                bundle,
+                tasks=tasks,
+                frozen=self.preflight.frozen,
+                io_evidence=self.preflight.io_evidence,
+                inventory_identity=self.preflight.inventory["inventory_identity"],
+            )
+            pool_path = self._shared_pool_path(tasks[0])
+            pool_path.parent.mkdir(parents=True, exist_ok=True)
+            _write_once(pool_path, pool, field=f"shared_pool.{tasks[0]['paired_run_id']}")
+            for row in normalized:
+                method = str(row["method"])
+                task = task_by_method[method]
+                key = self._task_key(task)
+                _write_once(self._row_path(task), row, field=f"measurement.{key}")
+                terminal = next(payload for candidate, payload in attempts if candidate["method"] == method)
+                terminal = dict(terminal)
+                terminal["status"] = "SUCCEEDED"
+                terminal["finished_at"] = _now()
+                terminal["artifact_hash"] = canonical_json_hash({k: v for k, v in terminal.items() if k != "artifact_hash"})
+                write_canonical_json(self._attempt_path(task), terminal)
+                completed[key] = row
+        except Exception as error:
+            for task, payload in attempts:
+                key = self._task_key(task)
+                self._record_failure(task, code="S29_SHARED_PROFILER_FAILED", reason=f"{type(error).__name__}:{error}")
+                failed = dict(payload)
+                failed["status"] = "FAILED"
+                failed["finished_at"] = _now()
+                failed["failure_code"] = "S29_SHARED_PROFILER_FAILED"
+                failed["failure_reason"] = f"{type(error).__name__}:{error}"
+                failed["artifact_hash"] = canonical_json_hash({k: v for k, v in failed.items() if k != "artifact_hash"})
+                write_canonical_json(self._attempt_path(task), failed)
+            raise
 
     def _anchor_task(self, *, device_count: int) -> dict[str, Any]:
         if device_count not in {1, 4}:
@@ -1130,6 +1575,32 @@ class S29ProfilerRunner:
             )
             if canonical_json_hash(normalized) != canonical_json_hash(row):
                 raise S29RunnerBlocked(f"MEASUREMENT_ROW_IDENTITY_DRIFT:{self._task_key(task)}")
+            if task["semantic"] == "scientific_equal_sample_cost":
+                if row.get("shared_pool_ref") != task.get("shared_pool_ref"):
+                    raise S29RunnerBlocked(f"SHARED_POOL_REF_DRIFT:{self._task_key(task)}")
+                pool = _load_object(self._shared_pool_path(task), field=f"shared_pool.{task['paired_run_id']}")
+                pool_task = dict(task)
+                pool_task.update(
+                    {
+                        "shared_pool_id": row.get("shared_pool_id"),
+                        "shared_pool_artifact_hash": row.get("shared_pool_artifact_hash"),
+                        "shared_sample_mapping_hash": row.get("shared_sample_mapping_hash"),
+                        "shared_gradient_pool_hash": row.get("shared_gradient_pool_hash"),
+                        "shared_sample_sequence_count": row.get("shared_sample_sequence_count"),
+                        "shared_sample_token_count": row.get("shared_sample_token_count"),
+                    }
+                )
+                validated_pool = _validate_shared_pool(pool, task=pool_task, frozen=self.preflight.frozen)
+                if any(row.get(name) != expected for name, expected in {
+                    "shared_pool_id": validated_pool["pool_id"],
+                    "shared_pool_artifact_hash": validated_pool["artifact_hash"],
+                    "shared_pool_ref": validated_pool["shared_pool_ref"],
+                    "shared_sample_mapping_hash": validated_pool["sample_mapping_hash"],
+                    "shared_gradient_pool_hash": validated_pool["gradient_pool_hash"],
+                    "shared_sample_sequence_count": validated_pool["sequence_count"],
+                    "shared_sample_token_count": validated_pool["token_count"],
+                }.items()):
+                    raise S29RunnerBlocked(f"SHARED_POOL_ROW_BINDING_DRIFT:{self._task_key(task)}")
             completed[self._task_key(task)] = row
         return completed
 
@@ -1184,7 +1655,25 @@ class S29ProfilerRunner:
                 "failure_evidence": sorted(path.name for path in self.failure_root.glob("*.json")),
             }
         completed = self._load_completed(tasks)
+        shared_groups: dict[str, list[Mapping[str, Any]]] = {}
         for task in tasks:
+            if task["semantic"] == "scientific_equal_sample_cost":
+                shared_groups.setdefault(str(task["paired_run_id"]), []).append(task)
+        processed_shared: set[str] = set()
+        for task in tasks:
+            if task["semantic"] == "scientific_equal_sample_cost":
+                paired_run_id = str(task["paired_run_id"])
+                if paired_run_id in processed_shared:
+                    continue
+                processed_shared.add(paired_run_id)
+                try:
+                    self._run_shared_group(shared_groups[paired_run_id], completed=completed)
+                except Exception:
+                    # The group helper records immutable failure evidence for
+                    # all three methods.  Continue to inspect other groups;
+                    # the terminal count below keeps the run BLOCKED.
+                    continue
+                continue
             key = self._task_key(task)
             if key in completed:
                 continue
@@ -1214,8 +1703,9 @@ class S29ProfilerRunner:
                 "S29_METHOD": str(task.get("method", "shared")),
                 "S29_ANCHOR_ID": str(task["anchor_id"]),
                 "S29_REPETITION": str(task["repetition"]),
-                # Every method task is an isolated single-GPU process.  The
-                # four-card set is reserved exclusively for _run_measured_anchor.
+                # Method-only tasks are isolated single-GPU processes.  The
+                # scientific shared semantic is dispatched by
+                # _run_shared_group as one paired worker invocation.
                 "S29_GPU_UUIDS": str(task["gpu_uuid"]),
                 "CUDA_VISIBLE_DEVICES": str(task["gpu_uuid"]),
             }
@@ -1254,15 +1744,23 @@ class S29ProfilerRunner:
             semantic: {"observations": []}
             for semantic in S29_COST_SEMANTICS
         }
+        shared_metadata = cost_observations["scientific_equal_sample_cost"]
+        shared_metadata.update(
+            {
+                "shared_paired_runner_schema": S29_SHARED_RUN_SCHEMA,
+                "shared_pool_schema": S29_SHARED_POOL_SCHEMA,
+                "shared_paired_runs": self._shared_manifest(completed.values()),
+            }
+        )
         online_metadata = cost_observations["online_training_incremental_cost"]
         for field in ("randomized_method_order", "randomization_seed", "decision_ratio_threshold"):
             if field in self.preflight.measurement_plan:
                 online_metadata[field] = self.preflight.measurement_plan[field]
         for row in completed.values():
             cost_observations[str(row["semantic"])] ["observations"].append(row)
-        # Method-only measured rows are still required for all three semantics;
-        # shared/isolated anchors are intentionally supplied as separately
-        # measured, immutable inputs to this control plane.
+        # The scientific semantic has already been collected by one worker
+        # invocation per anchor/repetition; only isolated and online semantics
+        # use one worker invocation per method.
         try:
             report_root = self._publish_reduced(cost_observations)
         except Exception as error:
@@ -1360,6 +1858,13 @@ class S29ProfilerRunner:
             )
             if self.preflight.g25_gate_ref is not None:
                 evidence_set.add(self.preflight.g25_gate_ref)
+            shared_rows = cost_observations.get("scientific_equal_sample_cost", {}).get("observations", [])
+            if isinstance(shared_rows, list):
+                evidence_set.update(
+                    self._shared_evidence_ref(str(row["shared_pool_ref"]))
+                    for row in shared_rows
+                    if isinstance(row, Mapping) and row.get("shared_pool_ref")
+                )
             evidence_refs = tuple(sorted(evidence_set))
             gate_payload = GateRecord(
                 gate_id=gate.gate_id,
@@ -1391,6 +1896,7 @@ class S29ProfilerRunner:
                 "g25_gate_ref": self.preflight.g25_gate_ref,
                 "io_evidence_ref": self.preflight.io_evidence_ref,
                 "actual_measurements_only": True,
+                "run_root_ref": self._run_root_ref(),
                 "failure_evidence_ref": "../failures",
             }
             report_payload["gate"] = gate_payload
