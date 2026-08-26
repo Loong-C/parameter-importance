@@ -562,3 +562,74 @@ def test_s211_replay_hash_mismatch_cannot_claim_equivalence(tmp_path: Path) -> N
     )
     assert result["status"] == "BLOCKED"
     assert "REPLAY_RESULT_HASH_MISMATCH" in result["delivery_manifest"]["reasons"]
+
+
+def test_s211_accepts_actual_producer_specific_g23_g24a_g26_gates(tmp_path: Path) -> None:
+    gate, decision, lineage, values, upstream, roles = _inputs(tmp_path)
+    cell_ids = (
+        "pythia-14m:initialization",
+        "pythia-14m:early",
+        "pythia-14m:mid_late",
+        "pythia-31m-deduped:initialization",
+        "pythia-31m-deduped:early",
+        "pythia-31m-deduped:mid_late",
+    )
+    g23 = _hashed({
+        "schema_version": "stage2-g23-reference-evaluation-v1",
+        "gate_id": "stage2.G2.3",
+        "status": "PASS",
+        "formal_eligible": True,
+        "required_cell_count": 6,
+        "complete_cell_count": 6,
+        "expected_cell_ids": list(cell_ids),
+        "cells": [{"cell_id": cell_id, "status": "PASS"} for cell_id in cell_ids],
+    })
+    g24a = _hashed({
+        "schema_version": "stage2-g24a-formal-evaluation-v1",
+        "gate_id": "stage2.G2.4a",
+        "status": "PASS",
+        "formal_eligible": True,
+        "cell_count": 6,
+        "results": [
+            {"cell_id": cell_id, "status": "PASS", "formal_eligible": True}
+            for cell_id in cell_ids
+        ],
+        "rebind_plan_hash": "3" * 64,
+        "g23_evaluation_hash": g23["artifact_hash"],
+        "execution_commit": "d" * 40,
+        "evidence_refs": ["evidence.json"],
+        "confirmatory_draws_generated": False,
+    })
+    g26 = _hashed({
+        "schema_version": "stage2-s208-g26-gate-v1",
+        "gate_id": "stage2.G2.6",
+        "stage": 2,
+        "status": "PASS",
+        "quality_gate_dependency": True,
+        "measured": {"six_primary_cells": True},
+        "threshold": {"frozen_thresholds": True},
+        "reasons": [],
+        "upstream_gate_hashes": {
+            "stage2.G2.3": g23["artifact_hash"],
+            "stage2.G2.4a": g24a["artifact_hash"],
+            "stage2.G2.4b": upstream["stage2.G2.4b"]["artifact_hash"],
+            "stage2.G2.5": upstream["stage2.G2.5"]["artifact_hash"],
+        },
+    })
+    custom_upstream = dict(upstream)
+    custom_upstream.update({"stage2.G2.3": g23, "stage2.G2.4a": g24a, "stage2.G2.6": g26})
+    result = run_s211_g28(
+        g27b_gate=gate,
+        g27b_decision=decision,
+        stage2_lineage=lineage,
+        boundary_refs={key: value for key, value in values.items() if key != "replay_audit_31m"},
+        replay_audit_31m=values["replay_audit_31m"],
+        data_root=tmp_path,
+        predecessor_gates=custom_upstream,
+        delivery_refs=roles,
+        output_root=tmp_path / "delivery",
+        producer_commit="a" * 40,
+        consumer_commit="b" * 40,
+    )
+    assert result["status"] == "PASS"
+    assert result["delivery_manifest"]["upstream_gate_hashes"]["stage2.G2.6"] == g26["artifact_hash"]

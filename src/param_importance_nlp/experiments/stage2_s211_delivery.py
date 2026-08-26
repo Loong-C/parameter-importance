@@ -43,9 +43,21 @@ S211_LINEAGE_SCHEMA = "stage2-s211-lineage-v1"
 S211_GATE_SCHEMA = "stage2-s211-g28-gate-v1"
 S211_OUTPUT_INVENTORY_SCHEMA = "stage2-s211-output-inventory-v1"
 S210_GATE_SCHEMA = "stage2-s210-g27b-gate-v1"
+S208_GATE_SCHEMA = "stage2-s208-g26-gate-v1"
+S25_GATE_SCHEMA = "stage2-g24a-formal-evaluation-v1"
+S23_GATE_SCHEMA = "stage2-g23-reference-evaluation-v1"
 
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _COMMIT = re.compile(r"^[0-9a-f]{40}$")
+_PRIMARY_CELL_IDS = (
+    "pythia-14m:initialization",
+    "pythia-14m:early",
+    "pythia-14m:mid_late",
+    "pythia-31m-deduped:initialization",
+    "pythia-31m-deduped:early",
+    "pythia-31m-deduped:mid_late",
+)
+_G26_PRIMARY_GATES = ("stage2.G2.3", "stage2.G2.4a", "stage2.G2.4b", "stage2.G2.5")
 _STAGE2_TASKS = tuple(
     f"stage2.{index:02d}_{name}"
     for index, name in (
@@ -356,6 +368,167 @@ def _gate_record(
     return record.artifact_hash, sorted(set(reasons))
 
 
+def _producer_gate_identity(
+    value: Mapping[str, Any] | None,
+    *,
+    gate_id: str,
+    schema: str,
+    field: str,
+) -> tuple[str | None, list[str]]:
+    """Check the common identity/status contract of a producer gate."""
+
+    if value is None:
+        return None, [f"UPSTREAM_GATE_MISSING:{gate_id}"]
+    if value.get("schema_version") != schema:
+        return None, [f"UPSTREAM_GATE_SCHEMA_MISMATCH:{gate_id}"]
+    try:
+        identity, declared = _payload_identity(value, field=field)
+    except S211DeliveryBlocked as error:
+        return None, [str(error)]
+    reasons: list[str] = []
+    if not declared:
+        reasons.append(f"UPSTREAM_GATE_ARTIFACT_HASH_MISSING:{gate_id}")
+    if value.get("gate_id") != gate_id:
+        reasons.append(f"UPSTREAM_GATE_ID_MISMATCH:{gate_id}")
+    if value.get("status") != "PASS":
+        reasons.append(f"UPSTREAM_GATE_NOT_PASS:{gate_id}")
+    return identity, reasons
+
+
+def _validate_g23(
+    value: Mapping[str, Any] | None,
+    *,
+    field: str,
+) -> tuple[str | None, list[str]]:
+    """Validate the exact producer-specific S2.4/G2.3 qualification object."""
+
+    identity, reasons = _producer_gate_identity(
+        value,
+        gate_id="stage2.G2.3",
+        schema=S23_GATE_SCHEMA,
+        field=field,
+    )
+    if value is None or value.get("schema_version") != S23_GATE_SCHEMA:
+        return identity, sorted(set(reasons))
+    if value.get("formal_eligible") is not True:
+        reasons.append("UPSTREAM_GATE_NOT_FORMAL:stage2.G2.3")
+    if (
+        value.get("required_cell_count") != len(_PRIMARY_CELL_IDS)
+        or value.get("complete_cell_count") != len(_PRIMARY_CELL_IDS)
+        or value.get("expected_cell_ids") != list(_PRIMARY_CELL_IDS)
+    ):
+        reasons.append("G2.3_SIX_CELL_COMPLETENESS_REQUIRED")
+    cells = value.get("cells")
+    if (
+        not isinstance(cells, list)
+        or len(cells) != len(_PRIMARY_CELL_IDS)
+        or tuple(item.get("cell_id") if isinstance(item, Mapping) else None for item in cells)
+        != _PRIMARY_CELL_IDS
+    ):
+        reasons.append("G2.3_CELL_ORDER_INVALID")
+    elif any(
+        not isinstance(item, Mapping)
+        or item.get("status") != "PASS"
+        or item.get("formal_eligible") is False
+        for item in cells
+    ):
+        reasons.append("G2.3_CELL_PASS_REQUIRED")
+    return identity, sorted(set(reasons))
+
+
+def _validate_g24a(
+    value: Mapping[str, Any] | None,
+    *,
+    field: str,
+    data_root: Path | None = None,
+) -> tuple[str | None, list[str]]:
+    """Validate the exact producer-specific S2.5/G2.4a qualification object."""
+
+    identity, reasons = _producer_gate_identity(
+        value,
+        gate_id="stage2.G2.4a",
+        schema=S25_GATE_SCHEMA,
+        field=field,
+    )
+    if value is None or value.get("schema_version") != S25_GATE_SCHEMA:
+        return identity, sorted(set(reasons))
+    if value.get("formal_eligible") is not True:
+        reasons.append("UPSTREAM_GATE_NOT_FORMAL:stage2.G2.4a")
+    if value.get("cell_count") != len(_PRIMARY_CELL_IDS):
+        reasons.append("G2.4A_SIX_CELL_COMPLETENESS_REQUIRED")
+    results = value.get("results")
+    if (
+        not isinstance(results, list)
+        or len(results) != len(_PRIMARY_CELL_IDS)
+        or tuple(item.get("cell_id") if isinstance(item, Mapping) else None for item in results)
+        != _PRIMARY_CELL_IDS
+    ):
+        reasons.append("G2.4A_CELL_ORDER_INVALID")
+    elif any(
+        not isinstance(item, Mapping)
+        or item.get("status") != "PASS"
+        or item.get("formal_eligible") is not True
+        for item in results
+    ):
+        reasons.append("G2.4A_CELL_PASS_REQUIRED")
+    execution_commit = value.get("execution_commit")
+    if not isinstance(execution_commit, str) or _COMMIT.fullmatch(execution_commit) is None:
+        reasons.append("G2.4A_EXECUTION_COMMIT_REQUIRED")
+    evidence_refs = value.get("evidence_refs")
+    if not isinstance(evidence_refs, list) or not evidence_refs:
+        reasons.append("G2.4A_EVIDENCE_REFS_MISSING")
+    elif data_root is not None:
+        try:
+            _check_declared_refs(evidence_refs, root=data_root, field=f"{field}.evidence_refs")
+        except S211DeliveryBlocked as error:
+            reasons.append(str(error))
+    if value.get("confirmatory_draws_generated") is not False:
+        reasons.append("G2.4A_CONFIRMATORY_DRAWS_FORBIDDEN")
+    for name in ("rebind_plan_hash", "g23_evaluation_hash"):
+        try:
+            _sha(value.get(name), field=f"{field}.{name}")
+        except S211DeliveryBlocked as error:
+            reasons.append(str(error))
+    return identity, sorted(set(reasons))
+
+
+def _validate_g26(
+    value: Mapping[str, Any] | None,
+    *,
+    field: str,
+) -> tuple[str | None, list[str]]:
+    """Validate the exact producer-specific S2.8/G2.6 quality gate."""
+
+    identity, reasons = _producer_gate_identity(
+        value,
+        gate_id="stage2.G2.6",
+        schema=S208_GATE_SCHEMA,
+        field=field,
+    )
+    if value is None or value.get("schema_version") != S208_GATE_SCHEMA:
+        return identity, sorted(set(reasons))
+    if value.get("stage") != 2:
+        reasons.append("G2.6_STAGE_MISMATCH")
+    if value.get("quality_gate_dependency") is not True:
+        reasons.append("G2.6_QUALITY_GATE_DEPENDENCY_REQUIRED")
+    if not isinstance(value.get("measured"), Mapping):
+        reasons.append("G2.6_MEASURED_REQUIRED")
+    if not isinstance(value.get("threshold"), Mapping):
+        reasons.append("G2.6_THRESHOLD_REQUIRED")
+    if value.get("reasons") != []:
+        reasons.append("G2.6_REASONS_MUST_BE_EMPTY_FOR_PASS")
+    upstream = value.get("upstream_gate_hashes")
+    if not isinstance(upstream, Mapping) or set(upstream) != set(_G26_PRIMARY_GATES):
+        reasons.append("G2.6_UPSTREAM_GATE_SET_INVALID")
+    elif any(
+        not isinstance(upstream.get(gate_id), str)
+        or _SHA256.fullmatch(upstream.get(gate_id, "")) is None
+        for gate_id in _G26_PRIMARY_GATES
+    ):
+        reasons.append("G2.6_UPSTREAM_GATE_HASHES_INVALID")
+    return identity, sorted(set(reasons))
+
+
 def _validate_upstream_gates(
     values: Mapping[str, Mapping[str, Any] | str | Path | None] | None,
     *,
@@ -404,6 +577,23 @@ def _validate_upstream_gates(
             )
             hashes[gate_id] = identity
             reasons.extend(g27b_reasons)
+            continue
+        if isinstance(raw, Mapping) and raw.get("schema_version") == S23_GATE_SCHEMA:
+            identity, gate_reasons = _validate_g23(raw, field=f"upstream.{gate_id}")
+            hashes[gate_id] = identity
+            reasons.extend(gate_reasons)
+            continue
+        if isinstance(raw, Mapping) and raw.get("schema_version") == S25_GATE_SCHEMA:
+            identity, gate_reasons = _validate_g24a(
+                raw, field=f"upstream.{gate_id}", data_root=data_root
+            )
+            hashes[gate_id] = identity
+            reasons.extend(gate_reasons)
+            continue
+        if isinstance(raw, Mapping) and raw.get("schema_version") == S208_GATE_SCHEMA:
+            identity, gate_reasons = _validate_g26(raw, field=f"upstream.{gate_id}")
+            hashes[gate_id] = identity
+            reasons.extend(gate_reasons)
             continue
         identity, gate_reasons = _gate_record(
             raw, gate_id=gate_id, field=f"upstream.{gate_id}", data_root=data_root
