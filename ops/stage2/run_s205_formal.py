@@ -770,6 +770,7 @@ def _worker(args: argparse.Namespace) -> dict[str, object]:
         "cell_id": args.cell_id,
         "gpu_uuid": args.gpu_uuid,
         "execution_commit": preflight["execution_commit"],
+        "s204_execution_commit": preflight["s204_execution_commit"],
         "launcher_source_sha256": preflight["launcher_source_sha256"],
         "preflight": preflight,
         "cell": result,
@@ -815,6 +816,7 @@ def _execute(args: argparse.Namespace) -> dict[str, object]:
                 raise S25ExecutionBlocked("S205_STATUS_COMPLETED_CELL_RECORD_INVALID")
             if old_record.get("returncode") == 0 and (
                 old_record.get("execution_commit") != preflight.get("execution_commit")
+                or old_record.get("s204_execution_commit") != preflight.get("s204_execution_commit")
                 or old_record.get("launcher_source_sha256") != preflight.get("launcher_source_sha256")
             ):
                 raise S25ExecutionBlocked("S205_STATUS_COMPLETED_CELL_IDENTITY_MISMATCH")
@@ -909,6 +911,7 @@ def _execute(args: argparse.Namespace) -> dict[str, object]:
                         "returncode": completed.returncode,
                         "log_ref": str(log.relative_to(root)),
                         "execution_commit": preflight["execution_commit"],
+                        "s204_execution_commit": preflight["s204_execution_commit"],
                         "launcher_source_sha256": preflight["launcher_source_sha256"],
                     }
                     records.append(record)
@@ -1152,6 +1155,7 @@ def _detach(args: argparse.Namespace, raw_argv: Sequence[str] | None = None) -> 
         "status_ref": str((operations / "status.json").relative_to(root)),
         "preflight_artifact_hash": preflight["preflight_artifact_hash"],
         "execution_commit": preflight["execution_commit"],
+        "s204_execution_commit": preflight["s204_execution_commit"],
         "launcher_source_sha256": preflight["launcher_source_sha256"],
         "gpu_inventory_identity": preflight["gpu_inventory_identity"],
         "confirmatory_draws_generated": False,

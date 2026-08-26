@@ -385,6 +385,7 @@ def _detached_test_preflight() -> dict[str, object]:
     return {
         "preflight_artifact_hash": "f" * 64,
         "execution_commit": "a" * 40,
+        "s204_execution_commit": "e" * 40,
         "launcher_source_sha256": "b" * 64,
         "gpu_inventory_identity": {
             "artifact_ref": "inventory.json",
