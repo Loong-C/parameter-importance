@@ -278,7 +278,15 @@ def _detach(args: argparse.Namespace) -> dict[str, Any]:
     # The detached child is the actual executor.  Replacing the action token
     # (rather than dropping it) is required because the child parser demands
     # exactly one mutually-exclusive action.
-    child = ["--execute" if item == "--detach" else str(item) for item in sys.argv[1:]]
+    child = [str(item) for item in sys.argv[1:]]
+    try:
+        action_index = child.index("--detach")
+    except ValueError as error:
+        raise S29RunnerBlocked("DETACH_ACTION_NOT_FOUND") from error
+    # Replace only the launcher action.  A profiler command may legitimately
+    # carry its own ``--detach`` argument; rewriting every matching token
+    # would silently change the worker's frozen command line.
+    child[action_index] = "--execute"
     try:
         with log_path.open("ab") as handle:
             process = subprocess.Popen(
