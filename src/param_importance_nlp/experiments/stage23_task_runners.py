@@ -3263,10 +3263,29 @@ def _derive_sizing_delta_sci(
         raise _blocked(BlockerCode.CONTRACT_UNFROZEN, "stage2_preregistration", "absolute floors missing", retryable=False)
     floors = precision["absolute_floors"]
     endpoints = ("model_total", "layer", "module")
+    # ``candidate_sample_counts`` are the S2.4 sizing/convergence nodes.  The
+    # scientific margin is consumed by S2.6 at the separately frozen estimator
+    # batch sizes.  Keep both identities explicit: sizing nodes remain
+    # hash-bound evidence while the published table is keyed by B.
+    batch_sizes = tuple(int(value) for value in CANDIDATE_BATCH_SIZES)
+    selected_values: set[int] = set()
+    for state, _raw in state_by_count.values():
+        selected_raw = state.get("selected_sample_count_per_stream")
+        if selected_raw is None:
+            continue
+        if isinstance(selected_raw, bool) or not isinstance(selected_raw, int):
+            raise _blocked(BlockerCode.CONTRACT_UNFROZEN, "stage2_reference_sizing", "selected sizing node invalid", retryable=False)
+        selected_values.add(int(selected_raw))
+    if len(selected_values) > 1:
+        raise _blocked(BlockerCode.CONTRACT_UNFROZEN, "stage2_reference_sizing", "selected sizing node drift", retryable=False)
+    selected_count = next(iter(selected_values), plan.candidate_sample_counts[-1])
+    if selected_count not in state_by_count:
+        raise _blocked(BlockerCode.CONTRACT_UNFROZEN, "stage2_reference_sizing", "selected sizing node missing", retryable=False)
     delta_by_endpoint: dict[str, dict[str, float]] = {endpoint: {} for endpoint in endpoints}
     signal_by_endpoint: dict[str, dict[str, float]] = {endpoint: {} for endpoint in endpoints}
     noise_by_endpoint: dict[str, dict[str, float]] = {endpoint: {} for endpoint in endpoints}
     nodes: list[dict[str, object]] = []
+    selected_scales: dict[str, tuple[float, float]] | None = None
     for count in plan.candidate_sample_counts:
         state, raw = state_by_count[count]
         refs = raw["refs"]
@@ -3276,24 +3295,18 @@ def _derive_sizing_delta_sci(
         sigma2 = _weighted_sequence_variance_from_shards(shard_store, refs, assumptions, plan.block_size)
         a = {name: np.square(mean[name]) for name in names}
         model_s = max(abs(float(sum(np.sum(value) for value in a.values()))), float(floors["tau_model"]))
-        model_d = abs(float(sum(np.sum(value) for value in sigma2.values()))) / float(count)
+        model_d = abs(float(sum(np.sum(value) for value in sigma2.values())))
         layer_a = [float(sum(np.sum(a[name]) for name in group)) for group in layer_groups.values()]
-        layer_d = [float(sum(np.sum(sigma2[name]) for name in group)) / float(count) for group in layer_groups.values()]
+        layer_d = [float(sum(np.sum(sigma2[name]) for name in group)) for group in layer_groups.values()]
         module_a = [float(sum(np.sum(a[name]) for name in group)) for group in module_groups.values()]
-        module_d = [float(sum(np.sum(sigma2[name]) for name in group)) / float(count) for group in module_groups.values()]
+        module_d = [float(sum(np.sum(sigma2[name]) for name in group)) for group in module_groups.values()]
         endpoint_values = {
             "model_total": (max(abs(model_s), float(floors["tau_model"])), abs(model_d)),
             "layer": (max(float(sum(abs(value) for value in layer_a)), float(floors["tau_layer"])), float(sum(abs(value) for value in layer_d))),
             "module": (max(float(sum(abs(value) for value in module_a)), float(floors["tau_module"])), float(sum(abs(value) for value in module_d))),
         }
-        for endpoint, (signal, noise) in endpoint_values.items():
-            try:
-                delta = _sizing_delta_sci(signal, noise)
-            except (TypeError, ValueError, OverflowError) as error:
-                raise _blocked(BlockerCode.CONTRACT_UNFROZEN, "stage2_reference_delta_sci", f"invalid sizing margin: {endpoint}/{count}", retryable=False)
-            signal_by_endpoint[endpoint][str(count)] = signal
-            noise_by_endpoint[endpoint][str(count)] = noise
-            delta_by_endpoint[endpoint][str(count)] = delta
+        if count == selected_count:
+            selected_scales = dict(endpoint_values)
         commit = raw["commit"]
         assert isinstance(commit, Mapping)
         nodes.append({
@@ -3306,6 +3319,18 @@ def _derive_sizing_delta_sci(
             "mean_hash": _vector_digest(mean),
             "sequence_variance_hash": _vector_digest(sigma2),
         })
+    if selected_scales is None:
+        raise _blocked(BlockerCode.CONTRACT_UNFROZEN, "stage2_reference_sizing", "selected sizing scales missing", retryable=False)
+    for batch_size in batch_sizes:
+        for endpoint, (signal, sigma2) in selected_scales.items():
+            noise = float(sigma2) / float(batch_size)
+            try:
+                delta = _sizing_delta_sci(signal, noise)
+            except (TypeError, ValueError, OverflowError) as error:
+                raise _blocked(BlockerCode.CONTRACT_UNFROZEN, "stage2_reference_delta_sci", f"invalid sizing margin: {endpoint}/B{batch_size}", retryable=False) from error
+            signal_by_endpoint[endpoint][str(batch_size)] = signal
+            noise_by_endpoint[endpoint][str(batch_size)] = noise
+            delta_by_endpoint[endpoint][str(batch_size)] = delta
     body: dict[str, object] = {
         "schema_version": "stage2-reference-delta-sci-v2",
         "source_kind": "reference_sizing_raw_shards",
@@ -3317,6 +3342,8 @@ def _derive_sizing_delta_sci(
         "sizing_result_hash": sizing_result_hash,
         "sizing_plan_hash": plan.artifact_hash,
         "candidate_sample_counts": list(plan.candidate_sample_counts),
+        "delta_sci_batch_sizes": list(batch_sizes),
+        "selected_sample_count_per_stream": selected_count,
         "delta_sci_by_endpoint": delta_by_endpoint,
         "signal_scale_by_endpoint": signal_by_endpoint,
         "noise_scale_by_endpoint": noise_by_endpoint,
@@ -3495,31 +3522,43 @@ def _derive_sizing_delta_sci_bounded(
     if not isinstance(precision, Mapping) or not isinstance(precision.get("absolute_floors"), Mapping):
         raise _blocked(BlockerCode.CONTRACT_UNFROZEN, "stage2_preregistration", "absolute floors missing", retryable=False)
     floors = precision["absolute_floors"]
-    delta_by_endpoint: dict[str, dict[str, float]] = {endpoint: {} for endpoint in ("model_total", "layer", "module")}
+    endpoints = ("model_total", "layer", "module")
+    # ``candidate_sample_counts`` are the immutable S2.4 sizing/convergence
+    # nodes.  S2.6 consumes the scientific margin at its independently frozen
+    # estimator batch sizes, so keep the node ladder and B table distinct.
+    batch_sizes = tuple(int(value) for value in CANDIDATE_BATCH_SIZES)
+    selected_raw = checkpoint.get("selected_sample_count_per_stream")
+    if selected_raw is None:
+        selected_count = plan.candidate_sample_counts[-1]
+    elif isinstance(selected_raw, bool) or not isinstance(selected_raw, int):
+        raise _blocked(BlockerCode.CONTRACT_UNFROZEN, "stage2_reference_sizing", "selected sizing node invalid", retryable=False)
+    else:
+        selected_count = int(selected_raw)
+    if selected_count not in plan.candidate_sample_counts:
+        raise _blocked(BlockerCode.CONTRACT_UNFROZEN, "stage2_reference_sizing", "selected sizing node missing", retryable=False)
+    delta_by_endpoint: dict[str, dict[str, float]] = {endpoint: {} for endpoint in endpoints}
     signal_by_endpoint: dict[str, dict[str, float]] = {endpoint: {} for endpoint in delta_by_endpoint}
     noise_by_endpoint: dict[str, dict[str, float]] = {endpoint: {} for endpoint in delta_by_endpoint}
     nodes: list[dict[str, object]] = []
+    selected_scales: dict[str, tuple[float, float]] | None = None
     for count in plan.candidate_sample_counts:
         moments = candidates[count]
         mean = moments.mean()
         sigma2 = estimate_sequence_variance_bounded(moments, block_size=plan.block_size)
         a = {name: np.square(mean[name]) for name in names}
         model_s = max(abs(float(sum(np.sum(value) for value in a.values()))), float(floors["tau_model"]))
-        model_d = abs(float(sum(np.sum(value) for value in sigma2.values()))) / float(count)
+        model_d = abs(float(sum(np.sum(value) for value in sigma2.values())))
         layer_a = [float(sum(np.sum(a[name]) for name in group)) for group in layer_groups.values()]
-        layer_d = [float(sum(np.sum(sigma2[name]) for name in group)) / float(count) for group in layer_groups.values()]
+        layer_d = [float(sum(np.sum(sigma2[name]) for name in group)) for group in layer_groups.values()]
         module_a = [float(sum(np.sum(a[name]) for name in group)) for group in module_groups.values()]
-        module_d = [float(sum(np.sum(sigma2[name]) for name in group)) / float(count) for group in module_groups.values()]
+        module_d = [float(sum(np.sum(sigma2[name]) for name in group)) for group in module_groups.values()]
         endpoint_values = {
             "model_total": (max(abs(model_s), float(floors["tau_model"])), abs(model_d)),
             "layer": (max(float(sum(abs(value) for value in layer_a)), float(floors["tau_layer"])), float(sum(abs(value) for value in layer_d))),
             "module": (max(float(sum(abs(value) for value in module_a)), float(floors["tau_module"])), float(sum(abs(value) for value in module_d))),
         }
-        for endpoint, (signal, noise) in endpoint_values.items():
-            delta = _sizing_delta_sci(signal, noise)
-            signal_by_endpoint[endpoint][str(count)] = signal
-            noise_by_endpoint[endpoint][str(count)] = noise
-            delta_by_endpoint[endpoint][str(count)] = delta
+        if count == selected_count:
+            selected_scales = dict(endpoint_values)
         nodes.append({
             "sample_count": count,
             "state_digest": canonical_json_hash({"checkpoint_schema": _BoundedCheckpointStore.schema_version, "plan_hash": plan.artifact_hash, "sample_count": count, "moments_hash": _bounded_moments_digest(moments)}),
@@ -3527,6 +3566,15 @@ def _derive_sizing_delta_sci_bounded(
             "mean_hash": _vector_digest(mean),
             "sequence_variance_hash": _vector_digest(sigma2),
         })
+    if selected_scales is None:
+        raise _blocked(BlockerCode.CONTRACT_UNFROZEN, "stage2_reference_sizing", "selected sizing scales missing", retryable=False)
+    for batch_size in batch_sizes:
+        for endpoint, (signal, sigma2) in selected_scales.items():
+            noise = float(sigma2) / float(batch_size)
+            delta = _sizing_delta_sci(signal, noise)
+            signal_by_endpoint[endpoint][str(batch_size)] = signal
+            noise_by_endpoint[endpoint][str(batch_size)] = noise
+            delta_by_endpoint[endpoint][str(batch_size)] = delta
     body: dict[str, object] = {
         "schema_version": "stage2-reference-delta-sci-v2",
         "source_kind": "reference_sizing_bounded_online",
@@ -3536,6 +3584,8 @@ def _derive_sizing_delta_sci_bounded(
         "absolute_floors": dict(floors), "reference_id": plan.reference_id,
         "sizing_result_hash": sizing_result_hash, "sizing_plan_hash": plan.artifact_hash,
         "candidate_sample_counts": list(plan.candidate_sample_counts),
+        "delta_sci_batch_sizes": list(batch_sizes),
+        "selected_sample_count_per_stream": selected_count,
         "delta_sci_by_endpoint": delta_by_endpoint, "signal_scale_by_endpoint": signal_by_endpoint,
         "noise_scale_by_endpoint": noise_by_endpoint, "sizing_nodes": nodes,
         "registry_hash": provider.registry_hash,

@@ -4,20 +4,26 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
 
-from param_importance_nlp.contracts.jsonio import canonical_json_hash
+from param_importance_nlp.contracts.jsonio import canonical_json_hash, write_canonical_json
 from param_importance_nlp.experiments.stage2_g23_evaluator import (
     CellInput,
+    CORRECTED_DELTA_BATCH_SIZES,
+    CORRECTED_DELTA_SIDECAR_FIELDS,
+    CORRECTED_DELTA_SCHEMA_VERSION,
     EXPECTED_CELL_IDS,
     G23Blocked,
+    _CellEvidence,
     _array,
     _bootstrap_independent_bias_interval,
     _bootstrap_independent_cross_interval,
     _bootstrap_u_diagnostics,
     _bounded_moments_strict,
+    _delta_sci,
     _moments_from_blocks,
     _pearson,
     _top_overlap,
@@ -27,6 +33,7 @@ from param_importance_nlp.experiments.stage2_g23_evaluator import (
 from param_importance_nlp.experiments.sampling import SamplingPlan, SamplingUniverse
 from param_importance_nlp.experiments.stage2_formal import (
     ReferenceSizingPlan,
+    _BoundedCheckpointStore,
     _BoundedMoments,
     _ReferenceShardStore,
     _moments_from_shards,
@@ -270,6 +277,438 @@ def test_sizing_delta_formula_uses_noise_or_signal_floor_at_boundary() -> None:
     assert _sizing_delta_sci(100.0, 30.0) == pytest.approx(3.0)
     with pytest.raises(ValueError):
         _sizing_delta_sci(float("nan"), 1.0)
+
+
+def test_corrected_delta_uses_convergence_selected_node_and_legacy_raw_source(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The selected node is authoritative in convergence, not the sizing plan."""
+
+    import param_importance_nlp.experiments.stage2_g23_evaluator as evaluator
+
+    evidence = _CellEvidence(
+        CellInput("pythia-14m:initialization", "runs/task-result.json"),
+        workspace_root=tmp_path,
+    )
+    sizing_root = tmp_path / "sizing"
+    store = _ReferenceShardStore(sizing_root)
+    refs = [
+        store.publish({"p": np.asarray([float(index), float(index + 1)])}, 1.0)
+        for index in range(4)
+    ]
+    assumptions = {
+        "statistical_unit": "sequence",
+        "weight_unit": "tokens",
+        "sampling_design": "with_replacement",
+        "weights_exogenous": True,
+        "common_mean_assumption": True,
+    }
+    states = [
+        {
+            "a": {"g1": {}, "g2": {}},
+            "b": {"g1": {}, "g2": {}},
+            "last_bias": {},
+            "blocks_a": [],
+            "blocks_b": [],
+            "moment_hash_mode": "shard_refs-v1",
+            "sizing_stream": True,
+            "weighting_assumptions": assumptions,
+            "processed_block_pairs": count,
+            "last_bias_block_pairs": count,
+            "shard_refs_a": refs[:count],
+            "shard_refs_b": [],
+        }
+        for count in (2, 4)
+    ]
+    evidence.sizing_root = sizing_root
+    evidence.sizing_states = states
+    mean = {"p": np.asarray([2.0, 3.0])}
+    sigma2 = {"p": np.asarray([4.0, 5.0])}
+    monkeypatch.setattr(
+        evaluator,
+        "_sizing_sequence_variance",
+        lambda *_args: (mean, sigma2),
+    )
+    registry_hash = "1" * 64
+    registry = {
+        "schema_version": "stage2-parameter-registry-artifact-v1",
+        "status": "READY",
+        "registry_hash": registry_hash,
+        "parameter_groups": {"p": {"layer": "layer0", "module": "module0"}},
+    }
+    registry["artifact_hash"] = canonical_json_hash(registry)
+    evidence.identities["registry_hash"] = registry_hash
+    evidence.identities["producer_commit"] = "5" * 40
+    floors = {
+        "tau_model": 1.0e-12,
+        "tau_layer": 1.0e-12,
+        "tau_module": 1.0e-12,
+        "tau_coord": 1.0e-12,
+        "tau_nmse": 1.0e-12,
+    }
+    formula_hash = "2" * 64
+    preregistration = {
+        "equivalence_and_precision": {"absolute_floors": floors},
+    }
+    evidence.external_payloads = {"preregistration": preregistration}
+    plan = {
+        "schema_version": "stage2-reference-sizing-plan-v1",
+        "reference_id": "reference-test",
+        "candidate_sample_counts": [2, 4],
+        "block_size": 1,
+        "required_consecutive": 1,
+        "convergence_tolerance": 0.02,
+    }
+    plan["artifact_hash"] = canonical_json_hash(plan)
+    nodes = []
+    for count, state in zip((2, 4), states):
+        nodes.append(
+            {
+                "sample_count": count,
+                "state_digest": evaluator._ReferenceSnapshotStore._state_digest(state),
+                "shard_refs_hash": canonical_json_hash(
+                    [
+                        {
+                            "shard_hash": ref.get("shard_hash"),
+                            "manifest_hash": ref.get("manifest_hash"),
+                            "weight": ref.get("weight"),
+                        }
+                        for ref in state["shard_refs_a"]
+                    ]
+                ),
+                "mean_hash": evaluator._vector_digest(mean),
+                "sequence_variance_hash": evaluator._vector_digest(sigma2),
+            }
+        )
+    old_delta_tables = {
+        endpoint: {"2": 0.45, "4": 0.225}
+        for endpoint in ("model_total", "layer", "module")
+    }
+    old_signal_tables = {
+        endpoint: {"2": 13.0, "4": 13.0}
+        for endpoint in ("model_total", "layer", "module")
+    }
+    old_noise_tables = {
+        endpoint: {"2": 4.5, "4": 2.25}
+        for endpoint in ("model_total", "layer", "module")
+    }
+    source_body = {
+        "schema_version": "stage2-reference-delta-sci-v2",
+        "source_kind": "reference_sizing_raw_shards",
+        "formula_contract_hash": formula_hash,
+        "formula_version": "stage2-reference-sizing-margin-v1",
+        "formula": "delta_sci=max(0.10*Delta,0.01*S); a=mu_sizing^2; d=sigma_squared_over_B",
+        "absolute_floors": floors,
+        "reference_id": plan["reference_id"],
+        "sizing_result_hash": "3" * 64,
+        "sizing_plan_hash": plan["artifact_hash"],
+        "candidate_sample_counts": [2, 4],
+        "delta_sci_by_endpoint": old_delta_tables,
+        "signal_scale_by_endpoint": old_signal_tables,
+        "noise_scale_by_endpoint": old_noise_tables,
+        "sizing_nodes": nodes,
+        "registry_hash": registry_hash,
+    }
+    source_body["artifact_hash"] = canonical_json_hash(source_body)
+    source_ref = "sizing/derived/delta-sci.json"
+    write_canonical_json(tmp_path / source_ref, source_body)
+    source_link = {
+        **source_body,
+        "source_ref": source_ref,
+        "source_hash": source_body["artifact_hash"],
+        "source_artifact_hash": source_body["artifact_hash"],
+    }
+    evidence.convergence = SimpleNamespace(
+        payload={
+            "candidate_delta_sci": source_link,
+            "sizing_plan": plan,
+            "sizing_plan_artifact_hash": plan["artifact_hash"],
+            "formula_contract_hash": formula_hash,
+            "sizing_result_hash": "3" * 64,
+            "parameter_registry_artifact": registry,
+            # This is intentionally omitted from ``plan`` to prove that the
+            # convergence report is the authoritative selected-node source.
+            "selected_sample_count_per_stream": 4,
+        }
+    )
+
+    _, minimum, sidecar = _delta_sci(
+        evidence, [2, 4], evaluator_commit="4" * 40
+    )
+    assert tuple(sorted(minimum)) == ("layer", "model_total", "module")
+    assert sidecar["schema_version"] == CORRECTED_DELTA_SCHEMA_VERSION
+    assert sidecar["candidate_sample_counts"] == [2, 4]
+    assert sidecar["delta_sci_batch_sizes"] == list(CORRECTED_DELTA_BATCH_SIZES)
+    assert sidecar["selected_sample_count_per_stream"] == 4
+    assert sidecar["source_producer_table_mode"] == "sizing_nodes_legacy"
+    assert sidecar["correction_reason"] == (
+        "producer_delta_sci_keyed_by_sizing_nodes; S2.6_requires_candidate_batch_sizes"
+    )
+    for endpoint in ("model_total", "layer", "module"):
+        assert set(sidecar["delta_sci_by_endpoint"][endpoint]) == {  # type: ignore[index]
+            str(batch_size) for batch_size in CORRECTED_DELTA_BATCH_SIZES
+        }
+    expected_hash = canonical_json_hash(
+        {key: value for key, value in sidecar.items() if key != "artifact_hash"}
+    )
+    assert set(sidecar) == CORRECTED_DELTA_SIDECAR_FIELDS
+    assert sidecar["artifact_hash"] == expected_hash
+
+    cell = {
+        "cell_id": evidence.source.cell_id,
+        "status": "PASS",
+        "identities": {},
+        "metrics": {},
+        "_corrected_delta_sci": dict(sidecar),
+    }
+    evaluator._publish_corrected_delta_sidecars(
+        tmp_path, tmp_path / "evidence" / "g23-attempt", [cell]
+    )
+    sidecar_ref = cell["identities"]["corrected_delta_sci_ref"]  # type: ignore[index]
+    assert sidecar_ref == (
+        "evidence/g23-attempt/g2.3-corrected-delta-sci/"
+        f"{sidecar['artifact_hash']}.json"
+    )
+    assert (tmp_path / sidecar_ref).is_file()
+    assert cell["identities"]["corrected_delta_sci_hash"] == sidecar["artifact_hash"]  # type: ignore[index]
+    assert cell["metrics"]["corrected_delta_sci_ref"] == sidecar_ref  # type: ignore[index]
+
+    future_source = dict(source_body)
+    future_source.update(
+        {
+            "delta_sci_batch_sizes": list(CORRECTED_DELTA_BATCH_SIZES),
+            "selected_sample_count_per_stream": 4,
+            "delta_sci_by_endpoint": sidecar["delta_sci_by_endpoint"],
+            "signal_scale_by_endpoint": sidecar["signal_scale_by_endpoint"],
+            "noise_scale_by_endpoint": sidecar["noise_scale_by_endpoint"],
+        }
+    )
+    future_source["artifact_hash"] = canonical_json_hash(
+        {key: value for key, value in future_source.items() if key != "artifact_hash"}
+    )
+    write_canonical_json(tmp_path / source_ref, future_source)
+    evidence.convergence.payload["candidate_delta_sci"] = {
+        **future_source,
+        "source_ref": source_ref,
+        "source_hash": future_source["artifact_hash"],
+        "source_artifact_hash": future_source["artifact_hash"],
+    }
+    _, _, verified_sidecar = _delta_sci(
+        evidence, [2, 4], evaluator_commit="4" * 40
+    )
+    assert verified_sidecar["source_producer_table_mode"] == "candidate_batch_sizes"
+    assert verified_sidecar["correction_reason"] == (
+        "producer_delta_sci_candidate_batch_sizes_verified_by_evaluator"
+    )
+
+    future_tampered = dict(future_source)
+    future_tampered["delta_sci_batch_sizes"] = [131072, 262144]
+    future_tampered["artifact_hash"] = canonical_json_hash(
+        {key: value for key, value in future_tampered.items() if key != "artifact_hash"}
+    )
+    write_canonical_json(tmp_path / source_ref, future_tampered)
+    evidence.convergence.payload["candidate_delta_sci"] = {
+        **future_tampered,
+        "source_ref": source_ref,
+        "source_hash": future_tampered["artifact_hash"],
+        "source_artifact_hash": future_tampered["artifact_hash"],
+    }
+    with pytest.raises(G23Blocked, match="PRODUCER_BATCH_DOMAIN_BINDING_MISMATCH"):
+        _delta_sci(evidence, [2, 4], evaluator_commit="4" * 40)
+
+    tampered_source = dict(source_body)
+    tampered_delta = {
+        endpoint: dict(values)
+        for endpoint, values in old_delta_tables.items()
+    }
+    tampered_delta["model_total"]["2"] = 0.44
+    tampered_source["delta_sci_by_endpoint"] = tampered_delta
+    tampered_source["artifact_hash"] = canonical_json_hash(
+        {key: value for key, value in tampered_source.items() if key != "artifact_hash"}
+    )
+    write_canonical_json(tmp_path / source_ref, tampered_source)
+    evidence.convergence.payload["candidate_delta_sci"] = {
+        **tampered_source,
+        "source_ref": source_ref,
+        "source_hash": tampered_source["artifact_hash"],
+        "source_artifact_hash": tampered_source["artifact_hash"],
+    }
+    with pytest.raises(G23Blocked, match="LEGACY_PRODUCER_FORMULA_RECOMPUTE_MISMATCH"):
+        _delta_sci(evidence, [2, 4], evaluator_commit="4" * 40)
+
+
+def test_corrected_delta_uses_bounded_checkpoint_and_rejects_state_tamper(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Bounded r23 moments are reloaded, then legacy values are rechecked."""
+
+    import param_importance_nlp.experiments.stage2_g23_evaluator as evaluator
+
+    evidence = _CellEvidence(
+        CellInput("pythia-14m:initialization", "runs/task-result.json"),
+        workspace_root=tmp_path,
+    )
+    sizing_root = tmp_path / "sizing"
+    moments_by_count: dict[int, _BoundedMoments] = {}
+    for count in (2, 4):
+        moments = _BoundedMoments(include_higher=False)
+        for index in range(count):
+            moments.update_vector(
+                {"p": np.asarray([float(index), float(index + 1)])}, 1.0
+            )
+        moments_by_count[count] = moments
+    empty = _BoundedMoments(include_higher=False).to_state()
+    states = [
+        {
+            "a": moments_by_count[count].to_state(),
+            "b": empty,
+            "processed_block_pairs": count,
+            "sizing_stream": True,
+            "weighting_assumptions": {
+                "statistical_unit": "sequence",
+                "weight_unit": "tokens",
+                "sampling_design": "with_replacement",
+                "weights_exogenous": True,
+                "common_mean_assumption": True,
+            },
+        }
+        for count in (2, 4)
+    ]
+    _BoundedCheckpointStore(sizing_root).publish(
+        4,
+        {
+            "selected_sample_count_per_stream": 4,
+            "candidate_states": {
+                str(count): {"a": state["a"], "b": state["b"]}
+                for count, state in zip((2, 4), states)
+            },
+            "a": states[-1]["a"],
+            "b": states[-1]["b"],
+        },
+    )
+    evidence.sizing_root = sizing_root
+    evidence.sizing_states = states
+    sigma2 = {"p": np.asarray([4.0, 5.0])}
+    monkeypatch.setattr(
+        evaluator,
+        "estimate_sequence_variance_bounded",
+        lambda *_args, **_kwargs: sigma2,
+    )
+    registry_hash = "6" * 64
+    registry = {
+        "schema_version": "stage2-parameter-registry-artifact-v1",
+        "status": "READY",
+        "registry_hash": registry_hash,
+        "parameter_groups": {"p": {"layer": "layer0", "module": "module0"}},
+    }
+    registry["artifact_hash"] = canonical_json_hash(registry)
+    evidence.identities.update({
+        "registry_hash": registry_hash,
+        "producer_commit": "7" * 40,
+    })
+    floors = {
+        "tau_model": 1.0e-12,
+        "tau_layer": 1.0e-12,
+        "tau_module": 1.0e-12,
+        "tau_coord": 1.0e-12,
+        "tau_nmse": 1.0e-12,
+    }
+    formula_hash = "8" * 64
+    evidence.external_payloads = {
+        "preregistration": {
+            "equivalence_and_precision": {"absolute_floors": floors}
+        }
+    }
+    plan = {
+        "schema_version": "stage2-reference-sizing-plan-v1",
+        "reference_id": "bounded-reference-test",
+        "candidate_sample_counts": [2, 4],
+        "block_size": 1,
+        "required_consecutive": 1,
+        "convergence_tolerance": 0.02,
+    }
+    plan["artifact_hash"] = canonical_json_hash(plan)
+    nodes = [
+        {
+            "sample_count": count,
+            "state_digest": canonical_json_hash({
+                "checkpoint_schema": _BoundedCheckpointStore.schema_version,
+                "plan_hash": plan["artifact_hash"],
+                "sample_count": count,
+                "moments_hash": evaluator._bounded_moments_digest(moments_by_count[count]),
+            }),
+            "shard_refs_hash": canonical_json_hash([]),
+            "mean_hash": evaluator._vector_digest(
+                moments_by_count[count].mean()
+            ),
+            "sequence_variance_hash": evaluator._vector_digest(sigma2),
+        }
+        for count in (2, 4)
+    ]
+    old_delta = {endpoint: {} for endpoint in ("model_total", "layer", "module")}
+    old_signal = {endpoint: {} for endpoint in ("model_total", "layer", "module")}
+    old_noise = {endpoint: {} for endpoint in ("model_total", "layer", "module")}
+    for count, moments in moments_by_count.items():
+        mean = moments.mean()
+        signal = float(sum(np.sum(np.square(value)) for value in mean.values()))
+        noise = float(sum(np.sum(value) for value in sigma2.values())) / count
+        for endpoint in old_delta:
+            old_signal[endpoint][str(count)] = signal
+            old_noise[endpoint][str(count)] = noise
+            old_delta[endpoint][str(count)] = max(0.10 * noise, 0.01 * signal)
+    source_body = {
+        "schema_version": "stage2-reference-delta-sci-v2",
+        "source_kind": "reference_sizing_bounded_online",
+        "formula_contract_hash": formula_hash,
+        "formula_version": "stage2-reference-sizing-margin-v1",
+        "formula": "delta_sci=max(0.10*Delta,0.01*S); a=mu_sizing^2; d=sigma_squared_over_B",
+        "absolute_floors": floors,
+        "reference_id": plan["reference_id"],
+        "sizing_result_hash": "9" * 64,
+        "sizing_plan_hash": plan["artifact_hash"],
+        "candidate_sample_counts": [2, 4],
+        "delta_sci_by_endpoint": old_delta,
+        "signal_scale_by_endpoint": old_signal,
+        "noise_scale_by_endpoint": old_noise,
+        "sizing_nodes": nodes,
+        "registry_hash": registry_hash,
+    }
+    source_body["artifact_hash"] = canonical_json_hash(source_body)
+    source_ref = "sizing/derived/delta-sci.json"
+    write_canonical_json(tmp_path / source_ref, source_body)
+    source_link = {
+        **source_body,
+        "source_ref": source_ref,
+        "source_hash": source_body["artifact_hash"],
+        "source_artifact_hash": source_body["artifact_hash"],
+    }
+    evidence.convergence = SimpleNamespace(
+        payload={
+            "candidate_delta_sci": source_link,
+            "sizing_plan": plan,
+            "sizing_plan_artifact_hash": plan["artifact_hash"],
+            "formula_contract_hash": formula_hash,
+            "sizing_result_hash": "9" * 64,
+            "parameter_registry_artifact": registry,
+            "selected_sample_count_per_stream": 4,
+        }
+    )
+    _, _, sidecar = _delta_sci(
+        evidence, [2, 4], evaluator_commit="a" * 40
+    )
+    assert sidecar["source_producer_table_mode"] == "sizing_nodes_legacy"
+    assert sidecar["selected_sample_count_per_stream"] == 4
+    assert set(sidecar["delta_sci_by_endpoint"]["model_total"]) == {  # type: ignore[index]
+        str(batch_size) for batch_size in CORRECTED_DELTA_BATCH_SIZES
+    }
+
+    tampered_state = dict(states[-1])
+    tampered_a = dict(tampered_state["a"])
+    tampered_a["n2"] = float(tampered_a["n2"]) + 1.0  # type: ignore[arg-type]
+    tampered_state["a"] = tampered_a
+    evidence.sizing_states[-1] = tampered_state
+    with pytest.raises(G23Blocked, match="SIZING_NODE_BINDING_MISMATCH"):
+        _delta_sci(evidence, [2, 4], evaluator_commit="a" * 40)
 
 
 def test_bounded_final_moments_missing_higher_fields_are_blocked() -> None:

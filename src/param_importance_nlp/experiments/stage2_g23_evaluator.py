@@ -64,7 +64,7 @@ from .stage2_g23_contracts import (
     validate_sizing_plan_contract,
     validate_weighting_contract,
 )
-from .sampling import DrawStreamManifest, SamplingPlan
+from .sampling import CANDIDATE_BATCH_SIZES, DrawStreamManifest, SamplingPlan
 
 
 SCHEMA_VERSION = "stage2-g23-reference-evaluation-v1"
@@ -86,6 +86,39 @@ THRESHOLDS: Mapping[str, float] = {
     "h_ref_divisor": 4.0,
     "epsilon_num_divisor": 10.0,
 }
+CORRECTED_DELTA_SCHEMA_VERSION = "stage2-g23-corrected-delta-sci-v1"
+CORRECTED_DELTA_BATCH_SIZES: tuple[int, ...] = tuple(
+    int(value) for value in CANDIDATE_BATCH_SIZES
+)
+CORRECTED_DELTA_SIDECAR_FIELDS = frozenset(
+    {
+        "schema_version",
+        "source_producer_schema_version",
+        "source_producer_ref",
+        "source_producer_artifact_hash",
+        "source_producer_table_mode",
+        "source_producer_commit",
+        "evaluator_commit",
+        "evaluator_source_sha256",
+        "formula_contract_hash",
+        "formula_version",
+        "formula",
+        "absolute_floors",
+        "reference_id",
+        "sizing_result_hash",
+        "sizing_plan_hash",
+        "registry_hash",
+        "candidate_sample_counts",
+        "delta_sci_batch_sizes",
+        "selected_sample_count_per_stream",
+        "delta_sci_by_endpoint",
+        "signal_scale_by_endpoint",
+        "noise_scale_by_endpoint",
+        "sizing_nodes",
+        "correction_reason",
+        "artifact_hash",
+    }
+)
 _SHA = re.compile(r"^[0-9a-f]{64}$")
 _COMMIT = re.compile(r"^[0-9a-f]{40}$")
 
@@ -377,6 +410,22 @@ def _digest_bytes(path: Path) -> str:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _git_head(path: Path) -> str:
+    """Return the evaluator repository commit for explicit producer/consumer lineage."""
+
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(path), "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    value = result.stdout.strip()
+    return value if _COMMIT.fullmatch(value) is not None else ""
 
 
 def _append_attempt_index(index: Path, artifact_hash: str) -> None:
@@ -1953,8 +2002,19 @@ def _sizing_sequence_variance(
 def _delta_sci(
     evidence: _CellEvidence,
     counts: Sequence[int],
-) -> tuple[dict[str, dict[int, float]], dict[str, float]]:
-    """Recompute sizing-derived S/Delta/delta and compare the frozen artifact."""
+    *,
+    evaluator_commit: str,
+) -> tuple[dict[str, dict[int, float]], dict[str, float], Mapping[str, object]]:
+    """Recompute the S2.6-B margin from hash-bound sizing moments.
+
+    ``counts`` are the S2.4 sizing/convergence nodes.  They are deliberately
+    not the estimator batch-size domain consumed by S2.6.  Older r23
+    producers published ``delta_sci_by_endpoint`` keyed by those sizing
+    counts; the evaluator retains that artifact as immutable provenance and
+    emits a corrected, content-addressed sidecar keyed by
+    ``CANDIDATE_BATCH_SIZES``.  No draw, threshold, or producer artifact is
+    rewritten.
+    """
 
     if evidence.convergence is None or evidence.sizing_root is None or not evidence.sizing_states:
         raise G23Blocked("delta_sci:SIZING_RAW_DIAGNOSTICS_MISSING")
@@ -1964,6 +2024,8 @@ def _delta_sci(
         raise G23Blocked("delta_sci:SIZING_DERIVED_ARTIFACT_REQUIRED")
     source_ref = _path(source.get("source_ref"), "candidate_delta_sci.source_ref")
     source_hash = _sha(source.get("source_hash"), "candidate_delta_sci.source_hash")
+    if source.get("source_artifact_hash") != source_hash:
+        raise G23Blocked("delta_sci:SIZING_SOURCE_ARTIFACT_HASH_MISMATCH")
     if evidence.workspace_root is None:
         raise G23Blocked("delta_sci:WORKSPACE_ROOT_MISSING")
     source_value = _load_json(evidence.workspace_root, source_ref, "candidate_delta_sci")
@@ -2004,6 +2066,34 @@ def _delta_sci(
         or source.get("absolute_floors") != dict(floors)
     ):
         raise G23Blocked("delta_sci:SOURCE_IDENTITY_MISMATCH")
+    producer_delta = source_value.get("delta_sci_by_endpoint")
+    producer_signal = source_value.get("signal_scale_by_endpoint")
+    producer_noise = source_value.get("noise_scale_by_endpoint")
+    if not all(isinstance(value, Mapping) for value in (producer_delta, producer_signal, producer_noise)):
+        raise G23Blocked("delta_sci:PRODUCER_SCALE_TABLES_MISSING")
+    sizing_keys = {str(count) for count in counts}
+    batch_keys = {str(batch_size) for batch_size in CORRECTED_DELTA_BATCH_SIZES}
+    producer_key_sets: set[frozenset[str]] = set()
+    for table in (producer_delta, producer_signal, producer_noise):
+        assert isinstance(table, Mapping)
+        if set(table) != {"model_total", "layer", "module"}:
+            raise G23Blocked("delta_sci:PRODUCER_ENDPOINT_DOMAIN_INVALID")
+        for endpoint in ("model_total", "layer", "module"):
+            values = table.get(endpoint)
+            if not isinstance(values, Mapping):
+                raise G23Blocked(f"delta_sci:PRODUCER_ENDPOINT_TABLE_MISSING:{endpoint}")
+            if any(not isinstance(key, str) for key in values):
+                raise G23Blocked(f"delta_sci:PRODUCER_SCALE_KEY_INVALID:{endpoint}")
+            producer_key_sets.add(frozenset(str(key) for key in values))
+    if len(producer_key_sets) != 1:
+        raise G23Blocked("delta_sci:PRODUCER_SCALE_KEY_DRIFT")
+    producer_keys = next(iter(producer_key_sets))
+    if producer_keys == frozenset(sizing_keys):
+        producer_table_mode = "sizing_nodes_legacy"
+    elif producer_keys == frozenset(batch_keys):
+        producer_table_mode = "candidate_batch_sizes"
+    else:
+        raise G23Blocked("delta_sci:PRODUCER_SCALE_KEY_DOMAIN_INVALID")
     state_by_count: dict[int, Mapping[str, object]] = {}
     for state in evidence.sizing_states:
         count = int(state.get("processed_block_pairs", 0)) * block_size
@@ -2011,25 +2101,39 @@ def _delta_sci(
             state_by_count[count] = state
     if any(count not in state_by_count for count in counts):
         raise G23Blocked("delta_sci:SIZING_CANDIDATE_STATE_MISSING")
-    latest = state_by_count[counts[-1]]
+    convergence_payload = evidence.convergence.payload
+    selected_value = convergence_payload.get("selected_sample_count_per_stream")
+    if isinstance(selected_value, bool) or not isinstance(selected_value, int) or selected_value not in state_by_count:
+        raise G23Blocked("delta_sci:SELECTED_SIZING_NODE_MISSING")
+    selected_count = int(selected_value)
+    if producer_table_mode == "candidate_batch_sizes":
+        if source.get("delta_sci_batch_sizes") != list(CORRECTED_DELTA_BATCH_SIZES):
+            raise G23Blocked("delta_sci:PRODUCER_BATCH_DOMAIN_BINDING_MISMATCH")
+        if source.get("selected_sample_count_per_stream") != selected_count:
+            raise G23Blocked("delta_sci:PRODUCER_SELECTED_NODE_BINDING_MISMATCH")
     bounded = source.get("source_kind") == "reference_sizing_bounded_online"
+    selected_scales: dict[str, tuple[float, float]] | None = None
     if bounded:
-        latest_moments = _BoundedMoments.from_state(latest["a"])  # type: ignore[arg-type]
-        first_vector = latest_moments.g1
+        selected_moments = _BoundedMoments.from_state(state_by_count[selected_count]["a"])  # type: ignore[arg-type]
+        first_vector = selected_moments.g1
         store = None
     else:
-        refs_latest = latest.get("shard_refs_a")
-        if not isinstance(refs_latest, list) or not refs_latest:
+        refs_selected = state_by_count[selected_count].get("shard_refs_a")
+        if not isinstance(refs_selected, list) or not refs_selected:
             raise G23Blocked("delta_sci:SIZING_SHARDS_MISSING")
         store = _ReferenceShardStore(evidence.sizing_root)
         try:
-            first_vector, _, _ = store.load(refs_latest[0])
+            first_vector, _, _ = store.load(refs_selected[0])
         except (OSError, TypeError, ValueError) as error:
             raise G23Blocked("delta_sci:SIZING_SHARD_INVALID") from error
+    names = tuple(sorted(first_vector))
     layer_groups, module_groups = _group_map(first_vector, evidence)
     computed: dict[str, dict[int, float]] = {endpoint: {} for endpoint in ("model_total", "layer", "module")}
     computed_signal: dict[str, dict[int, float]] = {endpoint: {} for endpoint in computed}
     computed_noise: dict[str, dict[int, float]] = {endpoint: {} for endpoint in computed}
+    legacy_computed: dict[str, dict[int, float]] = {endpoint: {} for endpoint in computed}
+    legacy_signal: dict[str, dict[int, float]] = {endpoint: {} for endpoint in computed}
+    legacy_noise: dict[str, dict[int, float]] = {endpoint: {} for endpoint in computed}
     computed_nodes: list[Mapping[str, object]] = []
     for count in counts:
         state = state_by_count[count]
@@ -2048,23 +2152,23 @@ def _delta_sci(
             mean, sigma2 = _sizing_sequence_variance(store, refs, assumptions, block_size)
         a = {name: np.square(mean[name]) for name in mean}
         model_signal = max(abs(float(sum(np.sum(value) for value in a.values()))), floors_f["tau_model"])
-        model_noise = abs(float(sum(np.sum(value) for value in sigma2.values()))) / float(count)
+        model_noise = abs(float(sum(np.sum(value) for value in sigma2.values())))
         layer_signal_values = [float(sum(np.sum(a[name]) for name in names)) for names in layer_groups.values()]
-        layer_noise_values = [float(sum(np.sum(sigma2[name]) for name in names)) / float(count) for names in layer_groups.values()]
+        layer_noise_values = [float(sum(np.sum(sigma2[name]) for name in names)) for names in layer_groups.values()]
         module_signal_values = [float(sum(np.sum(a[name]) for name in names)) for names in module_groups.values()]
-        module_noise_values = [float(sum(np.sum(sigma2[name]) for name in names)) / float(count) for names in module_groups.values()]
+        module_noise_values = [float(sum(np.sum(sigma2[name]) for name in names)) for names in module_groups.values()]
         endpoint_values = {
             "model_total": (max(abs(model_signal), floors_f["tau_model"]), abs(model_noise)),
             "layer": (max(float(sum(abs(value) for value in layer_signal_values)), floors_f["tau_layer"]), float(sum(abs(value) for value in layer_noise_values))),
             "module": (max(float(sum(abs(value) for value in module_signal_values)), floors_f["tau_module"]), float(sum(abs(value) for value in module_noise_values))),
         }
-        for endpoint, (signal, noise) in endpoint_values.items():
-            delta = max(0.10 * noise, 0.01 * signal)
-            if not all(math.isfinite(value) and value > 0 for value in (signal, noise, delta)):
-                raise G23Blocked(f"delta_sci:{endpoint}:{count}:NON_FINITE")
-            computed[endpoint][count] = delta
-            computed_signal[endpoint][count] = signal
-            computed_noise[endpoint][count] = noise
+        for endpoint, (signal, sigma2_total) in endpoint_values.items():
+            noise = float(sigma2_total) / float(count)
+            legacy_signal[endpoint][count] = signal
+            legacy_noise[endpoint][count] = noise
+            legacy_computed[endpoint][count] = max(0.10 * noise, 0.01 * signal)
+        if count == selected_count:
+            selected_scales = dict(endpoint_values)
         state_digest = (
             canonical_json_hash({"checkpoint_schema": _BoundedCheckpointStore.schema_version, "plan_hash": plan.get("artifact_hash"), "sample_count": count, "moments_hash": _bounded_moments_digest(moments)})
             if bounded else _ReferenceSnapshotStore._state_digest(state)
@@ -2074,14 +2178,68 @@ def _delta_sci(
             for ref in refs if isinstance(ref, Mapping)
         ])
         computed_nodes.append({"sample_count": count, "state_digest": state_digest, "shard_refs_hash": shard_refs_hash, "mean_hash": _vector_digest(mean), "sequence_variance_hash": _vector_digest(sigma2)})
-    expected_endpoint_source = source_value.get("delta_sci_by_endpoint")
-    if expected_endpoint_source != {endpoint: {str(count): value for count, value in mapping.items()} for endpoint, mapping in computed.items()}:
-        raise G23Blocked("delta_sci:FORMULA_RECOMPUTE_MISMATCH")
-    if source_value.get("signal_scale_by_endpoint") != {endpoint: {str(count): value for count, value in mapping.items()} for endpoint, mapping in computed_signal.items()} or source_value.get("noise_scale_by_endpoint") != {endpoint: {str(count): value for count, value in mapping.items()} for endpoint, mapping in computed_noise.items()}:
-        raise G23Blocked("delta_sci:SCALE_RECOMPUTE_MISMATCH")
+    if selected_scales is None:
+        raise G23Blocked("delta_sci:SELECTED_SIZING_SCALES_MISSING")
+    for batch_size in CORRECTED_DELTA_BATCH_SIZES:
+        for endpoint, (signal, sigma2) in selected_scales.items():
+            noise = float(sigma2) / float(batch_size)
+            delta = max(0.10 * noise, 0.01 * signal)
+            if not all(math.isfinite(value) and value > 0 for value in (signal, noise, delta)):
+                raise G23Blocked(f"delta_sci:{endpoint}:B{batch_size}:NON_FINITE")
+            computed[endpoint][batch_size] = delta
+            computed_signal[endpoint][batch_size] = signal
+            computed_noise[endpoint][batch_size] = noise
+    expected_computed = {endpoint: {str(batch_size): value for batch_size, value in mapping.items()} for endpoint, mapping in computed.items()}
+    expected_signal = {endpoint: {str(batch_size): value for batch_size, value in mapping.items()} for endpoint, mapping in computed_signal.items()}
+    expected_noise = {endpoint: {str(batch_size): value for batch_size, value in mapping.items()} for endpoint, mapping in computed_noise.items()}
+    expected_legacy = {endpoint: {str(count): value for count, value in mapping.items()} for endpoint, mapping in legacy_computed.items()}
+    expected_legacy_signal = {endpoint: {str(count): value for count, value in mapping.items()} for endpoint, mapping in legacy_signal.items()}
+    expected_legacy_noise = {endpoint: {str(count): value for count, value in mapping.items()} for endpoint, mapping in legacy_noise.items()}
+    if producer_table_mode == "sizing_nodes_legacy":
+        if producer_delta != expected_legacy:
+            raise G23Blocked("delta_sci:LEGACY_PRODUCER_FORMULA_RECOMPUTE_MISMATCH")
+        if producer_signal != expected_legacy_signal or producer_noise != expected_legacy_noise:
+            raise G23Blocked("delta_sci:LEGACY_PRODUCER_SCALE_RECOMPUTE_MISMATCH")
+    elif producer_table_mode == "candidate_batch_sizes":
+        if producer_delta != expected_computed:
+            raise G23Blocked("delta_sci:PRODUCER_FORMULA_RECOMPUTE_MISMATCH")
+        if producer_signal != expected_signal or producer_noise != expected_noise:
+            raise G23Blocked("delta_sci:PRODUCER_SCALE_RECOMPUTE_MISMATCH")
     if source_value.get("sizing_nodes") != computed_nodes:
         raise G23Blocked("delta_sci:SIZING_NODE_BINDING_MISMATCH")
-    return computed, {endpoint: min(mapping.values()) for endpoint, mapping in computed.items()}
+    correction_reason = (
+        "producer_delta_sci_keyed_by_sizing_nodes; S2.6_requires_candidate_batch_sizes"
+        if producer_table_mode == "sizing_nodes_legacy"
+        else "producer_delta_sci_candidate_batch_sizes_verified_by_evaluator"
+    )
+    sidecar: dict[str, object] = {
+        "schema_version": CORRECTED_DELTA_SCHEMA_VERSION,
+        "source_producer_schema_version": source.get("schema_version"),
+        "source_producer_ref": source_ref,
+        "source_producer_artifact_hash": source_hash,
+        "source_producer_table_mode": producer_table_mode,
+        "source_producer_commit": evidence.identities.get("producer_commit"),
+        "evaluator_commit": evaluator_commit,
+        "evaluator_source_sha256": _digest_bytes(Path(__file__).resolve()),
+        "formula_contract_hash": source.get("formula_contract_hash"),
+        "formula_version": source.get("formula_version"),
+        "formula": source.get("formula"),
+        "absolute_floors": dict(floors),
+        "reference_id": plan.get("reference_id"),
+        "sizing_result_hash": source.get("sizing_result_hash"),
+        "sizing_plan_hash": source.get("sizing_plan_hash"),
+        "registry_hash": source.get("registry_hash"),
+        "candidate_sample_counts": list(counts),
+        "delta_sci_batch_sizes": list(CORRECTED_DELTA_BATCH_SIZES),
+        "selected_sample_count_per_stream": selected_count,
+        "delta_sci_by_endpoint": expected_computed,
+        "signal_scale_by_endpoint": expected_signal,
+        "noise_scale_by_endpoint": expected_noise,
+        "sizing_nodes": computed_nodes,
+        "correction_reason": correction_reason,
+    }
+    sidecar["artifact_hash"] = canonical_json_hash(sidecar)
+    return computed, {endpoint: min(mapping.values()) for endpoint, mapping in computed.items()}, sidecar
 
 
 def _u_from_blocks_longdouble(
@@ -2862,7 +3020,7 @@ def _sequence_scaling(
     return all(np.allclose(expected[name], sequence[name], rtol=1e-9, atol=1e-12) for name in expected)
 
 
-def _evaluate_cell(evidence: _CellEvidence) -> dict[str, object]:
+def _evaluate_cell(evidence: _CellEvidence, *, evaluator_commit: str) -> dict[str, object]:
     cell: dict[str, object] = {"cell_id": evidence.source.cell_id, "status": "BLOCKED", "identities": dict(evidence.identities), "reasons": list(evidence.reasons)}
     if evidence.reasons:
         return cell
@@ -2879,7 +3037,11 @@ def _evaluate_cell(evidence: _CellEvidence) -> dict[str, object]:
             bias, cross, ranking, blocks_a, blocks_b, uncertainty = _final_vectors(evidence)
         previous_bias, latest_bias = previous
         flat_prev, flat_latest = _flat(previous_bias), _flat(latest_bias)
-        delta_sci, min_delta_by_endpoint = _delta_sci(evidence, [int(item) for item in plan["candidate_sample_counts"]])
+        delta_sci, min_delta_by_endpoint, corrected_delta_sci = _delta_sci(
+            evidence,
+            [int(item) for item in plan["candidate_sample_counts"]],
+            evaluator_commit=evaluator_commit,
+        )
         epsilon_num = _numerical_error(evidence, bias)
         block_size = int(plan.get("block_size", 0))
         if block_size <= 0:
@@ -3102,6 +3264,7 @@ def _evaluate_cell(evidence: _CellEvidence) -> dict[str, object]:
             "state_replay_verified": checks["state_replay_verified"],
             "one_shot_complete": checks["one_shot_complete"],
         })
+        cell["_corrected_delta_sci"] = dict(corrected_delta_sci)
         reasons = [name + ":THRESHOLD_FAILED" for name, passed in checks.items() if not passed]
         cell.update({
             "status": "PASS" if not reasons else "BLOCKED",
@@ -3141,6 +3304,96 @@ def _evaluate_cell(evidence: _CellEvidence) -> dict[str, object]:
     except (KeyError, TypeError, ValueError, OverflowError, FloatingPointError) as error:
         cell["reasons"] = list(cell.get("reasons", [])) + [f"RAW_DIAGNOSTIC_INVALID:{type(error).__name__}"]
     return cell
+
+
+def _publish_corrected_delta_sidecars(
+    root: Path,
+    output_root: Path | None,
+    cells: Sequence[dict[str, object]],
+) -> None:
+    """Atomically publish evaluator-owned corrected delta artifacts.
+
+    The sidecar is content addressed by its own canonical payload hash.  The
+    producer's original artifact is never overwritten; each PASS cell binds
+    the new workspace-relative reference and hash into its identities/metrics.
+    """
+
+    pending = [
+        cell
+        for cell in cells
+        if cell.get("status") == "PASS"
+        and isinstance(cell.get("_corrected_delta_sci"), Mapping)
+    ]
+    if not pending:
+        return
+    if output_root is None:
+        for cell in pending:
+            cell.pop("_corrected_delta_sci", None)
+            cell["status"] = "BLOCKED"
+            cell["formal_eligible"] = False
+            reasons = cell.setdefault("reasons", [])
+            if isinstance(reasons, list):
+                reasons.append("delta_sci:CORRECTED_SIDECAR_OUTPUT_REQUIRED")
+        return
+    try:
+        output_root.relative_to(root)
+    except ValueError as error:
+        raise G23Blocked("delta_sci:CORRECTED_SIDECAR_OUTPUT_OUTSIDE_WORKSPACE") from error
+    sidecar_root = output_root / "g2.3-corrected-delta-sci"
+    _reject_absolute_symlink_chain(sidecar_root, "corrected_delta_sci_root")
+    sidecar_root.mkdir(parents=True, exist_ok=True)
+    for cell in pending:
+        raw = cell.pop("_corrected_delta_sci")
+        if not isinstance(raw, Mapping):
+            continue
+        sidecar = dict(raw)
+        if set(sidecar) != CORRECTED_DELTA_SIDECAR_FIELDS:
+            raise RuntimeError("G23_CORRECTED_DELTA_SCHEMA_FIELDS_MISMATCH")
+        if sidecar.get("schema_version") != CORRECTED_DELTA_SCHEMA_VERSION:
+            raise RuntimeError("G23_CORRECTED_DELTA_SCHEMA_VERSION_MISMATCH")
+        if sidecar.get("delta_sci_batch_sizes") != list(CORRECTED_DELTA_BATCH_SIZES):
+            raise RuntimeError("G23_CORRECTED_DELTA_BATCH_DOMAIN_MISMATCH")
+        mode = sidecar.get("source_producer_table_mode")
+        expected_reason = (
+            "producer_delta_sci_keyed_by_sizing_nodes; S2.6_requires_candidate_batch_sizes"
+            if mode == "sizing_nodes_legacy"
+            else "producer_delta_sci_candidate_batch_sizes_verified_by_evaluator"
+            if mode == "candidate_batch_sizes"
+            else None
+        )
+        if expected_reason is None or sidecar.get("correction_reason") != expected_reason:
+            raise RuntimeError("G23_CORRECTED_DELTA_CORRECTION_REASON_MISMATCH")
+        sidecar_hash = _canonical_payload_hash(sidecar, "corrected_delta_sci")
+        target = sidecar_root / f"{sidecar_hash}.json"
+        _reject_absolute_symlink_chain(target, "corrected_delta_sci_target")
+        if target.exists():
+            try:
+                existing = load_canonical_json(target)
+            except (OSError, TypeError, ValueError) as error:
+                raise RuntimeError("G23_CORRECTED_DELTA_CONTENT_ADDRESS_COLLISION") from error
+            if existing != sidecar:
+                raise RuntimeError("G23_CORRECTED_DELTA_CONTENT_ADDRESS_COLLISION")
+        else:
+            write_canonical_json(target, sidecar)
+        try:
+            reference = target.relative_to(root).as_posix()
+        except ValueError as error:
+            raise G23Blocked("delta_sci:CORRECTED_SIDECAR_OUTSIDE_WORKSPACE") from error
+        identities = cell.setdefault("identities", {})
+        metrics = cell.get("metrics")
+        if not isinstance(identities, dict) or not isinstance(metrics, dict):
+            cell["status"] = "BLOCKED"
+            cell["formal_eligible"] = False
+            reasons = cell.setdefault("reasons", [])
+            if isinstance(reasons, list):
+                reasons.append("delta_sci:CORRECTED_SIDECAR_BINDING_TARGET_INVALID")
+            continue
+        identities["corrected_delta_sci_hash"] = sidecar_hash
+        identities["corrected_delta_sci_ref"] = reference
+        metrics["corrected_delta_sci_hash"] = sidecar_hash
+        metrics["corrected_delta_sci_ref"] = reference
+        metrics["corrected_delta_sci_batch_sizes"] = list(CORRECTED_DELTA_BATCH_SIZES)
+        metrics["delta_sci_source"] = "g23_output_derived_corrected_sidecar"
 
 
 def _attempt_payload(cells: Sequence[Mapping[str, object]], calculator: Mapping[str, object], *, expected_cell_ids: Sequence[str]) -> dict[str, object]:
@@ -3196,6 +3449,7 @@ def evaluate_formal_g23(
     # ``expected_cell_ids`` remains accepted for source compatibility only;
     # its values never influence the formal decision.
     expected = EXPECTED_CELL_IDS
+    evaluator_commit = _git_head(trusted_repo)
     prepared: list[_CellEvidence] = []
     structure_reason: str | None = None
     if len(normalized) == REQUIRED_CELL_COUNT and len(set(item.cell_id for item in normalized)) == REQUIRED_CELL_COUNT:
@@ -3228,7 +3482,15 @@ def evaluate_formal_g23(
         manifest_hashes = {item.identities.get("six_cell_manifest_hash", "") for item in prepared}
         if len(manifest_hashes) != 1 or "" in manifest_hashes:
             structure_reason = "SIX_CELL_MANIFEST_NOT_COMMON"
-    cell_rows = [_evaluate_cell(item) for item in prepared]
+    cell_rows = [
+        _evaluate_cell(item, evaluator_commit=evaluator_commit)
+        for item in prepared
+    ]
+    if output_root is not None:
+        out = _reject_absolute_symlink_chain(Path(output_root), "output_root")
+    else:
+        out = None
+    _publish_corrected_delta_sidecars(root, out, cell_rows)
     producer_values: set[str] = set()
     for item in prepared:
         if "producer_commit" in item.identities:
@@ -3238,7 +3500,12 @@ def evaluate_formal_g23(
     else:
         producer = ""
     module_path = Path(__file__).resolve()
-    calculator = {"producer_commit": producer, "source_sha256": _digest_bytes(module_path), "source_schema": SCHEMA_VERSION}
+    calculator = {
+        "producer_commit": producer,
+        "evaluator_commit": evaluator_commit,
+        "source_sha256": _digest_bytes(module_path),
+        "source_schema": SCHEMA_VERSION,
+    }
     payload = _attempt_payload(cell_rows, calculator, expected_cell_ids=expected)
     if len(normalized) != REQUIRED_CELL_COUNT:
         payload["status"] = "NOT_RUN" if not normalized else "BLOCKED"
@@ -3256,7 +3523,7 @@ def evaluate_formal_g23(
     artifact_hash = canonical_json_hash(payload)
     payload["artifact_hash"] = artifact_hash
     if output_root is not None:
-        out = _reject_absolute_symlink_chain(Path(output_root), "output_root")
+        assert out is not None
         attempt_dir = out / "g2.3-attempts" / artifact_hash
         _reject_absolute_symlink_chain(attempt_dir, "attempt_dir")
         attempt_dir.mkdir(parents=True, exist_ok=True)
@@ -3304,6 +3571,9 @@ class G23ReferenceEvaluator:
 
 __all__ = [
     "CellInput",
+    "CORRECTED_DELTA_BATCH_SIZES",
+    "CORRECTED_DELTA_SIDECAR_FIELDS",
+    "CORRECTED_DELTA_SCHEMA_VERSION",
     "G23Blocked",
     "G23ReferenceEvaluator",
     "GATE_ID",
