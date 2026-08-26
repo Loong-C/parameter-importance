@@ -28,6 +28,7 @@ from param_importance_nlp.contracts.config_v2 import ResolvedConfigV2
 from param_importance_nlp.contracts.jsonio import load_canonical_json, write_canonical_json
 from param_importance_nlp.experiments.sampling import SamplingPlan, SamplingUniverse
 from param_importance_nlp.experiments.stage2_s206_inputs import build_formal_execution_evidence
+from param_importance_nlp.experiments.stage2_executor_identity import compute_executor_identity
 from param_importance_nlp.experiments.stage2_s206_formal import (
     ANCHOR_IDS,
     APPROVED_GPU_BINDINGS,
@@ -372,7 +373,22 @@ def test_detached_wait_recovers_final_g24b_freeze(tmp_path: Path) -> None:
     )
     execution_ref = "evidence/execution.json"
     write_canonical_json(tmp_path / execution_ref, execution)
-    preflight = {"status": "READY"}
+    executor_identity = compute_executor_identity(
+        ROOT,
+        ROOT / "ops/stage2/run_s206_formal.py",
+    )
+    inventory_identity = {
+        "source_ref": identity["source_ref"],
+        "artifact_ref": identity["artifact_ref"],
+        "artifact_hash": identity["artifact_hash"],
+        "source_sha256": identity["source_sha256"],
+        "schema_version": identity["schema_version"],
+    }
+    preflight = {
+        "status": "READY",
+        "gpu_inventory_identity": inventory_identity,
+        "executor_identity": executor_identity,
+    }
     preflight["preflight_artifact_hash"] = canonical_json_hash(preflight)
     status_payload: dict[str, object] = {
         "schema_version": "stage2-s206-formal-detached-status-v1",
@@ -386,6 +402,8 @@ def test_detached_wait_recovers_final_g24b_freeze(tmp_path: Path) -> None:
         "gpu_inventory_source_ref": identity["source_ref"],
         "gpu_inventory_artifact_hash": identity["artifact_hash"],
         "gpu_inventory_source_sha256": identity["source_sha256"],
+        "gpu_inventory_identity": inventory_identity,
+        "executor_identity": executor_identity,
         "execution_evidence_ref": execution_ref,
         "execution_evidence_hash": execution["artifact_hash"],
     }

@@ -16,6 +16,7 @@ EXECUTOR_IDENTITY_FIELDS = frozenset(
 )
 _COMMIT = re.compile(r"^[0-9a-f]{40}$")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
+_REAL_POPEN = subprocess.Popen
 
 
 class ExecutorIdentityError(ValueError):
@@ -35,18 +36,25 @@ def _sha256_file(path: Path) -> str:
 
 def _git(repository: Path, *args: str) -> str:
     try:
-        result = subprocess.run(
+        # Keep identity's Git probe independent from the launcher's child
+        # ``Popen`` seam.  Tests and failure handling may replace that seam to
+        # model spawn/receipt errors; the identity probe must still be an
+        # actual fixed ``git -C <resolved repo>`` command.
+        process = _REAL_POPEN(
             ["git", "-C", str(repository), *args],
             cwd=repository,
-            check=True,
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
             encoding="utf-8",
             errors="replace",
         )
+        stdout, _stderr = process.communicate()
+        if process.returncode != 0:
+            raise subprocess.CalledProcessError(process.returncode, process.args)
     except (OSError, subprocess.CalledProcessError) as error:
         raise ExecutorIdentityError("GIT_IDENTITY_UNAVAILABLE") from error
-    return result.stdout.strip()
+    return stdout.strip()
 
 
 def compute_executor_identity(
