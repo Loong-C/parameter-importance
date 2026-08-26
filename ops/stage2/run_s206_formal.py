@@ -119,6 +119,13 @@ def _logical(root: Path, value: str, *, field: str) -> Path:
     return result
 
 
+def _canonical_logical_ref(root: Path, value: object, *, field: str) -> str:
+    """Return one DATA_ROOT-relative POSIX reference for status receipts."""
+
+    path = _logical(root, value, field=field)
+    return path.relative_to(root.resolve()).as_posix()
+
+
 def _file_sha256(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as handle:
@@ -381,13 +388,116 @@ def _run_anchor(
     return records
 
 
+def _load_hashed_formal_ref(
+    root: Path,
+    ref: object,
+    *,
+    field: str,
+) -> tuple[str, dict[str, object], str]:
+    """Load one DATA_ROOT-relative canonical object and verify its own hash.
+
+    The execution amendment is an authorization envelope, so its lineage must
+    be checked against the exact objects named on this invocation.  A declared
+    hash is not sufficient by itself: the object body is hashed again here to
+    reject a tampered or substituted canonical file.
+    """
+
+    if not isinstance(ref, str) or not ref:
+        raise S206PreparationBlocked(f"EXECUTION_EVIDENCE_{field.upper()}_REF_REQUIRED")
+    path = _logical(root, ref, field=field)
+    try:
+        raw = load_canonical_json(path)
+    except (OSError, TypeError, ValueError) as error:
+        raise S206PreparationBlocked(f"EXECUTION_EVIDENCE_{field.upper()}_LOAD_FAILED") from error
+    if not isinstance(raw, Mapping):
+        raise S206PreparationBlocked(f"EXECUTION_EVIDENCE_{field.upper()}_OBJECT_REQUIRED")
+    payload = dict(raw)
+    declared = payload.get("artifact_hash")
+    if not isinstance(declared, str) or len(declared) != 64 or any(
+        char not in "0123456789abcdef" for char in declared
+    ):
+        raise S206PreparationBlocked(f"EXECUTION_EVIDENCE_{field.upper()}_HASH_REQUIRED")
+    if canonical_json_hash({key: item for key, item in payload.items() if key != "artifact_hash"}) != declared:
+        raise S206PreparationBlocked(f"EXECUTION_EVIDENCE_{field.upper()}_HASH_MISMATCH")
+    return path.relative_to(root.resolve()).as_posix(), payload, declared
+
+
+def _validate_formal_execution_lineage(
+    args: argparse.Namespace,
+    execution: FormalExecutionEvidence,
+) -> None:
+    """Cross-bind execution metadata to this invocation's G23/G24a/S205.
+
+    Formal execution evidence is immutable, but the CLI can otherwise point at
+    a different amendment after it was produced.  Every formal consumer calls
+    this helper so the amendment and all three predecessor objects form one
+    exact hash-bound lineage.
+    """
+
+    root = args.data_root.resolve()
+    metadata = execution.metadata
+    if not isinstance(metadata, Mapping):
+        raise S206PreparationBlocked("EXECUTION_EVIDENCE_LINEAGE_METADATA_REQUIRED")
+    refs = (
+        ("g23_evaluation", "g23_evaluation_ref", "g23_evaluation_hash", args.g23_evaluation),
+        ("g24a_evaluation", "g24a_evaluation_ref", "g24a_evaluation_hash", args.g24a_evaluation),
+        ("s205_rebind", "s205_rebind_ref", "s205_rebind_hash", args.s205_rebind_ref),
+    )
+    loaded: dict[str, tuple[str, dict[str, object], str]] = {}
+    for field, ref_key, hash_key, requested_ref in refs:
+        actual_ref, payload, actual_hash = _load_hashed_formal_ref(root, requested_ref, field=field)
+        declared_ref = metadata.get(ref_key)
+        declared_hash = metadata.get(hash_key)
+        if not isinstance(declared_ref, str) or not declared_ref:
+            raise S206PreparationBlocked(f"EXECUTION_EVIDENCE_{field.upper()}_REF_REQUIRED")
+        if not isinstance(declared_hash, str) or not declared_hash:
+            raise S206PreparationBlocked(f"EXECUTION_EVIDENCE_{field.upper()}_HASH_REQUIRED")
+        if declared_ref != actual_ref:
+            raise S206PreparationBlocked(f"EXECUTION_EVIDENCE_{field.upper()}_REF_MISMATCH")
+        if declared_hash != actual_hash:
+            raise S206PreparationBlocked(f"EXECUTION_EVIDENCE_{field.upper()}_HASH_MISMATCH")
+        loaded[field] = (actual_ref, payload, actual_hash)
+
+    g23_ref, g23, g23_hash = loaded["g23_evaluation"]
+    g24a_ref, g24a, g24a_hash = loaded["g24a_evaluation"]
+    s205_ref, s205, s205_hash = loaded["s205_rebind"]
+    if g23.get("schema_version") != "stage2-g23-reference-evaluation-v1":
+        raise S206PreparationBlocked("EXECUTION_EVIDENCE_G23_SCHEMA_INVALID")
+    if g24a.get("schema_version") != "stage2-g24a-formal-evaluation-v1":
+        raise S206PreparationBlocked("EXECUTION_EVIDENCE_G24A_SCHEMA_INVALID")
+    if s205.get("schema_version") != "stage2-s205-rebind-plan-v1":
+        raise S206PreparationBlocked("EXECUTION_EVIDENCE_S205_SCHEMA_INVALID")
+    if (
+        g23.get("status") != "PASS"
+        or g23.get("formal_eligible") is not True
+        or g24a.get("status") != "PASS"
+        or g24a.get("formal_eligible") is not True
+        or s205.get("status") != "READY"
+        or s205.get("formal_eligible") is not True
+    ):
+        raise S206PreparationBlocked("EXECUTION_EVIDENCE_PREDECESSORS_NOT_FORMAL")
+    if (
+        g24a.get("g23_evaluation_ref") != g23_ref
+        or g24a.get("g23_evaluation_hash") != g23_hash
+    ):
+        raise S206PreparationBlocked("EXECUTION_EVIDENCE_G24A_G23_BINDING_MISMATCH")
+    if (
+        s205.get("g23_evaluation_ref") != g23_ref
+        or s205.get("g23_evaluation_hash") != g23_hash
+    ):
+        raise S206PreparationBlocked("EXECUTION_EVIDENCE_S205_G23_BINDING_MISMATCH")
+
+
 def _load_formal_execution(args: argparse.Namespace) -> FormalExecutionEvidence:
-    """Load the explicit formal authorization consumed by every child cell."""
+    """Load and exact-bind the formal authorization consumed by every child."""
 
     if not args.execution_evidence_ref:
         raise S206PreparationBlocked("EXECUTE_REQUIRES_FORMAL_EXECUTION_EVIDENCE")
     path = _logical(args.data_root.resolve(), args.execution_evidence_ref, field="execution_evidence_ref")
-    value = load_canonical_json(path)
+    try:
+        value = load_canonical_json(path)
+    except (OSError, TypeError, ValueError) as error:
+        raise S206PreparationBlocked("EXECUTION_EVIDENCE_LOAD_FAILED") from error
     if not isinstance(value, Mapping):
         raise S206PreparationBlocked("EXECUTION_EVIDENCE_NOT_OBJECT")
     try:
@@ -395,6 +505,7 @@ def _load_formal_execution(args: argparse.Namespace) -> FormalExecutionEvidence:
         execution.require_for_stage(2)
     except (TypeError, ValueError, S206PreparationBlocked) as error:
         raise S206PreparationBlocked(f"EXECUTION_EVIDENCE_INVALID:{error}") from error
+    _validate_formal_execution_lineage(args, execution)
     return execution
 
 
@@ -402,6 +513,7 @@ def _legacy_execute(args: argparse.Namespace) -> dict[str, object]:
     preflight = _preflight(args)
     execution = _load_formal_execution(args)
     root = args.data_root.resolve()
+    execution_ref = _canonical_logical_ref(root, args.execution_evidence_ref, field="execution_evidence_ref")
     operations = _logical(root, args.operations_root, field="operations_root")
     operations.mkdir(parents=True, exist_ok=True)
     output = operations / "status.json"
@@ -443,7 +555,7 @@ def _legacy_execute(args: argparse.Namespace) -> dict[str, object]:
             plan_path.parent.mkdir(parents=True, exist_ok=True)
             write_canonical_json(plan_path, plan_payload)
         cell_plan_refs.append(str(plan_path))
-    _write_status(output, {"run_id": args.run_id, "stage": "PREFLIGHT_PASS", "formal_eligible": True, "preflight": preflight, "execution_evidence_hash": execution.artifact_hash, "pilot_mapping_ref": str(mapping_output), "pilot_mapping_hash": mapping.artifact_hash, "cell_plan_refs": cell_plan_refs, "completed_cells": []})
+    _write_status(output, {"run_id": args.run_id, "stage": "PREFLIGHT_PASS", "formal_eligible": True, "preflight": preflight, "execution_evidence_ref": execution_ref, "execution_evidence_hash": execution.artifact_hash, "pilot_mapping_ref": str(mapping_output), "pilot_mapping_hash": mapping.artifact_hash, "cell_plan_refs": cell_plan_refs, "completed_cells": []})
     records: list[dict[str, object]] = []
     try:
         # Wave A occupies the four approved cards.  Wave B starts only after
@@ -455,8 +567,8 @@ def _legacy_execute(args: argparse.Namespace) -> dict[str, object]:
             }
             for future in as_completed(futures):
                 records.extend(future.result())
-                _write_status(output, {"run_id": args.run_id, "stage": "WAVE_A_RUNNING", "formal_eligible": True, "preflight": preflight, "execution_evidence_hash": execution.artifact_hash, "pilot_mapping_ref": str(mapping_output), "pilot_mapping_hash": mapping.artifact_hash, "cell_plan_refs": cell_plan_refs, "completed_cells": records})
-        _write_status(output, {"run_id": args.run_id, "stage": "WAVE_A_COMPLETE", "formal_eligible": True, "preflight": preflight, "execution_evidence_hash": execution.artifact_hash, "pilot_mapping_ref": str(mapping_output), "pilot_mapping_hash": mapping.artifact_hash, "cell_plan_refs": cell_plan_refs, "completed_cells": records})
+                _write_status(output, {"run_id": args.run_id, "stage": "WAVE_A_RUNNING", "formal_eligible": True, "preflight": preflight, "execution_evidence_ref": execution_ref, "execution_evidence_hash": execution.artifact_hash, "pilot_mapping_ref": str(mapping_output), "pilot_mapping_hash": mapping.artifact_hash, "cell_plan_refs": cell_plan_refs, "completed_cells": records})
+        _write_status(output, {"run_id": args.run_id, "stage": "WAVE_A_COMPLETE", "formal_eligible": True, "preflight": preflight, "execution_evidence_ref": execution_ref, "execution_evidence_hash": execution.artifact_hash, "pilot_mapping_ref": str(mapping_output), "pilot_mapping_hash": mapping.artifact_hash, "cell_plan_refs": cell_plan_refs, "completed_cells": records})
         with ThreadPoolExecutor(max_workers=2) as pool:
             futures = {
                 pool.submit(_run_anchor, args=args, anchor_id=anchor_id, gpu_uuid=CELL_GPU_BINDINGS[anchor_id], status_root=operations): anchor_id
@@ -464,11 +576,11 @@ def _legacy_execute(args: argparse.Namespace) -> dict[str, object]:
             }
             for future in as_completed(futures):
                 records.extend(future.result())
-                _write_status(output, {"run_id": args.run_id, "stage": "WAVE_B_RUNNING", "formal_eligible": True, "preflight": preflight, "execution_evidence_hash": execution.artifact_hash, "pilot_mapping_ref": str(mapping_output), "pilot_mapping_hash": mapping.artifact_hash, "cell_plan_refs": cell_plan_refs, "completed_cells": records})
+                _write_status(output, {"run_id": args.run_id, "stage": "WAVE_B_RUNNING", "formal_eligible": True, "preflight": preflight, "execution_evidence_ref": execution_ref, "execution_evidence_hash": execution.artifact_hash, "pilot_mapping_ref": str(mapping_output), "pilot_mapping_hash": mapping.artifact_hash, "cell_plan_refs": cell_plan_refs, "completed_cells": records})
     except Exception as error:
-        _write_status(output, {"run_id": args.run_id, "stage": "BLOCKED_EXECUTION", "formal_eligible": False, "preflight": preflight, "execution_evidence_hash": execution.artifact_hash, "pilot_mapping_ref": str(mapping_output), "pilot_mapping_hash": mapping.artifact_hash, "cell_plan_refs": cell_plan_refs, "completed_cells": records, "reason": f"{type(error).__name__}:{error}"})
+        _write_status(output, {"run_id": args.run_id, "stage": "BLOCKED_EXECUTION", "formal_eligible": False, "preflight": preflight, "execution_evidence_ref": execution_ref, "execution_evidence_hash": execution.artifact_hash, "pilot_mapping_ref": str(mapping_output), "pilot_mapping_hash": mapping.artifact_hash, "cell_plan_refs": cell_plan_refs, "completed_cells": records, "reason": f"{type(error).__name__}:{error}"})
         raise
-    _write_status(output, {"run_id": args.run_id, "stage": "PILOT_COMPLETE", "formal_eligible": True, "preflight": preflight, "execution_evidence_hash": execution.artifact_hash, "pilot_mapping_ref": str(mapping_output), "pilot_mapping_hash": mapping.artifact_hash, "cell_plan_refs": cell_plan_refs, "completed_cells": records, "expected_cell_count": 24, "confirmatory_draws_generated": False})
+    _write_status(output, {"run_id": args.run_id, "stage": "PILOT_COMPLETE", "formal_eligible": True, "preflight": preflight, "execution_evidence_ref": execution_ref, "execution_evidence_hash": execution.artifact_hash, "pilot_mapping_ref": str(mapping_output), "pilot_mapping_hash": mapping.artifact_hash, "cell_plan_refs": cell_plan_refs, "completed_cells": records, "expected_cell_count": 24, "confirmatory_draws_generated": False})
     return load_canonical_json(output)  # type: ignore[return-value]
 
 
@@ -1084,6 +1196,7 @@ def _production_smoke_cell(args: argparse.Namespace) -> dict[str, object]:
 
     preflight = _preflight(args)
     root = args.data_root.resolve()
+    execution_ref = _canonical_logical_ref(root, args.execution_evidence_ref, field="execution_evidence_ref")
     mapping_path = _absolute_or_logical(root, args.pilot_mapping_ref, field="pilot_mapping_ref")
     mapping_value = load_canonical_json(mapping_path)
     if not isinstance(mapping_value, Mapping):
@@ -1148,6 +1261,7 @@ def _production_smoke_cell(args: argparse.Namespace) -> dict[str, object]:
             "cost_statistics",
             "cost_io_quiescent",
             "pilot_mapping_ref",
+            "execution_evidence_ref",
             "execution_evidence_hash",
             "s205_rebind_hash",
             "corrected_delta_sci_hash",
@@ -1168,6 +1282,9 @@ def _production_smoke_cell(args: argparse.Namespace) -> dict[str, object]:
             or existing.get("confirmatory_draws_generated") is not False
             or existing.get("mapping_id") != mapping.mapping_id
             or existing.get("mapping_artifact_hash") != mapping.artifact_hash
+            or existing.get("pilot_mapping_ref") != str(mapping_path)
+            or existing.get("execution_evidence_ref") != execution_ref
+            or existing.get("execution_evidence_hash") != execution.artifact_hash
             or existing.get("mapping_cell_hash") != smoke_mapping_hash
             or existing.get("anchor_id") != args.cell_anchor
             or existing.get("batch_size") != args.cell_batch_size
@@ -1249,6 +1366,7 @@ def _production_smoke_cell(args: argparse.Namespace) -> dict[str, object]:
         "cost_statistics": cost_statistics,
         "cost_io_quiescent": bool(args.cost_io_quiescent),
         "pilot_mapping_ref": str(mapping_path),
+        "execution_evidence_ref": execution_ref,
         "execution_evidence_hash": execution.artifact_hash,
         "s205_rebind_hash": canonical_json_hash(s205_plan),
         "corrected_delta_sci_hash": corrected_delta.artifact_hash,
@@ -1431,6 +1549,7 @@ def _production_execute(args: argparse.Namespace) -> dict[str, object]:
     if not args.s205_rebind_ref or not args.cost_semantics_ref:
         raise S206PreparationBlocked("PRODUCTION_EXECUTE_REQUIRES_S205_REBIND_AND_COST_SEMANTICS")
     root = args.data_root.resolve()
+    execution_ref = _canonical_logical_ref(root, args.execution_evidence_ref, field="execution_evidence_ref")
     sampling_path = _absolute_or_logical(root, args.sampling_plan_ref, field="sampling_plan_ref")
     sampling_value = load_canonical_json(sampling_path)
     if not isinstance(sampling_value, Mapping):
@@ -1512,6 +1631,7 @@ def _production_execute(args: argparse.Namespace) -> dict[str, object]:
                 "stage": stage,
                 "formal_eligible": stage not in {"BLOCKED_EXECUTION", "PILOT_BLOCKED"},
                 "preflight": preflight,
+                "execution_evidence_ref": execution_ref,
                 "execution_evidence_hash": execution.artifact_hash,
                 "pilot_mapping_ref": str(mapping_path),
                 "pilot_mapping_hash": mapping.artifact_hash,
@@ -1798,6 +1918,7 @@ def _production_execute(args: argparse.Namespace) -> dict[str, object]:
         "confirmatory_mapping_ref": str(confirmatory_path),
         "confirmatory_mapping_hash": confirmatory.artifact_hash,
         "pilot_mapping_hash": mapping.artifact_hash,
+        "execution_evidence_ref": execution_ref,
         "execution_evidence_hash": execution.artifact_hash,
         "gpu_inventory_ref": preflight["gpu_inventory_ref"],
         "gpu_inventory_source_ref": preflight["gpu_inventory_source_ref"],
@@ -2002,7 +2123,9 @@ def _qualify(args: argparse.Namespace) -> dict[str, object]:
         tuple(BlindPilotMeasurement.from_mapping(dict(item)) for item in measurement_values),
         cost_semantics=costs,
     )
-    execution = FormalExecutionEvidence.from_mapping(dict(raw_execution))
+    # Qualification is a formal consumer too; do not let a caller replace the
+    # amendment after the reducer has produced its blinded report.
+    execution = _load_formal_execution(args)
     refs = tuple(args.evidence_ref or (args.measurements_ref, args.pilot_mapping_ref, args.execution_evidence_ref))
     gate = build_g24b_gate(report, execution, evidence_refs=refs)
     matrix = qualify_formal_matrix(report, execution, gate, freeze_id=args.freeze_id)
@@ -2052,6 +2175,25 @@ def _verify_status_inventory_identity(
         raise S206PreparationBlocked("STATUS_PREFLIGHT_IDENTITY_DRIFT")
 
 
+def _verify_status_execution_identity(
+    value: Mapping[str, object],
+    *,
+    args: argparse.Namespace,
+) -> None:
+    """Verify a terminal/running status against the exact execution amendment."""
+
+    required = ("execution_evidence_ref", "execution_evidence_hash")
+    if any(key not in value for key in required):
+        raise S206PreparationBlocked("STATUS_EXECUTION_EVIDENCE_IDENTITY_MISSING")
+    execution = _load_formal_execution(args)
+    root = args.data_root.resolve()
+    expected_ref = _logical(root, args.execution_evidence_ref, field="execution_evidence_ref").relative_to(root).as_posix()
+    if value["execution_evidence_ref"] != expected_ref:
+        raise S206PreparationBlocked("STATUS_EXECUTION_EVIDENCE_REF_DRIFT")
+    if value["execution_evidence_hash"] != execution.artifact_hash:
+        raise S206PreparationBlocked("STATUS_EXECUTION_EVIDENCE_HASH_DRIFT")
+
+
 def _wait(args: argparse.Namespace) -> int:
     status_path = _logical(args.data_root.resolve(), f"{args.operations_root}/status.json", field="status")
     deadline = None if args.timeout_seconds is None else time.monotonic() + args.timeout_seconds
@@ -2070,6 +2212,10 @@ def _wait(args: argparse.Namespace) -> int:
                         value,
                         data_root=args.data_root.resolve(),
                     )
+                    # Every formal terminal status must carry and revalidate
+                    # the exact execution amendment; inventory-only recovery
+                    # is intentionally not a compatibility mode.
+                    _verify_status_execution_identity(value, args=args)
                     return 0 if value.get("stage") == "G2.4B_PASS_MATRIX_FROZEN" else 3
         if deadline is not None and time.monotonic() >= deadline:
             return 4
@@ -2084,6 +2230,14 @@ def _detach(args: argparse.Namespace) -> int:
     # Validate all immutable gates and the inventory identity before spawning
     # anything.  The child repeats this check immediately before scheduling.
     preflight = _preflight(args)
+    # Detached launch is itself a formal execution entry point.  Validate the
+    # amendment lineage before creating a child process so a later wait cannot
+    # recover an authorization that was never bound to this command.
+    execution = _load_formal_execution(args)
+    execution_ref = _canonical_logical_ref(args.data_root.resolve(), args.execution_evidence_ref, field="execution_evidence_ref")
+    g23_ref = _canonical_logical_ref(args.data_root.resolve(), args.g23_evaluation, field="g23_evaluation")
+    g24a_ref = _canonical_logical_ref(args.data_root.resolve(), args.g24a_evaluation, field="g24a_evaluation")
+    s205_ref = _canonical_logical_ref(args.data_root.resolve(), args.s205_rebind_ref, field="s205_rebind_ref")
     operations = _logical(args.data_root.resolve(), args.operations_root, field="operations_root")
     operations.mkdir(parents=True, exist_ok=True)
     log_path = operations / "launcher.log"
@@ -2124,7 +2278,18 @@ def _detach(args: argparse.Namespace) -> int:
         "gpu_inventory_source_sha256": preflight["gpu_inventory_source_sha256"],
         "gpu_inventory_path": preflight["gpu"]["inventory_path"],  # type: ignore[index]
         "preflight_artifact_hash": preflight["preflight_artifact_hash"],
-        "recovery_command": "--wait",
+        "execution_evidence_ref": execution_ref,
+        "execution_evidence_hash": execution.artifact_hash,
+        "recovery_command": (
+            "--wait "
+            f"--data-root {args.data_root.resolve()} "
+            f"--s204-root {args.s204_root} "
+            f"--g23-evaluation {g23_ref} "
+            f"--g24a-evaluation {g24a_ref} "
+            f"--s205-rebind-ref {s205_ref} "
+            f"--execution-evidence-ref {execution_ref} "
+            f"--operations-root {args.operations_root}"
+        ),
         "confirmatory_draws_generated": False,
     }
     write_canonical_json(pid_path, payload)
@@ -2214,6 +2379,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(json.dumps(result, ensure_ascii=False, sort_keys=True, indent=2))
             return 0
         if args.wait:
+            if not args.execution_evidence_ref or not args.s205_rebind_ref:
+                raise S206PreparationBlocked(
+                    "WAIT_REQUIRES_EXECUTION_EVIDENCE_AND_S205_REBIND"
+                )
             return _wait(args)
         if args.reduce:
             result = _reduce(args)
