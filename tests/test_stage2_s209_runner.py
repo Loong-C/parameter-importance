@@ -305,6 +305,7 @@ def test_s209_four_card_anchor_requires_worker_gpu_uuid_set() -> None:
 def test_s209_detach_rejects_duplicate_launch_lease(monkeypatch, tmp_path: Path) -> None:
     monkeypatch.setattr(launcher, "_preflight", lambda _args: {})
     monkeypatch.setattr(launcher.subprocess, "Popen", lambda *args, **kwargs: SimpleNamespace(pid=os.getpid()))
+    monkeypatch.setattr(launcher.sys, "argv", ["run_s209_g27a.py", "--detach"])
     args = SimpleNamespace(
         profiler_command=["profiler"],
         data_root=tmp_path,
@@ -337,6 +338,41 @@ def test_s209_detach_child_runs_execute_action(monkeypatch, tmp_path: Path) -> N
     assert isinstance(command, list)
     assert "--detach" not in command
     assert command.count("--execute") == 1
+
+
+def test_s209_detach_rewrites_only_launcher_action(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(launcher, "_preflight", lambda _args: {})
+    captured: dict[str, object] = {}
+
+    def fake_popen(command, **kwargs):
+        captured["command"] = list(command)
+        return SimpleNamespace(pid=os.getpid())
+
+    monkeypatch.setattr(launcher.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(
+        launcher.sys,
+        "argv",
+        [
+            "run_s209_g27a.py",
+            "--detach",
+            "--data-root",
+            "fixture",
+            "--profiler-command",
+            "worker",
+            "--detach",
+        ],
+    )
+    args = SimpleNamespace(
+        profiler_command=["worker", "--detach"],
+        data_root=tmp_path,
+        run_root="runs/s209",
+        run_id="s209-run",
+    )
+    launcher._detach(args)
+    command = captured["command"]
+    assert isinstance(command, list)
+    assert command.count("--execute") == 1
+    assert command.count("--detach") == 1
 
 
 def test_s209_anchor_failure_publishes_terminal_blocked_status(tmp_path: Path) -> None:
