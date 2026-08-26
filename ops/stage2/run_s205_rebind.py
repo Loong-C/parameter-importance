@@ -31,7 +31,16 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--data-root", type=Path, required=True)
     parser.add_argument("--s204-run-root", required=True)
     parser.add_argument("--s204-prepared-root", required=True)
-    parser.add_argument("--g23-evaluation-root", required=True)
+    parser.add_argument(
+        "--g23-evaluation-ref",
+        required=True,
+        help="Exact content-addressed G2.3 evaluation.json reference approved for this handoff",
+    )
+    parser.add_argument(
+        "--g23-evaluation-hash",
+        required=True,
+        help="Exact SHA-256 artifact hash of --g23-evaluation-ref",
+    )
     parser.add_argument("--s205-output-root", required=True)
     parser.add_argument("--operations-root", required=True)
     parser.add_argument("--g3-ref", required=True)
@@ -52,7 +61,8 @@ def main(argv: list[str] | None = None) -> int:
             data_root=args.data_root.resolve(),
             s204_run_root=args.s204_run_root,
             s204_prepared_root=args.s204_prepared_root,
-            g23_evaluation_root=args.g23_evaluation_root,
+            g23_evaluation_ref=args.g23_evaluation_ref,
+            g23_evaluation_hash=args.g23_evaluation_hash,
             s205_output_root=args.s205_output_root,
             operations_root=args.operations_root,
             g3_ref=args.g3_ref,
