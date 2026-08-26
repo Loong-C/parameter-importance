@@ -21,6 +21,11 @@ from param_importance_nlp.experiments.stage2_s209_worker import (
     S209WorkerBlocked,
     run_s209_profiler_worker,
 )
+from param_importance_nlp.experiments.stage2_s209_production import (
+    S209ProductionBlocked,
+    _device_identity,
+    _row_bytes,
+)
 
 
 PLAN_HASH = "a" * 64
@@ -224,3 +229,18 @@ def test_worker_cli_stdout_is_exactly_one_json_object(tmp_path: Path) -> None:
     decoded = json.loads(completed.stdout)
     assert isinstance(decoded, dict)
     assert completed.stdout.count("\n") == 1
+
+
+def test_repository_production_backend_has_no_cpu_or_synthetic_fallback() -> None:
+    # The development host is CPU-only by contract.  A production invocation
+    # must stop before constructing any result instead of returning a fixture
+    # measurement when CUDA is absent.
+    with pytest.raises(S209ProductionBlocked, match="CUDA_SINGLE_DEVICE_REQUIRED"):
+        _device_identity(UUID)
+
+
+def test_output_byte_counter_is_content_derived() -> None:
+    row = {"measurement_kind": "device_actual", "measured": True, "sequence_count": 1}
+    observed = _row_bytes(row)
+    assert observed == len(__import__("param_importance_nlp.contracts.jsonio", fromlist=["canonical_json_bytes"]).canonical_json_bytes(row))
+    assert row["output_bytes"] == observed

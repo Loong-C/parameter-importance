@@ -108,6 +108,17 @@ def _task_from_environment(environment: Mapping[str, str]) -> dict[str, Any]:
         "gpu_uuids": visible,
         "device_count": len(visible),
     }
+    # The detached runner can bind the launch-time I/O snapshot into the
+    # child environment.  Keep this optional for the small boundary fixtures,
+    # but expose it to a production backend so it cannot assert quiescence from
+    # a config-time default.
+    if "S29_IO_EVIDENCE_HASH" in environment:
+        task["io_evidence_hash"] = _required_sha(environment, "S29_IO_EVIDENCE_HASH")
+    if "S29_COST_IO_QUIESCENT" in environment:
+        value = _required_text(environment, "S29_COST_IO_QUIESCENT").lower()
+        if value not in {"true", "false"}:
+            raise S209WorkerBlocked("ENV_S29_COST_IO_QUIESCENT_BOOLEAN_REQUIRED")
+        task["cost_io_quiescent"] = value == "true"
     if semantic == "scientific_equal_sample_cost":
         if _required_text(environment, "S29_SHARED_RUN_SCHEMA") != S29_SHARED_RUN_SCHEMA:
             raise S209WorkerBlocked("ENV_SHARED_RUN_SCHEMA_INVALID")
