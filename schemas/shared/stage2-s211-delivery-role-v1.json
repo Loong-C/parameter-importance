@@ -1,0 +1,16 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://parameter-importance.invalid/schemas/shared/stage2-s211-delivery-role-v1.json",
+  "title": "Stage 2.11 Stage 3 handoff role envelope",
+  "type": "object",
+  "required": ["schema_version", "status", "formal_eligible", "artifact_hash"],
+  "properties": {
+    "schema_version": {"type": "string", "minLength": 1},
+    "task_id": {"const": "stage2.11_delivery_and_exit_gate"},
+    "role": {"type": "string", "minLength": 1},
+    "status": {"type": "string", "minLength": 1},
+    "formal_eligible": {"const": true},
+    "artifact_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+  },
+  "additionalProperties": true
+}
