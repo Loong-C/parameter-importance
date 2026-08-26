@@ -141,6 +141,129 @@ _GPU_INVENTORY_HEALTH_ALIASES = {
 }
 _GPU_CLEAN_VALUES = {"none", "0", "clean", "false", "not_pending", "not-pending", "n/a", "na"}
 
+# This is the wire contract emitted by the S2.6 inventory producer and
+# consumed by S2.7.  Keep the formal S2.5 boundary byte-for-byte compatible:
+# aliases are useful for private unit fixtures, but accepting them here would
+# let a legacy/partial inventory enter a formal execution.
+_FORMAL_GPU_INVENTORY_FIELDS = frozenset(
+    {
+        "schema_version",
+        "scope",
+        "status",
+        "checked_at",
+        "artifact_ref",
+        "source_ref",
+        "source_sha256",
+        "rows",
+        "compute_apps",
+        "approved_gpu_uuids",
+        "excluded_pci",
+        "excluded_gpu_uuid",
+        "artifact_hash",
+    }
+)
+_FORMAL_GPU_ROW_FIELDS = frozenset(
+    {
+        "uuid",
+        "pci_bus_id",
+        "gpu_name",
+        "temperature_c",
+        "memory_used_mib",
+        "memory_total_mib",
+        "utilization_gpu_percent",
+        "compute_mode",
+        "ecc_uncorrected_volatile",
+        "ecc_uncorrected_aggregate",
+        "row_remap_failure",
+        "row_remap_pending",
+        "row_remap_status",
+        "gpu_recovery_action",
+        "health_state",
+        "compute_apps",
+    }
+)
+_FORMAL_GPU_APP_FIELDS = frozenset({"pid", "gpu_uuid", "process_name", "used_memory"})
+
+
+def _validate_formal_gpu_inventory_schema(value: Mapping[str, object]) -> None:
+    """Validate the exact S2.6/S2.7 inventory envelope before normalization."""
+
+    if "gpus" in value:
+        raise S25ExecutionBlocked("S205_GPU_INVENTORY_GPUS_ALIAS_FORBIDDEN")
+    if "artifact_ref" not in value:
+        raise S25ExecutionBlocked("S205_GPU_INVENTORY_ARTIFACT_REF_REQUIRED")
+    if "source_sha256" not in value:
+        raise S25ExecutionBlocked("S205_GPU_INVENTORY_SOURCE_SHA256_REQUIRED")
+    unknown = set(value) - _FORMAL_GPU_INVENTORY_FIELDS
+    if unknown:
+        raise S25ExecutionBlocked("S205_GPU_INVENTORY_TOP_LEVEL_UNKNOWN_FIELDS")
+    if set(value) != _FORMAL_GPU_INVENTORY_FIELDS:
+        raise S25ExecutionBlocked("S205_GPU_INVENTORY_TOP_LEVEL_FIELDS_REQUIRED")
+    if value.get("scope") != "formal":
+        raise S25ExecutionBlocked("S205_GPU_INVENTORY_SCOPE_INVALID")
+    if value.get("status") != "OBSERVED":
+        raise S25ExecutionBlocked("S205_GPU_INVENTORY_STATUS_INVALID")
+    checked_at = value.get("checked_at")
+    if not isinstance(checked_at, str) or not checked_at:
+        raise S25ExecutionBlocked("S205_GPU_INVENTORY_CHECKED_AT_REQUIRED")
+    try:
+        checked = datetime.fromisoformat(checked_at)
+    except ValueError as error:
+        raise S25ExecutionBlocked("S205_GPU_INVENTORY_CHECKED_AT_INVALID") from error
+    if checked.tzinfo is None:
+        raise S25ExecutionBlocked("S205_GPU_INVENTORY_CHECKED_AT_TIMEZONE_REQUIRED")
+    approved = value.get("approved_gpu_uuids")
+    if not isinstance(approved, list) or tuple(approved) != tuple(APPROVED_GPU_UUIDS):
+        raise S25ExecutionBlocked("S205_GPU_INVENTORY_APPROVED_UUIDS_IDENTITY_DRIFT")
+    if value.get("excluded_pci") != EXCLUDED_PCI or value.get("excluded_gpu_uuid") != EXCLUDED_UUID:
+        raise S25ExecutionBlocked("S205_GPU_INVENTORY_EXCLUDED_IDENTITY_DRIFT")
+    rows = value.get("rows")
+    if not isinstance(rows, list):
+        raise S25ExecutionBlocked("S205_GPU_INVENTORY_ROWS_REQUIRED")
+    for index, item in enumerate(rows):
+        if not isinstance(item, Mapping):
+            raise S25ExecutionBlocked(f"S205_GPU_INVENTORY_ROW_INVALID:{index}")
+        if set(item) != _FORMAL_GPU_ROW_FIELDS:
+            raise S25ExecutionBlocked(f"S205_GPU_INVENTORY_ROW_FIELDS_INVALID:{index}")
+        for field in (
+            "uuid",
+            "pci_bus_id",
+            "gpu_name",
+            "compute_mode",
+            "row_remap_status",
+            "gpu_recovery_action",
+            "health_state",
+        ):
+            if not isinstance(item[field], str) or not item[field]:
+                raise S25ExecutionBlocked(f"S205_GPU_INVENTORY_ROW_{field.upper()}_INVALID:{index}")
+        for field in ("temperature_c", "utilization_gpu_percent"):
+            number = item[field]
+            if isinstance(number, bool) or not isinstance(number, (int, float)) or not math.isfinite(float(number)):
+                raise S25ExecutionBlocked(f"S205_GPU_INVENTORY_ROW_{field.upper()}_INVALID:{index}")
+        for field in (
+            "memory_used_mib",
+            "memory_total_mib",
+            "ecc_uncorrected_volatile",
+            "ecc_uncorrected_aggregate",
+            "row_remap_failure",
+            "row_remap_pending",
+        ):
+            number = item[field]
+            if isinstance(number, bool) or not isinstance(number, int) or number < 0:
+                raise S25ExecutionBlocked(f"S205_GPU_INVENTORY_ROW_{field.upper()}_INVALID:{index}")
+        row_apps = item["compute_apps"]
+        if not isinstance(row_apps, list):
+            raise S25ExecutionBlocked(f"S205_GPU_INVENTORY_ROW_COMPUTE_APPS_INVALID:{index}")
+        for app_index, app in enumerate(row_apps):
+            if not isinstance(app, Mapping) or set(app) != _FORMAL_GPU_APP_FIELDS:
+                raise S25ExecutionBlocked(f"S205_GPU_INVENTORY_ROW_APP_FIELDS_INVALID:{index}:{app_index}")
+    apps = value.get("compute_apps")
+    if not isinstance(apps, list):
+        raise S25ExecutionBlocked("S205_GPU_INVENTORY_COMPUTE_APPS_REQUIRED")
+    for index, app in enumerate(apps):
+        if not isinstance(app, Mapping) or set(app) != _FORMAL_GPU_APP_FIELDS:
+            raise S25ExecutionBlocked(f"S205_GPU_INVENTORY_APP_FIELDS_INVALID:{index}")
+
 
 def _inventory_uuid(value: object, *, field: str) -> str:
     if not isinstance(value, str) or not value.strip():
@@ -300,13 +423,14 @@ def _load_inventory_snapshot(
     payload = dict(envelope)
     if payload.get("schema_version") != _GPU_INVENTORY_SCHEMA:
         raise S25ExecutionBlocked("S205_GPU_INVENTORY_SCHEMA_INVALID")
+    _validate_formal_gpu_inventory_schema(payload)
     artifact_ref = payload.get("artifact_ref")
     expected_artifact_ref = resolved.relative_to(root).as_posix()
     if not isinstance(artifact_ref, str) or not artifact_ref:
         raise S25ExecutionBlocked("S205_GPU_INVENTORY_ARTIFACT_REF_REQUIRED")
     if artifact_ref != expected_artifact_ref:
         raise S25ExecutionBlocked("S205_GPU_INVENTORY_ARTIFACT_REF_PATH_MISMATCH")
-    rows = payload.get("rows", payload.get("gpus"))
+    rows = payload.get("rows")
     apps = payload.get("compute_apps")
     if not isinstance(rows, list) or not all(isinstance(item, Mapping) for item in rows):
         raise S25ExecutionBlocked("S205_GPU_INVENTORY_ROWS_REQUIRED")
@@ -321,6 +445,8 @@ def _load_inventory_snapshot(
     if not isinstance(source_ref, str) or not source_ref:
         raise S25ExecutionBlocked("S205_GPU_INVENTORY_SOURCE_REF_REQUIRED")
     source_path = _logical(root, source_ref, field="gpu_inventory_source_ref")
+    if source_ref != source_path.relative_to(root).as_posix():
+        raise S25ExecutionBlocked("S205_GPU_INVENTORY_SOURCE_REF_NOT_CANONICAL")
     if source_path == resolved:
         raise S25ExecutionBlocked("S205_GPU_INVENTORY_SOURCE_REF_SELF_REFERENCE")
     source_sha = _file_sha256(source_path)
