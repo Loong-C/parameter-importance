@@ -56,6 +56,8 @@ G24B_GATE_SCHEMA = "stage2-g24b-gate-v1"
 FORMAL_CONFIRMATORY_MAPPING_SCHEMA = "stage2-formal-confirmatory-mapping-v1"
 FORMAL_CELL_PLAN_SCHEMA = "stage2-formal-pilot-cell-plan-v1"
 FORMAL_CELL_RUN_SCHEMA = "stage2-formal-pilot-cell-run-v1"
+CORRECTED_DELTA_SCI_SOURCE = "g23_output_derived_corrected_sidecar"
+CORRECTED_DELTA_SCI_BATCH_SIZES = (32, 64, 128, 256)
 
 PILOT_REPETITIONS = 50
 PILOT_M_VALUES = (2, 4, 8, 16, 32)
@@ -114,6 +116,12 @@ def _cell_component(anchor_id: str, batch_size: int) -> str:
 
 def _cell_order() -> tuple[tuple[str, int], ...]:
     return tuple((anchor_id, batch_size) for anchor_id in ANCHOR_IDS for batch_size in PILOT_B_VALUES)
+
+
+def _g23_cell_id(anchor_id: str) -> str:
+    """Return the canonical G2.3 cell identity for an S2.6 anchor."""
+
+    return anchor_id.replace(".", ":", 1)
 
 
 @dataclass(frozen=True, slots=True)
@@ -640,6 +648,13 @@ class FormalPilotCellRun:
     mapping_artifact_hash: str
     mapping_cell_hash: str
     summary_hash: str
+    corrected_delta_sci_hash: str
+    corrected_delta_sci_ref: str
+    corrected_delta_sci_batch_sizes: tuple[int, ...]
+    delta_sci_source: str
+    corrected_delta_sci_cell_id: str
+    corrected_delta_sci_config_hash: str
+    corrected_delta_sci_result_hash: str
     measurements: tuple["BlindPilotMeasurement", ...]
     costs: Mapping[str, Mapping[str, object]]
     cost_io_quiescent: bool
@@ -655,8 +670,32 @@ class FormalPilotCellRun:
             _hash(value, field)
         if self.schema_version != FORMAL_CELL_RUN_SCHEMA:
             raise ValueError("formal cell run schema mismatch")
+        _hash(self.corrected_delta_sci_hash, "corrected_delta_sci_hash")
+        if not isinstance(self.corrected_delta_sci_ref, str) or not self.corrected_delta_sci_ref or "\\" in self.corrected_delta_sci_ref or self.corrected_delta_sci_ref.startswith("/"):
+            raise ValueError("corrected delta sidecar ref must be a relative POSIX path")
+        if self.corrected_delta_sci_batch_sizes != CORRECTED_DELTA_SCI_BATCH_SIZES:
+            raise ValueError("corrected delta sidecar batch sizes mismatch")
+        if self.delta_sci_source != CORRECTED_DELTA_SCI_SOURCE:
+            raise ValueError("corrected delta sidecar source mismatch")
+        _hash(self.corrected_delta_sci_config_hash, "corrected_delta_sci_config_hash")
+        _hash(self.corrected_delta_sci_result_hash, "corrected_delta_sci_result_hash")
         if len(self.measurements) != len(PILOT_M_VALUES):
             raise ValueError("formal cell run must emit one row per preregistered M")
+        if self.corrected_delta_sci_cell_id != _g23_cell_id(self.measurements[0].anchor_id):
+            raise ValueError("corrected delta sidecar cell identity mismatch")
+        if any(
+            (
+                item.corrected_delta_sci_hash != self.corrected_delta_sci_hash
+                or item.corrected_delta_sci_ref != self.corrected_delta_sci_ref
+                or item.corrected_delta_sci_batch_sizes != self.corrected_delta_sci_batch_sizes
+                or item.delta_sci_source != self.delta_sci_source
+                or item.corrected_delta_sci_cell_id != self.corrected_delta_sci_cell_id
+                or item.corrected_delta_sci_config_hash != self.corrected_delta_sci_config_hash
+                or item.corrected_delta_sci_result_hash != self.corrected_delta_sci_result_hash
+            )
+            for item in self.measurements
+        ):
+            raise ValueError("formal cell run corrected delta binding drift")
         if set(self.costs) != {
             "scientific_equal_sample_cost",
             "isolated_estimator_cost",
@@ -681,6 +720,13 @@ class FormalPilotCellRun:
             "mapping_artifact_hash": self.mapping_artifact_hash,
             "mapping_cell_hash": self.mapping_cell_hash,
             "summary_hash": self.summary_hash,
+            "corrected_delta_sci_hash": self.corrected_delta_sci_hash,
+            "corrected_delta_sci_ref": self.corrected_delta_sci_ref,
+            "corrected_delta_sci_batch_sizes": list(self.corrected_delta_sci_batch_sizes),
+            "delta_sci_source": self.delta_sci_source,
+            "corrected_delta_sci_cell_id": self.corrected_delta_sci_cell_id,
+            "corrected_delta_sci_config_hash": self.corrected_delta_sci_config_hash,
+            "corrected_delta_sci_result_hash": self.corrected_delta_sci_result_hash,
             "measurements": [item.to_dict() for item in self.measurements],
             "costs": self.operational_costs,
             "scientific_values_masked": True,
@@ -699,6 +745,13 @@ class FormalPilotCellRun:
             "mapping_artifact_hash",
             "mapping_cell_hash",
             "summary_hash",
+            "corrected_delta_sci_hash",
+            "corrected_delta_sci_ref",
+            "corrected_delta_sci_batch_sizes",
+            "delta_sci_source",
+            "corrected_delta_sci_cell_id",
+            "corrected_delta_sci_config_hash",
+            "corrected_delta_sci_result_hash",
             "measurements",
             "costs",
             "scientific_values_masked",
@@ -752,6 +805,13 @@ class FormalPilotCellRun:
             mapping_artifact_hash=value["mapping_artifact_hash"],  # type: ignore[arg-type]
             mapping_cell_hash=value["mapping_cell_hash"],  # type: ignore[arg-type]
             summary_hash=value["summary_hash"],  # type: ignore[arg-type]
+            corrected_delta_sci_hash=value["corrected_delta_sci_hash"],  # type: ignore[arg-type]
+            corrected_delta_sci_ref=value["corrected_delta_sci_ref"],  # type: ignore[arg-type]
+            corrected_delta_sci_batch_sizes=tuple(value["corrected_delta_sci_batch_sizes"]),  # type: ignore[arg-type]
+            delta_sci_source=value["delta_sci_source"],  # type: ignore[arg-type]
+            corrected_delta_sci_cell_id=value["corrected_delta_sci_cell_id"],  # type: ignore[arg-type]
+            corrected_delta_sci_config_hash=value["corrected_delta_sci_config_hash"],  # type: ignore[arg-type]
+            corrected_delta_sci_result_hash=value["corrected_delta_sci_result_hash"],  # type: ignore[arg-type]
             measurements=tuple(
                 BlindPilotMeasurement.from_mapping(dict(item))
                 for item in raw_measurements
@@ -774,6 +834,13 @@ def run_formal_pilot_cell(
     reference_hash: str,
     artifact_root: str | Path,
     delta_sci_by_endpoint: Mapping[str, float],
+    corrected_delta_sci_hash: str,
+    corrected_delta_sci_ref: str,
+    corrected_delta_sci_batch_sizes: Sequence[int],
+    delta_sci_source: str,
+    corrected_delta_sci_cell_id: str,
+    corrected_delta_sci_config_hash: str,
+    corrected_delta_sci_result_hash: str,
     reference_half_width_by_endpoint: Mapping[str, float],
     resource_within_budget: bool,
     cost_io_quiescent: bool,
@@ -868,6 +935,13 @@ def run_formal_pilot_cell(
             aggregation_overhead_ratio=overhead,
             variance_by_endpoint=variance_by_m[microbatch_count],
             delta_sci_by_endpoint=dict(delta_sci_by_endpoint),
+            corrected_delta_sci_hash=corrected_delta_sci_hash,
+            corrected_delta_sci_ref=corrected_delta_sci_ref,
+            corrected_delta_sci_batch_sizes=tuple(corrected_delta_sci_batch_sizes),
+            delta_sci_source=delta_sci_source,
+            corrected_delta_sci_cell_id=corrected_delta_sci_cell_id,
+            corrected_delta_sci_config_hash=corrected_delta_sci_config_hash,
+            corrected_delta_sci_result_hash=corrected_delta_sci_result_hash,
             reference_half_width_by_endpoint=dict(reference_half_width_by_endpoint),
             storage_bytes=storage_bytes,
             gpu_hours=gpu_hours,
@@ -881,6 +955,13 @@ def run_formal_pilot_cell(
         mapping_artifact_hash=mapping.artifact_hash,
         mapping_cell_hash=_cell_hash(cell),
         summary_hash=summary.artifact_hash,
+        corrected_delta_sci_hash=corrected_delta_sci_hash,
+        corrected_delta_sci_ref=corrected_delta_sci_ref,
+        corrected_delta_sci_batch_sizes=tuple(corrected_delta_sci_batch_sizes),
+        delta_sci_source=delta_sci_source,
+        corrected_delta_sci_cell_id=corrected_delta_sci_cell_id,
+        corrected_delta_sci_config_hash=corrected_delta_sci_config_hash,
+        corrected_delta_sci_result_hash=corrected_delta_sci_result_hash,
         measurements=measurements,
         costs=costs,
         cost_io_quiescent=cost_io_quiescent,
@@ -903,6 +984,13 @@ class BlindPilotMeasurement:
     aggregation_overhead_ratio: float
     variance_by_endpoint: Mapping[str, float]
     delta_sci_by_endpoint: Mapping[str, float]
+    corrected_delta_sci_hash: str
+    corrected_delta_sci_ref: str
+    corrected_delta_sci_batch_sizes: tuple[int, ...]
+    delta_sci_source: str
+    corrected_delta_sci_cell_id: str
+    corrected_delta_sci_config_hash: str
+    corrected_delta_sci_result_hash: str
     reference_half_width_by_endpoint: Mapping[str, float]
     storage_bytes: int
     gpu_hours: float
@@ -918,6 +1006,17 @@ class BlindPilotMeasurement:
             raise ValueError("measurement M must divide B")
         if self.repetitions != PILOT_REPETITIONS:
             raise ValueError("measurement repetitions must be exactly 50")
+        _hash(self.corrected_delta_sci_hash, "corrected_delta_sci_hash")
+        if not isinstance(self.corrected_delta_sci_ref, str) or not self.corrected_delta_sci_ref or "\\" in self.corrected_delta_sci_ref or self.corrected_delta_sci_ref.startswith("/"):
+            raise ValueError("corrected delta sidecar ref must be a relative POSIX path")
+        if self.corrected_delta_sci_batch_sizes != CORRECTED_DELTA_SCI_BATCH_SIZES:
+            raise ValueError("corrected delta sidecar batch sizes mismatch")
+        if self.delta_sci_source != CORRECTED_DELTA_SCI_SOURCE:
+            raise ValueError("corrected delta sidecar source mismatch")
+        if self.corrected_delta_sci_cell_id != _g23_cell_id(self.anchor_id):
+            raise ValueError("corrected delta sidecar cell identity mismatch")
+        _hash(self.corrected_delta_sci_config_hash, "corrected_delta_sci_config_hash")
+        _hash(self.corrected_delta_sci_result_hash, "corrected_delta_sci_result_hash")
         if not 0 <= self.aggregation_overhead_ratio <= 1:
             raise ValueError("aggregation overhead must be in [0,1]")
         if self.storage_bytes < 0 or self.gpu_hours < 0:
@@ -977,6 +1076,13 @@ class BlindPilotMeasurement:
             "aggregation_overhead_ratio": self.aggregation_overhead_ratio,
             "variance_by_endpoint": dict(self.variance_by_endpoint),
             "delta_sci_by_endpoint": dict(self.delta_sci_by_endpoint),
+            "corrected_delta_sci_hash": self.corrected_delta_sci_hash,
+            "corrected_delta_sci_ref": self.corrected_delta_sci_ref,
+            "corrected_delta_sci_batch_sizes": list(self.corrected_delta_sci_batch_sizes),
+            "delta_sci_source": self.delta_sci_source,
+            "corrected_delta_sci_cell_id": self.corrected_delta_sci_cell_id,
+            "corrected_delta_sci_config_hash": self.corrected_delta_sci_config_hash,
+            "corrected_delta_sci_result_hash": self.corrected_delta_sci_result_hash,
             "reference_half_width_by_endpoint": dict(self.reference_half_width_by_endpoint),
             "required_repetitions_by_endpoint": self.required_repetitions_by_endpoint,
             "required_repetitions": self.required_repetitions,
@@ -993,6 +1099,10 @@ class BlindPilotMeasurement:
             "anchors_runnable", "finite", "state_unchanged", "m2_equivalent",
             "mean_gradient_consistent", "aggregation_overhead_ratio",
             "variance_by_endpoint", "delta_sci_by_endpoint",
+            "corrected_delta_sci_hash", "corrected_delta_sci_ref",
+            "corrected_delta_sci_batch_sizes", "delta_sci_source",
+            "corrected_delta_sci_cell_id", "corrected_delta_sci_config_hash",
+            "corrected_delta_sci_result_hash",
             "reference_half_width_by_endpoint", "required_repetitions_by_endpoint",
             "required_repetitions", "storage_bytes", "gpu_hours",
             "resource_within_budget", "cost_io_quiescent",
@@ -1015,6 +1125,13 @@ class BlindPilotMeasurement:
             aggregation_overhead_ratio=value["aggregation_overhead_ratio"],  # type: ignore[arg-type]
             variance_by_endpoint=dict(value["variance_by_endpoint"]),  # type: ignore[arg-type]
             delta_sci_by_endpoint=dict(value["delta_sci_by_endpoint"]),  # type: ignore[arg-type]
+            corrected_delta_sci_hash=value["corrected_delta_sci_hash"],  # type: ignore[arg-type]
+            corrected_delta_sci_ref=value["corrected_delta_sci_ref"],  # type: ignore[arg-type]
+            corrected_delta_sci_batch_sizes=tuple(value["corrected_delta_sci_batch_sizes"]),  # type: ignore[arg-type]
+            delta_sci_source=value["delta_sci_source"],  # type: ignore[arg-type]
+            corrected_delta_sci_cell_id=value["corrected_delta_sci_cell_id"],  # type: ignore[arg-type]
+            corrected_delta_sci_config_hash=value["corrected_delta_sci_config_hash"],  # type: ignore[arg-type]
+            corrected_delta_sci_result_hash=value["corrected_delta_sci_result_hash"],  # type: ignore[arg-type]
             reference_half_width_by_endpoint=dict(value["reference_half_width_by_endpoint"]),  # type: ignore[arg-type]
             storage_bytes=value["storage_bytes"],  # type: ignore[arg-type]
             gpu_hours=value["gpu_hours"],  # type: ignore[arg-type]
@@ -1026,6 +1143,51 @@ class BlindPilotMeasurement:
         return result
 
 
+_CORRECTED_DELTA_BINDING_FIELDS = {
+    "cell_id",
+    "config_hash",
+    "result_hash",
+    "corrected_delta_sci_hash",
+    "corrected_delta_sci_ref",
+    "corrected_delta_sci_batch_sizes",
+    "delta_sci_source",
+}
+
+
+def _binding_from_measurement(item: BlindPilotMeasurement) -> dict[str, object]:
+    return {
+        "cell_id": item.corrected_delta_sci_cell_id,
+        "config_hash": item.corrected_delta_sci_config_hash,
+        "result_hash": item.corrected_delta_sci_result_hash,
+        "corrected_delta_sci_hash": item.corrected_delta_sci_hash,
+        "corrected_delta_sci_ref": item.corrected_delta_sci_ref,
+        "corrected_delta_sci_batch_sizes": list(item.corrected_delta_sci_batch_sizes),
+        "delta_sci_source": item.delta_sci_source,
+    }
+
+
+def _validate_corrected_delta_binding(binding: Mapping[str, object], expected_cell_id: str) -> None:
+    if set(binding) != _CORRECTED_DELTA_BINDING_FIELDS or binding.get("cell_id") != _g23_cell_id(expected_cell_id):
+        raise ValueError("corrected delta binding fields/identity mismatch")
+    for field in ("config_hash", "result_hash", "corrected_delta_sci_hash"):
+        _hash(binding.get(field), field)
+    ref = binding.get("corrected_delta_sci_ref")
+    if not isinstance(ref, str) or not ref or "\\" in ref or ref.startswith("/"):
+        raise ValueError("corrected delta binding ref invalid")
+    if binding.get("corrected_delta_sci_batch_sizes") != list(CORRECTED_DELTA_SCI_BATCH_SIZES):
+        raise ValueError("corrected delta binding batch sizes invalid")
+    if binding.get("delta_sci_source") != CORRECTED_DELTA_SCI_SOURCE:
+        raise ValueError("corrected delta binding source invalid")
+
+
+def _measurement_matches_binding(item: BlindPilotMeasurement, binding: Mapping[str, object]) -> bool:
+    return _binding_from_measurement(item) == dict(binding)
+
+
+def _bindings_hash(bindings: Sequence[Mapping[str, object]]) -> str:
+    return canonical_json_hash({"bindings": [dict(binding) for binding in bindings]})
+
+
 @dataclass(frozen=True, slots=True)
 class BlindedPilotReport:
     """A candidate-only report suitable for matrix selection."""
@@ -1033,6 +1195,7 @@ class BlindedPilotReport:
     report_id: str
     mapping_hash: str
     sampling_plan_hash: str
+    corrected_delta_sci_bindings: tuple[Mapping[str, object], ...]
     measurements: tuple[BlindPilotMeasurement, ...]
     anchor_rows: tuple[AnchorPilotResult, ...]
     candidate_evaluations: tuple[CandidateEvaluation, ...]
@@ -1044,6 +1207,19 @@ class BlindedPilotReport:
         _safe_id(self.report_id, "report_id")
         _hash(self.mapping_hash, "mapping_hash")
         _hash(self.sampling_plan_hash, "sampling_plan_hash")
+        if len(self.corrected_delta_sci_bindings) != len(ANCHOR_IDS):
+            raise ValueError("blinded report corrected delta binding count mismatch")
+        for expected_cell_id, binding in zip(ANCHOR_IDS, self.corrected_delta_sci_bindings):
+            _validate_corrected_delta_binding(binding, expected_cell_id)
+        binding_by_cell = {
+            str(binding["cell_id"]): binding for binding in self.corrected_delta_sci_bindings
+        }
+        if tuple(binding_by_cell) != tuple(_g23_cell_id(anchor_id) for anchor_id in ANCHOR_IDS):
+            raise ValueError("blinded report corrected delta binding order/identity mismatch")
+        for item in self.measurements:
+            binding = binding_by_cell.get(_g23_cell_id(item.anchor_id))
+            if binding is None or not _measurement_matches_binding(item, binding):
+                raise ValueError("blinded report corrected delta binding drift")
         if self.status not in {"READY_FOR_QUALIFICATION", "BLOCKED"}:
             raise ValueError("invalid blinded pilot status")
         if self.schema_version != BLINDED_PILOT_REPORT_SCHEMA:
@@ -1063,6 +1239,8 @@ class BlindedPilotReport:
             "report_id": self.report_id,
             "mapping_hash": self.mapping_hash,
             "sampling_plan_hash": self.sampling_plan_hash,
+            "corrected_delta_sci_bindings": [dict(binding) for binding in self.corrected_delta_sci_bindings],
+            "corrected_delta_sci_bindings_hash": _bindings_hash(self.corrected_delta_sci_bindings),
             "status": self.status,
             "measurement_count": len(self.measurements),
             "anchor_row_count": len(self.anchor_rows),
@@ -1130,10 +1308,19 @@ def reduce_blinded_pilot(
         "online_training_incremental_cost",
     )):
         status = "BLOCKED"
+    bindings_by_cell: dict[str, Mapping[str, object]] = {}
+    for item in measurements:
+        binding = _binding_from_measurement(item)
+        existing = bindings_by_cell.setdefault(item.anchor_id, binding)
+        if existing != binding:
+            raise S206PreparationBlocked(f"PILOT_CORRECTED_DELTA_BINDING_DRIFT:{item.anchor_id}")
+    if set(bindings_by_cell) != set(ANCHOR_IDS):
+        raise S206PreparationBlocked("PILOT_CORRECTED_DELTA_BINDING_SET_INVALID")
     return BlindedPilotReport(
         report_id=report_id,
         mapping_hash=mapping.artifact_hash,
         sampling_plan_hash=mapping.sampling_plan_hash,
+        corrected_delta_sci_bindings=tuple(bindings_by_cell[cell_id] for cell_id in ANCHOR_IDS),
         measurements=tuple(measurements),
         anchor_rows=tuple(anchor_rows),
         candidate_evaluations=tuple(evaluations),
@@ -1150,6 +1337,7 @@ class FormalMatrixFreeze:
     pilot_report_hash: str
     pilot_mapping_hash: str
     sampling_plan_hash: str
+    corrected_delta_sci_bindings: tuple[Mapping[str, object], ...]
     anchor_ids: tuple[str, ...]
     candidate_evaluations: tuple[CandidateEvaluation, ...]
     b_primary: int
@@ -1174,6 +1362,10 @@ class FormalMatrixFreeze:
             ("execution_evidence_hash", self.execution_evidence_hash),
         ):
             _hash(value, field)
+        if len(self.corrected_delta_sci_bindings) != len(ANCHOR_IDS):
+            raise ValueError("formal matrix corrected delta binding count mismatch")
+        for expected_cell_id, binding in zip(ANCHOR_IDS, self.corrected_delta_sci_bindings):
+            _validate_corrected_delta_binding(binding, expected_cell_id)
         if self.scope != "formal" or not self.formal_eligible or self.status != "FORMAL_FROZEN":
             raise FormalRunRejected("S206_FORMAL_MATRIX_NOT_QUALIFIED")
         if self.schema_version != FORMAL_MATRIX_SCHEMA:
@@ -1213,6 +1405,8 @@ class FormalMatrixFreeze:
             "pilot_report_hash": self.pilot_report_hash,
             "pilot_mapping_hash": self.pilot_mapping_hash,
             "sampling_plan_hash": self.sampling_plan_hash,
+            "corrected_delta_sci_bindings": [dict(binding) for binding in self.corrected_delta_sci_bindings],
+            "corrected_delta_sci_bindings_hash": _bindings_hash(self.corrected_delta_sci_bindings),
             "execution_evidence_hash": self.execution_evidence_hash,
             "formal_eligible": self.formal_eligible,
             "qualification_gate_hash": self.qualification_gate_hash,
@@ -1233,6 +1427,10 @@ def build_g24b_gate(
     """Create the single-writer G2.4b GateRecord, never an implicit PASS."""
 
     reasons: list[str] = []
+    binding_measured = {
+        "corrected_delta_sci_bindings": [dict(binding) for binding in report.corrected_delta_sci_bindings],
+        "corrected_delta_sci_bindings_hash": _bindings_hash(report.corrected_delta_sci_bindings),
+    }
     try:
         execution.require_for_stage(2)
     except FormalRunRejected as error:
@@ -1263,7 +1461,7 @@ def build_g24b_gate(
             stage=2,
             status=GateStatus.BLOCKED,
             checked_at=now,
-            measured={"pilot_report_hash": report.artifact_hash, **inventory_measured},
+            measured={"pilot_report_hash": report.artifact_hash, **binding_measured, **inventory_measured},
             threshold={"required_status": "READY_FOR_QUALIFICATION"},
             evidence_refs=refs or ("s206-preparation-blocked",),
             reasons=tuple(reasons),
@@ -1282,6 +1480,7 @@ def build_g24b_gate(
             "selected_batch_size": selected.batch_size,
             "selected_microbatch_count": selected.microbatch_count,
             "required_repetitions": selected.r_required,
+            **binding_measured,
             **inventory_measured,
         },
         threshold={
@@ -1322,6 +1521,7 @@ def qualify_formal_matrix(
         pilot_report_hash=report.artifact_hash,
         pilot_mapping_hash=report.mapping_hash,
         sampling_plan_hash=report.sampling_plan_hash,
+        corrected_delta_sci_bindings=report.corrected_delta_sci_bindings,
         anchor_ids=ANCHOR_IDS,
         candidate_evaluations=report.candidate_evaluations,
         b_primary=selected.batch_size,
@@ -1511,7 +1711,8 @@ def _validate_g23(value: Mapping[str, Any]) -> None:
     if value.get("required_cell_count") != 6 or value.get("complete_cell_count") != 6:
         raise S206PreparationBlocked("G23_SIX_CELL_COMPLETENESS_REQUIRED")
     cells = value.get("cells")
-    if not isinstance(cells, list) or tuple(item.get("cell_id") for item in cells if isinstance(item, Mapping)) != ANCHOR_IDS:
+    expected_g23_cells = tuple(_g23_cell_id(anchor_id) for anchor_id in ANCHOR_IDS)
+    if not isinstance(cells, list) or tuple(item.get("cell_id") for item in cells if isinstance(item, Mapping)) != expected_g23_cells:
         raise S206PreparationBlocked("G23_ANCHOR_SET_INVALID")
     if any(
         not isinstance(item, Mapping)
@@ -1520,6 +1721,21 @@ def _validate_g23(value: Mapping[str, Any]) -> None:
         for item in cells
     ):
         raise S206PreparationBlocked("G23_CELL_PASS_REQUIRED")
+    for item in cells:
+        if not isinstance(item, Mapping) or not isinstance(item.get("identities"), Mapping) or not isinstance(item.get("metrics"), Mapping):
+            raise S206PreparationBlocked("G23_CORRECTED_DELTA_BINDING_MISSING")
+        identities = item["identities"]
+        metrics = item["metrics"]
+        assert isinstance(identities, Mapping) and isinstance(metrics, Mapping)
+        if (
+            not isinstance(identities.get("corrected_delta_sci_hash"), str)
+            or identities.get("corrected_delta_sci_hash") != metrics.get("corrected_delta_sci_hash")
+            or identities.get("corrected_delta_sci_ref") != metrics.get("corrected_delta_sci_ref")
+            or metrics.get("corrected_delta_sci_batch_sizes") != list(CORRECTED_DELTA_SCI_BATCH_SIZES)
+            or metrics.get("delta_sci_source") != CORRECTED_DELTA_SCI_SOURCE
+        ):
+            raise S206PreparationBlocked("G23_CORRECTED_DELTA_BINDING_INVALID")
+        _hash(identities.get("corrected_delta_sci_hash"), "G23.corrected_delta_sci_hash")
     _validate_hashed_object(value, field="G23")
 
 

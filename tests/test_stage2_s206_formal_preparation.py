@@ -115,7 +115,12 @@ def _costs() -> CostSemantics:
 
 def _measurements() -> list[BlindPilotMeasurement]:
     rows: list[BlindPilotMeasurement] = []
-    for anchor_id in ANCHOR_IDS:
+    hex_chars = "123456"
+    for anchor_index, anchor_id in enumerate(ANCHOR_IDS):
+        corrected_hash = hex_chars[anchor_index] * 64
+        corrected_ref = "evidence/g23-attempt/g2.3-corrected-delta-sci/" + corrected_hash + ".json"
+        config_hash = "abcdef"[anchor_index] * 64
+        result_hash = "fedcba"[anchor_index] * 64
         for batch_size in (32, 64, 128, 256):
             for microbatch_count in (2, 4, 8, 16, 32):
                 rows.append(
@@ -132,6 +137,13 @@ def _measurements() -> list[BlindPilotMeasurement]:
                         aggregation_overhead_ratio=0.1,
                         variance_by_endpoint={"bias": 0.0, "nmse": 0.0, "rank": 0.0},
                         delta_sci_by_endpoint={"bias": 0.1, "nmse": 0.1, "rank": 0.1},
+                        corrected_delta_sci_hash=corrected_hash,
+                        corrected_delta_sci_ref=corrected_ref,
+                        corrected_delta_sci_batch_sizes=(32, 64, 128, 256),
+                        delta_sci_source="g23_output_derived_corrected_sidecar",
+                        corrected_delta_sci_cell_id=anchor_id.replace(".", ":", 1),
+                        corrected_delta_sci_config_hash=config_hash,
+                        corrected_delta_sci_result_hash=result_hash,
                         reference_half_width_by_endpoint={"bias": 0.01, "nmse": 0.01, "rank": 0.01},
                         storage_bytes=1024,
                         gpu_hours=0.01,
@@ -176,6 +188,13 @@ def test_formal_cell_bridge_executes_synthetic_slice_and_masks_science(tmp_path:
         reference_hash=_vector_digest(reference),
         artifact_root=tmp_path / "cell-artifacts",
         delta_sci_by_endpoint={"bias": 0.1, "nmse": 0.1, "rank": 0.1},
+        corrected_delta_sci_hash="c" * 64,
+        corrected_delta_sci_ref="evidence/g23-attempt/g2.3-corrected-delta-sci/" + "c" * 64 + ".json",
+        corrected_delta_sci_batch_sizes=(32, 64, 128, 256),
+        delta_sci_source="g23_output_derived_corrected_sidecar",
+        corrected_delta_sci_cell_id=cell.anchor_id.replace(".", ":", 1),
+        corrected_delta_sci_config_hash="d" * 64,
+        corrected_delta_sci_result_hash="e" * 64,
         reference_half_width_by_endpoint={"bias": 0.01, "nmse": 0.01, "rank": 0.01},
         resource_within_budget=True,
         cost_io_quiescent=True,
@@ -269,7 +288,24 @@ def _write_upstream_fixture(root: Path) -> tuple[str, str, str]:
         "formal_eligible": True,
         "required_cell_count": 6,
         "complete_cell_count": 6,
-        "cells": [{"cell_id": anchor_id, "status": "PASS", "formal_eligible": True} for anchor_id in ANCHOR_IDS],
+        "cells": [
+            {
+                "cell_id": anchor_id.replace(".", ":", 1),
+                "status": "PASS",
+                "formal_eligible": True,
+                "identities": {
+                    "corrected_delta_sci_hash": "a" * 64,
+                    "corrected_delta_sci_ref": "evidence/g23/g2.3-corrected-delta-sci/" + "a" * 64 + ".json",
+                },
+                "metrics": {
+                    "corrected_delta_sci_hash": "a" * 64,
+                    "corrected_delta_sci_ref": "evidence/g23/g2.3-corrected-delta-sci/" + "a" * 64 + ".json",
+                    "corrected_delta_sci_batch_sizes": [32, 64, 128, 256],
+                    "delta_sci_source": "g23_output_derived_corrected_sidecar",
+                },
+            }
+            for anchor_id in ANCHOR_IDS
+        ],
     }
     g23["artifact_hash"] = canonical_json_hash(g23)
     g23_ref = "evidence/g23.json"
