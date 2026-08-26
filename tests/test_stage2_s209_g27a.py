@@ -18,6 +18,7 @@ from param_importance_nlp.experiments.stage2_s209_g27a import (
     bind_s209_inputs,
     run_s209_g27a,
     shared_paired_run_identity,
+    _anchor_reasons,
 )
 
 INVENTORY_ARTIFACT_HASH = "1" * 64
@@ -212,7 +213,7 @@ def _health() -> dict[str, object]:
 
 
 def _anchor(device_count: int, uuids: list[str]) -> dict[str, object]:
-    return {
+    value: dict[str, object] = {
         "status": "PASS",
         "matrix_hash": _inputs()[0]["artifact_hash"],
         "source_raw_run_id": "s207-formal-run",
@@ -229,6 +230,105 @@ def _anchor(device_count: int, uuids: list[str]) -> dict[str, object]:
         "communication_bytes": 0,
         "output_bytes": 4096,
     }
+    if device_count == 4:
+        local_devices = [
+            {
+                "rank": index,
+                "gpu_uuid": uuid,
+                "sequence_count": 8,
+                "token_count": 256,
+                "backward_count": 4,
+            }
+            for index, uuid in enumerate(uuids)
+        ]
+        for index, item in enumerate(local_devices):
+            item.update(
+                {
+                    "local_sample_mapping_hash": f"{index + 1}" * 64,
+                    "local_gradient_pool_hash": f"{index + 5}" * 64,
+                    "fixed_checkpoint_id": "checkpoint-fixed",
+                    "checkpoint_hash": "d" * 64,
+                    "mapping_hash": "e" * 64,
+                    "global_s1_hash": "8" * 64,
+                    "global_s2_hash": "9" * 64,
+                    "estimate_hash": "a" * 64,
+                    "state_digest": "f" * 64,
+                    "state_digest_after": "0" * 64,
+                    "all_reduce_identity_hash": ("a" if index == 0 else "b" if index == 1 else "c" if index == 2 else "d") * 64,
+                }
+            )
+        value.update(
+            {
+                "sequence_count": 32,
+                "token_count": 1024,
+                "backward_count": 16,
+                "communication_bytes": 128,
+                "barrier_seconds": 0.1,
+                "barrier_count": 2,
+                "statistical_unit": "microbatch",
+                "statistical_unit_count": 16,
+                "global_statistical_unit_count": 16,
+                "global_weight": 1024.0,
+                "system_anchor_mode": "synchronized_fixed_state_four_process_nccl",
+                "communication_mode": "nccl_all_reduce_s1_s2",
+                "rank_partition_mode": "disjoint_complete_microbatch_groups",
+                "all_reduce_s1_seconds": 0.01,
+                "all_reduce_s2_seconds": 0.01,
+                "all_reduce_weight_seconds": 0.01,
+                "all_reduce_count_seconds": 0.01,
+                "all_reduce_s1_bytes": 32,
+                "all_reduce_s2_bytes": 32,
+                "all_reduce_weight_bytes": 8,
+                "all_reduce_count_bytes": 8,
+                "all_reduce_s1_count": 4,
+                "all_reduce_s2_count": 4,
+                "all_reduce_weight_count": 4,
+                "all_reduce_count": 16,
+                "all_reduce_identity_hash": "7" * 64,
+                "local_sample_mapping_hashes": [item["local_sample_mapping_hash"] for item in local_devices],
+                "local_gradient_pool_hashes": [item["local_gradient_pool_hash"] for item in local_devices],
+                "global_s1_hash": "8" * 64,
+                "global_s2_hash": "9" * 64,
+                "estimate_hash": "a" * 64,
+                "gradient_pool_hash": "b" * 64,
+                "fixed_checkpoint_id": "checkpoint-fixed",
+                "checkpoint_hash": "d" * 64,
+                "mapping_hash": "e" * 64,
+                "sample_mapping_hash": "5" * 64,
+                "state_digest": "f" * 64,
+                "state_digest_after": "0" * 64,
+                "four_process_identity_hash": "1" * 64,
+                "four_card_throughput_sequences_per_second": 20.0,
+                "single_card_throughput_sequences_per_second": 10.0,
+                "strong_scaling_speedup": 2.0,
+                "strong_scaling_efficiency": 0.5,
+                "strong_scaling_reference_wall_seconds": 3.2,
+                "strong_scaling_reference_sequence_count": 32,
+                "strong_scaling_reference_token_count": 1024,
+                "strong_scaling_reference_backward_count": 16,
+                "single_anchor_identity_hash": "c" * 64,
+                "per_device_measurements": local_devices,
+            }
+        )
+        value["all_reduce_identity_hash"] = canonical_json_hash(
+            [
+                {"rank": int(item["rank"]), "gpu_uuid": str(item["gpu_uuid"]), "identity_hash": str(item["all_reduce_identity_hash"])}
+                for item in sorted(local_devices, key=lambda item: item["rank"])
+            ]
+        )
+        value["four_process_identity_hash"] = canonical_json_hash(
+            {
+                "gpu_uuids": list(APPROVED_GPU_UUIDS),
+                "sample_mapping_hash": value["sample_mapping_hash"],
+                "gradient_pool_hash": value["gradient_pool_hash"],
+                "estimate_hash": value["estimate_hash"],
+                "state_digest": value["state_digest"],
+                "state_digest_after": value["state_digest_after"],
+                "checkpoint_hash": value["checkpoint_hash"],
+                "mapping_hash": value["mapping_hash"],
+            }
+        )
+    return value
 
 
 def _accuracy() -> list[dict[str, object]]:
@@ -237,6 +337,37 @@ def _accuracy() -> list[dict[str, object]]:
         for cell in EXPECTED_CELL_IDS
         for method in ("raw", "double", "u")
     ]
+
+
+def test_s209_four_card_anchor_rejects_zero_collective_and_repeated_full_pool() -> None:
+    matrix, gate, manifest = _inputs()
+    frozen = bind_s209_inputs(matrix=matrix, g24b_gate=gate, raw_manifest=manifest)
+    anchor = _anchor(4, list(APPROVED_GPU_UUIDS))
+    zero_collective = {**anchor, "communication_bytes": 0}
+    assert "FOUR_CARD_COMMUNICATION_BYTES_REQUIRED" in _anchor_reasons(zero_collective, frozen=frozen, expected_devices=4)
+    repeated = {**anchor, "local_sample_mapping_hashes": ["1" * 64] * 4}
+    assert "FOUR_CARD_PARTITION_HASHES_INVALID" in _anchor_reasons(repeated, frozen=frozen, expected_devices=4)
+    per_device_repeated = {**anchor, "per_device_measurements": [dict(item, local_sample_mapping_hash="1" * 64) for item in anchor["per_device_measurements"]]}
+    assert "FOUR_CARD_PER_DEVICE_PARTITION_HASH_MISMATCH" in _anchor_reasons(per_device_repeated, frozen=frozen, expected_devices=4)
+
+
+def test_s209_four_card_anchor_rejects_identity_hash_tamper() -> None:
+    matrix, gate, manifest = _inputs()
+    frozen = bind_s209_inputs(matrix=matrix, g24b_gate=gate, raw_manifest=manifest)
+    anchor = _anchor(4, list(APPROVED_GPU_UUIDS))
+    tampered_state = {**anchor, "state_digest": "1" * 64}
+    state_reasons = _anchor_reasons(tampered_state, frozen=frozen, expected_devices=4)
+    assert "FOUR_CARD_PROCESS_IDENTITY_MISMATCH" in state_reasons
+    tampered_collective = {**anchor, "all_reduce_identity_hash": "2" * 64}
+    assert "FOUR_CARD_ALL_REDUCE_IDENTITY_MISMATCH" in _anchor_reasons(tampered_collective, frozen=frozen, expected_devices=4)
+
+
+def test_s209_four_card_anchor_preserves_measured_efficiency_above_one() -> None:
+    matrix, gate, manifest = _inputs()
+    frozen = bind_s209_inputs(matrix=matrix, g24b_gate=gate, raw_manifest=manifest)
+    anchor = {**_anchor(4, list(APPROVED_GPU_UUIDS)), "strong_scaling_efficiency": 1.1}
+    reasons = _anchor_reasons(anchor, frozen=frozen, expected_devices=4)
+    assert not any("STRONG_SCALING_EFFICIENCY_INVALID" in reason for reason in reasons)
 
 
 def test_s209_binds_frozen_matrix_and_sealed_raw_manifest() -> None:
