@@ -23,6 +23,8 @@ from param_importance_nlp.experiments.stage2_pilot import CostSemantics
 from param_importance_nlp.experiments.stage2_s206_formal import (
     BlindPilotMeasurement,
     BlindedPilotReport,
+    CORRECTED_DELTA_SCI_BATCH_SIZES,
+    CORRECTED_DELTA_SCI_SOURCE,
 )
 from param_importance_nlp.experiments.stage2_s208_production import (
     S208ProductionBlocked,
@@ -62,9 +64,12 @@ def _moments(count: int) -> _BoundedMoments:
     return result
 
 
-def _pilot_report() -> dict[str, object]:
+def _pilot_report(binding_rows: list[dict[str, object]]) -> dict[str, object]:
+    bindings_by_cell = {str(item["cell_id"]): item for item in binding_rows}
     measurements = []
     for anchor in ANCHORS:
+        cell_id = anchor.replace(".", ":")
+        binding = bindings_by_cell[cell_id]
         for batch_size in BATCH_SIZES:
             for microbatch_count in (2, 4, 8, 16, 32):
                 measurement = BlindPilotMeasurement(
@@ -80,6 +85,13 @@ def _pilot_report() -> dict[str, object]:
                     aggregation_overhead_ratio=0.1,
                     variance_by_endpoint={"bias": 0.0, "nmse": 0.0, "rank": 0.0},
                     delta_sci_by_endpoint={"bias": 0.1, "nmse": 0.1, "rank": 0.1},
+                    corrected_delta_sci_hash=str(binding["corrected_delta_sci_hash"]),
+                    corrected_delta_sci_ref=str(binding["corrected_delta_sci_ref"]),
+                    corrected_delta_sci_batch_sizes=tuple(CORRECTED_DELTA_SCI_BATCH_SIZES),
+                    delta_sci_source=CORRECTED_DELTA_SCI_SOURCE,
+                    corrected_delta_sci_cell_id=cell_id,
+                    corrected_delta_sci_config_hash=str(binding["config_hash"]),
+                    corrected_delta_sci_result_hash=str(binding["result_hash"]),
                     reference_half_width_by_endpoint={"bias": 0.01, "nmse": 0.01, "rank": 0.01},
                     storage_bytes=1024,
                     gpu_hours=0.01,
@@ -91,6 +103,7 @@ def _pilot_report() -> dict[str, object]:
         report_id="s206-formal-blinded-pilot",
         mapping_hash="1" * 64,
         sampling_plan_hash="2" * 64,
+        corrected_delta_sci_bindings=tuple(binding_rows),
         measurements=tuple(measurements),
         anchor_rows=(),
         candidate_evaluations=(),
@@ -139,8 +152,6 @@ def formal_inputs_template(tmp_path_factory: pytest.TempPathFactory) -> dict[str
     )
     hypothesis_ref = hypothesis_commit.commit_ref
     hypothesis_artifact_hash = hypothesis_commit.artifact_hash
-
-    pilot = _pilot_report()
 
     references: dict[str, dict[str, object]] = {}
     index_rows = []
@@ -364,20 +375,7 @@ def formal_inputs_template(tmp_path_factory: pytest.TempPathFactory) -> dict[str
         }
         for index, cell_id in enumerate(CELLS)
     ]
-    for measurement in pilot["measurements"]:
-        assert isinstance(measurement, dict)
-        cell_id = str(measurement["anchor_id"]).replace(".", ":")
-        binding = next(item for item in binding_rows if item["cell_id"] == cell_id)
-        measurement.update({
-            "corrected_delta_sci_cell_id": binding["cell_id"],
-            "corrected_delta_sci_config_hash": binding["config_hash"],
-            "corrected_delta_sci_result_hash": binding["result_hash"],
-            "corrected_delta_sci_hash": binding["corrected_delta_sci_hash"],
-            "corrected_delta_sci_ref": binding["corrected_delta_sci_ref"],
-            "corrected_delta_sci_batch_sizes": binding["corrected_delta_sci_batch_sizes"],
-            "delta_sci_source": binding["delta_sci_source"],
-        })
-    pilot["corrected_delta_sci_bindings"] = binding_rows
+    pilot = _pilot_report(binding_rows)
     pilot_ref, pilot_hash = _write(root, "refs/s206/blinded-pilot-report.json", pilot)
     matrix = _hashed({
         "schema_version": "stage2-formal-pilot-matrix-freeze-v1",
