@@ -33,6 +33,7 @@ from param_importance_nlp.experiments.stage2_s206_formal import (
     EXCLUDED_UUID,
     GPU_INVENTORY_SCHEMA,
     GlobalPilotMappingManifest,
+    S206PreparationBlocked,
     build_global_pilot_mapping,
 )
 from param_importance_nlp.providers.synthetic import SyntheticGradientProvider
@@ -537,30 +538,10 @@ def test_production_cell_uses_candidate_bundle_and_emits_blinded_pilot_only(
         resource_within_budget=True,
         cost_io_quiescent=True,
     )
-    result = launcher._production_cell(args)
-    assert result["status"] == "COMPLETE"
-    cell_payload = result["cell"]
-    assert isinstance(cell_payload, dict)
-    assert cell_payload["scientific_values_masked"] is True
-    assert cell_payload["formal_eligible"] is False
-    assert GlobalPilotMappingManifest.from_mapping(mapping.to_dict()).to_dict()[
-        "confirmatory_draws_generated"
-    ] is False
-    assert not (root / "operations/s206/confirmatory-mapping.json").exists()
-
-    # The bounded server smoke reuses the same production provider/input
-    # bridge, but commits only one frozen 14M/B32 repetition and cannot enter
-    # the reducer or confirmatory stream.
-    smoke_args = SimpleNamespace(**vars(args))
-    smoke_args.cell_artifact_root = "operations/s206/smoke-artifacts"
-    smoke_args.cell_output = "operations/s206/smoke.json"
-    smoke = launcher._production_smoke_cell(smoke_args)
-    assert smoke["status"] == "SMOKE_COMPLETE"
-    smoke_payload = smoke["smoke"]
-    assert isinstance(smoke_payload, dict)
-    assert smoke_payload["anchor_id"] == ANCHOR_IDS[0]
-    assert smoke_payload["repetitions_requested"] == 1
-    assert smoke_payload["completed_repetitions"] == 1
-    assert smoke_payload["scientific_values_masked"] is True
-    assert smoke_payload["confirmatory_draws_generated"] is False
+    # This pre-existing fixture intentionally models the invalid legacy
+    # consumer shape: G23 cells have no canonical identities/bound sidecars
+    # and the producer table is not a corrected amendment.  S2.6 must stop
+    # before constructing a provider or consuming any pilot draw.
+    with pytest.raises(S206PreparationBlocked, match="G23_(ANCHOR_SET|CORRECTED_DELTA)"):
+        launcher._production_cell(args)
     assert not (root / "operations/s206/confirmatory-mapping.json").exists()

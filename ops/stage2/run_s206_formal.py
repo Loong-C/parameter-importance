@@ -57,6 +57,11 @@ from param_importance_nlp.experiments.stage2_s206_formal import (
     strict_preflight,
     normalize_gpu_inventory,
 )
+from param_importance_nlp.experiments.stage2_s206_delta_consumer import (
+    CorrectedDeltaBinding,
+    CorrectedDeltaRejected,
+    load_bound_corrected_delta,
+)
 from param_importance_nlp.experiments.stage2_pilot import CostSemantics
 from param_importance_nlp.experiments.sampling import SamplingPlan
 from param_importance_nlp.runtime.task_artifacts import load_committed_task_artifact
@@ -573,12 +578,24 @@ def _load_s205_rebind(args: argparse.Namespace) -> tuple[dict[str, object], dict
         raise S206PreparationBlocked("S205_REBIND_SIX_CELL_ROWS_REQUIRED")
     by_anchor: dict[str, dict[str, object]] = {}
     for expected, raw in zip(ANCHOR_IDS, rows):
-        if not isinstance(raw, Mapping) or raw.get("cell_id") != expected:
+        g23_cell_id = expected.replace(".", ":", 1)
+        if not isinstance(raw, Mapping) or raw.get("cell_id") != g23_cell_id:
             raise S206PreparationBlocked("S205_REBIND_ANCHOR_ORDER_INVALID")
         row = dict(raw)
-        for name in ("config_ref", "environment_ref", "formal_execution_ref", "reference_artifact_refs"):
+        for name in (
+            "config_ref",
+            "environment_ref",
+            "formal_execution_ref",
+            "reference_artifact_refs",
+            "task_result_status_path",
+            "config_hash",
+            "result_hash",
+        ):
             if name not in row:
                 raise S206PreparationBlocked(f"S205_REBIND_{name.upper()}_MISSING:{expected}")
+        for name in ("config_hash", "result_hash"):
+            if not isinstance(row[name], str) or len(row[name]) != 64 or any(char not in "0123456789abcdef" for char in row[name]):
+                raise S206PreparationBlocked(f"S205_REBIND_{name.upper()}_INVALID:{expected}")
         if not isinstance(row["reference_artifact_refs"], Mapping):
             raise S206PreparationBlocked(f"S205_REBIND_REFERENCE_REFS_INVALID:{expected}")
         by_anchor[expected] = row
@@ -597,8 +614,12 @@ def _load_g24a_metrics(args: argparse.Namespace) -> dict[str, dict[str, object]]
     for raw in results:
         if not isinstance(raw, Mapping) or not isinstance(raw.get("cell_id"), str):
             raise S206PreparationBlocked("G24A_RESULT_CELL_INVALID")
-        cell_id = str(raw["cell_id"])
-        if cell_id not in ANCHOR_IDS or cell_id in by_anchor:
+        g23_cell_id = str(raw["cell_id"])
+        expected_g23_ids = {anchor.replace(".", ":", 1): anchor for anchor in ANCHOR_IDS}
+        if g23_cell_id not in expected_g23_ids:
+            raise S206PreparationBlocked("G24A_RESULT_CELL_SET_INVALID")
+        cell_id = expected_g23_ids[g23_cell_id]
+        if cell_id in by_anchor:
             raise S206PreparationBlocked("G24A_RESULT_CELL_SET_INVALID")
         metrics = raw.get("metrics")
         if not isinstance(metrics, Mapping):
@@ -648,13 +669,31 @@ def _load_production_cell_inputs(
     s205_rows: Mapping[str, Mapping[str, object]],
     g24a_rows: Mapping[str, Mapping[str, object]],
     execution: FormalExecutionEvidence,
-) -> tuple[object, Mapping[str, object], Mapping[str, Mapping[str, object]], str, dict[str, float], dict[str, float]]:
+) -> tuple[object, Mapping[str, object], Mapping[str, Mapping[str, object]], str, dict[str, float], dict[str, float], CorrectedDeltaBinding]:
     """Bind one S2.4 config/environment/reference to the real formal provider."""
 
     root = args.data_root.resolve()
     row = s205_rows.get(anchor_id)
     if row is None:
         raise S206PreparationBlocked(f"S205_ROW_MISSING:{anchor_id}")
+    if not isinstance(row.get("config_hash"), str) or not isinstance(row.get("result_hash"), str):
+        raise S206PreparationBlocked(f"S205_REBIND_CELL_IDENTITIES_MISSING:{anchor_id}")
+    _status_path, final_status = _load_object_ref(
+        root,
+        row["task_result_status_path"],
+        field=f"{anchor_id}.task_result_status_path",
+    )
+    if (
+        final_status.get("schema_version") != "stage2-s204-cell-final-status-v3"
+        or final_status.get("status") != "COMPLETE"
+        or final_status.get("formal_eligible") is not True
+        or final_status.get("cell_id") != anchor_id.replace(".", ":", 1)
+        or final_status.get("task_result_hash") != row["result_hash"]
+        or final_status.get("config_hash") != row["config_hash"]
+    ):
+        raise S206PreparationBlocked(f"S204_FINAL_STATUS_RESULT_BINDING_INVALID:{anchor_id}")
+    if canonical_json_hash({key: item for key, item in final_status.items() if key != "artifact_hash"}) != final_status.get("artifact_hash"):
+        raise S206PreparationBlocked(f"S204_FINAL_STATUS_HASH_INVALID:{anchor_id}")
     config_path, config_wire = _load_object_ref(root, row["config_ref"], field=f"{anchor_id}.config_ref")
     try:
         source_config = ResolvedConfigV2.from_mapping(config_wire)
@@ -792,44 +831,31 @@ def _load_production_cell_inputs(
     }
     if any(not isinstance(value, (int, float)) or isinstance(value, bool) or not math.isfinite(float(value)) or float(value) < 0 for value in half_width.values()):
         raise S206PreparationBlocked(f"G24A_REFERENCE_HALF_WIDTH_INVALID:{anchor_id}")
-    sizing = convergence_payload.get("candidate_delta_sci")
-    sizing_source_ref = convergence_payload.get("candidate_delta_sci_source")
-    sizing_source_hash = convergence_payload.get("candidate_delta_sci_source_hash")
-    if (
-        not isinstance(sizing, Mapping)
-        or not isinstance(sizing_source_ref, str)
-        or not isinstance(sizing_source_hash, str)
-        or sizing.get("source_ref") != sizing_source_ref
-        or sizing.get("source_hash") != sizing_source_hash
-    ):
-        raise S206PreparationBlocked(f"S204_SIZING_SOURCE_BINDING_MISSING:{anchor_id}")
-    _sizing_source_path, sizing_source = _load_object_ref(
-        root,
-        sizing_source_ref,
-        field=f"{anchor_id}.candidate_delta_sci_source",
-    )
-    if sizing_source.get("artifact_hash") != sizing_source_hash:
-        raise S206PreparationBlocked(f"S204_SIZING_SOURCE_HASH_MISMATCH:{anchor_id}")
-    expected_sizing_source = {
-        key: value
-        for key, value in sizing.items()
-        if key not in {"source_ref", "source_hash", "source_artifact_hash"}
-    }
-    if sizing_source != expected_sizing_source:
-        raise S206PreparationBlocked(f"S204_SIZING_SOURCE_CONTENT_MISMATCH:{anchor_id}")
-    delta_table = sizing.get("delta_sci_by_endpoint") if isinstance(sizing, Mapping) else None
-    if not isinstance(delta_table, Mapping):
-        raise S206PreparationBlocked(f"S204_SIZING_DELTA_MISSING:{anchor_id}")
-    endpoint_map = {"bias": "model_total", "nmse": "layer", "rank": "module"}
-    delta: dict[str, float] = {}
-    for endpoint, source_endpoint in endpoint_map.items():
-        source_values = delta_table.get(source_endpoint)
-        if not isinstance(source_values, Mapping):
-            raise S206PreparationBlocked(f"S204_SIZING_ENDPOINT_MISSING:{anchor_id}:{source_endpoint}")
-        raw = source_values.get(str(batch_size))
-        if not isinstance(raw, (int, float)) or isinstance(raw, bool) or not math.isfinite(float(raw)) or float(raw) <= 0:
-            raise S206PreparationBlocked(f"S204_SIZING_DELTA_INVALID:{anchor_id}:B{batch_size}:{source_endpoint}")
-        delta[endpoint] = float(raw)
+    sizing_plan = convergence_payload.get("sizing_plan")
+    expected_sizing_plan_hash = convergence_payload.get("sizing_plan_artifact_hash")
+    if expected_sizing_plan_hash is None and isinstance(sizing_plan, Mapping):
+        expected_sizing_plan_hash = sizing_plan.get("artifact_hash")
+    expected_sizing_result_hash = convergence_payload.get("sizing_result_hash")
+    expected_reference_id = sizing_plan.get("reference_id") if isinstance(sizing_plan, Mapping) else None
+    registry_artifact = convergence_payload.get("parameter_registry_artifact")
+    expected_registry_hash = convergence_payload.get("registry_hash")
+    if expected_registry_hash is None and isinstance(registry_artifact, Mapping):
+        expected_registry_hash = registry_artifact.get("registry_hash")
+    try:
+        corrected = load_bound_corrected_delta(
+            root,
+            g23_evaluation_ref=args.g23_evaluation,
+            cell_id=anchor_id,
+            expected_config_hash=str(row["config_hash"]),
+            expected_result_hash=str(row["result_hash"]),
+            expected_sizing_plan_hash=(str(expected_sizing_plan_hash) if expected_sizing_plan_hash is not None else None),
+            expected_sizing_result_hash=(str(expected_sizing_result_hash) if expected_sizing_result_hash is not None else None),
+            expected_reference_id=(str(expected_reference_id) if expected_reference_id is not None else None),
+            expected_registry_hash=(str(expected_registry_hash) if expected_registry_hash is not None else None),
+        )
+        delta = corrected.delta_for(batch_size)
+    except CorrectedDeltaRejected as error:
+        raise S206PreparationBlocked(f"G23_CORRECTED_DELTA_INVALID:{anchor_id}:{error}") from error
     half_width = {name: float(value) for name, value in half_width.items()}
     if any(half_width[name] > delta[name] / 4.0 for name in delta):
         raise S206PreparationBlocked(f"G24A_REFERENCE_PRECISION_NOT_BOUND:{anchor_id}:B{batch_size}")
@@ -845,6 +871,7 @@ def _load_production_cell_inputs(
         _vector_digest(vectors["bias_reference"]),
         delta,
         half_width,
+        corrected,
     )
 
 
@@ -913,13 +940,31 @@ def _production_cell(args: argparse.Namespace) -> dict[str, object]:
         resumed = FormalPilotCellRun.from_mapping(dict(existing))
         if resumed.mapping_artifact_hash != mapping.artifact_hash:
             raise S206PreparationBlocked("PRODUCTION_CELL_OUTPUT_MAPPING_HASH_CONFLICT")
+        try:
+            corrected_resume = load_bound_corrected_delta(
+                root,
+                g23_evaluation_ref=args.g23_evaluation,
+                cell_id=args.cell_anchor,
+                expected_config_hash=str(s205_rows[args.cell_anchor]["config_hash"]),
+                expected_result_hash=str(s205_rows[args.cell_anchor]["result_hash"]),
+            )
+        except CorrectedDeltaRejected as error:
+            raise S206PreparationBlocked(f"G23_CORRECTED_DELTA_RESUME_INVALID:{args.cell_anchor}:{error}") from error
+        if (
+            resumed.corrected_delta_sci_hash != corrected_resume.artifact_hash
+            or resumed.corrected_delta_sci_ref != corrected_resume.ref
+            or resumed.corrected_delta_sci_cell_id != corrected_resume.cell_id
+            or resumed.corrected_delta_sci_config_hash != corrected_resume.config_hash
+            or resumed.corrected_delta_sci_result_hash != corrected_resume.result_hash
+        ):
+            raise S206PreparationBlocked("PRODUCTION_CELL_OUTPUT_CORRECTED_DELTA_BINDING_CONFLICT")
         return {
             "status": "RESUMED_EXISTING",
             "cell": resumed.to_dict(),
             "preflight": preflight,
             "s205_rebind_hash": canonical_json_hash(s205_plan),
         }
-    provider, reference, references, reference_hash, delta, half_width = _load_production_cell_inputs(
+    provider, reference, references, reference_hash, delta, half_width, corrected_delta = _load_production_cell_inputs(
         args,
         anchor_id=args.cell_anchor,
         batch_size=args.cell_batch_size,
@@ -939,6 +984,13 @@ def _production_cell(args: argparse.Namespace) -> dict[str, object]:
             reference_hash=reference_hash,
             artifact_root=artifact_root,
             delta_sci_by_endpoint=delta,
+            corrected_delta_sci_hash=corrected_delta.artifact_hash,
+            corrected_delta_sci_ref=corrected_delta.ref,
+            corrected_delta_sci_batch_sizes=corrected_delta.batch_sizes,
+            delta_sci_source=corrected_delta.source,
+            corrected_delta_sci_cell_id=corrected_delta.cell_id,
+            corrected_delta_sci_config_hash=corrected_delta.config_hash,
+            corrected_delta_sci_result_hash=corrected_delta.result_hash,
             reference_half_width_by_endpoint=half_width,
             resource_within_budget=bool(args.resource_within_budget),
             cost_io_quiescent=bool(args.cost_io_quiescent),
@@ -1019,6 +1071,16 @@ def _production_smoke_cell(args: argparse.Namespace) -> dict[str, object]:
 
     # A committed receipt is sufficient recovery for a completed smoke.  Do
     # not reload the model/provider or consume another repetition on resume.
+    try:
+        corrected_smoke = load_bound_corrected_delta(
+            root,
+            g23_evaluation_ref=args.g23_evaluation,
+            cell_id=args.cell_anchor,
+            expected_config_hash=str(s205_rows[args.cell_anchor]["config_hash"]),
+            expected_result_hash=str(s205_rows[args.cell_anchor]["result_hash"]),
+        )
+    except CorrectedDeltaRejected as error:
+        raise S206PreparationBlocked(f"G23_CORRECTED_DELTA_SMOKE_INVALID:{args.cell_anchor}:{error}") from error
     if output.exists():
         existing = load_canonical_json(output)
         if not isinstance(existing, Mapping):
@@ -1048,6 +1110,10 @@ def _production_smoke_cell(args: argparse.Namespace) -> dict[str, object]:
             "pilot_mapping_ref",
             "execution_evidence_hash",
             "s205_rebind_hash",
+            "corrected_delta_sci_hash",
+            "corrected_delta_sci_ref",
+            "corrected_delta_sci_batch_sizes",
+            "delta_sci_source",
             "artifact_hash",
         }
         if set(existing) != required_existing:
@@ -1068,6 +1134,10 @@ def _production_smoke_cell(args: argparse.Namespace) -> dict[str, object]:
             or existing.get("repetitions_requested") != 1
             or existing.get("completed_repetitions") != 1
             or existing.get("unit_ids") != [smoke_mapping.repetition_id]
+            or existing.get("corrected_delta_sci_hash") != corrected_smoke.artifact_hash
+            or existing.get("corrected_delta_sci_ref") != corrected_smoke.ref
+            or existing.get("corrected_delta_sci_batch_sizes") != list(corrected_smoke.batch_sizes)
+            or existing.get("delta_sci_source") != corrected_smoke.source
         ):
             raise S206PreparationBlocked("PRODUCTION_SMOKE_OUTPUT_BINDING_DRIFT")
         if existing.get("artifact_hash") != canonical_json_hash(
@@ -1081,7 +1151,7 @@ def _production_smoke_cell(args: argparse.Namespace) -> dict[str, object]:
             "s205_rebind_hash": canonical_json_hash(s205_plan),
         }
 
-    provider, reference, references, reference_hash, _delta, _half_width = _load_production_cell_inputs(
+    provider, reference, references, reference_hash, _delta, _half_width, corrected_delta = _load_production_cell_inputs(
         args,
         anchor_id=args.cell_anchor,
         batch_size=args.cell_batch_size,
@@ -1141,6 +1211,10 @@ def _production_smoke_cell(args: argparse.Namespace) -> dict[str, object]:
         "pilot_mapping_ref": str(mapping_path),
         "execution_evidence_hash": execution.artifact_hash,
         "s205_rebind_hash": canonical_json_hash(s205_plan),
+        "corrected_delta_sci_hash": corrected_delta.artifact_hash,
+        "corrected_delta_sci_ref": corrected_delta.ref,
+        "corrected_delta_sci_batch_sizes": list(corrected_delta.batch_sizes),
+        "delta_sci_source": corrected_delta.source,
     }
     payload["artifact_hash"] = canonical_json_hash(payload)
     _write_once(output, payload)
@@ -1517,13 +1591,39 @@ def _production_execute(args: argparse.Namespace) -> dict[str, object]:
 
     runs: list[FormalPilotCellRun] = []
     measurements: list[dict[str, object]] = []
-    for path in result_refs:
+    for path, (anchor_id, batch_size) in zip(
+        result_refs,
+        ((anchor_id, batch_size) for anchor_id in ANCHOR_IDS for batch_size in PILOT_B_VALUES),
+    ):
         value = load_canonical_json(path)
         if not isinstance(value, Mapping):
             raise S206PreparationBlocked(f"PRODUCTION_CELL_RESULT_NOT_OBJECT:{path}")
         run = FormalPilotCellRun.from_mapping(dict(value))
         if run.mapping_artifact_hash != mapping.artifact_hash:
             raise S206PreparationBlocked(f"PRODUCTION_CELL_MAPPING_HASH_DRIFT:{path}")
+        row = _s205_rows.get(anchor_id)
+        if row is None:
+            raise S206PreparationBlocked(f"S205_ROW_MISSING:{anchor_id}")
+        try:
+            corrected = load_bound_corrected_delta(
+                root,
+                g23_evaluation_ref=args.g23_evaluation,
+                cell_id=anchor_id,
+                expected_config_hash=str(row["config_hash"]),
+                expected_result_hash=str(row["result_hash"]),
+            )
+        except CorrectedDeltaRejected as error:
+            raise S206PreparationBlocked(f"G23_CORRECTED_DELTA_AGGREGATE_INVALID:{anchor_id}:{error}") from error
+        expected_delta = corrected.delta_for(batch_size)
+        if (
+            run.corrected_delta_sci_hash != corrected.artifact_hash
+            or run.corrected_delta_sci_ref != corrected.ref
+            or run.corrected_delta_sci_cell_id != corrected.cell_id
+            or run.corrected_delta_sci_config_hash != corrected.config_hash
+            or run.corrected_delta_sci_result_hash != corrected.result_hash
+            or any(dict(item.delta_sci_by_endpoint) != expected_delta for item in run.measurements)
+        ):
+            raise S206PreparationBlocked(f"PRODUCTION_CELL_CORRECTED_DELTA_BINDING_DRIFT:{anchor_id}:B{batch_size}")
         runs.append(run)
         measurements.extend(item.to_dict() for item in run.measurements)
     measurements_payload: dict[str, object] = {
@@ -1746,13 +1846,19 @@ def _reduce(args: argparse.Namespace) -> dict[str, object]:
 
 
 def _synthetic_cell(args: argparse.Namespace) -> dict[str, object]:
-    """Direct bridge entry point used for a deterministic formal-cell smoke test."""
+    """Reject the legacy direct bridge until it has a G2.3 sidecar binding.
+
+    The old implementation accepted a caller-authored ``delta_sci`` table,
+    which made it possible to silently consume the r23 sizing-node keys.  A
+    synthetic provider is not an exception to the S2.6 consumer contract.
+    """
 
     root = args.data_root.resolve()
     # Keep the direct bridge under the same G2.3/G2.4a and approved-GPU
     # preflight as the long-running launcher; synthetic execution is not a
     # bypass around those gates.
     _preflight(args)
+    raise S206PreparationBlocked("SYNTHETIC_CELL_REQUIRES_BOUND_G23_CORRECTED_DELTA")
     required = (
         args.pilot_mapping_ref,
         args.execution_evidence_ref,
