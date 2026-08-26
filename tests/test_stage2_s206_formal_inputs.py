@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -18,6 +19,7 @@ from param_importance_nlp.experiments.stage2_s206_inputs import (
 )
 from param_importance_nlp.experiments.stage2_s207_runner import load_s27_gpu_inventory_envelope
 from ops.stage2.produce_s206_formal_inputs import main as produce_s206_inputs
+from ops.stage2.run_s206_formal import _load_formal_execution
 
 
 def _gpu_output() -> str:
@@ -44,7 +46,6 @@ def test_live_collector_is_explicit_and_non_self_referential(tmp_path: Path) -> 
         source_output=source,
         data_root=tmp_path,
         runner=runner,
-        checked_at="2026-08-26T00:00:00+00:00",
     )
     assert len(calls) == 2
     assert payload["artifact_ref"] == "evidence/gpu-inventory.json"
@@ -217,6 +218,48 @@ def test_execution_evidence_binds_exact_g23_g24a_and_s205(tmp_path: Path) -> Non
     assert metadata["s205_rebind_ref"] == s205_ref
     evidence = FormalExecutionEvidence.from_mapping(output)
     assert {gate.gate_id for gate in evidence.prerequisite_gates} >= {"stage2.G2.2", "stage2.G2.3", "stage2.G2.4a"}
+
+    execution_ref = "evidence/execution.json"
+    write_canonical_json(tmp_path / execution_ref, output)
+    args = SimpleNamespace(
+        data_root=tmp_path,
+        execution_evidence_ref=execution_ref,
+        g23_evaluation=g23_ref,
+        g24a_evaluation=g24a_ref,
+        s205_rebind_ref=s205_ref,
+    )
+    assert _load_formal_execution(args).artifact_hash == output["artifact_hash"]
+
+    # A second valid object is still a different amendment when its ref is
+    # changed; the consumer must reject metadata substitution even when the
+    # content hash happens to be identical.
+    alternate_g23_ref = "evidence/g23-other.json"
+    alternate_g23 = load_canonical_json(tmp_path / g23_ref)
+    assert isinstance(alternate_g23, dict)
+    write_canonical_json(tmp_path / alternate_g23_ref, alternate_g23)
+    substituted = dict(output)
+    substituted_metadata = dict(output["metadata"])  # type: ignore[arg-type]
+    substituted_metadata["g23_evaluation_ref"] = alternate_g23_ref
+    substituted["metadata"] = substituted_metadata
+    substituted["artifact_hash"] = canonical_json_hash(
+        {key: value for key, value in substituted.items() if key != "artifact_hash"}
+    )
+    substituted_ref = "evidence/execution-substituted.json"
+    write_canonical_json(tmp_path / substituted_ref, substituted)
+    with pytest.raises(Exception, match="EXECUTION_EVIDENCE_G23_EVALUATION_REF_MISMATCH"):
+        _load_formal_execution(SimpleNamespace(**{**vars(args), "execution_evidence_ref": substituted_ref}))
+
+    missing_hash = dict(output)
+    missing_metadata = dict(output["metadata"])  # type: ignore[arg-type]
+    missing_metadata.pop("g24a_evaluation_hash")
+    missing_hash["metadata"] = missing_metadata
+    missing_hash["artifact_hash"] = canonical_json_hash(
+        {key: value for key, value in missing_hash.items() if key != "artifact_hash"}
+    )
+    missing_ref = "evidence/execution-missing-hash.json"
+    write_canonical_json(tmp_path / missing_ref, missing_hash)
+    with pytest.raises(Exception, match="EXECUTION_EVIDENCE_G24A_EVALUATION_HASH_REQUIRED"):
+        _load_formal_execution(SimpleNamespace(**{**vars(args), "execution_evidence_ref": missing_ref}))
 
     blocked_g23 = load_canonical_json(tmp_path / g23_ref)
     assert isinstance(blocked_g23, dict)
