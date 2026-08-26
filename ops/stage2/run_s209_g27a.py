@@ -275,7 +275,10 @@ def _detach(args: argparse.Namespace) -> dict[str, Any]:
     run_root.mkdir(parents=True, exist_ok=True)
     lease_path = _claim_detach_lease(run_root, run_id=args.run_id)
     log_path = run_root / "launcher.log"
-    child = [str(item) for item in sys.argv[1:] if item != "--detach"]
+    # The detached child is the actual executor.  Replacing the action token
+    # (rather than dropping it) is required because the child parser demands
+    # exactly one mutually-exclusive action.
+    child = ["--execute" if item == "--detach" else str(item) for item in sys.argv[1:]]
     try:
         with log_path.open("ab") as handle:
             process = subprocess.Popen(

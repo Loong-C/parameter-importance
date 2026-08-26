@@ -22,6 +22,7 @@ from param_importance_nlp.experiments.stage2_s209_runner import (
     S29_IO_SCHEMA,
     S29_TIMING_FIELDS,
     S29RunnerBlocked,
+    S29ProfilerRunner,
     S29StatusStore,
     _task_list,
     _validate_measured_row,
@@ -313,6 +314,73 @@ def test_s209_detach_rejects_duplicate_launch_lease(monkeypatch, tmp_path: Path)
     launcher._detach(args)
     with pytest.raises(S29RunnerBlocked, match="ALREADY_RUNNING"):
         launcher._detach(args)
+
+
+def test_s209_detach_child_runs_execute_action(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(launcher, "_preflight", lambda _args: {})
+    captured: dict[str, object] = {}
+
+    def fake_popen(command, **kwargs):
+        captured["command"] = list(command)
+        return SimpleNamespace(pid=os.getpid())
+
+    monkeypatch.setattr(launcher.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(launcher.sys, "argv", ["run_s209_g27a.py", "--detach", "--data-root", "fixture"])
+    args = SimpleNamespace(
+        profiler_command=["profiler"],
+        data_root=tmp_path,
+        run_root="runs/s209",
+        run_id="s209-run",
+    )
+    launcher._detach(args)
+    command = captured["command"]
+    assert isinstance(command, list)
+    assert "--detach" not in command
+    assert command.count("--execute") == 1
+
+
+def test_s209_anchor_failure_publishes_terminal_blocked_status(tmp_path: Path) -> None:
+    frozen = S29FrozenInputs(
+        matrix_hash="a" * 64,
+        g24b_gate_hash="b" * 64,
+        raw_manifest_hash="c" * 64,
+        raw_run_id="s207-run",
+        plan_hash="d" * 64,
+        mapping_hash="e" * 64,
+        sampling_plan_hash="f" * 64,
+        expected_unit_ids=("unit-0",),
+        batch_size=32,
+        microbatch_count=16,
+        repetitions=2,
+        completion_denominator=1,
+    )
+    plan = {
+        "run_id": "s209-run",
+        "artifact_hash": "d" * 64,
+        "rows": [
+            {"anchor_id": "anchor-a", "repetition": 0, "method_order": ["raw", "double", "u"]},
+        ],
+    }
+    preflight = SimpleNamespace(
+        measurement_plan=plan,
+        frozen=frozen,
+        inventory={"inventory_identity": {"artifact_hash": "1" * 64, "source_sha256": "2" * 64}},
+        io_evidence={"artifact_hash": "3" * 64, "cost_io_quiescent": True},
+        plan_hash="d" * 64,
+    )
+
+    def failing_profiler(_task, *, environment):
+        raise RuntimeError("anchor unavailable")
+
+    runner = S29ProfilerRunner(
+        preflight=preflight,
+        run_id="s209-run",
+        run_root=tmp_path / "run",
+        profiler=failing_profiler,
+    )
+    result = runner.run()
+    assert result["status"] == "BLOCKED"
+    assert runner.status_store.load().status == "BLOCKED"
 
 
 def test_s209_detach_rejects_stale_lease_without_relaunch_or_unlink(monkeypatch, tmp_path: Path) -> None:
