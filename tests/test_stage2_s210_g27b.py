@@ -5,7 +5,7 @@ from pathlib import Path
 import pytest
 
 from param_importance_nlp.contracts.artifacts import validate_estimator_decision_artifact
-from param_importance_nlp.contracts.jsonio import canonical_json_bytes, canonical_json_hash, write_canonical_json
+from param_importance_nlp.contracts.jsonio import canonical_json_bytes, canonical_json_hash, load_canonical_json, write_canonical_json
 from param_importance_nlp.contracts.status import GateRecord
 from param_importance_nlp.experiments.stage2_s204_ids import EXPECTED_CELL_IDS
 from param_importance_nlp.experiments.stage2_s210_g27b import S210G27BBlocked, run_s210_g27b
@@ -120,7 +120,18 @@ def _formal_inputs(*, double_qualified: bool) -> dict[str, object]:
     quality.pop("artifact_hash", None)
     quality["status"] = "PASS"
     quality["formal_eligible"] = True
-    quality["gates"] = [{"gate": "reference_convergence", "status": "PASS"}]
+    quality["gates"] = [
+        {"gate": gate, "status": "PASS"}
+        for gate in (
+            "fixed_state",
+            "sample_independence",
+            "reference_convergence",
+            "result_completeness",
+            "finite_numeric_values",
+            "fair_total_draw_budget",
+            "replayability",
+        )
+    ]
     values["quality"] = _hashed(quality)
 
     family = dict(values["family"])
@@ -158,6 +169,7 @@ def _formal_inputs(*, double_qualified: bool) -> dict[str, object]:
     cost = dict(values["cost"])
     cost.pop("artifact_hash", None)
     cost["health_snapshot"] = {"healthy": True, "cost_io_quiescent": True}
+    cost["gate"] = _g27a_gate()
     values["cost"] = _hashed(cost)
     values["raw_calibration"] = _hashed(
         {
@@ -297,4 +309,90 @@ def test_s210_path_inputs_reject_hash_forgery(tmp_path: Path) -> None:
             g26_family_decisions=paths["family"],
             g27a_report=paths["cost"],
             g27a_gate=paths["g27a_gate"],
+        )
+
+
+def test_s210_analysis_fallback_is_bound_to_aggregate_identity() -> None:
+    values = _formal_inputs(double_qualified=True)
+    analysis = {
+        "schema_version": "stage2-s208-g26-analysis-v1",
+        "analysis_id": "sealed-analysis",
+        "status": "PASS",
+        "quality_gates": values["quality"],
+        "hypothesis_decisions": values["hypothesis"],
+        "statistics_long_table": values["long"]["rows"],
+        "statistics_summary": [],
+        "raw_calibration": values["raw_calibration"]["rows"],
+        "confirmatory_family_decisions": values["family"],
+        "g2_6_gate": values["g26_gate"],
+        "output_files": [],
+    }
+    analysis["analysis_hash"] = canonical_json_hash(analysis)
+    forged = dict(analysis)
+    forged["statistics_long_table"] = list(analysis["statistics_long_table"])
+    forged["statistics_long_table"][0] = dict(forged["statistics_long_table"][0], model="forged-model")
+    with pytest.raises(S210G27BBlocked, match="ANALYSIS_HASH_MISMATCH"):
+        run_s210_g27b(
+            g26_analysis=forged,
+            g27a_report=values["cost"],
+            g27a_gate=_g27a_gate(),
+        )
+
+
+def test_s210_requires_nested_g27a_gate_identity() -> None:
+    values = _formal_inputs(double_qualified=True)
+    cost = dict(values["cost"])
+    cost.pop("artifact_hash", None)
+    cost.pop("gate", None)
+    values["cost"] = _hashed(cost)
+    result = run_s210_g27b(
+        g26_gate=values["g26_gate"],
+        g26_quality_gates=values["quality"],
+        g26_hypothesis_decisions=values["hypothesis"],
+        g26_statistics_long_table=values["long"],
+        g26_raw_calibration=values["raw_calibration"],
+        g26_family_decisions=values["family"],
+        g27a_report=values["cost"],
+        g27a_gate=_g27a_gate(),
+    )
+    assert result["status"] == "BLOCKED"
+    assert "G2.7A_NESTED_GATE_REQUIRED" in result["decision"]["metadata"]["reasons"]
+
+
+def test_s210_report_hash_binds_declared_output_files(tmp_path: Path) -> None:
+    values = _formal_inputs(double_qualified=True)
+    output = tmp_path / "formal-pass"
+    result = run_s210_g27b(
+        g26_gate=values["g26_gate"],
+        g26_quality_gates=values["quality"],
+        g26_hypothesis_decisions=values["hypothesis"],
+        g26_statistics_long_table=values["long"],
+        g26_raw_calibration=values["raw_calibration"],
+        g26_family_decisions=values["family"],
+        g27a_report=values["cost"],
+        g27a_gate=_g27a_gate(),
+        output_root=output,
+    )
+    published = load_canonical_json(output / "report.json")
+    assert published["output_files"] == result["output_files"]
+    assert published["artifact_hash"] == canonical_json_hash({key: value for key, value in published.items() if key != "artifact_hash"})
+    assert result["report"]["artifact_hash"] == published["artifact_hash"]
+
+
+def test_s210_rejects_missing_primary_statistics_view() -> None:
+    values = _formal_inputs(double_qualified=True)
+    long = dict(values["long"])
+    long.pop("artifact_hash", None)
+    long["rows"] = [row for row in long["rows"] if row["reference_view"] != "ranking"]
+    values["long"] = _hashed(long)
+    with pytest.raises(S210G27BBlocked, match="PRIMARY_VIEW_SET_INCOMPLETE"):
+        run_s210_g27b(
+            g26_gate=values["g26_gate"],
+            g26_quality_gates=values["quality"],
+            g26_hypothesis_decisions=values["hypothesis"],
+            g26_statistics_long_table=values["long"],
+            g26_raw_calibration=values["raw_calibration"],
+            g26_family_decisions=values["family"],
+            g27a_report=values["cost"],
+            g27a_gate=_g27a_gate(),
         )
