@@ -42,6 +42,7 @@ S211_REPLAY_AUDIT_SCHEMA = "stage2-s211-replay-audit-v1"
 S211_LINEAGE_SCHEMA = "stage2-s211-lineage-v1"
 S211_GATE_SCHEMA = "stage2-s211-g28-gate-v1"
 S211_OUTPUT_INVENTORY_SCHEMA = "stage2-s211-output-inventory-v1"
+S210_GATE_SCHEMA = "stage2-s210-g27b-gate-v1"
 
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _COMMIT = re.compile(r"^[0-9a-f]{40}$")
@@ -95,6 +96,18 @@ _DELIVERY_ROLES = (
     "failure_retry_amendment_history",
 )
 _AGENT_DOCUMENTS = ("git.md", "local.md", "remote_access.md", "server.md", "sync.md", "worklogs.md")
+_ROLE_SCHEMAS = {
+    "plan": "stage2-s211-plan-v1",
+    "task_catalog": "task-catalog-v1",
+    "replay_report": "stage2-s211-replay-report-v1",
+    "gate_summary": "stage2-s211-gate-summary-v1",
+    "sync_report": "stage2-s211-sync-report-v1",
+    "estimator_decision": "estimator-decision-v1",
+    "large_artifact_index": "stage2-s211-large-artifact-index-v1",
+    "worklog": "stage2-s211-worklog-v1",
+    "dirty_head_evidence": "stage2-s211-dirty-head-v1",
+    "failure_retry_amendment_history": "stage2-s211-history-v1",
+}
 
 
 class S211DeliveryBlocked(RuntimeError):
@@ -129,7 +142,10 @@ def _payload_identity(payload: Mapping[str, Any], *, field: str) -> tuple[str, b
 
     declared = payload.get("artifact_hash")
     body = {key: item for key, item in payload.items() if key != "artifact_hash"}
-    computed = canonical_json_hash(body if declared is not None else payload)
+    try:
+        computed = canonical_json_hash(body if declared is not None else payload)
+    except (TypeError, ValueError) as error:
+        raise S211DeliveryBlocked(f"{field}:CANONICAL_HASH_FAILED") from error
     if declared is not None:
         _sha(declared, field=f"{field}.artifact_hash")
         if declared != computed:
@@ -251,7 +267,12 @@ def _read(
         else:
             if data_root is None:
                 raise S211DeliveryBlocked(f"{field}:DATA_ROOT_REQUIRED")
-            path = _inside_data_root(value, root=data_root, field=field)
+            # CLI references are logical paths rooted at DATA_ROOT.  Absolute
+            # paths are still accepted only when they resolve inside that
+            # root; resolving relative references against the process cwd
+            # would make an otherwise valid server invocation fail closed (or,
+            # worse, make its meaning depend on the launch directory).
+            path = _resolve_data_root_ref(value, root=data_root, field=field)
             ref = path.as_posix()
             loaded = load_canonical_json(path)
             if not isinstance(loaded, Mapping):
@@ -365,6 +386,17 @@ def _validate_upstream_gates(
                 reasons.append(str(error))
                 continue
             raw = loaded
+        if gate_id == "stage2.G2.7b":
+            # S2.10 has a producer-specific Gate schema in addition to the
+            # generic GateRecord wire form.  Keep this compatibility at the
+            # boundary, but apply the same exact ID/status/hash checks before
+            # it can unlock G2.8.
+            identity, g27b_reasons = _validate_g27b(
+                raw, field=f"upstream.{gate_id}", data_root=data_root
+            )
+            hashes[gate_id] = identity
+            reasons.extend(g27b_reasons)
+            continue
         identity, gate_reasons = _gate_record(
             raw, gate_id=gate_id, field=f"upstream.{gate_id}", data_root=data_root
         )
@@ -373,18 +405,75 @@ def _validate_upstream_gates(
     return hashes, sorted(set(reasons))
 
 
-def _validate_g27b(value: Mapping[str, Any] | None, *, field: str) -> tuple[str | None, list[str]]:
+def _validate_g27b(
+    value: Mapping[str, Any] | None,
+    *,
+    field: str,
+    data_root: Path | None = None,
+) -> tuple[str | None, list[str]]:
     reasons: list[str] = []
     if value is None:
         return None, ["G2.7B_GATE_MISSING"]
+    # A server task-output may wrap the producer Gate.  Verify the wrapper
+    # identity and eligibility, then validate the nested S2.10 object instead
+    # of treating the wrapper as a different Gate schema.
+    nested = value.get("payload")
+    if isinstance(nested, Mapping):
+        expected_wrapper_fields = {
+            "schema_version",
+            "task_id",
+            "artifact_kind",
+            "config_hash",
+            "run_intent",
+            "formal_eligible",
+            "source_refs",
+            "payload",
+            "artifact_hash",
+        }
+        if value.get("schema_version") != "task-output-artifact-v1":
+            return None, ["G2.7B_WRAPPER_SCHEMA_MISMATCH"]
+        if set(value) != expected_wrapper_fields:
+            return None, ["G2.7B_WRAPPER_FIELDS_INVALID"]
+        if (
+            value.get("task_id") != "stage2.10_visualization_reporting_and_decision"
+            or not isinstance(value.get("artifact_kind"), str)
+            or not value.get("artifact_kind")
+            or value.get("run_intent") != "formal"
+            or value.get("formal_eligible") is not True
+            or not isinstance(value.get("config_hash"), str)
+            or _SHA256.fullmatch(value["config_hash"]) is None
+        ):
+            return None, ["G2.7B_WRAPPER_IDENTITY_INVALID"]
+        source_refs = value.get("source_refs")
+        if (
+            not isinstance(source_refs, list)
+            or not source_refs
+            or any(not isinstance(ref, str) or not ref for ref in source_refs)
+            or len(source_refs) != len(set(source_refs))
+        ):
+            return None, ["G2.7B_WRAPPER_SOURCE_REFS_INVALID"]
+        if data_root is not None:
+            try:
+                _check_declared_refs(source_refs, root=data_root, field=f"{field}.source_refs")
+            except S211DeliveryBlocked as error:
+                return None, [str(error)]
+        try:
+            _wrapper_hash, wrapper_declared = _payload_identity(value, field=field)
+        except S211DeliveryBlocked as error:
+            return None, [str(error)]
+        if not wrapper_declared:
+            reasons.append("G2.7B_WRAPPER_ARTIFACT_HASH_MISSING")
+        nested_hash, nested_reasons = _validate_g27b(
+            dict(nested), field=f"{field}.payload", data_root=data_root
+        )
+        return nested_hash, sorted(set(reasons + nested_reasons))
     try:
         record = GateRecord.from_mapping(dict(value))
     except Exception as error:
         # S2.10's producer-specific gate is accepted only if it still exposes
         # the same exact identity/status contract.
-        if value.get("schema_version") != "stage2-s210-g27b-gate-v1":
+        if value.get("schema_version") != S210_GATE_SCHEMA:
             return None, [f"G2.7B_GATE_INVALID:{type(error).__name__}"]
-        declared = value.get("artifact_hash")
         try:
             identity, has_hash = _payload_identity(value, field=field)
         except S211DeliveryBlocked as blocked:
@@ -395,13 +484,27 @@ def _validate_g27b(value: Mapping[str, Any] | None, *, field: str) -> tuple[str 
             reasons.append("G2.7B_GATE_ID_MISMATCH")
         if value.get("status") != "PASS":
             reasons.append("G2.7B_NOT_PASS")
+        if value.get("scope") not in {None, "formal"}:
+            reasons.append("G2.7B_GATE_SCOPE_NOT_FORMAL")
+        if (
+            "formal_eligible" in value
+            and value.get("formal_eligible") is not True
+        ) or (
+            "formal_eligible" not in value
+            and value.get("scope") != "formal"
+        ):
+            reasons.append("G2.7B_GATE_NOT_FORMAL")
+        if not isinstance(value.get("measured"), Mapping):
+            reasons.append("G2.7B_GATE_MEASURED_MISSING")
         return identity, reasons
     if record.gate_id != "stage2.G2.7b" or record.stage != 2:
         reasons.append("G2.7B_GATE_ID_MISMATCH")
     if record.effective_status() is not GateStatus.PASS:
         reasons.append("G2.7B_NOT_PASS")
     declared = value.get("artifact_hash")
-    if declared != record.artifact_hash:
+    if not isinstance(declared, str):
+        reasons.append("G2.7B_GATE_ARTIFACT_HASH_MISSING")
+    elif declared != record.artifact_hash:
         reasons.append("G2.7B_GATE_HASH_MISMATCH")
     return record.artifact_hash, reasons
 
@@ -416,6 +519,8 @@ def _lineage_entries(
         return [], ["STAGE2_LINEAGE_MISSING"], None
     identity, declared = _payload_identity(value, field=field)
     reasons: list[str] = []
+    if value.get("schema_version") != S211_LINEAGE_SCHEMA:
+        reasons.append("STAGE2_LINEAGE_SCHEMA_MISMATCH")
     raw: Any = value.get("tasks", value.get("entries", value.get("lineage", value.get("artifacts"))))
     entries: list[dict[str, Any]] = []
     if isinstance(raw, Mapping):
@@ -429,7 +534,17 @@ def _lineage_entries(
     if not entries:
         reasons.append("STAGE2_LINEAGE_ENTRIES_MISSING")
         return entries, reasons, identity
-    by_task = {item.get("task_id"): item for item in entries if isinstance(item.get("task_id"), str)}
+    by_task: dict[str, dict[str, Any]] = {}
+    duplicate_tasks: set[str] = set()
+    for item in entries:
+        task_id = item.get("task_id")
+        if not isinstance(task_id, str):
+            continue
+        if task_id in by_task:
+            duplicate_tasks.add(task_id)
+        by_task[task_id] = item
+    for task_id in sorted(duplicate_tasks):
+        reasons.append(f"STAGE2_LINEAGE_DUPLICATE:{task_id}")
     missing = [task_id for task_id in _STAGE2_TASKS if task_id not in by_task]
     if missing:
         reasons.append("STAGE2_LINEAGE_INCOMPLETE:" + ",".join(missing))
@@ -550,7 +665,12 @@ def _validate_replay(audit: Mapping[str, Any] | None, *, expected_31m_hash: str 
     for name, candidate in (("source_result_hash", source_hash), ("replay_result_hash", replay_hash)):
         if not isinstance(candidate, str) or _SHA256.fullmatch(candidate) is None:
             reasons.append(f"REPLAY_{name.upper()}_MISSING")
-    if isinstance(expected_31m_hash, str) and isinstance(audit.get("source_artifact_hash"), str) and audit.get("source_artifact_hash") != expected_31m_hash:
+    source_artifact_hash = audit.get("source_artifact_hash")
+    if not isinstance(source_artifact_hash, str) or _SHA256.fullmatch(source_artifact_hash) is None:
+        reasons.append("REPLAY_31M_SOURCE_HASH_MISSING")
+    elif not isinstance(expected_31m_hash, str):
+        reasons.append("REPLAY_31M_BOUNDARY_HASH_MISSING")
+    elif source_artifact_hash != expected_31m_hash:
         reasons.append("REPLAY_31M_SOURCE_HASH_MISMATCH")
     if audit.get("formal_eligible") is not True:
         reasons.append("REPLAY_NOT_FORMAL")
@@ -580,6 +700,9 @@ def _validate_delivery_role(
     assert payload is not None
     if not declared:
         reasons.append(f"DELIVERY_ROLE_ARTIFACT_HASH_MISSING:{role}")
+    expected_schema = _ROLE_SCHEMAS.get(role)
+    if expected_schema is not None and payload.get("schema_version") != expected_schema:
+        reasons.append(f"DELIVERY_ROLE_SCHEMA_MISMATCH:{role}")
     role_formal = payload.get("formal_eligible") is True
     estimator_object: Any = None
     if role == "estimator_decision":
@@ -907,6 +1030,10 @@ def run_s211_g28(
         if value is not None:
             boundary_values[role] = value
     reasons: list[str] = []
+    for role in sorted(set(boundary_values) - set(_BOUNDARY_ROLES)):
+        reasons.append(f"BOUNDARY_ROLE_UNSUPPORTED:{role}")
+    for role in sorted(set(role_values) - set(_DELIVERY_ROLES)):
+        reasons.append(f"DELIVERY_ROLE_UNSUPPORTED:{role}")
     try:
         g27b_payload, g27b_hash, g27b_declared = _read(g27b_gate, field="g27b_gate", data_root=resolved_data_root)
     except S211DeliveryBlocked as error:
@@ -938,6 +1065,15 @@ def run_s211_g28(
             reasons.append("G2.7B_DECISION_NOT_FORMAL")
         if not isinstance(decision_payload.get("selected_estimator"), str) or not decision_payload.get("selected_estimator"):
             reasons.append("G2.7B_DECISION_ESTIMATOR_MISSING")
+        try:
+            from .stage2 import EstimatorDecision
+
+            parsed_decision = EstimatorDecision.from_mapping(decision_payload)
+        except (TypeError, ValueError, RuntimeError) as error:
+            reasons.append(f"G2.7B_DECISION_INVALID:{type(error).__name__}")
+        else:
+            if not parsed_decision.formal_eligible:
+                reasons.append("G2.7B_DECISION_NOT_FORMAL_ELIGIBLE")
     if estimator_decision is not None and g27b_decision is not None:
         try:
             _estimator_payload, estimator_hash, _ = _read(
@@ -950,9 +1086,15 @@ def run_s211_g28(
                 reasons.append("ESTIMATOR_DECISION_DUPLICATE_MISMATCH")
         except S211DeliveryBlocked as error:
             reasons.append(str(error))
-    if g27b_payload is not None and isinstance(g27b_payload.get("measured"), Mapping) and decision_hash is not None:
-        expected = g27b_payload["measured"].get("decision_hash")
-        if expected is not None and expected != decision_hash:
+    if g27b_payload is not None:
+        gate_payload = g27b_payload
+        while isinstance(gate_payload.get("payload"), Mapping):
+            gate_payload = dict(gate_payload["payload"])
+        measured = gate_payload.get("measured")
+        expected = measured.get("decision_hash") if isinstance(measured, Mapping) else None
+        if not isinstance(expected, str) or _SHA256.fullmatch(expected) is None:
+            reasons.append("G2.7B_DECISION_HASH_MISSING")
+        elif decision_hash is None or expected != decision_hash:
             reasons.append("G2.7B_DECISION_HASH_MISMATCH")
 
     try:
@@ -1024,6 +1166,8 @@ def run_s211_g28(
         except S211DeliveryBlocked as error:
             reasons.append(str(error))
             consumer_commit = None
+    else:
+        reasons.append("CONSUMER_COMMIT_REQUIRED")
     sync_execution_commit = role_payloads.get("sync_report", {}).get("target_execution_commit")
     if producer_commit is not None and sync_execution_commit is not None and sync_execution_commit != producer_commit:
         reasons.append("SYNC_TARGET_EXECUTION_COMMIT_MISMATCH")
@@ -1126,7 +1270,7 @@ def run_s211_g28(
         payload = role_payloads.get(role)
         if payload is None:
             payload = {
-                "schema_version": f"stage2-s211-{role}-v1",
+                "schema_version": _ROLE_SCHEMAS.get(role, f"stage2-s211-{role}-v1"),
                 "task_id": S211_TASK_ID,
                 "role": role,
                 "status": "BLOCKED",
@@ -1154,12 +1298,14 @@ def run_s211_g28(
     }
     output_files: list[str] = []
     if output_root is not None:
-        output_candidate = Path(output_root)
-        try:
-            output_parent = output_candidate.parent.resolve(strict=False)
-            _inside_data_root(output_parent, root=resolved_data_root, field="output_root", must_exist=False)
-        except S211DeliveryBlocked as error:
-            raise
+        # Keep the publication target in DATA_ROOT and give relative targets
+        # the same stable meaning as all artifact references.
+        output_candidate = _resolve_data_root_ref(
+            output_root,
+            root=resolved_data_root,
+            field="output_root",
+            must_exist=False,
+        )
         if output_candidate.exists() and output_candidate.is_symlink():
             raise S211DeliveryBlocked("output_root:SYMLINK_REF_FORBIDDEN")
         output_files = _publish_atomic(output_candidate, files)
