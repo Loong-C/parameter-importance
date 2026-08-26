@@ -633,3 +633,102 @@ def test_s211_accepts_actual_producer_specific_g23_g24a_g26_gates(tmp_path: Path
     )
     assert result["status"] == "PASS"
     assert result["delivery_manifest"]["upstream_gate_hashes"]["stage2.G2.6"] == g26["artifact_hash"]
+
+
+def test_s211_cross_binds_g26_upstream_hashes(tmp_path: Path) -> None:
+    gate, decision, lineage, values, upstream, roles = _inputs(tmp_path)
+    g26 = _hashed({
+        "schema_version": "stage2-s208-g26-gate-v1",
+        "gate_id": "stage2.G2.6",
+        "stage": 2,
+        "status": "PASS",
+        "quality_gate_dependency": True,
+        "measured": {"six_primary_cells": True},
+        "threshold": {"frozen_thresholds": True},
+        "reasons": [],
+        "upstream_gate_hashes": {
+            "stage2.G2.3": "0" * 64,
+            "stage2.G2.4a": upstream["stage2.G2.4a"]["artifact_hash"],
+            "stage2.G2.4b": upstream["stage2.G2.4b"]["artifact_hash"],
+            "stage2.G2.5": upstream["stage2.G2.5"]["artifact_hash"],
+        },
+    })
+    upstream = dict(upstream)
+    upstream["stage2.G2.6"] = g26
+    result = run_s211_g28(
+        g27b_gate=gate,
+        g27b_decision=decision,
+        stage2_lineage=lineage,
+        boundary_refs={key: value for key, value in values.items() if key != "replay_audit_31m"},
+        replay_audit_31m=values["replay_audit_31m"],
+        data_root=tmp_path,
+        predecessor_gates=upstream,
+        delivery_refs=roles,
+        producer_commit="a" * 40,
+        consumer_commit="b" * 40,
+    )
+    assert result["status"] == "BLOCKED"
+    assert "G2.6_UPSTREAM_HASH_MISMATCH:stage2.G2.3" in result["delivery_manifest"]["reasons"]
+
+
+def test_s211_explicit_local_fixture_marker_cannot_pass(tmp_path: Path) -> None:
+    gate, decision, lineage, values, upstream, roles = _inputs(tmp_path)
+    boundary = dict(values["formal_31m"])
+    boundary.pop("artifact_hash", None)
+    boundary["local_fixture"] = True
+    boundaries = {key: value for key, value in values.items() if key != "replay_audit_31m"}
+    boundaries["formal_31m"] = _hashed(boundary)
+    result = run_s211_g28(
+        g27b_gate=gate,
+        g27b_decision=decision,
+        stage2_lineage=lineage,
+        boundary_refs=boundaries,
+        replay_audit_31m=values["replay_audit_31m"],
+        data_root=tmp_path,
+        predecessor_gates=upstream,
+        delivery_refs=roles,
+        producer_commit="a" * 40,
+        consumer_commit="b" * 40,
+    )
+    assert result["status"] == "BLOCKED"
+    assert "BOUNDARY_NOT_FORMAL:formal_31m" in result["delivery_manifest"]["reasons"]
+
+
+def test_s211_g23_evidence_ref_must_stay_under_data_root(tmp_path: Path) -> None:
+    gate, decision, lineage, values, upstream, roles = _inputs(tmp_path)
+    g23 = _hashed({
+        "schema_version": "stage2-g23-reference-evaluation-v1",
+        "gate_id": "stage2.G2.3",
+        "status": "PASS",
+        "formal_eligible": True,
+        "required_cell_count": 6,
+        "complete_cell_count": 6,
+        "expected_cell_ids": [
+            "pythia-14m:initialization", "pythia-14m:early", "pythia-14m:mid_late",
+            "pythia-31m-deduped:initialization", "pythia-31m-deduped:early", "pythia-31m-deduped:mid_late",
+        ],
+        "cells": [
+            {"cell_id": cell, "status": "PASS"}
+            for cell in (
+                "pythia-14m:initialization", "pythia-14m:early", "pythia-14m:mid_late",
+                "pythia-31m-deduped:initialization", "pythia-31m-deduped:early", "pythia-31m-deduped:mid_late",
+            )
+        ],
+        "evidence_refs": ["../outside-evidence.json"],
+    })
+    upstream = dict(upstream)
+    upstream["stage2.G2.3"] = g23
+    result = run_s211_g28(
+        g27b_gate=gate,
+        g27b_decision=decision,
+        stage2_lineage=lineage,
+        boundary_refs={key: value for key, value in values.items() if key != "replay_audit_31m"},
+        replay_audit_31m=values["replay_audit_31m"],
+        data_root=tmp_path,
+        predecessor_gates=upstream,
+        delivery_refs=roles,
+        producer_commit="a" * 40,
+        consumer_commit="b" * 40,
+    )
+    assert result["status"] == "BLOCKED"
+    assert any(reason.startswith("upstream.stage2.G2.3.evidence_refs") for reason in result["delivery_manifest"]["reasons"])
