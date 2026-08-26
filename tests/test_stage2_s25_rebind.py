@@ -603,6 +603,10 @@ def test_s205_gate_only_runs_fixture_gate_without_formal_plan(
             "g23_evaluation_hash": "b" * 64,
         },
     )
+    # Gate-only is a synthetic qualification fixture; isolate it from the
+    # user's intentionally dirty main checkout while production preflight
+    # continues to require a clean executor worktree.
+    monkeypatch.setattr(launcher, "_repository_commit", lambda _repository: "c" * 40)
     args = argparse.Namespace(
         data_root=tmp_path,
         s205_rebind_ref="evidence/stage2/s205-rebind.json",

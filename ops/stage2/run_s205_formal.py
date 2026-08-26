@@ -723,7 +723,15 @@ def _preflight(args: argparse.Namespace) -> dict[str, object]:
         artifact_root=args.artifact_root,
     )
     inventory, inventory_identity = _load_inventory_snapshot(args.gpu_inventory_json, data_root=root)
-    result["gpu"] = inventory
+    result["gpu"] = {
+        "schema_version": _GPU_INVENTORY_SCHEMA,
+        "approved_gpu_uuids": list(APPROVED_GPU_UUIDS),
+        "excluded_gpu_uuid": EXCLUDED_UUID,
+        "excluded_pci": EXCLUDED_PCI,
+        "inventory_count": len(inventory),
+        "inventory": inventory,
+        "compute_apps": inventory_identity["compute_apps"],
+    }
     # ``preflight_s25`` exposes the S2.4 execution commit.  Preserve it under
     # an explicit name and reserve the launcher-level execution_commit for the
     # exact clean HEAD whose source will run the six workers.
