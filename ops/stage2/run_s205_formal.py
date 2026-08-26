@@ -1041,6 +1041,7 @@ def _parser() -> argparse.ArgumentParser:
     action.add_argument("--status", action="store_true")
     action.add_argument("--wait", action="store_true")
     parser.add_argument("--detach", action="store_true", help="detach --execute and return a PID")
+    parser.add_argument("--detached-child", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--resume", action="store_true", help="resume a non-terminal status/run root")
     parser.add_argument("--data-root", type=Path, required=True)
     parser.add_argument("--s205-rebind-ref", required=True)
@@ -1079,6 +1080,8 @@ def _detach(args: argparse.Namespace, raw_argv: Sequence[str] | None = None) -> 
     if attempts.exists():
         receipt_candidates.extend(attempts.glob("*/launcher.pid.json"))
     for existing_path in receipt_candidates:
+        if not existing_path.exists():
+            continue
         if existing_path.is_symlink():
             raise S25ExecutionBlocked("S205_DETACHED_PID_INVALID")
         if not existing_path.is_file():
@@ -1126,6 +1129,8 @@ def _detach(args: argparse.Namespace, raw_argv: Sequence[str] | None = None) -> 
         child[commit_index + 1] = str(preflight["execution_commit"])
     else:
         child += ["--execution-commit", str(preflight["execution_commit"])]
+    if "--detached-child" not in child:
+        child.append("--detached-child")
     if "--repository" in child:
         repository_index = child.index("--repository")
         if repository_index + 1 >= len(child):
@@ -1171,6 +1176,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             return _detach(args, argv)
         if args.resume and not args.execute:
             raise S25ExecutionBlocked("S205_RESUME_REQUIRES_EXECUTE")
+        if args.resume and not args.detach and not args.detached_child:
+            raise S25ExecutionBlocked("S205_RESUME_REQUIRES_DETACH")
         if args.status:
             return _status(args, wait=False)
         if args.wait:

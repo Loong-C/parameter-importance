@@ -30,8 +30,10 @@ from ops.stage2.run_s205_formal import (
     _inventory,
     _load_inventory_snapshot,
     _load_materialization_index,
+    main,
     _parser,
     _repository_commit,
+    _detach,
     _validate_inventory,
     _worker,
 )
@@ -358,6 +360,85 @@ def test_launcher_detach_and_resume_are_execute_modifiers() -> None:
         "--artifact-root", "out", "--operations-root", "ops",
     ])
     assert args.execute is True and args.detach is True and args.resume is True
+
+
+def test_launcher_resume_requires_detached_parent() -> None:
+    assert main([
+        "--execute", "--resume", "--data-root", "root",
+        "--s205-rebind-ref", "rebind.json", "--input-index-ref", "inputs/index.json",
+        "--artifact-root", "out", "--operations-root", "ops",
+    ]) == 3
+
+
+def _detached_test_args(tmp_path: Path) -> object:
+    return type("DetachArgs", (), {
+        "execute": True,
+        "data_root": tmp_path,
+        "operations_root": "ops",
+        "run_id": "test-run",
+        "repository": Path(__file__).resolve().parents[1],
+        "python": Path("python"),
+    })()
+
+
+def _detached_test_preflight() -> dict[str, object]:
+    return {
+        "preflight_artifact_hash": "f" * 64,
+        "execution_commit": "a" * 40,
+        "launcher_source_sha256": "b" * 64,
+        "gpu_inventory_identity": {
+            "artifact_ref": "inventory.json",
+            "artifact_hash": "c" * 64,
+            "source_ref": "capture.raw",
+            "source_sha256": "d" * 64,
+        },
+    }
+
+
+def _write_pid_receipt(path: Path, pid: int) -> None:
+    value: dict[str, object] = {"schema_version": "stage2-s205-detached-launch-v1", "pid": pid}
+    value["artifact_hash"] = canonical_json_hash(value)
+    write_canonical_json(path, value)
+
+
+def test_first_detached_launch_creates_unique_attempt_receipt(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.setattr("ops.stage2.run_s205_formal._preflight", lambda _args: _detached_test_preflight())
+    monkeypatch.setattr("ops.stage2.run_s205_formal.subprocess.Popen", lambda *_args, **_kwargs: SimpleNamespace(pid=424242))
+    args = _detached_test_args(tmp_path)
+    assert _detach(args, ["--execute", "--detach"]) == 0
+    receipts = list((tmp_path / "ops" / "attempts").glob("*/launcher.pid.json"))
+    assert len(receipts) == 1
+    assert not (tmp_path / "ops" / "launcher.pid.json").exists()
+
+
+def test_detached_launch_allows_only_stale_receipts_and_preserves_them(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    operations = tmp_path / "ops"
+    attempts = operations / "attempts" / "old-attempt"
+    attempts.mkdir(parents=True)
+    _write_pid_receipt(operations / "launcher.pid.json", 999991)
+    _write_pid_receipt(attempts / "launcher.pid.json", 999992)
+    monkeypatch.setattr("ops.stage2.run_s205_formal._preflight", lambda _args: _detached_test_preflight())
+    monkeypatch.setattr("ops.stage2.run_s205_formal.os.kill", lambda *_args: (_ for _ in ()).throw(OSError()))
+    monkeypatch.setattr("ops.stage2.run_s205_formal.subprocess.Popen", lambda *_args, **_kwargs: SimpleNamespace(pid=424243))
+    args = _detached_test_args(tmp_path)
+    assert _detach(args, ["--execute", "--detach", "--resume"]) == 0
+    assert (operations / "launcher.pid.json").exists()
+    assert (attempts / "launcher.pid.json").exists()
+    assert len(list((operations / "attempts").glob("*/launcher.pid.json"))) == 2
+
+
+def test_detached_launch_blocks_live_receipt(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    operations = tmp_path / "ops"
+    attempts = operations / "attempts" / "live-attempt"
+    attempts.mkdir(parents=True)
+    _write_pid_receipt(attempts / "launcher.pid.json", 12345)
+    monkeypatch.setattr("ops.stage2.run_s205_formal._preflight", lambda _args: _detached_test_preflight())
+    monkeypatch.setattr("ops.stage2.run_s205_formal.os.kill", lambda *_args: None)
+    args = _detached_test_args(tmp_path)
+    with pytest.raises(S25ExecutionBlocked, match="S205_DETACHED_LAUNCH_ALREADY_RUNNING:12345"):
+        _detach(args, ["--execute", "--detach", "--resume"])
 
 
 def test_worker_requires_exact_visible_gpu_binding(monkeypatch: pytest.MonkeyPatch) -> None:
