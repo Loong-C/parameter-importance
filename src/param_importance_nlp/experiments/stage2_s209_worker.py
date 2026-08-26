@@ -15,6 +15,7 @@ import json
 import math
 import os
 from pathlib import Path
+import re
 import sys
 from typing import Any, Callable, Mapping, Sequence
 
@@ -33,11 +34,13 @@ from .stage2_s209_g27a import (
     _validate_stage1_numeric_comparison,
     _valid_stage1_numeric_ref,
 )
+from .stage2_s209_runner import S29_EXECUTION_IDENTITY_SCHEMA, _validate_execution_identity
 
 
 S209_WORKER_CONFIG_SCHEMA = "stage2-s209-profiler-worker-config-v1"
 _ACTUAL_MARKERS = {"actual", "device_actual"}
 _SHA256_LENGTH = 64
+_GIT_HEAD = re.compile(r"^[0-9a-f]{40}$")
 
 
 def _required_sha(environment: Mapping[str, str], name: str) -> str:
@@ -87,7 +90,49 @@ def _uuid_list(value: str, *, field: str) -> list[str]:
     return result
 
 
+def _execution_identity_from_environment(environment: Mapping[str, str]) -> dict[str, Any]:
+    """Reconstruct and verify the launch-time source/command identity."""
+
+    head = _required_text(environment, "S29_REPOSITORY_HEAD")
+    if _GIT_HEAD.fullmatch(head) is None:
+        raise S209WorkerBlocked("ENV_S29_REPOSITORY_HEAD_INVALID")
+    launcher_sha = _required_sha(environment, "S29_LAUNCHER_SOURCE_SHA256")
+    command_sha = _required_sha(environment, "S29_PROFILER_COMMAND_HASH")
+    identity_sha = _required_sha(environment, "S29_EXECUTION_IDENTITY_HASH")
+    body = {
+        "schema_version": S29_EXECUTION_IDENTITY_SCHEMA,
+        "repository_head": head,
+        "launcher_source_sha256": launcher_sha,
+        "profiler_command_hash": command_sha,
+        "repository_clean": True,
+    }
+    body["artifact_hash"] = identity_sha
+    try:
+        return _validate_execution_identity(body, field="worker.execution_identity")
+    except Exception as error:
+        if isinstance(error, S209WorkerBlocked):
+            raise
+        raise S209WorkerBlocked("ENV_S29_EXECUTION_IDENTITY_INVALID") from error
+
+
 def _task_from_environment(environment: Mapping[str, str]) -> dict[str, Any]:
+    identity_names = {
+        "S29_REPOSITORY_HEAD",
+        "S29_LAUNCHER_SOURCE_SHA256",
+        "S29_PROFILER_COMMAND_HASH",
+        "S29_EXECUTION_IDENTITY_HASH",
+    }
+    present_identity = identity_names & set(environment)
+    if present_identity and present_identity != identity_names:
+        raise S209WorkerBlocked("ENV_S29_EXECUTION_IDENTITY_INCOMPLETE")
+    formal_marker = environment.get("S29_FORMAL_EXECUTION") == "1"
+    if formal_marker or present_identity:
+        execution_identity = _execution_identity_from_environment(environment)
+    else:
+        # The importable helper remains useful for focused non-formal unit
+        # tests.  The production runner always sets the marker and all four
+        # identity values before invoking the CLI boundary.
+        execution_identity = None
     semantic = _required_text(environment, "S29_SEMANTIC")
     method = _required_text(environment, "S29_METHOD")
     if semantic not in (*S29_COST_SEMANTICS, "anchor"):
@@ -124,6 +169,8 @@ def _task_from_environment(environment: Mapping[str, str]) -> dict[str, Any]:
         "gpu_uuids": visible,
         "device_count": len(visible),
     }
+    if execution_identity is not None:
+        task["execution_identity"] = execution_identity
     if semantic == "anchor":
         candidate_or_reference_ref = _required_text(environment, "S29_STAGE1_NUMERIC_ARTIFACT_REF")
         try:
@@ -438,6 +485,34 @@ def _require_four_gpu_system_anchor(value: Mapping[str, Any], *, task: Mapping[s
         raise S209WorkerBlocked("FOUR_GPU_PER_DEVICE_BACKWARD_COUNT_MISMATCH")
 
 
+def _bind_execution_identity(value: Mapping[str, Any], *, task: Mapping[str, Any]) -> dict[str, Any]:
+    identity = task.get("execution_identity")
+    if not isinstance(identity, Mapping):
+        return dict(value)
+    fields = {
+        "repository_head": identity["repository_head"],
+        "launcher_source_sha256": identity["launcher_source_sha256"],
+        "profiler_command_hash": identity["profiler_command_hash"],
+        "execution_identity_hash": identity["artifact_hash"],
+    }
+
+    def bind(target: Mapping[str, Any], *, field: str) -> dict[str, Any]:
+        result = dict(target)
+        for name, expected in fields.items():
+            if name in result and result[name] != expected:
+                raise S209WorkerBlocked(f"{field}_{name.upper()}_DRIFT")
+            result[name] = expected
+        return result
+
+    output = bind(value, field="PROFILER_OUTPUT")
+    if task.get("semantic") == "scientific_equal_sample_cost":
+        rows = output.get("rows")
+        if not isinstance(rows, list):
+            raise S209WorkerBlocked("PROFILER_SHARED_RUN_ROWS_REQUIRED")
+        output["rows"] = [bind(row, field="PROFILER_SHARED_ROW") if isinstance(row, Mapping) else row for row in rows]
+    return output
+
+
 def _validate_backend_output(value: Any, *, task: Mapping[str, Any]) -> dict[str, Any]:
     if not isinstance(value, Mapping):
         raise S209WorkerBlocked("PROFILER_OUTPUT_OBJECT_REQUIRED")
@@ -553,7 +628,7 @@ def run_s209_profiler_worker(
         raise
     except Exception as error:
         raise S209WorkerBlocked(f"PROFILER_BACKEND_FAILED:{type(error).__name__}:{error}") from error
-    return _validate_backend_output(result, task=task)
+    return _validate_backend_output(_bind_execution_identity(result, task=task), task=task)
 
 
 def load_backend(specification: str) -> Callable[..., Mapping[str, Any]]:

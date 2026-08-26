@@ -55,7 +55,10 @@ S29_DECISION_RATIO = 1.25
 S29_CROSSCHECK_TOLERANCE = 0.25
 S29_STAGE1_NUMERIC_ARTIFACT_SCHEMA = "stage2-s209-stage1-raw-numeric-artifact-v1"
 S29_STAGE1_NUMERIC_COMPARISON_SCHEMA = "stage2-s209-stage1-raw-numeric-comparison-v1"
-S29_STAGE1_NUMERIC_REFERENCE_REF = "anchors/single-gpu-anchor.json#stage1_numeric_artifact"
+# Formal references identify persisted files, never JSON fragments.  The
+# anchor's embedded ``stage1_numeric_artifact`` is checked against this file
+# after reload, so a fragment would make the provenance ambiguous.
+S29_STAGE1_NUMERIC_REFERENCE_REF = "anchors/single-gpu-anchor.json"
 S29_STAGE1_NUMERIC_CANDIDATE_REF = "anchors/four-gpu-stage1-numeric.json"
 S29_STAGE1_TOLERANCE_PROFILE = {
     "name": "T64_ORACLE",
@@ -65,6 +68,8 @@ S29_STAGE1_TOLERANCE_PROFILE = {
     "rtol": 1e-10,
     "normalized_l2_limit": 1e-10,
 }
+S29_EXECUTION_IDENTITY_SCHEMA = "stage2-s209-execution-identity-v1"
+_GIT_HEAD = re.compile(r"^[0-9a-f]{40}$")
 
 
 def _valid_stage1_numeric_ref(value: Any, *, suffix: str, field: str) -> str:
@@ -72,11 +77,72 @@ def _valid_stage1_numeric_ref(value: Any, *, suffix: str, field: str) -> str:
 
     if not isinstance(value, str) or not value or "\\" in value or value.startswith("/") or ":" in value:
         raise S29G27ABlocked(f"{field}:DATA_ROOT_POSIX_REF_REQUIRED")
-    path_part = value.split("#", 1)[0]
-    logical = PurePosixPath(path_part)
-    if logical.is_absolute() or any(part in {"", ".", ".."} for part in logical.parts) or not path_part.endswith(suffix):
+    if "#" in value:
+        raise S29G27ABlocked(f"{field}:DATA_ROOT_POSIX_REF_FRAGMENT_FORBIDDEN")
+    logical = PurePosixPath(value)
+    if logical.is_absolute() or any(part in {"", ".", ".."} for part in logical.parts) or not value.endswith(suffix):
         raise S29G27ABlocked(f"{field}:DATA_ROOT_POSIX_REF_INVALID")
     return value
+
+
+def _formal_file(root: Path, reference: Any, *, filename: str, field: str) -> tuple[dict[str, Any], str]:
+    """Reload one persisted formal anchor; caller mappings never grant authority."""
+
+    if not isinstance(reference, str) or not reference or "#" in reference or "\\" in reference:
+        raise S29G27ABlocked(f"{field}:PERSISTED_POSIX_REF_REQUIRED")
+    path_ref = PurePosixPath(reference)
+    if path_ref.is_absolute() or any(part in {"", ".", ".."} for part in path_ref.parts) or not reference.endswith(filename):
+        raise S29G27ABlocked(f"{field}:PERSISTED_POSIX_REF_INVALID")
+    current = root.resolve()
+    for part in path_ref.parts:
+        current = current / part
+        if current.is_symlink():
+            raise S29G27ABlocked(f"{field}:SYMLINK_COMPONENT_FORBIDDEN")
+    path = current.resolve()
+    try:
+        path.relative_to(root.resolve())
+    except ValueError as error:
+        raise S29G27ABlocked(f"{field}:PATH_ESCAPE") from error
+    if path.name != filename or not path.is_file():
+        raise S29G27ABlocked(f"{field}:PERSISTED_FILE_REQUIRED")
+    try:
+        value = load_canonical_json(path)
+    except Exception as error:
+        raise S29G27ABlocked(f"{field}:CANONICAL_READ_FAILED") from error
+    if not isinstance(value, Mapping):
+        raise S29G27ABlocked(f"{field}:OBJECT_REQUIRED")
+    payload = dict(value)
+    declared = payload.get("artifact_hash")
+    if not isinstance(declared, str) or _SHA256.fullmatch(declared) is None:
+        raise S29G27ABlocked(f"{field}:ARTIFACT_HASH_REQUIRED")
+    if canonical_json_hash({key: item for key, item in payload.items() if key != "artifact_hash"}) != declared:
+        raise S29G27ABlocked(f"{field}:ARTIFACT_HASH_MISMATCH")
+    return payload, reference
+
+
+def _validate_execution_identity(value: Any) -> dict[str, Any]:
+    if not isinstance(value, Mapping):
+        raise S29G27ABlocked("EXECUTION_IDENTITY_REQUIRED")
+    payload = dict(value)
+    required = {
+        "schema_version",
+        "repository_head",
+        "launcher_source_sha256",
+        "profiler_command_hash",
+        "repository_clean",
+        "artifact_hash",
+    }
+    if set(payload) != required or payload.get("schema_version") != S29_EXECUTION_IDENTITY_SCHEMA:
+        raise S29G27ABlocked("EXECUTION_IDENTITY_SCHEMA_INVALID")
+    if not isinstance(payload.get("repository_head"), str) or _GIT_HEAD.fullmatch(payload["repository_head"]) is None:
+        raise S29G27ABlocked("EXECUTION_IDENTITY_HEAD_INVALID")
+    for name in ("launcher_source_sha256", "profiler_command_hash", "artifact_hash"):
+        _sha(payload.get(name), field=f"execution_identity.{name}")
+    if payload.get("repository_clean") is not True:
+        raise S29G27ABlocked("EXECUTION_IDENTITY_REPOSITORY_DIRTY")
+    if canonical_json_hash({key: item for key, item in payload.items() if key != "artifact_hash"}) != payload["artifact_hash"]:
+        raise S29G27ABlocked("EXECUTION_IDENTITY_HASH_MISMATCH")
+    return payload
 S29_TIMING_FIELDS = (
     "data_wait_seconds",
     "forward_seconds",
@@ -1052,7 +1118,6 @@ def _health_reasons(snapshot: Any, *, expected_io: bool) -> tuple[list[str], lis
         "gpu_class",
         "gpu_uuids",
         "ecc_errors",
-        "xid_errors",
         "inventory_artifact_hash",
         "inventory_source_sha256",
     )
@@ -1065,8 +1130,15 @@ def _health_reasons(snapshot: Any, *, expected_io: bool) -> tuple[list[str], lis
     uuids = snapshot.get("gpu_uuids")
     if not isinstance(uuids, list) or not uuids or len(set(uuids)) != len(uuids) or any(uuid not in APPROVED_GPU_UUIDS for uuid in uuids):
         blockers.append("APPROVED_GPU_UUIDS_REQUIRED")
-    if snapshot.get("ecc_errors") != 0 or snapshot.get("xid_errors") != 0:
+    if snapshot.get("ecc_errors") != 0:
         blockers.append("GPU_ERROR_COUNTER_NONZERO")
+    if "xid_errors" in snapshot:
+        if snapshot.get("xid_errors") != 0:
+            blockers.append("GPU_ERROR_COUNTER_NONZERO")
+    else:
+        health_states = snapshot.get("health_states")
+        if not isinstance(health_states, list) or not health_states or any(str(item).strip().upper() != "HEALTHY" for item in health_states):
+            blockers.append("GPU_HEALTH_STATE_NOT_CLEAN")
     try:
         _sha(snapshot.get("inventory_artifact_hash"), field="health.inventory_artifact_hash")
         _sha(snapshot.get("inventory_source_sha256"), field="health.inventory_source_sha256")
@@ -1716,6 +1788,11 @@ def run_s209_g27a(
     measurement_plan: Mapping[str, Any] | str | Path | None = None,
     matrix_ref: str = "g24b-matrix.json",
     raw_manifest_ref: str = "raw-results-manifest.json",
+    execution_identity: Mapping[str, Any] | None = None,
+    data_root: str | Path | None = None,
+    single_gpu_anchor_ref: str | None = None,
+    four_gpu_anchor_ref: str | None = None,
+    four_gpu_numeric_ref: str | None = None,
 ) -> dict[str, Any]:
     """Reduce supplied formal profiler rows and produce the G2.7a decision.
 
@@ -1737,6 +1814,47 @@ def run_s209_g27a(
     validated_measurement_plan = _validate_measurement_plan(measurement_plan, frozen=frozen) if measurement_plan is not None else None
     if validated_measurement_plan is not None and validated_measurement_plan["run_id"] != run_id:
         raise S29G27ABlocked("MEASUREMENT_PLAN_RUN_ID_MISMATCH")
+    validated_execution_identity = (
+        _validate_execution_identity(execution_identity)
+        if execution_identity is not None
+        else None
+    )
+    if validated_execution_identity is not None:
+        if data_root is None or single_gpu_anchor_ref is None or four_gpu_anchor_ref is None or four_gpu_numeric_ref is None:
+            raise S29G27ABlocked("FORMAL_ANCHOR_PERSISTED_REFERENCES_REQUIRED")
+        formal_root = Path(data_root).resolve()
+        persisted_single, persisted_single_ref = _formal_file(
+            formal_root,
+            single_gpu_anchor_ref,
+            filename="single-gpu-anchor.json",
+            field="single_gpu_anchor_ref",
+        )
+        persisted_four, persisted_four_ref = _formal_file(
+            formal_root,
+            four_gpu_anchor_ref,
+            filename="four-gpu-anchor.json",
+            field="four_gpu_anchor_ref",
+        )
+        persisted_numeric, persisted_numeric_ref = _formal_file(
+            formal_root,
+            four_gpu_numeric_ref,
+            filename="four-gpu-stage1-numeric.json",
+            field="four_gpu_numeric_ref",
+        )
+        if isinstance(single_gpu_anchor, Mapping) and dict(single_gpu_anchor) != persisted_single:
+            raise S29G27ABlocked("FORMAL_SINGLE_ANCHOR_CALLER_MAPPING_DRIFT")
+        if isinstance(four_gpu_anchor, Mapping) and dict(four_gpu_anchor) != persisted_four:
+            raise S29G27ABlocked("FORMAL_FOUR_ANCHOR_CALLER_MAPPING_DRIFT")
+        single_gpu_anchor = persisted_single
+        four_gpu_anchor = persisted_four
+        try:
+            candidate = _validate_stage1_numeric_artifact(persisted_numeric, role="four_gpu_candidate")
+        except Exception as error:
+            raise S29G27ABlocked("FORMAL_FOUR_NUMERIC_SIDECAR_INVALID") from error
+        if persisted_four.get("stage1_numeric_artifact") != candidate or persisted_four.get("stage1_numeric_artifact_ref") != persisted_numeric_ref:
+            raise S29G27ABlocked("FORMAL_FOUR_NUMERIC_SIDECAR_BINDING_DRIFT")
+        if persisted_single.get("stage1_numeric_artifact_ref") != persisted_single_ref:
+            raise S29G27ABlocked("FORMAL_SINGLE_NUMERIC_REFERENCE_REF_DRIFT")
     if not isinstance(cost_observations, Mapping) or set(cost_observations) != set(S29_COST_SEMANTICS):
         raise S29G27ABlocked("COST_SEMANTICS_EXACTLY_THREE_REQUIRED")
     reducer = StrictS29Reducer(frozen, run_id=run_id)
@@ -1852,6 +1970,15 @@ def run_s209_g27a(
         "shared_pool_artifact_hashes": sorted({str(item["shared_pool_artifact_hash"]) for item in shared_pairs}),
         "shared_attribution_crosscheck_hash": None if generated_crosscheck is None else generated_crosscheck["artifact_hash"],
     }
+    if validated_execution_identity is not None:
+        measured.update(
+            {
+                "repository_head": validated_execution_identity["repository_head"],
+                "launcher_source_sha256": validated_execution_identity["launcher_source_sha256"],
+                "profiler_command_hash": validated_execution_identity["profiler_command_hash"],
+                "execution_identity_hash": validated_execution_identity["artifact_hash"],
+            }
+        )
     gate = GateRecord(
         gate_id="stage2.G2.7a",
         stage=2,
@@ -1902,6 +2029,8 @@ def run_s209_g27a(
         "gate": gate.to_dict(),
         "reasons": list(reasons),
     }
+    if validated_execution_identity is not None:
+        report["execution_identity"] = validated_execution_identity
     report["artifact_hash"] = canonical_json_hash(report)
     if output_root is not None:
         root = Path(output_root)
