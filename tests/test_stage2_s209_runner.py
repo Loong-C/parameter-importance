@@ -17,15 +17,19 @@ from param_importance_nlp.experiments.stage2_s207_formal import (
     EXCLUDED_PCI,
 )
 from param_importance_nlp.experiments.stage2_s209_runner import (
+    S29_COUNT_FIELDS,
     S29_INVENTORY_SCHEMA,
     S29_IO_SCHEMA,
+    S29_TIMING_FIELDS,
     S29RunnerBlocked,
     S29StatusStore,
     _task_list,
+    _validate_measured_row,
     _load_inventory_envelope,
     validate_s209_gpu_inventory,
     validate_s209_io_evidence,
 )
+from param_importance_nlp.experiments.stage2_s209_g27a import S29FrozenInputs
 
 
 def _inventory() -> list[dict[str, object]]:
@@ -207,6 +211,7 @@ def test_s209_status_store_rejects_frozen_identity_tamper(tmp_path: Path) -> Non
 def test_s209_task_list_is_single_gpu_for_every_method_task() -> None:
     preflight = SimpleNamespace(
         measurement_plan={
+            "run_id": "s209-run",
             "rows": [
                 {"anchor_id": "anchor-a", "repetition": 0, "method_order": ["double", "raw", "u"]},
                 {"anchor_id": "anchor-a", "repetition": 1, "method_order": ["raw", "u", "double"]},
@@ -221,6 +226,79 @@ def test_s209_task_list_is_single_gpu_for_every_method_task() -> None:
     assert all(task["device_count"] == 1 for task in tasks)
     assert all(task["gpu_uuid"] in APPROVED_GPU_UUIDS for task in tasks)
     assert all(len(str(task["gpu_uuid"])) > 0 for task in tasks)
+
+
+def test_s209_task_list_rejects_plan_run_id_rebinding() -> None:
+    preflight = SimpleNamespace(
+        measurement_plan={
+            "run_id": "planned-run",
+            "rows": [
+                {"anchor_id": "anchor-a", "repetition": 0, "method_order": ["double", "raw", "u"]},
+            ],
+        }
+    )
+    with pytest.raises(S29RunnerBlocked, match="MEASUREMENT_PLAN_RUN_ID_MISMATCH"):
+        _task_list(preflight, run_id="different-run")
+
+
+def test_s209_four_card_anchor_requires_worker_gpu_uuid_set() -> None:
+    frozen = S29FrozenInputs(
+        matrix_hash="a" * 64,
+        g24b_gate_hash="b" * 64,
+        raw_manifest_hash="c" * 64,
+        raw_run_id="s207-run",
+        plan_hash="d" * 64,
+        mapping_hash="e" * 64,
+        sampling_plan_hash="f" * 64,
+        expected_unit_ids=("unit-0",),
+        batch_size=32,
+        microbatch_count=16,
+        repetitions=2,
+        completion_denominator=1,
+    )
+    task = {
+        "semantic": "anchor",
+        "method": "anchor",
+        "anchor_id": "four-gpu-anchor",
+        "repetition": 0,
+        "run_id": "s209-run",
+        "gpu_uuid": APPROVED_GPU_UUIDS[0],
+        "gpu_uuids": list(APPROVED_GPU_UUIDS),
+        "device_count": 4,
+    }
+    row: dict[str, object] = {
+        "measurement_kind": "actual",
+        "measured": True,
+        "gpu_uuids": list(APPROVED_GPU_UUIDS),
+        "source_raw_run_id": "s207-run",
+        "matrix_hash": "a" * 64,
+        "raw_manifest_hash": "c" * 64,
+        "batch_size": 32,
+        "microbatch_count": 16,
+        "inventory_artifact_hash": "1" * 64,
+        "inventory_source_sha256": "2" * 64,
+        "cost_io_quiescent": True,
+        "health_ok": True,
+    }
+    row.update({name: 0.1 for name in S29_TIMING_FIELDS})
+    row.update({"wall_seconds": 10.0, "allocated_peak_bytes": 100, "reserved_peak_bytes": 120, "device_peak_bytes": 140})
+    row.update({name: (0 if name.endswith("bytes") else 1) for name in S29_COUNT_FIELDS})
+    validated = _validate_measured_row(
+        row,
+        task=task,
+        frozen=frozen,
+        io_evidence={"artifact_hash": "3" * 64, "cost_io_quiescent": True},
+        inventory_identity={"artifact_hash": "1" * 64, "source_sha256": "2" * 64},
+    )
+    assert validated["device_count"] == 4
+    with pytest.raises(S29RunnerBlocked, match="PROFILER_GPU_UUID_SET_INVALID"):
+        _validate_measured_row(
+            {**row, "gpu_uuids": [APPROVED_GPU_UUIDS[0]]},
+            task=task,
+            frozen=frozen,
+            io_evidence={"artifact_hash": "3" * 64, "cost_io_quiescent": True},
+            inventory_identity={"artifact_hash": "1" * 64, "source_sha256": "2" * 64},
+        )
 
 
 def test_s209_detach_rejects_duplicate_launch_lease(monkeypatch, tmp_path: Path) -> None:

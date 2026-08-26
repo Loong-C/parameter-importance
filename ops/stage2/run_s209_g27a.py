@@ -236,6 +236,8 @@ def _execute(args: argparse.Namespace) -> dict[str, Any]:
         capacity_ref=args.capacity_ref,
         ulimit_ref=args.ulimit_ref,
     )
+    if preflight.measurement_plan.get("run_id") != args.run_id:
+        raise S29RunnerBlocked("MEASUREMENT_PLAN_RUN_ID_MISMATCH")
     root = args.data_root.resolve()
     single_anchor = _load_optional(root, args.single_gpu_anchor_ref, field="single_gpu_anchor")
     four_anchor = _load_optional(root, args.four_gpu_anchor_ref, field="four_gpu_anchor")
@@ -319,6 +321,8 @@ def _status(args: argparse.Namespace, *, wait: bool) -> int:
         capacity_ref=args.capacity_ref,
         ulimit_ref=args.ulimit_ref,
     )
+    if preflight.measurement_plan.get("run_id") != args.run_id:
+        raise S29RunnerBlocked("MEASUREMENT_PLAN_RUN_ID_MISMATCH")
     inventory_identity = preflight.inventory.get("inventory_identity")
     if not isinstance(inventory_identity, Mapping):
         raise S29RunnerBlocked("STATUS_INVENTORY_IDENTITY_MISSING")

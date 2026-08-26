@@ -271,6 +271,7 @@ def _validate_measurement_plan(value: Any, *, frozen: S29FrozenInputs) -> dict[s
     if payload.get("schema_version") != S29_MEASUREMENT_PLAN_SCHEMA or payload.get("task_id") != S29_TASK_ID:
         raise S29G27ABlocked("MEASUREMENT_PLAN_SCHEMA_INVALID")
     _verify_hash(payload, field="measurement_plan")
+    _id(payload.get("run_id"), field="measurement_plan.run_id")
     for field, expected in (("matrix_hash", frozen.matrix_hash), ("raw_manifest_hash", frozen.raw_manifest_hash), ("source_raw_run_id", frozen.raw_run_id), ("g25_gate_hash", frozen.g25_gate_hash)):
         if payload.get(field) != expected:
             raise S29G27ABlocked(f"MEASUREMENT_PLAN_{field.upper()}_MISMATCH")
