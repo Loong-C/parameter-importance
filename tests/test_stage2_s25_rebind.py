@@ -39,6 +39,22 @@ CONFIG_HASH = "b" * 64
 G23_ROOT = "evidence/stage2/s204/formal-r19-g3-v5/g23-evaluation"
 CORRECTED_BATCH_SIZES = [32, 64, 128, 256]
 CORRECTED_SOURCE = "g23_output_derived_corrected_sidecar"
+SOURCE_COMMIT = "3" * 40
+EVALUATOR_COMMIT = "4" * 40
+EVALUATOR_SOURCE_SHA = "5" * 64
+
+
+def _sizing_nodes() -> list[dict[str, object]]:
+    return [
+        {
+            "sample_count": count,
+            "state_digest": f"{count:064x}",
+            "shard_refs_hash": "6" * 64,
+            "mean_hash": "7" * 64,
+            "sequence_variance_hash": "8" * 64,
+        }
+        for count in (131072, 262144)
+    ]
 
 
 def _spec(
@@ -241,19 +257,76 @@ def _write_ready_inputs(tmp_path: Path, *, g23: bool = True) -> None:
             tmp_path / spec.s204_prepared_root / "environments" / f"{component}.json",
             environment,
         )
+        old_table = {
+            endpoint: {"131072": 1.0, "262144": 1.0}
+            for endpoint in ("model_total", "layer", "module")
+        }
         source = {
             "schema_version": "stage2-reference-delta-sci-v2",
-            "cell_id": cell_id,
-            "delta_sci_by_endpoint": {"model_total": {"32": 1.0}},
+            "source_kind": "reference_sizing_bounded_online",
+            "formula_contract_hash": "9" * 64,
+            "formula_version": "stage2-reference-sizing-margin-v1",
+            "formula": "delta_sci=max(0.10*Delta,0.01*S); a=mu_sizing^2; d=sigma_squared_over_B",
+            "absolute_floors": {
+                "tau_model": 1e-12,
+                "tau_layer": 1e-12,
+                "tau_module": 1e-12,
+                "tau_coord": 1e-12,
+                "tau_nmse": 1e-12,
+            },
+            "reference_id": "reference-r23",
+            "sizing_result_hash": "a" * 64,
+            "sizing_plan_hash": "b" * 64,
+            "registry_hash": "c" * 64,
+            "candidate_sample_counts": [131072, 262144],
+            "delta_sci_by_endpoint": old_table,
+            "signal_scale_by_endpoint": old_table,
+            "noise_scale_by_endpoint": old_table,
+            "sizing_nodes": _sizing_nodes(),
         }
         source["artifact_hash"] = canonical_json_hash(source)
         source_ref = f"evidence/stage2/g23-source/{component}.json"
         write_canonical_json(tmp_path / source_ref, source)
+        signal = {
+            endpoint: {str(batch): 2.0 for batch in CORRECTED_BATCH_SIZES}
+            for endpoint in ("model_total", "layer", "module")
+        }
+        noise = {
+            endpoint: {str(batch): 0.7 / batch for batch in CORRECTED_BATCH_SIZES}
+            for endpoint in ("model_total", "layer", "module")
+        }
+        delta = {
+            endpoint: {
+                key: max(0.10 * values[key], 0.01 * signal[endpoint][key])
+                for key in values
+            }
+            for endpoint, values in noise.items()
+        }
         sidecar = {
             "schema_version": "stage2-g23-corrected-delta-sci-v1",
+            "source_producer_schema_version": source["schema_version"],
             "source_producer_ref": source_ref,
             "source_producer_artifact_hash": source["artifact_hash"],
+            "source_producer_table_mode": "sizing_nodes_legacy",
+            "source_producer_commit": SOURCE_COMMIT,
+            "evaluator_commit": EVALUATOR_COMMIT,
+            "evaluator_source_sha256": EVALUATOR_SOURCE_SHA,
+            "formula_contract_hash": source["formula_contract_hash"],
+            "formula_version": source["formula_version"],
+            "formula": source["formula"],
+            "absolute_floors": source["absolute_floors"],
+            "reference_id": source["reference_id"],
+            "sizing_result_hash": source["sizing_result_hash"],
+            "sizing_plan_hash": source["sizing_plan_hash"],
+            "registry_hash": source["registry_hash"],
+            "candidate_sample_counts": [131072, 262144],
             "delta_sci_batch_sizes": CORRECTED_BATCH_SIZES,
+            "selected_sample_count_per_stream": 262144,
+            "delta_sci_by_endpoint": delta,
+            "signal_scale_by_endpoint": signal,
+            "noise_scale_by_endpoint": noise,
+            "sizing_nodes": source["sizing_nodes"],
+            "correction_reason": "producer_delta_sci_keyed_by_sizing_nodes; S2.6_requires_candidate_batch_sizes",
         }
         sidecar["artifact_hash"] = canonical_json_hash(sidecar)
         corrected_hash = sidecar["artifact_hash"]
@@ -263,9 +336,16 @@ def _write_ready_inputs(tmp_path: Path, *, g23: bool = True) -> None:
             {
                 "cell_id": cell_id,
                 "status": "PASS",
+                "formal_eligible": True,
                 "identities": {
+                    "cell_id": cell_id,
                     "result_hash": result["result_hash"],
                     "config_hash": CONFIG_HASH,
+                    "producer_commit": SOURCE_COMMIT,
+                    "sizing_plan_hash": source["sizing_plan_hash"],
+                    "sizing_result_hash": source["sizing_result_hash"],
+                    "reference_id": source["reference_id"],
+                    "registry_hash": source["registry_hash"],
                     "corrected_delta_sci_hash": corrected_hash,
                     "corrected_delta_sci_ref": corrected_ref,
                 },
@@ -287,6 +367,14 @@ def _write_ready_inputs(tmp_path: Path, *, g23: bool = True) -> None:
             "complete_cell_count": 6,
             "expected_cell_ids": list(EXPECTED_CELL_IDS),
             "cells": g23_cells,
+            "calculator": {
+                "producer_commit": SOURCE_COMMIT,
+                "evaluator_commit": EVALUATOR_COMMIT,
+                "source_sha256": EVALUATOR_SOURCE_SHA,
+                "source_schema": "stage2-g23-reference-evaluation-v1",
+            },
+            "thresholds": {},
+            "reasons": [],
         }
         evaluation["artifact_hash"] = canonical_json_hash(evaluation)
         write_canonical_json(
@@ -407,6 +495,47 @@ def test_rebind_blocks_duplicate_complete_s204_status(tmp_path: Path) -> None:
     )
     write_canonical_json(duplicate, original)
     with pytest.raises(S25RebindBlocked, match="S204_STATUS_NOT_UNIQUE"):
+        prepare_s25_rebind(spec)
+
+
+@pytest.mark.parametrize("mutation", ["wrong_cell", "failed"])
+def test_rebind_blocks_mixed_valid_and_semantically_invalid_status_candidates(
+    tmp_path: Path, mutation: str
+) -> None:
+    """A valid attempt cannot hide a wrong-cell or failed candidate."""
+
+    _write_ready_inputs(tmp_path)
+    spec = _spec(tmp_path)
+    component = CELL_COMPONENTS[EXPECTED_CELL_IDS[0]]
+    original_path = (
+        tmp_path
+        / spec.s204_run_root
+        / component
+        / "attempts"
+        / "fresh"
+        / "final-status.json"
+    )
+    invalid = dict(load_canonical_json(original_path))
+    if mutation == "wrong_cell":
+        invalid["cell_id"] = EXPECTED_CELL_IDS[1]
+    else:
+        invalid["status"] = "FAILED"
+    invalid["artifact_hash"] = canonical_json_hash(
+        {key: value for key, value in invalid.items() if key != "artifact_hash"}
+    )
+    contaminated_path = (
+        tmp_path
+        / spec.s204_run_root
+        / component
+        / "attempts"
+        / "contaminated"
+        / "final-status.json"
+    )
+    write_canonical_json(contaminated_path, invalid)
+    with pytest.raises(
+        S25RebindBlocked,
+        match="STATUS_CANDIDATE_SEMANTICS_INVALID",
+    ):
         prepare_s25_rebind(spec)
 
 

@@ -2,6 +2,7 @@
 
 from copy import deepcopy
 import hashlib
+import os
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -34,6 +35,7 @@ from ops.stage2.run_s205_formal import (
     _parser,
     _repository_commit,
     _detach,
+    _load_detached_child_receipt,
     _validate_inventory,
     _worker,
 )
@@ -485,12 +487,31 @@ def _detached_test_preflight() -> dict[str, object]:
             "artifact_hash": "c" * 64,
             "source_ref": "capture.raw",
             "source_sha256": "d" * 64,
+            "schema_version": "stage2-s206-gpu-inventory-v1",
         },
     }
 
 
-def _write_pid_receipt(path: Path, pid: int) -> None:
-    value: dict[str, object] = {"schema_version": "stage2-s205-detached-launch-v1", "pid": pid}
+def _write_pid_receipt(path: Path, pid: int, *, child_argv_sha256: str = "c" * 64) -> None:
+    attempt_id = path.parent.name if path.parent.name != "ops" else "legacy"
+    attempt_ref = f"ops/attempts/{attempt_id}"
+    value: dict[str, object] = {
+        "schema_version": "stage2-s205-detached-launch-v1",
+        "attempt_id": attempt_id,
+        "attempt_ref": attempt_ref,
+        "pid": pid,
+        "run_id": "test-run",
+        "operations_root": "ops",
+        "log_ref": f"{attempt_ref}/launcher.log",
+        "status_ref": "ops/status.json",
+        "gpu_inventory_identity": _detached_test_preflight()["gpu_inventory_identity"],
+        "preflight_artifact_hash": "f" * 64,
+        "execution_commit": "a" * 40,
+        "s204_execution_commit": "e" * 40,
+        "launcher_source_sha256": "b" * 64,
+        "confirmatory_draws_generated": False,
+        "child_argv_sha256": child_argv_sha256,
+    }
     value["artifact_hash"] = canonical_json_hash(value)
     write_canonical_json(path, value)
 
@@ -533,6 +554,97 @@ def test_detached_launch_blocks_live_receipt(monkeypatch: pytest.MonkeyPatch, tm
     args = _detached_test_args(tmp_path)
     with pytest.raises(S25ExecutionBlocked, match="S205_DETACHED_LAUNCH_ALREADY_RUNNING:12345"):
         _detach(args, ["--execute", "--detach", "--resume"])
+
+
+def test_detached_attempt_unknown_entry_fails_closed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    operations = tmp_path / "ops"
+    attempt = operations / "attempts" / "contaminated"
+    attempt.mkdir(parents=True)
+    write_canonical_json(attempt / "unexpected.json", {"status": "unknown"})
+    monkeypatch.setattr("ops.stage2.run_s205_formal._preflight", lambda _args: _detached_test_preflight())
+    args = _detached_test_args(tmp_path)
+    with pytest.raises(S25ExecutionBlocked, match="S205_DETACHED_ATTEMPT_UNKNOWN_ENTRY"):
+        _detach(args, ["--execute", "--detach"])
+
+
+def test_detached_spawn_failure_is_recorded_as_immutable_marker(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr("ops.stage2.run_s205_formal._preflight", lambda _args: _detached_test_preflight())
+
+    def fail_spawn(*_args: object, **_kwargs: object) -> object:
+        raise OSError("spawn failed")
+
+    monkeypatch.setattr("ops.stage2.run_s205_formal.subprocess.Popen", fail_spawn)
+    args = _detached_test_args(tmp_path)
+    with pytest.raises(OSError, match="spawn failed"):
+        _detach(args, ["--execute", "--detach"])
+    failures = list((tmp_path / "ops" / "attempts").glob("*/launcher.failure.json"))
+    assert len(failures) == 1
+    failure = load_canonical_json(failures[0])
+    assert failure["status"] == "SPAWN_FAILED"
+    assert failure["pid"] is None
+    assert failure["artifact_hash"] == canonical_json_hash(
+        {key: item for key, item in failure.items() if key != "artifact_hash"}
+    )
+
+
+def test_detached_receipt_write_failure_terminates_child_and_records_marker(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr("ops.stage2.run_s205_formal._preflight", lambda _args: _detached_test_preflight())
+    calls: list[str] = []
+
+    class FakeProcess:
+        pid = 424244
+
+        def terminate(self) -> None:
+            calls.append("terminate")
+
+        def wait(self, *, timeout: int) -> None:
+            calls.append(f"wait:{timeout}")
+
+    monkeypatch.setattr(
+        "ops.stage2.run_s205_formal.subprocess.Popen",
+        lambda *_args, **_kwargs: FakeProcess(),
+    )
+
+    def fail_receipt(*_args: object, **_kwargs: object) -> None:
+        raise OSError("receipt write failed")
+
+    monkeypatch.setattr("ops.stage2.run_s205_formal._write_once", fail_receipt)
+    args = _detached_test_args(tmp_path)
+    with pytest.raises(OSError, match="receipt write failed"):
+        _detach(args, ["--execute", "--detach"])
+    assert calls == ["terminate", "wait:10"]
+    failures = list((tmp_path / "ops" / "attempts").glob("*/launcher.failure.json"))
+    assert len(failures) == 1
+    failure = load_canonical_json(failures[0])
+    assert failure["status"] == "RECEIPT_WRITE_FAILED"
+    assert failure["pid"] == 424244
+
+
+def test_detached_child_must_match_persisted_attempt_pid_and_command(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    args = _detached_test_args(tmp_path)
+    args.detached_attempt_id = "child-attempt"
+    command = [
+        "--execute",
+        "--resume",
+        "--detached-child",
+        "--detached-attempt-id",
+        "child-attempt",
+    ]
+    monkeypatch.setattr("ops.stage2.run_s205_formal.sys.argv", ["run_s205_formal.py", *command])
+    expected_hash = canonical_json_hash({"argv": command})
+    receipt = tmp_path / "ops" / "attempts" / "child-attempt" / "launcher.pid.json"
+    _write_pid_receipt(receipt, os.getpid(), child_argv_sha256=expected_hash)
+    loaded = _load_detached_child_receipt(args, preflight=_detached_test_preflight())
+    assert loaded["attempt_id"] == "child-attempt"
+    assert loaded["pid"] == os.getpid()
 
 
 def test_worker_requires_exact_visible_gpu_binding(monkeypatch: pytest.MonkeyPatch) -> None:
