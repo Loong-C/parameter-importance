@@ -9,7 +9,7 @@ import pytest
 from param_importance_nlp.contracts.jsonio import canonical_json_hash, load_canonical_json, write_canonical_json
 from param_importance_nlp.contracts.stage23 import FormalExecutionEvidence
 from param_importance_nlp.contracts.status import GateRecord, GateStatus
-from param_importance_nlp.experiments.stage2_s206_formal import ANCHOR_IDS, APPROVED_GPU_BINDINGS, EXCLUDED_PCI, EXCLUDED_UUID
+from param_importance_nlp.experiments.stage2_s206_formal import ANCHOR_IDS, APPROVED_GPU_BINDINGS, APPROVED_GPU_UUIDS, EXCLUDED_PCI, EXCLUDED_UUID
 from param_importance_nlp.experiments.stage2_s206_inputs import (
     S206FormalInputError,
     build_cost_semantics_contract,
@@ -92,10 +92,90 @@ def test_formal_inventory_loader_requires_distinct_source_binding(tmp_path: Path
         launcher._load_inventory_snapshot(path, data_root=tmp_path)
 
     payload["source_sha256"] = hashlib.sha256(source.read_bytes()).hexdigest()
+    payload.update(
+        {
+            "scope": "formal",
+            "status": "OBSERVED",
+            "checked_at": "2026-08-26T00:00:00+00:00",
+            "approved_gpu_uuids": list(APPROVED_GPU_UUIDS),
+            "excluded_pci": EXCLUDED_PCI,
+            "excluded_gpu_uuid": EXCLUDED_UUID,
+        }
+    )
     payload["source_ref"] = "capture.txt//"
     payload["artifact_hash"] = canonical_json_hash({key: value for key, value in payload.items() if key != "artifact_hash"})
     write_canonical_json(path, payload)
     with pytest.raises(Exception, match="GPU_INVENTORY_SOURCE_REF_NOT_CANONICAL"):
+        launcher._load_inventory_snapshot(path, data_root=tmp_path)
+
+
+def test_formal_inventory_exact_schema_and_identity_fail_closed(tmp_path: Path) -> None:
+    from ops.stage2 import run_s206_formal as launcher
+
+    path = tmp_path / "gpu-inventory.json"
+    source = tmp_path / "capture.txt"
+    source.write_bytes(b"raw capture\n")
+    payload: dict[str, object] = {
+        "schema_version": "stage2-s206-gpu-inventory-v1",
+        "scope": "formal",
+        "status": "OBSERVED",
+        "checked_at": "2026-08-26T00:00:00+00:00",
+        "artifact_ref": "gpu-inventory.json",
+        "source_ref": "capture.txt",
+        "source_sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
+        "rows": [],
+        "compute_apps": [],
+        "approved_gpu_uuids": list(APPROVED_GPU_UUIDS),
+        "excluded_pci": EXCLUDED_PCI,
+        "excluded_gpu_uuid": EXCLUDED_UUID,
+    }
+
+    def publish() -> None:
+        payload["artifact_hash"] = canonical_json_hash(
+            {key: value for key, value in payload.items() if key != "artifact_hash"}
+        )
+        write_canonical_json(path, payload)
+
+    payload["gpus"] = payload.pop("rows")
+    publish()
+    with pytest.raises(Exception, match="GPU_INVENTORY_GPUS_ALIAS_FORBIDDEN"):
+        launcher._load_inventory_snapshot(path, data_root=tmp_path)
+
+    payload.pop("gpus")
+    payload["rows"] = []
+    payload["unknown_top_level"] = True
+    publish()
+    with pytest.raises(Exception, match="GPU_INVENTORY_TOP_LEVEL_UNKNOWN_FIELDS"):
+        launcher._load_inventory_snapshot(path, data_root=tmp_path)
+
+    payload.pop("unknown_top_level")
+    payload.pop("scope")
+    publish()
+    with pytest.raises(Exception, match="GPU_INVENTORY_TOP_LEVEL_FIELDS_REQUIRED"):
+        launcher._load_inventory_snapshot(path, data_root=tmp_path)
+
+    payload["scope"] = "formal"
+    payload["approved_gpu_uuids"] = list(reversed(APPROVED_GPU_UUIDS))
+    publish()
+    with pytest.raises(Exception, match="GPU_INVENTORY_APPROVED_UUIDS_IDENTITY_DRIFT"):
+        launcher._load_inventory_snapshot(path, data_root=tmp_path)
+
+    payload["approved_gpu_uuids"] = list(APPROVED_GPU_UUIDS)
+    payload["excluded_pci"] = "0000:51:00.0"
+    publish()
+    with pytest.raises(Exception, match="GPU_INVENTORY_EXCLUDED_IDENTITY_DRIFT"):
+        launcher._load_inventory_snapshot(path, data_root=tmp_path)
+
+    payload["excluded_pci"] = EXCLUDED_PCI
+    payload["rows"] = [{"unknown": True}]
+    publish()
+    with pytest.raises(Exception, match="GPU_INVENTORY_ROW_FIELDS_INVALID:0"):
+        launcher._load_inventory_snapshot(path, data_root=tmp_path)
+
+    payload["rows"] = []
+    payload["compute_apps"] = [{"pid": 1, "gpu_uuid": APPROVED_GPU_UUIDS[0], "process_name": "x", "used_memory": "1", "unknown": True}]
+    publish()
+    with pytest.raises(Exception, match="GPU_INVENTORY_APP_FIELDS_INVALID:0"):
         launcher._load_inventory_snapshot(path, data_root=tmp_path)
 
 

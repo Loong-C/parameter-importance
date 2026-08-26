@@ -104,14 +104,20 @@ def _s27_inventory_rows() -> list[dict[str, object]]:
         {
             "pci_bus_id": pci,
             "uuid": uuid,
+            "gpu_name": "A100-SXM4-80GB",
+            "temperature_c": 40,
             "memory_used_mib": 0,
             "memory_total_mib": 81920,
             "utilization_gpu_percent": 0,
+            "compute_mode": "Default",
             "ecc_uncorrected_volatile": 0,
             "ecc_uncorrected_aggregate": 0,
-            "temperature_c": 40,
+            "row_remap_failure": 0,
+            "row_remap_pending": 0,
             "row_remap_status": "None",
             "gpu_recovery_action": "None",
+            "health_state": "HEALTHY",
+            "compute_apps": [],
         }
         for pci, uuid in approved
     ]
@@ -119,14 +125,20 @@ def _s27_inventory_rows() -> list[dict[str, object]]:
         {
             "pci_bus_id": EXCLUDED_PCI,
             "uuid": EXCLUDED_GPU_UUID,
+            "gpu_name": "A100-SXM4-80GB",
+            "temperature_c": 40,
             "memory_used_mib": 0,
             "memory_total_mib": 81920,
             "utilization_gpu_percent": 0,
+            "compute_mode": "Default",
             "ecc_uncorrected_volatile": 24,
             "ecc_uncorrected_aggregate": 24,
-            "temperature_c": 40,
+            "row_remap_failure": 0,
+            "row_remap_pending": 1,
             "row_remap_status": "Pending",
             "gpu_recovery_action": "None",
+            "health_state": "UNHEALTHY",
+            "compute_apps": [],
         }
     )
     for index, pci in enumerate(("0000:4f:00.0", "0000:51:00.0", "0000:57:00.0")):
@@ -134,14 +146,20 @@ def _s27_inventory_rows() -> list[dict[str, object]]:
             {
                 "pci_bus_id": pci,
                 "uuid": f"GPU-test-extra-{index}",
+                "gpu_name": "A100-SXM4-80GB",
+                "temperature_c": 40,
                 "memory_used_mib": 0,
                 "memory_total_mib": 81920,
                 "utilization_gpu_percent": 0,
+                "compute_mode": "Default",
                 "ecc_uncorrected_volatile": 0,
                 "ecc_uncorrected_aggregate": 0,
-                "temperature_c": 40,
+                "row_remap_failure": 0,
+                "row_remap_pending": 0,
                 "row_remap_status": "None",
                 "gpu_recovery_action": "None",
+                "health_state": "HEALTHY",
+                "compute_apps": [],
             }
         )
     return rows
@@ -155,11 +173,17 @@ def _write_s27_inventory(path: Path, *, rows: list[dict[str, object]] | None = N
     source_path.write_bytes(source_bytes)
     payload: dict[str, object] = {
         "schema_version": "stage2-s206-gpu-inventory-v1",
+        "scope": "formal",
+        "status": "OBSERVED",
+        "checked_at": "2026-08-26T00:00:00+00:00",
         "artifact_ref": path.relative_to(data_root).as_posix(),
         "source_ref": source_path.relative_to(data_root).as_posix(),
         "source_sha256": hashlib.sha256(source_bytes).hexdigest(),
         "rows": rows if rows is not None else _s27_inventory_rows(),
         "compute_apps": [],
+        "approved_gpu_uuids": list(APPROVED_GPU_UUIDS),
+        "excluded_pci": EXCLUDED_PCI,
+        "excluded_gpu_uuid": EXCLUDED_GPU_UUID,
         **extra,
     }
     payload["artifact_hash"] = canonical_json_hash(payload)
@@ -190,7 +214,7 @@ def test_s27_inventory_rejects_tamper_missing_health_and_legacy_wire(tmp_path: P
     rows = _s27_inventory_rows()
     rows[0].pop("row_remap_status")
     _write_s27_inventory(path, rows=rows)
-    with pytest.raises(S27ExecutionBlocked, match="HEALTH_FIELD_MISSING:row_remap_status"):
+    with pytest.raises(S27ExecutionBlocked, match="GPU_INVENTORY_ROW_FIELDS_INVALID:0"):
         load_s27_gpu_inventory_envelope(path, data_root=tmp_path)
 
     write_canonical_json(path, _s27_inventory_rows())
@@ -241,6 +265,82 @@ def test_s27_inventory_requires_distinct_source_hash_binding(tmp_path: Path) -> 
     source = path.parent / "gpu-inventory.capture.txt"
     source.write_bytes(b"tampered capture\n")
     with pytest.raises(S27ExecutionBlocked, match="GPU_INVENTORY_SOURCE_SHA256_MISMATCH"):
+        load_s27_gpu_inventory_envelope(path, data_root=tmp_path)
+
+
+def test_s27_inventory_exact_formal_schema_and_identity(tmp_path: Path) -> None:
+    path = tmp_path / "evidence/gpu-inventory.json"
+
+    _write_s27_inventory(path)
+    payload = load_canonical_json(path)
+    assert isinstance(payload, dict)
+    payload["gpus"] = payload.pop("rows")
+    payload["artifact_hash"] = canonical_json_hash({key: value for key, value in payload.items() if key != "artifact_hash"})
+    write_canonical_json(path, payload)
+    with pytest.raises(S27ExecutionBlocked, match="GPU_INVENTORY_GPUS_ALIAS_FORBIDDEN"):
+        load_s27_gpu_inventory_envelope(path, data_root=tmp_path)
+
+    for field, pattern in (
+        ("scope", "GPU_INVENTORY_SCOPE_INVALID"),
+        ("status", "GPU_INVENTORY_STATUS_INVALID"),
+    ):
+        _write_s27_inventory(path)
+        payload = load_canonical_json(path)
+        assert isinstance(payload, dict)
+        payload[field] = "not-formal"
+        payload["artifact_hash"] = canonical_json_hash({key: value for key, value in payload.items() if key != "artifact_hash"})
+        write_canonical_json(path, payload)
+        with pytest.raises(S27ExecutionBlocked, match=pattern):
+            load_s27_gpu_inventory_envelope(path, data_root=tmp_path)
+
+    _write_s27_inventory(path)
+    payload = load_canonical_json(path)
+    assert isinstance(payload, dict)
+    payload["unknown_top_level"] = True
+    payload["artifact_hash"] = canonical_json_hash({key: value for key, value in payload.items() if key != "artifact_hash"})
+    write_canonical_json(path, payload)
+    with pytest.raises(S27ExecutionBlocked, match="GPU_INVENTORY_TOP_LEVEL_UNKNOWN_FIELDS"):
+        load_s27_gpu_inventory_envelope(path, data_root=tmp_path)
+
+    _write_s27_inventory(path)
+    payload = load_canonical_json(path)
+    assert isinstance(payload, dict)
+    payload.pop("checked_at")
+    payload["artifact_hash"] = canonical_json_hash({key: value for key, value in payload.items() if key != "artifact_hash"})
+    write_canonical_json(path, payload)
+    with pytest.raises(S27ExecutionBlocked, match="GPU_INVENTORY_TOP_LEVEL_FIELDS_REQUIRED"):
+        load_s27_gpu_inventory_envelope(path, data_root=tmp_path)
+
+    for field, replacement, pattern in (
+        ("approved_gpu_uuids", list(reversed(APPROVED_GPU_UUIDS)), "GPU_INVENTORY_APPROVED_UUIDS_IDENTITY_DRIFT"),
+        ("excluded_pci", "0000:51:00.0", "GPU_INVENTORY_EXCLUDED_IDENTITY_DRIFT"),
+        ("excluded_gpu_uuid", APPROVED_GPU_UUIDS[0], "GPU_INVENTORY_EXCLUDED_IDENTITY_DRIFT"),
+    ):
+        _write_s27_inventory(path)
+        payload = load_canonical_json(path)
+        assert isinstance(payload, dict)
+        payload[field] = replacement
+        payload["artifact_hash"] = canonical_json_hash({key: value for key, value in payload.items() if key != "artifact_hash"})
+        write_canonical_json(path, payload)
+        with pytest.raises(S27ExecutionBlocked, match=pattern):
+            load_s27_gpu_inventory_envelope(path, data_root=tmp_path)
+
+    _write_s27_inventory(path)
+    payload = load_canonical_json(path)
+    assert isinstance(payload, dict)
+    payload["rows"][0]["unknown_row_field"] = 1  # type: ignore[index]
+    payload["artifact_hash"] = canonical_json_hash({key: value for key, value in payload.items() if key != "artifact_hash"})
+    write_canonical_json(path, payload)
+    with pytest.raises(S27ExecutionBlocked, match="GPU_INVENTORY_ROW_FIELDS_INVALID:0"):
+        load_s27_gpu_inventory_envelope(path, data_root=tmp_path)
+
+    _write_s27_inventory(path)
+    payload = load_canonical_json(path)
+    assert isinstance(payload, dict)
+    payload["compute_apps"] = [{"pid": 1, "gpu_uuid": APPROVED_GPU_UUIDS[0], "process_name": "x", "used_memory": "1", "unknown": True}]
+    payload["artifact_hash"] = canonical_json_hash({key: value for key, value in payload.items() if key != "artifact_hash"})
+    write_canonical_json(path, payload)
+    with pytest.raises(S27ExecutionBlocked, match="GPU_INVENTORY_APP_FIELDS_INVALID:0"):
         load_s27_gpu_inventory_envelope(path, data_root=tmp_path)
 
 

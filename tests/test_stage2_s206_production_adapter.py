@@ -55,24 +55,40 @@ def _write_gpu_inventory(path: Path) -> None:
             {
                 "uuid": uuid,
                 "pci_bus_id": pci,
+                "gpu_name": "A100-SXM4-80GB",
+                "temperature_c": 42,
                 "memory_used_mib": 0,
                 "memory_total_mib": 81920,
                 "utilization_gpu_percent": 0,
+                "compute_mode": "Default",
                 "ecc_uncorrected_volatile": 0,
                 "ecc_uncorrected_aggregate": 0,
+                "row_remap_failure": 0,
+                "row_remap_pending": 0,
+                "row_remap_status": "None",
                 "gpu_recovery_action": "None",
+                "health_state": "HEALTHY",
+                "compute_apps": [],
             }
         )
     rows.append(
         {
             "uuid": EXCLUDED_UUID,
             "pci_bus_id": EXCLUDED_PCI,
+            "gpu_name": "A100-SXM4-80GB",
+            "temperature_c": 55,
             "memory_used_mib": 0,
             "memory_total_mib": 81920,
             "utilization_gpu_percent": 0,
+            "compute_mode": "Default",
             "ecc_uncorrected_volatile": 113,
             "ecc_uncorrected_aggregate": 179,
+            "row_remap_failure": 0,
+            "row_remap_pending": 1,
+            "row_remap_status": "pending",
             "gpu_recovery_action": "None",
+            "health_state": "UNHEALTHY",
+            "compute_apps": [],
         }
     )
     for index, pci in enumerate(("0000:4F:00.0", "0000:51:00.0", "0000:57:00.0")):
@@ -80,12 +96,20 @@ def _write_gpu_inventory(path: Path) -> None:
             {
                 "uuid": f"GPU-test-extra-{index}",
                 "pci_bus_id": pci,
+                "gpu_name": "A100-SXM4-80GB",
+                "temperature_c": 40,
                 "memory_used_mib": 0,
                 "memory_total_mib": 81920,
                 "utilization_gpu_percent": 0,
+                "compute_mode": "Default",
                 "ecc_uncorrected_volatile": 0,
                 "ecc_uncorrected_aggregate": 0,
+                "row_remap_failure": 0,
+                "row_remap_pending": 0,
+                "row_remap_status": "None",
                 "gpu_recovery_action": "None",
+                "health_state": "HEALTHY",
+                "compute_apps": [],
             }
         )
     data_root = path.parent.parent
@@ -95,11 +119,17 @@ def _write_gpu_inventory(path: Path) -> None:
     source_path.write_bytes(source_bytes)
     payload: dict[str, object] = {
         "schema_version": GPU_INVENTORY_SCHEMA,
+        "scope": "formal",
+        "status": "OBSERVED",
+        "checked_at": "2026-08-26T00:00:00+00:00",
         "artifact_ref": path.relative_to(data_root).as_posix(),
         "source_ref": source_path.relative_to(data_root).as_posix(),
         "source_sha256": hashlib.sha256(source_bytes).hexdigest(),
         "rows": rows,
         "compute_apps": [],
+        "approved_gpu_uuids": list(APPROVED_GPU_UUIDS),
+        "excluded_pci": EXCLUDED_PCI,
+        "excluded_gpu_uuid": EXCLUDED_UUID,
     }
     payload["artifact_hash"] = canonical_json_hash(payload)
     write_canonical_json(path, payload)
@@ -520,6 +550,150 @@ def test_detach_uses_append_only_attempts_and_blocks_live_receipts(
     write_canonical_json(receipts[1], tampered)
     monkeypatch.setattr(launcher.os, "kill", lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError()))
     with pytest.raises(S206PreparationBlocked, match="DETACHED_ATTEMPT_RECEIPT_HASH_MISMATCH"):
+        launcher._detach(args)
+
+
+def test_detach_spawn_failure_is_durable_and_retryable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    args, preflight, execution = _detached_test_args(tmp_path)
+    monkeypatch.setattr(launcher, "_preflight", lambda _args: preflight)
+    monkeypatch.setattr(launcher, "_load_formal_execution", lambda _args: execution)
+    monkeypatch.setattr(launcher.sys, "argv", ["run_s206_formal.py", "--execute", "--detach"])
+
+    def fail_spawn(*_args: object, **_kwargs: object) -> object:
+        raise OSError("spawn refused")
+
+    monkeypatch.setattr(launcher.subprocess, "Popen", fail_spawn)
+    with pytest.raises(OSError, match="spawn refused"):
+        launcher._detach(args)
+
+    attempts = tmp_path / "operations/s206/attempts"
+    failures = sorted(attempts.glob("*/launcher.failure.json"))
+    assert len(failures) == 1
+    assert not list(attempts.glob("*/launcher.pid.json"))
+    failure = load_canonical_json(failures[0])
+    assert isinstance(failure, dict)
+    assert failure["status"] == "SPAWN_FAILED"
+    assert failure["pid"] is None
+    assert failure["artifact_hash"] == canonical_json_hash(
+        {key: value for key, value in failure.items() if key != "artifact_hash"}
+    )
+
+    class FakeProcess:
+        pid = 50201
+
+    monkeypatch.setattr(launcher.subprocess, "Popen", lambda *_args, **_kwargs: FakeProcess())
+    assert launcher._detach(args) == 0
+    assert len(list(attempts.glob("*/launcher.failure.json"))) == 1
+    assert len(list(attempts.glob("*/launcher.pid.json"))) == 1
+
+
+def test_detach_receipt_write_failure_terminates_waits_and_is_retryable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    args, preflight, execution = _detached_test_args(tmp_path)
+    monkeypatch.setattr(launcher, "_preflight", lambda _args: preflight)
+    monkeypatch.setattr(launcher, "_load_formal_execution", lambda _args: execution)
+    monkeypatch.setattr(launcher.sys, "argv", ["run_s206_formal.py", "--execute", "--detach"])
+    processes: list[object] = []
+
+    class FakeProcess:
+        pid = 50202
+
+        def __init__(self) -> None:
+            self.terminated = False
+            self.waited = False
+
+        def terminate(self) -> None:
+            self.terminated = True
+
+        def wait(self, *, timeout: float) -> int:
+            assert timeout == 10
+            self.waited = True
+            return 0
+
+    def spawn(*_args: object, **_kwargs: object) -> FakeProcess:
+        process = FakeProcess()
+        processes.append(process)
+        return process
+
+    monkeypatch.setattr(launcher.subprocess, "Popen", spawn)
+    real_write = launcher.write_canonical_json
+
+    def fail_launch_receipt(path: Path, payload: object) -> Path:
+        if Path(path).name == "launcher.pid.json":
+            raise OSError("receipt storage refused")
+        return real_write(path, payload)
+
+    monkeypatch.setattr(launcher, "write_canonical_json", fail_launch_receipt)
+    with pytest.raises(OSError, match="receipt storage refused"):
+        launcher._detach(args)
+    assert len(processes) == 1
+    assert processes[0].terminated is True  # type: ignore[union-attr]
+    assert processes[0].waited is True  # type: ignore[union-attr]
+
+    attempts = tmp_path / "operations/s206/attempts"
+    failures = sorted(attempts.glob("*/launcher.failure.json"))
+    assert len(failures) == 1
+    failure = load_canonical_json(failures[0])
+    assert isinstance(failure, dict)
+    assert failure["status"] == "RECEIPT_WRITE_FAILED"
+    assert failure["pid"] == 50202
+    assert failure["cleanup_error"] is None
+    assert failure["artifact_hash"] == canonical_json_hash(
+        {key: value for key, value in failure.items() if key != "artifact_hash"}
+    )
+
+    # A waited/stale failed attempt is retained and does not block the retry.
+    monkeypatch.setattr(launcher, "write_canonical_json", real_write)
+    monkeypatch.setattr(launcher.os, "kill", lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError()))
+    class RetryProcess:
+        pid = 50203
+
+    monkeypatch.setattr(launcher.subprocess, "Popen", lambda *_args, **_kwargs: RetryProcess())
+    assert launcher._detach(args) == 0
+    assert len(list(attempts.glob("*/launcher.failure.json"))) == 1
+    assert len(list(attempts.glob("*/launcher.pid.json"))) == 1
+
+
+@pytest.mark.parametrize(
+    "field,value,pattern",
+    [
+        ("log_ref", "operations/s206/attempts/replaced/other.log", "LOG_REF_MISMATCH"),
+        ("status_ref", "operations/s206/replaced-status.json", "STATUS_REF_MISMATCH"),
+        ("gpu_inventory_path", "evidence/replaced-inventory.json", "GPU_INVENTORY_PATH_MISMATCH"),
+    ],
+)
+def test_detach_rejects_hash_valid_receipt_path_substitution(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    field: str,
+    value: str,
+    pattern: str,
+) -> None:
+    args, preflight, execution = _detached_test_args(tmp_path)
+    monkeypatch.setattr(launcher, "_preflight", lambda _args: preflight)
+    monkeypatch.setattr(launcher, "_load_formal_execution", lambda _args: execution)
+    monkeypatch.setattr(launcher.sys, "argv", ["run_s206_formal.py", "--execute", "--detach"])
+
+    class FakeProcess:
+        pid = 50204
+
+    monkeypatch.setattr(launcher.subprocess, "Popen", lambda *_args, **_kwargs: FakeProcess())
+    assert launcher._detach(args) == 0
+    receipt_path = next((tmp_path / "operations/s206/attempts").glob("*/launcher.pid.json"))
+    receipt = load_canonical_json(receipt_path)
+    assert isinstance(receipt, dict)
+    receipt[field] = value
+    receipt["artifact_hash"] = canonical_json_hash(
+        {key: item for key, item in receipt.items() if key != "artifact_hash"}
+    )
+    write_canonical_json(receipt_path, receipt)
+    monkeypatch.setattr(launcher.os, "kill", lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError()))
+    with pytest.raises(S206PreparationBlocked, match=f"DETACHED_ATTEMPT_RECEIPT_{pattern}"):
         launcher._detach(args)
 
 
