@@ -837,6 +837,18 @@ def _validate_measured_row(
     }
     if semantic != "anchor" and int(task["device_count"]) != 1:
         raise S29RunnerBlocked("METHOD_TASK_SINGLE_GPU_REQUIRED")
+    # System anchors are the only multi-GPU measurements.  Bind the complete
+    # UUID set reported by the worker; checking only device_count would allow a
+    # nominal four-card anchor to run on one card while retaining a four-card
+    # label in the generated evidence.
+    if semantic == "anchor":
+        expected_gpu_uuids = task.get("gpu_uuids")
+        if (
+            not isinstance(expected_gpu_uuids, list)
+            or not expected_gpu_uuids
+            or row.get("gpu_uuids") != expected_gpu_uuids
+        ):
+            raise S29RunnerBlocked("PROFILER_GPU_UUID_SET_INVALID")
     for name, expected in expected_identity.items():
         if name in row and row[name] != expected:
             raise S29RunnerBlocked(f"PROFILER_IDENTITY_DRIFT:{name}")
@@ -904,6 +916,8 @@ def _validate_measured_row(
 
 
 def _task_list(preflight: S29Preflight, *, run_id: str) -> list[dict[str, Any]]:
+    if preflight.measurement_plan.get("run_id") != run_id:
+        raise S29RunnerBlocked("MEASUREMENT_PLAN_RUN_ID_MISMATCH")
     rows = preflight.measurement_plan.get("rows")
     if not isinstance(rows, list) or not rows:
         raise S29RunnerBlocked("MEASUREMENT_PLAN_ROWS_REQUIRED")
@@ -955,6 +969,8 @@ class S29ProfilerRunner:
     ) -> None:
         self.preflight = preflight
         self.run_id = _safe_id(run_id, field="runner.run_id")
+        if self.preflight.measurement_plan.get("run_id") != self.run_id:
+            raise S29RunnerBlocked("MEASUREMENT_PLAN_RUN_ID_MISMATCH")
         self.run_root = Path(run_root).resolve()
         self.profiler = profiler
         self.single_gpu_anchor = single_gpu_anchor
@@ -1025,15 +1041,12 @@ class S29ProfilerRunner:
         }
         try:
             measured = self.profiler(task, environment=env)
-            # The row contract is identical to a cost row; an anchor is then
-            # reduced to its system/numeric evidence without entering cost
-            # aggregates.
-            cost_task = dict(task)
-            cost_task["semantic"] = "scientific_equal_sample_cost"
-            cost_task["method"] = "raw"
+            # Validate the system anchor using its own semantic.  Converting a
+            # four-card anchor to a method row would trigger the single-GPU
+            # guard and make every real four-card anchor impossible to run.
             row = _validate_measured_row(
                 measured,
-                task=cost_task,
+                task=task,
                 frozen=self.preflight.frozen,
                 io_evidence=self.preflight.io_evidence,
                 inventory_identity=self.preflight.inventory["inventory_identity"],
