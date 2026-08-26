@@ -30,14 +30,7 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Evaluate formal Stage 2 G2.3 reference evidence")
     parser.add_argument("--workspace-root", type=Path, required=True)
     parser.add_argument("--output-root", type=Path, required=True)
-    parser.add_argument(
-        "--repo-root",
-        type=Path,
-        help=(
-            "trusted producer repository checkout for producer/source verification; "
-            "evaluator provenance is bound to this CLI's own checkout"
-        ),
-    )
+    parser.add_argument("--repo-root", type=Path, help="trusted repository checkout for producer/source verification")
     parser.add_argument(
         "--task-result",
         action="append",

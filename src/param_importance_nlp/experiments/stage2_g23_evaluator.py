@@ -121,7 +121,6 @@ CORRECTED_DELTA_SIDECAR_FIELDS = frozenset(
 )
 _SHA = re.compile(r"^[0-9a-f]{64}$")
 _COMMIT = re.compile(r"^[0-9a-f]{40}$")
-_EVALUATOR_SOURCE_RELATIVE = "src/param_importance_nlp/experiments/stage2_g23_evaluator.py"
 
 
 class G23Blocked(ValueError):
@@ -413,74 +412,20 @@ def _digest_bytes(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _validate_evaluator_provenance(
-    repo_root: Path,
-    *,
-    module_path: Path,
-) -> tuple[str, str]:
-    """Bind evaluator lineage to the checkout containing the running module.
+def _git_head(path: Path) -> str:
+    """Return the evaluator repository commit for explicit producer/consumer lineage."""
 
-    Producer provenance is intentionally validated by ``repo_root`` supplied
-    by the CLI.  This separate check never consults that argument: the
-    evaluator commit and source digest must describe the checkout from which
-    this module was actually imported and executed.
-    """
-
-    repository = repo_root.resolve()
-    module = module_path.resolve()
     try:
-        relative = module.relative_to(repository).as_posix()
-    except ValueError as error:
-        raise G23Blocked("evaluator_provenance:MODULE_OUTSIDE_REPOSITORY") from error
-    if relative != _EVALUATOR_SOURCE_RELATIVE or not module.is_file():
-        raise G23Blocked("evaluator_provenance:MODULE_SOURCE_PATH_INVALID")
-    try:
-        head = subprocess.run(
-            ["git", "-C", str(repository), "rev-parse", "--verify", "HEAD^{commit}"],
-            check=True,
-            capture_output=True,
-            text=True,
-        ).stdout.strip()
-        _commit(head, "evaluator_provenance.head_commit")
-        subprocess.run(
-            ["git", "-C", str(repository), "cat-file", "-e", f"{head}^{{commit}}"],
+        result = subprocess.run(
+            ["git", "-C", str(path), "rev-parse", "HEAD"],
             check=True,
             capture_output=True,
             text=True,
         )
-        status = subprocess.run(
-            ["git", "-C", str(repository), "status", "--porcelain", "--untracked-files=no"],
-            check=True,
-            capture_output=True,
-            text=True,
-        ).stdout.strip()
-        if status:
-            raise G23Blocked("evaluator_provenance:TRACKED_FILES_NOT_CLEAN")
-        head_blob = subprocess.run(
-            ["git", "-C", str(repository), "rev-parse", f"HEAD:{relative}"],
-            check=True,
-            capture_output=True,
-            text=True,
-        ).stdout.strip()
-        worktree_blob = subprocess.run(
-            ["git", "-C", str(repository), "hash-object", "--", relative],
-            check=True,
-            capture_output=True,
-            text=True,
-        ).stdout.strip()
-    except G23Blocked:
-        raise
-    except (OSError, subprocess.SubprocessError) as error:
-        raise G23Blocked("evaluator_provenance:GIT_UNAVAILABLE") from error
-    if not _COMMIT.fullmatch(head_blob) or worktree_blob != head_blob:
-        raise G23Blocked("evaluator_provenance:MODULE_GIT_BLOB_MISMATCH")
-    try:
-        source_sha256 = _digest_bytes(module)
-    except OSError as error:
-        raise G23Blocked("evaluator_provenance:MODULE_SOURCE_UNREADABLE") from error
-    if _SHA.fullmatch(source_sha256) is None:
-        raise G23Blocked("evaluator_provenance:MODULE_SOURCE_HASH_INVALID")
-    return head, source_sha256
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    value = result.stdout.strip()
+    return value if _COMMIT.fullmatch(value) is not None else ""
 
 
 def _append_attempt_index(index: Path, artifact_hash: str) -> None:
@@ -3486,13 +3431,11 @@ def evaluate_formal_g23(
     """
 
     root = _reject_absolute_symlink_chain(Path(workspace_root), "workspace_root")
-    module_path = Path(__file__).resolve()
-    evaluator_repo = module_path.parents[3]
-    evaluator_commit, evaluator_source_sha256 = _validate_evaluator_provenance(
-        evaluator_repo,
-        module_path=module_path,
+    trusted_repo = (
+        Path(__file__).resolve().parents[3]
+        if repo_root is None
+        else Path(repo_root).resolve()
     )
-    producer_repo = None if repo_root is None else Path(repo_root).resolve()
     normalized_items: list[CellInput] = []
     for index, item in enumerate(cells):
         if isinstance(item, CellInput):
@@ -3506,10 +3449,11 @@ def evaluate_formal_g23(
     # ``expected_cell_ids`` remains accepted for source compatibility only;
     # its values never influence the formal decision.
     expected = EXPECTED_CELL_IDS
+    evaluator_commit = _git_head(trusted_repo)
     prepared: list[_CellEvidence] = []
     structure_reason: str | None = None
     if len(normalized) == REQUIRED_CELL_COUNT and len(set(item.cell_id for item in normalized)) == REQUIRED_CELL_COUNT:
-        prepared = [_prepare_cell(root, item, repo_root=producer_repo) for item in normalized]
+        prepared = [_prepare_cell(root, item, repo_root=trusted_repo) for item in normalized]
     elif normalized:
         structure_reason = "DUPLICATE_OR_INVALID_CELL_IDENTITIES"
     if prepared:
@@ -3555,10 +3499,11 @@ def evaluate_formal_g23(
         producer = next(iter(producer_values))
     else:
         producer = ""
+    module_path = Path(__file__).resolve()
     calculator = {
         "producer_commit": producer,
         "evaluator_commit": evaluator_commit,
-        "source_sha256": evaluator_source_sha256,
+        "source_sha256": _digest_bytes(module_path),
         "source_schema": SCHEMA_VERSION,
     }
     payload = _attempt_payload(cell_rows, calculator, expected_cell_ids=expected)

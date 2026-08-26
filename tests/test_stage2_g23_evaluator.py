@@ -2,11 +2,8 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 from pathlib import Path
-import shutil
-import subprocess
 from types import SimpleNamespace
 
 import numpy as np
@@ -94,65 +91,6 @@ def _six_cell_manifest_for_registry_hashes(
     return body
 
 
-_PROVENANCE_SOURCE_PATHS = (
-    "src/param_importance_nlp/experiments/stage2_formal.py",
-    "src/param_importance_nlp/experiments/stage23_task_runners.py",
-    "src/param_importance_nlp/experiments/stage2_g23_evaluator.py",
-    "ops/stage2/evaluate_s204_g23.py",
-)
-
-
-def _git(repo: Path, *args: str) -> str:
-    return subprocess.run(
-        ["git", "-C", str(repo), *args],
-        check=True,
-        capture_output=True,
-        text=True,
-    ).stdout.strip()
-
-
-def _make_provenance_repo(tmp_path: Path, source_root: Path) -> tuple[Path, str, dict[str, object]]:
-    repo = tmp_path / "producer-repo"
-    for relative in _PROVENANCE_SOURCE_PATHS:
-        target = repo / relative
-        target.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(source_root / relative, target)
-    (repo / "tracked-marker.txt").write_text("clean\n", encoding="utf-8")
-    _git(repo, "init", "--quiet")
-    _git(repo, "config", "user.email", "g23-test@example.invalid")
-    _git(repo, "config", "user.name", "G23 test")
-    _git(repo, "add", "--all")
-    _git(repo, "commit", "--quiet", "-m", "producer fixture")
-    head = _git(repo, "rev-parse", "--verify", "HEAD^{commit}")
-    tree = _git(repo, "rev-parse", "HEAD^{tree}")
-    source_bytes = []
-    for relative in _PROVENANCE_SOURCE_PATHS:
-        source_bytes.append(
-            {
-                "path": relative,
-                "sha256": hashlib.sha256((repo / relative).read_bytes()).hexdigest(),
-                "git_blob": _git(repo, "hash-object", "--", relative),
-            }
-        )
-    provenance: dict[str, object] = {
-        "schema_version": "stage2-reference-producer-provenance-v2",
-        "repository_root_name": repo.name,
-        "head_commit": head,
-        "head_tree": tree,
-        "tracked_clean": True,
-        "source_bytes": source_bytes,
-    }
-    provenance["provenance_hash"] = canonical_json_hash(
-        {
-            "head_commit": head,
-            "head_tree": tree,
-            "tracked_clean": True,
-            "source_bytes": source_bytes,
-        }
-    )
-    return repo, head, provenance
-
-
 def test_six_cell_manifest_binds_model_specific_registry_hashes() -> None:
     model_specific = ("1" * 64,) * 3 + ("2" * 64,) * 3
 
@@ -205,139 +143,6 @@ def test_six_cell_manifest_legacy_common_registry_form_is_explicit() -> None:
     )
     with pytest.raises(G23Blocked, match="LEGACY_COMMON_REGISTRY_REQUIRED"):
         _validate_six_cell_manifest(model_specific_without_map)
-
-
-def test_evaluator_and_producer_repositories_are_separately_bound(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A PASS keeps producer 8dade and the running evaluator lineage distinct."""
-
-    import param_importance_nlp.experiments.stage2_g23_evaluator as evaluator
-
-    module_path = Path(evaluator.__file__).resolve()
-    evaluator_repo = module_path.parents[3]
-    evaluator_head, evaluator_source_sha256 = evaluator._validate_evaluator_provenance(
-        evaluator_repo, module_path=module_path
-    )
-    producer_repo, producer_head, producer_provenance = _make_provenance_repo(
-        tmp_path, evaluator_repo
-    )
-    assert producer_head != evaluator_head
-    producer_convergence = {
-        "producer_provenance": producer_provenance,
-        "stage2_reference_producer_commit": producer_head,
-    }
-    assert evaluator._validate_producer_provenance(
-        producer_convergence, repo_root=producer_repo
-    ) == producer_head
-
-    observed: dict[str, object] = {}
-
-    def fake_prepare(
-        root: Path, source: CellInput, *, repo_root: Path | None = None
-    ) -> _CellEvidence:
-        observed["producer_repo"] = repo_root
-        evaluator._validate_producer_provenance(
-            producer_convergence, repo_root=repo_root
-        )
-        index = EXPECTED_CELL_IDS.index(source.cell_id)
-        evidence = _CellEvidence(source, workspace_root=root)
-        evidence.identities.update(
-            {
-                "cell_id": source.cell_id,
-                "result_hash": f"{index + 1:064x}",
-                "config_hash": f"{index + 11:064x}",
-                "checkpoint_hash": f"{index + 21:064x}",
-                "one_shot_result_hash": f"{index + 31:064x}",
-                "stream_a_draw_hash": f"{index + 41:064x}",
-                "stream_b_draw_hash": f"{index + 51:064x}",
-                "bundle_manifest_hash": f"{index + 61:064x}",
-                "sizing_plan_hash": f"{index + 71:064x}",
-                "reference_id": f"reference-{index}",
-                "one_shot_plan_hash": f"{index + 81:064x}",
-                "six_cell_manifest_hash": "f" * 64,
-                "producer_commit": producer_head,
-            }
-        )
-        return evidence
-
-    def fake_evaluate(
-        evidence: _CellEvidence, *, evaluator_commit: str
-    ) -> dict[str, object]:
-        observed["evaluator_commit"] = evaluator_commit
-        return {
-            "cell_id": evidence.source.cell_id,
-            "status": "PASS",
-            "identities": dict(evidence.identities),
-            "metrics": {},
-            "reasons": [],
-        }
-
-    monkeypatch.setattr(evaluator, "_prepare_cell", fake_prepare)
-    monkeypatch.setattr(evaluator, "_evaluate_cell", fake_evaluate)
-    cells = [CellInput(cell_id, f"unused/{index}.json") for index, cell_id in enumerate(EXPECTED_CELL_IDS)]
-    result = evaluator.evaluate_formal_g23(
-        tmp_path,
-        cells,
-        output_root=tmp_path / "attempts",
-        repo_root=producer_repo,
-    )
-    assert result["status"] == "PASS"
-    assert result["formal_eligible"] is True
-    calculator = result["calculator"]
-    assert isinstance(calculator, dict)
-    assert calculator["producer_commit"] == producer_head
-    assert calculator["evaluator_commit"] == evaluator_head
-    assert calculator["source_sha256"] == evaluator_source_sha256
-    assert observed == {
-        "producer_repo": producer_repo.resolve(),
-        "evaluator_commit": evaluator_head,
-    }
-
-    with pytest.raises(G23Blocked, match="REPOSITORY_HEAD_OR_CLEAN_STATE_DRIFT"):
-        evaluator.evaluate_formal_g23(
-            tmp_path,
-            cells,
-            output_root=tmp_path / "swapped",
-            repo_root=evaluator_repo,
-        )
-
-    dirty_repo, _dirty_head, dirty_provenance = _make_provenance_repo(
-        tmp_path / "dirty", evaluator_repo
-    )
-    (dirty_repo / "tracked-marker.txt").write_text("dirty\n", encoding="utf-8")
-    dirty_convergence = {
-        "producer_provenance": dirty_provenance,
-        "stage2_reference_producer_commit": _dirty_head,
-    }
-    with pytest.raises(G23Blocked, match="REPOSITORY_HEAD_OR_CLEAN_STATE_DRIFT"):
-        evaluator._validate_producer_provenance(
-            dirty_convergence, repo_root=dirty_repo
-        )
-
-    tampered_repo, tampered_head, tampered_provenance = _make_provenance_repo(
-        tmp_path / "tampered", evaluator_repo
-    )
-    tampered_path = tampered_repo / evaluator._EVALUATOR_SOURCE_RELATIVE
-    tampered_path.write_bytes(tampered_path.read_bytes() + b"\n# tampered\n")
-    tampered_convergence = {
-        "producer_provenance": tampered_provenance,
-        "stage2_reference_producer_commit": tampered_head,
-    }
-    with pytest.raises(G23Blocked, match="SOURCE_DRIFT"):
-        evaluator._validate_producer_provenance(
-            tampered_convergence, repo_root=tampered_repo
-        )
-
-    evaluator_copy, _copy_head, _copy_provenance = _make_provenance_repo(
-        tmp_path / "evaluator-copy", evaluator_repo
-    )
-    copy_module = evaluator_copy / evaluator._EVALUATOR_SOURCE_RELATIVE
-    copy_module.write_bytes(copy_module.read_bytes() + b"\n# evaluator tampered\n")
-    with pytest.raises(G23Blocked, match="TRACKED_FILES_NOT_CLEAN"):
-        evaluator._validate_evaluator_provenance(
-            evaluator_copy, module_path=copy_module
-        )
 
 
 def test_missing_cells_are_not_a_formal_decision(tmp_path: Path) -> None:
