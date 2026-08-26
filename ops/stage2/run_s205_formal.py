@@ -16,6 +16,8 @@ from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from datetime import datetime, timezone
 import hashlib
 import json
+import math
+import re
 import os
 from pathlib import Path
 import subprocess
@@ -45,8 +47,10 @@ from param_importance_nlp.experiments.stage2_s25_inputs import (
 from param_importance_nlp.experiments.sampling import SamplingPlan
 from param_importance_nlp.contracts.stage23 import FormalExecutionEvidence
 from param_importance_nlp.runtime.task_artifacts import load_committed_task_artifact
-from param_importance_nlp.experiments.stage2_s206_formal import (
-    validate_gpu_inventory,
+from param_importance_nlp.contracts.g21_formal_handoff import (
+    ALLOWED_DEVICES as APPROVED_GPU_BINDINGS,
+    EXCLUDED_PCI,
+    EXCLUDED_UUID,
 )
 
 
@@ -60,9 +64,20 @@ def _logical(root: Path, value: str, *, field: str, allow_missing: bool = False)
     path = Path(value)
     if path.is_absolute() or any(part in {"", ".", ".."} for part in path.parts):
         raise S25ExecutionBlocked(f"{field}:PATH_ESCAPE")
-    result = (root / path).resolve()
+    root = root.resolve()
+    candidate = root / path
+    # Formal references are content-addressed inputs.  A symlink can otherwise
+    # make a harmless-looking DATA_ROOT-relative ref resolve to an unrelated
+    # mutable file after preflight, so reject every symlink component (including
+    # the terminal path) before resolving it.
+    cursor = root
+    for part in path.parts:
+        cursor = cursor / part
+        if cursor.is_symlink():
+            raise S25ExecutionBlocked(f"{field}:SYMLINK_NOT_ALLOWED")
+    result = candidate.resolve()
     try:
-        result.relative_to(root.resolve())
+        result.relative_to(root)
     except ValueError as error:
         raise S25ExecutionBlocked(f"{field}:PATH_ESCAPE") from error
     if not allow_missing and not result.exists():
@@ -78,46 +93,262 @@ def _file_sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _launcher_source_sha256() -> str:
+    """Digest the exact launcher source used by every child worker."""
+
+    return _file_sha256(Path(__file__).resolve())
+
+
+def _require_launcher_in_repository(repository: Path) -> None:
+    try:
+        Path(__file__).resolve().relative_to(repository.resolve())
+    except ValueError as error:
+        raise S25ExecutionBlocked("S205_LAUNCHER_SOURCE_OUTSIDE_REPOSITORY") from error
+
+
+def _strict_inventory_path(root: Path, path: Path) -> Path:
+    """Resolve an inventory path only when it is a non-symlink DATA_ROOT ref."""
+
+    candidate = path if path.is_absolute() else root / path
+    try:
+        relative = candidate.relative_to(root)
+    except ValueError as error:
+        raise S25ExecutionBlocked("S205_GPU_INVENTORY_PATH_OUTSIDE_DATA_ROOT") from error
+    # Reuse the logical-reference policy for symlink and escape checks.  The
+    # caller may pass an absolute Path, while the envelope itself stores the
+    # required DATA_ROOT-relative artifact_ref.
+    return _logical(root, relative.as_posix(), field="gpu_inventory_ref")
+
+
+_GPU_INVENTORY_SCHEMA = "stage2-s206-gpu-inventory-v1"
+_GPU_INVENTORY_HEALTH_ALIASES = {
+    "memory_used_mib": ("memory_used_mib", "memory_used", "memory.used"),
+    "memory_total_mib": ("memory_total_mib", "memory_total", "memory.total"),
+    "utilization_gpu_percent": (
+        "utilization_gpu_percent", "utilization_percent", "utilization_gpu", "utilization.gpu"
+    ),
+    "ecc_uncorrected_volatile": (
+        "ecc_uncorrected_volatile", "ecc_volatile_uncorrected",
+        "ecc.errors.uncorrected.volatile.total",
+    ),
+    "ecc_uncorrected_aggregate": (
+        "ecc_uncorrected_aggregate", "ecc_aggregate_uncorrected",
+        "ecc.errors.uncorrected.aggregate.total",
+    ),
+    "temperature_c": ("temperature_c", "temperature_gpu_c", "temperature.gpu"),
+    "row_remap_status": ("row_remap_status", "row_remap", "row_remap_pending"),
+    "gpu_recovery_action": ("gpu_recovery_action", "recovery_action"),
+}
+_GPU_CLEAN_VALUES = {"none", "0", "clean", "false", "not_pending", "not-pending", "n/a", "na"}
+
+
+def _inventory_uuid(value: object, *, field: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise S25ExecutionBlocked(f"{field}:UUID_REQUIRED")
+    text = value.strip()
+    return text if text.upper().startswith("GPU-") else f"GPU-{text}"
+
+
+def _inventory_pci(value: object, *, field: str) -> str:
+    if not isinstance(value, str):
+        raise S25ExecutionBlocked(f"{field}:PCI_REQUIRED")
+    match = re.fullmatch(
+        r"(?:[0-9A-F]{4}|[0-9A-F]{8}):([0-9A-F]{2}):([0-9A-F]{2})\.([0-9])",
+        value.strip().upper(),
+    )
+    if match is None:
+        raise S25ExecutionBlocked(f"{field}:PCI_INVALID")
+    return f"0000:{match.group(1)[-4:]}:{match.group(2)}.{match.group(3)}"
+
+
+def _inventory_number(value: object, *, field: str) -> float:
+    try:
+        result = float(value)
+    except (TypeError, ValueError) as error:
+        raise S25ExecutionBlocked(f"{field}:NUMBER_REQUIRED") from error
+    if not math.isfinite(result):
+        raise S25ExecutionBlocked(f"{field}:NONFINITE")
+    return result
+
+
+def _validate_s205_gpu_inventory(
+    rows: Sequence[Mapping[str, object]],
+    *,
+    compute_apps: Sequence[Mapping[str, object]],
+) -> dict[str, object]:
+    """Validate the complete eight-card S2.6/S2.7 live inventory contract."""
+
+    if not isinstance(rows, Sequence) or isinstance(rows, (str, bytes)):
+        raise S25ExecutionBlocked("S205_GPU_INVENTORY_ROWS_REQUIRED")
+    if len(rows) != 8:
+        raise S25ExecutionBlocked(f"S205_GPU_INVENTORY_LIVE_CARD_COUNT_INVALID:{len(rows)}")
+    if not isinstance(compute_apps, Sequence) or isinstance(compute_apps, (str, bytes)):
+        raise S25ExecutionBlocked("S205_GPU_INVENTORY_COMPUTE_APPS_REQUIRED")
+    expected = {pci.casefold(): uuid.casefold() for pci, uuid in APPROVED_GPU_BINDINGS}
+    expected[EXCLUDED_PCI.casefold()] = EXCLUDED_UUID.casefold()
+    approved = {uuid.casefold() for _pci, uuid in APPROVED_GPU_BINDINGS}
+    seen_uuid: set[str] = set()
+    seen_pci: set[str] = set()
+    normalized: list[dict[str, object]] = []
+    for index, source in enumerate(rows):
+        if not isinstance(source, Mapping):
+            raise S25ExecutionBlocked(f"S205_GPU_INVENTORY_ROW_INVALID:{index}")
+        row = dict(source)
+        uuid = _inventory_uuid(row.get("uuid", row.get("gpu_uuid")), field=f"gpu[{index}]")
+        pci = _inventory_pci(row.get("pci_bus_id", row.get("pci")), field=f"gpu[{index}]")
+        if uuid.casefold() in seen_uuid:
+            raise S25ExecutionBlocked("S205_GPU_INVENTORY_DUPLICATE_UUID")
+        if pci.casefold() in seen_pci:
+            raise S25ExecutionBlocked("S205_GPU_INVENTORY_DUPLICATE_PCI")
+        seen_uuid.add(uuid.casefold())
+        seen_pci.add(pci.casefold())
+        row["uuid"] = uuid
+        row["pci_bus_id"] = pci
+        for canonical, aliases in _GPU_INVENTORY_HEALTH_ALIASES.items():
+            found = next((row[name] for name in aliases if name in row), None)
+            if found is None:
+                raise S25ExecutionBlocked(f"S205_GPU_INVENTORY_HEALTH_FIELD_MISSING:{canonical}")
+            row[canonical] = found
+        for field in (
+            "memory_used_mib", "memory_total_mib", "utilization_gpu_percent",
+            "ecc_uncorrected_volatile", "ecc_uncorrected_aggregate", "temperature_c",
+        ):
+            row[field] = _inventory_number(row[field], field=f"gpu[{index}].{field}")
+        normalized.append(row)
+    observed = {
+        str(row["pci_bus_id"]).casefold(): str(row["uuid"]).casefold()
+        for row in normalized
+        if str(row["pci_bus_id"]).casefold() in expected
+    }
+    if observed != expected:
+        raise S25ExecutionBlocked("S205_GPU_INVENTORY_APPROVED_OR_EXCLUDED_IDENTITY_DRIFT")
+    apps_by_uuid: dict[str, list[dict[str, object]]] = {}
+    live_uuids = {str(row["uuid"]).casefold() for row in normalized}
+    app_rows: list[dict[str, object]] = []
+    for index, source in enumerate(compute_apps):
+        if not isinstance(source, Mapping):
+            raise S25ExecutionBlocked(f"S205_GPU_INVENTORY_COMPUTE_APP_INVALID:{index}")
+        app = dict(source)
+        app_uuid = _inventory_uuid(app.get("gpu_uuid", app.get("uuid")), field=f"compute_app[{index}]")
+        if app_uuid.casefold() not in live_uuids:
+            raise S25ExecutionBlocked("S205_GPU_INVENTORY_COMPUTE_APP_GPU_UNKNOWN")
+        app["gpu_uuid"] = app_uuid
+        apps_by_uuid.setdefault(app_uuid.casefold(), []).append(app)
+        app_rows.append(app)
+    for row in normalized:
+        uuid_key = str(row["uuid"]).casefold()
+        if uuid_key not in approved:
+            continue
+        if apps_by_uuid.get(uuid_key):
+            raise S25ExecutionBlocked("S205_GPU_INVENTORY_APPROVED_CARD_NOT_IDLE")
+        if (
+            float(row["memory_total_mib"]) <= 0
+            or float(row["memory_used_mib"]) != 0
+            or float(row["utilization_gpu_percent"]) != 0
+        ):
+            raise S25ExecutionBlocked("S205_GPU_INVENTORY_APPROVED_CARD_NOT_IDLE")
+        if float(row["ecc_uncorrected_volatile"]) != 0 or float(row["ecc_uncorrected_aggregate"]) != 0:
+            raise S25ExecutionBlocked("S205_GPU_INVENTORY_APPROVED_CARD_ECC_NOT_CLEAN")
+        if float(row["temperature_c"]) < 0 or float(row["temperature_c"]) >= 85:
+            raise S25ExecutionBlocked("S205_GPU_INVENTORY_APPROVED_CARD_TEMPERATURE_INVALID")
+        if str(row["row_remap_status"]).strip().casefold() not in _GPU_CLEAN_VALUES:
+            raise S25ExecutionBlocked("S205_GPU_INVENTORY_APPROVED_ROW_REMAP_NOT_CLEAN")
+        if str(row["gpu_recovery_action"]).strip().casefold() not in _GPU_CLEAN_VALUES:
+            raise S25ExecutionBlocked("S205_GPU_INVENTORY_APPROVED_CARD_RECOVERY_NOT_CLEAN")
+    return {
+        "schema_version": _GPU_INVENTORY_SCHEMA,
+        "approved_gpu_uuids": [uuid for _pci, uuid in APPROVED_GPU_BINDINGS],
+        "excluded_gpu_uuid": EXCLUDED_UUID,
+        "excluded_pci": EXCLUDED_PCI,
+        "inventory_count": len(normalized),
+        "inventory": normalized,
+        "compute_apps": app_rows,
+    }
+
+
+def _load_inventory_snapshot(
+    path: Path | None,
+    *,
+    data_root: Path,
+) -> tuple[list[dict[str, object]], dict[str, object]]:
+    """Load the strict S2.6/S2.7 source-bound inventory envelope.
+
+    ``artifact_ref`` names the inventory JSON and ``source_ref`` names a
+    distinct raw ``nvidia-smi`` capture.  This exact S2.6/S2.7 protocol checks
+    the canonical artifact hash, raw-capture SHA-256, complete eight-row
+    identity set, health fields and compute-app list.  The wrapper adds the
+    common DATA_ROOT/no-symlink policy and an explicit path identity for S2.5
+    status and detached receipts.
+    """
+
+    if path is None:
+        raise S25ExecutionBlocked("S205_GPU_INVENTORY_JSON_REQUIRED")
+    root = data_root.resolve()
+    resolved = _strict_inventory_path(root, path)
+    try:
+        envelope = load_canonical_json(resolved)
+    except (OSError, TypeError, ValueError) as error:
+        raise S25ExecutionBlocked("S205_GPU_INVENTORY_JSON_INVALID") from error
+    if not isinstance(envelope, Mapping):
+        raise S25ExecutionBlocked("S205_GPU_INVENTORY_ENVELOPE_REQUIRED")
+    source_ref = envelope.get("source_ref")
+    if not isinstance(source_ref, str) or not source_ref:
+        raise S25ExecutionBlocked("S205_GPU_INVENTORY_SOURCE_REF_REQUIRED")
+    # Validate the raw capture path independently so the shared loader's
+    # resolved path cannot hide a symlink component.
+    _logical(root, source_ref, field="gpu_inventory_source_ref")
+    payload = dict(envelope)
+    if payload.get("schema_version") != _GPU_INVENTORY_SCHEMA:
+        raise S25ExecutionBlocked("S205_GPU_INVENTORY_SCHEMA_INVALID")
+    artifact_ref = payload.get("artifact_ref")
+    expected_artifact_ref = resolved.relative_to(root).as_posix()
+    if not isinstance(artifact_ref, str) or not artifact_ref:
+        raise S25ExecutionBlocked("S205_GPU_INVENTORY_ARTIFACT_REF_REQUIRED")
+    if artifact_ref != expected_artifact_ref:
+        raise S25ExecutionBlocked("S205_GPU_INVENTORY_ARTIFACT_REF_PATH_MISMATCH")
+    rows = payload.get("rows", payload.get("gpus"))
+    apps = payload.get("compute_apps")
+    if not isinstance(rows, list) or not all(isinstance(item, Mapping) for item in rows):
+        raise S25ExecutionBlocked("S205_GPU_INVENTORY_ROWS_REQUIRED")
+    if not isinstance(apps, list) or not all(isinstance(item, Mapping) for item in apps):
+        raise S25ExecutionBlocked("S205_GPU_INVENTORY_COMPUTE_APPS_REQUIRED")
+    artifact_hash = payload.get("artifact_hash")
+    if not isinstance(artifact_hash, str) or re.fullmatch(r"[0-9a-f]{64}", artifact_hash) is None:
+        raise S25ExecutionBlocked("S205_GPU_INVENTORY_ARTIFACT_HASH_REQUIRED")
+    if canonical_json_hash({key: item for key, item in payload.items() if key != "artifact_hash"}) != artifact_hash:
+        raise S25ExecutionBlocked("S205_GPU_INVENTORY_ARTIFACT_HASH_MISMATCH")
+    source_ref = payload.get("source_ref")
+    if not isinstance(source_ref, str) or not source_ref:
+        raise S25ExecutionBlocked("S205_GPU_INVENTORY_SOURCE_REF_REQUIRED")
+    source_path = _logical(root, source_ref, field="gpu_inventory_source_ref")
+    if source_path == resolved:
+        raise S25ExecutionBlocked("S205_GPU_INVENTORY_SOURCE_REF_SELF_REFERENCE")
+    source_sha = _file_sha256(source_path)
+    declared_source_sha = payload.get("source_sha256")
+    if not isinstance(declared_source_sha, str) or re.fullmatch(r"[0-9a-f]{64}", declared_source_sha) is None:
+        raise S25ExecutionBlocked("S205_GPU_INVENTORY_SOURCE_SHA256_REQUIRED")
+    if declared_source_sha != source_sha:
+        raise S25ExecutionBlocked("S205_GPU_INVENTORY_SOURCE_SHA256_MISMATCH")
+    summary = _validate_s205_gpu_inventory(rows, compute_apps=apps)
+    identity = {
+        "source_ref": source_ref,
+        "artifact_ref": artifact_ref,
+        "artifact_hash": artifact_hash,
+        "source_sha256": source_sha,
+        "path": str(resolved),
+        "schema_version": _GPU_INVENTORY_SCHEMA,
+        "compute_apps": [dict(item) for item in apps],
+    }
+    return [dict(row) for row in summary["inventory"]], identity  # type: ignore[index]
+
+
 def _inventory(path: Path | None, *, data_root: Path | None = None) -> list[dict[str, object]]:
     if path is not None:
-        resolved = path.resolve()
-        if data_root is not None:
-            try:
-                expected_ref = resolved.relative_to(data_root.resolve()).as_posix()
-            except ValueError as error:
-                raise S25ExecutionBlocked("S205_GPU_INVENTORY_PATH_OUTSIDE_DATA_ROOT") from error
-        else:
-            expected_ref = None
-        try:
-            value = load_canonical_json(resolved)
-        except (OSError, TypeError, ValueError) as error:
-            raise S25ExecutionBlocked("S205_GPU_INVENTORY_JSON_INVALID") from error
-        if not isinstance(value, Mapping) or value.get("schema_version") != "stage2-s206-gpu-inventory-v1":
-            raise S25ExecutionBlocked("S205_GPU_INVENTORY_SCHEMA_INVALID")
-        source_ref = value.get("source_ref")
-        if not isinstance(source_ref, str) or not source_ref:
-            raise S25ExecutionBlocked("S205_GPU_INVENTORY_SOURCE_REF_REQUIRED")
-        if expected_ref is not None and source_ref != expected_ref:
-            raise S25ExecutionBlocked("S205_GPU_INVENTORY_SOURCE_REF_PATH_MISMATCH")
-        artifact_hash = value.get("artifact_hash")
-        if not isinstance(artifact_hash, str) or len(artifact_hash) != 64 or any(c not in "0123456789abcdef" for c in artifact_hash):
-            raise S25ExecutionBlocked("S205_GPU_INVENTORY_ARTIFACT_HASH_REQUIRED")
-        if canonical_json_hash({key: item for key, item in value.items() if key != "artifact_hash"}) != artifact_hash:
-            raise S25ExecutionBlocked("S205_GPU_INVENTORY_ARTIFACT_HASH_MISMATCH")
-        source_sha = value.get("source_sha256")
-        if source_sha is not None and source_sha != _file_sha256(resolved):
-            raise S25ExecutionBlocked("S205_GPU_INVENTORY_SOURCE_SHA256_MISMATCH")
-        rows = value.get("rows", value.get("gpus"))
-        apps = value.get("compute_apps")
-        if not isinstance(rows, list) or not all(isinstance(row, Mapping) for row in rows):
-            raise S25ExecutionBlocked("S205_GPU_INVENTORY_ROWS_REQUIRED")
-        if not isinstance(apps, list) or not all(isinstance(row, Mapping) for row in apps):
-            raise S25ExecutionBlocked("S205_GPU_INVENTORY_COMPUTE_APPS_REQUIRED")
-        try:
-            normalized = validate_gpu_inventory(rows, compute_apps=apps)
-        except Exception as error:
-            raise S25ExecutionBlocked(f"S205_GPU_INVENTORY_HEALTH_INVALID:{error}") from error
-        return [dict(row) for row in normalized["inventory"]]  # type: ignore[index]
+        rows, _identity = _load_inventory_snapshot(
+            path,
+            data_root=(data_root.resolve() if data_root is not None else path.resolve().parent),
+        )
+        return rows
     try:
         completed = subprocess.run(
             ["nvidia-smi", "--query-gpu=index,uuid,pci.bus_id,memory.used,memory.total,utilization.gpu,ecc.errors.uncorrected.volatile.total,ecc.errors.uncorrected.aggregate.total", "--format=csv,noheader,nounits"],
@@ -146,7 +377,7 @@ def _inventory(path: Path | None, *, data_root: Path | None = None) -> list[dict
 
 def _validate_inventory(rows: Sequence[Mapping[str, object]]) -> dict[str, object]:
     try:
-        summary = validate_gpu_inventory(rows, compute_apps=())
+        summary = _validate_s205_gpu_inventory(rows, compute_apps=())
     except Exception as error:
         raise S25ExecutionBlocked(f"S205_GPU_INVENTORY_INVALID:{error}") from error
     return dict(summary)
@@ -184,6 +415,14 @@ def _write_once(path: Path, payload: Mapping[str, object]) -> None:
 
 def _repository_commit(repository: Path) -> str:
     try:
+        dirty = subprocess.run(
+            ["git", "-C", str(repository.resolve()), "status", "--porcelain=v1", "--untracked-files=all"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        if dirty.stdout.strip():
+            raise S25ExecutionBlocked("S205_REPOSITORY_DIRTY")
         completed = subprocess.run(
             ["git", "-C", str(repository.resolve()), "rev-parse", "HEAD"],
             check=True,
@@ -193,7 +432,7 @@ def _repository_commit(repository: Path) -> str:
     except (OSError, subprocess.CalledProcessError) as error:
         raise S25ExecutionBlocked("S205_RUNNER_COMMIT_UNAVAILABLE") from error
     commit = completed.stdout.strip()
-    if len(commit) != 40 or any(character not in "0123456789abcdef" for character in commit):
+    if re.fullmatch(r"[0-9a-f]{40}", commit) is None:
         raise S25ExecutionBlocked("S205_RUNNER_COMMIT_INVALID")
     return commit
 
@@ -459,6 +698,15 @@ def _preflight(args: argparse.Namespace) -> dict[str, object]:
     if not args.sampling_plan_ref or not args.experiment_plan_ref or not args.artifact_root:
         raise S25ExecutionBlocked("S205_FORMAL_PLAN_REFS_REQUIRED")
     root = args.data_root.resolve()
+    _require_launcher_in_repository(args.repository)
+    executor_commit = _repository_commit(args.repository)
+    supplied_execution_commit = getattr(args, "execution_commit", None)
+    if supplied_execution_commit is not None and supplied_execution_commit != executor_commit:
+        raise S25ExecutionBlocked("S205_EXECUTION_COMMIT_MISMATCH")
+    launcher_source_sha256 = _launcher_source_sha256()
+    supplied_launcher_source = getattr(args, "launcher_source_sha256", None)
+    if supplied_launcher_source is not None and supplied_launcher_source != launcher_source_sha256:
+        raise S25ExecutionBlocked("S205_LAUNCHER_SOURCE_SHA256_MISMATCH")
     plan = load_s25_rebind_plan(root, args.s205_rebind_ref)
     _validate_s204_input_refs(root, plan, index)
     if args.artifact_root != plan.get("s205_output_root"):
@@ -474,24 +722,33 @@ def _preflight(args: argparse.Namespace) -> dict[str, object]:
         experiment_plan_ref=args.experiment_plan_ref,
         artifact_root=args.artifact_root,
     )
-    inventory_path = args.gpu_inventory_json.resolve()
-    inventory = _validate_inventory(_inventory(inventory_path, data_root=root))
+    inventory, inventory_identity = _load_inventory_snapshot(args.gpu_inventory_json, data_root=root)
     result["gpu"] = inventory
-    try:
-        inventory_value = load_canonical_json(inventory_path)
-        inventory_ref = inventory_path.relative_to(root).as_posix()
-    except (OSError, TypeError, ValueError) as error:
-        raise S25ExecutionBlocked("S205_GPU_INVENTORY_IDENTITY_UNAVAILABLE") from error
-    if not isinstance(inventory_value, Mapping):
-        raise S25ExecutionBlocked("S205_GPU_INVENTORY_IDENTITY_UNAVAILABLE")
-    result["gpu_inventory_ref"] = inventory_ref
-    result["gpu_inventory_artifact_hash"] = inventory_value.get("artifact_hash")
-    result["gpu_inventory_source_sha256"] = _file_sha256(inventory_path)
+    # ``preflight_s25`` exposes the S2.4 execution commit.  Preserve it under
+    # an explicit name and reserve the launcher-level execution_commit for the
+    # exact clean HEAD whose source will run the six workers.
+    result["s204_execution_commit"] = result.pop("execution_commit")
+    result["execution_commit"] = executor_commit
+    result["launcher_source_sha256"] = launcher_source_sha256
+    result["gpu_inventory_ref"] = inventory_identity["artifact_ref"]
+    result["gpu_inventory_artifact_hash"] = inventory_identity["artifact_hash"]
+    result["gpu_inventory_source_ref"] = inventory_identity["source_ref"]
+    result["gpu_inventory_source_sha256"] = inventory_identity["source_sha256"]
+    result["gpu_inventory_path"] = inventory_identity["path"]
+    result["gpu_inventory_identity"] = {
+        "artifact_ref": inventory_identity["artifact_ref"],
+        "artifact_hash": inventory_identity["artifact_hash"],
+        "source_ref": inventory_identity["source_ref"],
+        "source_sha256": inventory_identity["source_sha256"],
+    }
     result["launcher"] = {
         "repository": str(args.repository.resolve()),
         "data_root": str(root),
         "run_id": args.run_id,
+        "execution_commit": executor_commit,
+        "launcher_source_sha256": launcher_source_sha256,
     }
+    result["preflight_artifact_hash"] = canonical_json_hash(result)
     return result
 
 
@@ -501,7 +758,7 @@ def _worker(args: argparse.Namespace) -> dict[str, object]:
     if args.gpu_uuid not in APPROVED_GPU_UUIDS:
         raise S25ExecutionBlocked("S205_WORKER_GPU_UNAPPROVED")
     visible = os.environ.get("CUDA_VISIBLE_DEVICES")
-    if visible is not None and visible != args.gpu_uuid:
+    if visible != args.gpu_uuid:
         raise S25ExecutionBlocked("S205_WORKER_GPU_BINDING_MISMATCH")
     root = args.data_root.resolve()
     preflight = _preflight(args)
@@ -523,7 +780,15 @@ def _worker(args: argparse.Namespace) -> dict[str, object]:
         artifact_root=_logical(root, args.artifact_root, field="artifact_root", allow_missing=True),
     )
     result = runner.run_cell(args.cell_id)
-    return {"status": "CELL_COMPLETE", "cell_id": args.cell_id, "gpu_uuid": args.gpu_uuid, "preflight": preflight, "cell": result}
+    return {
+        "status": "CELL_COMPLETE",
+        "cell_id": args.cell_id,
+        "gpu_uuid": args.gpu_uuid,
+        "execution_commit": preflight["execution_commit"],
+        "launcher_source_sha256": preflight["launcher_source_sha256"],
+        "preflight": preflight,
+        "cell": result,
+    }
 
 
 def _execute(args: argparse.Namespace) -> dict[str, object]:
@@ -546,6 +811,26 @@ def _execute(args: argparse.Namespace) -> dict[str, object]:
         previous = loaded
         if loaded.get("run_id") != args.run_id:
             raise S25ExecutionBlocked("S205_STATUS_RUN_ID_MISMATCH")
+        # Terminal status is still bound to the exact clean executor source;
+        # never let a later HEAD substitution or inventory drift masquerade as
+        # a successful resumable run.
+        if loaded.get("preflight") != preflight:
+            raise S25ExecutionBlocked("S205_STATUS_PREFLIGHT_IDENTITY_MISMATCH")
+        if loaded.get("execution_commit") != preflight.get("execution_commit"):
+            raise S25ExecutionBlocked("S205_STATUS_EXECUTION_COMMIT_MISMATCH")
+        if loaded.get("launcher_source_sha256") != preflight.get("launcher_source_sha256"):
+            raise S25ExecutionBlocked("S205_STATUS_LAUNCHER_SOURCE_SHA256_MISMATCH")
+        old_records = loaded.get("completed_cells")
+        if not isinstance(old_records, list):
+            raise S25ExecutionBlocked("S205_STATUS_COMPLETED_CELL_RECORDS_INVALID")
+        for old_record in old_records:
+            if not isinstance(old_record, Mapping):
+                raise S25ExecutionBlocked("S205_STATUS_COMPLETED_CELL_RECORD_INVALID")
+            if old_record.get("returncode") == 0 and (
+                old_record.get("execution_commit") != preflight.get("execution_commit")
+                or old_record.get("launcher_source_sha256") != preflight.get("launcher_source_sha256")
+            ):
+                raise S25ExecutionBlocked("S205_STATUS_COMPLETED_CELL_IDENTITY_MISMATCH")
         if loaded.get("stage") in {"G2.4A_PASS", "G2.4A_BLOCKED", "BLOCKED"}:
             if loaded.get("stage") == "G2.4A_PASS":
                 return dict(loaded)
@@ -560,13 +845,14 @@ def _execute(args: argparse.Namespace) -> dict[str, object]:
                 pass
             else:
                 raise S25ExecutionBlocked("S205_STATUS_OWNED_BY_OTHER_PROCESS")
-        if loaded.get("preflight") != preflight:
-            raise S25ExecutionBlocked("S205_STATUS_PREFLIGHT_IDENTITY_MISMATCH")
     status: dict[str, object] = {
         "run_id": args.run_id,
         "stage": "PREPARED",
         "owner_pid": os.getpid(),
         "formal_eligible": True,
+        "execution_commit": preflight["execution_commit"],
+        "s204_execution_commit": preflight["s204_execution_commit"],
+        "launcher_source_sha256": preflight["launcher_source_sha256"],
         "preflight": preflight,
         "completed_cells": list(previous.get("completed_cells", [])) if previous else [],
         "confirmatory_draws_generated": False,
@@ -578,6 +864,9 @@ def _execute(args: argparse.Namespace) -> dict[str, object]:
         "--sampling-plan-ref", args.sampling_plan_ref, "--experiment-plan-ref", args.experiment_plan_ref,
         "--artifact-root", args.artifact_root, "--operations-root", args.operations_root,
         "--run-id", args.run_id,
+        "--repository", str(args.repository.resolve()),
+        "--execution-commit", str(preflight["execution_commit"]),
+        "--launcher-source-sha256", str(preflight["launcher_source_sha256"]),
     ]
     if getattr(args, "input_index_ref", None):
         base += ["--input-index-ref", args.input_index_ref]
@@ -627,7 +916,14 @@ def _execute(args: argparse.Namespace) -> dict[str, object]:
                     cell_id, gpu_uuid, log, handle = futures.pop(future)
                     completed = future.result()
                     handle.close()
-                    record = {"cell_id": cell_id, "gpu_uuid": gpu_uuid, "returncode": completed.returncode, "log_ref": str(log.relative_to(root))}
+                    record = {
+                        "cell_id": cell_id,
+                        "gpu_uuid": gpu_uuid,
+                        "returncode": completed.returncode,
+                        "log_ref": str(log.relative_to(root)),
+                        "execution_commit": preflight["execution_commit"],
+                        "launcher_source_sha256": preflight["launcher_source_sha256"],
+                    }
                     records.append(record)
                     status.update({"stage": "RUNNING", "completed_cells": list(records)})
                     _write_status(status_path, status)
@@ -673,15 +969,59 @@ def _status(args: argparse.Namespace, *, wait: bool) -> int:
             preflight = value.get("preflight")
             if not isinstance(preflight, Mapping):
                 raise S25ExecutionBlocked("S205_STATUS_PREFLIGHT_MISSING")
+            execution_commit = value.get("execution_commit")
+            launcher_source_sha256 = value.get("launcher_source_sha256")
+            if execution_commit != preflight.get("execution_commit"):
+                raise S25ExecutionBlocked("S205_STATUS_EXECUTION_COMMIT_MISMATCH")
+            if value.get("s204_execution_commit") != preflight.get("s204_execution_commit"):
+                raise S25ExecutionBlocked("S205_STATUS_S204_EXECUTION_COMMIT_MISMATCH")
+            if launcher_source_sha256 != preflight.get("launcher_source_sha256"):
+                raise S25ExecutionBlocked("S205_STATUS_LAUNCHER_SOURCE_SHA256_MISMATCH")
+            if execution_commit != _repository_commit(args.repository):
+                raise S25ExecutionBlocked("S205_STATUS_EXECUTION_COMMIT_DRIFT")
+            if launcher_source_sha256 != _launcher_source_sha256():
+                raise S25ExecutionBlocked("S205_STATUS_LAUNCHER_SOURCE_SHA256_DRIFT")
+            launcher = preflight.get("launcher")
+            if (
+                not isinstance(launcher, Mapping)
+                or launcher.get("repository") != str(args.repository.resolve())
+                or launcher.get("data_root") != str(args.data_root.resolve())
+                or launcher.get("run_id") != value.get("run_id")
+                or launcher.get("execution_commit") != execution_commit
+                or launcher.get("launcher_source_sha256") != launcher_source_sha256
+            ):
+                raise S25ExecutionBlocked("S205_STATUS_LAUNCHER_IDENTITY_MISMATCH")
+            declared_preflight_hash = preflight.get("preflight_artifact_hash")
+            if not isinstance(declared_preflight_hash, str) or declared_preflight_hash != canonical_json_hash(
+                {key: item for key, item in preflight.items() if key != "preflight_artifact_hash"}
+            ):
+                raise S25ExecutionBlocked("S205_STATUS_PREFLIGHT_ARTIFACT_HASH_INVALID")
             inventory_ref = preflight.get("gpu_inventory_ref")
             inventory_hash = preflight.get("gpu_inventory_artifact_hash")
+            inventory_source_ref = preflight.get("gpu_inventory_source_ref")
             inventory_source_sha = preflight.get("gpu_inventory_source_sha256")
-            if not isinstance(inventory_ref, str) or not isinstance(inventory_hash, str) or not isinstance(inventory_source_sha, str):
+            if (
+                not isinstance(inventory_ref, str)
+                or not isinstance(inventory_hash, str)
+                or not isinstance(inventory_source_ref, str)
+                or not isinstance(inventory_source_sha, str)
+            ):
                 raise S25ExecutionBlocked("S205_STATUS_GPU_IDENTITY_MISSING")
+            if preflight.get("gpu_inventory_identity") != {
+                "artifact_ref": inventory_ref,
+                "artifact_hash": inventory_hash,
+                "source_ref": inventory_source_ref,
+                "source_sha256": inventory_source_sha,
+            }:
+                raise S25ExecutionBlocked("S205_STATUS_GPU_IDENTITY_MISMATCH")
             inventory_path = _logical(args.data_root.resolve(), inventory_ref, field="gpu_inventory_ref")
-            _inventory(inventory_path, data_root=args.data_root.resolve())
-            inventory_value = load_canonical_json(inventory_path)
-            if not isinstance(inventory_value, Mapping) or inventory_value.get("artifact_hash") != inventory_hash or _file_sha256(inventory_path) != inventory_source_sha:
+            _rows, inventory_identity = _load_inventory_snapshot(inventory_path, data_root=args.data_root.resolve())
+            if (
+                inventory_identity.get("artifact_ref") != inventory_ref
+                or inventory_identity.get("artifact_hash") != inventory_hash
+                or inventory_identity.get("source_ref") != inventory_source_ref
+                or inventory_identity.get("source_sha256") != inventory_source_sha
+            ):
                 raise S25ExecutionBlocked("S205_STATUS_GPU_IDENTITY_DRIFT")
             print(json.dumps(value, ensure_ascii=False, sort_keys=True, indent=2))
             if not wait or (isinstance(value, Mapping) and value.get("stage") in {"G2.4A_PASS", "G2.4A_BLOCKED", "BLOCKED"}):
@@ -712,6 +1052,8 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--run-id", default="s205-formal-g24a")
     parser.add_argument("--gpu-inventory-json", type=Path)
     parser.add_argument("--repository", type=Path, default=_REPOSITORY_ROOT)
+    parser.add_argument("--execution-commit")
+    parser.add_argument("--launcher-source-sha256")
     parser.add_argument("--python", type=Path, default=Path(sys.executable))
     parser.add_argument("--cell-id")
     parser.add_argument("--gpu-uuid")
@@ -727,28 +1069,70 @@ def _detach(args: argparse.Namespace, raw_argv: Sequence[str] | None = None) -> 
     root = args.data_root.resolve()
     operations = _logical(root, args.operations_root, field="operations_root", allow_missing=True)
     operations.mkdir(parents=True, exist_ok=True)
-    pid_path = operations / "launcher.pid.json"
-    if pid_path.exists():
+    # Receipts are append-only per launch attempt.  A stale receipt from a
+    # crashed launcher must not make ``--execute --detach --resume``
+    # permanently unusable, while a live PID still blocks a duplicate run.
+    receipt_candidates = [operations / "launcher.pid.json"]
+    attempts = operations / "attempts"
+    if attempts.is_symlink():
+        raise S25ExecutionBlocked("S205_DETACHED_PID_INVALID")
+    if attempts.exists():
+        receipt_candidates.extend(attempts.glob("*/launcher.pid.json"))
+    for existing_path in receipt_candidates:
+        if existing_path.is_symlink():
+            raise S25ExecutionBlocked("S205_DETACHED_PID_INVALID")
+        if not existing_path.is_file():
+            raise S25ExecutionBlocked("S205_DETACHED_PID_INVALID")
         try:
-            existing = load_canonical_json(pid_path)
+            existing = load_canonical_json(existing_path)
         except (OSError, TypeError, ValueError) as error:
             raise S25ExecutionBlocked("S205_DETACHED_PID_INVALID") from error
-        if isinstance(existing, Mapping) and existing.get("artifact_hash") == canonical_json_hash(
+        if not isinstance(existing, Mapping) or existing.get("artifact_hash") != canonical_json_hash(
             {key: item for key, item in existing.items() if key != "artifact_hash"}
-        ) and isinstance(existing.get("pid"), int):
-            try:
-                os.kill(int(existing["pid"]), 0)
-            except OSError:
-                pass
-            else:
-                raise S25ExecutionBlocked(f"S205_DETACHED_LAUNCH_ALREADY_RUNNING:{existing['pid']}")
-        raise S25ExecutionBlocked("S205_DETACHED_LAUNCH_MARKER_EXISTS")
-    log_path = operations / "launcher.log"
+        ) or not isinstance(existing.get("pid"), int):
+            raise S25ExecutionBlocked("S205_DETACHED_PID_INVALID")
+        try:
+            os.kill(int(existing["pid"]), 0)
+        except OSError:
+            continue
+        raise S25ExecutionBlocked(f"S205_DETACHED_LAUNCH_ALREADY_RUNNING:{existing['pid']}")
+
+    attempts.mkdir(parents=True, exist_ok=True)
+    safe_run_id = re.sub(r"[^A-Za-z0-9._-]", "_", str(args.run_id))[:80] or "run"
+    attempt_id = f"{safe_run_id}-{time.time_ns()}-{os.getpid()}"
+    attempt_root = attempts / attempt_id
+    try:
+        attempt_root.mkdir()
+    except FileExistsError as error:
+        raise S25ExecutionBlocked("S205_DETACHED_ATTEMPT_COLLISION") from error
+    pid_path = attempt_root / "launcher.pid.json"
+    log_path = attempt_root / "launcher.log"
     child = list(sys.argv[1:] if raw_argv is None else raw_argv)
     try:
         child[child.index("--detach")] = "--execute"
     except ValueError as error:
         raise S25ExecutionBlocked("S205_DETACH_ACTION_NOT_FOUND") from error
+    if "--launcher-source-sha256" in child:
+        source_index = child.index("--launcher-source-sha256")
+        if source_index + 1 >= len(child):
+            raise S25ExecutionBlocked("S205_LAUNCHER_SOURCE_SHA256_REQUIRED")
+        child[source_index + 1] = str(preflight["launcher_source_sha256"])
+    else:
+        child += ["--launcher-source-sha256", str(preflight["launcher_source_sha256"])]
+    if "--execution-commit" in child:
+        commit_index = child.index("--execution-commit")
+        if commit_index + 1 >= len(child):
+            raise S25ExecutionBlocked("S205_EXECUTION_COMMIT_REQUIRED")
+        child[commit_index + 1] = str(preflight["execution_commit"])
+    else:
+        child += ["--execution-commit", str(preflight["execution_commit"])]
+    if "--repository" in child:
+        repository_index = child.index("--repository")
+        if repository_index + 1 >= len(child):
+            raise S25ExecutionBlocked("S205_REPOSITORY_REQUIRED")
+        child[repository_index + 1] = str(args.repository.resolve())
+    else:
+        child += ["--repository", str(args.repository.resolve())]
     with log_path.open("ab") as handle:
         process = subprocess.Popen(
             [str(args.python), str(Path(__file__).resolve()), *child],
@@ -762,11 +1146,16 @@ def _detach(args: argparse.Namespace, raw_argv: Sequence[str] | None = None) -> 
     payload: dict[str, object] = {
         "schema_version": "stage2-s205-detached-launch-v1",
         "pid": int(process.pid),
+        "attempt_id": attempt_id,
         "run_id": args.run_id,
         "operations_root": args.operations_root,
+        "attempt_root": str(attempt_root.relative_to(root)),
         "log_ref": str(log_path.relative_to(root)),
         "status_ref": str((operations / "status.json").relative_to(root)),
-        "preflight_artifact_hash": canonical_json_hash(preflight),
+        "preflight_artifact_hash": preflight["preflight_artifact_hash"],
+        "execution_commit": preflight["execution_commit"],
+        "launcher_source_sha256": preflight["launcher_source_sha256"],
+        "gpu_inventory_identity": preflight["gpu_inventory_identity"],
         "confirmatory_draws_generated": False,
     }
     payload["artifact_hash"] = canonical_json_hash(payload)
