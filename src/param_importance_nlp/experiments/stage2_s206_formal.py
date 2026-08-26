@@ -1739,13 +1739,23 @@ def _validate_g23(value: Mapping[str, Any]) -> None:
     _validate_hashed_object(value, field="G23")
 
 
-def _validate_g24a(value: Mapping[str, Any]) -> None:
+def _validate_g24a(
+    value: Mapping[str, Any],
+    *,
+    expected_g23_ref: str | None = None,
+    expected_g23_hash: str | None = None,
+) -> None:
     if value.get("schema_version") != "stage2-g24a-formal-evaluation-v1":
         raise S206PreparationBlocked("G24A_SCHEMA_INVALID")
     if value.get("gate_id") != "stage2.G2.4a" or value.get("status") != "PASS" or value.get("formal_eligible") is not True:
         raise S206PreparationBlocked("G24A_STRICT_PASS_REQUIRED")
     if value.get("cell_count") != 6:
         raise S206PreparationBlocked("G24A_SIX_CELL_COMPLETENESS_REQUIRED")
+    if expected_g23_hash is not None:
+        if value.get("g23_evaluation_hash") != expected_g23_hash:
+            raise S206PreparationBlocked("G24A_G23_EVALUATION_HASH_BINDING_INVALID")
+        if expected_g23_ref is not None and value.get("g23_evaluation_ref") != expected_g23_ref:
+            raise S206PreparationBlocked("G24A_G23_EVALUATION_REF_BINDING_INVALID")
     results = value.get("results")
     if not isinstance(results, list) or len(results) != 6:
         raise S206PreparationBlocked("G24A_RESULTS_INVALID")
@@ -1931,7 +1941,11 @@ def strict_preflight(
     g23_ref, g23 = _load_root_json(root, spec.g23_ref, field="g23_ref")
     g24a_ref, g24a = _load_root_json(root, spec.g24a_ref, field="g24a_ref")
     _validate_g23(g23)
-    _validate_g24a(g24a)
+    _validate_g24a(
+        g24a,
+        expected_g23_ref=g23_ref,
+        expected_g23_hash=str(g23["artifact_hash"]),
+    )
     s204_root = (root / spec.s204_root).resolve()
     try:
         s204_root.relative_to(root)

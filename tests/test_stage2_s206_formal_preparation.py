@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
-from param_importance_nlp.contracts.jsonio import canonical_json_hash, write_canonical_json
+from param_importance_nlp.contracts.jsonio import canonical_json_hash, load_canonical_json, write_canonical_json
 from param_importance_nlp.contracts.stage23 import FormalExecutionEvidence
 from param_importance_nlp.contracts.status import GateRecord, GateStatus
 from param_importance_nlp.experiments.sampling import SamplingPlan, SamplingUniverse
@@ -30,6 +31,7 @@ from param_importance_nlp.experiments.stage2_s206_formal import (
 from param_importance_nlp.experiments.stage2_formal import _vector_digest
 from param_importance_nlp.providers.synthetic import SyntheticGradientProvider
 from param_importance_nlp.experiments.stage2_pilot import CostSemantics
+from ops.stage2.run_s206_formal import _load_s205_rebind
 
 
 def _live_gpu_inventory() -> list[dict[str, object]]:
@@ -316,6 +318,8 @@ def _write_upstream_fixture(root: Path) -> tuple[str, str, str]:
         "status": "PASS",
         "formal_eligible": True,
         "cell_count": 6,
+        "g23_evaluation_ref": g23_ref,
+        "g23_evaluation_hash": g23["artifact_hash"],
         "results": [{"cell_id": anchor_id, "status": "PASS", "formal_eligible": True} for anchor_id in ANCHOR_IDS],
     }
     g24a["artifact_hash"] = canonical_json_hash(g24a)
@@ -337,3 +341,81 @@ def test_strict_preflight_requires_all_upstream_cells_and_approved_gpus(tmp_path
     bad[0] = {**bad[0], "pci_bus_id": EXCLUDED_PCI}
     with pytest.raises(S206PreparationBlocked, match="EXCLUDED"):
         strict_preflight(S206PreflightSpec(tmp_path, s204_root, g23_ref, g24a_ref), gpu_inventory=bad)
+
+
+@pytest.mark.parametrize(
+    "mutation,pattern",
+    [
+        (lambda value: value.__setitem__("g23_evaluation_hash", "b" * 64), "HASH_BINDING_INVALID"),
+        (lambda value: value.__setitem__("g23_evaluation_ref", "evidence/other-g23.json"), "REF_BINDING_INVALID"),
+        (lambda value: value.pop("g23_evaluation_hash"), "HASH_BINDING_INVALID"),
+    ],
+)
+def test_strict_preflight_rejects_cross_amendment_or_missing_g23_binding(
+    tmp_path: Path,
+    mutation,
+    pattern: str,
+) -> None:
+    s204_root, g23_ref, g24a_ref = _write_upstream_fixture(tmp_path)
+    inventory = _live_gpu_inventory()
+    value = load_canonical_json(tmp_path / g24a_ref)
+    assert isinstance(value, dict)
+    mutation(value)
+    value["artifact_hash"] = canonical_json_hash(
+        {key: item for key, item in value.items() if key != "artifact_hash"}
+    )
+    write_canonical_json(tmp_path / g24a_ref, value)
+    with pytest.raises(S206PreparationBlocked, match=pattern):
+        strict_preflight(
+            S206PreflightSpec(tmp_path, s204_root, g23_ref, g24a_ref),
+            gpu_inventory=inventory,
+        )
+
+
+def test_s205_rebind_requires_exact_command_g23_ref_and_hash(tmp_path: Path) -> None:
+    _s204_root, g23_ref, _g24a_ref = _write_upstream_fixture(tmp_path)
+    g23 = load_canonical_json(tmp_path / g23_ref)
+    assert isinstance(g23, dict)
+    rows = [
+        {
+            "cell_id": anchor_id.replace(".", ":", 1),
+            "config_ref": "prepared/config.json",
+            "environment_ref": "prepared/environment.json",
+            "formal_execution_ref": "evidence/formal-execution.json",
+            "reference_artifact_refs": {},
+            "task_result_status_path": "evidence/final-status.json",
+            "config_hash": "a" * 64,
+            "result_hash": "b" * 64,
+        }
+        for anchor_id in ANCHOR_IDS
+    ]
+    plan: dict[str, object] = {
+        "schema_version": "stage2-s205-rebind-plan-v1",
+        "status": "READY",
+        "formal_eligible": True,
+        "g23_evaluation_ref": g23_ref,
+        "g23_evaluation_hash": g23["artifact_hash"],
+        "cells": rows,
+    }
+    plan_ref = "prepared/s205-rebind.json"
+    write_canonical_json(tmp_path / plan_ref, plan)
+    args = SimpleNamespace(
+        data_root=tmp_path,
+        s205_rebind_ref=plan_ref,
+        g23_evaluation=g23_ref,
+    )
+    _load_s205_rebind(args)
+    for field, replacement in (
+        ("g23_evaluation_ref", "evidence/other-g23.json"),
+        ("g23_evaluation_hash", "c" * 64),
+    ):
+        tampered = dict(plan)
+        tampered[field] = replacement
+        write_canonical_json(tmp_path / plan_ref, tampered)
+        with pytest.raises(Exception, match="BINDING"):
+            _load_s205_rebind(args)
+    missing = dict(plan)
+    missing.pop("g23_evaluation_hash")
+    write_canonical_json(tmp_path / plan_ref, missing)
+    with pytest.raises(Exception, match="BINDING"):
+        _load_s205_rebind(args)
