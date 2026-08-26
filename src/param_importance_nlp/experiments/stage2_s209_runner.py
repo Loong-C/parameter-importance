@@ -36,6 +36,11 @@ from ..contracts.jsonio import canonical_json_hash, load_canonical_json, write_c
 from ..contracts.status import GateRecord
 from ..contracts.g21_formal_handoff import ALLOWED_DEVICES, EXCLUDED_UUID
 from .stage2_s207_formal import APPROVED_GPU_UUIDS, EXCLUDED_GPU_UUID, EXCLUDED_PCI
+from .stage2_s207_runner import (
+    S27_GPU_INVENTORY_SCHEMA,
+    load_s27_gpu_inventory_envelope,
+    validate_s27_gpu_inventory,
+)
 from .stage2_s209_g27a import (
     S29_COUNT_FIELDS,
     S29_COST_SEMANTICS,
@@ -65,11 +70,9 @@ S29_IO_SCHEMA = "stage2-s209-g27a-io-quiescence-v1"
 S29_INVENTORY_SCHEMA = "stage2-s209-g27a-gpu-inventory-v1"
 S29_CAPACITY_SCHEMA = "stage2-s209-g27a-capacity-v1"
 S29_ULIMIT_SCHEMA = "stage2-s209-g27a-ulimit-v1"
+S29_EXECUTION_IDENTITY_SCHEMA = "stage2-s209-execution-identity-v1"
 S29_SHARED_POOL_REF_PREFIX = "shared-pools/"
-S29_ACCEPTED_INVENTORY_SCHEMAS = frozenset({
-    S29_INVENTORY_SCHEMA,
-    "stage2-s206-gpu-inventory-v1",
-})
+S29_ACCEPTED_INVENTORY_SCHEMAS = frozenset({S27_GPU_INVENTORY_SCHEMA})
 S29_LIVE_GPU_COUNT = 8
 S29_INVENTORY_HEALTH_ALIASES = {
     "memory_used_mib": ("memory_used_mib", "memory_used", "memory.used"),
@@ -103,6 +106,7 @@ S29_STATUS_VALUES = ("PREPARED", "RUNNING", "PAUSED", "FAILED", "SEALED", "BLOCK
 S29_TERMINAL_VALUES = frozenset({"FAILED", "SEALED", "BLOCKED"})
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _SAFE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,159}$")
+_GIT_HEAD = re.compile(r"^[0-9a-f]{40}$")
 
 
 class S29RunnerBlocked(RuntimeError):
@@ -123,6 +127,33 @@ def _sha(value: Any, *, field: str) -> str:
     if not isinstance(value, str) or _SHA256.fullmatch(value) is None:
         raise S29RunnerBlocked(f"{field}:SHA256_REQUIRED")
     return value
+
+
+def _validate_execution_identity(value: Any, *, field: str = "execution_identity") -> dict[str, Any]:
+    if not isinstance(value, Mapping):
+        raise S29RunnerBlocked(f"{field}:REQUIRED")
+    payload = dict(value)
+    required = {
+        "schema_version",
+        "repository_head",
+        "launcher_source_sha256",
+        "profiler_command_hash",
+        "repository_clean",
+        "artifact_hash",
+    }
+    if set(payload) != required or payload.get("schema_version") != S29_EXECUTION_IDENTITY_SCHEMA:
+        raise S29RunnerBlocked(f"{field}:SCHEMA_INVALID")
+    head = payload.get("repository_head")
+    if not isinstance(head, str) or _GIT_HEAD.fullmatch(head) is None:
+        raise S29RunnerBlocked(f"{field}.repository_head:40HEX_REQUIRED")
+    for name in ("launcher_source_sha256", "profiler_command_hash"):
+        _sha(payload.get(name), field=f"{field}.{name}")
+    if payload.get("repository_clean") is not True:
+        raise S29RunnerBlocked(f"{field}.repository_clean:REQUIRED")
+    declared = _sha(payload.get("artifact_hash"), field=f"{field}.artifact_hash")
+    if canonical_json_hash({key: item for key, item in payload.items() if key != "artifact_hash"}) != declared:
+        raise S29RunnerBlocked(f"{field}:ARTIFACT_HASH_MISMATCH")
+    return payload
 
 
 def _file_sha256(path: str | Path) -> str:
@@ -174,18 +205,27 @@ def _verify_hash(payload: Mapping[str, Any], *, field: str, key: str = "artifact
 def _logical(root: Path, reference: str, *, field: str) -> Path:
     if not isinstance(reference, str) or not reference or "\\" in reference:
         raise S29RunnerBlocked(f"{field}:INVALID_LOGICAL_REFERENCE")
+    parts = reference.split("/")
     logical = PurePosixPath(reference)
-    if logical.is_absolute() or any(part in {"", ".", ".."} for part in logical.parts):
+    if logical.is_absolute() or any(part in {"", ".", ".."} for part in parts):
         raise S29RunnerBlocked(f"{field}:PATH_ESCAPE")
-    target = (root.joinpath(*logical.parts)).resolve()
+    root = root.resolve()
+    current = root
+    for part in parts:
+        current = current / part
+        if current.is_symlink():
+            raise S29RunnerBlocked(f"{field}:SYMLINK_COMPONENT_FORBIDDEN")
+    target = current.resolve()
     try:
-        target.relative_to(root.resolve())
+        target.relative_to(root)
     except ValueError as error:
         raise S29RunnerBlocked(f"{field}:PATH_ESCAPE") from error
     return target
 
 
 def _write_once(path: Path, value: Mapping[str, Any], *, field: str) -> None:
+    if path.is_symlink():
+        raise S29RunnerBlocked(f"{field}:SYMLINK_OUTPUT_FORBIDDEN")
     if path.exists():
         try:
             existing = _load_object(path, field=field)
@@ -333,54 +373,52 @@ def _load_inventory_envelope(
     root: Path | None = None,
     inventory_ref: str | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
-    """Validate a hash-bound live inventory envelope and return rows/identity."""
+    """Reload the exact S2.6/S2.7 13-key inventory wire and its 5-key identity."""
 
-    if not isinstance(value, Mapping):
-        raise S29RunnerBlocked("GPU_INVENTORY_ENVELOPE_REQUIRED")
-    payload = dict(value)
-    if payload.get("schema_version") not in S29_ACCEPTED_INVENTORY_SCHEMAS:
-        raise S29RunnerBlocked("GPU_INVENTORY_SCHEMA_INVALID")
-    source_ref = payload.get("source_ref")
-    if not isinstance(source_ref, str) or not source_ref or "\\" in source_ref:
-        raise S29RunnerBlocked("GPU_INVENTORY_SOURCE_REF_REQUIRED")
-    if root is not None:
-        _logical(root, source_ref, field="gpu_inventory.source_ref")
-        if inventory_ref is not None:
-            try:
-                expected_source_ref = Path(inventory_ref).resolve().relative_to(root.resolve()).as_posix()
-            except ValueError as error:
-                raise S29RunnerBlocked("GPU_INVENTORY_PATH_OUTSIDE_DATA_ROOT") from error
-            if source_ref != expected_source_ref:
-                raise S29RunnerBlocked("GPU_INVENTORY_SOURCE_REF_PATH_MISMATCH")
-    rows = payload.get("rows")
-    apps = payload.get("compute_apps")
-    if not isinstance(rows, list) or not all(isinstance(item, Mapping) for item in rows):
-        raise S29RunnerBlocked("GPU_INVENTORY_ROWS_REQUIRED")
-    if not isinstance(apps, list) or not all(isinstance(item, Mapping) for item in apps):
-        raise S29RunnerBlocked("GPU_INVENTORY_COMPUTE_APPS_REQUIRED")
-    artifact_hash = _verify_hash(payload, field="gpu_inventory")
-    source_sha = _file_sha256(inventory_ref) if inventory_ref is not None else ""
-    declared_source_sha = payload.get("source_sha256")
-    if declared_source_sha is not None:
-        if not isinstance(declared_source_sha, str) or declared_source_sha != source_sha:
-            raise S29RunnerBlocked("GPU_INVENTORY_SOURCE_SHA256_MISMATCH")
-    normalized = validate_s209_gpu_inventory(rows, compute_apps=apps)
-    identity = {
-        "source_ref": source_ref,
-        "artifact_hash": artifact_hash,
-        "source_sha256": source_sha,
-        "schema_version": str(payload["schema_version"]),
-    }
-    normalized_summary = dict(normalized)
+    if root is None or inventory_ref is None:
+        raise S29RunnerBlocked("GPU_INVENTORY_PERSISTED_REFERENCE_REQUIRED")
+    path = _logical(root, inventory_ref, field="gpu_inventory")
+    try:
+        persisted = _load_object(path, field="gpu_inventory")
+        summary, identity = load_s27_gpu_inventory_envelope(path, data_root=root)
+    except S29RunnerBlocked:
+        raise
+    except Exception as error:
+        raise S29RunnerBlocked("GPU_INVENTORY_S27_ENVELOPE_INVALID") from error
+    # A caller-provided mapping is advisory only.  If it was supplied, it must
+    # be byte-for-byte canonical-equal to the source file we just reloaded.
+    if not isinstance(value, Mapping) or dict(value) != persisted:
+        raise S29RunnerBlocked("GPU_INVENTORY_CALLER_MAPPING_DRIFT")
+    if set(identity) != {"source_ref", "artifact_ref", "artifact_hash", "source_sha256", "schema_version"}:
+        raise S29RunnerBlocked("GPU_INVENTORY_IDENTITY_FIELDS_INVALID")
+    rows = summary.get("inventory")
+    apps = summary.get("compute_apps")
+    if not isinstance(rows, list) or not isinstance(apps, list):
+        raise S29RunnerBlocked("GPU_INVENTORY_SUMMARY_INVALID")
+    normalized: list[dict[str, Any]] = []
+    for item in rows:
+        row = dict(item)
+        # S2.6's exact wire calls the model class ``gpu_name``; retain that
+        # measured field and expose the S2.9 descriptive alias.  XID counters
+        # are deliberately not fabricated: the S2.6 health_state is consumed
+        # by the G2.7a health check when that counter is not part of the wire.
+        if "gpu_class" not in row and isinstance(row.get("gpu_name"), str):
+            row["gpu_class"] = row["gpu_name"]
+        normalized.append(row)
+    normalized_summary = dict(summary)
+    normalized_summary["rows"] = normalized
     normalized_summary.update(
         {
-            "inventory_source_ref": source_ref,
-            "inventory_artifact_hash": artifact_hash,
-            "inventory_source_sha256": source_sha,
-            "inventory_schema_version": str(payload["schema_version"]),
+            "schema_version": S29_INVENTORY_SCHEMA,
+            "selected_gpu_uuids": list(APPROVED_GPU_UUIDS),
+            "excluded_present": any(str(row.get("uuid")) == EXCLUDED_GPU_UUID for row in rows if isinstance(row, Mapping)),
+            "inventory_source_ref": identity["source_ref"],
+            "inventory_artifact_hash": identity["artifact_hash"],
+            "inventory_source_sha256": identity["source_sha256"],
+            "inventory_schema_version": identity["schema_version"],
         }
     )
-    return normalized_summary, identity
+    return normalized_summary, dict(identity)
 
 
 def validate_s209_gpu_inventory(
@@ -490,6 +528,7 @@ class S29Preflight:
     capacity_ref: str = "capacity.json"
     ulimit_evidence: dict[str, Any] | None = None
     ulimit_ref: str = "ulimit.json"
+    execution_identity: dict[str, Any] | None = None
 
     @property
     def plan_hash(self) -> str:
@@ -508,6 +547,7 @@ def prepare_s209_plan(
     repetitions: int = 2,
     randomization_seed: int = 2909,
     inventory: Mapping[str, Any] | None = None,
+    inventory_ref: str | None = None,
     io_evidence: Mapping[str, Any] | None = None,
     output_ref: str | None = None,
 ) -> dict[str, Any]:
@@ -533,7 +573,7 @@ def prepare_s209_plan(
         raw_manifest_ref=raw_manifest_ref,
     )
     if inventory is not None:
-        _load_inventory_envelope(inventory, root=root)
+        _load_inventory_envelope(inventory, root=root, inventory_ref=inventory_ref)
     if io_evidence is not None:
         validate_s209_io_evidence(io_evidence)
     plan = prepare_s209_measurement_plan(frozen, run_id=run_id, anchor_ids=anchor_ids, repetitions=repetitions, randomization_seed=randomization_seed)
@@ -589,6 +629,10 @@ def load_s209_preflight(
     # stale plan cannot grant authority to a replaced S2.7 manifest.
     from .stage2_s209_g27a import _validate_measurement_plan  # private, same contract
     _validate_measurement_plan(plan, frozen=frozen)
+    execution_identity = _validate_execution_identity(
+        plan.get("execution_identity"),
+        field="measurement_plan.execution_identity",
+    )
     inventory_raw = _load_object(refs["inventory"], field="gpu_inventory")
     inventory, inventory_identity = _load_inventory_envelope(
         inventory_raw,
@@ -622,6 +666,7 @@ def load_s209_preflight(
         capacity_ref=capacity_identity["ref"],
         ulimit_evidence=ulimit_evidence,
         ulimit_ref=ulimit_identity["ref"],
+        execution_identity=execution_identity,
     )
 
 
@@ -639,6 +684,10 @@ class S29DetachedStatus:
     inventory_source_sha256: str | None = None
     matrix_hash: str | None = None
     raw_manifest_hash: str | None = None
+    repository_head: str | None = None
+    launcher_source_sha256: str | None = None
+    profiler_command_hash: str | None = None
+    execution_identity_hash: str | None = None
 
     def __post_init__(self) -> None:
         _safe_id(self.run_id, field="status.run_id")
@@ -656,9 +705,17 @@ class S29DetachedStatus:
             ("status.inventory_source_sha256", self.inventory_source_sha256),
             ("status.matrix_hash", self.matrix_hash),
             ("status.raw_manifest_hash", self.raw_manifest_hash),
+            ("status.repository_head", self.repository_head),
+            ("status.launcher_source_sha256", self.launcher_source_sha256),
+            ("status.profiler_command_hash", self.profiler_command_hash),
+            ("status.execution_identity_hash", self.execution_identity_hash),
         ):
             if value is not None:
-                _sha(value, field=field)
+                if field == "status.repository_head":
+                    if not isinstance(value, str) or _GIT_HEAD.fullmatch(value) is None:
+                        raise S29RunnerBlocked(f"{field}:40HEX_REQUIRED")
+                else:
+                    _sha(value, field=field)
 
     def to_dict(self) -> dict[str, Any]:
         body = {
@@ -675,6 +732,10 @@ class S29DetachedStatus:
             "inventory_source_sha256": self.inventory_source_sha256,
             "matrix_hash": self.matrix_hash,
             "raw_manifest_hash": self.raw_manifest_hash,
+            "repository_head": self.repository_head,
+            "launcher_source_sha256": self.launcher_source_sha256,
+            "profiler_command_hash": self.profiler_command_hash,
+            "execution_identity_hash": self.execution_identity_hash,
         }
         body["artifact_hash"] = canonical_json_hash(body)
         return body
@@ -700,12 +761,18 @@ class S29StatusStore:
         plan_hash: str,
         inventory_identity: Mapping[str, Any] | None = None,
         cost_identity: Mapping[str, Any] | None = None,
+        execution_identity: Mapping[str, Any] | None = None,
     ) -> None:
         self.path = Path(path)
         self.run_id = _safe_id(run_id, field="status.run_id")
         self.plan_hash = _sha(plan_hash, field="status.plan_hash")
         self.inventory_identity = dict(inventory_identity) if isinstance(inventory_identity, Mapping) else None
         self.cost_identity = dict(cost_identity) if isinstance(cost_identity, Mapping) else None
+        self.execution_identity = (
+            _validate_execution_identity(execution_identity)
+            if execution_identity is not None
+            else None
+        )
 
     def _bind_identity(self, status: S29DetachedStatus) -> S29DetachedStatus:
         expected = {
@@ -713,6 +780,10 @@ class S29StatusStore:
             "inventory_source_sha256": None if self.inventory_identity is None else self.inventory_identity.get("source_sha256"),
             "matrix_hash": None if self.cost_identity is None else self.cost_identity.get("matrix_hash"),
             "raw_manifest_hash": None if self.cost_identity is None else self.cost_identity.get("raw_manifest_hash"),
+            "repository_head": None if self.execution_identity is None else self.execution_identity.get("repository_head"),
+            "launcher_source_sha256": None if self.execution_identity is None else self.execution_identity.get("launcher_source_sha256"),
+            "profiler_command_hash": None if self.execution_identity is None else self.execution_identity.get("profiler_command_hash"),
+            "execution_identity_hash": None if self.execution_identity is None else self.execution_identity.get("artifact_hash"),
         }
         for field, value in expected.items():
             actual = getattr(status, field)
@@ -722,7 +793,14 @@ class S29StatusStore:
 
     def load(self) -> S29DetachedStatus:
         value = _load_object(self.path, field="status")
-        if value.get("schema_version") != S29_STATUS_SCHEMA:
+        required = {
+            "schema_version", "run_id", "plan_hash", "status", "completed_tasks",
+            "expected_tasks", "updated_at", "owner_pid", "terminal_reason",
+            "inventory_artifact_hash", "inventory_source_sha256", "matrix_hash",
+            "raw_manifest_hash", "repository_head", "launcher_source_sha256",
+            "profiler_command_hash", "execution_identity_hash", "artifact_hash",
+        }
+        if set(value) != required or value.get("schema_version") != S29_STATUS_SCHEMA:
             raise S29RunnerBlocked("STATUS_SCHEMA_INVALID")
         declared = _sha(value.get("artifact_hash"), field="status.artifact_hash")
         if canonical_json_hash({key: item for key, item in value.items() if key != "artifact_hash"}) != declared:
@@ -742,6 +820,10 @@ class S29StatusStore:
             inventory_source_sha256=(None if value.get("inventory_source_sha256") is None else str(value["inventory_source_sha256"])),
             matrix_hash=(None if value.get("matrix_hash") is None else str(value["matrix_hash"])),
             raw_manifest_hash=(None if value.get("raw_manifest_hash") is None else str(value["raw_manifest_hash"])),
+            repository_head=(None if value.get("repository_head") is None else str(value["repository_head"])),
+            launcher_source_sha256=(None if value.get("launcher_source_sha256") is None else str(value["launcher_source_sha256"])),
+            profiler_command_hash=(None if value.get("profiler_command_hash") is None else str(value["profiler_command_hash"])),
+            execution_identity_hash=(None if value.get("execution_identity_hash") is None else str(value["execution_identity_hash"])),
         )
         bound = self._bind_identity(status)
         if bound != status:
@@ -752,6 +834,8 @@ class S29StatusStore:
         status = self._bind_identity(status)
         if status.run_id != self.run_id or status.plan_hash != self.plan_hash:
             raise S29RunnerBlocked("STATUS_IDENTITY_MISMATCH")
+        if self.path.is_symlink():
+            raise S29RunnerBlocked("STATUS_SYMLINK_FORBIDDEN")
         if self.path.exists():
             previous = self.load()
             if status.status not in self._ALLOWED[previous.status]:
@@ -761,6 +845,8 @@ class S29StatusStore:
 
     def acquire(self, *, expected_tasks: int) -> S29DetachedStatus:
         current: S29DetachedStatus | None = None
+        if self.path.is_symlink():
+            raise S29RunnerBlocked("STATUS_SYMLINK_FORBIDDEN")
         if self.path.exists():
             current = self.load()
             if current.expected_tasks != expected_tasks:
@@ -1253,6 +1339,7 @@ class S29ProfilerRunner:
         shared_attribution_cross_check: Mapping[str, Any] | None = None,
         accuracy_rows: Sequence[Mapping[str, Any]] = (),
         capacity_inputs: Mapping[str, Any] | None = None,
+        execution_identity: Mapping[str, Any] | None = None,
     ) -> None:
         self.preflight = preflight
         self.run_id = _safe_id(run_id, field="runner.run_id")
@@ -1265,6 +1352,15 @@ class S29ProfilerRunner:
         self.shared_attribution_cross_check = shared_attribution_cross_check
         self.accuracy_rows = tuple(dict(row) for row in accuracy_rows)
         self.capacity_inputs = dict(capacity_inputs) if isinstance(capacity_inputs, Mapping) else capacity_inputs
+        self.execution_identity = (
+            _validate_execution_identity(execution_identity, field="runner.execution_identity")
+            if execution_identity is not None
+            else (
+                _validate_execution_identity(getattr(self.preflight, "execution_identity", None), field="preflight.execution_identity")
+                if getattr(self.preflight, "execution_identity", None) is not None
+                else None
+            )
+        )
         self._last_report_status: str | None = None
         self.measurement_root = self.run_root / "measurements"
         self.attempt_root = self.run_root / "attempts"
@@ -1278,6 +1374,7 @@ class S29ProfilerRunner:
                 "matrix_hash": preflight.frozen.matrix_hash,
                 "raw_manifest_hash": preflight.frozen.raw_manifest_hash,
             },
+            execution_identity=self.execution_identity,
         )
 
     def _task_key(self, task: Mapping[str, Any]) -> str:
@@ -1337,6 +1434,50 @@ class S29ProfilerRunner:
             raise S29RunnerBlocked("STAGE1_NUMERIC_DATA_ROOT_REF_REQUIRED")
         return suffix if run_root_ref == "." else f"{run_root_ref}/{suffix}"
 
+    def _execution_environment(self) -> dict[str, str]:
+        if self.execution_identity is None:
+            return {}
+        return {
+            "S29_FORMAL_EXECUTION": "1",
+            "S29_REPOSITORY_HEAD": str(self.execution_identity["repository_head"]),
+            "S29_LAUNCHER_SOURCE_SHA256": str(self.execution_identity["launcher_source_sha256"]),
+            "S29_PROFILER_COMMAND_HASH": str(self.execution_identity["profiler_command_hash"]),
+            "S29_EXECUTION_IDENTITY_HASH": str(self.execution_identity["artifact_hash"]),
+        }
+
+    def _execution_manifest(self) -> dict[str, Any]:
+        if self.execution_identity is None:
+            return {}
+        return {
+            "repository_head": self.execution_identity["repository_head"],
+            "launcher_source_sha256": self.execution_identity["launcher_source_sha256"],
+            "profiler_command_hash": self.execution_identity["profiler_command_hash"],
+            "execution_identity_hash": self.execution_identity["artifact_hash"],
+        }
+
+    def _validate_execution_output(self, value: Any) -> Any:
+        """Require worker output to carry the same launch-time identity."""
+
+        if self.execution_identity is None:
+            return value
+        if not isinstance(value, Mapping):
+            raise S29RunnerBlocked("PROFILER_OUTPUT_OBJECT_REQUIRED")
+        expected = self._execution_manifest()
+
+        def check(target: Mapping[str, Any], *, field: str) -> None:
+            for name, required in expected.items():
+                if target.get(name) != required:
+                    raise S29RunnerBlocked(f"{field}_EXECUTION_IDENTITY_DRIFT:{name}")
+
+        check(value, field="profiler_output")
+        if value.get("semantic") == "scientific_equal_sample_cost":
+            rows = value.get("rows")
+            if not isinstance(rows, list) or any(not isinstance(row, Mapping) for row in rows):
+                raise S29RunnerBlocked("PROFILER_SHARED_RUN_ROWS_REQUIRED")
+            for row in rows:
+                check(row, field="profiler_shared_row")
+        return value
+
     def _shared_environment(self, task: Mapping[str, Any]) -> dict[str, str]:
         return {
             "S29_RUN_ID": self.run_id,
@@ -1355,6 +1496,7 @@ class S29ProfilerRunner:
             "S29_SHARED_POOL_REF": str(task["shared_pool_ref"]),
             "S29_IO_EVIDENCE_HASH": str(self.preflight.io_evidence["artifact_hash"]),
             "S29_COST_IO_QUIESCENT": str(bool(self.preflight.io_evidence.get("cost_io_quiescent"))).lower(),
+            **self._execution_environment(),
         }
 
     def _shared_manifest(self, rows: Iterable[Mapping[str, Any]]) -> list[dict[str, Any]]:
@@ -1424,12 +1566,15 @@ class S29ProfilerRunner:
                 "task": dict(task),
                 "status": "RUNNING",
                 "started_at": _now(),
+                **self._execution_manifest(),
             }
             payload["artifact_hash"] = canonical_json_hash(payload)
             _write_once(attempt, payload, field=f"attempt.{key}")
             attempts.append((task, payload))
         try:
-            bundle = self.profiler(tasks[0], environment=self._shared_environment(tasks[0]))
+            bundle = self._validate_execution_output(
+                self.profiler(tasks[0], environment=self._shared_environment(tasks[0]))
+            )
             normalized, pool = _validate_shared_bundle(
                 bundle,
                 tasks=tasks,
@@ -1450,7 +1595,10 @@ class S29ProfilerRunner:
                 terminal["status"] = "SUCCEEDED"
                 terminal["finished_at"] = _now()
                 terminal["artifact_hash"] = canonical_json_hash({k: v for k, v in terminal.items() if k != "artifact_hash"})
-                write_canonical_json(self._attempt_path(task), terminal)
+                terminal_path = self._attempt_path(task)
+                if terminal_path.is_symlink():
+                    raise S29RunnerBlocked("ATTEMPT_SYMLINK_FORBIDDEN")
+                write_canonical_json(terminal_path, terminal)
                 completed[key] = row
         except Exception as error:
             for task, payload in attempts:
@@ -1462,7 +1610,10 @@ class S29ProfilerRunner:
                 failed["failure_code"] = "S29_SHARED_PROFILER_FAILED"
                 failed["failure_reason"] = f"{type(error).__name__}:{error}"
                 failed["artifact_hash"] = canonical_json_hash({k: v for k, v in failed.items() if k != "artifact_hash"})
-                write_canonical_json(self._attempt_path(task), failed)
+                failed_path = self._attempt_path(task)
+                if failed_path.is_symlink():
+                    raise S29RunnerBlocked("ATTEMPT_SYMLINK_FORBIDDEN")
+                write_canonical_json(failed_path, failed)
             raise
 
     def _anchor_task(self, *, device_count: int) -> dict[str, Any]:
@@ -1503,6 +1654,7 @@ class S29ProfilerRunner:
             "S29_STAGE1_NUMERIC_ARTIFACT_REF": self._stage1_numeric_artifact_ref(
                 "anchors/single-gpu-anchor.json" if int(task["device_count"]) == 1 else "anchors/four-gpu-stage1-numeric.json"
             ),
+            **self._execution_environment(),
         }
         if int(task["device_count"]) == 4:
             # The four-card system measurement is a strong-scaling comparison
@@ -1538,7 +1690,7 @@ class S29ProfilerRunner:
                 }
             )
         try:
-            measured = self.profiler(task, environment=env)
+            measured = self._validate_execution_output(self.profiler(task, environment=env))
             # Validate the system anchor using its own semantic.  Converting a
             # four-card anchor to a method row would trigger the single-GPU
             # guard and make every real four-card anchor impossible to run.
@@ -1571,6 +1723,7 @@ class S29ProfilerRunner:
                 "measurement_kind": "actual",
                 "measurement_source": "profiler_worker",
                 "io_evidence_hash": self.preflight.io_evidence["artifact_hash"],
+                **self._execution_manifest(),
             }
             if int(task["device_count"]) == 1:
                 for name in (
@@ -1653,6 +1806,8 @@ class S29ProfilerRunner:
                     row["stage1_numeric_artifact"],
                     field="anchor.four-gpu-stage1-numeric",
                 )
+            if self.execution_identity is not None:
+                anchor["artifact_hash"] = canonical_json_hash(anchor)
             self._validate_anchor(anchor, task)
             anchor_root.mkdir(parents=True, exist_ok=True)
             _write_once(anchor_path, anchor, field=f"anchor.{key}")
@@ -1682,6 +1837,9 @@ class S29ProfilerRunner:
             "measurement_source": "profiler_worker",
             "io_evidence_hash": self.preflight.io_evidence["artifact_hash"],
         }
+        expected.update(self._execution_manifest())
+        if self.execution_identity is not None:
+            _verify_hash(anchor, field=f"anchor.{task['anchor_id']}")
         for name, value in expected.items():
             if anchor.get(name) != value:
                 raise S29RunnerBlocked(f"ANCHOR_IDENTITY_DRIFT:{task['anchor_id']}:{name}")
@@ -1865,6 +2023,7 @@ class S29ProfilerRunner:
             if not path.exists():
                 continue
             row = _load_object(path, field=f"measurement.{self._task_key(task)}")
+            self._validate_execution_output(row)
             normalized = _validate_measured_row(
                 row,
                 task=task,
@@ -1992,6 +2151,7 @@ class S29ProfilerRunner:
                 "task": dict(task),
                 "status": "RUNNING",
                 "started_at": _now(),
+                **self._execution_manifest(),
             }
             attempt_payload["artifact_hash"] = canonical_json_hash(attempt_payload)
             _write_once(attempt, attempt_payload, field=f"attempt.{key}")
@@ -2009,9 +2169,10 @@ class S29ProfilerRunner:
                 "CUDA_VISIBLE_DEVICES": str(task["gpu_uuid"]),
                 "S29_IO_EVIDENCE_HASH": str(self.preflight.io_evidence["artifact_hash"]),
                 "S29_COST_IO_QUIESCENT": str(bool(self.preflight.io_evidence.get("cost_io_quiescent"))).lower(),
+                **self._execution_environment(),
             }
             try:
-                measured = self.profiler(task, environment=env)
+                measured = self._validate_execution_output(self.profiler(task, environment=env))
                 row = _validate_measured_row(
                     measured,
                     task=task,
@@ -2024,6 +2185,8 @@ class S29ProfilerRunner:
                 terminal["status"] = "SUCCEEDED"
                 terminal["finished_at"] = _now()
                 terminal["artifact_hash"] = canonical_json_hash({k: v for k, v in terminal.items() if k != "artifact_hash"})
+                if attempt.is_symlink():
+                    raise S29RunnerBlocked("ATTEMPT_SYMLINK_FORBIDDEN")
                 write_canonical_json(attempt, terminal)
                 completed[key] = row
             except Exception as error:
@@ -2034,6 +2197,8 @@ class S29ProfilerRunner:
                 failed["failure_code"] = "S29_PROFILER_FAILED"
                 failed["failure_reason"] = f"{type(error).__name__}:{error}"
                 failed["artifact_hash"] = canonical_json_hash({k: v for k, v in failed.items() if k != "artifact_hash"})
+                if attempt.is_symlink():
+                    raise S29RunnerBlocked("ATTEMPT_SYMLINK_FORBIDDEN")
                 write_canonical_json(attempt, failed)
         done_count = len(completed)
         status_completed = done_count + 2  # the single/four-card anchors
@@ -2087,13 +2252,18 @@ class S29ProfilerRunner:
                 row for row in self.preflight.inventory["rows"]
                 if str(row.get("uuid", "")).casefold() in {uuid.casefold() for uuid in APPROVED_GPU_UUIDS}
             ]
-            gpu_classes = {str(row.get("gpu_class", "")).strip() for row in approved_rows}
+            gpu_classes = {
+                str(row.get("gpu_class", row.get("gpu_name", ""))).strip()
+                for row in approved_rows
+            }
+            health_states = [row.get("health_state") for row in approved_rows]
             health_snapshot = {
                 "healthy": all(
                     float(row["ecc_uncorrected_volatile"]) == 0
                     and float(row["ecc_uncorrected_aggregate"]) == 0
                     and str(row["row_remap_status"]).strip().casefold() in {"none", "0", "clean", "false", "not_pending", "not-pending", "n/a", "na"}
                     and str(row["gpu_recovery_action"]).strip().casefold() in {"none", "0", "clean", "n/a", "na"}
+                    and ("health_state" not in row or str(row["health_state"]).strip().upper() == "HEALTHY")
                     for row in approved_rows
                 ),
                 "idle": all(
@@ -2107,11 +2277,14 @@ class S29ProfilerRunner:
                     int(float(row["ecc_uncorrected_volatile"]) + float(row["ecc_uncorrected_aggregate"]))
                     for row in approved_rows
                 ),
-                "xid_errors": sum(int(float(row["xid_errors"])) for row in approved_rows),
                 "cost_io_quiescent": self.preflight.io_evidence["cost_io_quiescent"],
                 "inventory_artifact_hash": self.preflight.inventory["inventory_artifact_hash"],
                 "inventory_source_sha256": self.preflight.inventory["inventory_source_sha256"],
             }
+            if all("xid_errors" in row for row in approved_rows):
+                health_snapshot["xid_errors"] = sum(int(float(row["xid_errors"])) for row in approved_rows)
+            else:
+                health_snapshot["health_states"] = health_states
             capacity_inputs = dict(self.preflight.capacity_inputs or {})
             if self.preflight.ulimit_evidence is not None:
                 capacity_inputs["ulimit_evidence_hash"] = self.preflight.ulimit_evidence["ulimit_evidence_hash"]
@@ -2134,6 +2307,15 @@ class S29ProfilerRunner:
                 measurement_plan=self.preflight.measurement_plan,
                 matrix_ref=self.preflight.matrix_ref,
                 raw_manifest_ref=self.preflight.raw_manifest_ref,
+                execution_identity=self.execution_identity,
+                data_root=self.preflight.root,
+                single_gpu_anchor_ref=self._stage1_numeric_artifact_ref("anchors/single-gpu-anchor.json"),
+                four_gpu_anchor_ref=(
+                    f"{self._run_root_ref().rstrip('/')}/anchors/four-gpu-anchor.json"
+                    if self._run_root_ref() not in {None, "."}
+                    else "anchors/four-gpu-anchor.json"
+                ),
+                four_gpu_numeric_ref=self._stage1_numeric_artifact_ref("anchors/four-gpu-stage1-numeric.json"),
             )
             if not isinstance(report, Mapping) or report.get("status") not in {"PASS", "PROVISIONAL", "BLOCKED"}:
                 raise S29RunnerBlocked("G27A_REPORT_INVALID")
