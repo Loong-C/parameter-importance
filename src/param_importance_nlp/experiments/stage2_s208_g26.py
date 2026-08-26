@@ -592,6 +592,8 @@ class _CellData:
     reference_half_widths: Mapping[str, float]
     numeric_error: float
     group_registry: Mapping[str, tuple[str, ...]]
+    layer_group_registry: Mapping[str, tuple[str, ...]]
+    module_group_registry: Mapping[str, tuple[str, ...]]
 
 
 def _reference_variance_vector(cell: _CellData, view: str) -> np.ndarray:
@@ -668,10 +670,17 @@ def _extract_cell_data(
     raw_root: Path,
     reference_payload: Mapping[str, Any],
     matrix: Mapping[str, Any],
+    matrix_materialization: Mapping[str, Any] | None = None,
     memmap_root: Path | None = None,
 ) -> _CellData:
     model, stage = _cell_parts(cell_id)
     cell_matrix = _resolve_matrix_cell(matrix, cell_id)
+    if matrix_materialization is not None:
+        materialized_cells = matrix_materialization.get("cells")
+        materialized_cell = materialized_cells.get(cell_id) if isinstance(materialized_cells, Mapping) else None
+        if not isinstance(materialized_cell, Mapping):
+            raise S28G26Blocked(f"matrix_materialization.{cell_id}:INPUT_REQUIRED")
+        cell_matrix = {**cell_matrix, **dict(materialized_cell)}
     views, blocks, variances, sequence_variance, uncertainty_mode = _reference_views(reference_payload, field=f"reference.{cell_id}")
     reference_hash = reference_payload.get("reference_hash", reference_payload.get("artifact_hash"))
     if reference_hash is None:
@@ -777,20 +786,27 @@ def _extract_cell_data(
     if isinstance(numeric_error, bool) or not isinstance(numeric_error, (int, float)) or not math.isfinite(float(numeric_error)) or float(numeric_error) < 0:
         raise S28G26Blocked(f"reference.{cell_id}:NUMERIC_ERROR_INVALID")
     groups_source = cell_matrix.get("group_registry", matrix.get("group_registry"))
-    if not isinstance(groups_source, Mapping):
+    layer_source = cell_matrix.get("layer_group_registry", groups_source)
+    module_source = cell_matrix.get("module_group_registry", groups_source)
+    if not isinstance(layer_source, Mapping) or not isinstance(module_source, Mapping):
         raise S28G26Blocked(f"matrix.{cell_id}:CANONICAL_GROUP_REGISTRY_REQUIRED")
     ids = views["bias"][0]
-    groups: dict[str, tuple[str, ...]] = {}
-    seen: set[str] = set()
-    for name, coordinates in groups_source.items():
-        if not isinstance(name, str) or not isinstance(coordinates, list) or not coordinates or not all(isinstance(item, str) for item in coordinates):
-            raise S28G26Blocked(f"matrix.{cell_id}:GROUP_REGISTRY_INVALID")
-        if set(coordinates).difference(ids) or seen.intersection(coordinates):
-            raise S28G26Blocked(f"matrix.{cell_id}:GROUP_REGISTRY_OVERLAP_OR_UNKNOWN_COORDINATE")
-        seen.update(coordinates)
-        groups[name] = tuple(coordinates)
-    if not groups or seen != set(ids):
-        raise S28G26Blocked(f"matrix.{cell_id}:GROUP_REGISTRY_NOT_EXHAUSTIVE")
+    def parse_groups(source: Mapping[str, Any], scope: str) -> dict[str, tuple[str, ...]]:
+        groups: dict[str, tuple[str, ...]] = {}
+        seen: set[str] = set()
+        for name, coordinates in source.items():
+            if not isinstance(name, str) or not isinstance(coordinates, (list, tuple)) or not coordinates or not all(isinstance(item, str) for item in coordinates):
+                raise S28G26Blocked(f"matrix.{cell_id}:{scope}:GROUP_REGISTRY_INVALID")
+            if set(coordinates).difference(ids) or seen.intersection(coordinates):
+                raise S28G26Blocked(f"matrix.{cell_id}:{scope}:GROUP_REGISTRY_OVERLAP_OR_UNKNOWN_COORDINATE")
+            seen.update(coordinates)
+            groups[name] = tuple(coordinates)
+        if not groups or seen != set(ids):
+            raise S28G26Blocked(f"matrix.{cell_id}:{scope}:GROUP_REGISTRY_NOT_EXHAUSTIVE")
+        return groups
+    layer_groups = parse_groups(layer_source, "layer")
+    module_groups = parse_groups(module_source, "module")
+    groups = layer_groups
     return _CellData(
         cell_id,
         model,
@@ -809,6 +825,8 @@ def _extract_cell_data(
         half_widths,
         float(numeric_error),
         groups,
+        layer_groups,
+        module_groups,
     )
 
 
@@ -951,7 +969,8 @@ def _family_endpoint(cell: _CellData, method: str, endpoint: str, *, bootstrap_r
     vectors = [item[0][method][1] for item in cell.repetitions.values()]
     mean = _mean_vectors(vectors)
     bias = mean - target
-    groups = _group_values(bias, ids, cell.group_registry)
+    endpoint_groups = cell.layer_group_registry if endpoint == "layer_total_l1_bias" else cell.module_group_registry
+    groups = _group_values(bias, ids, endpoint_groups)
     if endpoint == "model_total_signed_bias":
         observed = float(np.sum(bias))
         statistic = lambda m, r: float(np.sum(m - r))
@@ -959,12 +978,12 @@ def _family_endpoint(cell: _CellData, method: str, endpoint: str, *, bootstrap_r
         lower, upper = 0.05, 0.95
     elif endpoint == "layer_total_l1_bias":
         observed = float(sum(abs(value) for value in groups.values()))
-        statistic = lambda m, r: float(sum(abs(value) for value in _group_values(m - r, ids, cell.group_registry).values()))
+        statistic = lambda m, r: float(sum(abs(value) for value in _group_values(m - r, ids, endpoint_groups).values()))
         interval_name = "upper_95"
         lower, upper = 0.0, 0.95
     elif endpoint == "module_total_l1_bias":
         observed = float(sum(abs(value) for value in groups.values()))
-        statistic = lambda m, r: float(sum(abs(value) for value in _group_values(m - r, ids, cell.group_registry).values()))
+        statistic = lambda m, r: float(sum(abs(value) for value in _group_values(m - r, ids, endpoint_groups).values()))
         interval_name = "upper_95"
         lower, upper = 0.0, 0.95
     else:  # pragma: no cover - endpoint list is closed above
@@ -1272,6 +1291,7 @@ def analyze_s208_g26(
     raw_root: str | Path | None = None,
     references: Mapping[str, Any] | str | Path,
     matrix: Mapping[str, Any] | str | Path,
+    matrix_materialization: Mapping[str, Any] | str | Path | None = None,
     preregistration: Mapping[str, Any] | str | Path,
     hypothesis_contract: Mapping[str, Any] | str | Path,
     upstream_gates: Mapping[str, Mapping[str, Any] | str | Path],
@@ -1344,6 +1364,14 @@ def analyze_s208_g26(
     direct_g24a = matrix_payload.get("g24a_gate_hash", matrix_payload.get("runner_gate_hash"))
     if direct_g24a is not None and direct_g24a != gates["stage2.G2.4a"].artifact_hash:
         raise S28G26Blocked("matrix:G2.4A_BINDING_MISMATCH")
+    matrix_enrichment: Mapping[str, Any] | None = None
+    if matrix_materialization is not None:
+        matrix_enrichment = _load(matrix_materialization, field="matrix_materialization")
+        if matrix_enrichment.get("schema_version") != "stage2-s208-matrix-materialization-v1" or matrix_enrichment.get("scope") != "formal":
+            raise S28G26Blocked("matrix_materialization:FORMAL_SCHEMA_REQUIRED")
+        _verify_hash(matrix_enrichment, field="matrix_materialization")
+        if matrix_enrichment.get("matrix_hash") != matrix_hash or matrix_enrichment.get("preregistration_hash") != prereg.get("preregistration_hash") or matrix_enrichment.get("g23_gate_hash") != gates["stage2.G2.3"].artifact_hash or matrix_enrichment.get("g24a_gate_hash") != gates["stage2.G2.4a"].artifact_hash or (matrix_enrichment.get("g24b_gate_hash") is not None and matrix_enrichment.get("g24b_gate_hash") != gates["stage2.G2.4b"].artifact_hash):
+            raise S28G26Blocked("matrix_materialization:UPSTREAM_BINDING_MISMATCH")
     references_payload = _load(references, field="references")
     raw_root_path = Path(raw_root) if raw_root is not None else (Path(raw_manifest).parent if isinstance(raw_manifest, (str, Path)) else Path.cwd())
     refs_by_cell: dict[str, Mapping[str, Any]] = {}
@@ -1369,6 +1397,7 @@ def analyze_s208_g26(
                 raw_root=raw_root_path,
                 reference_payload=refs_by_cell[cell],
                 matrix=matrix_payload,
+                matrix_materialization=matrix_enrichment,
                 memmap_root=None if memmap_root is None else Path(memmap_root).resolve(),
             )
         )
@@ -1420,8 +1449,12 @@ def analyze_s208_g26(
     family_payload: dict[str, Any] = {"schema_version": S28_FAMILY_SCHEMA, "primary_cells": list(S28_CELL_IDS), "b_primary": matrix_payload.get("b_primary"), "m_primary": matrix_payload.get("m_primary"), "multiplicity": "intersection_union_across_six_primary_cells", "methods": family_methods, "rows": family_rows, "noninferiority_rows": noninferiority_rows, "global": family_qualified, "noninferiority_global": noninf_global, "artifact_hash": ""}
     family_payload["artifact_hash"] = canonical_json_hash({key: value for key, value in family_payload.items() if key != "artifact_hash"})
     audit: dict[str, Any] = {"schema_version": S28_INPUT_AUDIT_SCHEMA, "raw_manifest_hash": manifest_hash, "matrix_hash": matrix_hash, "gate_hashes": {key: value.artifact_hash for key, value in gates.items()}, "primary_cells": list(S28_CELL_IDS), "unit_count": len(units), "units_per_cell": {cell.cell_id: len(cell.repetitions) for cell in cell_data}, "bootstrap_unit": S28_BOOTSTRAP_UNIT, "reference_uncertainty_modes": {cell.cell_id: cell.reference_uncertainty_mode for cell in cell_data}, "raw_reference_blocks_reconstructed": False, "parameter_coordinate_pseudoreplication": False, "status": "PASS", "artifact_hash": ""}
+    if matrix_enrichment is not None:
+        audit["matrix_materialization_hash"] = matrix_enrichment.get("artifact_hash")
     audit["artifact_hash"] = canonical_json_hash({key: value for key, value in audit.items() if key != "artifact_hash"})
     lineage: dict[str, Any] = {"schema_version": S28_LINEAGE_SCHEMA, "producer_task": "stage2.08_statistics_and_robustness", "consumer_commit_required": "record_at_execution", "raw_manifest_hash": manifest_hash, "matrix_hash": matrix_hash, "gate_hashes": {key: value.artifact_hash for key, value in gates.items()}, "reference_hashes": {cell.cell_id: refs_by_cell[cell.cell_id].get("reference_hash", refs_by_cell[cell.cell_id].get("artifact_hash")) for cell in cell_data}, "derived_artifacts": ["analysis_input_audit.json", "statistics_long_table.json", "statistics_summary.json", "raw_calibration.json", "confirmatory_family_decisions.json", "quality_gates.json", "hypothesis_decisions.json", "lineage_manifest.json"], "artifact_hash": ""}
+    if matrix_enrichment is not None:
+        lineage["matrix_materialization_hash"] = matrix_enrichment.get("artifact_hash")
     lineage["artifact_hash"] = canonical_json_hash({key: value for key, value in lineage.items() if key != "artifact_hash"})
     gate_status = "PASS" if quality_pass else "BLOCKED"
     gate_body = {"schema_version": S28_GATE_SCHEMA, "gate_id": "stage2.G2.6", "stage": 2, "status": gate_status, "quality_gate_dependency": quality_pass, "measured": quality_metrics, "threshold": {"bootstrap_unit": S28_BOOTSTRAP_UNIT, "parameter_coordinate_pseudoreplication": False, "six_primary_cell_intersection_union": True, "frozen_thresholds": True}, "reasons": [] if quality_pass else ["QUALITY_GATE_FAILED"], "upstream_gate_hashes": {key: value.artifact_hash for key, value in gates.items()}, "artifact_hash": ""}

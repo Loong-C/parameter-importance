@@ -18,6 +18,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--raw-root", type=Path, required=True)
     parser.add_argument("--reference-bundle", type=Path, required=True, help="S2.7 six-cell plan/bundle containing S2.4 candidate refs")
     parser.add_argument("--g23-gate", type=Path, required=True, help="independent S2.4/G2.3 PASS evaluation")
+    parser.add_argument("--materialization-index", type=Path, required=True, help="S2.4 six-cell materialization index")
     parser.add_argument("--reference-root", type=Path, default=None)
     parser.add_argument("--memmap-root", type=Path, default=None)
     parser.add_argument("--matrix", type=Path, required=True)
@@ -42,6 +43,7 @@ def main(argv: list[str] | None = None) -> int:
             raw_root=args.raw_root,
             reference_bundle=args.reference_bundle,
             g23_gate=args.g23_gate,
+            materialization_index=args.materialization_index,
             reference_root=args.reference_root,
             memmap_root=args.memmap_root,
             matrix=args.matrix,

@@ -17,7 +17,7 @@ from typing import Any, Mapping
 
 from ..contracts.jsonio import canonical_json_hash, write_canonical_json
 from .stage2_s208_g26 import S28G26Blocked, analyze_s208_g26
-from .stage2_s208_production import S208ProductionBlocked, load_s208_reference_bundle
+from .stage2_s208_production import S208ProductionBlocked, load_s208_reference_bundle, materialize_s208_matrix
 
 
 S208_RUNNER_SCHEMA = "stage2-s208-g26-production-runner-v1"
@@ -96,6 +96,7 @@ def run_s208_g26_production(
     raw_root: str | Path,
     reference_bundle: str | Path,
     g23_gate: str | Path,
+    materialization_index: str | Path,
     matrix: str | Path,
     preregistration: str | Path,
     hypothesis_contract: str | Path,
@@ -124,11 +125,35 @@ def run_s208_g26_production(
         # The G2.3 object consumed by the strict reference loader is the only
         # accepted G2.3 identity; a caller cannot substitute a second mapping.
         gates["stage2.G2.3"] = loaded["g23_gate"]
+        g23_gate_ref = loaded.get("lineage", {}).get("g23_gate_ref") if isinstance(loaded.get("lineage"), Mapping) else None
+        if not isinstance(g23_gate_ref, str) or not g23_gate_ref:
+            raise S208ProductionBlocked("stage2.G2.3:REFERENCE_REQUIRED")
+        g24a_input = gates.get("stage2.G2.4a")
+        g24b_input = gates.get("stage2.G2.4b")
+        if g24a_input is None:
+            raise S208ProductionBlocked("stage2.G2.4a:INPUT_REQUIRED")
+        if g24b_input is None:
+            raise S208ProductionBlocked("stage2.G2.4b:INPUT_REQUIRED")
+        if not isinstance(g24a_input, (str, Path)):
+            raise S208ProductionBlocked("stage2.G2.4a:REFERENCE_REQUIRED")
+        if not isinstance(g24b_input, (str, Path)):
+            raise S208ProductionBlocked("stage2.G2.4b:REFERENCE_REQUIRED")
+        matrix_materialization = materialize_s208_matrix(
+            root,
+            materialization_index,
+            matrix=matrix,
+            preregistration=preregistration,
+            g23_gate=g23_gate_ref,
+            g24a_gate=g24a_input,
+            g24b_gate=g24b_input,
+            references=loaded,
+        )
         result = analyze_s208_g26(
             raw_manifest=raw_manifest,
             raw_root=raw_root,
             references=loaded,
             matrix=matrix,
+            matrix_materialization=matrix_materialization,
             preregistration=preregistration,
             hypothesis_contract=hypothesis_contract,
             upstream_gates=gates,
@@ -137,10 +162,27 @@ def run_s208_g26_production(
             bootstrap_replicates=bootstrap_replicates,
             bootstrap_seed=bootstrap_seed,
         )
-        source_lineage = loaded["lineage"]
+        source_lineage = dict(loaded["lineage"])
+        source_lineage["matrix_materialization_hash"] = matrix_materialization["artifact_hash"]
+        source_lineage["matrix_materialization_ref"] = "matrix_materialization.json"
+        source_lineage["artifact_hash"] = canonical_json_hash({key: value for key, value in source_lineage.items() if key != "artifact_hash"})
+        derived_artifacts = result["lineage_manifest"].get("derived_artifacts", [])
+        if not isinstance(derived_artifacts, list):
+            derived_artifacts = []
+        result["lineage_manifest"]["derived_artifacts"] = [
+            *derived_artifacts,
+            "matrix_materialization.json",
+        ]
+        result["lineage_manifest"]["derived_artifact_hashes"] = {
+            "matrix_materialization.json": matrix_materialization["artifact_hash"],
+        }
         result["lineage_manifest"]["reference_source_lineage"] = source_lineage
         result["lineage_manifest"]["artifact_hash"] = canonical_json_hash({key: value for key, value in result["lineage_manifest"].items() if key != "artifact_hash"})
         result["input_audit"]["reference_source_lineage"] = source_lineage
+        result["input_audit"]["matrix_materialization"] = {
+            "ref": "matrix_materialization.json",
+            "artifact_hash": matrix_materialization["artifact_hash"],
+        }
         result["input_audit"]["artifact_hash"] = canonical_json_hash({key: value for key, value in result["input_audit"].items() if key != "artifact_hash"})
         files: dict[str, Mapping[str, Any]] = {
             "analysis_input_audit.json": result["input_audit"],
@@ -151,6 +193,7 @@ def run_s208_g26_production(
             "quality_gates.json": result["quality_gates"],
             "hypothesis_decisions.json": result["hypothesis_decisions"],
             "lineage_manifest.json": result["lineage_manifest"],
+            "matrix_materialization.json": matrix_materialization,
             "g2.6-gate.json": result["g2_6_gate"],
         }
         result["output_files"] = list(_atomic_publish(destination, files))
