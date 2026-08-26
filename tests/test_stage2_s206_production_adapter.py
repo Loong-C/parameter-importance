@@ -415,6 +415,7 @@ def test_detached_wait_recovers_final_g24b_freeze(tmp_path: Path) -> None:
     result = launcher._wait(
         SimpleNamespace(
             data_root=tmp_path,
+            repository=ROOT,
             operations_root="operations/s206",
             timeout_seconds=0,
             poll_seconds=0.01,
@@ -441,6 +442,7 @@ def test_detached_wait_recovers_final_g24b_freeze(tmp_path: Path) -> None:
         launcher._wait(
             SimpleNamespace(
                 data_root=tmp_path,
+                repository=ROOT,
                 operations_root="operations/s206",
                 timeout_seconds=0,
                 poll_seconds=0.01,
@@ -455,6 +457,7 @@ def test_detached_wait_recovers_final_g24b_freeze(tmp_path: Path) -> None:
         launcher._wait(
             SimpleNamespace(
                 data_root=tmp_path,
+                repository=ROOT,
                 operations_root="operations/s206",
                 timeout_seconds=0,
                 poll_seconds=0.01,
@@ -483,6 +486,7 @@ def test_detached_wait_recovers_final_g24b_freeze(tmp_path: Path) -> None:
 
 def _detached_test_args(tmp_path: Path) -> tuple[SimpleNamespace, dict[str, object], FormalExecutionEvidence]:
     inventory_ref = "evidence/gpu-inventory.json"
+    executor_identity = compute_executor_identity(ROOT, Path(launcher.__file__))
     preflight = {
         "gpu_inventory_ref": inventory_ref,
         "gpu_inventory_source_ref": "evidence/gpu-inventory.capture.txt",
@@ -490,6 +494,7 @@ def _detached_test_args(tmp_path: Path) -> tuple[SimpleNamespace, dict[str, obje
         "gpu_inventory_source_sha256": "b" * 64,
         "preflight_artifact_hash": "c" * 64,
         "gpu": {"inventory_path": inventory_ref},
+        "executor_identity": executor_identity,
     }
     args = SimpleNamespace(
         execute=True,

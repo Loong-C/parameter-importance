@@ -280,6 +280,8 @@ def _scan_detached_attempts(
     run_root_ref: str,
     args: argparse.Namespace,
     executor_identity: Mapping[str, object],
+    expected_plan_hash: str | None = None,
+    expected_inventory_identity: Mapping[str, object] | None = None,
     block_live: bool = True,
 ) -> None:
     """Validate all append-only attempts and block only a live valid PID."""
@@ -329,6 +331,11 @@ def _scan_detached_attempts(
             or raw.get("run_root_ref") != run_root_ref
             or raw.get("run_id") != args.run_id
             or raw.get("plan_ref") != _canonical_ref(_data_root(args.data_root), args.plan_ref, field="plan_ref")[0]
+            or (expected_plan_hash is not None and raw.get("plan_hash") != expected_plan_hash)
+            or (
+                expected_inventory_identity is not None
+                and raw.get("gpu_inventory_identity") != dict(expected_inventory_identity)
+            )
             or raw.get("executor_identity") != dict(executor_identity)
         ):
             raise S27ExecutionBlocked("S27_DETACHED_RECEIPT_IDENTITY_MISMATCH")
@@ -356,6 +363,12 @@ def _validate_launch_status(
     expected_plan_ref, _ = _canonical_ref(root, args.plan_ref, field="plan_ref")
     if value.get("run_id") != args.run_id or value.get("plan_ref") != expected_plan_ref:
         raise S27ExecutionBlocked("S27_LAUNCH_STATUS_BINDING_INVALID")
+    try:
+        current_plan = load_s27_plan(root, expected_plan_ref)
+    except (OSError, TypeError, ValueError, RuntimeError) as error:
+        raise S27ExecutionBlocked("S27_LAUNCH_STATUS_PLAN_INVALID") from error
+    if value.get("plan_hash") != current_plan.artifact_hash:
+        raise S27ExecutionBlocked("S27_LAUNCH_STATUS_PLAN_HASH_DRIFT")
     if value.get("executor_identity") != dict(executor_identity):
         raise S27ExecutionBlocked("S27_EXECUTOR_IDENTITY_DRIFT")
     inventory_identity = _validate_receipt_gpu_identity(value.get("gpu_inventory_identity"))
@@ -715,6 +728,8 @@ def _detach(args: argparse.Namespace) -> dict[str, object]:
         run_root_ref=run_root_ref,
         args=args,
         executor_identity=executor_identity,
+        expected_plan_hash=str(preflight["plan_hash"]),
+        expected_inventory_identity=preflight["gpu_inventory_identity"],
     )
     attempts_root = run_root / "attempts"
     attempts_root.mkdir(parents=True, exist_ok=True)
@@ -824,11 +839,24 @@ def _status(args: argparse.Namespace, *, wait: bool) -> int:
     root = _data_root(args.data_root)
     executor_identity = _executor_identity(args.repository)
     run_root_ref, run_root = _canonical_ref(root, args.run_root, field="run_root")
+    if args.gpu_inventory_json is None:
+        raise S27ExecutionBlocked("S27_GPU_INVENTORY_JSON_REQUIRED")
+    _summary, inventory_identity = load_s27_gpu_inventory_envelope(
+        args.gpu_inventory_json,
+        data_root=root,
+    )
+    plan_ref, _plan_path = _canonical_ref(root, args.plan_ref, field="plan_ref")
+    try:
+        plan_hash = load_s27_plan(root, plan_ref).artifact_hash
+    except (OSError, TypeError, ValueError, RuntimeError) as error:
+        raise S27ExecutionBlocked("S27_PLAN_INVALID") from error
     _scan_detached_attempts(
         run_root,
         run_root_ref=run_root_ref,
         args=args,
         executor_identity=executor_identity,
+        expected_plan_hash=plan_hash,
+        expected_inventory_identity=inventory_identity,
         block_live=False,
     )
     path = run_root / "launcher-status.json"
