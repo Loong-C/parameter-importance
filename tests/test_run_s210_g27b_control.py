@@ -37,6 +37,7 @@ def _args(root: Path, *, run_id: str, output: Path, operations: Path, run: Path)
         "g26_family_decisions": values["family"],
         "g27a_report": values["cost"],
         "g27a_gate": _g27a_gate(),
+        "matrix": {"schema_version": "stage2-s206-matrix-v1", "b_primary": 32, "m_primary": 16},
     }
     result: list[str] = []
     for name, payload in payloads.items():
