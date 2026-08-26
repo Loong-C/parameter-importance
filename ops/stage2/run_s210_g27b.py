@@ -201,10 +201,13 @@ def _source_paths(args: argparse.Namespace) -> dict[str, Path]:
         if value is None:
             raise S210G27BBlocked(f"{name}:INPUT_REQUIRED")
         values[name] = value
-    for name in ("g26_statistics_summary", "g26_raw_calibration", "matrix"):
+    for name in ("g26_statistics_summary", "g26_raw_calibration"):
         value = getattr(args, name)
         if value is not None:
             values[name] = value
+    if args.matrix is None:
+        raise S210G27BBlocked("matrix:FORMAL_INPUT_REQUIRED")
+    values["matrix"] = args.matrix
     return values
 
 
