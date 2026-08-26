@@ -17,7 +17,12 @@ from typing import Any, Mapping
 
 from ..contracts.jsonio import canonical_json_hash, write_canonical_json
 from .stage2_s208_g26 import S28G26Blocked, analyze_s208_g26
-from .stage2_s208_production import S208ProductionBlocked, load_s208_reference_bundle, materialize_s208_matrix
+from .stage2_s208_production import (
+    S208ProductionBlocked,
+    _safe_path,
+    load_s208_reference_bundle,
+    materialize_s208_matrix,
+)
 
 
 S208_RUNNER_SCHEMA = "stage2-s208-g26-production-runner-v1"
@@ -54,6 +59,18 @@ def _validate_production_paths(
         field="output_root",
     )
     return root, scratch, destination
+
+
+def _resolve_analysis_gate_refs(root: Path, gates: Mapping[str, Any]) -> dict[str, Any]:
+    """Resolve DATA_ROOT-relative gate refs before the detached analyzer reads them."""
+
+    resolved: dict[str, Any] = {}
+    for gate_id, value in gates.items():
+        if isinstance(value, (str, Path)):
+            resolved[str(gate_id)] = _safe_path(root, str(value), f"{gate_id}.ref")
+        else:
+            resolved[str(gate_id)] = value
+    return resolved
 
 
 def _atomic_publish(destination: Path, files: Mapping[str, Mapping[str, Any]]) -> tuple[str, ...]:
@@ -138,6 +155,7 @@ def run_s208_g26_production(
             raise S208ProductionBlocked("stage2.G2.4a:REFERENCE_REQUIRED")
         if not isinstance(g24b_input, (str, Path)):
             raise S208ProductionBlocked("stage2.G2.4b:REFERENCE_REQUIRED")
+        analysis_gates = _resolve_analysis_gate_refs(root, gates)
         matrix_materialization = materialize_s208_matrix(
             root,
             materialization_index,
@@ -156,7 +174,7 @@ def run_s208_g26_production(
             matrix_materialization=matrix_materialization,
             preregistration=preregistration,
             hypothesis_contract=hypothesis_contract,
-            upstream_gates=gates,
+            upstream_gates=analysis_gates,
             output_root=None,
             memmap_root=scratch,
             bootstrap_replicates=bootstrap_replicates,

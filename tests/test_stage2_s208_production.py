@@ -13,7 +13,7 @@ from param_importance_nlp.experiments.stage2_s208_production import (
     load_s208_reference_bundle,
 )
 from param_importance_nlp.experiments.stage2_s208_g26 import S28G26Blocked, _read_raw_payload
-from param_importance_nlp.experiments.stage2_s208_runner import _validate_production_paths
+from param_importance_nlp.experiments.stage2_s208_runner import _resolve_analysis_gate_refs, _validate_production_paths
 from param_importance_nlp.runtime.tensor_bundle import publish_tensor_bundle
 
 
@@ -228,3 +228,20 @@ def test_production_paths_require_new_data_root_namespaces(tmp_path: Path) -> No
     output.mkdir(parents=True)
     with pytest.raises(S208ProductionBlocked, match="output_root:NAMESPACE_ALREADY_EXISTS"):
         _validate_production_paths(data_root, scratch, output)
+
+
+def test_analysis_gate_refs_resolve_under_data_root(tmp_path: Path) -> None:
+    data_root = tmp_path / "data"
+    data_root.mkdir()
+    (data_root / "evidence").mkdir()
+    resolved = _resolve_analysis_gate_refs(
+        data_root,
+        {
+            "stage2.G2.4a": "evidence/g24a.json",
+            "stage2.G2.4b": "evidence/g24b.json",
+            "stage2.G2.5": "evidence/g25.json",
+        },
+    )
+    assert resolved["stage2.G2.4a"] == (data_root / "evidence/g24a.json").resolve()
+    with pytest.raises(S208ProductionBlocked, match="SAFE_RELATIVE_REFERENCE_REQUIRED|PATH_ESCAPE"):
+        _resolve_analysis_gate_refs(data_root, {"stage2.G2.4a": "../outside.json"})
