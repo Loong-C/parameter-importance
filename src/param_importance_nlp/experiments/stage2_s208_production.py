@@ -131,6 +131,21 @@ def _strict_cell_bindings(value: Mapping[str, Any], field: str) -> dict[str, Map
     return result
 
 
+def _verify_cell_bindings_hash(value: Mapping[str, Any], field: str) -> str:
+    """Verify the S2.6 wrapper hash over the exact ordered binding list."""
+
+    bindings = value.get("corrected_delta_sci_bindings")
+    if not isinstance(bindings, list):
+        raise S208ProductionBlocked(f"{field}:SIX_CELL_BINDINGS_REQUIRED")
+    declared = _sha(
+        value.get("corrected_delta_sci_bindings_hash"),
+        f"{field}.corrected_delta_sci_bindings_hash",
+    )
+    if declared != canonical_json_hash({"bindings": bindings}):
+        raise S208ProductionBlocked(f"{field}:CORRECTED_DELTA_BINDINGS_HASH_MISMATCH")
+    return declared
+
+
 def _sha(value: object, field: str) -> str:
     if not isinstance(value, str) or _SHA256.fullmatch(value) is None:
         raise S208ProductionBlocked(f"{field}:SHA256_REQUIRED")
@@ -1223,7 +1238,11 @@ def materialize_s208_matrix(
     g23_by_cell = {str(item["cell_id"]): item for item in g23_rows if isinstance(item, Mapping)}
     if g24a_payload.get("schema_version") != "stage2-g24a-formal-evaluation-v1" or g24a_payload.get("gate_id") != "stage2.G2.4a" or g24a_payload.get("status") != "PASS" or g24a_payload.get("formal_eligible") is not True:
         raise S208ProductionBlocked("g24a_gate:FORMAL_PASS_REQUIRED")
-    if g24a_payload.get("g23_evaluation_hash") != g23_hash:
+    if (
+        g23_gate_ref is None
+        or g24a_payload.get("g23_evaluation_ref") != g23_gate_ref
+        or g24a_payload.get("g23_evaluation_hash") != g23_hash
+    ):
         raise S208ProductionBlocked("g24a_gate:G23_BINDING_MISMATCH")
     g24a_rows = g24a_payload.get("results")
     if not isinstance(g24a_rows, list) or tuple(item.get("cell_id") for item in g24a_rows if isinstance(item, Mapping)) != _S208_CELL_IDS:
@@ -1272,9 +1291,9 @@ def materialize_s208_matrix(
     if not isinstance(g24b_measured, Mapping):
         raise S208ProductionBlocked("g24b_gate:MEASURED_BINDINGS_REQUIRED")
     g24b_cell_bindings = _strict_cell_bindings(g24b_measured, "g24b_gate.measured")
-    bindings_hash = g24b_measured.get("corrected_delta_sci_bindings_hash")
-    if _sha(bindings_hash, "g24b_gate.measured.corrected_delta_sci_bindings_hash") != canonical_json_hash({"bindings": g24b_measured["corrected_delta_sci_bindings"]}):
-        raise S208ProductionBlocked("g24b_gate:CORRECTED_DELTA_BINDINGS_HASH_MISMATCH")
+    _verify_cell_bindings_hash(pilot_payload, "s206_pilot_report")
+    _verify_cell_bindings_hash(matrix_payload, "matrix")
+    _verify_cell_bindings_hash(g24b_measured, "g24b_gate.measured")
     pilot_measurements = pilot_payload.get("measurements")
     if not isinstance(pilot_measurements, list) or len(pilot_measurements) != 6 * 4 * 5:
         raise S208ProductionBlocked("s206_pilot_report:MEASUREMENT_GRID_REQUIRED")

@@ -382,6 +382,7 @@ def formal_inputs_template(tmp_path_factory: pytest.TempPathFactory) -> dict[str
         "freeze_id": "s206-formal-matrix-freeze",
         "pilot_report_hash": pilot_hash,
         "corrected_delta_sci_bindings": binding_rows,
+        "corrected_delta_sci_bindings_hash": canonical_json_hash({"bindings": binding_rows}),
         "pilot_mapping_hash": "1" * 64,
         "sampling_plan_hash": "2" * 64,
         "anchor_ids": list(ANCHORS),
@@ -426,6 +427,7 @@ def formal_inputs_template(tmp_path_factory: pytest.TempPathFactory) -> dict[str
         "status": "PASS",
         "formal_eligible": True,
         "cell_count": 6,
+        "g23_evaluation_ref": g23_ref,
         "g23_evaluation_hash": g23_hash,
         "rebind_plan_ref": rebind_ref,
         "rebind_plan_hash": rebind_hash,
@@ -556,6 +558,18 @@ def test_corrected_delta_cell_binding_mismatch_is_blocked(formal_inputs: dict[st
     gate["artifact_hash"] = canonical_json_hash({key: value for key, value in gate.items() if key != "artifact_hash"})
     write_canonical_json(gate_path, gate)
     with pytest.raises(S208ProductionBlocked, match="CORRECTED_DELTA|g23_gate|G23"):
+        _materialize(formal_inputs)
+
+
+def test_g24a_g23_reference_mismatch_is_blocked(formal_inputs: dict[str, object]) -> None:
+    root = formal_inputs["root"]
+    assert isinstance(root, Path)
+    gate_path = root / str(formal_inputs["g24a"])
+    gate = json.loads(gate_path.read_text(encoding="utf-8"))
+    gate["g23_evaluation_ref"] = "refs/g23/g2.3-attempts/other/evaluation.json"
+    gate["artifact_hash"] = canonical_json_hash({key: value for key, value in gate.items() if key != "artifact_hash"})
+    write_canonical_json(gate_path, gate)
+    with pytest.raises(S208ProductionBlocked, match="g24a_gate:G23_BINDING_MISMATCH"):
         _materialize(formal_inputs)
 
 
