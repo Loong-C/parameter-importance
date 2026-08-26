@@ -92,6 +92,41 @@ def _load_execution(root: Path, reference: str) -> FormalExecutionEvidence:
     return evidence
 
 
+def _verify_failure_rule(root: Path, plan: object) -> None:
+    """Re-read the explicit S2.7 stop rule before any launch.
+
+    Older in-memory reducer fixtures may omit this input, but a persisted
+    production plan must carry both the logical ref and its canonical hash.
+    This keeps a caller from changing the failure threshold after plan
+    materialization while preserving the historical fixture API.
+    """
+
+    frozen = getattr(plan, "frozen_inputs", None)
+    rule_ref = getattr(frozen, "failure_rule_ref", None)
+    rule_hash = getattr(frozen, "failure_rule_hash", None)
+    if not isinstance(rule_ref, str) or not isinstance(rule_hash, str):
+        raise S27ExecutionBlocked("S27_FAILURE_RULE_BINDING_REQUIRED")
+    path = _logical(root, rule_ref, field="failure_rule_ref")
+    value = load_canonical_json(path)
+    if not isinstance(value, Mapping):
+        raise S27ExecutionBlocked("S27_FAILURE_RULE_OBJECT_REQUIRED")
+    declared = value.get("artifact_hash")
+    body = {key: item for key, item in value.items() if key != "artifact_hash"}
+    if declared != rule_hash or canonical_json_hash(body) != declared:
+        raise S27ExecutionBlocked("S27_FAILURE_RULE_HASH_DRIFT")
+    if (
+        value.get("schema_version") != "stage2-s207-failure-rule-amendment-v1"
+        or value.get("scope") != "formal"
+        or value.get("task_id") != "stage2.07_main_sweep"
+        or value.get("status") != "FROZEN"
+        or value.get("formal_eligible") is not True
+        or value.get("approval_status") != "APPROVED"
+        or value.get("rule") != "stop_after_failure_fraction_exceeds_max"
+        or value.get("max_failure_fraction") != frozen.max_failure_fraction
+    ):
+        raise S27ExecutionBlocked("S27_FAILURE_RULE_BINDING_INVALID")
+
+
 def _derive_s207_config(source_config: ResolvedConfigV2) -> ResolvedConfigV2:
     """Retarget the complete S2.4 v2 wire object for the S2.7 adapter.
 
@@ -186,6 +221,7 @@ def _build_request(
 def _preflight(args: argparse.Namespace) -> dict[str, object]:
     root = args.data_root.resolve()
     plan = load_s27_plan(root, args.plan_ref)
+    _verify_failure_rule(root, plan)
     # Re-read all producer artifacts at launch time.  A prepared plan alone is
     # not permission to consume a replaced matrix, mapping, or G2.4b Gate.
     matrix_path = _logical(root, plan.frozen_inputs.matrix_ref, field="g24b_matrix")
