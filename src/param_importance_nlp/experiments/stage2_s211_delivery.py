@@ -367,6 +367,14 @@ def _validate_upstream_gates(
     source = dict(values or {})
     if "stage2.G2.8" in source:
         return {}, ["G2.8_CANNOT_BE_ITS_OWN_PREDECESSOR"]
+    unsupported = set(source) - set(_UPSTREAM_GATES)
+    if unsupported:
+        # The predecessor map is a closed contract.  Ignoring an additional
+        # gate would make a caller's claimed upstream set differ from the
+        # machine-checked set while still allowing G2.8 to pass.
+        return {}, [
+            "UPSTREAM_GATE_UNSUPPORTED:" + ",".join(sorted(map(str, unsupported)))
+        ]
     if g27b_gate is not None:
         existing = source.get("stage2.G2.7b")
         if existing is not None and existing != g27b_gate:
@@ -525,12 +533,18 @@ def _lineage_entries(
     entries: list[dict[str, Any]] = []
     if isinstance(raw, Mapping):
         for task_id, item in raw.items():
-            if isinstance(item, Mapping):
-                row = dict(item)
-                row.setdefault("task_id", task_id)
-                entries.append(row)
+            if not isinstance(item, Mapping):
+                reasons.append("STAGE2_LINEAGE_ENTRY_INVALID")
+                continue
+            row = dict(item)
+            if row.get("task_id") is not None and row.get("task_id") != task_id:
+                reasons.append("STAGE2_LINEAGE_TASK_KEY_MISMATCH")
+            row.setdefault("task_id", task_id)
+            entries.append(row)
     elif isinstance(raw, list):
         entries = [dict(item) for item in raw if isinstance(item, Mapping)]
+        if len(entries) != len(raw):
+            reasons.append("STAGE2_LINEAGE_ENTRY_INVALID")
     if not entries:
         reasons.append("STAGE2_LINEAGE_ENTRIES_MISSING")
         return entries, reasons, identity
@@ -539,12 +553,16 @@ def _lineage_entries(
     for item in entries:
         task_id = item.get("task_id")
         if not isinstance(task_id, str):
+            reasons.append("STAGE2_LINEAGE_TASK_ID_INVALID")
             continue
         if task_id in by_task:
             duplicate_tasks.add(task_id)
         by_task[task_id] = item
     for task_id in sorted(duplicate_tasks):
         reasons.append(f"STAGE2_LINEAGE_DUPLICATE:{task_id}")
+    unknown_tasks = set(by_task) - set(_STAGE2_TASKS)
+    for task_id in sorted(unknown_tasks):
+        reasons.append(f"STAGE2_LINEAGE_UNSUPPORTED_TASK:{task_id}")
     missing = [task_id for task_id in _STAGE2_TASKS if task_id not in by_task]
     if missing:
         reasons.append("STAGE2_LINEAGE_INCOMPLETE:" + ",".join(missing))
@@ -665,6 +683,14 @@ def _validate_replay(audit: Mapping[str, Any] | None, *, expected_31m_hash: str 
     for name, candidate in (("source_result_hash", source_hash), ("replay_result_hash", replay_hash)):
         if not isinstance(candidate, str) or _SHA256.fullmatch(candidate) is None:
             reasons.append(f"REPLAY_{name.upper()}_MISSING")
+    if (
+        isinstance(source_hash, str)
+        and _SHA256.fullmatch(source_hash) is not None
+        and isinstance(replay_hash, str)
+        and _SHA256.fullmatch(replay_hash) is not None
+        and source_hash != replay_hash
+    ):
+        reasons.append("REPLAY_RESULT_HASH_MISMATCH")
     source_artifact_hash = audit.get("source_artifact_hash")
     if not isinstance(source_artifact_hash, str) or _SHA256.fullmatch(source_artifact_hash) is None:
         reasons.append("REPLAY_31M_SOURCE_HASH_MISSING")
