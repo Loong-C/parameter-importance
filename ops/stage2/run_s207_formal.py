@@ -200,7 +200,7 @@ def _preflight(args: argparse.Namespace) -> dict[str, object]:
     materialized = load_s27_materialized_inputs(root, args.materialization_index_ref)
     if set(materialized) != set(plan.cells[i].cell_id for i in range(len(plan.cells))):
         raise S27ExecutionBlocked("S27_MATERIALIZATION_CELL_SET_MISMATCH")
-    gpu, _inventory_identity = load_s27_gpu_inventory_envelope(
+    gpu, inventory_identity = load_s27_gpu_inventory_envelope(
         args.gpu_inventory_json,
         data_root=root,
     )
@@ -245,6 +245,7 @@ def _preflight(args: argparse.Namespace) -> dict[str, object]:
         "excluded_gpu_uuid": EXCLUDED_GPU_UUID,
         "excluded_pci": EXCLUDED_PCI,
         "gpu_inventory": gpu,
+        "gpu_inventory_identity": dict(inventory_identity),
         "confirmatory_draws_generated": False,
         "mapping_units_loaded": len(mapping),
         "optional_stopping": False,
@@ -257,6 +258,8 @@ def _preflight(args: argparse.Namespace) -> dict[str, object]:
 def _worker(args: argparse.Namespace) -> dict[str, object]:
     root = args.data_root.resolve()
     plan = load_s27_plan(root, args.plan_ref)
+    if any(cell.corrected_delta_sci_binding is None for cell in plan.cells):
+        raise S27ExecutionBlocked("S27_CORRECTED_DELTA_BINDINGS_REQUIRED")
     if args.cell_id not in {cell.cell_id for cell in plan.cells}:
         raise S27ExecutionBlocked("S27_WORKER_CELL_UNKNOWN")
     if args.gpu_uuid not in APPROVED_GPU_UUIDS:
@@ -290,6 +293,12 @@ def _worker(args: argparse.Namespace) -> dict[str, object]:
     execution_g24b = [gate for gate in execution.prerequisite_gates if gate.gate_id == "stage2.G2.4b"]
     if len(execution_g24b) != 1 or execution_g24b[0].artifact_hash != plan.frozen_inputs.g24b_gate_hash:
         raise S27ExecutionBlocked("S27_WORKER_EXECUTION_G24B_BINDING_INVALID")
+    # Every detached worker re-reads the same hash-bound live envelope.  The
+    # parent preflight is not a substitute for carrying this identity into a
+    # child process whose environment may have changed before it starts.
+    if args.gpu_inventory_json is None:
+        raise S27ExecutionBlocked("S27_WORKER_GPU_INVENTORY_JSON_REQUIRED")
+    load_s27_gpu_inventory_envelope(args.gpu_inventory_json, data_root=root)
     materialized = load_s27_materialized_inputs(root, args.materialization_index_ref)[args.cell_id]
     request = _build_request(root, cell_id=args.cell_id, materialization_index_ref=args.materialization_index_ref, execution_evidence_ref=args.execution_evidence_ref)
     run_root = _logical(root, args.run_root, field="run_root")
@@ -433,8 +442,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             return 0
         # --execute is the only foreground launcher mode.  It repeats the
         # read-only preflight immediately before creating a child process.
-        _preflight(args)
-        inventory = _load_inventory(args.gpu_inventory_json, data_root=args.data_root)
+        preflight = _preflight(args)
+        inventory, inventory_identity = load_s27_gpu_inventory_envelope(
+            args.gpu_inventory_json,
+            data_root=args.data_root.resolve(),
+        )
+        if preflight.get("gpu_inventory_identity") != inventory_identity:
+            raise S27ExecutionBlocked("S27_GPU_INVENTORY_PREFLIGHT_IDENTITY_DRIFT")
         result = S27DetachedLauncher(
             data_root=args.data_root,
             plan_ref=args.plan_ref,
@@ -445,6 +459,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             materialization_index_ref=args.materialization_index_ref,
             execution_evidence_ref=args.execution_evidence_ref,
             approved_inventory=inventory,
+            gpu_inventory_json=args.gpu_inventory_json,
+            gpu_inventory_identity=inventory_identity,
         ).execute()
         print(json.dumps(result, ensure_ascii=False, sort_keys=True, indent=2))
         return 0

@@ -19,7 +19,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import re
 from typing import Any, Mapping, Sequence
 
@@ -46,6 +46,22 @@ S27_REFERENCE_TASK = "stage2.04_reference_target"
 S27_CHECKPOINT_TASK = "stage2.03_assets_checkpoints_and_sampling"
 S27_REQUIRED_GATES = ("stage2.G2.2", "stage2.G2.3", "stage2.G2.4a", "stage2.G2.4b")
 S27_WAVE_ORDER = EXPECTED_CELL_IDS
+# S2.6 keeps its historical dot anchor spelling in matrix/mapping objects,
+# while G2.3/S2.7 use the canonical colon cell identity.
+S27_ANCHOR_ORDER = tuple(cell.replace(":", ".", 1) for cell in EXPECTED_CELL_IDS)
+S27_CORRECTED_DELTA_BINDING_FIELDS = frozenset(
+    {
+        "cell_id",
+        "config_hash",
+        "result_hash",
+        "corrected_delta_sci_hash",
+        "corrected_delta_sci_ref",
+        "corrected_delta_sci_batch_sizes",
+        "delta_sci_source",
+    }
+)
+S27_CORRECTED_DELTA_BATCH_SIZES = (32, 64, 128, 256)
+S27_CORRECTED_DELTA_SOURCE = "g23_output_derived_corrected_sidecar"
 APPROVED_GPU_UUIDS = (
     "GPU-180ff767-885a-7dc9-c8a9-921d65a01bbd",
     "GPU-5c672d04-4f83-3cc0-80d0-0108b1b63267",
@@ -151,6 +167,45 @@ def _map_ref(value: object, *, field: str) -> str:
     if "\\" in value or value.startswith("/"):
         raise ValueError(f"{field}:UNSAFE_REFERENCE")
     return _ref(value, field=field)
+
+
+def _anchor_to_cell_id(value: object, *, field: str = "anchor_id") -> str:
+    """Map one exact S2.6 dot anchor to the canonical S2.7 colon cell."""
+
+    if not isinstance(value, str) or value not in S27_ANCHOR_ORDER:
+        raise ValueError(f"{field}:S206_DOT_ANCHOR_REQUIRED")
+    return EXPECTED_CELL_IDS[S27_ANCHOR_ORDER.index(value)]
+
+
+def _validate_corrected_delta_binding(
+    value: object,
+    *,
+    expected_cell_id: str,
+    field: str,
+) -> dict[str, object]:
+    """Validate the exact per-cell S2.6/G2.3 sidecar binding."""
+
+    if not isinstance(value, Mapping) or set(value) != S27_CORRECTED_DELTA_BINDING_FIELDS:
+        raise ValueError(f"{field}:FIELDS_INVALID")
+    binding = dict(value)
+    if binding.get("cell_id") != expected_cell_id:
+        raise ValueError(f"{field}:CELL_IDENTITY_MISMATCH")
+    for name in ("config_hash", "result_hash", "corrected_delta_sci_hash"):
+        _sha(binding.get(name), field=f"{field}.{name}")
+    ref = binding.get("corrected_delta_sci_ref")
+    if not isinstance(ref, str) or not ref or "\\" in ref or ref.startswith("/") or ref.endswith("/"):
+        raise ValueError(f"{field}.corrected_delta_sci_ref:INVALID")
+    ref_path = PurePosixPath(ref)
+    if ref_path.is_absolute() or any(part in {"", ".", ".."} for part in ref_path.parts):
+        raise ValueError(f"{field}.corrected_delta_sci_ref:INVALID")
+    expected_suffix = f"g2.3-corrected-delta-sci/{binding['corrected_delta_sci_hash']}.json"
+    if not ref.endswith(expected_suffix):
+        raise ValueError(f"{field}.corrected_delta_sci_ref:CONTENT_ADDRESS_INVALID")
+    if binding.get("corrected_delta_sci_batch_sizes") != list(S27_CORRECTED_DELTA_BATCH_SIZES):
+        raise ValueError(f"{field}.corrected_delta_sci_batch_sizes:INVALID")
+    if binding.get("delta_sci_source") != S27_CORRECTED_DELTA_SOURCE:
+        raise ValueError(f"{field}.delta_sci_source:INVALID")
+    return binding
 
 
 @dataclass(frozen=True, slots=True)
@@ -317,6 +372,7 @@ class S27CellPlan:
     reference_gate_hash: str
     expected_unit_ids: tuple[str, ...]
     assigned_gpu_uuid: str
+    corrected_delta_sci_binding: Mapping[str, object] | None = None
 
     def __post_init__(self) -> None:
         if self.cell_id not in EXPECTED_CELL_IDS:
@@ -334,6 +390,12 @@ class S27CellPlan:
             raise ValueError("cell expected unit IDs must be non-empty and unique")
         if self.assigned_gpu_uuid not in APPROVED_GPU_UUIDS or self.assigned_gpu_uuid == EXCLUDED_GPU_UUID:
             raise ValueError("cell assigned to unapproved GPU")
+        if self.corrected_delta_sci_binding is not None:
+            _validate_corrected_delta_binding(
+                self.corrected_delta_sci_binding,
+                expected_cell_id=self.cell_id,
+                field=f"corrected_delta_sci_binding.{self.cell_id}",
+            )
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -349,15 +411,24 @@ class S27CellPlan:
             "reference_gate_hash": self.reference_gate_hash,
             "expected_unit_ids": list(self.expected_unit_ids),
             "assigned_gpu_uuid": self.assigned_gpu_uuid,
+            "corrected_delta_sci_binding": (
+                None
+                if self.corrected_delta_sci_binding is None
+                else dict(self.corrected_delta_sci_binding)
+            ),
         }
 
     @classmethod
     def from_mapping(cls, value: Mapping[str, object]) -> "S27CellPlan":
-        required = {"cell_id", "model_id", "training_stage", "checkpoint_ref", "checkpoint_hash", "checkpoint_id", "reference_ref", "reference_hash", "reference_gate_ref", "reference_gate_hash", "expected_unit_ids", "assigned_gpu_uuid"}
+        required = {"cell_id", "model_id", "training_stage", "checkpoint_ref", "checkpoint_hash", "checkpoint_id", "reference_ref", "reference_hash", "reference_gate_ref", "reference_gate_hash", "expected_unit_ids", "assigned_gpu_uuid", "corrected_delta_sci_binding"}
         if set(value) != required or not isinstance(value.get("expected_unit_ids"), list):
             raise ValueError("cell plan fields mismatch")
+        binding_value = value.get("corrected_delta_sci_binding")
+        if not isinstance(binding_value, Mapping):
+            raise ValueError("cell plan corrected delta binding required")
         return cls(
             cell_id=value["cell_id"], model_id=value["model_id"], training_stage=value["training_stage"], checkpoint_ref=value["checkpoint_ref"], checkpoint_hash=value["checkpoint_hash"], checkpoint_id=value["checkpoint_id"], reference_ref=value["reference_ref"], reference_hash=value["reference_hash"], reference_gate_ref=value["reference_gate_ref"], reference_gate_hash=value["reference_gate_hash"], expected_unit_ids=tuple(value["expected_unit_ids"]), assigned_gpu_uuid=value["assigned_gpu_uuid"],
+            corrected_delta_sci_binding=dict(binding_value),
         )  # type: ignore[arg-type]
 
 
@@ -412,6 +483,20 @@ class S27Plan:
             "formal_eligible": self.formal_eligible,
             "frozen_inputs": self.frozen_inputs.to_dict(),
             "cells": [item.to_dict() for item in self.cells],
+            "corrected_delta_sci_bindings": [
+                None
+                if item.corrected_delta_sci_binding is None
+                else dict(item.corrected_delta_sci_binding)
+                for item in self.cells
+            ],
+            "corrected_delta_sci_bindings_hash": canonical_json_hash({
+                "bindings": [
+                    None
+                    if item.corrected_delta_sci_binding is None
+                    else dict(item.corrected_delta_sci_binding)
+                    for item in self.cells
+                ]
+            }),
             "source_artifact_refs": list(self.source_artifact_refs),
             "approved_gpu_uuids": list(self.approved_gpu_uuids),
             "excluded_pci": self.excluded_pci,
@@ -425,18 +510,26 @@ class S27Plan:
 
     @classmethod
     def from_mapping(cls, value: Mapping[str, object]) -> "S27Plan":
-        required = {"schema_version", "task_id", "plan_id", "plan_ref", "scope", "stream", "status", "formal_eligible", "frozen_inputs", "cells", "source_artifact_refs", "approved_gpu_uuids", "excluded_pci", "wave_order", "expected_unit_count", "expected_sample_budget", "artifact_hash"}
+        required = {"schema_version", "task_id", "plan_id", "plan_ref", "scope", "stream", "status", "formal_eligible", "frozen_inputs", "cells", "corrected_delta_sci_bindings", "corrected_delta_sci_bindings_hash", "source_artifact_refs", "approved_gpu_uuids", "excluded_pci", "wave_order", "expected_unit_count", "expected_sample_budget", "artifact_hash"}
         if set(value) != required or value.get("schema_version") != S27_PLAN_SCHEMA or value.get("task_id") != S27_TASK_ID or value.get("scope") != S27_SCOPE or value.get("stream") != S27_STREAM:
             raise ValueError("S2.7 plan fields or identity mismatch")
         declared = _sha(value.get("artifact_hash"), field="s27_plan.artifact_hash")
         if declared != canonical_json_hash({key: item for key, item in value.items() if key != "artifact_hash"}):
             raise ValueError("S2.7 plan artifact hash mismatch")
-        if not isinstance(value.get("frozen_inputs"), Mapping) or not isinstance(value.get("cells"), list) or not isinstance(value.get("source_artifact_refs"), list) or not isinstance(value.get("approved_gpu_uuids"), list):
+        if not isinstance(value.get("frozen_inputs"), Mapping) or not isinstance(value.get("cells"), list) or not isinstance(value.get("corrected_delta_sci_bindings"), list) or not isinstance(value.get("source_artifact_refs"), list) or not isinstance(value.get("approved_gpu_uuids"), list):
             raise TypeError("S2.7 plan nested fields invalid")
         frozen = S27FrozenInputs.from_mapping(value["frozen_inputs"])
         cells = tuple(S27CellPlan.from_mapping(item) for item in value["cells"] if isinstance(item, Mapping))
         if len(cells) != len(value["cells"]):
             raise ValueError("S2.7 plan cells must be objects")
+        bindings = value["corrected_delta_sci_bindings"]
+        if len(bindings) != len(cells) or any(not isinstance(item, Mapping) for item in bindings):
+            raise ValueError("S2.7 plan corrected delta bindings invalid")
+        if value["corrected_delta_sci_bindings_hash"] != canonical_json_hash({"bindings": bindings}):
+            raise ValueError("S2.7 plan corrected delta bindings hash mismatch")
+        for cell, binding in zip(cells, bindings):
+            if cell.corrected_delta_sci_binding != dict(binding):
+                raise ValueError(f"S2.7 plan corrected delta binding drift: {cell.cell_id}")
         result = cls(plan_id=value["plan_id"], plan_ref=value["plan_ref"], frozen_inputs=frozen, cells=cells, source_artifact_refs=tuple(value["source_artifact_refs"]), approved_gpu_uuids=tuple(value["approved_gpu_uuids"]), excluded_pci=value["excluded_pci"], status=value["status"], formal_eligible=value["formal_eligible"])  # type: ignore[arg-type]
         if value["wave_order"] != list(S27_WAVE_ORDER) or value["expected_unit_count"] != len(result.expected_unit_ids) or value["expected_sample_budget"] != sum(item.batch_size for item in frozen.units) or declared != result.artifact_hash:
             raise ValueError("S2.7 plan derived identity mismatch")
@@ -476,7 +569,7 @@ def _extract_reference(row: Mapping[str, object], *, cell_id: str) -> tuple[str,
 
 def _mapping_units(mapping: Mapping[str, object], *, matrix_hash: str, mapping_hash: str, batch_size: int, microbatch_count: int, repetitions: int, sampling_plan_hash: str) -> tuple[S27MappingUnit, ...]:
     cells = mapping.get("cells")
-    if not isinstance(cells, list) or tuple(item.get("anchor_id") for item in cells if isinstance(item, Mapping)) != EXPECTED_CELL_IDS:
+    if not isinstance(cells, list) or tuple(item.get("anchor_id") for item in cells if isinstance(item, Mapping)) != S27_ANCHOR_ORDER:
         raise S27PreparationBlocked("confirmatory mapping must cover six cells in canonical order")
     pilot_ids = mapping.get("pilot_draw_ids")
     if pilot_ids is None:
@@ -499,7 +592,10 @@ def _mapping_units(mapping: Mapping[str, object], *, matrix_hash: str, mapping_h
     for cell in cells:
         if not isinstance(cell, Mapping):
             raise S27PreparationBlocked("confirmatory mapping cell must be an object")
-        cell_id = str(cell.get("anchor_id"))
+        try:
+            cell_id = _anchor_to_cell_id(cell.get("anchor_id"))
+        except ValueError as error:
+            raise S27PreparationBlocked(f"mapping.{cell.get('anchor_id')}:DOT_ANCHOR_REQUIRED") from error
         rows = cell.get("mappings")
         if not isinstance(rows, list) or len(rows) != repetitions:
             raise S27PreparationBlocked(f"mapping.{cell_id}:REPETITION_DENOMINATOR_MISMATCH")
@@ -587,8 +683,25 @@ def prepare_s27_plan(
         raise S27PreparationBlocked(str(error)) from error
     if matrix.get("scope") != S27_SCOPE or matrix.get("status") != "FORMAL_FROZEN" or matrix.get("formal_eligible") is not True:
         raise S27PreparationBlocked("G24B_FORMAL_FROZEN_MATRIX_REQUIRED")
-    if tuple(matrix.get("anchor_ids", ())) != EXPECTED_CELL_IDS:
+    if tuple(matrix.get("anchor_ids", ())) != S27_ANCHOR_ORDER:
         raise S27PreparationBlocked("G24B_MATRIX_SIX_CELL_ORDER_INVALID")
+    raw_bindings = matrix.get("corrected_delta_sci_bindings")
+    if not isinstance(raw_bindings, list) or len(raw_bindings) != len(EXPECTED_CELL_IDS):
+        raise S27PreparationBlocked("G24B_CORRECTED_DELTA_BINDINGS_REQUIRED")
+    bindings: list[dict[str, object]] = []
+    for index, expected_cell_id in enumerate(EXPECTED_CELL_IDS):
+        try:
+            bindings.append(
+                _validate_corrected_delta_binding(
+                    raw_bindings[index],
+                    expected_cell_id=expected_cell_id,
+                    field=f"g24b_matrix.corrected_delta_sci_bindings[{index}]",
+                )
+            )
+        except (IndexError, TypeError, ValueError) as error:
+            raise S27PreparationBlocked("G24B_CORRECTED_DELTA_BINDING_INVALID") from error
+    if matrix.get("corrected_delta_sci_bindings_hash") != canonical_json_hash({"bindings": bindings}):
+        raise S27PreparationBlocked("G24B_CORRECTED_DELTA_BINDINGS_HASH_INVALID")
     if not isinstance(matrix.get("candidate_evaluations"), list) or not matrix.get("candidate_evaluations"):
         raise S27PreparationBlocked("G24B_MATRIX_CANDIDATE_TABLE_MISSING")
     try:
@@ -654,6 +767,7 @@ def prepare_s27_plan(
             reference_gate_hash=reference_gate_hash,
             expected_unit_ids=expected_ids,
             assigned_gpu_uuid=APPROVED_GPU_UUIDS[index % len(APPROVED_GPU_UUIDS)],
+            corrected_delta_sci_binding=bindings[index],
         ))
     return S27Plan(
         plan_id=_text(plan_id, field="plan_id", pattern=_SAFE_ID),
@@ -815,6 +929,10 @@ class StrictG25Reducer:
         cell = self._by_cell[unit.cell_id]
         if (unit.matrix_hash != self.plan.frozen_inputs.matrix_hash or unit.mapping_hash != expected.mapping_hash or unit.sampling_plan_hash != self.plan.frozen_inputs.sampling_plan_hash or unit.checkpoint_hash != cell.checkpoint_hash or unit.reference_hash != cell.reference_hash):
             raise S27G25Blocked(f"UNIT_LINEAGE_MISMATCH:{unit.unit_id}")
+        if cell.corrected_delta_sci_binding is not None:
+            observed_binding = unit.metrics.get("corrected_delta_sci_binding")
+            if observed_binding != dict(cell.corrected_delta_sci_binding):
+                raise S27G25Blocked(f"UNIT_CORRECTED_DELTA_BINDING_MISMATCH:{unit.unit_id}")
         previous = self._records.get(unit.unit_id)
         if previous is not None:
             if previous.artifact_hash == unit.artifact_hash and previous.attempt_id == unit.attempt_id:
@@ -847,7 +965,7 @@ class StrictG25Reducer:
         completed, failed, failure_fraction = self._validate_complete()
         descriptors = []
         for record in self.records:
-            descriptors.append({
+            descriptor: dict[str, object] = {
                 "unit_id": record.unit_id,
                 "cell_id": record.cell_id,
                 "repetition_id": record.repetition_id,
@@ -857,7 +975,11 @@ class StrictG25Reducer:
                 "raw_artifact_ref": record.raw_artifact_ref,
                 "raw_artifact_hash": record.raw_artifact_hash,
                 "unit_artifact_hash": record.artifact_hash,
-            })
+            }
+            binding = self._by_cell[record.cell_id].corrected_delta_sci_binding
+            if binding is not None:
+                descriptor["corrected_delta_sci_binding"] = dict(binding)
+            descriptors.append(descriptor)
         body: dict[str, object] = {
             "schema_version": S27_RAW_MANIFEST_SCHEMA,
             "run_id": self.run_id,
@@ -1039,6 +1161,10 @@ __all__ = [
     "EXCLUDED_GPU_UUID",
     "EXCLUDED_PCI",
     "S27CellPlan",
+    "S27_ANCHOR_ORDER",
+    "S27_CORRECTED_DELTA_BATCH_SIZES",
+    "S27_CORRECTED_DELTA_SOURCE",
+    "S27_CORRECTED_DELTA_BINDING_FIELDS",
     "S27DetachedStatus",
     "S27FrozenInputs",
     "S27G25Blocked",
