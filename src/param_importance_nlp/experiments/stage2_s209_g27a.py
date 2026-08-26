@@ -37,6 +37,7 @@ S29_GATE_SCHEMA = "stage2-s209-g27a-gate-v1"
 S29_MEASUREMENT_PLAN_SCHEMA = "stage2-s209-g27a-measurement-plan-v1"
 S29_SHARED_RUN_SCHEMA = "stage2-s209-g27a-shared-paired-run-v1"
 S29_SHARED_POOL_SCHEMA = "stage2-s209-g27a-shared-gradient-pool-v1"
+S29_CROSSCHECK_SCHEMA = "stage2-s209-g27a-shared-attribution-crosscheck-v1"
 S29_TASK_ID = "stage2.09_cost_and_system_validation"
 S29_MATRIX_SCHEMA = "stage2-formal-pilot-matrix-freeze-v1"
 S29_COST_SEMANTICS = (
@@ -958,6 +959,118 @@ def _crosscheck(rows: Sequence[Mapping[str, Any]], value: Any) -> list[str]:
     return reasons
 
 
+def _crosscheck_row_sort_key(row: Mapping[str, Any]) -> tuple[str, str, str, int, str]:
+    """Return a deterministic key for the rows sealed into a cross-check."""
+
+    repetition = row.get("repetition", 0)
+    return (
+        str(row.get("semantic", "")),
+        str(row.get("method", "")),
+        str(row.get("anchor_id", "")),
+        int(repetition) if isinstance(repetition, int) and not isinstance(repetition, bool) else 0,
+        str(row.get("run_id", "")),
+    )
+
+
+def _crosscheck_row_identity_hash(rows: Sequence[Mapping[str, Any]]) -> str:
+    """Hash the complete deterministic set of measured rows."""
+
+    ordered = [dict(row) for row in sorted(rows, key=_crosscheck_row_sort_key)]
+    return canonical_json_hash(ordered)
+
+
+def build_s209_shared_attribution_crosscheck(
+    rows: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Build a content-addressed cross-check from sealed measured rows.
+
+    The reducer must compare the shared and isolated medians from the exact
+    rows it just sealed.  This function intentionally has no fallback values:
+    missing method rows or non-positive timings are a hard error.
+    """
+
+    if not isinstance(rows, Sequence) or isinstance(rows, (str, bytes)):
+        raise S29G27ABlocked("SHARED_ATTRIBUTION_CROSSCHECK_ROWS_REQUIRED")
+    materialized = [dict(row) for row in rows if isinstance(row, Mapping)]
+    if len(materialized) != len(rows):
+        raise S29G27ABlocked("SHARED_ATTRIBUTION_CROSSCHECK_ROW_INVALID")
+    values: dict[str, dict[str, float]] = {}
+    for method in S29_METHODS:
+        shared = [
+            float(row["wall_seconds"])
+            for row in materialized
+            if row.get("semantic") == "scientific_equal_sample_cost"
+            and row.get("method") == method
+        ]
+        isolated = [
+            float(row["wall_seconds"])
+            for row in materialized
+            if row.get("semantic") == "isolated_estimator_cost"
+            and row.get("method") == method
+        ]
+        if not shared or not isolated or any(value <= 0 or not math.isfinite(value) for value in shared + isolated):
+            raise S29G27ABlocked(f"SHARED_ATTRIBUTION_CROSSCHECK_ROWS_MISSING:{method}")
+        shared_median = float(statistics.median(shared))
+        isolated_median = float(statistics.median(isolated))
+        relative_difference = abs(shared_median - isolated_median) / isolated_median
+        values[method] = {
+            "shared_wall_seconds": shared_median,
+            "isolated_wall_seconds": isolated_median,
+            "relative_difference": float(relative_difference),
+        }
+    body: dict[str, Any] = {
+        "schema_version": S29_CROSSCHECK_SCHEMA,
+        "source": "sealed_measured_rows",
+        "row_identity_hash": _crosscheck_row_identity_hash(materialized),
+        "rows": values,
+    }
+    body["artifact_hash"] = canonical_json_hash(body)
+    return body
+
+
+def _crosscheck_rows_mapping(value: Any, *, field: str) -> Mapping[str, Any]:
+    """Read the new envelope or the legacy method-key mapping."""
+
+    if not isinstance(value, Mapping):
+        raise S29G27ABlocked(f"{field}:OBJECT_REQUIRED")
+    if value.get("schema_version") == S29_CROSSCHECK_SCHEMA:
+        declared = value.get("artifact_hash")
+        if not isinstance(declared, str) or canonical_json_hash({key: item for key, item in value.items() if key != "artifact_hash"}) != declared:
+            raise S29G27ABlocked(f"{field}:ARTIFACT_HASH_MISMATCH")
+        if value.get("source") != "sealed_measured_rows":
+            raise S29G27ABlocked(f"{field}:SOURCE_INVALID")
+        row_identity = value.get("row_identity_hash")
+        if not isinstance(row_identity, str) or _SHA256.fullmatch(row_identity) is None:
+            raise S29G27ABlocked(f"{field}:ROW_IDENTITY_HASH_REQUIRED")
+        rows = value.get("rows")
+    else:
+        # Compatibility for callers that supplied the original method-key
+        # mapping.  It remains fail-closed below because every value must
+        # exactly equal the reducer-generated sealed-row result.
+        rows = value
+    if not isinstance(rows, Mapping):
+        raise S29G27ABlocked(f"{field}:ROWS_REQUIRED")
+    return rows
+
+
+def _validate_preprovided_crosscheck(
+    value: Any,
+    *,
+    generated: Mapping[str, Any],
+) -> None:
+    """Require a presealed attestation to match generated medians exactly."""
+
+    supplied = _crosscheck_rows_mapping(value, field="shared_attribution_crosscheck")
+    expected = generated.get("rows")
+    if not isinstance(expected, Mapping):
+        raise S29G27ABlocked("SHARED_ATTRIBUTION_CROSSCHECK_GENERATED_ROWS_REQUIRED")
+    for method in S29_METHODS:
+        if supplied.get(method) != expected.get(method):
+            raise S29G27ABlocked(f"SHARED_ATTRIBUTION_CROSSCHECK_PRESEALED_MISMATCH:{method}")
+    if value.get("schema_version") == S29_CROSSCHECK_SCHEMA and value.get("row_identity_hash") != generated.get("row_identity_hash"):
+        raise S29G27ABlocked("SHARED_ATTRIBUTION_CROSSCHECK_ROW_IDENTITY_MISMATCH")
+
+
 def _consistency(rows: Sequence[Mapping[str, Any]], frozen: S29FrozenInputs) -> dict[str, Any]:
     checks: dict[str, bool] = {
         "matrix_b_m": True,
@@ -1221,7 +1334,28 @@ def run_s209_g27a(
     online_blockers, online_aggregates, online_ratios = _online_checks(reduced, metadata["online_training_incremental_cost"])
     blockers.extend(online_blockers)
     blockers.extend(shared_blockers)
-    blockers.extend(_crosscheck(reduced, shared_attribution_cross_check))
+    generated_crosscheck: dict[str, Any] | None = None
+    try:
+        generated_crosscheck = build_s209_shared_attribution_crosscheck(reduced)
+    except S29G27ABlocked as error:
+        blockers.append(f"SHARED_ATTRIBUTION_CROSSCHECK_GENERATION_BLOCKED:{error}")
+    if generated_crosscheck is not None:
+        if shared_attribution_cross_check is not None:
+            try:
+                _validate_preprovided_crosscheck(
+                    shared_attribution_cross_check,
+                    generated=generated_crosscheck,
+                )
+            except S29G27ABlocked as error:
+                blockers.append(str(error))
+        # Always reduce the values sealed in this invocation. A caller may
+        # preseal an attestation, but it can never replace measured rows.
+        blockers.extend(_crosscheck(reduced, generated_crosscheck["rows"]))
+    else:
+        # A supplied attestation is never a fallback for malformed or
+        # incomplete sealed rows.  Without a reducer-generated identity there
+        # is no content-addressed cross-check that can be safely compared.
+        blockers.append("SHARED_ATTRIBUTION_CROSSCHECK_GENERATION_REQUIRED")
     pareto, pareto_reasons = _pareto(reduced, accuracy_rows)
     blockers.extend(pareto_reasons)
     capacity = _capacity(reduced, capacity_inputs)
@@ -1255,6 +1389,7 @@ def run_s209_g27a(
         "ulimit_nofile_soft": capacity.get("ulimit_nofile_soft"),
         "shared_paired_run_count": len(shared_pairs),
         "shared_pool_artifact_hashes": sorted({str(item["shared_pool_artifact_hash"]) for item in shared_pairs}),
+        "shared_attribution_crosscheck_hash": None if generated_crosscheck is None else generated_crosscheck["artifact_hash"],
     }
     gate = GateRecord(
         gate_id="stage2.G2.7a",
@@ -1263,7 +1398,7 @@ def run_s209_g27a(
         checked_at=now,
         measured=measured,
         threshold={"online_training_incremental_cost_ratio": S29_DECISION_RATIO, "shared_crosscheck_relative_difference": S29_CROSSCHECK_TOLERANCE, "four_gpu_required": True, "cost_io_quiescent": True, "shared_paired_runner_schema": S29_SHARED_RUN_SCHEMA, "shared_gradient_pool_schema": S29_SHARED_POOL_SCHEMA},
-        evidence_refs=(matrix_ref, raw_manifest_ref, f"s209/{run_id}/cost-system-validation.json"),
+        evidence_refs=(matrix_ref, raw_manifest_ref, f"s209/{run_id}/cost-system-validation.json", "shared-attribution-crosscheck.json"),
         reasons=reasons if gate_status is not GateStatus.PASS else (),
     )
     semantic_summary: dict[str, Any] = {}
@@ -1296,7 +1431,8 @@ def run_s209_g27a(
         "four_gpu_anchor": dict(four_gpu_anchor) if isinstance(four_gpu_anchor, Mapping) else None,
         "cost_io_quiescent": expected_io,
         "consistency": consistency,
-        "shared_attribution_cross_check": dict(shared_attribution_cross_check) if isinstance(shared_attribution_cross_check, Mapping) else None,
+        "shared_attribution_cross_check": None if generated_crosscheck is None else generated_crosscheck["rows"],
+        "shared_attribution_crosscheck": generated_crosscheck,
         "shared_paired_runs": shared_pairs,
         "online_training_incremental_cost": {"aggregates": online_aggregates, "ratios": online_ratios, "decision_source": "online_training_incremental_cost"},
         "pareto": pareto,
@@ -1311,6 +1447,8 @@ def run_s209_g27a(
         root.mkdir(parents=True, exist_ok=True)
         write_canonical_json(root / "cost-system-validation.json", report)
         write_canonical_json(root / "g2.7a-gate.json", gate.to_dict())
+        if generated_crosscheck is not None:
+            write_canonical_json(root / "shared-attribution-crosscheck.json", generated_crosscheck)
     return report
 
 
@@ -1328,12 +1466,14 @@ __all__ = [
     "S29_CROSSCHECK_TOLERANCE",
     "S29_DECISION_RATIO",
     "S29_MEASUREMENT_PLAN_SCHEMA",
+    "S29_CROSSCHECK_SCHEMA",
     "S29_SHARED_POOL_SCHEMA",
     "S29_SHARED_RUN_SCHEMA",
     "S29_SHARED_ROW_FIELDS",
     "S29FrozenInputs",
     "S29G27ABlocked",
     "StrictS29Reducer",
+    "build_s209_shared_attribution_crosscheck",
     "bind_s209_inputs",
     "orchestrate_s209_g27a",
     "prepare_s209_measurement_plan",

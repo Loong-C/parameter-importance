@@ -10,6 +10,7 @@ from param_importance_nlp.experiments.stage2_s204_ids import EXPECTED_CELL_IDS
 from param_importance_nlp.experiments.stage2_s207_formal import APPROVED_GPU_UUIDS
 from param_importance_nlp.experiments.stage2_s209_g27a import (
     S29_COST_SEMANTICS,
+    S29_CROSSCHECK_SCHEMA,
     S29_SHARED_POOL_SCHEMA,
     S29_SHARED_RUN_SCHEMA,
     S29G27ABlocked,
@@ -344,6 +345,72 @@ def test_s209_complete_fixture_emits_pass_pareto_capacity(tmp_path: Path) -> Non
     assert result["pareto"]["status"] == "PASS"
     assert result["capacity"]["forecasts"]["u"]["projected_total_a100_hours"] > 0
     assert (tmp_path / "pass" / "g2.7a-gate.json").exists()
+
+
+def test_s209_crosscheck_is_generated_from_sealed_rows_and_hash_bound(tmp_path: Path) -> None:
+    matrix, gate, manifest = _inputs()
+    result = run_s209_g27a(
+        matrix=matrix,
+        g24b_gate=gate,
+        raw_manifest=manifest,
+        cost_observations=_costs(),
+        health_snapshot=_health(),
+        single_gpu_anchor=_anchor(1, [APPROVED_GPU_UUIDS[0]]),
+        four_gpu_anchor=_anchor(4, list(APPROVED_GPU_UUIDS)),
+        shared_attribution_cross_check=None,
+        accuracy_rows=_accuracy(),
+        capacity_inputs={
+            "stage4_steps": 10,
+            "stage5_steps": 20,
+            "disk_free_bytes": 10**12,
+            "inode_free": 10**6,
+            "capacity_evidence_hash": "3" * 64,
+            "ulimit_evidence_hash": "4" * 64,
+            "ulimit_nofile_soft": 1024,
+        },
+        output_root=tmp_path / "generated",
+        checked_at="2026-08-25T00:00:00+00:00",
+    )
+    assert result["status"] == "PASS"
+    crosscheck = result["shared_attribution_crosscheck"]
+    assert crosscheck["schema_version"] == S29_CROSSCHECK_SCHEMA
+    assert crosscheck["source"] == "sealed_measured_rows"
+    assert crosscheck["artifact_hash"] == canonical_json_hash(
+        {key: value for key, value in crosscheck.items() if key != "artifact_hash"}
+    )
+    assert (tmp_path / "generated" / "shared-attribution-crosscheck.json").exists()
+
+
+def test_s209_preprovided_crosscheck_mismatch_fails_closed(tmp_path: Path) -> None:
+    matrix, gate, manifest = _inputs()
+    supplied = {
+        method: {"shared_wall_seconds": 10.0, "isolated_wall_seconds": 11.0, "relative_difference": 1 / 11}
+        for method in ("raw", "double", "u")
+    }
+    supplied["raw"] = dict(supplied["raw"], shared_wall_seconds=10.1)
+    result = run_s209_g27a(
+        matrix=matrix,
+        g24b_gate=gate,
+        raw_manifest=manifest,
+        cost_observations=_costs(),
+        health_snapshot=_health(),
+        single_gpu_anchor=_anchor(1, [APPROVED_GPU_UUIDS[0]]),
+        four_gpu_anchor=_anchor(4, list(APPROVED_GPU_UUIDS)),
+        shared_attribution_cross_check=supplied,
+        accuracy_rows=_accuracy(),
+        capacity_inputs={
+            "stage4_steps": 10,
+            "stage5_steps": 20,
+            "disk_free_bytes": 10**12,
+            "inode_free": 10**6,
+            "capacity_evidence_hash": "3" * 64,
+            "ulimit_evidence_hash": "4" * 64,
+            "ulimit_nofile_soft": 1024,
+        },
+        output_root=tmp_path / "mismatch",
+    )
+    assert result["status"] == "BLOCKED"
+    assert "SHARED_ATTRIBUTION_CROSSCHECK_PRESEALED_MISMATCH:raw" in result["reasons"]
 
 
 def test_s209_g27a_shared_pool_identity_drift_blocks_gate(tmp_path: Path) -> None:
