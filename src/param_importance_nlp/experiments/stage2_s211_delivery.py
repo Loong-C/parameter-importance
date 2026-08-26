@@ -311,8 +311,21 @@ def _status(payload: Mapping[str, Any]) -> str | None:
     return None
 
 
+def _forbidden_formal_source(payload: Mapping[str, Any]) -> bool:
+    """Return true for explicit fixture/synthetic provenance markers."""
+
+    return (
+        payload.get("local_fixture") is True
+        or payload.get("synthetic") is True
+        or payload.get("fixture") is True
+        or payload.get("scope") == "local_fixture"
+    )
+
+
 def _formal_eligible(payload: Mapping[str, Any]) -> bool:
-    return payload.get("formal_eligible") is True or payload.get("scope") == "formal"
+    return not _forbidden_formal_source(payload) and (
+        payload.get("formal_eligible") is True or payload.get("scope") == "formal"
+    )
 
 
 def _gate_record(
@@ -355,6 +368,8 @@ def _gate_record(
         reasons.append(f"UPSTREAM_GATE_ID_MISMATCH:{gate_id}")
     if record.effective_status() is not GateStatus.PASS:
         reasons.append(f"UPSTREAM_GATE_NOT_PASS:{gate_id}")
+    if _forbidden_formal_source(value):
+        reasons.append(f"UPSTREAM_GATE_FORBIDDEN_FIXTURE:{gate_id}")
     if data_root is not None:
         try:
             _check_declared_refs(record.evidence_refs, root=data_root, field=f"{field}.evidence_refs")
@@ -392,6 +407,8 @@ def _producer_gate_identity(
         reasons.append(f"UPSTREAM_GATE_ID_MISMATCH:{gate_id}")
     if value.get("status") != "PASS":
         reasons.append(f"UPSTREAM_GATE_NOT_PASS:{gate_id}")
+    if _forbidden_formal_source(value):
+        reasons.append(f"UPSTREAM_GATE_FORBIDDEN_FIXTURE:{gate_id}")
     return identity, reasons
 
 
@@ -399,6 +416,7 @@ def _validate_g23(
     value: Mapping[str, Any] | None,
     *,
     field: str,
+    data_root: Path | None = None,
 ) -> tuple[str | None, list[str]]:
     """Validate the exact producer-specific S2.4/G2.3 qualification object."""
 
@@ -433,6 +451,12 @@ def _validate_g23(
         for item in cells
     ):
         reasons.append("G2.3_CELL_PASS_REQUIRED")
+    evidence_refs = value.get("evidence_refs")
+    if data_root is not None and isinstance(evidence_refs, (list, tuple)):
+        try:
+            _check_declared_refs(evidence_refs, root=data_root, field=f"{field}.evidence_refs")
+        except S211DeliveryBlocked as error:
+            reasons.append(str(error))
     return identity, sorted(set(reasons))
 
 
@@ -555,6 +579,7 @@ def _validate_upstream_gates(
         source["stage2.G2.7b"] = g27b_gate
     hashes: dict[str, str | None] = {}
     reasons: list[str] = []
+    payloads: dict[str, Mapping[str, Any]] = {}
     for gate_id in _UPSTREAM_GATES:
         raw = source.get(gate_id)
         if raw is not None and not isinstance(raw, Mapping):
@@ -567,6 +592,8 @@ def _validate_upstream_gates(
                 reasons.append(str(error))
                 continue
             raw = loaded
+        if isinstance(raw, Mapping):
+            payloads[gate_id] = raw
         if gate_id == "stage2.G2.7b":
             # S2.10 has a producer-specific Gate schema in addition to the
             # generic GateRecord wire form.  Keep this compatibility at the
@@ -579,7 +606,9 @@ def _validate_upstream_gates(
             reasons.extend(g27b_reasons)
             continue
         if isinstance(raw, Mapping) and raw.get("schema_version") == S23_GATE_SCHEMA:
-            identity, gate_reasons = _validate_g23(raw, field=f"upstream.{gate_id}")
+            identity, gate_reasons = _validate_g23(
+                raw, field=f"upstream.{gate_id}", data_root=data_root
+            )
             hashes[gate_id] = identity
             reasons.extend(gate_reasons)
             continue
@@ -600,6 +629,23 @@ def _validate_upstream_gates(
         )
         hashes[gate_id] = identity
         reasons.extend(gate_reasons)
+    # Producer-specific predecessor fields must identify the exact objects
+    # supplied to this invocation, not merely any syntactically valid SHA.
+    g24a = payloads.get("stage2.G2.4a")
+    if isinstance(g24a, Mapping):
+        declared_g23 = g24a.get("g23_evaluation_hash")
+        actual_g23 = hashes.get("stage2.G2.3")
+        if isinstance(declared_g23, str) and actual_g23 is not None and declared_g23 != actual_g23:
+            reasons.append("G2.4A_G23_HASH_MISMATCH")
+    g26 = payloads.get("stage2.G2.6")
+    if isinstance(g26, Mapping):
+        declared_upstream = g26.get("upstream_gate_hashes")
+        if isinstance(declared_upstream, Mapping):
+            for dependency in _G26_PRIMARY_GATES:
+                declared_hash = declared_upstream.get(dependency)
+                actual_hash = hashes.get(dependency)
+                if isinstance(declared_hash, str) and actual_hash is not None and declared_hash != actual_hash:
+                    reasons.append(f"G2.6_UPSTREAM_HASH_MISMATCH:{dependency}")
     return hashes, sorted(set(reasons))
 
 
@@ -682,6 +728,8 @@ def _validate_g27b(
             reasons.append("G2.7B_GATE_ID_MISMATCH")
         if value.get("status") != "PASS":
             reasons.append("G2.7B_NOT_PASS")
+        if _forbidden_formal_source(value):
+            reasons.append("G2.7B_FORBIDDEN_FIXTURE")
         if value.get("scope") not in {None, "formal"}:
             reasons.append("G2.7B_GATE_SCOPE_NOT_FORMAL")
         if (
@@ -699,6 +747,8 @@ def _validate_g27b(
         reasons.append("G2.7B_GATE_ID_MISMATCH")
     if record.effective_status() is not GateStatus.PASS:
         reasons.append("G2.7B_NOT_PASS")
+    if _forbidden_formal_source(value):
+        reasons.append("G2.7B_FORBIDDEN_FIXTURE")
     declared = value.get("artifact_hash")
     if not isinstance(declared, str):
         reasons.append("G2.7B_GATE_ARTIFACT_HASH_MISSING")
@@ -719,6 +769,8 @@ def _lineage_entries(
     reasons: list[str] = []
     if value.get("schema_version") != S211_LINEAGE_SCHEMA:
         reasons.append("STAGE2_LINEAGE_SCHEMA_MISMATCH")
+    if _forbidden_formal_source(value):
+        reasons.append("STAGE2_LINEAGE_FORBIDDEN_FIXTURE")
     raw: Any = value.get("tasks", value.get("entries", value.get("lineage", value.get("artifacts"))))
     entries: list[dict[str, Any]] = []
     if isinstance(raw, Mapping):
@@ -764,6 +816,8 @@ def _lineage_entries(
             reasons.append(f"STAGE2_LINEAGE_NOT_PASS:{task_id}")
         if item.get("formal_eligible") is not True:
             reasons.append(f"STAGE2_LINEAGE_NOT_FORMAL:{task_id}")
+        if _forbidden_formal_source(item):
+            reasons.append(f"STAGE2_LINEAGE_FORBIDDEN_FIXTURE:{task_id}")
         refs = item.get("artifact_refs", item.get("artifacts"))
         if not isinstance(refs, (list, tuple)) or not refs:
             reasons.append(f"STAGE2_LINEAGE_ARTIFACT_REFS_MISSING:{task_id}")
@@ -890,7 +944,7 @@ def _validate_replay(audit: Mapping[str, Any] | None, *, expected_31m_hash: str 
         reasons.append("REPLAY_31M_SOURCE_HASH_MISMATCH")
     if audit.get("formal_eligible") is not True:
         reasons.append("REPLAY_NOT_FORMAL")
-    if audit.get("network_used") is True or audit.get("synthetic") is True or audit.get("local_fixture") is True:
+    if audit.get("network_used") is True or _forbidden_formal_source(audit):
         reasons.append("REPLAY_FORBIDDEN_SYNTHETIC_OR_NETWORK")
     body = dict(audit)
     body["validated_artifact_hash"] = identity
@@ -920,6 +974,9 @@ def _validate_delivery_role(
     if expected_schema is not None and payload.get("schema_version") != expected_schema:
         reasons.append(f"DELIVERY_ROLE_SCHEMA_MISMATCH:{role}")
     role_formal = payload.get("formal_eligible") is True
+    if _forbidden_formal_source(payload):
+        role_formal = False
+        reasons.append(f"DELIVERY_ROLE_FORBIDDEN_FIXTURE:{role}")
     estimator_object: Any = None
     if role == "estimator_decision":
         try:
@@ -1275,6 +1332,8 @@ def run_s211_g28(
     else:
         if not decision_declared:
             reasons.append("G2.7B_DECISION_ARTIFACT_HASH_MISSING")
+        if _forbidden_formal_source(decision_payload):
+            reasons.append("G2.7B_DECISION_FORBIDDEN_FIXTURE")
         if _status(decision_payload) not in {"SELECTED", "PASS"} or decision_payload.get("gate_status") != "PASS":
             reasons.append("G2.7B_DECISION_NOT_PASS")
         if decision_payload.get("scope") != "formal":

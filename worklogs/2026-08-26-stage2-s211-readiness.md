@@ -34,3 +34,10 @@
 ## 后续闭环
 
 待上游正式 producer 交付真实 gate/decision、完整 Stage 2 lineage、formal boundaries、独立 31M replay audit、全部 delivery role artifacts 及同步 commit 后，再运行本控制面生成 append-only G2.8 bundle 并决定 Stage 2 closure；在此之前保持 BLOCKED。
+
+## 2026-08-26 19:30 CST — 最新 S2.10 producer contract rebase
+
+- 基于 `79bbb6204a51bac936af5dd5ba4289c6c895b521` 的 clean worktree 重应用 S2.11 formal delivery consumer 加固；保留 `172cd0a` predecessor-gate 支持及 `c64ffbe`/`60fc7a8` S2.10 控制面。
+- 按当前真实 S2.10 producer 使用的 `estimator-decision-v1`（而非旧分支的 `stage2-s210-estimator-decision-v1`）保持 decision 校验，拒绝带有 `fixture`/`synthetic`/`local_fixture` 标记的正式来源。
+- 补齐 G2.3 evidence reference containment、G2.4a→G2.3 与 G2.6→G2.3/G2.4a/G2.4b/G2.5 的实际 artifact hash 交叉绑定；未启动服务器任务、S2.4 或正式 replay。
+- 验收：`tests/test_stage2_s211_delivery.py` 为 22 passed；S2.11+S2.10+S2.9+artifact schema/loaders 邻接集为 46 passed；目标文件 `py_compile` 与 `git diff --check` 均通过。以上仅为控制面回归，不宣称缺失真实 upstream evidence 时 G2.8 通过。
