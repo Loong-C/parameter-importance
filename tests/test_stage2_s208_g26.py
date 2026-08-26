@@ -2,9 +2,10 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import numpy as np
 import pytest
 
-from param_importance_nlp.contracts.jsonio import canonical_json_hash, write_canonical_json
+from param_importance_nlp.contracts.jsonio import canonical_json_hash, load_canonical_json, write_canonical_json
 from param_importance_nlp.contracts.status import GateRecord
 from param_importance_nlp.experiments.preregistration import (
     build_stage2_hypothesis_contract,
@@ -13,6 +14,7 @@ from param_importance_nlp.experiments.preregistration import (
 from param_importance_nlp.experiments.stage2_s204_ids import EXPECTED_CELL_IDS
 from param_importance_nlp.experiments.stage2_s208_g26 import (
     S28G26Blocked,
+    _top_metrics,
     analyze_s208_g26,
     two_stage_bootstrap,
 )
@@ -153,6 +155,59 @@ def test_two_stage_bootstrap_never_resamples_coordinates() -> None:
     result = two_stage_bootstrap([[1.0, 2.0], [2.0, 3.0], [3.0, 4.0]], [[1.0, 2.0], [1.0, 2.0], [1.0, 2.0]], replicates=100, seed=7)
     assert result["unit"] == "repetition_with_reference_block_strata"
     assert result["parameter_coordinate_resampling"] is False
+
+
+def test_top_k_primary_ranking_preserves_signed_scores() -> None:
+    # With absolute-value ranking both vectors would select coordinate 0;
+    # signed ranking must select coordinate 1 for the observed vector and
+    # coordinate 0 for the reference vector.
+    metrics = _top_metrics(
+        np.asarray([-10.0, 9.0]),
+        np.asarray([8.0, -7.0]),
+    )
+    assert metrics["overlap_at_0.0001"] == 0.0
+
+
+def test_nmse_observed_averages_per_repetition_coordinate_sums(tmp_path: Path) -> None:
+    values = _formal_inputs(tmp_path)
+    cell = EXPECTED_CELL_IDS[0]
+    # Keep every bootstrap resample's corrected denominator positive.  The
+    # raw method is displaced in one repetition, while U/double remain
+    # displaced in all repetitions so a valid resample cannot collapse their
+    # non-inferiority ratio to 0/0.
+    descriptors = [item for item in values["manifest"]["units"] if item["cell_id"] == cell]
+    assert len(descriptors) == 3
+    for index, descriptor in enumerate(descriptors):
+        payload_path = values["raw_root"] / str(descriptor["raw_artifact_ref"])
+        payload = load_canonical_json(payload_path)
+        assert isinstance(payload, dict)
+        payload["vectors"] = {
+            "raw": [3.0, 3.0, 3.0] if index == 0 else [1.0, 1.0, 1.0],
+            "double": [2.0, 2.0, 2.0],
+            "u_m16": [2.0, 2.0, 2.0],
+        }
+        write_canonical_json(payload_path, payload)
+        descriptor["raw_artifact_hash"] = canonical_json_hash(payload)
+    values["manifest"]["artifact_hash"] = canonical_json_hash({key: item for key, item in values["manifest"].items() if key != "artifact_hash"})
+    values["gates"]["stage2.G2.5"] = GateRecord(
+        gate_id="stage2.G2.5",
+        stage=2,
+        status="PASS",
+        checked_at="2026-08-25T00:00:00+00:00",
+        measured={"raw_manifest_hash": values["manifest"]["artifact_hash"]},
+        threshold={},
+        evidence_refs=("g25/evidence.json",),
+    ).to_dict()
+
+    result = analyze_s208_g26(
+        raw_manifest=values["manifest"], raw_root=values["raw_root"], references=values["refs"], matrix=values["matrix"],
+        preregistration=values["prereg"], hypothesis_contract=values["hypothesis"], upstream_gates=values["gates"],
+        bootstrap_replicates=100, bootstrap_seed=3,
+    )
+    summary = next(item for item in result["statistics_summary"] if item["cell_id"] == cell and item["method"] == "raw")
+    # Three coordinates are displaced by +2 in one of three repetitions:
+    # (3 * 2^2) / 3 / D_c(=1) = 4, not the squared repetition-mean error 4/3.
+    assert summary["corrected_nmse"] == pytest.approx(4.0)
 
 
 def test_s208_requires_valid_preregistration_before_upstream_gates() -> None:
