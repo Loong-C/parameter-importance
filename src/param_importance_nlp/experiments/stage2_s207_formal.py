@@ -278,6 +278,12 @@ class S27FrozenInputs:
     max_failure_fraction: float
     cost_required: bool
     units: tuple[S27MappingUnit, ...]
+    # The historical S2.6 freeze did not carry S2.7's operational failure
+    # stop rule.  New formal plans bind the explicit preregistration
+    # amendment/input here; the optional representation keeps old in-memory
+    # reducer fixtures readable while the production launcher requires it.
+    failure_rule_ref: str | None = None
+    failure_rule_hash: str | None = None
 
     def __post_init__(self) -> None:
         _map_ref(self.matrix_ref, field="matrix_ref")
@@ -299,6 +305,11 @@ class S27FrozenInputs:
             raise TypeError("max_failure_fraction must be a float")
         if not 0.0 <= self.max_failure_fraction < 1.0:
             raise ValueError("max_failure_fraction must be in [0,1)")
+        if (self.failure_rule_ref is None) != (self.failure_rule_hash is None):
+            raise ValueError("failure rule ref/hash must be supplied together")
+        if self.failure_rule_ref is not None:
+            _map_ref(self.failure_rule_ref, field="failure_rule_ref")
+            _sha(self.failure_rule_hash, field="failure_rule_hash")
         if type(self.cost_required) is not bool:
             raise TypeError("cost_required must be bool")
         if len(self.units) != self.completion_denominator:
@@ -320,7 +331,7 @@ class S27FrozenInputs:
         return tuple(draw_id for unit in self.units for draw_id in unit.draw_ids)
 
     def to_dict(self) -> dict[str, object]:
-        return {
+        value = {
             "matrix_ref": self.matrix_ref,
             "matrix_hash": self.matrix_hash,
             "mapping_ref": self.mapping_ref,
@@ -339,12 +350,20 @@ class S27FrozenInputs:
             "expected_draw_id_hash": canonical_json_hash(list(self.expected_draw_ids)),
             "units": [unit.to_dict() for unit in self.units],
         }
+        if self.failure_rule_ref is not None:
+            value["failure_rule_ref"] = self.failure_rule_ref
+            value["failure_rule_hash"] = self.failure_rule_hash
+        return value
 
     @classmethod
     def from_mapping(cls, value: Mapping[str, object]) -> "S27FrozenInputs":
         required = {"matrix_ref", "matrix_hash", "mapping_ref", "mapping_hash", "g24b_gate_ref", "g24b_gate_hash", "sampling_plan_hash", "batch_size", "microbatch_count", "repetitions", "completion_denominator", "max_failure_fraction", "cost_required", "unit_ids", "expected_draw_id_count", "expected_draw_id_hash", "units"}
-        if set(value) != required or not isinstance(value.get("units"), list):
+        allowed = required | {"failure_rule_ref", "failure_rule_hash"}
+        if not required.issubset(set(value)) or set(value) - allowed or not isinstance(value.get("units"), list):
             raise ValueError("frozen input fields mismatch")
+        extra_rule_fields = {"failure_rule_ref", "failure_rule_hash"} & set(value)
+        if extra_rule_fields and extra_rule_fields != {"failure_rule_ref", "failure_rule_hash"}:
+            raise ValueError("frozen input failure rule ref/hash mismatch")
         units = tuple(S27MappingUnit.from_mapping(item) for item in value["units"] if isinstance(item, Mapping))
         if len(units) != len(value["units"]):
             raise ValueError("frozen input units must be objects")
@@ -352,6 +371,7 @@ class S27FrozenInputs:
             matrix_ref=value["matrix_ref"], matrix_hash=value["matrix_hash"], mapping_ref=value["mapping_ref"], mapping_hash=value["mapping_hash"],
             g24b_gate_ref=value["g24b_gate_ref"], g24b_gate_hash=value["g24b_gate_hash"], sampling_plan_hash=value["sampling_plan_hash"],
             batch_size=value["batch_size"], microbatch_count=value["microbatch_count"], repetitions=value["repetitions"], completion_denominator=value["completion_denominator"], max_failure_fraction=value["max_failure_fraction"], cost_required=value["cost_required"], units=units,
+            failure_rule_ref=value.get("failure_rule_ref"), failure_rule_hash=value.get("failure_rule_hash"),
         )  # type: ignore[arg-type]
         if value["unit_ids"] != list(result.expected_unit_ids) or value["expected_draw_id_count"] != len(result.expected_draw_ids) or value["expected_draw_id_hash"] != canonical_json_hash(list(result.expected_draw_ids)):
             raise ValueError("frozen input derived identity mismatch")
@@ -672,6 +692,8 @@ def prepare_s27_plan(
     source_artifact_refs: Sequence[str],
     max_failure_fraction: float,
     cost_required: bool = True,
+    failure_rule_ref: str | None = None,
+    failure_rule_hash: str | None = None,
 ) -> S27Plan:
     """Build a six-cell formal plan without creating any confirmatory draw."""
 
@@ -745,6 +767,8 @@ def prepare_s27_plan(
         max_failure_fraction=float(max_failure_fraction),
         cost_required=cost_required,
         units=units,
+        failure_rule_ref=failure_rule_ref,
+        failure_rule_hash=failure_rule_hash,
     )
     if set(checkpoints) != set(EXPECTED_CELL_IDS) or set(references) != set(EXPECTED_CELL_IDS):
         raise S27PreparationBlocked("S27_CHECKPOINT_REFERENCE_COVERAGE_INVALID")
