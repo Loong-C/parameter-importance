@@ -280,14 +280,21 @@ def load_s27_gpu_inventory_envelope(
     path: str | Path | None,
     *,
     data_root: str | Path,
+    _allow_legacy: bool = False,
 ) -> tuple[dict[str, object], dict[str, object]]:
-    """Load only the hash-bound S2.6 inventory envelope; reject raw/legacy input."""
+    """Load the source-bound S2.6 inventory consumed by formal S2.7 paths.
+
+    The formal default requires an artifact reference, a distinct raw-capture
+    reference inside ``data_root``, and its declared SHA-256.  ``_allow_legacy``
+    is a private non-formal fixture escape hatch only; all S2.7 launch and
+    materialization callers use the strict default.
+    """
 
     if path is None:
         raise S27ExecutionBlocked("GPU_INVENTORY_JSON_REQUIRED")
     root = Path(data_root).resolve()
     resolved = _s27_inventory_path(root, path)
-    expected_source_ref = resolved.relative_to(root).as_posix()
+    expected_artifact_ref = resolved.relative_to(root).as_posix()
     try:
         value = load_canonical_json(resolved)
     except (OSError, TypeError, ValueError) as error:
@@ -300,8 +307,36 @@ def load_s27_gpu_inventory_envelope(
     source_ref = payload.get("source_ref")
     if not isinstance(source_ref, str) or not source_ref or "\\" in source_ref:
         raise S27ExecutionBlocked("GPU_INVENTORY_SOURCE_REF_REQUIRED")
-    if source_ref != expected_source_ref:
-        raise S27ExecutionBlocked("GPU_INVENTORY_SOURCE_REF_PATH_MISMATCH")
+    artifact_ref = payload.get("artifact_ref")
+    if artifact_ref is not None:
+        if not isinstance(artifact_ref, str) or not artifact_ref or "\\" in artifact_ref:
+            raise S27ExecutionBlocked("GPU_INVENTORY_ARTIFACT_REF_INVALID")
+        if artifact_ref != expected_artifact_ref:
+            raise S27ExecutionBlocked("GPU_INVENTORY_ARTIFACT_REF_PATH_MISMATCH")
+        try:
+            source_posix = PurePosixPath(source_ref)
+            if (
+                source_posix.is_absolute()
+                or Path(source_ref).is_absolute()
+                or Path(source_ref).drive
+                or any(part in {"", ".", ".."} for part in source_posix.parts)
+            ):
+                raise ValueError(source_ref)
+            source_path = (root / Path(*source_posix.parts)).resolve()
+            source_path.relative_to(root)
+        except (OSError, ValueError) as error:
+            raise S27ExecutionBlocked("GPU_INVENTORY_SOURCE_REF_PATH_INVALID") from error
+        if source_path == resolved:
+            raise S27ExecutionBlocked("GPU_INVENTORY_SOURCE_REF_SELF_REFERENCE")
+    else:
+        if not _allow_legacy:
+            raise S27ExecutionBlocked("GPU_INVENTORY_ARTIFACT_REF_REQUIRED")
+        # Legacy envelope: source_ref was the inventory itself.  A declared
+        # source digest is checked below and rejected in that shape because it
+        # would be a self-reference rather than a raw capture digest.
+        if source_ref != expected_artifact_ref:
+            raise S27ExecutionBlocked("GPU_INVENTORY_SOURCE_REF_PATH_MISMATCH")
+        source_path = resolved
     rows = payload.get("rows")
     apps = payload.get("compute_apps")
     if not isinstance(rows, list) or not all(isinstance(item, Mapping) for item in rows):
@@ -314,13 +349,18 @@ def load_s27_gpu_inventory_envelope(
     body = {key: item for key, item in payload.items() if key != "artifact_hash"}
     if canonical_json_hash(body) != artifact_hash:
         raise S27ExecutionBlocked("GPU_INVENTORY_ARTIFACT_HASH_MISMATCH")
-    source_sha = _s27_file_sha256(resolved)
+    source_sha = _s27_file_sha256(source_path)
     declared_source_sha = payload.get("source_sha256")
+    if declared_source_sha is None and not _allow_legacy:
+        raise S27ExecutionBlocked("GPU_INVENTORY_SOURCE_SHA256_REQUIRED")
     if declared_source_sha is not None and declared_source_sha != source_sha:
         raise S27ExecutionBlocked("GPU_INVENTORY_SOURCE_SHA256_MISMATCH")
+    if declared_source_sha is not None and artifact_ref is None:
+        raise S27ExecutionBlocked("GPU_INVENTORY_SOURCE_SHA256_SELF_REFERENCE")
     summary = validate_s27_gpu_inventory(rows, compute_apps=apps)
     identity = {
         "source_ref": source_ref,
+        "artifact_ref": artifact_ref or expected_artifact_ref,
         "artifact_hash": artifact_hash,
         "source_sha256": source_sha,
         "schema_version": S27_GPU_INVENTORY_SCHEMA,

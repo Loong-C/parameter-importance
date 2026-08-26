@@ -1,0 +1,62 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://parameter-importance.invalid/schemas/shared/stage2-s206-gpu-inventory-v1.json",
+  "title": "S2.6 live GPU inventory",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "scope", "status", "checked_at", "artifact_ref", "source_ref", "source_sha256", "rows", "compute_apps", "approved_gpu_uuids", "excluded_pci", "excluded_gpu_uuid", "artifact_hash"],
+  "properties": {
+    "schema_version": {"const": "stage2-s206-gpu-inventory-v1"},
+    "scope": {"const": "formal"},
+    "status": {"const": "OBSERVED"},
+    "checked_at": {"type": "string", "minLength": 1},
+    "artifact_ref": {"$ref": "#/$defs/ref"},
+    "source_ref": {"$ref": "#/$defs/ref"},
+    "source_sha256": {"$ref": "#/$defs/hash"},
+    "rows": {"type": "array", "minItems": 8, "maxItems": 8, "items": {"$ref": "#/$defs/gpu"}},
+    "compute_apps": {"type": "array", "items": {"$ref": "#/$defs/app"}},
+    "approved_gpu_uuids": {"type": "array", "minItems": 4, "uniqueItems": true, "items": {"type": "string", "pattern": "^GPU-.+$"}},
+    "excluded_pci": {"const": "0000:50:00.0"},
+    "excluded_gpu_uuid": {"const": "GPU-dc6cfc60-41dd-7bcf-ed09-b7deb5be342c"},
+    "artifact_hash": {"$ref": "#/$defs/hash"}
+  },
+  "$defs": {
+    "hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "ref": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._/-]*$"},
+    "number": {"type": "number"},
+    "gpu": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["uuid", "pci_bus_id", "gpu_name", "temperature_c", "memory_used_mib", "memory_total_mib", "utilization_gpu_percent", "compute_mode", "ecc_uncorrected_volatile", "ecc_uncorrected_aggregate", "row_remap_failure", "row_remap_pending", "row_remap_status", "gpu_recovery_action", "health_state", "compute_apps"],
+      "properties": {
+        "uuid": {"type": "string", "pattern": "^GPU-.+$"},
+        "pci_bus_id": {"type": "string", "pattern": "^0000:[0-9A-F]{2}:[0-9A-F]{2}\\.[0-9]$"},
+        "gpu_name": {"type": "string"},
+        "temperature_c": {"$ref": "#/$defs/number"},
+        "memory_used_mib": {"$ref": "#/$defs/number"},
+        "memory_total_mib": {"$ref": "#/$defs/number"},
+        "utilization_gpu_percent": {"$ref": "#/$defs/number"},
+        "compute_mode": {"type": "string"},
+        "ecc_uncorrected_volatile": {"$ref": "#/$defs/number"},
+        "ecc_uncorrected_aggregate": {"$ref": "#/$defs/number"},
+        "row_remap_failure": {"$ref": "#/$defs/number"},
+        "row_remap_pending": {"$ref": "#/$defs/number"},
+        "row_remap_status": {"type": "string"},
+        "gpu_recovery_action": {"type": "string"},
+        "health_state": {"enum": ["HEALTHY", "UNHEALTHY"]},
+        "compute_apps": {"type": "array", "items": {"$ref": "#/$defs/app"}}
+      }
+    },
+    "app": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["pid", "gpu_uuid", "process_name", "used_memory"],
+      "properties": {
+        "pid": {"type": "integer", "minimum": 0},
+        "gpu_uuid": {"type": "string", "pattern": "^GPU-.+$"},
+        "process_name": {"type": "string"},
+        "used_memory": {"type": "string"}
+      }
+    }
+  }
+}

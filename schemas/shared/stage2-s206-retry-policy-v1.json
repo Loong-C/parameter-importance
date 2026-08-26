@@ -1,0 +1,18 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://parameter-importance.invalid/schemas/shared/stage2-s206-retry-policy-v1.json",
+  "title": "S2.6 retry policy",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "scope", "status", "max_cell_attempts", "reuse_mapping_on_retry", "new_pilot_draws_on_retry", "preserve_failure_records", "artifact_hash"],
+  "properties": {
+    "schema_version": {"const": "stage2-s206-retry-policy-v1"},
+    "scope": {"const": "formal"},
+    "status": {"const": "FROZEN"},
+    "max_cell_attempts": {"type": "integer", "minimum": 1, "maximum": 3},
+    "reuse_mapping_on_retry": {"const": true},
+    "new_pilot_draws_on_retry": {"const": false},
+    "preserve_failure_records": {"const": true},
+    "artifact_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+  }
+}

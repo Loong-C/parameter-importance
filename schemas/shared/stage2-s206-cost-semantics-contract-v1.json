@@ -1,0 +1,39 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://parameter-importance.invalid/schemas/shared/stage2-s206-cost-semantics-contract-v1.json",
+  "title": "S2.6 cost semantics contract",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "scope", "status", "measurement_boundary", "scientific_equal_sample_cost", "isolated_estimator_cost", "online_training_incremental_cost", "cost_io_quiescent", "artifact_hash"],
+  "properties": {
+    "schema_version": {"const": "stage2-s206-cost-semantics-contract-v1"},
+    "scope": {"const": "formal"},
+    "status": {"const": "FROZEN"},
+    "measurement_boundary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["isolated_estimator_cost", "online_training_incremental_cost"],
+      "properties": {"isolated_estimator_cost": {"type": "string", "minLength": 1}, "online_training_incremental_cost": {"type": "string", "minLength": 1}}
+    },
+    "scientific_equal_sample_cost": {"$ref": "#/$defs/measurement"},
+    "isolated_estimator_cost": {"$ref": "#/$defs/measurement"},
+    "online_training_incremental_cost": {"$ref": "#/$defs/measurement"},
+    "cost_io_quiescent": {"type": "boolean"},
+    "artifact_hash": {"$ref": "#/$defs/hash"}
+  },
+  "$defs": {
+    "hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "measurement": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["defined", "definition", "measurement_status"],
+      "properties": {
+        "defined": {"const": true},
+        "definition": {"type": "string", "minLength": 1},
+        "measurement_status": {"enum": ["PENDING_S2.9", "OBSERVED"]},
+        "measurement_ref": {"type": "string", "minLength": 1}
+      },
+      "allOf": [{"if": {"properties": {"measurement_status": {"const": "OBSERVED"}}, "required": ["measurement_status"]}, "then": {"required": ["measurement_ref"]}}, {"if": {"properties": {"measurement_status": {"const": "PENDING_S2.9"}}, "required": ["measurement_status"]}, "then": {"not": {"anyOf": [{"required": ["seconds"]}, {"required": ["wall_seconds"]}, {"required": ["gpu_hours"]}, {"required": ["value"]}]}}}]
+    }
+  }
+}

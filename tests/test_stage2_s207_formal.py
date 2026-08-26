@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import hashlib
 from pathlib import Path
 import os
 
@@ -147,9 +148,16 @@ def _s27_inventory_rows() -> list[dict[str, object]]:
 
 
 def _write_s27_inventory(path: Path, *, rows: list[dict[str, object]] | None = None, **extra: object) -> None:
+    data_root = path.parent.parent
+    source_path = path.parent / "gpu-inventory.capture.txt"
+    source_bytes = b"test s2.6 live gpu capture\n"
+    source_path.parent.mkdir(parents=True, exist_ok=True)
+    source_path.write_bytes(source_bytes)
     payload: dict[str, object] = {
         "schema_version": "stage2-s206-gpu-inventory-v1",
-        "source_ref": "evidence/gpu-inventory.json",
+        "artifact_ref": path.relative_to(data_root).as_posix(),
+        "source_ref": source_path.relative_to(data_root).as_posix(),
+        "source_sha256": hashlib.sha256(source_bytes).hexdigest(),
         "rows": rows if rows is not None else _s27_inventory_rows(),
         "compute_apps": [],
         **extra,
@@ -164,7 +172,8 @@ def test_s27_inventory_requires_hash_bound_complete_health_envelope(tmp_path: Pa
     _write_s27_inventory(path)
     summary, identity = load_s27_gpu_inventory_envelope(path, data_root=tmp_path)
     assert summary["inventory_count"] == 8
-    assert identity["source_ref"] == "evidence/gpu-inventory.json"
+    assert identity["artifact_ref"] == "evidence/gpu-inventory.json"
+    assert identity["source_ref"] == "evidence/gpu-inventory.capture.txt"
     assert next(row for row in summary["inventory"] if row["uuid"] == EXCLUDED_GPU_UUID)["ecc_uncorrected_aggregate"] == 24
 
 
@@ -186,6 +195,43 @@ def test_s27_inventory_rejects_tamper_missing_health_and_legacy_wire(tmp_path: P
 
     write_canonical_json(path, _s27_inventory_rows())
     with pytest.raises(S27ExecutionBlocked, match="ENVELOPE_REQUIRED"):
+        load_s27_gpu_inventory_envelope(path, data_root=tmp_path)
+
+
+def test_s27_inventory_requires_distinct_source_hash_binding(tmp_path: Path) -> None:
+    path = tmp_path / "evidence/gpu-inventory.json"
+    _write_s27_inventory(path)
+    payload = load_canonical_json(path)
+    assert isinstance(payload, dict)
+
+    payload.pop("artifact_ref")
+    payload["artifact_hash"] = canonical_json_hash({key: value for key, value in payload.items() if key != "artifact_hash"})
+    write_canonical_json(path, payload)
+    with pytest.raises(S27ExecutionBlocked, match="GPU_INVENTORY_ARTIFACT_REF_REQUIRED"):
+        load_s27_gpu_inventory_envelope(path, data_root=tmp_path)
+
+    _write_s27_inventory(path)
+    payload = load_canonical_json(path)
+    assert isinstance(payload, dict)
+    payload.pop("source_sha256")
+    payload["artifact_hash"] = canonical_json_hash({key: value for key, value in payload.items() if key != "artifact_hash"})
+    write_canonical_json(path, payload)
+    with pytest.raises(S27ExecutionBlocked, match="GPU_INVENTORY_SOURCE_SHA256_REQUIRED"):
+        load_s27_gpu_inventory_envelope(path, data_root=tmp_path)
+
+    _write_s27_inventory(path)
+    payload = load_canonical_json(path)
+    assert isinstance(payload, dict)
+    payload["source_ref"] = payload["artifact_ref"]
+    payload["artifact_hash"] = canonical_json_hash({key: value for key, value in payload.items() if key != "artifact_hash"})
+    write_canonical_json(path, payload)
+    with pytest.raises(S27ExecutionBlocked, match="GPU_INVENTORY_SOURCE_REF_SELF_REFERENCE"):
+        load_s27_gpu_inventory_envelope(path, data_root=tmp_path)
+
+    _write_s27_inventory(path)
+    source = path.parent / "gpu-inventory.capture.txt"
+    source.write_bytes(b"tampered capture\n")
+    with pytest.raises(S27ExecutionBlocked, match="GPU_INVENTORY_SOURCE_SHA256_MISMATCH"):
         load_s27_gpu_inventory_envelope(path, data_root=tmp_path)
 
 
