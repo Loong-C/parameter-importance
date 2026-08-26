@@ -265,58 +265,29 @@ def _validate_corrected_delta_binding(
     *,
     field: str,
 ) -> None:
-    """Require the evaluator-owned corrected S2.6 sidecar for every cell.
+    """Require the same strict sidecar contract used by S2.6.
 
-    The sidecar is deliberately checked relative to the selected evaluation
-    artifact.  This prevents a valid-looking cell from borrowing a corrected
-    artifact from another amendment or from an unrelated evaluation root.
+    S2.5 must not merely trust the G2.3 cell's copied delta numbers: it is a
+    producer of the G2.4a handoff and therefore independently reloads the
+    evaluator sidecar, its exact 25-key schema, all four B tables, and source
+    provenance before any formal worker can start.
     """
 
     identities = cell.get("identities")
-    metrics = cell.get("metrics")
-    if not isinstance(identities, Mapping) or not isinstance(metrics, Mapping):
-        raise S25RebindBlocked(f"{field}:IDENTITIES_AND_METRICS_REQUIRED")
-    sidecar_hash = _require_hash(
-        identities.get("corrected_delta_sci_hash"),
-        field=f"{field}.identities.corrected_delta_sci_hash",
-    )
-    if metrics.get("corrected_delta_sci_hash") != sidecar_hash:
-        raise S25RebindBlocked(f"{field}:CORRECTED_DELTA_HASH_BINDING_MISMATCH")
-    sidecar_ref = identities.get("corrected_delta_sci_ref")
-    if not isinstance(sidecar_ref, str) or not sidecar_ref:
-        raise S25RebindBlocked(f"{field}.identities.corrected_delta_sci_ref:REQUIRED")
-    if metrics.get("corrected_delta_sci_ref") != sidecar_ref:
-        raise S25RebindBlocked(f"{field}:CORRECTED_DELTA_REF_BINDING_MISMATCH")
-    if metrics.get("corrected_delta_sci_batch_sizes") != list(_CORRECTED_DELTA_BATCH_SIZES):
-        raise S25RebindBlocked(f"{field}:CORRECTED_DELTA_BATCH_DOMAIN_INVALID")
-    if metrics.get("delta_sci_source") != _CORRECTED_DELTA_SOURCE:
-        raise S25RebindBlocked(f"{field}:CORRECTED_DELTA_SOURCE_INVALID")
+    if not isinstance(identities, Mapping):
+        raise S25RebindBlocked(f"{field}:IDENTITIES_REQUIRED")
+    try:
+        from .stage2_s206_delta_consumer import load_bound_corrected_delta
 
-    sidecar_path = _logical_path(root, sidecar_ref, field=f"{field}.corrected_delta_sci_ref")
-    expected_output_root = evaluation_path.parent.parent.parent
-    expected_sidecar_root = expected_output_root / "g2.3-corrected-delta-sci"
-    if sidecar_path.parent != expected_sidecar_root or sidecar_path.name != f"{sidecar_hash}.json":
-        raise S25RebindBlocked(f"{field}:CORRECTED_DELTA_REF_NOT_BOUND_TO_EVALUATION")
-    sidecar = _load_object(sidecar_path, field=f"{field}.corrected_delta_sci")
-    if sidecar.get("schema_version") != _CORRECTED_DELTA_SCHEMA:
-        raise S25RebindBlocked(f"{field}:CORRECTED_DELTA_SCHEMA_INVALID")
-    if _validate_hashed_object(sidecar, field=f"{field}.corrected_delta_sci") != sidecar_hash:
-        raise S25RebindBlocked(f"{field}:CORRECTED_DELTA_HASH_INVALID")
-    if sidecar.get("delta_sci_batch_sizes") != list(_CORRECTED_DELTA_BATCH_SIZES):
-        raise S25RebindBlocked(f"{field}:CORRECTED_DELTA_SIDECAR_BATCH_DOMAIN_INVALID")
-    source_ref = sidecar.get("source_producer_ref")
-    source_hash = _require_hash(
-        sidecar.get("source_producer_artifact_hash"),
-        field=f"{field}.corrected_delta_sci.source_producer_artifact_hash",
-    )
-    source_path = _logical_path(
-        root,
-        source_ref,
-        field=f"{field}.corrected_delta_sci.source_producer_ref",
-    )
-    source = _load_object(source_path, field=f"{field}.corrected_delta_sci.source_producer")
-    if _validate_hashed_object(source, field=f"{field}.corrected_delta_sci.source_producer") != source_hash:
-        raise S25RebindBlocked(f"{field}:CORRECTED_DELTA_SOURCE_HASH_INVALID")
+        load_bound_corrected_delta(
+            root,
+            g23_evaluation_ref=evaluation_path.relative_to(root).as_posix(),
+            cell_id=str(cell.get("cell_id")),
+            expected_config_hash=str(identities.get("config_hash")),
+            expected_result_hash=str(identities.get("result_hash")),
+        )
+    except (ValueError, TypeError, OSError) as error:
+        raise S25RebindBlocked(f"{field}:CORRECTED_DELTA_INVALID:{error}") from error
 
 
 def validate_g23_evaluation(
@@ -465,52 +436,73 @@ def _complete_statuses(spec: S25RebindSpec, g23: Mapping[str, Any]) -> list[dict
         complete: list[dict[str, Any]] = []
         complete_paths: list[tuple[Path, dict[str, Any]]] = []
         for status_path in statuses:
+            # A candidate final-status is part of the formal input closure.
+            # Never silently skip an unreadable object or a symlink that could
+            # redirect this scan outside the immutable S2.4 output root.
+            if status_path.is_symlink() or not status_path.is_file():
+                raise S25RebindBlocked(f"{component}:STATUS_CANDIDATE_INVALID")
+            try:
+                relative_status = status_path.relative_to(root)
+            except ValueError as error:
+                raise S25RebindBlocked(f"{component}:STATUS_CANDIDATE_PATH_INVALID") from error
+            cursor = root
+            for part in relative_status.parts:
+                cursor = cursor / part
+                if cursor.is_symlink():
+                    raise S25RebindBlocked(f"{component}:STATUS_CANDIDATE_SYMLINK")
             try:
                 status = _load_object(status_path, field=f"{component}.final_status")
-            except S25RebindBlocked:
-                continue
-            if status.get("status") == "COMPLETE" and status.get("cell_id") == cell_id:
-                required = {
-                    "schema_version",
-                    "cell_id",
-                    "config_path",
-                    "config_hash",
-                    "status",
-                    "formal_eligible",
-                    "task_result_hash",
-                    "task_result_ref",
-                    "artifact_refs",
-                    "artifact_hash",
-                    "execution_commit",
-                }
-                if not required.issubset(status):
-                    raise S25RebindBlocked(f"{component}:STATUS_SCHEMA_INVALID")
-                if status.get("schema_version") != _S204_STATUS_SCHEMA:
-                    raise S25RebindBlocked(f"{component}:STATUS_SCHEMA_INVALID")
-                if status.get("formal_eligible") is not True:
-                    raise S25RebindBlocked(f"{component}:STATUS_FORMAL_ELIGIBILITY_INVALID")
-                _require_hash(status.get("config_hash"), field=f"{component}.config_hash")
-                _require_hash(status.get("task_result_hash"), field=f"{component}.task_result_hash")
-                _validate_hashed_object(status, field=f"{component}.final_status")
-                if status.get("execution_commit") != spec.execution_commit:
-                    raise S25RebindBlocked(f"{component}:EXECUTION_COMMIT_MISMATCH")
-                _require_commit(
-                    status.get("execution_commit"),
-                    field=f"{component}.final_status.execution_commit",
-                )
-                validated_refs = _validate_status_artifacts(
-                    root,
-                    status,
-                    field=f"{component}.final_status",
-                )
-                _validate_task_result(
-                    root,
-                    status,
-                    validated_refs,
-                    field=f"{component}.final_status",
-                )
-                complete.append(status)
-                complete_paths.append((status_path, status))
+            except S25RebindBlocked as error:
+                raise S25RebindBlocked(f"{component}:STATUS_CANDIDATE_INVALID:{error}") from error
+            # Every discovered candidate is part of the formal closure.  Do
+            # not ignore a stale/failed/wrong-cell status merely because a
+            # different attempt happens to be valid: that would make the
+            # input set depend on directory ordering and hide contamination.
+            if status.get("cell_id") != cell_id:
+                raise S25RebindBlocked(f"{component}:STATUS_CANDIDATE_SEMANTICS_INVALID")
+            if status.get("status") != "COMPLETE":
+                raise S25RebindBlocked(f"{component}:STATUS_CANDIDATE_SEMANTICS_INVALID")
+            if status.get("formal_eligible") is not True:
+                raise S25RebindBlocked(f"{component}:STATUS_CANDIDATE_SEMANTICS_INVALID")
+            required = {
+                "schema_version",
+                "cell_id",
+                "config_path",
+                "config_hash",
+                "status",
+                "formal_eligible",
+                "task_result_hash",
+                "task_result_ref",
+                "artifact_refs",
+                "artifact_hash",
+                "execution_commit",
+            }
+            if not required.issubset(status):
+                raise S25RebindBlocked(f"{component}:STATUS_SCHEMA_INVALID")
+            if status.get("schema_version") != _S204_STATUS_SCHEMA:
+                raise S25RebindBlocked(f"{component}:STATUS_SCHEMA_INVALID")
+            _require_hash(status.get("config_hash"), field=f"{component}.config_hash")
+            _require_hash(status.get("task_result_hash"), field=f"{component}.task_result_hash")
+            _validate_hashed_object(status, field=f"{component}.final_status")
+            if status.get("execution_commit") != spec.execution_commit:
+                raise S25RebindBlocked(f"{component}:EXECUTION_COMMIT_MISMATCH")
+            _require_commit(
+                status.get("execution_commit"),
+                field=f"{component}.final_status.execution_commit",
+            )
+            validated_refs = _validate_status_artifacts(
+                root,
+                status,
+                field=f"{component}.final_status",
+            )
+            _validate_task_result(
+                root,
+                status,
+                validated_refs,
+                field=f"{component}.final_status",
+            )
+            complete.append(status)
+            complete_paths.append((status_path, status))
         if len(complete) != 1:
             raise S25RebindBlocked(f"S204_STATUS_NOT_UNIQUE:{component}:{len(complete)}")
         status_path, status = complete_paths[0]

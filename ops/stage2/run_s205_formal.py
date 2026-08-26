@@ -20,9 +20,11 @@ import math
 import re
 import os
 from pathlib import Path
+from pathlib import PurePosixPath
 import subprocess
 import sys
 import time
+import uuid
 from typing import Mapping, Sequence
 
 _REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
@@ -183,6 +185,69 @@ _FORMAL_GPU_ROW_FIELDS = frozenset(
     }
 )
 _FORMAL_GPU_APP_FIELDS = frozenset({"pid", "gpu_uuid", "process_name", "used_memory"})
+_FORMAL_GPU_INVENTORY_IDENTITY_FIELDS = frozenset(
+    {"artifact_ref", "source_ref", "artifact_hash", "source_sha256", "schema_version"}
+)
+def _validate_inventory_identity(value: object, *, field: str) -> dict[str, str]:
+    if not isinstance(value, Mapping) or set(value) != _FORMAL_GPU_INVENTORY_IDENTITY_FIELDS:
+        raise S25ExecutionBlocked(f"{field}:FIELDS_INVALID")
+    result: dict[str, str] = {}
+    for name in _FORMAL_GPU_INVENTORY_IDENTITY_FIELDS:
+        item = value.get(name)
+        if not isinstance(item, str) or not item:
+            raise S25ExecutionBlocked(f"{field}.{name}:REQUIRED")
+        result[name] = item
+    if result["schema_version"] != _GPU_INVENTORY_SCHEMA:
+        raise S25ExecutionBlocked(f"{field}.schema_version:INVALID")
+    if re.fullmatch(r"[0-9a-f]{64}", result["artifact_hash"]) is None:
+        raise S25ExecutionBlocked(f"{field}.artifact_hash:INVALID")
+    if re.fullmatch(r"[0-9a-f]{64}", result["source_sha256"]) is None:
+        raise S25ExecutionBlocked(f"{field}.source_sha256:INVALID")
+    return result
+
+
+_DETACHED_REF_FIELDS = ("attempt_ref", "operations_root", "log_ref", "status_ref")
+_DETACHED_LAUNCH_FIELDS = frozenset(
+    {
+        "schema_version",
+        "attempt_id",
+        "attempt_ref",
+        "pid",
+        "run_id",
+        "operations_root",
+        "log_ref",
+        "status_ref",
+        "gpu_inventory_identity",
+        "preflight_artifact_hash",
+        "execution_commit",
+        "s204_execution_commit",
+        "launcher_source_sha256",
+        "confirmatory_draws_generated",
+        "child_argv_sha256",
+        "artifact_hash",
+    }
+)
+_DETACHED_FAILURE_FIELDS = frozenset(
+    {
+        "schema_version",
+        "attempt_id",
+        "attempt_ref",
+        "pid",
+        "run_id",
+        "operations_root",
+        "log_ref",
+        "status_ref",
+        "gpu_inventory_identity",
+        "preflight_artifact_hash",
+        "execution_commit",
+        "s204_execution_commit",
+        "launcher_source_sha256",
+        "status",
+        "failure_reason",
+        "cleanup_error",
+        "artifact_hash",
+    }
+)
 
 
 def _validate_formal_gpu_inventory_schema(value: Mapping[str, object]) -> None:
@@ -851,7 +916,9 @@ def _preflight(args: argparse.Namespace) -> dict[str, object]:
         "artifact_hash": inventory_identity["artifact_hash"],
         "source_ref": inventory_identity["source_ref"],
         "source_sha256": inventory_identity["source_sha256"],
+        "schema_version": inventory_identity["schema_version"],
     }
+    _validate_inventory_identity(result["gpu_inventory_identity"], field="gpu_inventory_identity")
     result["launcher"] = {
         "repository": str(args.repository.resolve()),
         "data_root": str(root),
@@ -908,6 +975,8 @@ def _execute(args: argparse.Namespace) -> dict[str, object]:
     if resume and not bool(getattr(args, "detached_child", False)):
         raise S25ExecutionBlocked("S205_RESUME_REQUIRES_DETACH")
     preflight = _preflight(args)
+    if bool(getattr(args, "detached_child", False)):
+        _load_detached_child_receipt(args, preflight=preflight)
     root = args.data_root.resolve()
     operations = _logical(root, args.operations_root, field="operations_root", allow_missing=True)
     operations.mkdir(parents=True, exist_ok=True)
@@ -1123,21 +1192,19 @@ def _status(args: argparse.Namespace, *, wait: bool) -> int:
                 or not isinstance(inventory_source_sha, str)
             ):
                 raise S25ExecutionBlocked("S205_STATUS_GPU_IDENTITY_MISSING")
-            if preflight.get("gpu_inventory_identity") != {
+            expected_inventory_identity = {
                 "artifact_ref": inventory_ref,
                 "artifact_hash": inventory_hash,
                 "source_ref": inventory_source_ref,
                 "source_sha256": inventory_source_sha,
-            }:
+                "schema_version": _GPU_INVENTORY_SCHEMA,
+            }
+            if preflight.get("gpu_inventory_identity") != expected_inventory_identity:
                 raise S25ExecutionBlocked("S205_STATUS_GPU_IDENTITY_MISMATCH")
+            _validate_inventory_identity(preflight.get("gpu_inventory_identity"), field="preflight.gpu_inventory_identity")
             inventory_path = _logical(args.data_root.resolve(), inventory_ref, field="gpu_inventory_ref")
             _rows, inventory_identity = _load_inventory_snapshot(inventory_path, data_root=args.data_root.resolve())
-            if (
-                inventory_identity.get("artifact_ref") != inventory_ref
-                or inventory_identity.get("artifact_hash") != inventory_hash
-                or inventory_identity.get("source_ref") != inventory_source_ref
-                or inventory_identity.get("source_sha256") != inventory_source_sha
-            ):
+            if inventory_identity.get("artifact_ref") != inventory_ref or inventory_identity.get("artifact_hash") != inventory_hash or inventory_identity.get("source_ref") != inventory_source_ref or inventory_identity.get("source_sha256") != inventory_source_sha or inventory_identity.get("schema_version") != _GPU_INVENTORY_SCHEMA:
                 raise S25ExecutionBlocked("S205_STATUS_GPU_IDENTITY_DRIFT")
             print(json.dumps(value, ensure_ascii=False, sort_keys=True, indent=2))
             if not wait or (isinstance(value, Mapping) and value.get("stage") in {"G2.4A_PASS", "G2.4A_BLOCKED", "BLOCKED"}):
@@ -1145,6 +1212,271 @@ def _status(args: argparse.Namespace, *, wait: bool) -> int:
         if not wait or (deadline is not None and time.monotonic() >= deadline):
             return 4
         time.sleep(max(0.1, float(args.poll_seconds)))
+
+
+def _validate_detached_refs(value: Mapping[str, object]) -> None:
+    for field in _DETACHED_REF_FIELDS:
+        ref = value.get(field)
+        parsed = PurePosixPath(ref) if isinstance(ref, str) else PurePosixPath("")
+        if (
+            not isinstance(ref, str)
+            or not ref
+            or "\\" in ref
+            or parsed.is_absolute()
+            or parsed.as_posix() != ref
+            or any(part in {"", ".", ".."} for part in parsed.parts)
+        ):
+            raise S25ExecutionBlocked(f"S205_DETACHED_RECEIPT_{field.upper()}_REF_INVALID")
+    attempt_id = value.get("attempt_id")
+    if (
+        not isinstance(attempt_id, str)
+        or not attempt_id
+        or PurePosixPath(attempt_id).parts != (attempt_id,)
+        or "/" in attempt_id
+        or "\\" in attempt_id
+    ):
+        raise S25ExecutionBlocked("S205_DETACHED_RECEIPT_ATTEMPT_ID_INVALID")
+    operations_root = value["operations_root"]
+    attempt_ref = value["attempt_ref"]
+    if attempt_ref != f"{operations_root}/attempts/{attempt_id}":
+        raise S25ExecutionBlocked("S205_DETACHED_RECEIPT_ATTEMPT_REF_MISMATCH")
+    if value["log_ref"] != f"{attempt_ref}/launcher.log":
+        raise S25ExecutionBlocked("S205_DETACHED_RECEIPT_LOG_REF_MISMATCH")
+    if value["status_ref"] != f"{operations_root}/status.json":
+        raise S25ExecutionBlocked("S205_DETACHED_RECEIPT_STATUS_REF_MISMATCH")
+
+
+def _detached_receipt_hash(value: Mapping[str, object]) -> int:
+    if set(value) != _DETACHED_LAUNCH_FIELDS:
+        raise S25ExecutionBlocked("S205_DETACHED_RECEIPT_FIELDS_INVALID")
+    if value.get("schema_version") != "stage2-s205-detached-launch-v1":
+        raise S25ExecutionBlocked("S205_DETACHED_RECEIPT_SCHEMA_INVALID")
+    declared = value.get("artifact_hash")
+    if not isinstance(declared, str) or re.fullmatch(r"[0-9a-f]{64}", declared) is None:
+        raise S25ExecutionBlocked("S205_DETACHED_RECEIPT_HASH_REQUIRED")
+    if canonical_json_hash({key: item for key, item in value.items() if key != "artifact_hash"}) != declared:
+        raise S25ExecutionBlocked("S205_DETACHED_RECEIPT_HASH_MISMATCH")
+    _validate_detached_refs(value)
+    _validate_inventory_identity(value.get("gpu_inventory_identity"), field="S205_DETACHED_RECEIPT_GPU_INVENTORY")
+    for field in ("execution_commit", "s204_execution_commit"):
+        if not isinstance(value.get(field), str) or re.fullmatch(r"[0-9a-f]{40}", value[field]) is None:
+            raise S25ExecutionBlocked(f"S205_DETACHED_RECEIPT_{field.upper()}_INVALID")
+    if not isinstance(value.get("launcher_source_sha256"), str) or re.fullmatch(
+        r"[0-9a-f]{64}", value["launcher_source_sha256"]
+    ) is None:
+        raise S25ExecutionBlocked("S205_DETACHED_RECEIPT_LAUNCHER_SOURCE_SHA256_INVALID")
+    if not isinstance(value.get("child_argv_sha256"), str) or re.fullmatch(
+        r"[0-9a-f]{64}", value["child_argv_sha256"]
+    ) is None:
+        raise S25ExecutionBlocked("S205_DETACHED_RECEIPT_CHILD_ARGV_SHA256_INVALID")
+    if not isinstance(value.get("preflight_artifact_hash"), str) or re.fullmatch(
+        r"[0-9a-f]{64}", value["preflight_artifact_hash"]
+    ) is None:
+        raise S25ExecutionBlocked("S205_DETACHED_RECEIPT_PREFLIGHT_HASH_INVALID")
+    pid = value.get("pid")
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+        raise S25ExecutionBlocked("S205_DETACHED_RECEIPT_PID_INVALID")
+    if not isinstance(value.get("run_id"), str) or not value["run_id"]:
+        raise S25ExecutionBlocked("S205_DETACHED_RECEIPT_RUN_ID_INVALID")
+    if value.get("confirmatory_draws_generated") is not False:
+        raise S25ExecutionBlocked("S205_DETACHED_RECEIPT_SCOPE_INVALID")
+    return pid
+
+
+def _detached_failure_hash(value: Mapping[str, object]) -> int | None:
+    if set(value) != _DETACHED_FAILURE_FIELDS:
+        raise S25ExecutionBlocked("S205_DETACHED_FAILURE_FIELDS_INVALID")
+    if value.get("schema_version") != "stage2-s205-detached-failure-v1":
+        raise S25ExecutionBlocked("S205_DETACHED_FAILURE_SCHEMA_INVALID")
+    if value.get("status") not in {"SPAWN_FAILED", "RECEIPT_WRITE_FAILED"}:
+        raise S25ExecutionBlocked("S205_DETACHED_FAILURE_STATUS_INVALID")
+    if not isinstance(value.get("failure_reason"), str) or not value["failure_reason"]:
+        raise S25ExecutionBlocked("S205_DETACHED_FAILURE_REASON_INVALID")
+    if value.get("cleanup_error") is not None and not isinstance(value.get("cleanup_error"), str):
+        raise S25ExecutionBlocked("S205_DETACHED_FAILURE_CLEANUP_INVALID")
+    declared = value.get("artifact_hash")
+    if not isinstance(declared, str) or re.fullmatch(r"[0-9a-f]{64}", declared) is None:
+        raise S25ExecutionBlocked("S205_DETACHED_FAILURE_HASH_REQUIRED")
+    if canonical_json_hash({key: item for key, item in value.items() if key != "artifact_hash"}) != declared:
+        raise S25ExecutionBlocked("S205_DETACHED_FAILURE_HASH_MISMATCH")
+    _validate_detached_refs(value)
+    _validate_inventory_identity(value.get("gpu_inventory_identity"), field="S205_DETACHED_FAILURE_GPU_INVENTORY")
+    for field in ("execution_commit", "s204_execution_commit"):
+        if not isinstance(value.get(field), str) or re.fullmatch(r"[0-9a-f]{40}", value[field]) is None:
+            raise S25ExecutionBlocked(f"S205_DETACHED_FAILURE_{field.upper()}_INVALID")
+    if not isinstance(value.get("launcher_source_sha256"), str) or re.fullmatch(
+        r"[0-9a-f]{64}", value["launcher_source_sha256"]
+    ) is None:
+        raise S25ExecutionBlocked("S205_DETACHED_FAILURE_LAUNCHER_SOURCE_SHA256_INVALID")
+    pid = value.get("pid")
+    if value["status"] == "SPAWN_FAILED":
+        if pid is not None:
+            raise S25ExecutionBlocked("S205_DETACHED_FAILURE_SPAWN_PID_MUST_BE_NULL")
+        return None
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+        raise S25ExecutionBlocked("S205_DETACHED_FAILURE_PID_INVALID")
+    return pid
+
+
+def _pid_is_live(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def _validate_detached_identity(
+    value: Mapping[str, object],
+    *,
+    args: argparse.Namespace,
+    preflight: Mapping[str, object],
+) -> None:
+    expected_operations = str(args.operations_root)
+    if (
+        value.get("run_id") != args.run_id
+        or value.get("operations_root") != expected_operations
+        or value.get("preflight_artifact_hash") != preflight.get("preflight_artifact_hash")
+        or value.get("execution_commit") != preflight.get("execution_commit")
+        or value.get("s204_execution_commit") != preflight.get("s204_execution_commit")
+        or value.get("launcher_source_sha256") != preflight.get("launcher_source_sha256")
+        or value.get("gpu_inventory_identity") != preflight.get("gpu_inventory_identity")
+    ):
+        raise S25ExecutionBlocked("S205_DETACHED_RECEIPT_IDENTITY_MISMATCH")
+
+
+def _load_detached_child_receipt(
+    args: argparse.Namespace,
+    *,
+    preflight: Mapping[str, object],
+) -> Mapping[str, object]:
+    """Prove that this process is the child recorded by its detached attempt.
+
+    The parent necessarily writes the PID receipt after ``Popen`` returns,
+    while the child can start immediately.  A short bounded wait is therefore
+    the startup handshake; once the path appears, all checks are fail-closed.
+    """
+
+    attempt_id = getattr(args, "detached_attempt_id", None)
+    if not isinstance(attempt_id, str) or not attempt_id:
+        raise S25ExecutionBlocked("S205_DETACHED_CHILD_ATTEMPT_ID_REQUIRED")
+    root = args.data_root.resolve()
+    operations = _logical(root, args.operations_root, field="operations_root")
+    receipt = operations / "attempts" / attempt_id / "launcher.pid.json"
+    deadline = time.monotonic() + 10.0
+    while not receipt.exists():
+        if receipt.is_symlink() or time.monotonic() >= deadline:
+            raise S25ExecutionBlocked("S205_DETACHED_CHILD_RECEIPT_UNAVAILABLE")
+        time.sleep(0.05)
+    if receipt.is_symlink() or not receipt.is_file():
+        raise S25ExecutionBlocked("S205_DETACHED_CHILD_RECEIPT_INVALID")
+    try:
+        value = load_canonical_json(receipt)
+    except (OSError, TypeError, ValueError) as error:
+        raise S25ExecutionBlocked("S205_DETACHED_CHILD_RECEIPT_INVALID") from error
+    if not isinstance(value, Mapping):
+        raise S25ExecutionBlocked("S205_DETACHED_CHILD_RECEIPT_OBJECT_REQUIRED")
+    pid = _detached_receipt_hash(value)
+    _validate_detached_identity(value, args=args, preflight=preflight)
+    if value.get("attempt_id") != attempt_id:
+        raise S25ExecutionBlocked("S205_DETACHED_CHILD_ATTEMPT_IDENTITY_MISMATCH")
+    if pid != os.getpid():
+        raise S25ExecutionBlocked("S205_DETACHED_CHILD_PID_MISMATCH")
+    expected_command_hash = canonical_json_hash({"argv": list(sys.argv[1:])})
+    if value.get("child_argv_sha256") != expected_command_hash:
+        raise S25ExecutionBlocked("S205_DETACHED_CHILD_COMMAND_MISMATCH")
+    return value
+
+
+def _scan_detached_attempts(
+    root: Path,
+    operations: Path,
+    *,
+    args: argparse.Namespace,
+    preflight: Mapping[str, object],
+) -> None:
+    """Reject every malformed retained attempt and block live PIDs."""
+
+    legacy = operations / "launcher.pid.json"
+    if legacy.is_symlink() or (legacy.exists() and not legacy.is_file()):
+        raise S25ExecutionBlocked("S205_DETACHED_LEGACY_PID_INVALID")
+    if legacy.exists():
+        try:
+            raw = load_canonical_json(legacy)
+        except (OSError, TypeError, ValueError) as error:
+            raise S25ExecutionBlocked("S205_DETACHED_LEGACY_PID_INVALID") from error
+        if not isinstance(raw, Mapping):
+            raise S25ExecutionBlocked("S205_DETACHED_LEGACY_PID_INVALID")
+        pid = _detached_receipt_hash(raw)
+        _validate_detached_identity(raw, args=args, preflight=preflight)
+        if _pid_is_live(pid):
+            raise S25ExecutionBlocked(f"S205_DETACHED_LAUNCH_ALREADY_RUNNING:{pid}")
+    attempts = operations / "attempts"
+    if attempts.is_symlink() or (attempts.exists() and not attempts.is_dir()):
+        raise S25ExecutionBlocked("S205_DETACHED_ATTEMPTS_ROOT_INVALID")
+    if not attempts.exists():
+        return
+    allowed = {"launcher.pid.json", "launcher.failure.json", "launcher.log"}
+    for entry in sorted(attempts.iterdir(), key=lambda item: item.name):
+        if entry.is_symlink() or not entry.is_dir():
+            raise S25ExecutionBlocked("S205_DETACHED_ATTEMPT_DIRECTORY_INVALID")
+        children = {item.name: item for item in entry.iterdir()}
+        if set(children) - allowed:
+            raise S25ExecutionBlocked("S205_DETACHED_ATTEMPT_UNKNOWN_ENTRY")
+        for name in ("launcher.log", "launcher.pid.json", "launcher.failure.json"):
+            item = children.get(name)
+            if item is not None and (item.is_symlink() or not item.is_file()):
+                raise S25ExecutionBlocked("S205_DETACHED_ATTEMPT_NONREGULAR_ENTRY")
+        receipt = children.get("launcher.pid.json")
+        failure = children.get("launcher.failure.json")
+        if receipt is not None and failure is not None:
+            raise S25ExecutionBlocked("S205_DETACHED_ATTEMPT_MULTIPLE_RECEIPTS")
+        if receipt is None and failure is None:
+            raise S25ExecutionBlocked("S205_DETACHED_ATTEMPT_RECEIPT_REQUIRED")
+        selected = receipt or failure
+        assert selected is not None
+        try:
+            raw = load_canonical_json(selected)
+        except (OSError, TypeError, ValueError) as error:
+            raise S25ExecutionBlocked("S205_DETACHED_ATTEMPT_RECEIPT_INVALID") from error
+        if not isinstance(raw, Mapping):
+            raise S25ExecutionBlocked("S205_DETACHED_ATTEMPT_RECEIPT_OBJECT_REQUIRED")
+        pid = _detached_receipt_hash(raw) if receipt is not None else _detached_failure_hash(raw)
+        _validate_detached_identity(raw, args=args, preflight=preflight)
+        if raw.get("attempt_id") != entry.name:
+            raise S25ExecutionBlocked("S205_DETACHED_ATTEMPT_IDENTITY_MISMATCH")
+        if pid is not None and _pid_is_live(pid):
+            raise S25ExecutionBlocked(f"S205_DETACHED_LAUNCH_ALREADY_RUNNING:{pid}")
+
+
+def _publish_detached_failure(path: Path, payload: Mapping[str, object]) -> None:
+    if path.exists() or path.is_symlink():
+        raise S25ExecutionBlocked("S205_DETACHED_FAILURE_PATH_CONFLICT")
+    write_canonical_json(path, dict(payload))
+
+
+def _terminate_and_wait(process: object) -> str | None:
+    errors: list[str] = []
+    try:
+        process.terminate()  # type: ignore[attr-defined]
+    except Exception as error:
+        errors.append(f"terminate:{type(error).__name__}:{error}")
+    try:
+        process.wait(timeout=10)  # type: ignore[attr-defined]
+    except subprocess.TimeoutExpired:
+        try:
+            process.kill()  # type: ignore[attr-defined]
+        except Exception as error:
+            errors.append(f"kill:{type(error).__name__}:{error}")
+        try:
+            process.wait(timeout=10)  # type: ignore[attr-defined]
+        except Exception as error:
+            errors.append(f"wait_after_kill:{type(error).__name__}:{error}")
+    except Exception as error:
+        errors.append(f"wait:{type(error).__name__}:{error}")
+    return ";".join(errors) or None
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -1158,6 +1490,7 @@ def _parser() -> argparse.ArgumentParser:
     action.add_argument("--wait", action="store_true")
     parser.add_argument("--detach", action="store_true", help="detach --execute and return a PID")
     parser.add_argument("--detached-child", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--detached-attempt-id", help=argparse.SUPPRESS)
     parser.add_argument("--resume", action="store_true", help="resume a non-terminal status/run root")
     parser.add_argument("--data-root", type=Path, required=True)
     parser.add_argument("--s205-rebind-ref", required=True)
@@ -1186,52 +1519,22 @@ def _detach(args: argparse.Namespace, raw_argv: Sequence[str] | None = None) -> 
     root = args.data_root.resolve()
     operations = _logical(root, args.operations_root, field="operations_root", allow_missing=True)
     operations.mkdir(parents=True, exist_ok=True)
-    # Receipts are append-only per launch attempt.  A stale receipt from a
-    # crashed launcher must not make ``--execute --detach --resume``
-    # permanently unusable, while a live PID still blocks a duplicate run.
-    receipt_candidates = [operations / "launcher.pid.json"]
+    _scan_detached_attempts(root, operations, args=args, preflight=preflight)
     attempts = operations / "attempts"
-    if attempts.is_symlink():
-        raise S25ExecutionBlocked("S205_DETACHED_PID_INVALID")
-    if attempts.exists():
-        receipt_candidates.extend(attempts.glob("*/launcher.pid.json"))
-    for existing_path in receipt_candidates:
-        if existing_path.is_symlink():
-            raise S25ExecutionBlocked("S205_DETACHED_PID_INVALID")
-        if not existing_path.exists():
-            continue
-        if not existing_path.is_file():
-            raise S25ExecutionBlocked("S205_DETACHED_PID_INVALID")
-        try:
-            existing = load_canonical_json(existing_path)
-        except (OSError, TypeError, ValueError) as error:
-            raise S25ExecutionBlocked("S205_DETACHED_PID_INVALID") from error
-        if (
-            not isinstance(existing, Mapping)
-            or existing.get("schema_version") != "stage2-s205-detached-launch-v1"
-            or existing.get("artifact_hash") != canonical_json_hash(
-                {key: item for key, item in existing.items() if key != "artifact_hash"}
-            )
-            or not isinstance(existing.get("pid"), int)
-            or int(existing["pid"]) <= 0
-        ):
-            raise S25ExecutionBlocked("S205_DETACHED_PID_INVALID")
-        try:
-            os.kill(int(existing["pid"]), 0)
-        except OSError:
-            continue
-        raise S25ExecutionBlocked(f"S205_DETACHED_LAUNCH_ALREADY_RUNNING:{existing['pid']}")
-
     attempts.mkdir(parents=True, exist_ok=True)
-    safe_run_id = re.sub(r"[^A-Za-z0-9._-]", "_", str(args.run_id))[:80] or "run"
-    attempt_id = f"{safe_run_id}-{time.time_ns()}-{os.getpid()}"
+    attempt_id = f"{time.time_ns()}-{os.getpid()}-{uuid.uuid4().hex}"
     attempt_root = attempts / attempt_id
     try:
         attempt_root.mkdir()
     except FileExistsError as error:
         raise S25ExecutionBlocked("S205_DETACHED_ATTEMPT_COLLISION") from error
     pid_path = attempt_root / "launcher.pid.json"
+    failure_path = attempt_root / "launcher.failure.json"
     log_path = attempt_root / "launcher.log"
+    operations_ref = operations.relative_to(root).as_posix()
+    attempt_ref = f"{operations_ref}/attempts/{attempt_id}"
+    log_ref = f"{attempt_ref}/launcher.log"
+    status_ref = f"{operations_ref}/status.json"
     child = list(sys.argv[1:] if raw_argv is None else raw_argv)
     try:
         child[child.index("--detach")] = "--execute"
@@ -1253,6 +1556,12 @@ def _detach(args: argparse.Namespace, raw_argv: Sequence[str] | None = None) -> 
         child += ["--execution-commit", str(preflight["execution_commit"])]
     if "--detached-child" not in child:
         child.append("--detached-child")
+    if "--detached-attempt-id" in child:
+        attempt_index = child.index("--detached-attempt-id")
+        if attempt_index + 1 >= len(child) or child[attempt_index + 1] != attempt_id:
+            raise S25ExecutionBlocked("S205_DETACHED_ATTEMPT_ID_CONFLICT")
+    else:
+        child += ["--detached-attempt-id", attempt_id]
     if "--repository" in child:
         repository_index = child.index("--repository")
         if repository_index + 1 >= len(child):
@@ -1260,34 +1569,85 @@ def _detach(args: argparse.Namespace, raw_argv: Sequence[str] | None = None) -> 
         child[repository_index + 1] = str(args.repository.resolve())
     else:
         child += ["--repository", str(args.repository.resolve())]
-    with log_path.open("ab") as handle:
-        process = subprocess.Popen(
-            [str(args.python), str(Path(__file__).resolve()), *child],
-            cwd=args.repository.resolve(),
-            stdin=subprocess.DEVNULL,
-            stdout=handle,
-            stderr=subprocess.STDOUT,
-            start_new_session=True,
-            close_fds=True,
-        )
+    child_argv_sha256 = canonical_json_hash({"argv": child})
+
+    def publish_failure(
+        *, status: str, pid: int | None, error: BaseException, cleanup_error: str | None = None
+    ) -> None:
+        failure_payload: dict[str, object] = {
+            "schema_version": "stage2-s205-detached-failure-v1",
+            "attempt_id": attempt_id,
+            "attempt_ref": attempt_ref,
+            "pid": pid,
+            "run_id": args.run_id,
+            "operations_root": operations_ref,
+            "log_ref": log_ref,
+            "status_ref": status_ref,
+            "gpu_inventory_identity": dict(preflight["gpu_inventory_identity"]),
+            "preflight_artifact_hash": preflight["preflight_artifact_hash"],
+            "execution_commit": preflight["execution_commit"],
+            "s204_execution_commit": preflight["s204_execution_commit"],
+            "launcher_source_sha256": preflight["launcher_source_sha256"],
+            "status": status,
+            "failure_reason": f"{type(error).__name__}:{error}",
+            "cleanup_error": cleanup_error,
+        }
+        _validate_detached_refs(failure_payload)
+        failure_payload["artifact_hash"] = canonical_json_hash(failure_payload)
+        _publish_detached_failure(failure_path, failure_payload)
+
+    try:
+        with log_path.open("ab") as handle:
+            process = subprocess.Popen(
+                [str(args.python), str(Path(__file__).resolve()), *child],
+                cwd=args.repository.resolve(),
+                stdin=subprocess.DEVNULL,
+                stdout=handle,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+                close_fds=True,
+            )
+    except Exception as error:
+        try:
+            publish_failure(status="SPAWN_FAILED", pid=None, error=error)
+        except Exception as failure_error:
+            raise S25ExecutionBlocked("S205_DETACHED_SPAWN_FAILURE_UNRECORDED") from failure_error
+        raise
+
     payload: dict[str, object] = {
         "schema_version": "stage2-s205-detached-launch-v1",
-        "pid": int(process.pid),
         "attempt_id": attempt_id,
+        "attempt_ref": attempt_ref,
+        "pid": int(process.pid),
         "run_id": args.run_id,
-        "operations_root": args.operations_root,
-        "attempt_root": str(attempt_root.relative_to(root)),
-        "log_ref": str(log_path.relative_to(root)),
-        "status_ref": str((operations / "status.json").relative_to(root)),
+        "operations_root": operations_ref,
+        "log_ref": log_ref,
+        "status_ref": status_ref,
+        "gpu_inventory_identity": dict(preflight["gpu_inventory_identity"]),
         "preflight_artifact_hash": preflight["preflight_artifact_hash"],
         "execution_commit": preflight["execution_commit"],
         "s204_execution_commit": preflight["s204_execution_commit"],
         "launcher_source_sha256": preflight["launcher_source_sha256"],
-        "gpu_inventory_identity": preflight["gpu_inventory_identity"],
         "confirmatory_draws_generated": False,
+        "child_argv_sha256": child_argv_sha256,
     }
     payload["artifact_hash"] = canonical_json_hash(payload)
-    _write_once(pid_path, payload)
+    try:
+        _validate_detached_refs(payload)
+        _detached_receipt_hash(payload)
+        _write_once(pid_path, payload)
+    except Exception as error:
+        cleanup_error = _terminate_and_wait(process)
+        try:
+            publish_failure(
+                status="RECEIPT_WRITE_FAILED",
+                pid=int(process.pid),
+                error=error,
+                cleanup_error=cleanup_error,
+            )
+        except Exception as failure_error:
+            raise S25ExecutionBlocked("S205_DETACHED_RECEIPT_FAILURE_UNRECORDED") from failure_error
+        raise
     print(json.dumps(payload, ensure_ascii=False, sort_keys=True, indent=2))
     return 0
 
