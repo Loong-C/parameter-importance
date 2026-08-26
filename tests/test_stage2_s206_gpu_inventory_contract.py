@@ -86,7 +86,7 @@ def test_rows_wire_normalizes_aliases_and_retains_bad_card_ecc(tmp_path: Path) -
         row["ecc_aggregate_uncorrected"] = row.pop("ecc_uncorrected_aggregate")
     path = tmp_path / "gpu-inventory.json"
     _write_inventory(path, rows=rows)
-    loaded, identity = launcher._load_inventory_snapshot(path)
+    loaded, identity = launcher._load_inventory_snapshot(path, _allow_legacy=True)
     bad = next(row for row in loaded if row["uuid"] == EXCLUDED_UUID)
     assert bad["ecc_volatile_uncorrected"] == 113
     assert bad["ecc_aggregate_uncorrected"] == 179
@@ -105,18 +105,18 @@ def test_inventory_hash_and_source_hash_tamper_fail_closed(tmp_path: Path) -> No
     payload["rows"][0]["memory_used_mib"] = 1  # type: ignore[index]
     write_canonical_json(path, payload)
     with pytest.raises(S206PreparationBlocked, match="ARTIFACT_HASH_MISMATCH"):
-        launcher._load_inventory_snapshot(path)
+        launcher._load_inventory_snapshot(path, _allow_legacy=True)
 
     _write_inventory(path, source_sha256="0" * 64)
     with pytest.raises(S206PreparationBlocked, match="SOURCE_SHA256_MISMATCH"):
-        launcher._load_inventory_snapshot(path)
+        launcher._load_inventory_snapshot(path, _allow_legacy=True)
 
 
 def test_inventory_source_ref_must_match_resolved_data_root_path(tmp_path: Path) -> None:
     path = tmp_path / "evidence/gpu-inventory.json"
     path.parent.mkdir(parents=True)
     _write_inventory(path)
-    _rows, identity = launcher._load_inventory_snapshot(path, data_root=tmp_path)
+    _rows, identity = launcher._load_inventory_snapshot(path, data_root=tmp_path, _allow_legacy=True)
     assert identity["source_ref"] == "evidence/gpu-inventory.json"
 
     payload = launcher.load_canonical_json(path)
@@ -127,7 +127,7 @@ def test_inventory_source_ref_must_match_resolved_data_root_path(tmp_path: Path)
     )
     write_canonical_json(path, payload)
     with pytest.raises(S206PreparationBlocked, match="SOURCE_REF_PATH_MISMATCH"):
-        launcher._load_inventory_snapshot(path, data_root=tmp_path)
+        launcher._load_inventory_snapshot(path, data_root=tmp_path, _allow_legacy=True)
 
 
 @pytest.mark.parametrize(
