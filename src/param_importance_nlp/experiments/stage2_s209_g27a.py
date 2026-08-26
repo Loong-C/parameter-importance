@@ -860,6 +860,142 @@ def _anchor_reasons(anchor: Any, *, frozen: S29FrozenInputs, expected_devices: i
             reasons.append(prefix + "_COUNT_FIELDS_MISSING:" + name)
     if anchor.get("batch_size") != frozen.batch_size or anchor.get("microbatch_count") != frozen.microbatch_count:
         reasons.append(prefix + "_B_M_DRIFT")
+    if expected_devices == 4:
+        required_system_fields = (
+            "barrier_seconds",
+            "barrier_count",
+            "statistical_unit",
+            "statistical_unit_count",
+            "global_statistical_unit_count",
+            "global_weight",
+            "system_anchor_mode",
+            "communication_mode",
+            "rank_partition_mode",
+            "all_reduce_s1_seconds",
+            "all_reduce_s2_seconds",
+            "all_reduce_weight_seconds",
+            "all_reduce_count_seconds",
+            "all_reduce_s1_bytes",
+            "all_reduce_s2_bytes",
+            "all_reduce_weight_bytes",
+            "all_reduce_count_bytes",
+            "all_reduce_s1_count",
+            "all_reduce_s2_count",
+            "all_reduce_weight_count",
+            "all_reduce_count",
+            "all_reduce_identity_hash",
+            "local_sample_mapping_hashes",
+            "local_gradient_pool_hashes",
+            "fixed_checkpoint_id",
+            "checkpoint_hash",
+            "mapping_hash",
+            "sample_mapping_hash",
+            "state_digest",
+            "state_digest_after",
+            "four_process_identity_hash",
+            "global_s1_hash",
+            "global_s2_hash",
+            "estimate_hash",
+            "gradient_pool_hash",
+            "per_device_measurements",
+            "four_card_throughput_sequences_per_second",
+            "single_card_throughput_sequences_per_second",
+            "strong_scaling_speedup",
+            "strong_scaling_efficiency",
+            "strong_scaling_reference_wall_seconds",
+            "strong_scaling_reference_sequence_count",
+            "strong_scaling_reference_token_count",
+            "strong_scaling_reference_backward_count",
+            "single_anchor_identity_hash",
+        )
+        missing_system_fields = [name for name in required_system_fields if name not in anchor]
+        reasons.extend(prefix + "_SYSTEM_FIELDS_MISSING:" + name for name in missing_system_fields)
+        if missing_system_fields:
+            return reasons
+        if anchor.get("system_anchor_mode") != "synchronized_fixed_state_four_process_nccl":
+            reasons.append(prefix + "_NCCL_SYSTEM_MODE_REQUIRED")
+        if anchor.get("communication_mode") != "nccl_all_reduce_s1_s2":
+            reasons.append(prefix + "_NCCL_COLLECTIVE_REQUIRED")
+        if anchor.get("rank_partition_mode") != "disjoint_complete_microbatch_groups":
+            reasons.append(prefix + "_DISJOINT_PARTITION_REQUIRED")
+        if anchor.get("communication_bytes", 0) <= 0:
+            reasons.append(prefix + "_COMMUNICATION_BYTES_REQUIRED")
+        if anchor.get("sequence_count") != frozen.batch_size or anchor.get("backward_count") != frozen.microbatch_count:
+            reasons.append(prefix + "_GLOBAL_STATISTICS_COUNT_MISMATCH")
+        if anchor.get("statistical_unit") != "microbatch" or anchor.get("statistical_unit_count") != frozen.microbatch_count or anchor.get("global_statistical_unit_count") != frozen.microbatch_count:
+            reasons.append(prefix + "_STATISTICAL_UNIT_COUNT_INVALID")
+        if anchor.get("barrier_count") != 2:
+            reasons.append(prefix + "_BARRIER_COUNT_INVALID")
+        if anchor.get("all_reduce_s1_count") != 4 or anchor.get("all_reduce_s2_count") != 4 or anchor.get("all_reduce_weight_count") != 4 or anchor.get("all_reduce_count") != 16:
+            reasons.append(prefix + "_ALL_REDUCE_COUNT_INVALID")
+        for name in ("barrier_seconds", "global_weight", "all_reduce_s1_seconds", "all_reduce_s2_seconds", "all_reduce_weight_seconds", "all_reduce_count_seconds", "four_card_throughput_sequences_per_second", "single_card_throughput_sequences_per_second", "strong_scaling_speedup", "strong_scaling_efficiency", "strong_scaling_reference_wall_seconds"):
+            value = anchor.get(name)
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value)) or float(value) <= 0:
+                reasons.append(prefix + "_SYSTEM_FLOAT_INVALID:" + name)
+        for name in ("all_reduce_s1_bytes", "all_reduce_s2_bytes", "all_reduce_weight_bytes", "all_reduce_count_bytes", "all_reduce_weight_count", "statistical_unit_count", "global_statistical_unit_count", "strong_scaling_reference_sequence_count", "strong_scaling_reference_token_count", "strong_scaling_reference_backward_count"):
+            value = anchor.get(name)
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                reasons.append(prefix + "_SYSTEM_COUNT_INVALID:" + name)
+        if anchor.get("strong_scaling_reference_sequence_count") != frozen.batch_size or anchor.get("strong_scaling_reference_backward_count") != frozen.microbatch_count:
+            reasons.append(prefix + "_SINGLE_REFERENCE_COUNT_MISMATCH")
+        local_hashes = anchor.get("local_sample_mapping_hashes")
+        if not isinstance(local_hashes, list) or len(local_hashes) != 4 or len(set(local_hashes)) != 4 or any(not isinstance(value, str) or _SHA256.fullmatch(value) is None for value in local_hashes):
+            reasons.append(prefix + "_PARTITION_HASHES_INVALID")
+        local_gradient_hashes = anchor.get("local_gradient_pool_hashes")
+        if not isinstance(local_gradient_hashes, list) or len(local_gradient_hashes) != 4 or len(set(local_gradient_hashes)) != 4 or any(not isinstance(value, str) or _SHA256.fullmatch(value) is None for value in local_gradient_hashes):
+            reasons.append(prefix + "_LOCAL_GRADIENT_HASHES_INVALID")
+        if not isinstance(anchor.get("fixed_checkpoint_id"), str) or not anchor["fixed_checkpoint_id"]:
+            reasons.append(prefix + "_CHECKPOINT_ID_INVALID")
+        for name in ("checkpoint_hash", "mapping_hash", "sample_mapping_hash", "state_digest", "state_digest_after", "four_process_identity_hash", "global_s1_hash", "global_s2_hash", "estimate_hash", "gradient_pool_hash", "all_reduce_identity_hash", "single_anchor_identity_hash"):
+            if not isinstance(anchor.get(name), str) or _SHA256.fullmatch(anchor[name]) is None:
+                reasons.append(prefix + "_HASH_INVALID:" + name)
+        devices = anchor.get("per_device_measurements")
+        if not isinstance(devices, list) or len(devices) != 4 or any(not isinstance(item, Mapping) for item in devices):
+            reasons.append(prefix + "_PER_DEVICE_ROWS_INVALID")
+        else:
+            expected_devices_set = {(index, uuid) for index, uuid in enumerate(APPROVED_GPU_UUIDS)}
+            observed_devices = {(item.get("rank"), item.get("gpu_uuid")) for item in devices}
+            if observed_devices != expected_devices_set:
+                reasons.append(prefix + "_PER_DEVICE_UUID_BINDING_INVALID")
+            if observed_devices == expected_devices_set:
+                ranked_devices = sorted(devices, key=lambda item: item["rank"])
+                if [item.get("local_sample_mapping_hash") for item in ranked_devices] != local_hashes:
+                    reasons.append(prefix + "_PER_DEVICE_PARTITION_HASH_MISMATCH")
+                if [item.get("local_gradient_pool_hash") for item in ranked_devices] != local_gradient_hashes:
+                    reasons.append(prefix + "_PER_DEVICE_GRADIENT_HASH_MISMATCH")
+                if any(not isinstance(item.get("all_reduce_identity_hash"), str) or _SHA256.fullmatch(item["all_reduce_identity_hash"]) is None for item in ranked_devices):
+                    reasons.append(prefix + "_PER_DEVICE_ALL_REDUCE_HASH_INVALID")
+                for item in ranked_devices:
+                    if any(item.get(name) != anchor.get(name) for name in ("fixed_checkpoint_id", "checkpoint_hash", "mapping_hash", "global_s1_hash", "global_s2_hash", "estimate_hash", "state_digest", "state_digest_after")):
+                        reasons.append(prefix + "_PER_DEVICE_NUMERIC_IDENTITY_MISMATCH")
+                        break
+                expected_all_reduce_identity_hash = canonical_json_hash(
+                    [
+                        {"rank": int(item["rank"]), "gpu_uuid": str(item["gpu_uuid"]), "identity_hash": str(item["all_reduce_identity_hash"])}
+                        for item in ranked_devices
+                    ]
+                )
+                if anchor.get("all_reduce_identity_hash") != expected_all_reduce_identity_hash:
+                    reasons.append(prefix + "_ALL_REDUCE_IDENTITY_MISMATCH")
+                expected_four_process_identity_hash = canonical_json_hash(
+                    {
+                        "gpu_uuids": list(APPROVED_GPU_UUIDS),
+                        "sample_mapping_hash": anchor.get("sample_mapping_hash"),
+                        "gradient_pool_hash": anchor.get("gradient_pool_hash"),
+                        "estimate_hash": anchor.get("estimate_hash"),
+                        "state_digest": anchor.get("state_digest"),
+                        "state_digest_after": anchor.get("state_digest_after"),
+                        "checkpoint_hash": anchor.get("checkpoint_hash"),
+                        "mapping_hash": anchor.get("mapping_hash"),
+                    }
+                )
+                if anchor.get("four_process_identity_hash") != expected_four_process_identity_hash:
+                    reasons.append(prefix + "_PROCESS_IDENTITY_MISMATCH")
+            local_sequence_total = sum(int(item.get("sequence_count", -1)) for item in devices if isinstance(item.get("sequence_count"), int) and not isinstance(item.get("sequence_count"), bool))
+            local_token_total = sum(int(item.get("token_count", -1)) for item in devices if isinstance(item.get("token_count"), int) and not isinstance(item.get("token_count"), bool))
+            local_backward_total = sum(int(item.get("backward_count", -1)) for item in devices if isinstance(item.get("backward_count"), int) and not isinstance(item.get("backward_count"), bool))
+            if local_sequence_total != anchor.get("sequence_count") or local_token_total != anchor.get("token_count") or local_backward_total != anchor.get("backward_count"):
+                reasons.append(prefix + "_PER_DEVICE_GLOBAL_COUNT_MISMATCH")
     return reasons
 
 

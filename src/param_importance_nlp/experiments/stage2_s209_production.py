@@ -18,6 +18,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from contextlib import redirect_stdout
+from datetime import timedelta
 import io
 import json
 import math
@@ -25,6 +26,7 @@ import multiprocessing as mp
 import os
 from pathlib import Path, PurePosixPath
 import queue as queue_module
+import socket
 import time
 from typing import Any, Mapping, Sequence
 
@@ -34,6 +36,7 @@ from ..contracts.stage23 import FormalExecutionEvidence
 from ..contracts.task_catalog import DEFAULT_TASK_CATALOG
 from ..experiments.sampling import RepetitionMapping
 from ..runtime.task_runtime import TaskExecutionRequest, TaskRuntimeEnvironment
+from ..runtime.reducers import TorchDistributedReducer
 from .stage2 import CoreEstimatorKernel, _vector_digest
 from .stage2_s204_ids import EXPECTED_CELL_IDS
 from .stage2_s207_formal import APPROVED_GPU_UUIDS, S27CellPlan
@@ -561,11 +564,172 @@ def _device_identity_set(expected_uuids: Sequence[str]) -> None:
 
 
 _FOUR_GPU_BARRIER_TIMEOUT_SECONDS = 900.0
+_FOUR_GPU_WORLD_SIZE = 4
+
+
+def _partition_draw_hash(groups: Sequence[Sequence[Any]]) -> str:
+    """Hash the exact draw rows owned by one rank."""
+
+    draws: list[dict[str, Any]] = []
+    for group in groups:
+        for draw in group:
+            manifest = getattr(draw, "to_manifest", None)
+            if not callable(manifest):
+                raise S209ProductionBlocked("FOUR_GPU_DRAW_MANIFEST_REQUIRED")
+            value = manifest()
+            if not isinstance(value, Mapping):
+                raise S209ProductionBlocked("FOUR_GPU_DRAW_MANIFEST_INVALID")
+            draws.append(dict(value))
+    if not draws:
+        raise S209ProductionBlocked("FOUR_GPU_RANK_PARTITION_EMPTY")
+    return canonical_json_hash(draws)
+
+
+def _mapping_partition_hashes(mapping: RepetitionMapping, *, world_size: int = _FOUR_GPU_WORLD_SIZE) -> tuple[str, ...]:
+    """Return content hashes for disjoint complete microbatch partitions."""
+
+    if world_size != _FOUR_GPU_WORLD_SIZE:
+        raise S209ProductionBlocked("FOUR_GPU_WORLD_SIZE_INVALID")
+    groups = mapping.groups(max(mapping.m_values))
+    if len(groups) < world_size:
+        raise S209ProductionBlocked("FOUR_GPU_STATISTICAL_UNITS_LT_WORLD_SIZE")
+    partitions = [groups[rank::world_size] for rank in range(world_size)]
+    hashes = tuple(_partition_draw_hash(partition) for partition in partitions)
+    if len(set(hashes)) != world_size:
+        raise S209ProductionBlocked("FOUR_GPU_PARTITION_HASH_DUPLICATE")
+    return hashes
+
+
+def _local_sufficient_statistics(pool: _MeasuredPool) -> tuple[Any, Any, float, int]:
+    """Build local FP64 S1/S2 and count from the measured rank shard."""
+
+    import torch
+
+    if not pool.maps or len(pool.maps) != len(pool.weights):
+        raise S209ProductionBlocked("FOUR_GPU_LOCAL_STATISTICS_INPUT_INVALID")
+    template = pool.maps[0]
+    s1_values = {name: torch.zeros_like(value) for name, value in template.items()}
+    s2_values = {name: torch.zeros_like(value) for name, value in template.items()}
+    for sample, weight in zip(pool.maps, pool.weights, strict=True):
+        numeric_weight = float(weight)
+        if not math.isfinite(numeric_weight) or numeric_weight <= 0:
+            raise S209ProductionBlocked("FOUR_GPU_LOCAL_STATISTICS_WEIGHT_INVALID")
+        for name, value in sample.items():
+            s1_values[name] = s1_values[name] + value * numeric_weight
+            s2_values[name] = s2_values[name] + value.square() * (numeric_weight**2)
+    s1_flat = torch.cat([s1_values[name].reshape(-1) for name in template])
+    s2_flat = torch.cat([s2_values[name].reshape(-1) for name in template])
+    return s1_flat, s2_flat, float(sum(pool.weights)), len(pool.maps)
+
+
+def _restore_tensor_map(template: Any, flat: Any) -> Any:
+    """Restore a flattened all-reduced vector using the frozen registry shape."""
+
+    values: dict[str, Any] = {}
+    offset = 0
+    for name, tensor in template.items():
+        width = int(tensor.numel())
+        values[name] = flat[offset : offset + width].reshape(tensor.shape)
+        offset += width
+    if offset != int(flat.numel()):
+        raise S209ProductionBlocked("FOUR_GPU_REDUCED_VECTOR_SHAPE_INVALID")
+    return type(template)(values, registry=getattr(template, "registry", None), require_finite=False)
+
+
+def _timed_nccl_tensor_reduce(reducer: TorchDistributedReducer, name: str, tensor: Any) -> tuple[Any, float]:
+    """Perform one real NCCL all-reduce and return its CUDA-event duration."""
+
+    import torch
+
+    torch.cuda.synchronize()
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    wall_start = time.perf_counter()
+    start.record()
+    reduced = reducer.sum_tensors({name: tensor})[name]
+    end.record()
+    end.synchronize()
+    elapsed = float(start.elapsed_time(end)) / 1000.0
+    if elapsed <= 0 or not math.isfinite(elapsed) or time.perf_counter() <= wall_start:
+        raise S209ProductionBlocked(f"FOUR_GPU_ALL_REDUCE_{name.upper()}_TIMING_INVALID")
+    return reduced, elapsed
+
+
+def _timed_nccl_count_reduce(reducer: TorchDistributedReducer, value: int) -> tuple[int, float]:
+    import torch
+
+    torch.cuda.synchronize()
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    start.record()
+    result = reducer.sum_int(int(value))
+    end.record()
+    end.synchronize()
+    elapsed = float(start.elapsed_time(end)) / 1000.0
+    if elapsed <= 0 or not math.isfinite(elapsed):
+        raise S209ProductionBlocked("FOUR_GPU_ALL_REDUCE_COUNT_TIMING_INVALID")
+    return result, elapsed
+
+
+def _timed_nccl_barrier(dist: Any) -> float:
+    import torch
+
+    torch.cuda.synchronize()
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    start.record()
+    dist.barrier()
+    end.record()
+    end.synchronize()
+    elapsed = float(start.elapsed_time(end)) / 1000.0
+    if elapsed <= 0 or not math.isfinite(elapsed):
+        raise S209ProductionBlocked("FOUR_GPU_BARRIER_TIMING_INVALID")
+    return elapsed
+
+
+def _init_four_gpu_process_group(*, rank: int, world_size: int, master_addr: str, master_port: int) -> tuple[Any, Any]:
+    """Initialize NCCL data collectives and a Gloo control group."""
+
+    import torch.distributed as dist
+
+    if world_size != _FOUR_GPU_WORLD_SIZE or not dist.is_available() or not dist.is_nccl_available():
+        raise S209ProductionBlocked("FOUR_GPU_NCCL_UNAVAILABLE")
+    if dist.is_initialized():
+        raise S209ProductionBlocked("FOUR_GPU_PROCESS_GROUP_ALREADY_INITIALIZED")
+    os.environ.update(
+        {
+            "RANK": str(rank),
+            "LOCAL_RANK": "0",
+            "WORLD_SIZE": str(world_size),
+            "MASTER_ADDR": str(master_addr),
+            "MASTER_PORT": str(master_port),
+        }
+    )
+    dist.init_process_group(
+        backend="nccl",
+        init_method="env://",
+        rank=rank,
+        world_size=world_size,
+        timeout=timedelta(seconds=_FOUR_GPU_BARRIER_TIMEOUT_SECONDS),
+    )
+    try:
+        control_group = dist.new_group(
+            backend="gloo",
+            timeout=timedelta(seconds=_FOUR_GPU_BARRIER_TIMEOUT_SECONDS),
+        )
+    except Exception as error:
+        dist.destroy_process_group()
+        raise S209ProductionBlocked("FOUR_GPU_CONTROL_GROUP_REQUIRED") from error
+    return dist, control_group
 
 
 def _four_gpu_anchor_worker(
     gpu_uuid: str,
     *,
+    rank: int,
+    world_size: int,
+    master_addr: str,
+    master_port: int,
     config: Mapping[str, Any],
     root: Path,
     binding: Mapping[str, Any],
@@ -582,26 +746,87 @@ def _four_gpu_anchor_worker(
     """
 
     os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_uuid)
+    dist = None
+    control_group = None
+    failure: BaseException | None = None
     try:
         # Backend/provider implementations are not allowed to leak logs into
         # the worker's exact-one-JSON stdout stream.
         with redirect_stdout(io.StringIO()):
             if os.environ.get("CUDA_VISIBLE_DEVICES") != str(gpu_uuid):
                 raise S209ProductionBlocked("FOUR_GPU_CHILD_MASK_DRIFT")
+            if world_size != _FOUR_GPU_WORLD_SIZE or rank < 0 or rank >= world_size:
+                raise S209ProductionBlocked("FOUR_GPU_RANK_IDENTITY_INVALID")
             _device_identity(str(gpu_uuid))
+            import torch
+
+            torch.cuda.set_device(0)
+            dist, control_group = _init_four_gpu_process_group(
+                rank=rank,
+                world_size=world_size,
+                master_addr=master_addr,
+                master_port=master_port,
+            )
             provider, mapping, unit, _cell = _load_provider_for_binding(root, config, binding)
             groups = mapping.groups(max(mapping.m_values))
-            if not groups:
-                raise S209ProductionBlocked("FOUR_GPU_ANCHOR_GROUPS_EMPTY")
+            if len(groups) < world_size:
+                raise S209ProductionBlocked("FOUR_GPU_STATISTICAL_UNITS_LT_WORLD_SIZE")
+            local_groups = groups[rank::world_size]
+            local_sample_mapping_hash = _partition_draw_hash(local_groups)
             # Loading/model construction happens before the barrier.  The
             # reported wall interval starts only once all four peers are ready.
             barrier.wait(timeout=_FOUR_GPU_BARRIER_TIMEOUT_SECONDS)
+            pre_barrier_seconds = _timed_nccl_barrier(dist)
             wall_start = time.perf_counter()
-            pool = _measure_pool(provider, groups, mapping=mapping)
-            value, formula_seconds = _method_value(CoreEstimatorKernel(accumulation_dtype="float64"), pool, "raw", mapping)
+            pool = _measure_pool(provider, local_groups, mapping=mapping)
+            s1_local, s2_local, local_weight, local_unit_count = _local_sufficient_statistics(pool)
+            reducer = TorchDistributedReducer(integer_device=torch.device("cuda", 0))
+            s1_global, s1_seconds = _timed_nccl_tensor_reduce(reducer, "s1", s1_local)
+            s2_global, s2_seconds = _timed_nccl_tensor_reduce(reducer, "s2", s2_local)
+            weight_tensor = torch.tensor([local_weight], dtype=torch.float64, device=torch.device("cuda", 0))
+            weight_global_tensor, weight_seconds = _timed_nccl_tensor_reduce(reducer, "weight", weight_tensor)
+            global_unit_count, count_seconds = _timed_nccl_count_reduce(reducer, local_unit_count)
+            if global_unit_count != len(groups) or float(weight_global_tensor.item()) <= 0:
+                raise S209ProductionBlocked("FOUR_GPU_GLOBAL_STATISTICS_COUNT_INVALID")
+            template = pool.maps[0]
+            global_s1_map = _restore_tensor_map(template, s1_global)
+            global_s2_map = _restore_tensor_map(template, s2_global)
+            global_s1_hash = _vector_digest(global_s1_map)
+            global_s2_hash = _vector_digest(global_s2_map)
+            global_mean = global_s1_map / float(weight_global_tensor.item())
+            formula_start = time.perf_counter()
+            value = CoreEstimatorKernel(accumulation_dtype="float64").raw(global_mean)
+            formula_seconds = time.perf_counter() - formula_start
+            if formula_seconds <= 0:
+                raise S209ProductionBlocked("FORMULA_TIMING_INVALID")
             statistics_start = time.perf_counter()
             estimate_hash = _vector_digest(value)
             statistics_seconds = time.perf_counter() - statistics_start
+            communication_seconds = s1_seconds + s2_seconds + weight_seconds + count_seconds
+            communication_bytes = int(s1_global.numel() * s1_global.element_size() + s2_global.numel() * s2_global.element_size() + weight_global_tensor.numel() * weight_global_tensor.element_size() + 8)
+            identity_invariant = {
+                "checkpoint_id": str(unit["checkpoint_id"]),
+                "checkpoint_hash": str(unit["checkpoint_hash"]),
+                "mapping_hash": str(binding["mapping_hash"]),
+                "sample_mapping_hash": str(pool.sample_mapping_hash),
+                "global_s1_hash": global_s1_hash,
+                "global_s2_hash": global_s2_hash,
+                "estimate_hash": str(estimate_hash),
+                "state_digest": str(pool.state_digest),
+                "state_digest_after": str(pool.state_digest_after),
+                "global_unit_count": int(global_unit_count),
+            }
+            gathered: list[Any] = [None for _ in range(world_size)]
+            dist.all_gather_object(
+                gathered,
+                {"rank": rank, "gpu_uuid": str(gpu_uuid), "invariant": identity_invariant},
+                group=control_group,
+            )
+            if any(not isinstance(item, Mapping) or item.get("invariant") != identity_invariant for item in gathered):
+                raise S209ProductionBlocked("FOUR_GPU_RANK_NUMERIC_IDENTITY_DRIFT")
+            rank_pairs = {(item.get("rank"), item.get("gpu_uuid")) for item in gathered if isinstance(item, Mapping)}
+            if rank_pairs != {(index, uuid) for index, uuid in enumerate(APPROVED_GPU_UUIDS)}:
+                raise S209ProductionBlocked("FOUR_GPU_RANK_UUID_BINDING_DRIFT")
             phase = {
                 "data_wait_seconds": float(pool.data_wait_seconds),
                 "forward_seconds": float(pool.forward_seconds),
@@ -609,55 +834,110 @@ def _four_gpu_anchor_worker(
                 "gradient_aggregation_seconds": float(pool.gradient_aggregation_seconds),
                 "formula_seconds": float(formula_seconds),
                 "statistics_seconds": float(statistics_seconds),
-                "communication_seconds": 0.0,
+                "communication_seconds": float(communication_seconds),
                 "write_seconds": 0.0,
             }
             if any(value < 0 or not math.isfinite(value) for value in phase.values()):
                 raise S209ProductionBlocked("FOUR_GPU_PHASE_TIMING_INVALID")
-            # End timing is barrier-bounded: the slowest peer's synchronization
-            # tail is part of the actual system-anchor wall interval.
-            barrier.wait(timeout=_FOUR_GPU_BARRIER_TIMEOUT_SECONDS)
+            all_reduce_identity = {
+                "rank": int(rank),
+                "gpu_uuid": str(gpu_uuid),
+                "s1_seconds": float(s1_seconds),
+                "s2_seconds": float(s2_seconds),
+                "weight_seconds": float(weight_seconds),
+                "count_seconds": float(count_seconds),
+                "s1_bytes": int(s1_global.numel() * s1_global.element_size()),
+                "s2_bytes": int(s2_global.numel() * s2_global.element_size()),
+                "weight_bytes": int(weight_global_tensor.numel() * weight_global_tensor.element_size()),
+                "count_bytes": 8,
+                "s1_count": 1,
+                "s2_count": 1,
+                "weight_count": 1,
+                "count": 4,
+            }
+            all_reduce_identity_hash = canonical_json_hash(all_reduce_identity)
+            post_barrier_seconds = _timed_nccl_barrier(dist)
+            barrier_seconds = float(pre_barrier_seconds + post_barrier_seconds)
+            # End timing is NCCL-barrier bounded: the slowest peer's
+            # synchronization tail is part of the actual system-anchor wall
+            # interval.  The multiprocessing barrier only protects launch.
             wall_seconds = float(time.perf_counter() - wall_start)
             if wall_seconds <= 0 or wall_seconds + 1e-9 < sum(phase.values()):
                 raise S209ProductionBlocked("FOUR_GPU_BARRIER_WALL_INVALID")
             result_queue.put(
                 {
                     "ok": True,
+                    "rank": int(rank),
                     "gpu_uuid": str(gpu_uuid),
                     "health_ok": True,
                     "wall_seconds": wall_seconds,
+                    "barrier_seconds": barrier_seconds,
+                    "barrier_count": 2,
                     "phase": phase,
-                    "sequence_count": int(pool.sequence_count),
+                    "sequence_count": int(sum(len(group) for group in local_groups)),
                     "token_count": int(pool.token_count),
-                    "backward_count": int(pool.backward_count),
-                    "communication_bytes": 0,
+                    "backward_count": int(len(local_groups)),
+                    "statistical_unit": "microbatch",
+                    "statistical_unit_count": int(local_unit_count),
+                    "global_statistical_unit_count": int(global_unit_count),
+                    "global_weight": float(weight_global_tensor.item()),
+                    "communication_bytes": communication_bytes,
                     "allocated_peak_bytes": int(pool.allocated_peak_bytes),
                     "reserved_peak_bytes": int(pool.reserved_peak_bytes),
                     "device_peak_bytes": int(pool.device_peak_bytes),
                     "sample_mapping_hash": str(pool.sample_mapping_hash),
-                    "gradient_pool_hash": str(pool.gradient_pool_hash),
+                    "local_sample_mapping_hash": local_sample_mapping_hash,
+                    "local_gradient_pool_hash": str(pool.gradient_pool_hash),
+                    "global_s1_hash": global_s1_hash,
+                    "global_s2_hash": global_s2_hash,
                     "estimate_hash": str(estimate_hash),
                     "state_digest": str(pool.state_digest),
                     "state_digest_after": str(pool.state_digest_after),
                     "fixed_checkpoint_id": str(unit["checkpoint_id"]),
+                    "checkpoint_hash": str(unit["checkpoint_hash"]),
+                    "mapping_hash": str(binding["mapping_hash"]),
                     "cuda_gradient_seconds": float(pool.gradient_seconds),
+                    "all_reduce_s1_seconds": float(s1_seconds),
+                    "all_reduce_s2_seconds": float(s2_seconds),
+                    "all_reduce_weight_seconds": float(weight_seconds),
+                    "all_reduce_count_seconds": float(count_seconds),
+                    "all_reduce_s1_bytes": int(s1_global.numel() * s1_global.element_size()),
+                    "all_reduce_s2_bytes": int(s2_global.numel() * s2_global.element_size()),
+                    "all_reduce_weight_bytes": int(weight_global_tensor.numel() * weight_global_tensor.element_size()),
+                    "all_reduce_count_bytes": 8,
+                    "all_reduce_s1_count": 1,
+                    "all_reduce_s2_count": 1,
+                    "all_reduce_weight_count": 1,
+                    "all_reduce_count": 4,
+                    "all_reduce_identity_hash": all_reduce_identity_hash,
                 }
             )
     except BaseException as error:
+        failure = error
         try:
             barrier.abort()
         except Exception:
             pass
-        try:
-            result_queue.put(
-                {
-                    "ok": False,
-                    "gpu_uuid": str(gpu_uuid),
-                    "error": f"{type(error).__name__}:{error}",
-                }
-            )
-        except Exception:
-            pass
+    finally:
+        if dist is not None:
+            try:
+                import torch.distributed as distributed
+
+                if distributed.is_initialized():
+                    distributed.destroy_process_group()
+            except Exception:
+                pass
+        if failure is not None:
+            try:
+                result_queue.put(
+                    {
+                        "ok": False,
+                        "gpu_uuid": str(gpu_uuid),
+                        "error": f"{type(failure).__name__}:{failure}",
+                    }
+                )
+            except Exception:
+                pass
 
 
 def _aggregate_four_gpu_anchor_results(
@@ -666,6 +946,7 @@ def _aggregate_four_gpu_anchor_results(
     config: Mapping[str, Any],
     results: Sequence[Mapping[str, Any]],
     io_hash: str,
+    expected_partition_hashes: Sequence[str],
 ) -> dict[str, Any]:
     """Strictly aggregate four actual process records into one anchor row."""
 
@@ -675,23 +956,65 @@ def _aggregate_four_gpu_anchor_results(
     if expected != tuple(APPROVED_GPU_UUIDS) or len(expected) != 4:
         raise S209ProductionBlocked("FOUR_GPU_ANCHOR_UUID_SET_INVALID")
     _sha(io_hash, field="four_gpu.io_evidence_hash")
+    if len(expected_partition_hashes) != _FOUR_GPU_WORLD_SIZE:
+        raise S209ProductionBlocked("FOUR_GPU_PARTITION_HASH_COUNT_INVALID")
+    for index, value in enumerate(expected_partition_hashes):
+        _sha(value, field=f"four_gpu.partition_hash[{index}]")
+    if len(set(expected_partition_hashes)) != _FOUR_GPU_WORLD_SIZE:
+        raise S209ProductionBlocked("FOUR_GPU_PARTITION_HASH_DUPLICATE")
+    single = task.get("single_gpu_anchor")
+    if not isinstance(single, Mapping):
+        raise S209ProductionBlocked("FOUR_GPU_SINGLE_ANCHOR_REFERENCE_REQUIRED")
+    for name in ("sequence_count", "token_count", "backward_count"):
+        value = single.get(name)
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            raise S209ProductionBlocked(f"FOUR_GPU_SINGLE_ANCHOR_{name.upper()}_INVALID")
+    single_wall = single.get("wall_seconds")
+    if isinstance(single_wall, bool) or not isinstance(single_wall, (int, float)) or not math.isfinite(float(single_wall)) or float(single_wall) <= 0:
+        raise S209ProductionBlocked("FOUR_GPU_SINGLE_ANCHOR_WALL_INVALID")
+    single_identity_hash = single.get("identity_hash")
+    _sha(single_identity_hash, field="four_gpu.single_anchor_identity_hash")
+    expected_single_identity = canonical_json_hash(
+        {
+            "anchor_id": "single-gpu-anchor",
+            "run_id": task["run_id"],
+            "gpu_uuid": task["gpu_uuid"],
+            "device_count": 1,
+            "sequence_count": int(single["sequence_count"]),
+            "token_count": int(single["token_count"]),
+            "backward_count": int(single["backward_count"]),
+            "wall_seconds": float(single_wall),
+        }
+    )
+    if single_identity_hash != expected_single_identity:
+        raise S209ProductionBlocked("FOUR_GPU_SINGLE_ANCHOR_IDENTITY_DRIFT")
     if len(results) != 4:
         raise S209ProductionBlocked("FOUR_GPU_ANCHOR_RESULT_COUNT_INVALID")
     by_uuid: dict[str, Mapping[str, Any]] = {}
+    by_rank: dict[int, Mapping[str, Any]] = {}
     for result in results:
         if not isinstance(result, Mapping) or result.get("ok") is not True:
             raise S209ProductionBlocked("FOUR_GPU_ANCHOR_CHILD_FAILED")
         uuid = result.get("gpu_uuid")
         if uuid not in expected or uuid in by_uuid:
             raise S209ProductionBlocked("FOUR_GPU_ANCHOR_CHILD_UUID_DRIFT")
+        rank = result.get("rank")
+        if isinstance(rank, bool) or not isinstance(rank, int) or rank not in range(_FOUR_GPU_WORLD_SIZE) or rank != expected.index(str(uuid)) or rank in by_rank:
+            raise S209ProductionBlocked("FOUR_GPU_ANCHOR_CHILD_RANK_UUID_DRIFT")
         by_uuid[str(uuid)] = result
+        by_rank[rank] = result
     if set(by_uuid) != set(expected):
         raise S209ProductionBlocked("FOUR_GPU_ANCHOR_CHILD_UUID_SET_INVALID")
     required = {
-        "health_ok", "wall_seconds", "phase", "sequence_count", "token_count", "backward_count",
+        "rank", "health_ok", "wall_seconds", "barrier_seconds", "barrier_count", "phase", "sequence_count", "token_count", "backward_count",
+        "statistical_unit", "statistical_unit_count", "global_statistical_unit_count", "global_weight",
         "communication_bytes", "allocated_peak_bytes", "reserved_peak_bytes", "device_peak_bytes",
-        "sample_mapping_hash", "gradient_pool_hash", "estimate_hash", "state_digest", "state_digest_after",
+        "sample_mapping_hash", "local_sample_mapping_hash", "local_gradient_pool_hash", "global_s1_hash", "global_s2_hash", "estimate_hash", "state_digest", "state_digest_after", "checkpoint_hash", "mapping_hash",
         "fixed_checkpoint_id", "cuda_gradient_seconds",
+        "all_reduce_s1_seconds", "all_reduce_s2_seconds", "all_reduce_weight_seconds", "all_reduce_count_seconds",
+        "all_reduce_s1_bytes", "all_reduce_s2_bytes", "all_reduce_weight_bytes", "all_reduce_count_bytes",
+        "all_reduce_s1_count", "all_reduce_s2_count", "all_reduce_weight_count", "all_reduce_count",
+        "all_reduce_identity_hash",
     }
     for uuid, result in by_uuid.items():
         if set(result) < required or result.get("health_ok") is not True:
@@ -706,22 +1029,80 @@ def _aggregate_four_gpu_anchor_results(
         wall = result["wall_seconds"]
         if isinstance(wall, bool) or not isinstance(wall, (int, float)) or not math.isfinite(float(wall)) or float(wall) <= 0 or float(wall) + 1e-9 < sum(float(phase[name]) for name in S29_TIMING_FIELDS):
             raise S209ProductionBlocked(f"FOUR_GPU_CHILD_WALL_INVALID:{uuid}")
+        barrier_seconds = result["barrier_seconds"]
+        if isinstance(barrier_seconds, bool) or not isinstance(barrier_seconds, (int, float)) or not math.isfinite(float(barrier_seconds)) or float(barrier_seconds) <= 0 or result["barrier_count"] != 2:
+            raise S209ProductionBlocked(f"FOUR_GPU_CHILD_BARRIER_INVALID:{uuid}")
+        if result["statistical_unit"] != "microbatch" or result["statistical_unit_count"] <= 0 or result["global_statistical_unit_count"] <= 0:
+            raise S209ProductionBlocked(f"FOUR_GPU_CHILD_STATISTICS_UNIT_INVALID:{uuid}")
+        global_weight = result["global_weight"]
+        if isinstance(global_weight, bool) or not isinstance(global_weight, (int, float)) or not math.isfinite(float(global_weight)) or float(global_weight) <= 0:
+            raise S209ProductionBlocked(f"FOUR_GPU_CHILD_GLOBAL_WEIGHT_INVALID:{uuid}")
         for name in ("sequence_count", "token_count", "backward_count", "communication_bytes"):
             value = result[name]
-            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
                 raise S209ProductionBlocked(f"FOUR_GPU_CHILD_COUNTER_INVALID:{uuid}:{name}")
+        if int(result["communication_bytes"]) <= 0:
+            raise S209ProductionBlocked(f"FOUR_GPU_CHILD_COLLECTIVE_MISSING:{uuid}")
+        if result["local_sample_mapping_hash"] != expected_partition_hashes[int(result["rank"])]:
+            raise S209ProductionBlocked(f"FOUR_GPU_CHILD_PARTITION_HASH_DRIFT:{uuid}")
         memory = [result[name] for name in ("allocated_peak_bytes", "reserved_peak_bytes", "device_peak_bytes")]
         if any(isinstance(value, bool) or not isinstance(value, int) or value <= 0 for value in memory) or not memory[0] <= memory[1] <= memory[2]:
             raise S209ProductionBlocked(f"FOUR_GPU_CHILD_MEMORY_INVALID:{uuid}")
         if not isinstance(result["fixed_checkpoint_id"], str) or not result["fixed_checkpoint_id"]:
             raise S209ProductionBlocked(f"FOUR_GPU_CHILD_CHECKPOINT_INVALID:{uuid}")
-        for name in ("sample_mapping_hash", "gradient_pool_hash", "estimate_hash", "state_digest", "state_digest_after"):
+        for name in ("sample_mapping_hash", "local_sample_mapping_hash", "local_gradient_pool_hash", "global_s1_hash", "global_s2_hash", "estimate_hash", "state_digest", "state_digest_after", "checkpoint_hash", "mapping_hash"):
             _sha(result[name], field=f"four_gpu.{uuid}.{name}")
+        for name in ("all_reduce_s1_seconds", "all_reduce_s2_seconds", "all_reduce_weight_seconds", "all_reduce_count_seconds"):
+            value = result[name]
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value)) or float(value) <= 0:
+                raise S209ProductionBlocked(f"FOUR_GPU_CHILD_ALL_REDUCE_TIMING_INVALID:{uuid}:{name}")
+        for name in ("all_reduce_s1_bytes", "all_reduce_s2_bytes", "all_reduce_weight_bytes", "all_reduce_count_bytes", "all_reduce_s1_count", "all_reduce_s2_count", "all_reduce_weight_count", "all_reduce_count"):
+            value = result[name]
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                raise S209ProductionBlocked(f"FOUR_GPU_CHILD_ALL_REDUCE_COUNTER_INVALID:{uuid}:{name}")
+        if result["all_reduce_s1_count"] != 1 or result["all_reduce_s2_count"] != 1 or result["all_reduce_weight_count"] != 1 or result["all_reduce_count"] != 4:
+            raise S209ProductionBlocked(f"FOUR_GPU_CHILD_ALL_REDUCE_COUNT_INVALID:{uuid}")
+        _sha(result["all_reduce_identity_hash"], field=f"four_gpu.{uuid}.all_reduce_identity_hash")
+        expected_all_reduce_identity_hash = canonical_json_hash(
+            {
+                "rank": int(result["rank"]),
+                "gpu_uuid": uuid,
+                "s1_seconds": float(result["all_reduce_s1_seconds"]),
+                "s2_seconds": float(result["all_reduce_s2_seconds"]),
+                "weight_seconds": float(result["all_reduce_weight_seconds"]),
+                "count_seconds": float(result["all_reduce_count_seconds"]),
+                "s1_bytes": int(result["all_reduce_s1_bytes"]),
+                "s2_bytes": int(result["all_reduce_s2_bytes"]),
+                "weight_bytes": int(result["all_reduce_weight_bytes"]),
+                "count_bytes": int(result["all_reduce_count_bytes"]),
+                "s1_count": int(result["all_reduce_s1_count"]),
+                "s2_count": int(result["all_reduce_s2_count"]),
+                "weight_count": int(result["all_reduce_weight_count"]),
+                "count": int(result["all_reduce_count"]),
+            }
+        )
+        if result["all_reduce_identity_hash"] != expected_all_reduce_identity_hash:
+            raise S209ProductionBlocked(f"FOUR_GPU_CHILD_ALL_REDUCE_IDENTITY_DRIFT:{uuid}")
 
-    identity_fields = ("fixed_checkpoint_id", "sample_mapping_hash", "gradient_pool_hash", "estimate_hash", "state_digest", "state_digest_after")
+    expected_mapping_hash = task.get("mapping_hash")
+    expected_checkpoint_hash = task.get("checkpoint_hash")
+    if expected_mapping_hash is not None:
+        _sha(expected_mapping_hash, field="four_gpu.mapping_hash")
+    if expected_checkpoint_hash is not None:
+        _sha(expected_checkpoint_hash, field="four_gpu.checkpoint_hash")
+    for uuid, result in by_uuid.items():
+        if expected_mapping_hash is not None and result["mapping_hash"] != expected_mapping_hash:
+            raise S209ProductionBlocked(f"FOUR_GPU_MAPPING_IDENTITY_DRIFT:{uuid}")
+        if expected_checkpoint_hash is not None and result["checkpoint_hash"] != expected_checkpoint_hash:
+            raise S209ProductionBlocked(f"FOUR_GPU_CHECKPOINT_IDENTITY_DRIFT:{uuid}")
+    identity_fields = ("fixed_checkpoint_id", "checkpoint_hash", "mapping_hash", "sample_mapping_hash", "global_s1_hash", "global_s2_hash", "estimate_hash", "state_digest", "state_digest_after", "global_statistical_unit_count")
     for name in identity_fields:
         if len({str(result[name]) for result in by_uuid.values()}) != 1:
             raise S209ProductionBlocked(f"FOUR_GPU_NUMERIC_CONSISTENCY_FAILED:{name}")
+    if sum(int(result["statistical_unit_count"]) for result in by_uuid.values()) != int(next(iter(by_uuid.values()))["global_statistical_unit_count"]):
+        raise S209ProductionBlocked("FOUR_GPU_STATISTICAL_UNIT_GLOBAL_SUM_MISMATCH")
+    if int(next(iter(by_uuid.values()))["global_statistical_unit_count"]) != int(config["frozen"]["microbatch_count"]):
+        raise S209ProductionBlocked("FOUR_GPU_STATISTICAL_UNIT_FROZEN_COUNT_MISMATCH")
     slowest = max(by_uuid.values(), key=lambda result: float(result["wall_seconds"]))
     phase = {name: float(slowest["phase"][name]) for name in S29_TIMING_FIELDS}
     per_device = []
@@ -730,18 +1111,55 @@ def _aggregate_four_gpu_anchor_results(
         per_device.append(
             {
                 "gpu_uuid": uuid,
+                "rank": int(result["rank"]),
                 "wall_seconds": float(result["wall_seconds"]),
+                "barrier_seconds": float(result["barrier_seconds"]),
+                "barrier_count": int(result["barrier_count"]),
                 **{name: float(result["phase"][name]) for name in S29_TIMING_FIELDS},
                 "sequence_count": int(result["sequence_count"]),
                 "token_count": int(result["token_count"]),
                 "backward_count": int(result["backward_count"]),
+                "statistical_unit": str(result["statistical_unit"]),
+                "statistical_unit_count": int(result["statistical_unit_count"]),
+                "global_statistical_unit_count": int(result["global_statistical_unit_count"]),
+                "global_weight": float(result["global_weight"]),
                 "communication_bytes": int(result["communication_bytes"]),
                 "allocated_peak_bytes": int(result["allocated_peak_bytes"]),
                 "reserved_peak_bytes": int(result["reserved_peak_bytes"]),
                 "device_peak_bytes": int(result["device_peak_bytes"]),
                 "cuda_gradient_seconds": float(result["cuda_gradient_seconds"]),
+                "local_sample_mapping_hash": str(result["local_sample_mapping_hash"]),
+                "local_gradient_pool_hash": str(result["local_gradient_pool_hash"]),
+                "global_s1_hash": str(result["global_s1_hash"]),
+                    "global_s2_hash": str(result["global_s2_hash"]),
+                    "estimate_hash": str(result["estimate_hash"]),
+                    "fixed_checkpoint_id": str(result["fixed_checkpoint_id"]),
+                    "checkpoint_hash": str(result["checkpoint_hash"]),
+                    "mapping_hash": str(result["mapping_hash"]),
+                    "state_digest": str(result["state_digest"]),
+                    "state_digest_after": str(result["state_digest_after"]),
+                "all_reduce_s1_seconds": float(result["all_reduce_s1_seconds"]),
+                "all_reduce_s2_seconds": float(result["all_reduce_s2_seconds"]),
+                "all_reduce_weight_seconds": float(result["all_reduce_weight_seconds"]),
+                "all_reduce_count_seconds": float(result["all_reduce_count_seconds"]),
+                "all_reduce_s1_bytes": int(result["all_reduce_s1_bytes"]),
+                "all_reduce_s2_bytes": int(result["all_reduce_s2_bytes"]),
+                "all_reduce_weight_bytes": int(result["all_reduce_weight_bytes"]),
+                "all_reduce_count_bytes": int(result["all_reduce_count_bytes"]),
+                "all_reduce_s1_count": int(result["all_reduce_s1_count"]),
+                "all_reduce_s2_count": int(result["all_reduce_s2_count"]),
+                "all_reduce_weight_count": int(result["all_reduce_weight_count"]),
+                "all_reduce_count": int(result["all_reduce_count"]),
+                "all_reduce_identity_hash": str(result["all_reduce_identity_hash"]),
             }
         )
+    rank_gradient_pool_hashes = [str(by_rank[index]["local_gradient_pool_hash"]) for index in range(_FOUR_GPU_WORLD_SIZE)]
+    aggregate_gradient_pool_hash = canonical_json_hash(
+        {
+            "mapping_hash": str(slowest["sample_mapping_hash"]),
+            "rank_gradient_pool_hashes": rank_gradient_pool_hashes,
+        }
+    )
     row: dict[str, Any] = {
         "measurement_kind": "device_actual",
         "measurement_source": "stage2_s209_production.synchronized_four_process",
@@ -772,26 +1190,88 @@ def _aggregate_four_gpu_anchor_results(
         "microbatch_count": config["frozen"]["microbatch_count"],
         "source_unit_ids": [str(task.get("unit_id", "four-gpu-fixed-anchor"))],
         "fixed_checkpoint_id": str(slowest["fixed_checkpoint_id"]),
+        "checkpoint_hash": str(slowest["checkpoint_hash"]),
+        "mapping_hash": str(slowest["mapping_hash"]),
+        "state_digest": str(slowest["state_digest"]),
+        "state_digest_after": str(slowest["state_digest_after"]),
         "cuda_gradient_seconds": max(float(result["cuda_gradient_seconds"]) for result in by_uuid.values()),
         "gradient_timing_source": "torch_cuda_event",
         "memory_counter_source": "torch_cuda_peak_and_mem_get_info",
-        "system_anchor_mode": "synchronized_fixed_state_four_process",
-        "communication_mode": "barrier_only_no_gradient_collective",
+        "system_anchor_mode": "synchronized_fixed_state_four_process_nccl",
+        "communication_mode": "nccl_all_reduce_s1_s2",
+        "rank_partition_mode": "disjoint_complete_microbatch_groups",
+        "statistical_unit": "microbatch",
+        "statistical_unit_count": sum(int(result["statistical_unit_count"]) for result in by_uuid.values()),
+        "global_statistical_unit_count": int(slowest["global_statistical_unit_count"]),
+        "global_weight": float(slowest["global_weight"]),
+        "barrier_seconds": max(float(result["barrier_seconds"]) for result in by_uuid.values()),
+        "barrier_count": 2,
+        "all_reduce_s1_seconds": max(float(result["all_reduce_s1_seconds"]) for result in by_uuid.values()),
+        "all_reduce_s2_seconds": max(float(result["all_reduce_s2_seconds"]) for result in by_uuid.values()),
+        "all_reduce_weight_seconds": max(float(result["all_reduce_weight_seconds"]) for result in by_uuid.values()),
+        "all_reduce_count_seconds": max(float(result["all_reduce_count_seconds"]) for result in by_uuid.values()),
+        "all_reduce_s1_bytes": sum(int(result["all_reduce_s1_bytes"]) for result in by_uuid.values()),
+        "all_reduce_s2_bytes": sum(int(result["all_reduce_s2_bytes"]) for result in by_uuid.values()),
+        "all_reduce_weight_bytes": sum(int(result["all_reduce_weight_bytes"]) for result in by_uuid.values()),
+        "all_reduce_count_bytes": sum(int(result["all_reduce_count_bytes"]) for result in by_uuid.values()),
+        "all_reduce_s1_count": sum(int(result["all_reduce_s1_count"]) for result in by_uuid.values()),
+        "all_reduce_s2_count": sum(int(result["all_reduce_s2_count"]) for result in by_uuid.values()),
+        "all_reduce_weight_count": sum(int(result["all_reduce_weight_count"]) for result in by_uuid.values()),
+        "all_reduce_count": sum(int(result["all_reduce_count"]) for result in by_uuid.values()),
+        "all_reduce_identity_hash": canonical_json_hash(
+            [
+                {
+                    "rank": int(by_rank[index]["rank"]),
+                    "gpu_uuid": expected[index],
+                    "identity_hash": str(by_rank[index]["all_reduce_identity_hash"]),
+                }
+                for index in range(_FOUR_GPU_WORLD_SIZE)
+            ]
+        ),
         "sample_mapping_hash": str(slowest["sample_mapping_hash"]),
-        "gradient_pool_hash": str(slowest["gradient_pool_hash"]),
+        "local_sample_mapping_hashes": [str(by_rank[index]["local_sample_mapping_hash"]) for index in range(_FOUR_GPU_WORLD_SIZE)],
+        "local_gradient_pool_hashes": rank_gradient_pool_hashes,
+        "global_s1_hash": str(slowest["global_s1_hash"]),
+        "global_s2_hash": str(slowest["global_s2_hash"]),
         "estimate_hash": str(slowest["estimate_hash"]),
+        "gradient_pool_hash": aggregate_gradient_pool_hash,
         "four_process_identity_hash": canonical_json_hash(
             {
                 "gpu_uuids": list(expected),
                 "sample_mapping_hash": str(slowest["sample_mapping_hash"]),
-                "gradient_pool_hash": str(slowest["gradient_pool_hash"]),
+                "gradient_pool_hash": aggregate_gradient_pool_hash,
                 "estimate_hash": str(slowest["estimate_hash"]),
                 "state_digest": str(slowest["state_digest"]),
                 "state_digest_after": str(slowest["state_digest_after"]),
+                "checkpoint_hash": str(slowest["checkpoint_hash"]),
+                "mapping_hash": str(slowest["mapping_hash"]),
             }
         ),
         "per_device_measurements": per_device,
     }
+    four_throughput = float(row["sequence_count"]) / float(row["wall_seconds"])
+    single_throughput = float(single["sequence_count"]) / float(single_wall)
+    speedup = float(single_wall) / float(row["wall_seconds"])
+    efficiency = speedup / float(_FOUR_GPU_WORLD_SIZE)
+    if not all(math.isfinite(value) and value > 0 for value in (four_throughput, single_throughput, speedup, efficiency)):
+        raise S209ProductionBlocked("FOUR_GPU_STRONG_SCALING_INVALID")
+    if int(row["sequence_count"]) != int(single["sequence_count"]):
+        raise S209ProductionBlocked("FOUR_GPU_SINGLE_FOUR_SAMPLE_BUDGET_MISMATCH")
+    if int(row["token_count"]) != int(single["token_count"]) or int(row["backward_count"]) != int(single["backward_count"]):
+        raise S209ProductionBlocked("FOUR_GPU_SINGLE_FOUR_STATISTICS_UNIT_MISMATCH")
+    row.update(
+        {
+            "four_card_throughput_sequences_per_second": four_throughput,
+            "single_card_throughput_sequences_per_second": single_throughput,
+            "strong_scaling_speedup": speedup,
+            "strong_scaling_efficiency": efficiency,
+            "strong_scaling_reference_wall_seconds": float(single_wall),
+            "strong_scaling_reference_sequence_count": int(single["sequence_count"]),
+            "strong_scaling_reference_token_count": int(single["token_count"]),
+            "strong_scaling_reference_backward_count": int(single["backward_count"]),
+            "single_anchor_identity_hash": str(single_identity_hash),
+        }
+    )
     if row["wall_seconds"] + 1e-9 < sum(float(row[name]) for name in S29_TIMING_FIELDS):
         raise S209ProductionBlocked("FOUR_GPU_AGGREGATE_WALL_INVALID")
     _row_bytes(row)
@@ -799,6 +1279,7 @@ def _aggregate_four_gpu_anchor_results(
     _row_bytes(row)
     row["write_seconds"] = max(0.0, float(time.perf_counter() - write_start))
     row["wall_seconds"] = float(slowest["wall_seconds"]) + row["write_seconds"]
+    _row_bytes(row)
     return row
 
 
@@ -817,14 +1298,35 @@ def _run_four_gpu_anchor(*, task: Mapping[str, Any], config: Mapping[str, Any], 
     mapping = load_s27_frozen_mappings(root, plan, cell_id=cell_id).get(unit_id)
     if mapping is None:
         raise S209ProductionBlocked("FOUR_GPU_ANCHOR_MAPPING_MISSING")
+    expected_partition_hashes = _mapping_partition_hashes(mapping)
+    cell = next((item for item in plan.cells if item.cell_id == cell_id), None)
+    if cell is None:
+        raise S209ProductionBlocked("FOUR_GPU_ANCHOR_CELL_MISSING")
     binding = {"cell_id": cell_id, "unit_id": unit_id, "mapping_hash": mapping.digest}
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+            listener.bind(("127.0.0.1", 0))
+            master_port = int(listener.getsockname()[1])
+    except OSError as error:
+        raise S209ProductionBlocked("FOUR_GPU_MASTER_PORT_UNAVAILABLE") from error
     context = mp.get_context("spawn")
     barrier = context.Barrier(4)
     result_queue = context.Queue()
     processes = [
         context.Process(
             target=_four_gpu_anchor_worker,
-            kwargs={"gpu_uuid": uuid, "config": checked, "root": root, "binding": binding, "barrier": barrier, "result_queue": result_queue},
+            kwargs={
+                "gpu_uuid": uuid,
+                "rank": index,
+                "world_size": _FOUR_GPU_WORLD_SIZE,
+                "master_addr": "127.0.0.1",
+                "master_port": master_port,
+                "config": checked,
+                "root": root,
+                "binding": binding,
+                "barrier": barrier,
+                "result_queue": result_queue,
+            },
             name=f"s209-four-gpu-anchor-{index}",
         )
         for index, uuid in enumerate(expected)
@@ -854,7 +1356,15 @@ def _run_four_gpu_anchor(*, task: Mapping[str, Any], config: Mapping[str, Any], 
             results.append(dict(result))
         aggregate_task = dict(task)
         aggregate_task["unit_id"] = unit_id
-        return _aggregate_four_gpu_anchor_results(task=aggregate_task, config=checked, results=results, io_hash=str(task["io_evidence_hash"]))
+        aggregate_task["mapping_hash"] = mapping.digest
+        aggregate_task["checkpoint_hash"] = cell.checkpoint_hash
+        return _aggregate_four_gpu_anchor_results(
+            task=aggregate_task,
+            config=checked,
+            results=results,
+            io_hash=str(task["io_evidence_hash"]),
+            expected_partition_hashes=expected_partition_hashes,
+        )
     finally:
         for process in processes:
             if process.is_alive():

@@ -64,6 +64,17 @@ def _required_int(environment: Mapping[str, str], name: str) -> int:
     return result
 
 
+def _required_float(environment: Mapping[str, str], name: str) -> float:
+    value = _required_text(environment, name)
+    try:
+        result = float(value)
+    except ValueError as error:
+        raise S209WorkerBlocked(f"ENV_{name}_FINITE_FLOAT_REQUIRED") from error
+    if not math.isfinite(result) or result <= 0:
+        raise S209WorkerBlocked(f"ENV_{name}_FINITE_FLOAT_REQUIRED")
+    return result
+
+
 def _uuid_list(value: str, *, field: str) -> list[str]:
     result = [item.strip() for item in value.split(",") if item.strip()]
     if not result or len(set(result)) != len(result):
@@ -119,6 +130,29 @@ def _task_from_environment(environment: Mapping[str, str]) -> dict[str, Any]:
         if value not in {"true", "false"}:
             raise S209WorkerBlocked("ENV_S29_COST_IO_QUIESCENT_BOOLEAN_REQUIRED")
         task["cost_io_quiescent"] = value == "true"
+    if semantic == "anchor" and len(visible) == 4:
+        baseline = {
+            "wall_seconds": _required_float(environment, "S29_SINGLE_ANCHOR_WALL_SECONDS"),
+            "sequence_count": _required_int(environment, "S29_SINGLE_ANCHOR_SEQUENCE_COUNT"),
+            "token_count": _required_int(environment, "S29_SINGLE_ANCHOR_TOKEN_COUNT"),
+            "backward_count": _required_int(environment, "S29_SINGLE_ANCHOR_BACKWARD_COUNT"),
+            "identity_hash": _required_sha(environment, "S29_SINGLE_ANCHOR_IDENTITY_HASH"),
+        }
+        expected_baseline_hash = canonical_json_hash(
+            {
+                "anchor_id": "single-gpu-anchor",
+                "run_id": task["run_id"],
+                "gpu_uuid": task["gpu_uuid"],
+                "device_count": 1,
+                "sequence_count": baseline["sequence_count"],
+                "token_count": baseline["token_count"],
+                "backward_count": baseline["backward_count"],
+                "wall_seconds": baseline["wall_seconds"],
+            }
+        )
+        if baseline["identity_hash"] != expected_baseline_hash:
+            raise S209WorkerBlocked("ENV_SINGLE_ANCHOR_IDENTITY_DRIFT")
+        task["single_gpu_anchor"] = baseline
     if semantic == "scientific_equal_sample_cost":
         if _required_text(environment, "S29_SHARED_RUN_SCHEMA") != S29_SHARED_RUN_SCHEMA:
             raise S209WorkerBlocked("ENV_SHARED_RUN_SCHEMA_INVALID")
@@ -219,6 +253,106 @@ def _require_actual_measurement(value: Mapping[str, Any], *, task: Mapping[str, 
         raise S209WorkerBlocked("PROFILER_MEMORY_ORDER_INVALID")
 
 
+def _require_four_gpu_system_anchor(value: Mapping[str, Any], *, task: Mapping[str, Any]) -> None:
+    """Enforce the real NCCL/rank-partition contract at the worker boundary."""
+
+    if task.get("anchor_id") != "four-gpu-anchor" or task.get("device_count") != 4:
+        raise S209WorkerBlocked("FOUR_GPU_SYSTEM_ANCHOR_TASK_REQUIRED")
+    if value.get("gpu_uuids") != list(APPROVED_GPU_UUIDS):
+        raise S209WorkerBlocked("FOUR_GPU_SYSTEM_UUID_SET_INVALID")
+    if value.get("measurement_source") != "stage2_s209_production.synchronized_four_process":
+        raise S209WorkerBlocked("FOUR_GPU_SYSTEM_MEASUREMENT_SOURCE_INVALID")
+    if value.get("system_anchor_mode") != "synchronized_fixed_state_four_process_nccl":
+        raise S209WorkerBlocked("FOUR_GPU_NCCL_SYSTEM_MODE_REQUIRED")
+    if value.get("communication_mode") != "nccl_all_reduce_s1_s2":
+        raise S209WorkerBlocked("FOUR_GPU_NCCL_COLLECTIVE_REQUIRED")
+    if value.get("rank_partition_mode") != "disjoint_complete_microbatch_groups":
+        raise S209WorkerBlocked("FOUR_GPU_DISJOINT_PARTITION_REQUIRED")
+    if value.get("statistical_unit") != "microbatch" or value.get("barrier_count") != 2:
+        raise S209WorkerBlocked("FOUR_GPU_STATISTICAL_OR_BARRIER_CONTRACT_INVALID")
+    if value.get("all_reduce_s1_count") != 4 or value.get("all_reduce_s2_count") != 4 or value.get("all_reduce_weight_count") != 4 or value.get("all_reduce_count") != 16:
+        raise S209WorkerBlocked("FOUR_GPU_ALL_REDUCE_COUNT_INVALID")
+    for name in ("barrier_seconds", "global_weight", "all_reduce_s1_seconds", "all_reduce_s2_seconds", "all_reduce_weight_seconds", "all_reduce_count_seconds", "four_card_throughput_sequences_per_second", "single_card_throughput_sequences_per_second", "strong_scaling_speedup", "strong_scaling_efficiency", "strong_scaling_reference_wall_seconds"):
+        item = value.get(name)
+        if isinstance(item, bool) or not isinstance(item, (int, float)) or not math.isfinite(float(item)) or float(item) <= 0:
+            raise S209WorkerBlocked(f"FOUR_GPU_SYSTEM_FLOAT_INVALID:{name}")
+    if int(value["communication_bytes"]) <= 0:
+        raise S209WorkerBlocked("FOUR_GPU_COMMUNICATION_OR_SCALING_INVALID")
+    for name in ("all_reduce_s1_bytes", "all_reduce_s2_bytes", "all_reduce_weight_bytes", "all_reduce_count_bytes", "statistical_unit_count", "global_statistical_unit_count", "strong_scaling_reference_sequence_count", "strong_scaling_reference_token_count", "strong_scaling_reference_backward_count"):
+        item = value.get(name)
+        if isinstance(item, bool) or not isinstance(item, int) or item <= 0:
+            raise S209WorkerBlocked(f"FOUR_GPU_SYSTEM_COUNT_INVALID:{name}")
+    baseline = task.get("single_gpu_anchor")
+    if not isinstance(baseline, Mapping):
+        raise S209WorkerBlocked("FOUR_GPU_SINGLE_ANCHOR_REFERENCE_REQUIRED")
+    if value.get("single_anchor_identity_hash") != baseline.get("identity_hash"):
+        raise S209WorkerBlocked("FOUR_GPU_SINGLE_ANCHOR_IDENTITY_DRIFT")
+    if not isinstance(value.get("fixed_checkpoint_id"), str) or not value["fixed_checkpoint_id"]:
+        raise S209WorkerBlocked("FOUR_GPU_CHECKPOINT_ID_INVALID")
+    for name in ("checkpoint_hash", "mapping_hash", "sample_mapping_hash", "four_process_identity_hash", "global_s1_hash", "global_s2_hash", "estimate_hash", "gradient_pool_hash", "state_digest", "state_digest_after", "all_reduce_identity_hash", "single_anchor_identity_hash"):
+        item = value.get(name)
+        if not isinstance(item, str) or len(item) != _SHA256_LENGTH or any(char not in "0123456789abcdef" for char in item):
+            raise S209WorkerBlocked(f"FOUR_GPU_HASH_INVALID:{name}")
+    for name in ("sequence_count", "token_count", "backward_count"):
+        if value.get(name) != baseline.get(name) or value.get(f"strong_scaling_reference_{name}") != baseline.get(name):
+            raise S209WorkerBlocked(f"FOUR_GPU_SINGLE_FOUR_{name.upper()}_MISMATCH")
+    local_hashes = value.get("local_sample_mapping_hashes")
+    local_gradient_hashes = value.get("local_gradient_pool_hashes")
+    if not isinstance(local_hashes, list) or len(local_hashes) != 4 or len(set(local_hashes)) != 4 or any(not isinstance(item, str) or len(item) != _SHA256_LENGTH or any(char not in "0123456789abcdef" for char in item) for item in local_hashes):
+        raise S209WorkerBlocked("FOUR_GPU_PARTITION_HASHES_INVALID")
+    if not isinstance(local_gradient_hashes, list) or len(local_gradient_hashes) != 4 or len(set(local_gradient_hashes)) != 4 or any(not isinstance(item, str) or len(item) != _SHA256_LENGTH or any(char not in "0123456789abcdef" for char in item) for item in local_gradient_hashes):
+        raise S209WorkerBlocked("FOUR_GPU_LOCAL_GRADIENT_HASHES_INVALID")
+    devices = value.get("per_device_measurements")
+    if not isinstance(devices, list) or len(devices) != 4 or any(not isinstance(item, Mapping) for item in devices):
+        raise S209WorkerBlocked("FOUR_GPU_PER_DEVICE_ROWS_REQUIRED")
+    expected_devices = {(rank, uuid) for rank, uuid in enumerate(APPROVED_GPU_UUIDS)}
+    observed_devices = {(item.get("rank"), item.get("gpu_uuid")) for item in devices}
+    if observed_devices != expected_devices:
+        raise S209WorkerBlocked("FOUR_GPU_PER_DEVICE_UUID_BINDING_INVALID")
+    if {item.get("local_sample_mapping_hash") for item in devices} != set(local_hashes):
+        raise S209WorkerBlocked("FOUR_GPU_PER_DEVICE_PARTITION_HASH_DRIFT")
+    ranked_devices = sorted(devices, key=lambda item: item.get("rank", -1))
+    if [item.get("local_sample_mapping_hash") for item in ranked_devices] != local_hashes:
+        raise S209WorkerBlocked("FOUR_GPU_PER_DEVICE_PARTITION_ORDER_DRIFT")
+    if [item.get("local_gradient_pool_hash") for item in ranked_devices] != local_gradient_hashes:
+        raise S209WorkerBlocked("FOUR_GPU_PER_DEVICE_GRADIENT_HASH_DRIFT")
+    for item in ranked_devices:
+        item_hash = item.get("all_reduce_identity_hash")
+        if not isinstance(item_hash, str) or len(item_hash) != _SHA256_LENGTH or any(char not in "0123456789abcdef" for char in item_hash):
+            raise S209WorkerBlocked("FOUR_GPU_PER_DEVICE_ALL_REDUCE_HASH_INVALID")
+    for item in ranked_devices:
+        if any(item.get(name) != value.get(name) for name in ("fixed_checkpoint_id", "checkpoint_hash", "mapping_hash", "global_s1_hash", "global_s2_hash", "estimate_hash", "state_digest", "state_digest_after")):
+            raise S209WorkerBlocked("FOUR_GPU_PER_DEVICE_NUMERIC_IDENTITY_DRIFT")
+    expected_all_reduce_identity_hash = canonical_json_hash(
+        [
+            {"rank": int(item["rank"]), "gpu_uuid": str(item["gpu_uuid"]), "identity_hash": str(item["all_reduce_identity_hash"])}
+            for item in ranked_devices
+        ]
+    )
+    if value["all_reduce_identity_hash"] != expected_all_reduce_identity_hash:
+        raise S209WorkerBlocked("FOUR_GPU_ALL_REDUCE_IDENTITY_DRIFT")
+    expected_four_process_identity_hash = canonical_json_hash(
+        {
+            "gpu_uuids": list(APPROVED_GPU_UUIDS),
+            "sample_mapping_hash": value["sample_mapping_hash"],
+            "gradient_pool_hash": value["gradient_pool_hash"],
+            "estimate_hash": value["estimate_hash"],
+            "state_digest": value["state_digest"],
+            "state_digest_after": value["state_digest_after"],
+            "checkpoint_hash": value["checkpoint_hash"],
+            "mapping_hash": value["mapping_hash"],
+        }
+    )
+    if value["four_process_identity_hash"] != expected_four_process_identity_hash:
+        raise S209WorkerBlocked("FOUR_GPU_PROCESS_IDENTITY_DRIFT")
+    if sum(int(item.get("sequence_count", -1)) for item in devices) != int(value["sequence_count"]):
+        raise S209WorkerBlocked("FOUR_GPU_PER_DEVICE_SEQUENCE_COUNT_MISMATCH")
+    if sum(int(item.get("token_count", -1)) for item in devices) != int(value["token_count"]):
+        raise S209WorkerBlocked("FOUR_GPU_PER_DEVICE_TOKEN_COUNT_MISMATCH")
+    if sum(int(item.get("backward_count", -1)) for item in devices) != int(value["backward_count"]):
+        raise S209WorkerBlocked("FOUR_GPU_PER_DEVICE_BACKWARD_COUNT_MISMATCH")
+
+
 def _validate_backend_output(value: Any, *, task: Mapping[str, Any]) -> dict[str, Any]:
     if not isinstance(value, Mapping):
         raise S209WorkerBlocked("PROFILER_OUTPUT_OBJECT_REQUIRED")
@@ -293,6 +427,8 @@ def _validate_backend_output(value: Any, *, task: Mapping[str, Any]) -> dict[str
                 raise S209WorkerBlocked("PROFILER_SHARED_SAMPLE_COUNT_MISMATCH")
         return output
     _require_actual_measurement(output, task=task)
+    if task["semantic"] == "anchor" and task.get("device_count") == 4:
+        _require_four_gpu_system_anchor(output, task=task)
     return output
 
 

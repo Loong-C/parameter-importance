@@ -19,6 +19,7 @@ from param_importance_nlp.experiments.stage2_s209_g27a import (
 from param_importance_nlp.experiments.stage2_s209_worker import (
     S209_WORKER_CONFIG_SCHEMA,
     S209WorkerBlocked,
+    _task_from_environment,
     run_s209_profiler_worker,
 )
 from param_importance_nlp.experiments.stage2_s209_production import (
@@ -237,6 +238,40 @@ def test_repository_production_backend_has_no_cpu_or_synthetic_fallback() -> Non
     # measurement when CUDA is absent.
     with pytest.raises(S209ProductionBlocked, match="CUDA_SINGLE_DEVICE_REQUIRED"):
         _device_identity(UUID)
+
+
+def test_worker_four_anchor_requires_hash_bound_single_card_reference() -> None:
+    uuids = list(APPROVED_GPU_UUIDS)
+    environment = {
+        "S29_SEMANTIC": "anchor",
+        "S29_METHOD": "anchor",
+        "S29_RUN_ID": "s209-worker-test",
+        "S29_PLAN_HASH": PLAN_HASH,
+        "S29_ANCHOR_ID": "four-gpu-anchor",
+        "S29_REPETITION": "0",
+        "S29_GPU_UUIDS": ",".join(uuids),
+        "CUDA_VISIBLE_DEVICES": ",".join(uuids),
+        "S29_SINGLE_ANCHOR_WALL_SECONDS": "10",
+        "S29_SINGLE_ANCHOR_SEQUENCE_COUNT": "32",
+        "S29_SINGLE_ANCHOR_TOKEN_COUNT": "1024",
+        "S29_SINGLE_ANCHOR_BACKWARD_COUNT": "16",
+    }
+    baseline = {
+        "anchor_id": "single-gpu-anchor",
+        "run_id": environment["S29_RUN_ID"],
+        "gpu_uuid": uuids[0],
+        "device_count": 1,
+        "sequence_count": 32,
+        "token_count": 1024,
+        "backward_count": 16,
+        "wall_seconds": 10.0,
+    }
+    environment["S29_SINGLE_ANCHOR_IDENTITY_HASH"] = canonical_json_hash(baseline)
+    task = _task_from_environment(environment)
+    assert task["single_gpu_anchor"]["identity_hash"] == environment["S29_SINGLE_ANCHOR_IDENTITY_HASH"]
+    environment["S29_SINGLE_ANCHOR_IDENTITY_HASH"] = "f" * 64
+    with pytest.raises(S209WorkerBlocked, match="SINGLE_ANCHOR_IDENTITY_DRIFT"):
+        _task_from_environment(environment)
 
 
 def test_output_byte_counter_is_content_derived() -> None:

@@ -22,6 +22,7 @@ from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 import hashlib
 import json
+import math
 import os
 from pathlib import Path, PurePosixPath
 import re
@@ -1488,6 +1489,34 @@ class S29ProfilerRunner:
             "S29_IO_EVIDENCE_HASH": str(self.preflight.io_evidence["artifact_hash"]),
             "S29_COST_IO_QUIESCENT": str(bool(self.preflight.io_evidence.get("cost_io_quiescent"))).lower(),
         }
+        if int(task["device_count"]) == 4:
+            # The four-card system measurement is a strong-scaling comparison
+            # against the same frozen single-card anchor already completed by
+            # ``run``.  Pass only its validated scalar identity through the
+            # worker environment; the worker must fail closed if it is absent.
+            single = self.single_gpu_anchor
+            if not isinstance(single, Mapping):
+                raise S29RunnerBlocked("FOUR_GPU_SINGLE_ANCHOR_REFERENCE_REQUIRED")
+            env.update(
+                {
+                    "S29_SINGLE_ANCHOR_WALL_SECONDS": str(float(single["wall_seconds"])),
+                    "S29_SINGLE_ANCHOR_SEQUENCE_COUNT": str(int(single["sequence_count"])),
+                    "S29_SINGLE_ANCHOR_TOKEN_COUNT": str(int(single["token_count"])),
+                    "S29_SINGLE_ANCHOR_BACKWARD_COUNT": str(int(single["backward_count"])),
+                    "S29_SINGLE_ANCHOR_IDENTITY_HASH": canonical_json_hash(
+                        {
+                            "anchor_id": "single-gpu-anchor",
+                            "run_id": self.run_id,
+                            "gpu_uuid": task["gpu_uuid"],
+                            "device_count": 1,
+                            "sequence_count": int(single["sequence_count"]),
+                            "token_count": int(single["token_count"]),
+                            "backward_count": int(single["backward_count"]),
+                            "wall_seconds": float(single["wall_seconds"]),
+                        }
+                    ),
+                }
+            )
         try:
             measured = self.profiler(task, environment=env)
             # Validate the system anchor using its own semantic.  Converting a
@@ -1523,6 +1552,61 @@ class S29ProfilerRunner:
                 "measurement_source": "profiler_worker",
                 "io_evidence_hash": self.preflight.io_evidence["artifact_hash"],
             }
+            if int(task["device_count"]) == 4:
+                required_system_fields = (
+                    *S29_TIMING_FIELDS,
+                    "barrier_seconds",
+                    "barrier_count",
+                    "statistical_unit",
+                    "statistical_unit_count",
+                    "global_statistical_unit_count",
+                    "global_weight",
+                    "system_anchor_mode",
+                    "communication_mode",
+                    "rank_partition_mode",
+                    "all_reduce_s1_seconds",
+                    "all_reduce_s2_seconds",
+                    "all_reduce_weight_seconds",
+                    "all_reduce_count_seconds",
+                    "all_reduce_s1_bytes",
+                    "all_reduce_s2_bytes",
+                    "all_reduce_weight_bytes",
+                    "all_reduce_count_bytes",
+                    "all_reduce_s1_count",
+                    "all_reduce_s2_count",
+                    "all_reduce_weight_count",
+                    "all_reduce_count",
+                    "all_reduce_identity_hash",
+                    "local_sample_mapping_hashes",
+                    "local_gradient_pool_hashes",
+                    "fixed_checkpoint_id",
+                    "checkpoint_hash",
+                    "mapping_hash",
+                    "sample_mapping_hash",
+                    "state_digest",
+                    "state_digest_after",
+                    "four_process_identity_hash",
+                    "global_s1_hash",
+                    "global_s2_hash",
+                    "estimate_hash",
+                    "gradient_pool_hash",
+                    "per_device_measurements",
+                    "four_card_throughput_sequences_per_second",
+                    "single_card_throughput_sequences_per_second",
+                    "strong_scaling_speedup",
+                    "strong_scaling_efficiency",
+                    "strong_scaling_reference_wall_seconds",
+                    "strong_scaling_reference_sequence_count",
+                    "strong_scaling_reference_token_count",
+                    "strong_scaling_reference_backward_count",
+                    "single_anchor_identity_hash",
+                )
+                missing_system_fields = [name for name in required_system_fields if name not in row]
+                if missing_system_fields:
+                    raise S29RunnerBlocked(
+                        "FOUR_GPU_SYSTEM_FIELDS_MISSING:" + ",".join(missing_system_fields)
+                    )
+                anchor.update({name: row[name] for name in required_system_fields})
             anchor_root.mkdir(parents=True, exist_ok=True)
             _write_once(anchor_path, anchor, field=f"anchor.{key}")
             return anchor
@@ -1554,6 +1638,126 @@ class S29ProfilerRunner:
         for name, value in expected.items():
             if anchor.get(name) != value:
                 raise S29RunnerBlocked(f"ANCHOR_IDENTITY_DRIFT:{task['anchor_id']}:{name}")
+        if int(task["device_count"]) == 4:
+            required_system_fields = (
+                *S29_TIMING_FIELDS,
+                "barrier_seconds",
+                "barrier_count",
+                "statistical_unit",
+                "statistical_unit_count",
+                "global_statistical_unit_count",
+                "global_weight",
+                "system_anchor_mode",
+                "communication_mode",
+                "rank_partition_mode",
+                "all_reduce_s1_seconds",
+                "all_reduce_s2_seconds",
+                "all_reduce_weight_seconds",
+                "all_reduce_count_seconds",
+                "all_reduce_s1_bytes",
+                "all_reduce_s2_bytes",
+                "all_reduce_weight_bytes",
+                "all_reduce_count_bytes",
+                "all_reduce_s1_count",
+                "all_reduce_s2_count",
+                "all_reduce_weight_count",
+                "all_reduce_count",
+                "all_reduce_identity_hash",
+                "local_sample_mapping_hashes",
+                "local_gradient_pool_hashes",
+                "fixed_checkpoint_id",
+                "checkpoint_hash",
+                "mapping_hash",
+                "sample_mapping_hash",
+                "state_digest",
+                "state_digest_after",
+                "four_process_identity_hash",
+                "global_s1_hash",
+                "global_s2_hash",
+                "estimate_hash",
+                "gradient_pool_hash",
+                "per_device_measurements",
+                "four_card_throughput_sequences_per_second",
+                "single_card_throughput_sequences_per_second",
+                "strong_scaling_speedup",
+                "strong_scaling_efficiency",
+                "strong_scaling_reference_wall_seconds",
+                "strong_scaling_reference_sequence_count",
+                "strong_scaling_reference_token_count",
+                "strong_scaling_reference_backward_count",
+                "single_anchor_identity_hash",
+            )
+            missing = [name for name in required_system_fields if name not in anchor]
+            if missing:
+                raise S29RunnerBlocked(
+                    "FOUR_GPU_SYSTEM_FIELDS_MISSING:" + ",".join(missing)
+                )
+            if anchor["system_anchor_mode"] != "synchronized_fixed_state_four_process_nccl" or anchor["communication_mode"] != "nccl_all_reduce_s1_s2" or anchor["rank_partition_mode"] != "disjoint_complete_microbatch_groups":
+                raise S29RunnerBlocked("FOUR_GPU_SYSTEM_COLLECTIVE_CONTRACT_INVALID")
+            if anchor["statistical_unit"] != "microbatch" or anchor["barrier_count"] != 2 or anchor["all_reduce_s1_count"] != 4 or anchor["all_reduce_s2_count"] != 4 or anchor["all_reduce_count"] != 16:
+                raise S29RunnerBlocked("FOUR_GPU_SYSTEM_COLLECTIVE_COUNT_INVALID")
+            for name in ("barrier_seconds", "global_weight", "all_reduce_s1_seconds", "all_reduce_s2_seconds", "all_reduce_weight_seconds", "all_reduce_count_seconds", "four_card_throughput_sequences_per_second", "single_card_throughput_sequences_per_second", "strong_scaling_speedup", "strong_scaling_efficiency", "strong_scaling_reference_wall_seconds"):
+                value = anchor[name]
+                if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value)) or float(value) <= 0:
+                    raise S29RunnerBlocked(f"FOUR_GPU_SYSTEM_FLOAT_INVALID:{name}")
+            for name in ("all_reduce_s1_bytes", "all_reduce_s2_bytes", "all_reduce_weight_bytes", "all_reduce_count_bytes", "all_reduce_weight_count", "statistical_unit_count", "global_statistical_unit_count", "strong_scaling_reference_sequence_count", "strong_scaling_reference_token_count", "strong_scaling_reference_backward_count"):
+                value = anchor[name]
+                if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                    raise S29RunnerBlocked(f"FOUR_GPU_SYSTEM_COUNT_INVALID:{name}")
+            if anchor["communication_bytes"] <= 0:
+                raise S29RunnerBlocked("FOUR_GPU_SYSTEM_COMMUNICATION_OR_SCALING_INVALID")
+            local_hashes = anchor["local_sample_mapping_hashes"]
+            if not isinstance(local_hashes, list) or len(local_hashes) != 4 or len(set(local_hashes)) != 4 or any(not _SHA256.fullmatch(str(value)) for value in local_hashes):
+                raise S29RunnerBlocked("FOUR_GPU_SYSTEM_PARTITION_HASH_INVALID")
+            for name in ("checkpoint_hash", "mapping_hash", "sample_mapping_hash", "state_digest", "state_digest_after", "four_process_identity_hash", "global_s1_hash", "global_s2_hash", "estimate_hash", "gradient_pool_hash", "all_reduce_identity_hash"):
+                if not isinstance(anchor[name], str) or _SHA256.fullmatch(anchor[name]) is None:
+                    raise S29RunnerBlocked(f"FOUR_GPU_SYSTEM_HASH_INVALID:{name}")
+            if not isinstance(anchor["fixed_checkpoint_id"], str) or not anchor["fixed_checkpoint_id"]:
+                raise S29RunnerBlocked("FOUR_GPU_SYSTEM_CHECKPOINT_ID_INVALID")
+            local_gradient_hashes = anchor["local_gradient_pool_hashes"]
+            if not isinstance(local_gradient_hashes, list) or len(local_gradient_hashes) != 4 or len(set(local_gradient_hashes)) != 4 or any(not isinstance(value, str) or _SHA256.fullmatch(value) is None for value in local_gradient_hashes):
+                raise S29RunnerBlocked("FOUR_GPU_SYSTEM_LOCAL_GRADIENT_HASH_INVALID")
+            _sha(anchor["single_anchor_identity_hash"], field="single_anchor_identity_hash")
+            devices = anchor["per_device_measurements"]
+            if not isinstance(devices, list) or len(devices) != 4:
+                raise S29RunnerBlocked("FOUR_GPU_SYSTEM_DEVICE_ROWS_INVALID")
+            observed_devices = {(item.get("rank"), item.get("gpu_uuid")) for item in devices if isinstance(item, Mapping)}
+            if observed_devices != {(index, uuid) for index, uuid in enumerate(task["gpu_uuids"])}:
+                raise S29RunnerBlocked("FOUR_GPU_SYSTEM_DEVICE_IDENTITY_INVALID")
+            ranked_devices = sorted(devices, key=lambda item: item["rank"])
+            if [item.get("local_sample_mapping_hash") for item in ranked_devices] != local_hashes:
+                raise S29RunnerBlocked("FOUR_GPU_SYSTEM_PARTITION_HASH_DRIFT")
+            if [item.get("local_gradient_pool_hash") for item in ranked_devices] != local_gradient_hashes:
+                raise S29RunnerBlocked("FOUR_GPU_SYSTEM_GRADIENT_HASH_DRIFT")
+            for item in ranked_devices:
+                item_hash = item.get("all_reduce_identity_hash")
+                if not isinstance(item_hash, str) or _SHA256.fullmatch(item_hash) is None:
+                    raise S29RunnerBlocked("FOUR_GPU_SYSTEM_DEVICE_ALL_REDUCE_HASH_INVALID")
+            for item in ranked_devices:
+                if any(item.get(name) != anchor.get(name) for name in ("fixed_checkpoint_id", "checkpoint_hash", "mapping_hash", "global_s1_hash", "global_s2_hash", "estimate_hash", "state_digest", "state_digest_after")):
+                    raise S29RunnerBlocked("FOUR_GPU_SYSTEM_NUMERIC_IDENTITY_DRIFT")
+            expected_all_reduce_identity_hash = canonical_json_hash(
+                [
+                    {"rank": int(item["rank"]), "gpu_uuid": str(item["gpu_uuid"]), "identity_hash": str(item["all_reduce_identity_hash"])}
+                    for item in ranked_devices
+                ]
+            )
+            if anchor["all_reduce_identity_hash"] != expected_all_reduce_identity_hash:
+                raise S29RunnerBlocked("FOUR_GPU_SYSTEM_ALL_REDUCE_IDENTITY_DRIFT")
+            expected_four_process_identity_hash = canonical_json_hash(
+                {
+                    "gpu_uuids": list(task["gpu_uuids"]),
+                    "sample_mapping_hash": anchor["sample_mapping_hash"],
+                    "gradient_pool_hash": anchor["gradient_pool_hash"],
+                    "estimate_hash": anchor["estimate_hash"],
+                    "state_digest": anchor["state_digest"],
+                    "state_digest_after": anchor["state_digest_after"],
+                    "checkpoint_hash": anchor["checkpoint_hash"],
+                    "mapping_hash": anchor["mapping_hash"],
+                }
+            )
+            if anchor["four_process_identity_hash"] != expected_four_process_identity_hash:
+                raise S29RunnerBlocked("FOUR_GPU_SYSTEM_PROCESS_IDENTITY_DRIFT")
         for name in S29_COUNT_FIELDS:
             value = anchor.get(name)
             if isinstance(value, bool) or not isinstance(value, int) or value < 0:
