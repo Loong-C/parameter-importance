@@ -5,7 +5,7 @@ import hashlib
 
 import pytest
 
-from param_importance_nlp.contracts.jsonio import canonical_json_hash, load_canonical_json
+from param_importance_nlp.contracts.jsonio import canonical_json_hash, load_canonical_json, write_canonical_json
 from param_importance_nlp.contracts.status import GateRecord
 from param_importance_nlp.experiments.stage2_s211_delivery import S211DeliveryBlocked, run_s211_g28
 from param_importance_nlp.experiments.stage2 import EstimatorDecision
@@ -138,6 +138,7 @@ def test_s211_missing_refs_publishes_blocked_append_only_bundle(tmp_path: Path) 
     assert result["status"] == "BLOCKED"
     assert result["formal_eligible"] is False
     assert (tmp_path / "delivery" / "g2.8-gate.json").exists()
+    assert result["delivery_roles"]["replay_report.json"]["schema_version"] == "stage2-s211-replay-report-v1"
     with pytest.raises(S211DeliveryBlocked, match="OUTPUT_ROOT_MUST_BE_NEW"):
         run_s211_g28(data_root=tmp_path, output_root=tmp_path / "delivery", producer_commit="a" * 40)
 
@@ -352,3 +353,108 @@ def test_s211_sync_report_missing_legacy_and_escape_refs_block(tmp_path: Path) -
         predecessor_gates=upstream, delivery_refs=roles_legacy, producer_commit="a" * 40,
     )
     assert "LEGACY_LOCAL_TEMP_MUST_NOT_BE_BOUND" in result["delivery_manifest"]["reasons"]
+
+
+def test_s211_accepts_s210_producer_gate_and_task_output_wrapper(tmp_path: Path) -> None:
+    gate, decision, lineage, values, upstream, roles = _inputs(tmp_path)
+    producer_body = dict(gate)
+    producer_body["schema_version"] = "stage2-s210-g27b-gate-v1"
+    producer_body["task_id"] = "stage2.10_visualization_reporting_and_decision"
+    producer_body["formal_eligible"] = True
+    producer_gate = _hashed({key: value for key, value in producer_body.items() if key != "artifact_hash"})
+    wrapper = _hashed({
+        "schema_version": "task-output-artifact-v1",
+        "task_id": "stage2.10_visualization_reporting_and_decision",
+        "artifact_kind": "g27b_gate",
+        "config_hash": "d" * 64,
+        "run_intent": "formal",
+        "formal_eligible": True,
+        "source_refs": ["s210/g2.7b-gate.json"],
+        "payload": producer_gate,
+    })
+    result = run_s211_g28(
+        g27b_gate=wrapper,
+        g27b_decision=decision,
+        stage2_lineage=lineage,
+        boundary_refs={key: value for key, value in values.items() if key != "replay_audit_31m"},
+        replay_audit_31m=values["replay_audit_31m"],
+        data_root=tmp_path,
+        predecessor_gates=upstream,
+        delivery_refs=roles,
+        producer_commit="a" * 40,
+        consumer_commit="b" * 40,
+    )
+    assert result["status"] == "PASS"
+    assert result["delivery_manifest"]["g27b_gate_hash"] == producer_gate["artifact_hash"]
+
+
+def test_s211_relative_refs_are_rooted_at_data_root(tmp_path: Path) -> None:
+    gate, decision, lineage, values, upstream, roles = _inputs(tmp_path)
+    write_canonical_json(tmp_path / "g27b.json", gate)
+    write_canonical_json(tmp_path / "decision.json", decision)
+    result = run_s211_g28(
+        g27b_gate=Path("g27b.json"),
+        g27b_decision=Path("decision.json"),
+        stage2_lineage=lineage,
+        boundary_refs={key: value for key, value in values.items() if key != "replay_audit_31m"},
+        replay_audit_31m=values["replay_audit_31m"],
+        data_root=tmp_path,
+        predecessor_gates=upstream,
+        delivery_refs=roles,
+        producer_commit="a" * 40,
+        consumer_commit="b" * 40,
+    )
+    assert result["status"] == "PASS"
+    assert not any(reason.startswith("g27b_gate:") for reason in result["delivery_manifest"]["reasons"])
+    assert not any(reason.startswith("g27b_decision:") for reason in result["delivery_manifest"]["reasons"])
+
+
+def test_s211_replay_source_hash_is_required(tmp_path: Path) -> None:
+    gate, decision, lineage, values, upstream, roles = _inputs(tmp_path)
+    replay = dict(values["replay_audit_31m"])
+    replay.pop("source_artifact_hash")
+    replay = _hashed({key: value for key, value in replay.items() if key != "artifact_hash"})
+    result = run_s211_g28(
+        g27b_gate=gate,
+        g27b_decision=decision,
+        stage2_lineage=lineage,
+        boundary_refs={key: value for key, value in values.items() if key != "replay_audit_31m"},
+        replay_audit_31m=replay,
+        data_root=tmp_path,
+        predecessor_gates=upstream,
+        delivery_refs=roles,
+        producer_commit="a" * 40,
+        consumer_commit="b" * 40,
+    )
+    assert result["status"] == "BLOCKED"
+    assert "REPLAY_31M_SOURCE_HASH_MISSING" in result["delivery_manifest"]["reasons"]
+
+
+def test_s211_duplicate_lineage_and_role_schema_mismatch_block(tmp_path: Path) -> None:
+    gate, decision, lineage, values, upstream, roles = _inputs(tmp_path)
+    lineage_body = {key: value for key, value in lineage.items() if key != "artifact_hash"}
+    lineage_body["tasks"] = list(lineage_body["tasks"].values()) + [
+        dict(next(iter(lineage_body["tasks"].values())))
+    ]
+    duplicate_lineage = _hashed(lineage_body)
+    broken_roles = dict(roles)
+    broken_replay_report = dict(broken_roles["replay_report"])
+    broken_replay_report["schema_version"] = "wrong-role-schema-v1"
+    broken_roles["replay_report"] = _hashed({
+        key: value for key, value in broken_replay_report.items() if key != "artifact_hash"
+    })
+    result = run_s211_g28(
+        g27b_gate=gate,
+        g27b_decision=decision,
+        stage2_lineage=duplicate_lineage,
+        boundary_refs={key: value for key, value in values.items() if key != "replay_audit_31m"},
+        replay_audit_31m=values["replay_audit_31m"],
+        data_root=tmp_path,
+        predecessor_gates=upstream,
+        delivery_refs=broken_roles,
+        producer_commit="a" * 40,
+        consumer_commit="b" * 40,
+    )
+    assert result["status"] == "BLOCKED"
+    assert f"STAGE2_LINEAGE_DUPLICATE:{TASKS[0]}" in result["delivery_manifest"]["reasons"]
+    assert "DELIVERY_ROLE_SCHEMA_MISMATCH:replay_report" in result["delivery_manifest"]["reasons"]
