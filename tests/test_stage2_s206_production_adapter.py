@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from types import SimpleNamespace
+import hashlib
 
 import numpy as np
 import pytest
@@ -85,9 +86,16 @@ def _write_gpu_inventory(path: Path) -> None:
                 "gpu_recovery_action": "None",
             }
         )
+    data_root = path.parent.parent
+    source_path = path.parent / "gpu-inventory.capture.txt"
+    source_bytes = b"test live GPU capture\n"
+    source_path.parent.mkdir(parents=True, exist_ok=True)
+    source_path.write_bytes(source_bytes)
     payload: dict[str, object] = {
         "schema_version": GPU_INVENTORY_SCHEMA,
-        "source_ref": "evidence/gpu-inventory.json",
+        "artifact_ref": path.relative_to(data_root).as_posix(),
+        "source_ref": source_path.relative_to(data_root).as_posix(),
+        "source_sha256": hashlib.sha256(source_bytes).hexdigest(),
         "rows": rows,
         "compute_apps": [],
     }
@@ -248,7 +256,7 @@ def test_retry_policy_is_required_and_hash_bound_when_retries_enabled(tmp_path: 
 def test_detached_wait_recovers_final_g24b_freeze(tmp_path: Path) -> None:
     inventory_path = tmp_path / "evidence/gpu-inventory.json"
     _write_gpu_inventory(inventory_path)
-    _rows, identity = launcher._load_inventory_snapshot(inventory_path)
+    _rows, identity = launcher._load_inventory_snapshot(inventory_path, data_root=tmp_path)
     preflight = {"status": "READY"}
     preflight["preflight_artifact_hash"] = canonical_json_hash(preflight)
     write_canonical_json(
@@ -261,7 +269,8 @@ def test_detached_wait_recovers_final_g24b_freeze(tmp_path: Path) -> None:
             "preflight": preflight,
             "preflight_artifact_hash": preflight["preflight_artifact_hash"],
             "gpu_inventory_path": str(inventory_path.resolve()),
-            "gpu_inventory_ref": identity["source_ref"],
+            "gpu_inventory_ref": identity["artifact_ref"],
+            "gpu_inventory_source_ref": identity["source_ref"],
             "gpu_inventory_artifact_hash": identity["artifact_hash"],
             "gpu_inventory_source_sha256": identity["source_sha256"],
         },

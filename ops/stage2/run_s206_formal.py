@@ -131,17 +131,24 @@ def _load_inventory_snapshot(
     path: Path | None,
     *,
     data_root: Path | None = None,
+    _allow_legacy: bool = False,
 ) -> tuple[list[dict[str, object]], dict[str, object]]:
-    """Load the hash-bound inventory artifact used by every formal path."""
+    """Load the fully source-bound inventory used by formal paths.
+
+    ``_allow_legacy`` exists only for the private ``_load_inventory`` fixture
+    compatibility helper.  Preflight, execute, detached status and recovery
+    all use the default strict mode, which requires a distinct artifact ref
+    and raw-capture source digest.
+    """
 
     if path is None:
         raise S206PreparationBlocked("GPU_INVENTORY_JSON_REQUIRED")
     resolved = path.resolve()
-    expected_source_ref: str | None = None
+    root = data_root.resolve() if data_root is not None else resolved.parent
+    expected_artifact_ref: str | None = None
     if data_root is not None:
-        root = data_root.resolve()
         try:
-            expected_source_ref = resolved.relative_to(root).as_posix()
+            expected_artifact_ref = resolved.relative_to(root).as_posix()
         except ValueError as error:
             raise S206PreparationBlocked("GPU_INVENTORY_PATH_OUTSIDE_DATA_ROOT") from error
     try:
@@ -160,11 +167,29 @@ def _load_inventory_snapshot(
     if not isinstance(rows, list) or not all(isinstance(row, Mapping) for row in rows):
         raise S206PreparationBlocked("GPU_INVENTORY_JSON_ROWS_REQUIRED")
     source_ref = value.get("source_ref")
+    artifact_ref = value.get("artifact_ref")
     artifact_hash = value.get("artifact_hash")
     if not isinstance(source_ref, str) or not source_ref:
         raise S206PreparationBlocked("GPU_INVENTORY_SOURCE_REF_REQUIRED")
-    if expected_source_ref is not None and source_ref != expected_source_ref:
-        raise S206PreparationBlocked("GPU_INVENTORY_SOURCE_REF_PATH_MISMATCH")
+    if artifact_ref is not None:
+        if not isinstance(artifact_ref, str) or not artifact_ref or "\\" in artifact_ref:
+            raise S206PreparationBlocked("GPU_INVENTORY_ARTIFACT_REF_INVALID")
+        if expected_artifact_ref is not None and artifact_ref != expected_artifact_ref:
+            raise S206PreparationBlocked("GPU_INVENTORY_ARTIFACT_REF_PATH_MISMATCH")
+        try:
+            source_path = _logical(root, source_ref, field="GPU_INVENTORY_SOURCE_REF")
+        except (ValueError, OSError) as error:
+            raise S206PreparationBlocked("GPU_INVENTORY_SOURCE_REF_PATH_INVALID") from error
+        if source_path == resolved:
+            raise S206PreparationBlocked("GPU_INVENTORY_SOURCE_REF_SELF_REFERENCE")
+    else:
+        if not _allow_legacy:
+            raise S206PreparationBlocked("GPU_INVENTORY_ARTIFACT_REF_REQUIRED")
+        # Legacy envelope: source_ref names the inventory itself.  This path
+        # is accepted only by the explicitly non-formal compatibility helper.
+        if expected_artifact_ref is not None and source_ref != expected_artifact_ref:
+            raise S206PreparationBlocked("GPU_INVENTORY_SOURCE_REF_PATH_MISMATCH")
+        source_path = resolved
     if not isinstance(artifact_hash, str) or len(artifact_hash) != 64 or any(
         char not in "0123456789abcdef" for char in artifact_hash
     ):
@@ -173,10 +198,14 @@ def _load_inventory_snapshot(
     if canonical_json_hash(body) != artifact_hash:
         raise S206PreparationBlocked("GPU_INVENTORY_ARTIFACT_HASH_MISMATCH")
     declared_source_sha = value.get("source_sha256")
-    source_sha = _file_sha256(resolved)
+    source_sha = _file_sha256(source_path)
+    if declared_source_sha is None and not _allow_legacy:
+        raise S206PreparationBlocked("GPU_INVENTORY_SOURCE_SHA256_REQUIRED")
     if declared_source_sha is not None:
         if not isinstance(declared_source_sha, str) or declared_source_sha != source_sha:
             raise S206PreparationBlocked("GPU_INVENTORY_SOURCE_SHA256_MISMATCH")
+        if artifact_ref is None:
+            raise S206PreparationBlocked("GPU_INVENTORY_SOURCE_SHA256_SELF_REFERENCE")
     if "compute_apps" not in value:
         raise S206PreparationBlocked("GPU_INVENTORY_COMPUTE_APPS_REQUIRED")
     apps = value["compute_apps"]
@@ -188,6 +217,7 @@ def _load_inventory_snapshot(
         raise S206PreparationBlocked("GPU_INVENTORY_JSON_INVALID") from error
     return normalized, {
         "source_ref": source_ref,
+        "artifact_ref": artifact_ref or expected_artifact_ref,
         "artifact_hash": artifact_hash,
         "source_sha256": source_sha,
         "path": str(resolved),
@@ -197,9 +227,9 @@ def _load_inventory_snapshot(
 
 
 def _load_inventory(path: Path | None) -> list[dict[str, object]]:
-    """Compatibility wrapper returning rows while retaining strict loading."""
+    """Non-formal legacy compatibility wrapper returning normalized rows."""
 
-    rows, _identity = _load_inventory_snapshot(path)
+    rows, _identity = _load_inventory_snapshot(path, _allow_legacy=True)
     return rows
 
 
@@ -247,11 +277,13 @@ def _preflight(args: argparse.Namespace) -> dict[str, object]:
     )
     result["gpu_inventory_identity"] = {
         "source_ref": inventory_identity["source_ref"],
+        "artifact_ref": inventory_identity["artifact_ref"],
         "artifact_hash": inventory_identity["artifact_hash"],
         "source_sha256": inventory_identity["source_sha256"],
         "path": inventory_identity["path"],
     }
-    result["gpu_inventory_ref"] = inventory_identity["source_ref"]
+    result["gpu_inventory_ref"] = inventory_identity["artifact_ref"]
+    result["gpu_inventory_source_ref"] = inventory_identity["source_ref"]
     result["gpu_inventory_artifact_hash"] = inventory_identity["artifact_hash"]
     result["gpu_inventory_source_sha256"] = inventory_identity["source_sha256"]
     result["preflight_artifact_hash"] = canonical_json_hash(result)
@@ -1486,6 +1518,7 @@ def _production_execute(args: argparse.Namespace) -> dict[str, object]:
                 "approved_gpu_uuids": list(APPROVED_GPU_UUIDS),
                 "excluded_pci": EXCLUDED_PCI,
                 "gpu_inventory_ref": preflight["gpu_inventory_ref"],
+                "gpu_inventory_source_ref": preflight["gpu_inventory_source_ref"],
                 "gpu_inventory_artifact_hash": preflight["gpu_inventory_artifact_hash"],
                 "gpu_inventory_source_sha256": preflight["gpu_inventory_source_sha256"],
                 "gpu_inventory_path": preflight["gpu"]["inventory_path"],  # type: ignore[index]
@@ -1767,6 +1800,7 @@ def _production_execute(args: argparse.Namespace) -> dict[str, object]:
         "pilot_mapping_hash": mapping.artifact_hash,
         "execution_evidence_hash": execution.artifact_hash,
         "gpu_inventory_ref": preflight["gpu_inventory_ref"],
+        "gpu_inventory_source_ref": preflight["gpu_inventory_source_ref"],
         "gpu_inventory_artifact_hash": preflight["gpu_inventory_artifact_hash"],
         "gpu_inventory_source_sha256": preflight["gpu_inventory_source_sha256"],
         "gpu_inventory_path": preflight["gpu"]["inventory_path"],  # type: ignore[index]
@@ -1987,6 +2021,7 @@ def _verify_status_inventory_identity(
     required = (
         "gpu_inventory_path",
         "gpu_inventory_ref",
+        "gpu_inventory_source_ref",
         "gpu_inventory_artifact_hash",
         "gpu_inventory_source_sha256",
         "preflight_artifact_hash",
@@ -1998,7 +2033,8 @@ def _verify_status_inventory_identity(
         data_root=data_root,
     )
     if (
-        identity["source_ref"] != value["gpu_inventory_ref"]
+        identity["artifact_ref"] != value["gpu_inventory_ref"]
+        or identity["source_ref"] != value["gpu_inventory_source_ref"]
         or identity["artifact_hash"] != value["gpu_inventory_artifact_hash"]
         or identity["source_sha256"] != value["gpu_inventory_source_sha256"]
     ):
@@ -2083,6 +2119,7 @@ def _detach(args: argparse.Namespace) -> int:
         "log_ref": str(log_path),
         "status_ref": str(operations / "status.json"),
         "gpu_inventory_ref": preflight["gpu_inventory_ref"],
+        "gpu_inventory_source_ref": preflight["gpu_inventory_source_ref"],
         "gpu_inventory_artifact_hash": preflight["gpu_inventory_artifact_hash"],
         "gpu_inventory_source_sha256": preflight["gpu_inventory_source_sha256"],
         "gpu_inventory_path": preflight["gpu"]["inventory_path"],  # type: ignore[index]
