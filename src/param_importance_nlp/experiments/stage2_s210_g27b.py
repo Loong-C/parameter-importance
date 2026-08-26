@@ -22,6 +22,7 @@ import io
 import math
 from pathlib import Path
 import re
+import shutil
 from typing import Any, Mapping, Sequence
 
 from ..contracts.jsonio import canonical_json_hash, load_canonical_json, write_canonical_json
@@ -40,11 +41,36 @@ S210_GATE_ID = "stage2.G2.7b"
 S210_PRIMARY_CELLS = tuple(EXPECTED_CELL_IDS)
 S210_METHODS = ("raw", "double", "u")
 S210_COST_RATIO = 1.25
+S210_QUALITY_GATE_NAMES = frozenset(
+    {
+        "fixed_state",
+        "sample_independence",
+        "reference_convergence",
+        "result_completeness",
+        "finite_numeric_values",
+        "fair_total_draw_budget",
+        "replayability",
+    }
+)
+S210_G26_ANALYSIS_SCHEMA = "stage2-s208-g26-analysis-v1"
+S210_G26_QUALITY_SCHEMA = "stage2-s208-quality-gates-v1"
+S210_G26_HYPOTHESIS_SCHEMA = "stage2-s208-hypothesis-decisions-v1"
+S210_G26_FAMILY_SCHEMA = "stage2-s208-confirmatory-family-v1"
+S210_G26_RAW_CALIBRATION_SCHEMA = "stage2-s208-raw-calibration-v1"
+S210_G27A_REPORT_SCHEMA = "stage2-s209-g27a-cost-system-validation-v1"
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 
 
 class S210G27BBlocked(RuntimeError):
     """Raised for malformed, forged, or identity-inconsistent inputs."""
+
+
+def _safe_run_id(value: Any) -> str:
+    if not isinstance(value, str) or not value or len(value) > 160:
+        raise S210G27BBlocked("RUN_ID_SAFE_REQUIRED")
+    if any(character not in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._:-" for character in value):
+        raise S210G27BBlocked("RUN_ID_SAFE_REQUIRED")
+    return value
 
 
 def _finite(value: Any, *, field: str = "value") -> None:
@@ -114,6 +140,26 @@ def _identity(payload: Mapping[str, Any], *, field: str, required: bool = True) 
     return digest
 
 
+def _analysis_identity(payload: Mapping[str, Any], *, field: str) -> str:
+    """Verify the S2.8 aggregate identity used by its producer.
+
+    S2.8's aggregate predates the generic ``artifact_hash`` field and instead
+    publishes ``analysis_hash`` over the complete object without that field.
+    Accepting an unbound aggregate would allow its list children to be silently
+    replaced before the per-table checks run.
+    """
+
+    if payload.get("schema_version") != S210_G26_ANALYSIS_SCHEMA:
+        raise S210G27BBlocked(f"{field}:SCHEMA_VERSION_UNEXPECTED")
+    declared = payload.get("analysis_hash")
+    if not isinstance(declared, str) or _SHA256.fullmatch(declared) is None:
+        raise S210G27BBlocked(f"{field}:ANALYSIS_HASH_REQUIRED")
+    body = {key: item for key, item in payload.items() if key != "analysis_hash"}
+    if declared != canonical_json_hash(body):
+        raise S210G27BBlocked(f"{field}:ANALYSIS_HASH_MISMATCH")
+    return declared
+
+
 def _write_once(root: Path, name: str, value: Mapping[str, Any]) -> str:
     target = root / name
     if target.exists():
@@ -137,8 +183,11 @@ class _GateView:
     status: GateStatus
     measured: Mapping[str, Any]
     artifact_hash: str
+    record: GateRecord | None = None
 
     def effective_status(self) -> GateStatus:
+        if self.record is not None:
+            return self.record.effective_status()
         return self.status
 
 
@@ -154,6 +203,8 @@ def _gate(value: Mapping[str, Any] | str | Path | None, *, gate_id: str, field: 
         status = payload.get("status")
         if status not in {item.value for item in GateStatus}:
             raise S210G27BBlocked(f"{field}:STATUS_INVALID")
+        if status == GateStatus.PASS.value and payload.get("quality_gate_dependency") is not True:
+            raise S210G27BBlocked(f"{field}:QUALITY_GATE_DEPENDENCY_REQUIRED")
         measured = payload.get("measured")
         if not isinstance(measured, Mapping):
             raise S210G27BBlocked(f"{field}:MEASURED_REQUIRED")
@@ -165,7 +216,7 @@ def _gate(value: Mapping[str, Any] | str | Path | None, *, gate_id: str, field: 
     if record.gate_id != gate_id:
         raise S210G27BBlocked(f"{field}:GATE_ID_MISMATCH")
     digest = _identity(payload, field=field)
-    return _GateView(record.gate_id, record.status, dict(record.measured) if isinstance(record.measured, Mapping) else {}, digest), digest
+    return _GateView(record.gate_id, record.status, dict(record.measured) if isinstance(record.measured, Mapping) else {}, digest, record), digest
 
 
 @dataclass(frozen=True)
@@ -193,12 +244,15 @@ def _input(
     name: str,
     field: str,
     required_hash: bool = True,
+    allowed_schemas: set[str] | frozenset[str] | None = None,
 ) -> _Input:
     payload = _load(value, field=field)
     content_hash = _identity(payload, field=field, required=required_hash)
     schema = payload.get("schema_version")
     if not isinstance(schema, str) or not schema:
         raise S210G27BBlocked(f"{field}:SCHEMA_VERSION_REQUIRED")
+    if allowed_schemas is not None and schema not in allowed_schemas:
+        raise S210G27BBlocked(f"{field}:SCHEMA_VERSION_UNEXPECTED")
     return _Input(name, schema, payload, content_hash)
 
 
@@ -218,9 +272,9 @@ def _as_rows(value: Mapping[str, Any], *, field: str) -> list[dict[str, Any]]:
 def _require_upstream_pass(
     quality: _Input,
     family: _Input,
-    g26_gate: GateRecord,
+    g26_gate: _GateView,
     cost: _Input,
-    g27a_gate: GateRecord,
+    g27a_gate: _GateView,
 ) -> list[str]:
     reasons: list[str] = []
     if g26_gate.effective_status() is not GateStatus.PASS:
@@ -230,8 +284,14 @@ def _require_upstream_pass(
     if quality.payload.get("status") != "PASS" or quality.payload.get("formal_eligible") is not True:
         reasons.append("G2.6_QUALITY_NOT_FORMAL_PASS")
     checks = quality.payload.get("gates")
-    if not isinstance(checks, list) or not checks or any(
-        not isinstance(item, Mapping) or item.get("status") != "PASS" for item in checks
+    check_names = [item.get("gate") if isinstance(item, Mapping) else None for item in checks] if isinstance(checks, list) else []
+    if (
+        not isinstance(checks, list)
+        or len(checks) != len(S210_QUALITY_GATE_NAMES)
+        or any(not isinstance(name, str) for name in check_names)
+        or len(check_names) != len(set(check_names))
+        or set(check_names) != set(S210_QUALITY_GATE_NAMES)
+        or any(not isinstance(item, Mapping) or item.get("status") != "PASS" for item in checks)
     ):
         reasons.append("G2.6_QUALITY_GATE_SET_INCOMPLETE")
     if family.payload.get("primary_cells") != list(S210_PRIMARY_CELLS):
@@ -281,8 +341,11 @@ def _validate_statistics(
         cell = row.get("cell_id")
         if cell not in S210_PRIMARY_CELLS:
             raise S210G27BBlocked(f"{table.name}.rows[{index}]:PRIMARY_CELL_REQUIRED")
-        if not isinstance(row.get("model"), str) or not isinstance(row.get("training_stage"), str):
+        if not isinstance(cell, str) or not isinstance(row.get("model"), str) or not isinstance(row.get("training_stage"), str):
             raise S210G27BBlocked(f"{table.name}.rows[{index}]:MODEL_STAGE_REQUIRED")
+        expected_model, expected_stage = cell.split(":", 1)
+        if row.get("model") != expected_model or row.get("training_stage") != expected_stage:
+            raise S210G27BBlocked(f"{table.name}.rows[{index}]:CELL_IDENTITY_MISMATCH")
         method = _method_id(row.get("method"), field=f"{table.name}.rows[{index}].method")
         batch = row.get("batch_size")
         micro = row.get("microbatch_count")
@@ -303,11 +366,22 @@ def _validate_statistics(
         methods.add(method)
         if row.get("scope") != "parameter":
             raise S210G27BBlocked(f"{table.name}.rows[{index}]:PARAMETER_SCOPE_REQUIRED")
+        repetitions = row.get("repetitions")
+        if isinstance(repetitions, bool) or not isinstance(repetitions, int) or repetitions < 2:
+            raise S210G27BBlocked(f"{table.name}.rows[{index}]:REPETITIONS_INVALID")
     if cells != set(S210_PRIMARY_CELLS):
         raise S210G27BBlocked(f"{table.name}:SIX_PRIMARY_CELLS_REQUIRED")
     u_methods = {method for method in methods if method.startswith("u_m")}
     if methods != {"raw", "double"} | u_methods or u_methods != {f"u_m{expected_m}"}:
         raise S210G27BBlocked(f"{table.name}:PRIMARY_METHOD_SET_MISMATCH")
+    required_views = {
+        (cell, method, view)
+        for cell in S210_PRIMARY_CELLS
+        for method in ("raw", "double", f"u_m{expected_m}")
+        for view in ("bias", "ranking")
+    }
+    if not required_views.issubset(seen):
+        raise S210G27BBlocked(f"{table.name}:PRIMARY_VIEW_SET_INCOMPLETE")
     return rows, table.content_hash
 
 
@@ -341,7 +415,18 @@ def _family_qualification(family: Mapping[str, Any], *, method: str, expected_m:
     if not isinstance(rows, list):
         return False, ["G2.6_FAMILY_ROWS_MISSING"]
     selected = [row for row in rows if isinstance(row, Mapping) and row.get("method") == method_id]
-    if len(selected) != 18 or {row.get("cell_id") for row in selected} != set(S210_PRIMARY_CELLS):
+    expected_endpoints = {
+        "model_total_signed_bias",
+        "layer_total_l1_bias",
+        "module_total_l1_bias",
+    }
+    keys = {(row.get("cell_id"), row.get("endpoint")) for row in selected}
+    if (
+        len(selected) != 18
+        or len(keys) != 18
+        or {row.get("cell_id") for row in selected} != set(S210_PRIMARY_CELLS)
+        or {row.get("endpoint") for row in selected} != expected_endpoints
+    ):
         return False, [f"{method.upper()}_FAMILY_ROWS_INCOMPLETE"]
     if any(row.get("state") != "PASS" for row in selected):
         return False, [f"{method.upper()}_BIAS_ENDPOINT_NOT_PASS"]
@@ -366,7 +451,7 @@ def _u_noninferiority(family: Mapping[str, Any], *, expected_m: int) -> tuple[bo
     if any(row.get("state") != "PASS" for row in selected):
         return False, ["U_NONINFERIORITY_NOT_PASS"]
     global_rows = family.get("noninferiority_global")
-    if isinstance(global_rows, Mapping) and any(
+    if not isinstance(global_rows, Mapping) or any(
         not isinstance(global_rows.get(endpoint), Mapping) or global_rows[endpoint].get("all_cells") is not True
         for endpoint in expected_endpoints
     ):
@@ -729,10 +814,12 @@ def run_s210_g27b(
     g27a_gate = g27a_gate or aliases.pop("cost_gate", None)
     if aliases:
         raise S210G27BBlocked(f"UNSUPPORTED_ARGUMENTS:{','.join(sorted(aliases))}")
-    if not run_id or not isinstance(run_id, str):
-        raise S210G27BBlocked("RUN_ID_REQUIRED")
+    run_id = _safe_run_id(run_id)
 
     analysis = _load(g26_analysis, field="g26_analysis") if g26_analysis is not None else {}
+    analysis_hash: str | None = None
+    if g26_analysis is not None:
+        analysis_hash = _analysis_identity(analysis, field="g26_analysis")
     cost = _load(g27a_report, field="g27a_report") if g27a_report is not None else {}
     if not g26_quality_gates and analysis:
         g26_quality_gates = analysis.get("quality_gates")
@@ -741,13 +828,15 @@ def run_s210_g27b(
     if not g26_statistics_long_table and analysis:
         source = analysis.get("statistics_long_table")
         if isinstance(source, list):
-            g26_statistics_long_table = {"schema_version": S210_SOURCE_SCHEMA, "rows": source, "artifact_hash": canonical_json_hash({"schema_version": S210_SOURCE_SCHEMA, "rows": source})}
+            body = {"schema_version": S210_G26_ANALYSIS_SCHEMA, "rows": source}
+            g26_statistics_long_table = body | {"artifact_hash": canonical_json_hash(body)}
         else:
             g26_statistics_long_table = source
     if not g26_statistics_summary and analysis:
         source = analysis.get("statistics_summary")
         if isinstance(source, list):
-            g26_statistics_summary = {"schema_version": S210_SOURCE_SCHEMA, "rows": source, "artifact_hash": canonical_json_hash({"schema_version": S210_SOURCE_SCHEMA, "rows": source})}
+            body = {"schema_version": S210_G26_ANALYSIS_SCHEMA, "rows": source}
+            g26_statistics_summary = body | {"artifact_hash": canonical_json_hash(body)}
         else:
             g26_statistics_summary = source
     if not g26_family_decisions and analysis:
@@ -755,7 +844,8 @@ def run_s210_g27b(
     if not g26_raw_calibration and analysis:
         source = analysis.get("raw_calibration")
         if isinstance(source, list):
-            g26_raw_calibration = {"schema_version": S210_SOURCE_SCHEMA, "rows": source, "artifact_hash": canonical_json_hash({"schema_version": S210_SOURCE_SCHEMA, "rows": source})}
+            body = {"schema_version": S210_G26_ANALYSIS_SCHEMA, "rows": source}
+            g26_raw_calibration = body | {"artifact_hash": canonical_json_hash(body)}
         else:
             g26_raw_calibration = source
     if not g26_gate and analysis:
@@ -763,14 +853,46 @@ def run_s210_g27b(
     if not g27a_gate and cost:
         g27a_gate = cost.get("gate")
 
-    quality = _input(g26_quality_gates, name="g26_quality_gates", field="g26_quality_gates")
-    hypothesis = _input(g26_hypothesis_decisions, name="g26_hypothesis_decisions", field="g26_hypothesis_decisions", required_hash=False)
-    long_table = _input(g26_statistics_long_table, name="g26_statistics_long_table", field="g26_statistics_long_table")
-    family = _input(g26_family_decisions, name="g26_family_decisions", field="g26_family_decisions")
+    quality = _input(
+        g26_quality_gates,
+        name="g26_quality_gates",
+        field="g26_quality_gates",
+        allowed_schemas={S210_G26_QUALITY_SCHEMA},
+    )
+    hypothesis = _input(
+        g26_hypothesis_decisions,
+        name="g26_hypothesis_decisions",
+        field="g26_hypothesis_decisions",
+        required_hash=False,
+        allowed_schemas={S210_G26_HYPOTHESIS_SCHEMA},
+    )
+    long_table = _input(
+        g26_statistics_long_table,
+        name="g26_statistics_long_table",
+        field="g26_statistics_long_table",
+        allowed_schemas={S210_G26_ANALYSIS_SCHEMA},
+    )
+    family = _input(
+        g26_family_decisions,
+        name="g26_family_decisions",
+        field="g26_family_decisions",
+        allowed_schemas={S210_G26_FAMILY_SCHEMA},
+    )
     summary = None
     if g26_statistics_summary is not None:
-        summary = _input(g26_statistics_summary, name="g26_statistics_summary", field="g26_statistics_summary", required_hash=False)
-    cost_input = _input(g27a_report, name="g27a_report", field="g27a_report")
+        summary = _input(
+            g26_statistics_summary,
+            name="g26_statistics_summary",
+            field="g26_statistics_summary",
+            required_hash=False,
+            allowed_schemas={S210_G26_ANALYSIS_SCHEMA},
+        )
+    cost_input = _input(
+        g27a_report,
+        name="g27a_report",
+        field="g27a_report",
+        allowed_schemas={S210_G27A_REPORT_SCHEMA},
+    )
     g26_record, g26_gate_hash = _gate(g26_gate, gate_id="stage2.G2.6", field="g26_gate")
     g27a_record, g27a_gate_hash = _gate(g27a_gate, gate_id="stage2.G2.7a", field="g27a_gate")
     hypothesis_hash = hypothesis.content_hash  # retained in lineage; family rows drive the decision
@@ -787,6 +909,8 @@ def run_s210_g27b(
         nested_hash = _identity(nested_cost_gate, field="g27a_report.gate")
         if nested_hash != g27a_gate_hash:
             reasons.append("G2.7A_NESTED_GATE_HASH_MISMATCH")
+    else:
+        reasons.append("G2.7A_NESTED_GATE_REQUIRED")
 
     # Cross-stage content bindings.  If either producer exposes the shared
     # matrix/raw identities, they must agree; absence is not silently filled.
@@ -815,7 +939,13 @@ def run_s210_g27b(
     )
     calibration_payload = analysis.get("raw_calibration") if isinstance(analysis, Mapping) else None
     if g26_raw_calibration is not None:
-        calibration_input = _input(g26_raw_calibration, name="g26_raw_calibration", field="g26_raw_calibration", required_hash=True)
+        calibration_input = _input(
+            g26_raw_calibration,
+            name="g26_raw_calibration",
+            field="g26_raw_calibration",
+            required_hash=True,
+            allowed_schemas={S210_G26_ANALYSIS_SCHEMA, S210_G26_RAW_CALIBRATION_SCHEMA},
+        )
         calibration_rows = _as_rows(calibration_input.payload, field="g26_raw_calibration")
     elif isinstance(calibration_payload, list) and calibration_payload:
         calibration_input = None
@@ -838,7 +968,7 @@ def run_s210_g27b(
         raise S210G27BBlocked("G2.7A_PARETO_ROWS_INVALID")
     tables["cost_pareto"] = _table("cost_pareto", _provenance_rows(_source_rows(pareto_source, source_hash=cost_input.content_hash, source_run_id=str(cost_input.payload.get("run_id", source_run_id)), predicate=lambda _: True, table_name="cost_pareto"), batch_size=b, microbatch_count=m, default_scope="online_training_incremental_cost", default_aggregate="pareto"))
 
-    upstream = {
+    upstream: dict[str, Any] = {
         "g26_gate": g26_gate_hash,
         "g26_quality_gates": quality.content_hash,
         "g26_hypothesis_decisions": hypothesis_hash,
@@ -847,6 +977,12 @@ def run_s210_g27b(
         "g27a_report": cost_input.content_hash,
         "g27a_gate": g27a_gate_hash,
     }
+    if analysis_hash is not None:
+        # Preserve the aggregate S2.8 identity when list children were
+        # materialized into envelopes for the strict consumer API.
+        upstream["g26_analysis"] = analysis_hash
+    if summary is not None:
+        upstream["g26_statistics_summary"] = summary.content_hash
     decision, explanation = _decision(b=b, m=m, repetitions=repetitions, family=family_payload, cost=cost_input.payload, upstream_reasons=reasons, upstream=upstream)
     final_status = "PASS" if decision["selected_estimator"] is not None and decision["gate_status"] == "PASS" else "BLOCKED"
     formal_eligible = final_status == "PASS"
@@ -863,6 +999,22 @@ def run_s210_g27b(
         {"name": name, "schema_version": value["schema_version"], "content_hash": value["artifact_hash"], "row_count": value["row_count"], "frozen": True}
         for name, value in sorted(tables.items())
     ]
+    declared_output_files: list[str] = []
+    if output_root is not None:
+        declared_output_files = [
+            "estimator_decision.json",
+            "decision_explanation.json",
+            "g2.7b-gate.json",
+            "report.json",
+            "lineage_manifest.json",
+            "report.md",
+        ]
+        declared_output_files.extend(
+            f"sources/{name}.{extension}"
+            for name in sorted(tables)
+            for extension in ("json", "csv", "md")
+        )
+        declared_output_files.extend(f"charts/{chart['chart_id']}.json" for chart in charts)
     lineage_body = {
         "schema_version": S210_LINEAGE_SCHEMA,
         "task_id": S210_TASK_ID,
@@ -874,6 +1026,7 @@ def run_s210_g27b(
         "chart_specs": [chart["artifact_hash"] for chart in charts],
         "decision_hash": decision["artifact_hash"],
         "formal_eligible": formal_eligible,
+        "output_files": declared_output_files,
     }
     lineage = lineage_body | {"artifact_hash": canonical_json_hash(lineage_body)}
     report_body = {
@@ -889,6 +1042,7 @@ def run_s210_g27b(
         "decision_ref": "estimator_decision.json",
         "decision_hash": decision["artifact_hash"],
         "lineage_ref": "lineage_manifest.json",
+        "output_files": declared_output_files,
         "limitations": ["fixed_state_mu_squared_target_only", "conditional_on_frozen_empirical_distribution", "path_integral_and_actual_adamw_update_out_of_scope"],
         "reasons": sorted(set(explanation["reasons"])),
     }
@@ -917,27 +1071,36 @@ def run_s210_g27b(
     )
     if output_root is not None:
         destination = Path(output_root)
-        if destination.exists() and any(destination.iterdir()):
-            raise S210G27BBlocked("OUTPUT_ROOT_MUST_BE_NEW_AND_EMPTY")
-        destination.mkdir(parents=True, exist_ok=False) if not destination.exists() else None
-        files: list[str] = []
-        files.append(_write_once(destination, "estimator_decision.json", decision))
-        files.append(_write_once(destination, "decision_explanation.json", explanation))
-        files.append(_write_once(destination, "g2.7b-gate.json", gate.to_dict()))
-        files.append(_write_once(destination, "report.json", report))
-        files.append(_write_once(destination, "lineage_manifest.json", lineage))
-        files.append(_write_bytes_once(destination, "report.md", _render_report_markdown(report, decision)))
-        for name, table in sorted(tables.items()):
-            files.append(_write_once(destination, f"sources/{name}.json", table))
-            files.append(_write_bytes_once(destination, f"sources/{name}.csv", _table_csv(table)))
-            files.append(_write_bytes_once(destination, f"sources/{name}.md", _table_markdown(table)))
-        for chart in charts:
-            files.append(_write_once(destination, f"charts/{chart['chart_id']}.json", chart))
-        report["output_files"] = files
-    else:
-        report["output_files"] = []
-    report["analysis_hash"] = canonical_json_hash(report)
-    return {"status": final_status, "formal_eligible": formal_eligible, "report": report, "decision": decision, "gate": gate.to_dict(), "lineage": lineage, "tables": tables, "charts": charts, "output_files": report["output_files"], "analysis_hash": report["analysis_hash"]}
+        # A report directory is a logical version. Reusing even an empty
+        # directory makes retries ambiguous and can mix files from attempts.
+        if destination.exists():
+            raise S210G27BBlocked("OUTPUT_ROOT_MUST_BE_NEW")
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        staging = destination.parent / f".{destination.name}.staging-{run_id}"
+        if staging.exists():
+            raise S210G27BBlocked("OUTPUT_STAGING_ALREADY_EXISTS")
+        staging.mkdir(parents=True, exist_ok=False)
+        try:
+            _write_once(staging, "estimator_decision.json", decision)
+            _write_once(staging, "decision_explanation.json", explanation)
+            _write_once(staging, "g2.7b-gate.json", gate.to_dict())
+            _write_once(staging, "report.json", report)
+            _write_once(staging, "lineage_manifest.json", lineage)
+            _write_bytes_once(staging, "report.md", _render_report_markdown(report, decision))
+            for name, table in sorted(tables.items()):
+                _write_once(staging, f"sources/{name}.json", table)
+                _write_bytes_once(staging, f"sources/{name}.csv", _table_csv(table))
+                _write_bytes_once(staging, f"sources/{name}.md", _table_markdown(table))
+            for chart in charts:
+                _write_once(staging, f"charts/{chart['chart_id']}.json", chart)
+            staging.replace(destination)
+        except BaseException:
+            # The exact staging sibling is ours; remove it while leaving any
+            # pre-existing target untouched.
+            shutil.rmtree(staging, ignore_errors=True)
+            raise
+    analysis_identity = canonical_json_hash(report)
+    return {"status": final_status, "formal_eligible": formal_eligible, "report": report, "decision": decision, "gate": gate.to_dict(), "lineage": lineage, "tables": tables, "charts": charts, "output_files": declared_output_files, "analysis_hash": analysis_identity}
 
 
 orchestrate_s210_g27b = run_s210_g27b
