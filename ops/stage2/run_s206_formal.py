@@ -175,9 +175,12 @@ def _verify_worker_executor_identity(
         raise S206PreparationBlocked("S206_EXECUTOR_STATUS_INVALID") from error
     if not isinstance(value, Mapping):
         raise S206PreparationBlocked("S206_EXECUTOR_STATUS_OBJECT_REQUIRED")
+    repository = getattr(args, "repository", None)
+    if repository is None:
+        raise S206PreparationBlocked("S206_EXECUTOR_REPOSITORY_REQUIRED")
     declared = _validate_live_executor_identity(
         value.get("executor_identity"),
-        repository=getattr(args, "repository", _REPOSITORY_ROOT),
+        repository=repository,
     )
     if declared != dict(expected):
         raise S206PreparationBlocked("S206_EXECUTOR_IDENTITY_DRIFT")
@@ -466,7 +469,10 @@ def _write_status(path: Path, payload: Mapping[str, object]) -> None:
 
 def _preflight(args: argparse.Namespace) -> dict[str, object]:
     root = _data_root(args.data_root)
-    executor_identity = _executor_identity(getattr(args, "repository", _REPOSITORY_ROOT))
+    repository = getattr(args, "repository", None)
+    if repository is None:
+        raise S206PreparationBlocked("S206_EXECUTOR_REPOSITORY_REQUIRED")
+    executor_identity = _executor_identity(repository)
     inventory, inventory_identity = _load_inventory_snapshot(
         args.gpu_inventory_json,
         data_root=root,
@@ -2424,12 +2430,14 @@ def _verify_status_executor_identity(
 ) -> None:
     """Recompute the clean launcher identity for every formal status reload."""
 
-    repository = getattr(args, "repository", _REPOSITORY_ROOT)
+    repository = getattr(args, "repository", None)
+    if repository is None:
+        raise S206PreparationBlocked("STATUS_EXECUTOR_REPOSITORY_REQUIRED")
     if "executor_identity" not in value:
         raise S206PreparationBlocked("STATUS_EXECUTOR_IDENTITY_MISSING")
     expected = _validate_live_executor_identity(
         value.get("executor_identity"),
-        repository=repository or _REPOSITORY_ROOT,
+        repository=repository,
     )
     preflight = value.get("preflight")
     if isinstance(preflight, Mapping) and preflight.get("executor_identity") != expected:
@@ -2454,19 +2462,16 @@ def _wait(args: argparse.Namespace) -> int:
     root = _data_root(args.data_root)
     status_path = _logical(root, f"{args.operations_root}/status.json", field="status")
     repository = getattr(args, "repository", None)
-    executor_identity = (
-        _executor_identity(repository or _REPOSITORY_ROOT)
-        if repository is not None
-        else None
-    )
+    if repository is None:
+        raise S206PreparationBlocked("S206_EXECUTOR_REPOSITORY_REQUIRED")
+    executor_identity = _executor_identity(repository)
     operations_ref = _canonical_logical_ref(root, args.operations_root, field="operations_root")
-    if executor_identity is not None:
-        _scan_detached_attempts(
-            status_path.parent,
-            operations_ref=operations_ref,
-            executor_identity=executor_identity,
-            block_live=False,
-        )
+    _scan_detached_attempts(
+        status_path.parent,
+        operations_ref=operations_ref,
+        executor_identity=executor_identity,
+        block_live=False,
+    )
     deadline = None if args.timeout_seconds is None else time.monotonic() + args.timeout_seconds
     while True:
         if status_path.is_symlink():
@@ -2809,17 +2814,13 @@ def _detach(args: argparse.Namespace) -> int:
     operations_ref = _canonical_logical_ref(root, args.operations_root, field="operations_root")
     operations = _logical(root, args.operations_root, field="operations_root")
     operations.mkdir(parents=True, exist_ok=True)
-    declared_executor = preflight.get("executor_identity")
-    if declared_executor is None:
-        # Private legacy tests may replace _preflight with a minimal fixture;
-        # the real preflight always supplies this field and is never allowed
-        # to bypass the live clean-source recomputation.
-        executor_identity = _executor_identity(getattr(args, "repository", _REPOSITORY_ROOT))
-    else:
-        executor_identity = _validate_live_executor_identity(
-            declared_executor,
-            repository=getattr(args, "repository", _REPOSITORY_ROOT),
-        )
+    repository = getattr(args, "repository", None)
+    if repository is None:
+        raise S206PreparationBlocked("S206_EXECUTOR_REPOSITORY_REQUIRED")
+    executor_identity = _validate_live_executor_identity(
+        preflight.get("executor_identity"),
+        repository=repository,
+    )
     _scan_detached_attempts(
         operations,
         operations_ref=operations_ref,
