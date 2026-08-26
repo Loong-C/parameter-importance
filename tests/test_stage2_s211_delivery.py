@@ -458,3 +458,107 @@ def test_s211_duplicate_lineage_and_role_schema_mismatch_block(tmp_path: Path) -
     assert result["status"] == "BLOCKED"
     assert f"STAGE2_LINEAGE_DUPLICATE:{TASKS[0]}" in result["delivery_manifest"]["reasons"]
     assert "DELIVERY_ROLE_SCHEMA_MISMATCH:replay_report" in result["delivery_manifest"]["reasons"]
+
+
+def test_s211_unknown_upstream_gate_is_not_ignored(tmp_path: Path) -> None:
+    gate, decision, lineage, values, upstream, roles = _inputs(tmp_path)
+    extra = GateRecord(
+        gate_id="stage2.G9.9",
+        stage=2,
+        status="PASS",
+        checked_at="2026-08-25T00:00:00Z",
+        measured={},
+        threshold={},
+        evidence_refs=("evidence.json",),
+    ).to_dict()
+    upstream = dict(upstream)
+    upstream["stage2.G9.9"] = extra
+    result = run_s211_g28(
+        g27b_gate=gate,
+        g27b_decision=decision,
+        stage2_lineage=lineage,
+        boundary_refs={key: value for key, value in values.items() if key != "replay_audit_31m"},
+        replay_audit_31m=values["replay_audit_31m"],
+        data_root=tmp_path,
+        predecessor_gates=upstream,
+        delivery_refs=roles,
+        producer_commit="a" * 40,
+        consumer_commit="b" * 40,
+    )
+    assert result["status"] == "BLOCKED"
+    assert "UPSTREAM_GATE_UNSUPPORTED:stage2.G9.9" in result["delivery_manifest"]["reasons"]
+
+
+def test_s211_unknown_lineage_task_is_not_ignored(tmp_path: Path) -> None:
+    gate, decision, lineage, values, upstream, roles = _inputs(tmp_path)
+    lineage_body = {key: value for key, value in lineage.items() if key != "artifact_hash"}
+    lineage_body["tasks"] = dict(lineage_body["tasks"])
+    lineage_body["tasks"]["stage2.99_unknown"] = _hashed({
+        "task_id": "stage2.99_unknown",
+        "status": "PASS",
+        "formal_eligible": True,
+        "artifact_refs": ["unknown.json"],
+    })
+    unknown_lineage = _hashed(lineage_body)
+    result = run_s211_g28(
+        g27b_gate=gate,
+        g27b_decision=decision,
+        stage2_lineage=unknown_lineage,
+        boundary_refs={key: value for key, value in values.items() if key != "replay_audit_31m"},
+        replay_audit_31m=values["replay_audit_31m"],
+        data_root=tmp_path,
+        predecessor_gates=upstream,
+        delivery_refs=roles,
+        producer_commit="a" * 40,
+        consumer_commit="b" * 40,
+    )
+    assert result["status"] == "BLOCKED"
+    assert "STAGE2_LINEAGE_UNSUPPORTED_TASK:stage2.99_unknown" in result["delivery_manifest"]["reasons"]
+
+
+def test_s211_lineage_mapping_key_must_match_task_id(tmp_path: Path) -> None:
+    gate, decision, lineage, values, upstream, roles = _inputs(tmp_path)
+    lineage_body = {key: value for key, value in lineage.items() if key != "artifact_hash"}
+    lineage_body["tasks"] = dict(lineage_body["tasks"])
+    first_task = TASKS[0]
+    first_entry = dict(lineage_body["tasks"][first_task])
+    first_entry.pop("artifact_hash", None)
+    first_entry["task_id"] = TASKS[1]
+    lineage_body["tasks"][first_task] = _hashed(first_entry)
+    mismatched_lineage = _hashed(lineage_body)
+    result = run_s211_g28(
+        g27b_gate=gate,
+        g27b_decision=decision,
+        stage2_lineage=mismatched_lineage,
+        boundary_refs={key: value for key, value in values.items() if key != "replay_audit_31m"},
+        replay_audit_31m=values["replay_audit_31m"],
+        data_root=tmp_path,
+        predecessor_gates=upstream,
+        delivery_refs=roles,
+        producer_commit="a" * 40,
+        consumer_commit="b" * 40,
+    )
+    assert result["status"] == "BLOCKED"
+    assert "STAGE2_LINEAGE_TASK_KEY_MISMATCH" in result["delivery_manifest"]["reasons"]
+
+
+def test_s211_replay_hash_mismatch_cannot_claim_equivalence(tmp_path: Path) -> None:
+    gate, decision, lineage, values, upstream, roles = _inputs(tmp_path)
+    replay = dict(values["replay_audit_31m"])
+    replay.pop("artifact_hash", None)
+    replay["replay_result_hash"] = "2" * 64
+    replay = _hashed(replay)
+    result = run_s211_g28(
+        g27b_gate=gate,
+        g27b_decision=decision,
+        stage2_lineage=lineage,
+        boundary_refs={key: value for key, value in values.items() if key != "replay_audit_31m"},
+        replay_audit_31m=replay,
+        data_root=tmp_path,
+        predecessor_gates=upstream,
+        delivery_refs=roles,
+        producer_commit="a" * 40,
+        consumer_commit="b" * 40,
+    )
+    assert result["status"] == "BLOCKED"
+    assert "REPLAY_RESULT_HASH_MISMATCH" in result["delivery_manifest"]["reasons"]
