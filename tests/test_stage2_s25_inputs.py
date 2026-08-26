@@ -1,7 +1,9 @@
 """Fail-closed tests for S2.5 input extraction and exhaustive development sweep."""
 
 from copy import deepcopy
+import hashlib
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -11,6 +13,7 @@ from param_importance_nlp.contracts.status import GateRecord, GateStatus
 from param_importance_nlp.experiments.preregistration import build_stage2_preregistration
 from param_importance_nlp.experiments.sampling import SamplingPlan, SamplingUniverse
 from param_importance_nlp.experiments.stage2_s25_formal import (
+    APPROVED_GPU_UUIDS,
     S25ExecutionBlocked,
     S25FormalRunner,
     _experiment_plan_entries,
@@ -23,7 +26,15 @@ from param_importance_nlp.experiments.stage2_s25_inputs import (
 )
 from param_importance_nlp.runtime.task_artifacts import TaskArtifactStore
 from ops.stage2.materialize_s205_formal_inputs import main as materialize_main
-from ops.stage2.run_s205_formal import _inventory, _load_materialization_index, _parser, _validate_inventory
+from ops.stage2.run_s205_formal import (
+    _inventory,
+    _load_inventory_snapshot,
+    _load_materialization_index,
+    _parser,
+    _repository_commit,
+    _validate_inventory,
+    _worker,
+)
 from param_importance_nlp.contracts.g21_formal_handoff import ALLOWED_DEVICES, EXCLUDED_PCI, EXCLUDED_UUID
 
 
@@ -192,6 +203,8 @@ def test_launcher_gpu_inventory_requires_complete_clean_s206_snapshot() -> None:
             "utilization_gpu_percent": "0",
             "ecc_uncorrected_volatile": "0",
             "ecc_uncorrected_aggregate": "0",
+            "temperature_c": "40",
+            "row_remap_status": "None",
             "gpu_recovery_action": "None",
         }
         for pci, uuid in ALLOWED_DEVICES
@@ -205,6 +218,8 @@ def test_launcher_gpu_inventory_requires_complete_clean_s206_snapshot() -> None:
             "utilization_gpu_percent": "0",
             "ecc_uncorrected_volatile": "0",
             "ecc_uncorrected_aggregate": "0",
+            "temperature_c": "40",
+            "row_remap_status": "None",
             "gpu_recovery_action": "None",
         }
         for _ in range(1)
@@ -218,6 +233,8 @@ def test_launcher_gpu_inventory_requires_complete_clean_s206_snapshot() -> None:
             "utilization_gpu_percent": "0",
             "ecc_uncorrected_volatile": "0",
             "ecc_uncorrected_aggregate": "0",
+            "temperature_c": "40",
+            "row_remap_status": "None",
             "gpu_recovery_action": "None",
         }
         for bus in ("51", "52", "54")
@@ -239,6 +256,8 @@ def test_launcher_accepts_only_hash_bound_gpu_inventory_envelope(tmp_path: Path)
             "utilization_gpu_percent": "0",
             "ecc_uncorrected_volatile": "0",
             "ecc_uncorrected_aggregate": "0",
+            "temperature_c": "40",
+            "row_remap_status": "None",
             "gpu_recovery_action": "None",
         }
         for pci, uuid in ALLOWED_DEVICES
@@ -248,28 +267,88 @@ def test_launcher_accepts_only_hash_bound_gpu_inventory_envelope(tmp_path: Path)
         "uuid": EXCLUDED_UUID,
         "memory_used_mib": "0", "memory_total_mib": "40960",
         "utilization_gpu_percent": "0", "ecc_uncorrected_volatile": "0",
-        "ecc_uncorrected_aggregate": "0", "gpu_recovery_action": "None",
+        "ecc_uncorrected_aggregate": "0", "temperature_c": "40",
+        "row_remap_status": "None", "gpu_recovery_action": "None",
     }]
     rows += [{
         "pci_bus_id": f"0000:{bus}:00.0", "uuid": f"GPU-other-{bus}",
         "memory_used_mib": "0", "memory_total_mib": "40960",
         "utilization_gpu_percent": "0", "ecc_uncorrected_volatile": "0",
-        "ecc_uncorrected_aggregate": "0", "gpu_recovery_action": "None",
+        "ecc_uncorrected_aggregate": "0", "temperature_c": "40",
+        "row_remap_status": "None", "gpu_recovery_action": "None",
     } for bus in ("51", "52", "54")]
     path = tmp_path / "gpu-inventory.json"
+    raw_capture = tmp_path / "nvidia-smi.raw"
+    raw_capture.write_bytes(b"nvidia-smi capture fixture\n")
     value = {
         "schema_version": "stage2-s206-gpu-inventory-v1",
-        "source_ref": "gpu-inventory.json",
+        "artifact_ref": "gpu-inventory.json",
+        "source_ref": "nvidia-smi.raw",
+        "source_sha256": hashlib.sha256(raw_capture.read_bytes()).hexdigest(),
         "rows": rows,
         "compute_apps": [],
     }
     value["artifact_hash"] = canonical_json_hash(value)
     write_canonical_json(path, value)
-    assert len(_inventory(path, data_root=tmp_path)) == 8
+    rows_loaded, identity = _load_inventory_snapshot(path, data_root=tmp_path)
+    assert len(rows_loaded) == 8
+    assert identity["artifact_ref"] == "gpu-inventory.json"
+    assert identity["source_ref"] == "nvidia-smi.raw"
+    assert identity["source_sha256"] == value["source_sha256"]
     value["rows"][0]["memory_used_mib"] = "1"
     write_canonical_json(path, value)
     with pytest.raises(Exception, match="S205_GPU_INVENTORY_ARTIFACT_HASH_MISMATCH"):
         _inventory(path, data_root=tmp_path)
+
+
+def test_launcher_inventory_binds_distinct_raw_capture_and_rejects_tamper(tmp_path: Path) -> None:
+    rows = [
+        {
+            "pci_bus_id": pci,
+            "uuid": uuid,
+            "memory_used_mib": "0",
+            "memory_total_mib": "40960",
+            "utilization_gpu_percent": "0",
+            "ecc_uncorrected_volatile": "0",
+            "ecc_uncorrected_aggregate": "0",
+            "temperature_c": "40",
+            "row_remap_status": "None",
+            "gpu_recovery_action": "None",
+        }
+        for pci, uuid in ALLOWED_DEVICES
+    ]
+    rows += [{
+        "pci_bus_id": EXCLUDED_PCI,
+        "uuid": EXCLUDED_UUID,
+        "memory_used_mib": "0", "memory_total_mib": "40960",
+        "utilization_gpu_percent": "0", "ecc_uncorrected_volatile": "0",
+        "ecc_uncorrected_aggregate": "0", "temperature_c": "40",
+        "row_remap_status": "None", "gpu_recovery_action": "None",
+    }]
+    rows += [{
+        "pci_bus_id": f"0000:{bus}:00.0", "uuid": f"GPU-other-{bus}",
+        "memory_used_mib": "0", "memory_total_mib": "40960",
+        "utilization_gpu_percent": "0", "ecc_uncorrected_volatile": "0",
+        "ecc_uncorrected_aggregate": "0", "temperature_c": "40",
+        "row_remap_status": "None", "gpu_recovery_action": "None",
+    } for bus in ("51", "52", "54")]
+    raw_capture = tmp_path / "capture.raw"
+    raw_capture.write_bytes(b"raw capture v1")
+    path = tmp_path / "inventory.json"
+    value = {
+        "schema_version": "stage2-s206-gpu-inventory-v1",
+        "artifact_ref": "inventory.json",
+        "source_ref": "capture.raw",
+        "source_sha256": hashlib.sha256(raw_capture.read_bytes()).hexdigest(),
+        "rows": rows,
+        "compute_apps": [],
+    }
+    value["artifact_hash"] = canonical_json_hash(value)
+    write_canonical_json(path, value)
+    _load_inventory_snapshot(path, data_root=tmp_path)
+    raw_capture.write_bytes(b"tampered capture")
+    with pytest.raises(Exception, match="S205_GPU_INVENTORY_SOURCE_SHA256_MISMATCH"):
+        _load_inventory_snapshot(path, data_root=tmp_path)
 
 
 def test_launcher_detach_and_resume_are_execute_modifiers() -> None:
@@ -279,6 +358,37 @@ def test_launcher_detach_and_resume_are_execute_modifiers() -> None:
         "--artifact-root", "out", "--operations-root", "ops",
     ])
     assert args.execute is True and args.detach is True and args.resume is True
+
+
+def test_worker_requires_exact_visible_gpu_binding(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
+    args = type("WorkerArgs", (), {
+        "cell_id": "pythia-14m:initialization",
+        "gpu_uuid": APPROVED_GPU_UUIDS[0],
+    })()
+    with pytest.raises(S25ExecutionBlocked, match="S205_WORKER_GPU_BINDING_MISMATCH"):
+        _worker(args)
+
+
+def test_launcher_executor_commit_requires_clean_worktree(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    def dirty_run(*_args: object, **_kwargs: object) -> SimpleNamespace:
+        return SimpleNamespace(stdout=" M launcher.py\n")
+
+    monkeypatch.setattr("ops.stage2.run_s205_formal.subprocess.run", dirty_run)
+    with pytest.raises(S25ExecutionBlocked, match="S205_REPOSITORY_DIRTY"):
+        _repository_commit(tmp_path)
+
+
+def test_launcher_executor_commit_binds_exact_head(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    expected = "a" * 40
+
+    def clean_run(command: object, **_kwargs: object) -> SimpleNamespace:
+        if isinstance(command, list) and "status" in command:
+            return SimpleNamespace(stdout="")
+        return SimpleNamespace(stdout=expected + "\n")
+
+    monkeypatch.setattr("ops.stage2.run_s205_formal.subprocess.run", clean_run)
+    assert _repository_commit(tmp_path) == expected
 
 
 def test_runner_rejects_sweep_bound_to_other_formal_execution(tmp_path: Path) -> None:
