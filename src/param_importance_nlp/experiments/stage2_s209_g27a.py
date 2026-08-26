@@ -21,6 +21,7 @@ from datetime import datetime, timezone
 import hashlib
 import math
 from pathlib import Path
+from pathlib import PurePosixPath
 import random
 import re
 import statistics
@@ -28,6 +29,8 @@ from typing import Any, Iterable, Mapping, Sequence
 
 from ..contracts.jsonio import canonical_json_hash, load_canonical_json, write_canonical_json
 from ..contracts.status import GateRecord, GateStatus
+from ..core.oracles import compare_tensor_maps_fp64
+from ..core.tensors import TensorMap
 from .stage2_s204_ids import EXPECTED_CELL_IDS
 from .stage2_s207_formal import APPROVED_GPU_UUIDS, EXCLUDED_GPU_UUID, EXCLUDED_PCI, S27_RAW_MANIFEST_SCHEMA
 
@@ -50,6 +53,30 @@ S29_METHODS = ("raw", "double", "u")
 S29_CELL_IDS = EXPECTED_CELL_IDS
 S29_DECISION_RATIO = 1.25
 S29_CROSSCHECK_TOLERANCE = 0.25
+S29_STAGE1_NUMERIC_ARTIFACT_SCHEMA = "stage2-s209-stage1-raw-numeric-artifact-v1"
+S29_STAGE1_NUMERIC_COMPARISON_SCHEMA = "stage2-s209-stage1-raw-numeric-comparison-v1"
+S29_STAGE1_NUMERIC_REFERENCE_REF = "anchors/single-gpu-anchor.json#stage1_numeric_artifact"
+S29_STAGE1_NUMERIC_CANDIDATE_REF = "anchors/four-gpu-stage1-numeric.json"
+S29_STAGE1_TOLERANCE_PROFILE = {
+    "name": "T64_ORACLE",
+    "comparison_dtype": "torch.float64_cpu",
+    "natural_scale": 16.0,
+    "atol": 1e-12,
+    "rtol": 1e-10,
+    "normalized_l2_limit": 1e-10,
+}
+
+
+def _valid_stage1_numeric_ref(value: Any, *, suffix: str, field: str) -> str:
+    """Validate a DATA_ROOT-relative POSIX artifact reference."""
+
+    if not isinstance(value, str) or not value or "\\" in value or value.startswith("/") or ":" in value:
+        raise S29G27ABlocked(f"{field}:DATA_ROOT_POSIX_REF_REQUIRED")
+    path_part = value.split("#", 1)[0]
+    logical = PurePosixPath(path_part)
+    if logical.is_absolute() or any(part in {"", ".", ".."} for part in logical.parts) or not path_part.endswith(suffix):
+        raise S29G27ABlocked(f"{field}:DATA_ROOT_POSIX_REF_INVALID")
+    return value
 S29_TIMING_FIELDS = (
     "data_wait_seconds",
     "forward_seconds",
@@ -115,6 +142,226 @@ def _sha(value: Any, *, field: str) -> str:
     if not isinstance(value, str) or _SHA256.fullmatch(value) is None:
         raise S29G27ABlocked(f"{field}:SHA256_REQUIRED")
     return value
+
+
+def _stage1_numeric_wire(value: Any) -> dict[str, dict[str, Any]]:
+    """Serialize an actual estimator TensorMap without dropping coordinates."""
+
+    try:
+        import torch
+
+        items = list(value.items())
+    except (AttributeError, ImportError) as error:
+        raise S29G27ABlocked("STAGE1_NUMERIC_TENSOR_MAP_REQUIRED") from error
+    if not items:
+        raise S29G27ABlocked("STAGE1_NUMERIC_TENSOR_MAP_EMPTY")
+    output: dict[str, dict[str, Any]] = {}
+    for name, tensor in items:
+        if not isinstance(name, str) or not name or not isinstance(tensor, torch.Tensor):
+            raise S29G27ABlocked("STAGE1_NUMERIC_TENSOR_MAP_INVALID")
+        if not tensor.is_floating_point() or not bool(torch.isfinite(tensor).all()):
+            raise S29G27ABlocked("STAGE1_NUMERIC_TENSOR_NONFINITE")
+        output[name] = {
+            "dtype": str(tensor.dtype),
+            "shape": [int(size) for size in tensor.shape],
+            "values": [float(item) for item in tensor.detach().to(dtype=torch.float64).reshape(-1).tolist()],
+        }
+    return output
+
+
+def _stage1_numeric_artifact(
+    value: Any,
+    *,
+    role: str,
+    fixed_checkpoint_id: str,
+    checkpoint_hash: str,
+    mapping_hash: str,
+    sample_mapping_hash: str,
+    state_digest: str,
+    state_digest_after: str,
+    statistical_binding: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Build the content-addressed raw-estimator artifact used by S2.9."""
+
+    if role not in {"single_gpu_reference", "four_gpu_candidate"}:
+        raise S29G27ABlocked("STAGE1_NUMERIC_ARTIFACT_ROLE_INVALID")
+    if not isinstance(fixed_checkpoint_id, str) or not fixed_checkpoint_id:
+        raise S29G27ABlocked("STAGE1_NUMERIC_CHECKPOINT_ID_REQUIRED")
+    for name, item in (
+        ("checkpoint_hash", checkpoint_hash),
+        ("mapping_hash", mapping_hash),
+        ("sample_mapping_hash", sample_mapping_hash),
+        ("state_digest", state_digest),
+        ("state_digest_after", state_digest_after),
+    ):
+        _sha(item, field=f"stage1_numeric.{name}")
+    wire = _stage1_numeric_wire(value)
+    binding = dict(statistical_binding or {})
+    required_binding = {
+        "global_s1_hash",
+        "global_s2_hash",
+        "estimate_hash",
+        "global_weight",
+        "global_statistical_unit_count",
+    }
+    if set(binding) != required_binding:
+        raise S29G27ABlocked("STAGE1_NUMERIC_STATISTICAL_BINDING_REQUIRED")
+    for name in ("global_s1_hash", "global_s2_hash", "estimate_hash"):
+        _sha(binding[name], field=f"stage1_numeric.statistical_binding.{name}")
+    global_weight = binding["global_weight"]
+    global_count = binding["global_statistical_unit_count"]
+    if isinstance(global_weight, bool) or not isinstance(global_weight, (int, float)) or not math.isfinite(float(global_weight)) or float(global_weight) <= 0:
+        raise S29G27ABlocked("STAGE1_NUMERIC_GLOBAL_WEIGHT_INVALID")
+    if isinstance(global_count, bool) or not isinstance(global_count, int) or global_count <= 0:
+        raise S29G27ABlocked("STAGE1_NUMERIC_GLOBAL_COUNT_INVALID")
+    body: dict[str, Any] = {
+        "schema_version": S29_STAGE1_NUMERIC_ARTIFACT_SCHEMA,
+        "role": role,
+        "estimator": "raw",
+        "fixed_checkpoint_id": fixed_checkpoint_id,
+        "checkpoint_hash": checkpoint_hash,
+        "mapping_hash": mapping_hash,
+        "sample_mapping_hash": sample_mapping_hash,
+        "state_digest": state_digest,
+        "state_digest_after": state_digest_after,
+        "statistical_binding": binding,
+        "value": wire,
+        "value_hash": canonical_json_hash(wire),
+    }
+    body["artifact_hash"] = canonical_json_hash(body)
+    return body
+
+
+def _stage1_numeric_map_from_wire(value: Any) -> TensorMap:
+    try:
+        import torch
+
+        if not isinstance(value, Mapping) or not value:
+            raise S29G27ABlocked("STAGE1_NUMERIC_VALUE_INVALID")
+        tensors: dict[str, torch.Tensor] = {}
+        for name, entry in value.items():
+            if not isinstance(name, str) or not isinstance(entry, Mapping):
+                raise S29G27ABlocked("STAGE1_NUMERIC_VALUE_INVALID")
+            shape = entry.get("shape")
+            values = entry.get("values")
+            dtype = entry.get("dtype")
+            if not isinstance(dtype, str) or dtype not in {"torch.float32", "torch.float64"}:
+                raise S29G27ABlocked("STAGE1_NUMERIC_DTYPE_INVALID")
+            if not isinstance(shape, list) or any(isinstance(item, bool) or not isinstance(item, int) or item < 0 for item in shape):
+                raise S29G27ABlocked("STAGE1_NUMERIC_SHAPE_INVALID")
+            if not isinstance(values, list) or any(isinstance(item, bool) or not isinstance(item, (int, float)) or not math.isfinite(float(item)) for item in values):
+                raise S29G27ABlocked("STAGE1_NUMERIC_VALUES_INVALID")
+            expected_count = 1
+            for size in shape:
+                expected_count *= size
+            if len(values) != expected_count:
+                raise S29G27ABlocked("STAGE1_NUMERIC_VALUE_LENGTH_INVALID")
+            tensors[name] = torch.tensor(values, dtype=torch.float64).reshape(tuple(shape))
+        return TensorMap(tensors, require_finite=True)
+    except S29G27ABlocked:
+        raise
+    except Exception as error:
+        raise S29G27ABlocked("STAGE1_NUMERIC_VALUE_INVALID") from error
+
+
+def _validate_stage1_numeric_artifact(value: Any, *, role: str | None = None) -> dict[str, Any]:
+    if not isinstance(value, Mapping):
+        raise S29G27ABlocked("STAGE1_NUMERIC_ARTIFACT_REQUIRED")
+    output = dict(value)
+    required = {
+        "schema_version", "role", "estimator", "fixed_checkpoint_id", "checkpoint_hash", "mapping_hash",
+        "sample_mapping_hash", "state_digest", "state_digest_after", "value", "value_hash", "artifact_hash",
+        "statistical_binding",
+    }
+    if set(output) != required or output.get("schema_version") != S29_STAGE1_NUMERIC_ARTIFACT_SCHEMA or output.get("estimator") != "raw":
+        raise S29G27ABlocked("STAGE1_NUMERIC_ARTIFACT_SCHEMA_INVALID")
+    if role is not None and output.get("role") != role:
+        raise S29G27ABlocked("STAGE1_NUMERIC_ARTIFACT_ROLE_DRIFT")
+    if not isinstance(output.get("role"), str) or output["role"] not in {"single_gpu_reference", "four_gpu_candidate"}:
+        raise S29G27ABlocked("STAGE1_NUMERIC_ARTIFACT_ROLE_INVALID")
+    if not isinstance(output.get("fixed_checkpoint_id"), str) or not output["fixed_checkpoint_id"]:
+        raise S29G27ABlocked("STAGE1_NUMERIC_CHECKPOINT_ID_REQUIRED")
+    for name in ("checkpoint_hash", "mapping_hash", "sample_mapping_hash", "state_digest", "state_digest_after", "value_hash", "artifact_hash"):
+        _sha(output.get(name), field=f"stage1_numeric.{name}")
+    _stage1_numeric_map_from_wire(output["value"])
+    binding = output["statistical_binding"]
+    if not isinstance(binding, Mapping) or set(binding) != {
+        "global_s1_hash", "global_s2_hash", "estimate_hash", "global_weight", "global_statistical_unit_count"
+    }:
+        raise S29G27ABlocked("STAGE1_NUMERIC_STATISTICAL_BINDING_INVALID")
+    for name in ("global_s1_hash", "global_s2_hash", "estimate_hash"):
+        _sha(binding.get(name), field=f"stage1_numeric.statistical_binding.{name}")
+    if isinstance(binding.get("global_weight"), bool) or not isinstance(binding.get("global_weight"), (int, float)) or not math.isfinite(float(binding["global_weight"])) or float(binding["global_weight"]) <= 0:
+        raise S29G27ABlocked("STAGE1_NUMERIC_GLOBAL_WEIGHT_INVALID")
+    if isinstance(binding.get("global_statistical_unit_count"), bool) or not isinstance(binding.get("global_statistical_unit_count"), int) or binding["global_statistical_unit_count"] <= 0:
+        raise S29G27ABlocked("STAGE1_NUMERIC_GLOBAL_COUNT_INVALID")
+    if output["value_hash"] != canonical_json_hash(output["value"]):
+        raise S29G27ABlocked("STAGE1_NUMERIC_VALUE_HASH_MISMATCH")
+    if output["artifact_hash"] != canonical_json_hash({key: item for key, item in output.items() if key != "artifact_hash"}):
+        raise S29G27ABlocked("STAGE1_NUMERIC_ARTIFACT_HASH_MISMATCH")
+    return output
+
+
+def _stage1_numeric_comparison(
+    candidate: Mapping[str, Any],
+    reference: Mapping[str, Any],
+    *,
+    reference_ref: str = S29_STAGE1_NUMERIC_REFERENCE_REF,
+) -> dict[str, Any]:
+    """Compare candidate/reference with the frozen Stage 1 FP64 comparator."""
+
+    candidate = _validate_stage1_numeric_artifact(candidate, role="four_gpu_candidate")
+    reference = _validate_stage1_numeric_artifact(reference, role="single_gpu_reference")
+    _valid_stage1_numeric_ref(reference_ref, suffix="anchors/single-gpu-anchor.json", field="stage1_numeric.reference_ref")
+    for name in ("fixed_checkpoint_id", "checkpoint_hash", "mapping_hash", "sample_mapping_hash", "state_digest", "state_digest_after"):
+        if candidate[name] != reference[name]:
+            raise S29G27ABlocked(f"STAGE1_NUMERIC_IDENTITY_DRIFT:{name}")
+    try:
+        actual = _stage1_numeric_map_from_wire(candidate["value"])
+        oracle = _stage1_numeric_map_from_wire(reference["value"])
+        settings = {key: value for key, value in S29_STAGE1_TOLERANCE_PROFILE.items() if key in {"natural_scale", "atol", "rtol", "normalized_l2_limit"}}
+        global_result = compare_tensor_maps_fp64(actual, oracle, **settings).to_dict()
+        per_tensor: list[dict[str, Any]] = []
+        for name in actual:
+            result = compare_tensor_maps_fp64(
+                TensorMap({name: actual[name]}),
+                TensorMap({name: oracle[name]}),
+                **settings,
+            ).to_dict()
+            per_tensor.append({"parameter_name": name, **result})
+    except Exception as error:
+        raise S29G27ABlocked("STAGE1_NUMERIC_COMPARISON_UNCOMPARABLE") from error
+    body: dict[str, Any] = {
+        "schema_version": S29_STAGE1_NUMERIC_COMPARISON_SCHEMA,
+        "estimator": "raw",
+        "profile": dict(S29_STAGE1_TOLERANCE_PROFILE),
+        "candidate_artifact_hash": candidate["artifact_hash"],
+        "reference_artifact_hash": reference["artifact_hash"],
+        "reference_ref": reference_ref,
+        "global": global_result,
+        "per_tensor": per_tensor,
+        "passed": bool(global_result["passed"]) and all(bool(item["passed"]) for item in per_tensor),
+    }
+    body["artifact_hash"] = canonical_json_hash(body)
+    return body
+
+
+def _validate_stage1_numeric_comparison(
+    value: Any,
+    *,
+    candidate: Mapping[str, Any],
+    reference: Mapping[str, Any],
+    reference_ref: str = S29_STAGE1_NUMERIC_REFERENCE_REF,
+) -> dict[str, Any]:
+    if not isinstance(value, Mapping):
+        raise S29G27ABlocked("STAGE1_NUMERIC_COMPARISON_REQUIRED")
+    expected = _stage1_numeric_comparison(candidate, reference, reference_ref=reference_ref)
+    observed = dict(value)
+    if observed != expected:
+        raise S29G27ABlocked("STAGE1_NUMERIC_COMPARISON_DRIFT")
+    if observed.get("passed") is not True:
+        raise S29G27ABlocked("STAGE1_NUMERIC_COMPARISON_FAILED")
+    return observed
 
 
 def _id(value: Any, *, field: str) -> str:
@@ -833,7 +1080,13 @@ def _health_reasons(snapshot: Any, *, expected_io: bool) -> tuple[list[str], lis
     return blockers, provisional
 
 
-def _anchor_reasons(anchor: Any, *, frozen: S29FrozenInputs, expected_devices: int) -> list[str]:
+def _anchor_reasons(
+    anchor: Any,
+    *,
+    frozen: S29FrozenInputs,
+    expected_devices: int,
+    reference_anchor: Mapping[str, Any] | None = None,
+) -> list[str]:
     if not isinstance(anchor, Mapping):
         return ["FOUR_CARD_ANCHOR_MISSING" if expected_devices == 4 else "SINGLE_CARD_ANCHOR_MISSING"]
     prefix = "FOUR_CARD" if expected_devices == 4 else "SINGLE_CARD"
@@ -858,6 +1111,34 @@ def _anchor_reasons(anchor: Any, *, frozen: S29FrozenInputs, expected_devices: i
     for name in S29_COUNT_FIELDS:
         if name not in anchor:
             reasons.append(prefix + "_COUNT_FIELDS_MISSING:" + name)
+    numeric_artifact = anchor.get("stage1_numeric_artifact")
+    try:
+        expected_role = "single_gpu_reference" if expected_devices == 1 else "four_gpu_candidate"
+        validated_artifact = _validate_stage1_numeric_artifact(numeric_artifact, role=expected_role)
+        if anchor.get("stage1_numeric_artifact_hash") != validated_artifact["artifact_hash"]:
+            reasons.append(prefix + "_STAGE1_NUMERIC_ARTIFACT_HASH_MISMATCH")
+        stats_binding = validated_artifact["statistical_binding"]
+        for name in (
+            "global_s1_hash",
+            "global_s2_hash",
+            "estimate_hash",
+            "global_weight",
+            "global_statistical_unit_count",
+        ):
+            if name not in anchor:
+                reasons.append(prefix + "_STAGE1_NUMERIC_STATISTICAL_BINDING_MISSING:" + name)
+            elif anchor[name] != stats_binding[name]:
+                reasons.append(prefix + "_STAGE1_NUMERIC_STATISTICAL_BINDING_MISMATCH:" + name)
+        expected_suffix = "anchors/single-gpu-anchor.json" if expected_devices == 1 else "anchors/four-gpu-stage1-numeric.json"
+        try:
+            _valid_stage1_numeric_ref(anchor.get("stage1_numeric_artifact_ref"), suffix=expected_suffix, field=prefix + ".stage1_numeric_artifact_ref")
+        except S29G27ABlocked:
+            reasons.append(prefix + "_STAGE1_NUMERIC_ARTIFACT_REF_INVALID")
+    except S29G27ABlocked as error:
+        reasons.append(prefix + "_STAGE1_NUMERIC_ARTIFACT_INVALID:" + str(error))
+        validated_artifact = None
+    if expected_devices == 1:
+        return reasons
     if anchor.get("batch_size") != frozen.batch_size or anchor.get("microbatch_count") != frozen.microbatch_count:
         reasons.append(prefix + "_B_M_DRIFT")
     if expected_devices == 4:
@@ -907,11 +1188,50 @@ def _anchor_reasons(anchor: Any, *, frozen: S29FrozenInputs, expected_devices: i
             "strong_scaling_reference_token_count",
             "strong_scaling_reference_backward_count",
             "single_anchor_identity_hash",
+            "stage1_numeric_artifact",
+            "stage1_numeric_artifact_hash",
+            "stage1_numeric_artifact_ref",
+            "stage1_numeric_comparison",
+            "stage1_numeric_comparison_hash",
+            "stage1_numeric_reference_ref",
+            "stage1_numeric_reference_hash",
         )
         missing_system_fields = [name for name in required_system_fields if name not in anchor]
         reasons.extend(prefix + "_SYSTEM_FIELDS_MISSING:" + name for name in missing_system_fields)
         if missing_system_fields:
             return reasons
+        try:
+            _valid_stage1_numeric_ref(anchor.get("stage1_numeric_reference_ref"), suffix="anchors/single-gpu-anchor.json", field=prefix + ".stage1_numeric_reference_ref")
+        except S29G27ABlocked:
+            reasons.append(prefix + "_STAGE1_NUMERIC_REFERENCE_REF_INVALID")
+        if anchor.get("stage1_numeric_reference_hash") != (
+            reference_anchor.get("stage1_numeric_artifact_hash") if isinstance(reference_anchor, Mapping) else None
+        ):
+            reasons.append(prefix + "_STAGE1_NUMERIC_REFERENCE_HASH_MISMATCH")
+        if not isinstance(reference_anchor, Mapping):
+            reasons.append(prefix + "_STAGE1_NUMERIC_REFERENCE_REQUIRED")
+        else:
+            try:
+                reference_artifact = _validate_stage1_numeric_artifact(
+                    reference_anchor.get("stage1_numeric_artifact"), role="single_gpu_reference"
+                )
+                if reference_anchor.get("stage1_numeric_artifact_hash") != reference_artifact["artifact_hash"]:
+                    reasons.append(prefix + "_STAGE1_REFERENCE_ARTIFACT_HASH_MISMATCH")
+                if anchor.get("stage1_numeric_reference_ref") != reference_anchor.get("stage1_numeric_artifact_ref"):
+                    reasons.append(prefix + "_STAGE1_NUMERIC_REFERENCE_REF_MISMATCH")
+                if validated_artifact is not None:
+                    _validate_stage1_numeric_comparison(
+                        anchor.get("stage1_numeric_comparison"),
+                        candidate=validated_artifact,
+                        reference=reference_artifact,
+                        reference_ref=str(reference_anchor.get("stage1_numeric_artifact_ref", S29_STAGE1_NUMERIC_REFERENCE_REF)),
+                    )
+                    if anchor.get("stage1_numeric_comparison_hash") != anchor["stage1_numeric_comparison"].get("artifact_hash"):
+                        reasons.append(prefix + "_STAGE1_NUMERIC_COMPARISON_HASH_MISMATCH")
+                else:
+                    reasons.append(prefix + "_STAGE1_NUMERIC_COMPARISON_UNAVAILABLE")
+            except S29G27ABlocked as error:
+                reasons.append(prefix + "_STAGE1_NUMERIC_COMPARISON_INVALID:" + str(error))
         if anchor.get("system_anchor_mode") != "synchronized_fixed_state_four_process_nccl":
             reasons.append(prefix + "_NCCL_SYSTEM_MODE_REQUIRED")
         if anchor.get("communication_mode") != "nccl_all_reduce_s1_s2":
@@ -1460,7 +1780,12 @@ def run_s209_g27a(
         if row.get("inventory_artifact_hash") != health_inventory_hash or row.get("inventory_source_sha256") != health_source_sha256:
             blockers.append(f"OBSERVATION_GPU_INVENTORY_IDENTITY_DRIFT:{row['semantic']}:{row['anchor_id']}")
     blockers.extend(_anchor_reasons(single_gpu_anchor, frozen=frozen, expected_devices=1))
-    four_reasons = _anchor_reasons(four_gpu_anchor, frozen=frozen, expected_devices=4)
+    four_reasons = _anchor_reasons(
+        four_gpu_anchor,
+        frozen=frozen,
+        expected_devices=4,
+        reference_anchor=single_gpu_anchor,
+    )
     if four_reasons:
         provisional.append("FOUR_CARD_EVIDENCE_MISSING_OR_INVALID")
         blockers.extend(four_reasons)
@@ -1606,6 +1931,11 @@ __all__ = [
     "S29_SHARED_POOL_SCHEMA",
     "S29_SHARED_RUN_SCHEMA",
     "S29_SHARED_ROW_FIELDS",
+    "S29_STAGE1_NUMERIC_ARTIFACT_SCHEMA",
+    "S29_STAGE1_NUMERIC_COMPARISON_SCHEMA",
+    "S29_STAGE1_NUMERIC_REFERENCE_REF",
+    "S29_STAGE1_NUMERIC_CANDIDATE_REF",
+    "S29_STAGE1_TOLERANCE_PROFILE",
     "S29FrozenInputs",
     "S29G27ABlocked",
     "StrictS29Reducer",
@@ -1615,5 +1945,9 @@ __all__ = [
     "prepare_s209_measurement_plan",
     "run_s209_g27a",
     "shared_paired_run_identity",
+    "_stage1_numeric_artifact",
+    "_stage1_numeric_comparison",
+    "_validate_stage1_numeric_artifact",
+    "_validate_stage1_numeric_comparison",
     "validate_g27a",
 ]

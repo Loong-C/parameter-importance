@@ -255,6 +255,10 @@ def test_worker_four_anchor_requires_hash_bound_single_card_reference() -> None:
         "S29_SINGLE_ANCHOR_SEQUENCE_COUNT": "32",
         "S29_SINGLE_ANCHOR_TOKEN_COUNT": "1024",
         "S29_SINGLE_ANCHOR_BACKWARD_COUNT": "16",
+        "S29_SINGLE_ANCHOR_NUMERIC_REF": str(Path.cwd() / "single-gpu-anchor.json"),
+        "S29_SINGLE_ANCHOR_NUMERIC_HASH": "1" * 64,
+        "S29_SINGLE_ANCHOR_NUMERIC_ARTIFACT_REF": "anchors/single-gpu-anchor.json",
+        "S29_STAGE1_NUMERIC_ARTIFACT_REF": "anchors/four-gpu-stage1-numeric.json",
     }
     baseline = {
         "anchor_id": "single-gpu-anchor",

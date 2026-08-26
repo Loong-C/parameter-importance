@@ -57,6 +57,12 @@ from .stage2_s209_g27a import (
     S29_SHARED_POOL_SCHEMA,
     S29_SHARED_RUN_SCHEMA,
     S29_TIMING_FIELDS,
+    S29_STAGE1_NUMERIC_CANDIDATE_REF,
+    S29_STAGE1_NUMERIC_REFERENCE_REF,
+    _stage1_numeric_artifact,
+    _stage1_numeric_comparison,
+    _validate_stage1_numeric_artifact,
+    _valid_stage1_numeric_ref,
     _validate_measurement_plan,
     bind_s209_inputs,
 )
@@ -100,6 +106,36 @@ def _load_object(path: Path, *, field: str) -> dict[str, Any]:
     if not isinstance(value, Mapping):
         raise S209ProductionBlocked(f"{field}:OBJECT_REQUIRED")
     return dict(value)
+
+
+def _load_single_numeric_reference(task: Mapping[str, Any]) -> dict[str, Any]:
+    """Load the measured single-card raw value used as the four-card oracle."""
+
+    reference = task.get("single_gpu_anchor_numeric_ref")
+    declared_hash = task.get("single_gpu_anchor_numeric_hash")
+    if not isinstance(reference, str) or not reference or not Path(reference).is_absolute():
+        raise S209ProductionBlocked("FOUR_GPU_STAGE1_NUMERIC_REFERENCE_PATH_REQUIRED")
+    _sha(declared_hash, field="four_gpu.single_gpu_anchor_numeric_hash")
+    path = Path(reference).resolve()
+    if not path.is_file():
+        raise S209ProductionBlocked("FOUR_GPU_STAGE1_NUMERIC_REFERENCE_NOT_FOUND")
+    try:
+        anchor = _load_object(path, field="four_gpu.single_gpu_anchor_numeric_ref")
+        artifact = _validate_stage1_numeric_artifact(anchor.get("stage1_numeric_artifact"), role="single_gpu_reference")
+    except Exception as error:
+        if isinstance(error, S209ProductionBlocked):
+            raise
+        raise S209ProductionBlocked("FOUR_GPU_STAGE1_NUMERIC_REFERENCE_INVALID") from error
+    if artifact["artifact_hash"] != declared_hash or anchor.get("stage1_numeric_artifact_hash") != declared_hash:
+        raise S209ProductionBlocked("FOUR_GPU_STAGE1_NUMERIC_REFERENCE_HASH_MISMATCH")
+    reference_ref = task.get("single_gpu_anchor_numeric_artifact_ref", S29_STAGE1_NUMERIC_REFERENCE_REF)
+    try:
+        _valid_stage1_numeric_ref(reference_ref, suffix="anchors/single-gpu-anchor.json", field="four_gpu.stage1_numeric_reference_ref")
+    except Exception as error:
+        raise S209ProductionBlocked("FOUR_GPU_STAGE1_NUMERIC_REFERENCE_REF_INVALID") from error
+    if anchor.get("stage1_numeric_artifact_ref") != reference_ref:
+        raise S209ProductionBlocked("FOUR_GPU_STAGE1_NUMERIC_REFERENCE_REF_INVALID")
+    return artifact
 
 
 def _payload_identity(value: Mapping[str, Any], *, field: str) -> str:
@@ -799,6 +835,24 @@ def _four_gpu_anchor_worker(
             formula_seconds = time.perf_counter() - formula_start
             if formula_seconds <= 0:
                 raise S209ProductionBlocked("FORMULA_TIMING_INVALID")
+            estimate_hash = _vector_digest(value)
+            numeric_artifact = _stage1_numeric_artifact(
+                value,
+                role="four_gpu_candidate",
+                fixed_checkpoint_id=str(unit["checkpoint_id"]),
+                checkpoint_hash=str(unit["checkpoint_hash"]),
+                mapping_hash=str(binding["mapping_hash"]),
+                sample_mapping_hash=str(pool.sample_mapping_hash),
+                state_digest=str(pool.state_digest),
+                state_digest_after=str(pool.state_digest_after),
+                statistical_binding={
+                    "global_s1_hash": global_s1_hash,
+                    "global_s2_hash": global_s2_hash,
+                    "estimate_hash": estimate_hash,
+                    "global_weight": float(weight_global_tensor.item()),
+                    "global_statistical_unit_count": int(global_unit_count),
+                },
+            )
             statistics_start = time.perf_counter()
             estimate_hash = _vector_digest(value)
             statistics_seconds = time.perf_counter() - statistics_start
@@ -812,6 +866,7 @@ def _four_gpu_anchor_worker(
                 "global_s1_hash": global_s1_hash,
                 "global_s2_hash": global_s2_hash,
                 "estimate_hash": str(estimate_hash),
+                "numeric_artifact_hash": str(numeric_artifact["artifact_hash"]),
                 "state_digest": str(pool.state_digest),
                 "state_digest_after": str(pool.state_digest_after),
                 "global_unit_count": int(global_unit_count),
@@ -891,6 +946,8 @@ def _four_gpu_anchor_worker(
                     "global_s1_hash": global_s1_hash,
                     "global_s2_hash": global_s2_hash,
                     "estimate_hash": str(estimate_hash),
+                    "numeric_artifact": numeric_artifact,
+                    "numeric_artifact_hash": str(numeric_artifact["artifact_hash"]),
                     "state_digest": str(pool.state_digest),
                     "state_digest_after": str(pool.state_digest_after),
                     "fixed_checkpoint_id": str(unit["checkpoint_id"]),
@@ -947,6 +1004,7 @@ def _aggregate_four_gpu_anchor_results(
     results: Sequence[Mapping[str, Any]],
     io_hash: str,
     expected_partition_hashes: Sequence[str],
+    single_numeric_artifact: Mapping[str, Any],
 ) -> dict[str, Any]:
     """Strictly aggregate four actual process records into one anchor row."""
 
@@ -988,6 +1046,14 @@ def _aggregate_four_gpu_anchor_results(
     )
     if single_identity_hash != expected_single_identity:
         raise S209ProductionBlocked("FOUR_GPU_SINGLE_ANCHOR_IDENTITY_DRIFT")
+    reference_ref = task.get("single_gpu_anchor_numeric_artifact_ref", S29_STAGE1_NUMERIC_REFERENCE_REF)
+    candidate_ref = task.get("stage1_numeric_artifact_ref", S29_STAGE1_NUMERIC_CANDIDATE_REF)
+    try:
+        _valid_stage1_numeric_ref(reference_ref, suffix="anchors/single-gpu-anchor.json", field="four_gpu.stage1_numeric_reference_ref")
+        _valid_stage1_numeric_ref(candidate_ref, suffix="anchors/four-gpu-stage1-numeric.json", field="four_gpu.stage1_numeric_artifact_ref")
+        reference_artifact = _validate_stage1_numeric_artifact(single_numeric_artifact, role="single_gpu_reference")
+    except Exception as error:
+        raise S209ProductionBlocked("FOUR_GPU_STAGE1_NUMERIC_REFERENCE_INVALID") from error
     if len(results) != 4:
         raise S209ProductionBlocked("FOUR_GPU_ANCHOR_RESULT_COUNT_INVALID")
     by_uuid: dict[str, Mapping[str, Any]] = {}
@@ -1015,6 +1081,8 @@ def _aggregate_four_gpu_anchor_results(
         "all_reduce_s1_bytes", "all_reduce_s2_bytes", "all_reduce_weight_bytes", "all_reduce_count_bytes",
         "all_reduce_s1_count", "all_reduce_s2_count", "all_reduce_weight_count", "all_reduce_count",
         "all_reduce_identity_hash",
+        "numeric_artifact",
+        "numeric_artifact_hash",
     }
     for uuid, result in by_uuid.items():
         if set(result) < required or result.get("health_ok") is not True:
@@ -1052,6 +1120,24 @@ def _aggregate_four_gpu_anchor_results(
             raise S209ProductionBlocked(f"FOUR_GPU_CHILD_CHECKPOINT_INVALID:{uuid}")
         for name in ("sample_mapping_hash", "local_sample_mapping_hash", "local_gradient_pool_hash", "global_s1_hash", "global_s2_hash", "estimate_hash", "state_digest", "state_digest_after", "checkpoint_hash", "mapping_hash"):
             _sha(result[name], field=f"four_gpu.{uuid}.{name}")
+        try:
+            artifact = _validate_stage1_numeric_artifact(result["numeric_artifact"], role="four_gpu_candidate")
+        except Exception as error:
+            raise S209ProductionBlocked(f"FOUR_GPU_STAGE1_NUMERIC_ARTIFACT_INVALID:{uuid}") from error
+        if result["numeric_artifact_hash"] != artifact["artifact_hash"]:
+            raise S209ProductionBlocked(f"FOUR_GPU_STAGE1_NUMERIC_ARTIFACT_HASH_MISMATCH:{uuid}")
+        stats_binding = artifact["statistical_binding"]
+        if any(
+            stats_binding[name] != result[expected]
+            for name, expected in (
+                ("global_s1_hash", "global_s1_hash"),
+                ("global_s2_hash", "global_s2_hash"),
+                ("estimate_hash", "estimate_hash"),
+                ("global_weight", "global_weight"),
+                ("global_statistical_unit_count", "global_statistical_unit_count"),
+            )
+        ):
+            raise S209ProductionBlocked(f"FOUR_GPU_STAGE1_NUMERIC_STATISTICAL_BINDING_DRIFT:{uuid}")
         for name in ("all_reduce_s1_seconds", "all_reduce_s2_seconds", "all_reduce_weight_seconds", "all_reduce_count_seconds"):
             value = result[name]
             if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value)) or float(value) <= 0:
@@ -1095,7 +1181,7 @@ def _aggregate_four_gpu_anchor_results(
             raise S209ProductionBlocked(f"FOUR_GPU_MAPPING_IDENTITY_DRIFT:{uuid}")
         if expected_checkpoint_hash is not None and result["checkpoint_hash"] != expected_checkpoint_hash:
             raise S209ProductionBlocked(f"FOUR_GPU_CHECKPOINT_IDENTITY_DRIFT:{uuid}")
-    identity_fields = ("fixed_checkpoint_id", "checkpoint_hash", "mapping_hash", "sample_mapping_hash", "global_s1_hash", "global_s2_hash", "estimate_hash", "state_digest", "state_digest_after", "global_statistical_unit_count")
+    identity_fields = ("fixed_checkpoint_id", "checkpoint_hash", "mapping_hash", "sample_mapping_hash", "global_s1_hash", "global_s2_hash", "estimate_hash", "numeric_artifact_hash", "state_digest", "state_digest_after", "global_statistical_unit_count")
     for name in identity_fields:
         if len({str(result[name]) for result in by_uuid.values()}) != 1:
             raise S209ProductionBlocked(f"FOUR_GPU_NUMERIC_CONSISTENCY_FAILED:{name}")
@@ -1103,6 +1189,15 @@ def _aggregate_four_gpu_anchor_results(
         raise S209ProductionBlocked("FOUR_GPU_STATISTICAL_UNIT_GLOBAL_SUM_MISMATCH")
     if int(next(iter(by_uuid.values()))["global_statistical_unit_count"]) != int(config["frozen"]["microbatch_count"]):
         raise S209ProductionBlocked("FOUR_GPU_STATISTICAL_UNIT_FROZEN_COUNT_MISMATCH")
+    candidate_artifact = _validate_stage1_numeric_artifact(
+        next(iter(by_uuid.values()))["numeric_artifact"], role="four_gpu_candidate"
+    )
+    try:
+        numeric_comparison = _stage1_numeric_comparison(candidate_artifact, reference_artifact, reference_ref=str(reference_ref))
+    except Exception as error:
+        raise S209ProductionBlocked("FOUR_GPU_STAGE1_NUMERIC_COMPARISON_INVALID") from error
+    if numeric_comparison.get("passed") is not True:
+        raise S209ProductionBlocked("FOUR_GPU_STAGE1_NUMERIC_COMPARISON_FAILED")
     slowest = max(by_uuid.values(), key=lambda result: float(result["wall_seconds"]))
     phase = {name: float(slowest["phase"][name]) for name in S29_TIMING_FIELDS}
     per_device = []
@@ -1131,13 +1226,14 @@ def _aggregate_four_gpu_anchor_results(
                 "local_sample_mapping_hash": str(result["local_sample_mapping_hash"]),
                 "local_gradient_pool_hash": str(result["local_gradient_pool_hash"]),
                 "global_s1_hash": str(result["global_s1_hash"]),
-                    "global_s2_hash": str(result["global_s2_hash"]),
-                    "estimate_hash": str(result["estimate_hash"]),
-                    "fixed_checkpoint_id": str(result["fixed_checkpoint_id"]),
-                    "checkpoint_hash": str(result["checkpoint_hash"]),
-                    "mapping_hash": str(result["mapping_hash"]),
-                    "state_digest": str(result["state_digest"]),
-                    "state_digest_after": str(result["state_digest_after"]),
+                "global_s2_hash": str(result["global_s2_hash"]),
+                "estimate_hash": str(result["estimate_hash"]),
+                "stage1_numeric_artifact_hash": str(result["numeric_artifact_hash"]),
+                "fixed_checkpoint_id": str(result["fixed_checkpoint_id"]),
+                "checkpoint_hash": str(result["checkpoint_hash"]),
+                "mapping_hash": str(result["mapping_hash"]),
+                "state_digest": str(result["state_digest"]),
+                "state_digest_after": str(result["state_digest_after"]),
                 "all_reduce_s1_seconds": float(result["all_reduce_s1_seconds"]),
                 "all_reduce_s2_seconds": float(result["all_reduce_s2_seconds"]),
                 "all_reduce_weight_seconds": float(result["all_reduce_weight_seconds"]),
@@ -1234,6 +1330,13 @@ def _aggregate_four_gpu_anchor_results(
         "global_s1_hash": str(slowest["global_s1_hash"]),
         "global_s2_hash": str(slowest["global_s2_hash"]),
         "estimate_hash": str(slowest["estimate_hash"]),
+        "stage1_numeric_artifact": candidate_artifact,
+        "stage1_numeric_artifact_hash": str(candidate_artifact["artifact_hash"]),
+        "stage1_numeric_artifact_ref": str(candidate_ref),
+        "stage1_numeric_comparison": numeric_comparison,
+        "stage1_numeric_comparison_hash": str(numeric_comparison["artifact_hash"]),
+        "stage1_numeric_reference_ref": str(reference_ref),
+        "stage1_numeric_reference_hash": str(reference_artifact["artifact_hash"]),
         "gradient_pool_hash": aggregate_gradient_pool_hash,
         "four_process_identity_hash": canonical_json_hash(
             {
@@ -1292,6 +1395,7 @@ def _run_four_gpu_anchor(*, task: Mapping[str, Any], config: Mapping[str, Any], 
     if os.environ.get("CUDA_VISIBLE_DEVICES") != ",".join(expected):
         raise S209ProductionBlocked("FOUR_GPU_PARENT_MASK_INVALID")
     _device_identity_set(expected)
+    single_numeric_artifact = _load_single_numeric_reference(task)
     plan = load_s27_plan(root, str(checked["s27_plan_ref"]))
     cell_id = EXPECTED_CELL_IDS[0]
     unit_id = checked["frozen"]["expected_unit_ids"][0]
@@ -1364,6 +1468,7 @@ def _run_four_gpu_anchor(*, task: Mapping[str, Any], config: Mapping[str, Any], 
             results=results,
             io_hash=str(task["io_evidence_hash"]),
             expected_partition_hashes=expected_partition_hashes,
+            single_numeric_artifact=single_numeric_artifact,
         )
     finally:
         for process in processes:
@@ -1655,12 +1760,43 @@ def run_s209_production_backend(*, task: Mapping[str, Any], config: Mapping[str,
         provider = build_s27_torch_provider(cell, data_root=root, checkpoint_root_ref=material.checkpoint_root_ref, registry_ref=material.registry_ref, request=_request_for_cell(root, checked, cell)).provider
         pool = _measure_pool(provider, mapping.groups(max(mapping.m_values)), mapping=mapping)
         value, formula_seconds = _method_value(CoreEstimatorKernel(accumulation_dtype="float64"), pool, "raw", mapping)
+        single_s1, single_s2, single_weight, single_count = _local_sufficient_statistics(pool)
+        single_s1_map = _restore_tensor_map(pool.maps[0], single_s1)
+        single_s2_map = _restore_tensor_map(pool.maps[0], single_s2)
+        single_s1_hash = _vector_digest(single_s1_map)
+        single_s2_hash = _vector_digest(single_s2_map)
+        single_estimate_hash = _vector_digest(value)
+        numeric_artifact = _stage1_numeric_artifact(
+            value,
+            role="single_gpu_reference",
+            fixed_checkpoint_id=str(cell.checkpoint_id),
+            checkpoint_hash=str(cell.checkpoint_hash),
+            mapping_hash=str(mapping.digest),
+            sample_mapping_hash=str(pool.sample_mapping_hash),
+            state_digest=str(pool.state_digest),
+            state_digest_after=str(pool.state_digest_after),
+            statistical_binding={
+                "global_s1_hash": single_s1_hash,
+                "global_s2_hash": single_s2_hash,
+                "estimate_hash": single_estimate_hash,
+                "global_weight": float(single_weight),
+                "global_statistical_unit_count": int(single_count),
+            },
+        )
         stats_start = time.perf_counter()
         _ = _vector_digest(value)
         statistics_seconds = time.perf_counter() - stats_start
         write_start = time.perf_counter()
         row = _make_row(task=task, config=checked, unit={"unit_id": binding["unit_id"], "checkpoint_id": cell.checkpoint_id}, method="anchor", pool=pool, formula_seconds=formula_seconds, statistics_seconds=statistics_seconds, write_seconds=0.0, io_hash=str(task["io_evidence_hash"]))
         row["numeric_consistency"] = True
+        row["stage1_numeric_artifact"] = numeric_artifact
+        row["stage1_numeric_artifact_hash"] = str(numeric_artifact["artifact_hash"])
+        row["stage1_numeric_artifact_ref"] = str(task.get("stage1_numeric_artifact_ref", S29_STAGE1_NUMERIC_REFERENCE_REF))
+        row["global_s1_hash"] = single_s1_hash
+        row["global_s2_hash"] = single_s2_hash
+        row["estimate_hash"] = single_estimate_hash
+        row["global_weight"] = float(single_weight)
+        row["global_statistical_unit_count"] = int(single_count)
         row["write_seconds"] = max(0.0, time.perf_counter() - write_start)
         row["wall_seconds"] = sum(float(row[name]) for name in S29_TIMING_FIELDS)
         _row_bytes(row)

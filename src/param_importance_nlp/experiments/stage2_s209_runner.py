@@ -42,6 +42,8 @@ from .stage2_s209_g27a import (
     S29_METHODS,
     S29_SHARED_POOL_SCHEMA,
     S29_SHARED_RUN_SCHEMA,
+    S29_STAGE1_NUMERIC_CANDIDATE_REF,
+    S29_STAGE1_NUMERIC_REFERENCE_REF,
     S29_TIMING_FIELDS,
     S29FrozenInputs,
     S29_G25_GATE_ID,
@@ -50,6 +52,8 @@ from .stage2_s209_g27a import (
     prepare_s209_measurement_plan,
     run_s209_g27a,
     shared_paired_run_identity,
+    _validate_stage1_numeric_artifact,
+    _validate_stage1_numeric_comparison,
 )
 
 
@@ -1325,6 +1329,14 @@ class S29ProfilerRunner:
             return reference
         return f"{run_root_ref}/{reference}"
 
+    def _stage1_numeric_artifact_ref(self, suffix: str) -> str:
+        """Return a DATA_ROOT-relative POSIX ref for an anchor numeric artifact."""
+
+        run_root_ref = self._run_root_ref()
+        if run_root_ref is None:
+            raise S29RunnerBlocked("STAGE1_NUMERIC_DATA_ROOT_REF_REQUIRED")
+        return suffix if run_root_ref == "." else f"{run_root_ref}/{suffix}"
+
     def _shared_environment(self, task: Mapping[str, Any]) -> dict[str, str]:
         return {
             "S29_RUN_ID": self.run_id,
@@ -1488,6 +1500,9 @@ class S29ProfilerRunner:
             "CUDA_VISIBLE_DEVICES": ",".join(task["gpu_uuids"]),
             "S29_IO_EVIDENCE_HASH": str(self.preflight.io_evidence["artifact_hash"]),
             "S29_COST_IO_QUIESCENT": str(bool(self.preflight.io_evidence.get("cost_io_quiescent"))).lower(),
+            "S29_STAGE1_NUMERIC_ARTIFACT_REF": self._stage1_numeric_artifact_ref(
+                "anchors/single-gpu-anchor.json" if int(task["device_count"]) == 1 else "anchors/four-gpu-stage1-numeric.json"
+            ),
         }
         if int(task["device_count"]) == 4:
             # The four-card system measurement is a strong-scaling comparison
@@ -1514,6 +1529,11 @@ class S29ProfilerRunner:
                             "backward_count": int(single["backward_count"]),
                             "wall_seconds": float(single["wall_seconds"]),
                         }
+                    ),
+                    "S29_SINGLE_ANCHOR_NUMERIC_REF": str(anchor_root / "single-gpu-anchor.json"),
+                    "S29_SINGLE_ANCHOR_NUMERIC_HASH": str(single.get("stage1_numeric_artifact_hash", "")),
+                    "S29_SINGLE_ANCHOR_NUMERIC_ARTIFACT_REF": self._stage1_numeric_artifact_ref(
+                        "anchors/single-gpu-anchor.json"
                     ),
                 }
             )
@@ -1552,6 +1572,20 @@ class S29ProfilerRunner:
                 "measurement_source": "profiler_worker",
                 "io_evidence_hash": self.preflight.io_evidence["artifact_hash"],
             }
+            if int(task["device_count"]) == 1:
+                for name in (
+                    "stage1_numeric_artifact",
+                    "stage1_numeric_artifact_hash",
+                    "stage1_numeric_artifact_ref",
+                    "global_s1_hash",
+                    "global_s2_hash",
+                    "estimate_hash",
+                    "global_weight",
+                    "global_statistical_unit_count",
+                ):
+                    if name not in row:
+                        raise S29RunnerBlocked("SINGLE_GPU_STAGE1_NUMERIC_FIELDS_MISSING:" + name)
+                    anchor[name] = row[name]
             if int(task["device_count"]) == 4:
                 required_system_fields = (
                     *S29_TIMING_FIELDS,
@@ -1600,6 +1634,13 @@ class S29ProfilerRunner:
                     "strong_scaling_reference_token_count",
                     "strong_scaling_reference_backward_count",
                     "single_anchor_identity_hash",
+                    "stage1_numeric_artifact",
+                    "stage1_numeric_artifact_hash",
+                    "stage1_numeric_artifact_ref",
+                    "stage1_numeric_comparison",
+                    "stage1_numeric_comparison_hash",
+                    "stage1_numeric_reference_ref",
+                    "stage1_numeric_reference_hash",
                 )
                 missing_system_fields = [name for name in required_system_fields if name not in row]
                 if missing_system_fields:
@@ -1607,6 +1648,12 @@ class S29ProfilerRunner:
                         "FOUR_GPU_SYSTEM_FIELDS_MISSING:" + ",".join(missing_system_fields)
                     )
                 anchor.update({name: row[name] for name in required_system_fields})
+                _write_once(
+                    self.run_root / Path(*S29_STAGE1_NUMERIC_CANDIDATE_REF.split("/")),
+                    row["stage1_numeric_artifact"],
+                    field="anchor.four-gpu-stage1-numeric",
+                )
+            self._validate_anchor(anchor, task)
             anchor_root.mkdir(parents=True, exist_ok=True)
             _write_once(anchor_path, anchor, field=f"anchor.{key}")
             return anchor
@@ -1638,6 +1685,21 @@ class S29ProfilerRunner:
         for name, value in expected.items():
             if anchor.get(name) != value:
                 raise S29RunnerBlocked(f"ANCHOR_IDENTITY_DRIFT:{task['anchor_id']}:{name}")
+        expected_role = "single_gpu_reference" if int(task["device_count"]) == 1 else "four_gpu_candidate"
+        try:
+            numeric_artifact = _validate_stage1_numeric_artifact(anchor.get("stage1_numeric_artifact"), role=expected_role)
+        except Exception as error:
+            raise S29RunnerBlocked("ANCHOR_STAGE1_NUMERIC_ARTIFACT_INVALID") from error
+        expected_numeric_ref = self._stage1_numeric_artifact_ref(
+            "anchors/single-gpu-anchor.json" if int(task["device_count"]) == 1 else "anchors/four-gpu-stage1-numeric.json"
+        )
+        if anchor.get("stage1_numeric_artifact_hash") != numeric_artifact["artifact_hash"] or anchor.get("stage1_numeric_artifact_ref") != expected_numeric_ref:
+            raise S29RunnerBlocked("ANCHOR_STAGE1_NUMERIC_ARTIFACT_BINDING_INVALID")
+        stats_binding = numeric_artifact["statistical_binding"]
+        if any(anchor.get(name) != stats_binding[name] for name in stats_binding):
+            raise S29RunnerBlocked("ANCHOR_STAGE1_NUMERIC_STATISTICAL_BINDING_DRIFT")
+        if int(task["device_count"]) == 1:
+            return
         if int(task["device_count"]) == 4:
             required_system_fields = (
                 *S29_TIMING_FIELDS,
@@ -1686,6 +1748,13 @@ class S29ProfilerRunner:
                 "strong_scaling_reference_token_count",
                 "strong_scaling_reference_backward_count",
                 "single_anchor_identity_hash",
+                "stage1_numeric_artifact",
+                "stage1_numeric_artifact_hash",
+                "stage1_numeric_artifact_ref",
+                "stage1_numeric_comparison",
+                "stage1_numeric_comparison_hash",
+                "stage1_numeric_reference_ref",
+                "stage1_numeric_reference_hash",
             )
             missing = [name for name in required_system_fields if name not in anchor]
             if missing:
@@ -1718,6 +1787,28 @@ class S29ProfilerRunner:
             if not isinstance(local_gradient_hashes, list) or len(local_gradient_hashes) != 4 or len(set(local_gradient_hashes)) != 4 or any(not isinstance(value, str) or _SHA256.fullmatch(value) is None for value in local_gradient_hashes):
                 raise S29RunnerBlocked("FOUR_GPU_SYSTEM_LOCAL_GRADIENT_HASH_INVALID")
             _sha(anchor["single_anchor_identity_hash"], field="single_anchor_identity_hash")
+            try:
+                reference_artifact = _validate_stage1_numeric_artifact(
+                    self.single_gpu_anchor.get("stage1_numeric_artifact") if isinstance(self.single_gpu_anchor, Mapping) else None,
+                    role="single_gpu_reference",
+                )
+                _validate_stage1_numeric_comparison(
+                    anchor["stage1_numeric_comparison"],
+                    candidate=numeric_artifact,
+                    reference=reference_artifact,
+                    reference_ref=self._stage1_numeric_artifact_ref("anchors/single-gpu-anchor.json"),
+                )
+            except Exception as error:
+                raise S29RunnerBlocked("FOUR_GPU_STAGE1_NUMERIC_COMPARISON_INVALID") from error
+            expected_reference_ref = self._stage1_numeric_artifact_ref("anchors/single-gpu-anchor.json")
+            if anchor["stage1_numeric_reference_ref"] != expected_reference_ref or anchor["stage1_numeric_reference_hash"] != reference_artifact["artifact_hash"]:
+                raise S29RunnerBlocked("FOUR_GPU_STAGE1_NUMERIC_REFERENCE_BINDING_INVALID")
+            if anchor["stage1_numeric_comparison_hash"] != anchor["stage1_numeric_comparison"].get("artifact_hash"):
+                raise S29RunnerBlocked("FOUR_GPU_STAGE1_NUMERIC_COMPARISON_HASH_INVALID")
+            sidecar_path = self.run_root / Path(*S29_STAGE1_NUMERIC_CANDIDATE_REF.split("/"))
+            sidecar = _load_object(sidecar_path, field="anchor.four-gpu-stage1-numeric")
+            if sidecar != numeric_artifact:
+                raise S29RunnerBlocked("FOUR_GPU_STAGE1_NUMERIC_SIDECAR_DRIFT")
             devices = anchor["per_device_measurements"]
             if not isinstance(devices, list) or len(devices) != 4:
                 raise S29RunnerBlocked("FOUR_GPU_SYSTEM_DEVICE_ROWS_INVALID")

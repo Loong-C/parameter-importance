@@ -8,6 +8,7 @@ from param_importance_nlp.contracts.jsonio import canonical_json_hash
 from param_importance_nlp.experiments.stage2_s207_formal import APPROVED_GPU_UUIDS
 from param_importance_nlp.experiments.stage2_s204_ids import EXPECTED_CELL_IDS
 from param_importance_nlp.experiments.stage2_s209_g27a import S29_TIMING_FIELDS
+from param_importance_nlp.experiments.stage2_s209_g27a import _stage1_numeric_artifact
 from param_importance_nlp.experiments.stage2_s209_production import (
     S209ProductionBlocked,
     _MeasuredPool,
@@ -68,6 +69,28 @@ def _config() -> dict[str, object]:
     return {"frozen": {"batch_size": 32, "microbatch_count": 4}}
 
 
+def _numeric_artifact(*, role: str, value: float = 1.0) -> dict[str, object]:
+    import torch
+
+    return _stage1_numeric_artifact(
+        {"weight": torch.tensor([value], dtype=torch.float64)},
+        role=role,
+        fixed_checkpoint_id="checkpoint-fixed",
+        checkpoint_hash="2" * 64,
+        mapping_hash="1" * 64,
+        sample_mapping_hash=HASHES["sample_mapping_hash"],
+        state_digest=HASHES["state_digest"],
+        state_digest_after=HASHES["state_digest_after"],
+        statistical_binding={
+            "global_s1_hash": HASHES["global_s1_hash"],
+            "global_s2_hash": HASHES["global_s2_hash"],
+            "estimate_hash": HASHES["estimate_hash"],
+            "global_weight": 4.0,
+            "global_statistical_unit_count": 4,
+        },
+    )
+
+
 def _task() -> dict[str, object]:
     task: dict[str, object] = {
         "semantic": "anchor",
@@ -104,7 +127,7 @@ def _task() -> dict[str, object]:
     return task
 
 
-def _child_result(uuid: str, *, rank: int, local_hash: str, drift: bool = False) -> dict[str, object]:
+def _child_result(uuid: str, *, rank: int, local_hash: str, drift: bool = False, numeric_value: float = 1.0) -> dict[str, object]:
     phase = {name: 0.1 for name in S29_TIMING_FIELDS}
     result: dict[str, object] = {
         "ok": True,
@@ -144,6 +167,8 @@ def _child_result(uuid: str, *, rank: int, local_hash: str, drift: bool = False)
         "all_reduce_count": 4,
     }
     result.update(HASHES)
+    result["numeric_artifact"] = _numeric_artifact(role="four_gpu_candidate", value=numeric_value)
+    result["numeric_artifact_hash"] = result["numeric_artifact"]["artifact_hash"]
     result["local_sample_mapping_hash"] = local_hash
     result["local_gradient_pool_hash"] = "9" * 64
     result["all_reduce_identity_hash"] = canonical_json_hash(
@@ -183,11 +208,12 @@ def test_four_gpu_anchor_worker_uses_two_barriers_and_real_measurement_fields(mo
         gradient_aggregation_seconds=0.0,
     )
     monkeypatch.setattr(production, "_measure_pool", lambda *_args, **_kwargs: pool)
-    monkeypatch.setattr(production, "_method_value", lambda *_args, **_kwargs: (object(), 0.0))
+    import torch
+    monkeypatch.setattr(production, "_method_value", lambda *_args, **_kwargs: ({"weight": torch.tensor([1.0], dtype=torch.float64)}, 0.001))
     monkeypatch.setattr(production, "_vector_digest", lambda _value: HASHES["estimate_hash"])
     barrier = _Barrier()
     result_queue = _Queue()
-    import torch
+    numeric_map = {"weight": torch.tensor([1.0], dtype=torch.float64)}
     monkeypatch.setattr(torch.cuda, "set_device", lambda _device: None)
     class _FakeTensor:
         def numel(self) -> int:
@@ -211,7 +237,7 @@ def test_four_gpu_anchor_worker_uses_two_barriers_and_real_measurement_fields(mo
 
     class _FakeKernel:
         def raw(self, _value):
-            return object()
+            return numeric_map
 
     monkeypatch.setattr(production, "_init_four_gpu_process_group", lambda **_kwargs: (_FakeDist(), object()))
     monkeypatch.setattr(production, "_timed_nccl_barrier", lambda _dist: 0.000001)
@@ -242,7 +268,7 @@ def test_four_gpu_anchor_worker_uses_two_barriers_and_real_measurement_fields(mo
 def test_four_gpu_aggregate_requires_exact_child_uuid_set_and_preserves_actual_counters() -> None:
     partition_hashes = [str(index + 1) * 64 for index in range(4)]
     results = [_child_result(uuid, rank=index, local_hash=partition_hashes[index]) for index, uuid in enumerate(APPROVED_GPU_UUIDS)]
-    row = _aggregate_four_gpu_anchor_results(task=_task(), config=_config(), results=results, io_hash="f" * 64, expected_partition_hashes=partition_hashes)
+    row = _aggregate_four_gpu_anchor_results(task=_task(), config=_config(), results=results, io_hash="f" * 64, expected_partition_hashes=partition_hashes, single_numeric_artifact=_numeric_artifact(role="single_gpu_reference"))
     assert row["gpu_uuids"] == list(APPROVED_GPU_UUIDS)
     assert row["device_count"] == 4
     assert row["sequence_count"] == 4
@@ -257,7 +283,7 @@ def test_four_gpu_aggregate_requires_exact_child_uuid_set_and_preserves_actual_c
     drifted = [_child_result(uuid, rank=index, local_hash=partition_hashes[index]) for index, uuid in enumerate(APPROVED_GPU_UUIDS)]
     drifted[2] = _child_result(APPROVED_GPU_UUIDS[2], rank=2, local_hash=partition_hashes[2], drift=True)
     with pytest.raises(S209ProductionBlocked, match="CHILD_UUID"):
-        _aggregate_four_gpu_anchor_results(task=_task(), config=_config(), results=drifted, io_hash="f" * 64, expected_partition_hashes=partition_hashes)
+        _aggregate_four_gpu_anchor_results(task=_task(), config=_config(), results=drifted, io_hash="f" * 64, expected_partition_hashes=partition_hashes, single_numeric_artifact=_numeric_artifact(role="single_gpu_reference"))
 
 
 def test_four_gpu_aggregate_blocks_zero_collective_and_duplicate_partition() -> None:
@@ -265,10 +291,40 @@ def test_four_gpu_aggregate_blocks_zero_collective_and_duplicate_partition() -> 
     zero_collective = [_child_result(uuid, rank=index, local_hash=partition_hashes[index]) for index, uuid in enumerate(APPROVED_GPU_UUIDS)]
     zero_collective[0]["communication_bytes"] = 0
     with pytest.raises(S209ProductionBlocked, match="CHILD_COUNTER_INVALID|COLLECTIVE_MISSING"):
-        _aggregate_four_gpu_anchor_results(task=_task(), config=_config(), results=zero_collective, io_hash="f" * 64, expected_partition_hashes=partition_hashes)
+        _aggregate_four_gpu_anchor_results(task=_task(), config=_config(), results=zero_collective, io_hash="f" * 64, expected_partition_hashes=partition_hashes, single_numeric_artifact=_numeric_artifact(role="single_gpu_reference"))
     duplicate_partition = [_child_result(uuid, rank=index, local_hash="1" * 64) for index, uuid in enumerate(APPROVED_GPU_UUIDS)]
     with pytest.raises(S209ProductionBlocked, match="PARTITION_HASH_DUPLICATE"):
-        _aggregate_four_gpu_anchor_results(task=_task(), config=_config(), results=duplicate_partition, io_hash="f" * 64, expected_partition_hashes=["1" * 64] * 4)
+        _aggregate_four_gpu_anchor_results(task=_task(), config=_config(), results=duplicate_partition, io_hash="f" * 64, expected_partition_hashes=["1" * 64] * 4, single_numeric_artifact=_numeric_artifact(role="single_gpu_reference"))
+
+
+def test_four_gpu_stage1_numeric_comparator_accepts_near_threshold_and_blocks_overthreshold() -> None:
+    partition_hashes = [str(index + 1) * 64 for index in range(4)]
+    near = [_child_result(uuid, rank=index, local_hash=partition_hashes[index], numeric_value=1.0 + 1e-12) for index, uuid in enumerate(APPROVED_GPU_UUIDS)]
+    row = _aggregate_four_gpu_anchor_results(
+        task=_task(), config=_config(), results=near, io_hash="f" * 64,
+        expected_partition_hashes=partition_hashes,
+        single_numeric_artifact=_numeric_artifact(role="single_gpu_reference"),
+    )
+    assert row["stage1_numeric_comparison"]["passed"] is True
+    over = [_child_result(uuid, rank=index, local_hash=partition_hashes[index], numeric_value=1.0 + 1e-3) for index, uuid in enumerate(APPROVED_GPU_UUIDS)]
+    with pytest.raises(S209ProductionBlocked, match="STAGE1_NUMERIC_COMPARISON_FAILED"):
+        _aggregate_four_gpu_anchor_results(
+            task=_task(), config=_config(), results=over, io_hash="f" * 64,
+            expected_partition_hashes=partition_hashes,
+            single_numeric_artifact=_numeric_artifact(role="single_gpu_reference"),
+        )
+
+
+def test_four_gpu_stage1_numeric_sidecar_and_substitution_hashes_fail_closed() -> None:
+    partition_hashes = [str(index + 1) * 64 for index in range(4)]
+    results = [_child_result(uuid, rank=index, local_hash=partition_hashes[index]) for index, uuid in enumerate(APPROVED_GPU_UUIDS)]
+    results[0]["numeric_artifact_hash"] = "9" * 64
+    with pytest.raises(S209ProductionBlocked, match="NUMERIC_ARTIFACT_HASH_MISMATCH"):
+        _aggregate_four_gpu_anchor_results(
+            task=_task(), config=_config(), results=results, io_hash="f" * 64,
+            expected_partition_hashes=partition_hashes,
+            single_numeric_artifact=_numeric_artifact(role="single_gpu_reference"),
+        )
 
 
 def test_production_backend_dispatches_four_gpu_anchor_instead_of_rejecting_device_count(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -341,8 +397,14 @@ def test_four_gpu_parent_orchestrates_four_mocked_processes_and_rejects_missing_
         "frozen": {"batch_size": 4, "microbatch_count": 4, "expected_unit_ids": ["unit-0"]},
     }
     import torch
+    numeric_map = {"weight": torch.tensor([1.0], dtype=torch.float64)}
+    numeric_reference = _numeric_artifact(role="single_gpu_reference")
     monkeypatch.setattr(torch.cuda, "set_device", lambda _device: None)
-    monkeypatch.setattr(torch, "tensor", lambda *_args, **_kwargs: _FakeTensor())
+    real_tensor = torch.tensor
+    def _cpu_tensor(*args, **kwargs):
+        kwargs.pop("device", None)
+        return real_tensor(*args, **kwargs)
+    monkeypatch.setattr(torch, "tensor", _cpu_tensor)
     class _FakeTensor:
         def numel(self) -> int:
             return 4
@@ -363,11 +425,11 @@ def test_four_gpu_parent_orchestrates_four_mocked_processes_and_rejects_missing_
 
     class _FakeKernel:
         def raw(self, _value):
-            return object()
+            return numeric_map
 
     monkeypatch.setattr(production, "_init_four_gpu_process_group", lambda **_kwargs: (_FakeDist(), object()))
     monkeypatch.setattr(production, "_timed_nccl_barrier", lambda _dist: 0.000001)
-    monkeypatch.setattr(production, "_local_sufficient_statistics", lambda _pool: (_FakeTensor(), _FakeTensor(), 1.0, 1))
+    monkeypatch.setattr(production, "_local_sufficient_statistics", lambda _pool: (torch.tensor([1.0]), torch.tensor([1.0]), 1.0, 1))
     monkeypatch.setattr(production, "_timed_nccl_tensor_reduce", lambda _reducer, _name, tensor: (tensor, 0.000001))
     monkeypatch.setattr(production, "_timed_nccl_count_reduce", lambda _reducer, _value: (4, 0.000001))
     monkeypatch.setattr(production, "TorchDistributedReducer", lambda **_kwargs: object())
@@ -386,6 +448,7 @@ def test_four_gpu_parent_orchestrates_four_mocked_processes_and_rejects_missing_
         gradient_aggregation_seconds=0.0,
     )
     monkeypatch.setattr(production, "_measure_pool", lambda *_args, **_kwargs: pool)
+    monkeypatch.setattr(production, "_load_single_numeric_reference", lambda _task: numeric_reference)
     row = production._run_four_gpu_anchor(task=_task(), config=checked, checked=checked, root=Path("."))
     assert row["device_count"] == 4
     assert len(context.processes) == 4
@@ -394,8 +457,8 @@ def test_four_gpu_parent_orchestrates_four_mocked_processes_and_rejects_missing_
     partition_hashes = [str(index + 1) * 64 for index in range(4)]
     bad_results = [_child_result(uuid, rank=index, local_hash=partition_hashes[index]) for index, uuid in enumerate(APPROVED_GPU_UUIDS)]
     bad_results[0]["estimate_hash"] = "9" * 64
-    with pytest.raises(S209ProductionBlocked, match="NUMERIC_CONSISTENCY"):
-        production._aggregate_four_gpu_anchor_results(task=_task(), config=_config(), results=bad_results, io_hash="f" * 64, expected_partition_hashes=partition_hashes)
+    with pytest.raises(S209ProductionBlocked, match="NUMERIC_CONSISTENCY|STATISTICAL_BINDING"):
+        production._aggregate_four_gpu_anchor_results(task=_task(), config=_config(), results=bad_results, io_hash="f" * 64, expected_partition_hashes=partition_hashes, single_numeric_artifact=_numeric_artifact(role="single_gpu_reference"))
 
 
 def assert_uuid_set(uuids: object) -> None:
