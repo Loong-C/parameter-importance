@@ -1080,10 +1080,10 @@ def _detach(args: argparse.Namespace, raw_argv: Sequence[str] | None = None) -> 
     if attempts.exists():
         receipt_candidates.extend(attempts.glob("*/launcher.pid.json"))
     for existing_path in receipt_candidates:
-        if not existing_path.exists():
-            continue
         if existing_path.is_symlink():
             raise S25ExecutionBlocked("S205_DETACHED_PID_INVALID")
+        if not existing_path.exists():
+            continue
         if not existing_path.is_file():
             raise S25ExecutionBlocked("S205_DETACHED_PID_INVALID")
         try:
