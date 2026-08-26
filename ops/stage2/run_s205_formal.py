@@ -792,12 +792,14 @@ def _worker(args: argparse.Namespace) -> dict[str, object]:
 
 
 def _execute(args: argparse.Namespace) -> dict[str, object]:
+    resume = bool(getattr(args, "resume", False))
+    if resume and not bool(getattr(args, "detached_child", False)):
+        raise S25ExecutionBlocked("S205_RESUME_REQUIRES_DETACH")
     preflight = _preflight(args)
     root = args.data_root.resolve()
     operations = _logical(root, args.operations_root, field="operations_root", allow_missing=True)
     operations.mkdir(parents=True, exist_ok=True)
     status_path = operations / "status.json"
-    resume = bool(getattr(args, "resume", False))
     previous: Mapping[str, object] | None = None
     if status_path.exists():
         try:
