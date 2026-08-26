@@ -248,108 +248,201 @@ def test_launcher_gpu_inventory_requires_complete_clean_s206_snapshot() -> None:
         _validate_inventory(rows)
 
 
-def test_launcher_accepts_only_hash_bound_gpu_inventory_envelope(tmp_path: Path) -> None:
-    rows = [
+def _formal_inventory_rows() -> list[dict[str, object]]:
+    rows: list[dict[str, object]] = []
+    for pci, uuid in ALLOWED_DEVICES:
+        rows.append(
+            {
+                "pci_bus_id": pci,
+                "uuid": uuid,
+                "gpu_name": "A100-SXM4-80GB",
+                "temperature_c": 40,
+                "memory_used_mib": 0,
+                "memory_total_mib": 40960,
+                "utilization_gpu_percent": 0,
+                "compute_mode": "Default",
+                "ecc_uncorrected_volatile": 0,
+                "ecc_uncorrected_aggregate": 0,
+                "row_remap_failure": 0,
+                "row_remap_pending": 0,
+                "row_remap_status": "None",
+                "gpu_recovery_action": "None",
+                "health_state": "HEALTHY",
+                "compute_apps": [],
+            }
+        )
+    rows.append(
         {
-            "pci_bus_id": pci,
-            "uuid": uuid,
-            "memory_used_mib": "0",
-            "memory_total_mib": "40960",
-            "utilization_gpu_percent": "0",
-            "ecc_uncorrected_volatile": "0",
-            "ecc_uncorrected_aggregate": "0",
-            "temperature_c": "40",
-            "row_remap_status": "None",
+            "pci_bus_id": EXCLUDED_PCI,
+            "uuid": EXCLUDED_UUID,
+            "gpu_name": "A100-SXM4-80GB",
+            "temperature_c": 40,
+            "memory_used_mib": 0,
+            "memory_total_mib": 40960,
+            "utilization_gpu_percent": 0,
+            "compute_mode": "Default",
+            "ecc_uncorrected_volatile": 3,
+            "ecc_uncorrected_aggregate": 7,
+            "row_remap_failure": 0,
+            "row_remap_pending": 1,
+            "row_remap_status": "Pending",
             "gpu_recovery_action": "None",
+            "health_state": "UNHEALTHY",
+            "compute_apps": [],
         }
-        for pci, uuid in ALLOWED_DEVICES
-    ]
-    rows += [{
-        "pci_bus_id": EXCLUDED_PCI,
-        "uuid": EXCLUDED_UUID,
-        "memory_used_mib": "0", "memory_total_mib": "40960",
-        "utilization_gpu_percent": "0", "ecc_uncorrected_volatile": "0",
-        "ecc_uncorrected_aggregate": "0", "temperature_c": "40",
-        "row_remap_status": "None", "gpu_recovery_action": "None",
-    }]
-    rows += [{
-        "pci_bus_id": f"0000:{bus}:00.0", "uuid": f"GPU-other-{bus}",
-        "memory_used_mib": "0", "memory_total_mib": "40960",
-        "utilization_gpu_percent": "0", "ecc_uncorrected_volatile": "0",
-        "ecc_uncorrected_aggregate": "0", "temperature_c": "40",
-        "row_remap_status": "None", "gpu_recovery_action": "None",
-    } for bus in ("51", "52", "54")]
+    )
+    for bus in ("51", "52", "54"):
+        rows.append(
+            {
+                "pci_bus_id": f"0000:{bus}:00.0",
+                "uuid": f"GPU-other-{bus}",
+                "gpu_name": "A100-SXM4-80GB",
+                "temperature_c": 40,
+                "memory_used_mib": 0,
+                "memory_total_mib": 40960,
+                "utilization_gpu_percent": 0,
+                "compute_mode": "Default",
+                "ecc_uncorrected_volatile": 0,
+                "ecc_uncorrected_aggregate": 0,
+                "row_remap_failure": 0,
+                "row_remap_pending": 0,
+                "row_remap_status": "None",
+                "gpu_recovery_action": "None",
+                "health_state": "HEALTHY",
+                "compute_apps": [],
+            }
+        )
+    return rows
+
+
+def _write_formal_inventory(tmp_path: Path) -> tuple[Path, dict[str, object]]:
     path = tmp_path / "gpu-inventory.json"
     raw_capture = tmp_path / "nvidia-smi.raw"
     raw_capture.write_bytes(b"nvidia-smi capture fixture\n")
-    value = {
+    value: dict[str, object] = {
         "schema_version": "stage2-s206-gpu-inventory-v1",
+        "scope": "formal",
+        "status": "OBSERVED",
+        "checked_at": "2026-08-26T00:00:00+00:00",
         "artifact_ref": "gpu-inventory.json",
         "source_ref": "nvidia-smi.raw",
         "source_sha256": hashlib.sha256(raw_capture.read_bytes()).hexdigest(),
-        "rows": rows,
+        "rows": _formal_inventory_rows(),
         "compute_apps": [],
+        "approved_gpu_uuids": [uuid for _pci, uuid in ALLOWED_DEVICES],
+        "excluded_pci": EXCLUDED_PCI,
+        "excluded_gpu_uuid": EXCLUDED_UUID,
     }
     value["artifact_hash"] = canonical_json_hash(value)
     write_canonical_json(path, value)
+    return path, value
+
+
+def test_launcher_accepts_only_hash_bound_gpu_inventory_envelope(tmp_path: Path) -> None:
+    path, value = _write_formal_inventory(tmp_path)
     rows_loaded, identity = _load_inventory_snapshot(path, data_root=tmp_path)
     assert len(rows_loaded) == 8
     assert identity["artifact_ref"] == "gpu-inventory.json"
     assert identity["source_ref"] == "nvidia-smi.raw"
     assert identity["source_sha256"] == value["source_sha256"]
-    value["rows"][0]["memory_used_mib"] = "1"
+    value["rows"][0]["memory_used_mib"] = 1
     write_canonical_json(path, value)
     with pytest.raises(Exception, match="S205_GPU_INVENTORY_ARTIFACT_HASH_MISMATCH"):
         _inventory(path, data_root=tmp_path)
 
 
 def test_launcher_inventory_binds_distinct_raw_capture_and_rejects_tamper(tmp_path: Path) -> None:
-    rows = [
-        {
-            "pci_bus_id": pci,
-            "uuid": uuid,
-            "memory_used_mib": "0",
-            "memory_total_mib": "40960",
-            "utilization_gpu_percent": "0",
-            "ecc_uncorrected_volatile": "0",
-            "ecc_uncorrected_aggregate": "0",
-            "temperature_c": "40",
-            "row_remap_status": "None",
-            "gpu_recovery_action": "None",
-        }
-        for pci, uuid in ALLOWED_DEVICES
-    ]
-    rows += [{
-        "pci_bus_id": EXCLUDED_PCI,
-        "uuid": EXCLUDED_UUID,
-        "memory_used_mib": "0", "memory_total_mib": "40960",
-        "utilization_gpu_percent": "0", "ecc_uncorrected_volatile": "0",
-        "ecc_uncorrected_aggregate": "0", "temperature_c": "40",
-        "row_remap_status": "None", "gpu_recovery_action": "None",
-    }]
-    rows += [{
-        "pci_bus_id": f"0000:{bus}:00.0", "uuid": f"GPU-other-{bus}",
-        "memory_used_mib": "0", "memory_total_mib": "40960",
-        "utilization_gpu_percent": "0", "ecc_uncorrected_volatile": "0",
-        "ecc_uncorrected_aggregate": "0", "temperature_c": "40",
-        "row_remap_status": "None", "gpu_recovery_action": "None",
-    } for bus in ("51", "52", "54")]
-    raw_capture = tmp_path / "capture.raw"
-    raw_capture.write_bytes(b"raw capture v1")
-    path = tmp_path / "inventory.json"
-    value = {
-        "schema_version": "stage2-s206-gpu-inventory-v1",
-        "artifact_ref": "inventory.json",
-        "source_ref": "capture.raw",
-        "source_sha256": hashlib.sha256(raw_capture.read_bytes()).hexdigest(),
-        "rows": rows,
-        "compute_apps": [],
-    }
-    value["artifact_hash"] = canonical_json_hash(value)
-    write_canonical_json(path, value)
+    path, value = _write_formal_inventory(tmp_path)
     _load_inventory_snapshot(path, data_root=tmp_path)
-    raw_capture.write_bytes(b"tampered capture")
+    (tmp_path / "nvidia-smi.raw").write_bytes(b"tampered capture")
     with pytest.raises(Exception, match="S205_GPU_INVENTORY_SOURCE_SHA256_MISMATCH"):
+        _load_inventory_snapshot(path, data_root=tmp_path)
+
+
+def test_launcher_inventory_requires_exact_formal_envelope_and_rows(tmp_path: Path) -> None:
+    path, original = _write_formal_inventory(tmp_path)
+
+    def rewrite(value: dict[str, object]) -> None:
+        value.pop("artifact_hash", None)
+        value["artifact_hash"] = canonical_json_hash(value)
+        write_canonical_json(path, value)
+
+    alias = deepcopy(original)
+    alias["gpus"] = alias.pop("rows")
+    rewrite(alias)
+    with pytest.raises(Exception, match="S205_GPU_INVENTORY_GPUS_ALIAS_FORBIDDEN"):
+        _load_inventory_snapshot(path, data_root=tmp_path)
+
+    unknown = deepcopy(original)
+    unknown["unapproved_extra"] = True
+    rewrite(unknown)
+    with pytest.raises(Exception, match="S205_GPU_INVENTORY_TOP_LEVEL_UNKNOWN_FIELDS"):
+        _load_inventory_snapshot(path, data_root=tmp_path)
+
+    missing = deepcopy(original)
+    missing.pop("scope")
+    rewrite(missing)
+    with pytest.raises(Exception, match="S205_GPU_INVENTORY_TOP_LEVEL_FIELDS_REQUIRED"):
+        _load_inventory_snapshot(path, data_root=tmp_path)
+
+    wrong_scope = deepcopy(original)
+    wrong_scope["scope"] = "local_fixture"
+    rewrite(wrong_scope)
+    with pytest.raises(Exception, match="S205_GPU_INVENTORY_SCOPE_INVALID"):
+        _load_inventory_snapshot(path, data_root=tmp_path)
+
+    wrong_status = deepcopy(original)
+    wrong_status["status"] = "FROZEN"
+    rewrite(wrong_status)
+    with pytest.raises(Exception, match="S205_GPU_INVENTORY_STATUS_INVALID"):
+        _load_inventory_snapshot(path, data_root=tmp_path)
+
+    wrong_checked_at = deepcopy(original)
+    wrong_checked_at["checked_at"] = "2026-08-26T00:00:00"
+    rewrite(wrong_checked_at)
+    with pytest.raises(Exception, match="S205_GPU_INVENTORY_CHECKED_AT_TIMEZONE_REQUIRED"):
+        _load_inventory_snapshot(path, data_root=tmp_path)
+
+    wrong_approved = deepcopy(original)
+    wrong_approved["approved_gpu_uuids"] = list(reversed(APPROVED_GPU_UUIDS))
+    rewrite(wrong_approved)
+    with pytest.raises(Exception, match="S205_GPU_INVENTORY_APPROVED_UUIDS_IDENTITY_DRIFT"):
+        _load_inventory_snapshot(path, data_root=tmp_path)
+
+    wrong_excluded = deepcopy(original)
+    wrong_excluded["excluded_pci"] = "0000:51:00.0"
+    rewrite(wrong_excluded)
+    with pytest.raises(Exception, match="S205_GPU_INVENTORY_EXCLUDED_IDENTITY_DRIFT"):
+        _load_inventory_snapshot(path, data_root=tmp_path)
+
+    missing_row_field = deepcopy(original)
+    del missing_row_field["rows"][0]["health_state"]  # type: ignore[index]
+    rewrite(missing_row_field)
+    with pytest.raises(Exception, match="S205_GPU_INVENTORY_ROW_FIELDS_INVALID:0"):
+        _load_inventory_snapshot(path, data_root=tmp_path)
+
+    unknown_row_field = deepcopy(original)
+    unknown_row_field["rows"][0]["unexpected"] = True  # type: ignore[index]
+    rewrite(unknown_row_field)
+    with pytest.raises(Exception, match="S205_GPU_INVENTORY_ROW_FIELDS_INVALID:0"):
+        _load_inventory_snapshot(path, data_root=tmp_path)
+
+    bad_row_count = deepcopy(original)
+    bad_row_count["rows"] = bad_row_count["rows"][:-1]  # type: ignore[index]
+    rewrite(bad_row_count)
+    with pytest.raises(Exception, match="S205_GPU_INVENTORY_LIVE_CARD_COUNT_INVALID:7"):
+        _load_inventory_snapshot(path, data_root=tmp_path)
+
+    bad_app_fields = deepcopy(original)
+    bad_app_fields["compute_apps"] = [{
+        "pid": 1,
+        "gpu_uuid": APPROVED_GPU_UUIDS[0],
+        "process_name": "test",
+        "used_memory": "1",
+        "unexpected": True,
+    }]
+    rewrite(bad_app_fields)
+    with pytest.raises(Exception, match="S205_GPU_INVENTORY_APP_FIELDS_INVALID:0"):
         _load_inventory_snapshot(path, data_root=tmp_path)
 
 
