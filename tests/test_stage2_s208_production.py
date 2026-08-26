@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 import json
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -13,7 +14,7 @@ from param_importance_nlp.experiments.stage2_s208_production import (
     load_s208_reference_bundle,
 )
 from param_importance_nlp.experiments.stage2_s208_g26 import S28G26Blocked, _read_raw_payload
-from param_importance_nlp.experiments.stage2_s208_runner import _resolve_analysis_gate_refs, _validate_production_paths
+from param_importance_nlp.experiments.stage2_s208_runner import _resolve_analysis_gate_refs, _root_relative_ref, _validate_production_paths, _validate_s27_gpu_inventory_identity, run_s208_g26_production
 from param_importance_nlp.runtime.tensor_bundle import publish_tensor_bundle
 
 
@@ -119,6 +120,59 @@ def test_loader_requires_paths_and_independent_g23(tmp_path: Path) -> None:
     assert all(isinstance(item["vectors"]["bias"], np.memmap) for item in loaded["cells"].values())
     with pytest.raises(S208ProductionBlocked, match="PATH_INPUTS_REQUIRED"):
         load_s208_reference_bundle(tmp_path, {}, gate.relative_to(tmp_path))  # type: ignore[arg-type]
+
+
+def test_production_inputs_require_data_root_relative_posix_refs(tmp_path: Path) -> None:
+    assert _root_relative_ref(tmp_path, Path("sealed/raw-results-manifest.json"), field="raw_manifest") == "sealed/raw-results-manifest.json"
+    assert _root_relative_ref(tmp_path, "sealed/raw-results-manifest.json", field="raw_manifest") == "sealed/raw-results-manifest.json"
+    with pytest.raises(S208ProductionBlocked, match="POSIX_REFERENCE_REQUIRED"):
+        _root_relative_ref(tmp_path, "sealed\\raw-results-manifest.json", field="raw_manifest")
+    with pytest.raises(S208ProductionBlocked, match="DATA_ROOT_RELATIVE_REF_REQUIRED"):
+        _root_relative_ref(tmp_path, tmp_path / "sealed" / "raw-results-manifest.json", field="raw_manifest")
+    with pytest.raises(S208ProductionBlocked, match="PATH_ESCAPE"):
+        _root_relative_ref(tmp_path, "../outside.json", field="raw_manifest")
+
+
+def test_production_runner_publishes_blocked_gate_for_invalid_cli_ref(tmp_path: Path) -> None:
+    output_root = tmp_path / "results" / "stage2" / "derived" / "blocked-input"
+    result = run_s208_g26_production(
+        data_root=tmp_path,
+        raw_manifest=tmp_path / "sealed" / "raw-results-manifest.json",
+        raw_root=tmp_path,
+        reference_bundle="refs/bundle.json",
+        g23_gate="refs/g23.json",
+        materialization_index="refs/index.json",
+        matrix="refs/matrix.json",
+        preregistration="refs/prereg.json",
+        hypothesis_contract="refs/hypothesis.json",
+        upstream_gates={},
+        output_root=output_root,
+        memmap_root=tmp_path / "tmp" / "s208",
+    )
+    assert result["status"] == "BLOCKED"
+    assert result["g2_6_gate"]["status"] == "BLOCKED"
+    assert (output_root / "g2.6-gate.json").is_file()
+
+
+def test_s27_gpu_inventory_status_requires_and_reloads_five_field_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    expected = {
+        "source_ref": "inventory/raw-capture.json",
+        "artifact_ref": "inventory/formal-envelope.json",
+        "artifact_hash": "a" * 64,
+        "source_sha256": "b" * 64,
+        "schema_version": "stage2-s206-gpu-inventory-v1",
+    }
+    plan = SimpleNamespace(source_artifact_refs=(expected["source_ref"], expected["artifact_ref"]))
+    monkeypatch.setattr(
+        "param_importance_nlp.experiments.stage2_s208_runner.load_s27_gpu_inventory_envelope",
+        lambda artifact_ref, *, data_root: ({}, dict(expected)),
+    )
+    status = {"gpu_inventory_identity": expected}
+    assert _validate_s27_gpu_inventory_identity(tmp_path, plan, status) == expected
+    with pytest.raises(S208ProductionBlocked, match="GPU_INVENTORY_IDENTITY_REQUIRED"):
+        _validate_s27_gpu_inventory_identity(tmp_path, plan, {"gpu_inventory_identity": {key: value for key, value in expected.items() if key != "artifact_ref"}})
 
 
 def test_loader_rejects_candidate_self_qualification(tmp_path: Path) -> None:

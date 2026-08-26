@@ -439,8 +439,11 @@ def _top_metrics(observed: np.ndarray, expected: np.ndarray) -> dict[str, float 
     for fraction in TOP_FRACTIONS:
         key = f"{fraction:g}"
         k = max(1, int(math.ceil(fraction * observed.size)))
-        observed_top = set(np.argsort(-np.abs(observed), kind="mergesort")[:k].tolist())
-        expected_top = set(np.argsort(-np.abs(expected), kind="mergesort")[:k].tolist())
+        # The preregistered ranking estimand is the signed estimator vector.
+        # Absolute/positive/clamped rankings are diagnostic-only and must not
+        # silently replace the signed primary top-k endpoint.
+        observed_top = set(np.argsort(-observed, kind="mergesort")[:k].tolist())
+        expected_top = set(np.argsort(-expected, kind="mergesort")[:k].tolist())
         overlap = len(observed_top.intersection(expected_top)) / k
         union = len(observed_top.union(expected_top))
         result[f"overlap_at_{key}"] = float(overlap)
@@ -877,10 +880,23 @@ def _method_statistics(cell: _CellData, method: str, *, bootstrap_replicates: in
     error = mean - reference
     v_r = _variance_scalar(vectors, mean, ddof=0)
     s2 = _variance_scalar(vectors, mean, ddof=1)
-    observed_nmse = float(np.mean(np.square(error)) / cell.denominator)
+    # S2.1 defines NMSE_observed over every repetition and parameter
+    # coordinate, not as the squared error of the repetition mean.  Keep the
+    # unnormalised coordinate sum here because D_c already supplies the sole
+    # preregistered denominator.
+    observed_nmse = float(
+        sum(float(np.sum(np.square(vector - reference))) for vector in vectors)
+        / float(len(vectors))
+        / cell.denominator
+    )
     if cell.reference_blocks is not None:
         ref_blocks = cell.reference_blocks["bias"]
-        v_ref = _variance_scalar(tuple(ref_blocks), _mean_vectors(tuple(ref_blocks)), ddof=1) / cell.denominator
+        ref_mean = _mean_vectors(tuple(ref_blocks))
+        v_ref = float(
+            sum(float(np.sum(np.square(vector - ref_mean))) for vector in ref_blocks)
+            / float(len(ref_blocks) - 1)
+            / cell.denominator
+        )
     else:
         # S2.1 defines V_ref as trace(Sigma_ref) / D_c.  The bounded producer
         # publishes that diagonal exactly through its jackknife variance.
@@ -1134,18 +1150,33 @@ def _noninferiority_rows(cell: _CellData, *, bootstrap_replicates: int, seed: in
     ref_blocks = None if cell.reference_blocks is None else cell.reference_blocks["bias"]
     denominator = cell.denominator
     if ref_blocks is not None:
-        ref_var = float(np.mean(np.var(ref_blocks, axis=0, ddof=1)) / denominator)
+        # V_ref is trace(Sigma_ref) / D_c: sum the per-coordinate variance,
+        # rather than averaging it once more over parameter coordinates.
+        ref_var = float(np.sum(np.var(ref_blocks, axis=0, ddof=1)) / denominator)
     else:
         ref_var = float(np.sum(_reference_variance_vector(cell, "bias")) / denominator)
     left_mean, right_mean = _mean_vectors(left), _mean_vectors(right)
-    u_nmse = float(np.mean(np.square(left_mean - target)) / denominator - ref_var)
-    d_nmse = float(np.mean(np.square(right_mean - target)) / denominator - ref_var)
+    u_nmse = float(
+        sum(float(np.sum(np.square(vector - target))) for vector in left)
+        / float(len(left))
+        / denominator
+        - ref_var
+    )
+    d_nmse = float(
+        sum(float(np.sum(np.square(vector - target))) for vector in right)
+        / float(len(right))
+        / denominator
+        - ref_var
+    )
     rows: list[dict[str, Any]] = []
     if d_nmse <= float(ABSOLUTE_FLOORS["tau_nmse"]):
         nmse_state = "INCONCLUSIVE"
         nmse_bootstrap: dict[str, Any] = {"reason": "DOUBLE_CORRECTED_NMSE_NOT_ABOVE_POSITIVE_FLOOR"}
     else:
-        statistic = lambda u, d, r: float((np.mean(np.square(u - r)) / denominator - ref_var) / (np.mean(np.square(d - r)) / denominator - ref_var))
+        statistic = lambda u, d, r: float(
+            (np.sum(np.square(u - r)) / denominator - ref_var)
+            / (np.sum(np.square(d - r)) / denominator - ref_var)
+        )
         if ref_blocks is not None:
             nmse_bootstrap = _paired_bootstrap(
                 left,
@@ -1157,9 +1188,9 @@ def _noninferiority_rows(cell: _CellData, *, bootstrap_replicates: int, seed: in
             )
         else:
             variance = _reference_variance_vector(cell, "bias")
-            numerator = np.mean(np.square(left_mean - target)) / denominator - ref_var
-            baseline = np.mean(np.square(right_mean - target)) / denominator - ref_var
-            scale = float(target.size) * denominator
+            numerator = np.sum(np.square(left_mean - target)) / denominator - ref_var
+            baseline = np.sum(np.square(right_mean - target)) / denominator - ref_var
+            scale = float(denominator)
             derivative_left = 2.0 * (target - left_mean) / scale
             derivative_right = 2.0 * (target - right_mean) / scale
             derivative = (derivative_left * baseline - numerator * derivative_right) / (baseline * baseline)
