@@ -24,8 +24,9 @@ from param_importance_nlp.contracts import (
     canonical_json_hash,
 )
 from param_importance_nlp.contracts.config_v2 import ResolvedConfigV2
-from param_importance_nlp.contracts.jsonio import write_canonical_json
+from param_importance_nlp.contracts.jsonio import load_canonical_json, write_canonical_json
 from param_importance_nlp.experiments.sampling import SamplingPlan, SamplingUniverse
+from param_importance_nlp.experiments.stage2_s206_inputs import build_formal_execution_evidence
 from param_importance_nlp.experiments.stage2_s206_formal import (
     ANCHOR_IDS,
     APPROVED_GPU_BINDINGS,
@@ -101,6 +102,15 @@ def _write_gpu_inventory(path: Path) -> None:
     }
     payload["artifact_hash"] = canonical_json_hash(payload)
     write_canonical_json(path, payload)
+
+
+def _write_hashed(root: Path, ref: str, payload: dict[str, object]) -> str:
+    value = dict(payload)
+    value["artifact_hash"] = canonical_json_hash(
+        {key: item for key, item in value.items() if key != "artifact_hash"}
+    )
+    write_canonical_json(root / ref, value)
+    return str(value["artifact_hash"])
 
 
 def _s204_config() -> ResolvedConfigV2:
@@ -257,6 +267,80 @@ def test_detached_wait_recovers_final_g24b_freeze(tmp_path: Path) -> None:
     inventory_path = tmp_path / "evidence/gpu-inventory.json"
     _write_gpu_inventory(inventory_path)
     _rows, identity = launcher._load_inventory_snapshot(inventory_path, data_root=tmp_path)
+    g23_ref = "evidence/g23.json"
+    g23_hash = _write_hashed(
+        tmp_path,
+        g23_ref,
+        {
+            "schema_version": "stage2-g23-reference-evaluation-v1",
+            "status": "PASS",
+            "formal_eligible": True,
+            "required_cell_count": 6,
+            "complete_cell_count": 6,
+            "cells": [
+                {"cell_id": anchor.replace(".", ":", 1), "status": "PASS", "formal_eligible": True}
+                for anchor in ANCHOR_IDS
+            ],
+        },
+    )
+    g24a_ref = "evidence/g24a.json"
+    g24a_hash = _write_hashed(
+        tmp_path,
+        g24a_ref,
+        {
+            "schema_version": "stage2-g24a-formal-evaluation-v1",
+            "gate_id": "stage2.G2.4a",
+            "status": "PASS",
+            "formal_eligible": True,
+            "cell_count": 6,
+            "g23_evaluation_ref": g23_ref,
+            "g23_evaluation_hash": g23_hash,
+            "results": [
+                {
+                    "cell_id": anchor.replace(".", ":", 1),
+                    "status": "PASS",
+                    "formal_eligible": True,
+                    "metrics": {"h_ref_model_total": 0.01},
+                }
+                for anchor in ANCHOR_IDS
+            ],
+        },
+    )
+    s205_ref = "evidence/s205-rebind.json"
+    s205_hash = _write_hashed(
+        tmp_path,
+        s205_ref,
+        {
+            "schema_version": "stage2-s205-rebind-plan-v1",
+            "status": "READY",
+            "formal_eligible": True,
+            "g23_evaluation_ref": g23_ref,
+            "g23_evaluation_hash": g23_hash,
+            "cells": [
+                {
+                    "cell_id": anchor.replace(".", ":", 1),
+                    "config_ref": f"prepared/{index}.json",
+                    "environment_ref": f"prepared/{index}-env.json",
+                    "formal_execution_ref": "evidence/execution.json",
+                    "reference_artifact_refs": {},
+                    "task_result_status_path": f"prepared/{index}-status.json",
+                    "config_hash": "a" * 64,
+                    "result_hash": "b" * 64,
+                }
+                for index, anchor in enumerate(ANCHOR_IDS)
+            ],
+        },
+    )
+    execution = build_formal_execution_evidence(
+        data_root=tmp_path,
+        g23_evaluation_ref=g23_ref,
+        g24a_evaluation_ref=g24a_ref,
+        s205_rebind_ref=s205_ref,
+        contract_freeze_hash="c" * 64,
+        asset_manifest_hashes=("d" * 64,),
+    )
+    execution_ref = "evidence/execution.json"
+    write_canonical_json(tmp_path / execution_ref, execution)
     preflight = {"status": "READY"}
     preflight["preflight_artifact_hash"] = canonical_json_hash(preflight)
     write_canonical_json(
@@ -273,6 +357,8 @@ def test_detached_wait_recovers_final_g24b_freeze(tmp_path: Path) -> None:
             "gpu_inventory_source_ref": identity["source_ref"],
             "gpu_inventory_artifact_hash": identity["artifact_hash"],
             "gpu_inventory_source_sha256": identity["source_sha256"],
+            "execution_evidence_ref": execution_ref,
+            "execution_evidence_hash": execution["artifact_hash"],
         },
     )
     result = launcher._wait(
@@ -281,9 +367,49 @@ def test_detached_wait_recovers_final_g24b_freeze(tmp_path: Path) -> None:
             operations_root="operations/s206",
             timeout_seconds=0,
             poll_seconds=0.01,
+            # An accepted logical alias must be normalized in the status
+            # comparison; receipts themselves remain canonical POSIX refs.
+            execution_evidence_ref="evidence//execution.json",
+            g23_evaluation=g23_ref,
+            g24a_evaluation=g24a_ref,
+            s205_rebind_ref=s205_ref,
         )
     )
     assert result == 0
+
+    # A formal terminal status carrying an execution hash must also carry the
+    # exact amendment ref; wait/recovery cannot silently fall back to the old
+    # inventory-only identity check.
+    status_path = tmp_path / "operations/s206/status.json"
+    status_value = load_canonical_json(status_path)
+    assert isinstance(status_value, dict)
+    status_value.pop("execution_evidence_ref", None)
+    status_value["execution_evidence_hash"] = "a" * 64
+    write_canonical_json(status_path, status_value)
+    with pytest.raises(S206PreparationBlocked, match="STATUS_EXECUTION_EVIDENCE_IDENTITY_MISSING"):
+        launcher._wait(
+            SimpleNamespace(
+                data_root=tmp_path,
+                operations_root="operations/s206",
+                timeout_seconds=0,
+                poll_seconds=0.01,
+            )
+        )
+    assert launcher.main(
+        [
+            "--wait",
+            "--data-root",
+            str(tmp_path),
+            "--s204-root",
+            "evidence/s204",
+            "--g23-evaluation",
+            g23_ref,
+            "--g24a-evaluation",
+            g24a_ref,
+            "--operations-root",
+            "operations/s206",
+        ]
+    ) == 3
 
 
 def test_production_queue_is_deterministic_lpt_by_frozen_draw_work() -> None:
