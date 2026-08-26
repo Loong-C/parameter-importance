@@ -36,15 +36,34 @@ from ops.stage2.run_s205_formal import _S205DynamicLPTQueue, _gate_only
 G3_REF = "evidence/stage0/tasks/g3-v5/commits/asset_resolution.json"
 EXECUTION_COMMIT = "1" * 40
 CONFIG_HASH = "b" * 64
+G23_ROOT = "evidence/stage2/s204/formal-r19-g3-v5/g23-evaluation"
+CORRECTED_BATCH_SIZES = [32, 64, 128, 256]
+CORRECTED_SOURCE = "g23_output_derived_corrected_sidecar"
 
 
-def _spec(tmp_path: Path) -> S25RebindSpec:
+def _spec(
+    tmp_path: Path,
+    *,
+    g23_ref: str | None = None,
+    g23_hash: str | None = None,
+) -> S25RebindSpec:
     g3_commit = load_canonical_json(tmp_path / G3_REF)["artifact_hash"]
+    if g23_ref is None or g23_hash is None:
+        candidates = sorted((tmp_path / G23_ROOT / "g2.3-attempts").glob("*/evaluation.json"))
+        if candidates:
+            evaluation_path = candidates[0]
+            evaluation = load_canonical_json(evaluation_path)
+            g23_ref = evaluation_path.relative_to(tmp_path).as_posix()
+            g23_hash = evaluation["artifact_hash"]
+        else:
+            g23_hash = "a" * 64
+            g23_ref = f"{G23_ROOT}/g2.3-attempts/{g23_hash}/evaluation.json"
     return S25RebindSpec(
         data_root=tmp_path,
         s204_run_root="evidence/stage2/s204/formal-r19-g3-v5",
         s204_prepared_root="evidence/stage2/s204/prepared-r18-g3-v5",
-        g23_evaluation_root="evidence/stage2/s204/formal-r19-g3-v5/g23-evaluation",
+        g23_evaluation_ref=g23_ref,
+        g23_evaluation_hash=g23_hash,
         s205_output_root="evidence/stage2/s205-formal-r19-g3-v5",
         operations_root="operations/stage2/s205-formal-r19-g3-v5",
         g3_ref=G3_REF,
@@ -119,7 +138,8 @@ def _write_ready_inputs(tmp_path: Path, *, g23: bool = True) -> None:
         data_root=tmp_path,
         s204_run_root="evidence/stage2/s204/formal-r19-g3-v5",
         s204_prepared_root="evidence/stage2/s204/prepared-r18-g3-v5",
-        g23_evaluation_root="evidence/stage2/s204/formal-r19-g3-v5/g23-evaluation",
+        g23_evaluation_ref=f"{G23_ROOT}/g2.3-attempts/{'a' * 64}/evaluation.json",
+        g23_evaluation_hash="a" * 64,
         s205_output_root="evidence/stage2/s205-formal-r19-g3-v5",
         operations_root="operations/stage2/s205-formal-r19-g3-v5",
         g3_ref=g3_ref,
@@ -221,6 +241,24 @@ def _write_ready_inputs(tmp_path: Path, *, g23: bool = True) -> None:
             tmp_path / spec.s204_prepared_root / "environments" / f"{component}.json",
             environment,
         )
+        source = {
+            "schema_version": "stage2-reference-delta-sci-v2",
+            "cell_id": cell_id,
+            "delta_sci_by_endpoint": {"model_total": {"32": 1.0}},
+        }
+        source["artifact_hash"] = canonical_json_hash(source)
+        source_ref = f"evidence/stage2/g23-source/{component}.json"
+        write_canonical_json(tmp_path / source_ref, source)
+        sidecar = {
+            "schema_version": "stage2-g23-corrected-delta-sci-v1",
+            "source_producer_ref": source_ref,
+            "source_producer_artifact_hash": source["artifact_hash"],
+            "delta_sci_batch_sizes": CORRECTED_BATCH_SIZES,
+        }
+        sidecar["artifact_hash"] = canonical_json_hash(sidecar)
+        corrected_hash = sidecar["artifact_hash"]
+        corrected_ref = f"{G23_ROOT}/g2.3-corrected-delta-sci/{corrected_hash}.json"
+        write_canonical_json(tmp_path / corrected_ref, sidecar)
         g23_cells.append(
             {
                 "cell_id": cell_id,
@@ -228,6 +266,14 @@ def _write_ready_inputs(tmp_path: Path, *, g23: bool = True) -> None:
                 "identities": {
                     "result_hash": result["result_hash"],
                     "config_hash": CONFIG_HASH,
+                    "corrected_delta_sci_hash": corrected_hash,
+                    "corrected_delta_sci_ref": corrected_ref,
+                },
+                "metrics": {
+                    "corrected_delta_sci_hash": corrected_hash,
+                    "corrected_delta_sci_ref": corrected_ref,
+                    "corrected_delta_sci_batch_sizes": CORRECTED_BATCH_SIZES,
+                    "delta_sci_source": CORRECTED_SOURCE,
                 },
             }
         )
@@ -245,7 +291,7 @@ def _write_ready_inputs(tmp_path: Path, *, g23: bool = True) -> None:
         evaluation["artifact_hash"] = canonical_json_hash(evaluation)
         write_canonical_json(
             tmp_path
-            / spec.g23_evaluation_root
+            / G23_ROOT
             / "g2.3-attempts"
             / evaluation["artifact_hash"]
             / "evaluation.json",
@@ -265,6 +311,72 @@ def test_rebind_plan_requires_fresh_s204_and_strict_g23_pass(tmp_path: Path) -> 
     assert [row["gpu_uuid"] for row in plan["cells"]] == [
         APPROVED_GPU_UUIDS[index % len(APPROVED_GPU_UUIDS)] for index in range(6)
     ]
+
+
+def test_rebind_binds_designated_g23_attempt_when_root_has_multiple_passes(tmp_path: Path) -> None:
+    _write_ready_inputs(tmp_path)
+    original_path = next((tmp_path / G23_ROOT / "g2.3-attempts").glob("*/evaluation.json"))
+    original = load_canonical_json(original_path)
+    original_ref = original_path.relative_to(tmp_path).as_posix()
+    original_hash = original["artifact_hash"]
+    amendment = dict(original)
+    amendment["amendment_marker"] = "different-corrected-amendment"
+    amendment["artifact_hash"] = canonical_json_hash(
+        {key: value for key, value in amendment.items() if key != "artifact_hash"}
+    )
+    amendment_path = (
+        tmp_path / G23_ROOT / "g2.3-attempts" / amendment["artifact_hash"] / "evaluation.json"
+    )
+    write_canonical_json(amendment_path, amendment)
+
+    plan = prepare_s25_rebind(
+        _spec(tmp_path, g23_ref=original_ref, g23_hash=original_hash)
+    )
+    assert plan["g23_evaluation_ref"] == original_ref
+    assert plan["g23_evaluation_hash"] == original_hash
+
+
+def test_rebind_rejects_pre_correction_pass_even_if_exactly_selected(tmp_path: Path) -> None:
+    _write_ready_inputs(tmp_path)
+    evaluation_path = next((tmp_path / G23_ROOT / "g2.3-attempts").glob("*/evaluation.json"))
+    evaluation = load_canonical_json(evaluation_path)
+    for cell in evaluation["cells"]:
+        cell["identities"].pop("corrected_delta_sci_hash", None)
+        cell["identities"].pop("corrected_delta_sci_ref", None)
+        cell["metrics"].pop("corrected_delta_sci_hash", None)
+        cell["metrics"].pop("corrected_delta_sci_ref", None)
+        cell["metrics"].pop("corrected_delta_sci_batch_sizes", None)
+        cell["metrics"].pop("delta_sci_source", None)
+    evaluation["amendment_marker"] = "pre-correction"
+    evaluation["artifact_hash"] = canonical_json_hash(
+        {key: value for key, value in evaluation.items() if key != "artifact_hash"}
+    )
+    stale_path = (
+        tmp_path / G23_ROOT / "g2.3-attempts" / evaluation["artifact_hash"] / "evaluation.json"
+    )
+    write_canonical_json(stale_path, evaluation)
+    with pytest.raises(S25RebindBlocked, match="corrected_delta_sci_hash:SHA256_REQUIRED"):
+        prepare_s25_rebind(
+            _spec(
+                tmp_path,
+                g23_ref=stale_path.relative_to(tmp_path).as_posix(),
+                g23_hash=evaluation["artifact_hash"],
+            )
+        )
+
+
+def test_rebind_rejects_g23_ref_hash_substitution(tmp_path: Path) -> None:
+    _write_ready_inputs(tmp_path)
+    evaluation_path = next((tmp_path / G23_ROOT / "g2.3-attempts").glob("*/evaluation.json"))
+    evaluation = load_canonical_json(evaluation_path)
+    with pytest.raises(S25RebindBlocked, match="G2.3_EVALUATION_REF_NOT_CONTENT_ADDRESSED"):
+        prepare_s25_rebind(
+            _spec(
+                tmp_path,
+                g23_ref=evaluation_path.relative_to(tmp_path).as_posix(),
+                g23_hash="c" * 64,
+            )
+        )
 
 
 def test_rebind_blocks_until_g23_pass(tmp_path: Path) -> None:
@@ -330,19 +442,34 @@ def test_strict_s25_loader_rechecks_fresh_sources_and_g23_metrics(tmp_path: Path
     _write_ready_inputs(tmp_path)
     spec = _spec(tmp_path)
     evaluation_path = next(
-        (tmp_path / spec.g23_evaluation_root / "g2.3-attempts").glob("*/evaluation.json")
+        (tmp_path / G23_ROOT / "g2.3-attempts").glob("*/evaluation.json")
     )
     evaluation = load_canonical_json(evaluation_path)
     assert isinstance(evaluation, dict)
     for cell in evaluation["cells"]:
-        cell["metrics"] = {"h_ref_model_total": 0.0, "h_ref_layer": 0.0, "h_ref_module": 0.0}
+        metrics = cell["metrics"]
+        cell["metrics"] = {
+            "h_ref_model_total": 0.0,
+            "h_ref_layer": 0.0,
+            "h_ref_module": 0.0,
+            **{key: metrics[key] for key in (
+                "corrected_delta_sci_hash",
+                "corrected_delta_sci_ref",
+                "corrected_delta_sci_batch_sizes",
+                "delta_sci_source",
+            )},
+        }
     evaluation["artifact_hash"] = canonical_json_hash(
         {key: value for key, value in evaluation.items() if key != "artifact_hash"}
     )
-    write_canonical_json(evaluation_path, evaluation)
+    updated_evaluation_path = (
+        tmp_path / G23_ROOT / "g2.3-attempts" / evaluation["artifact_hash"] / "evaluation.json"
+    )
+    write_canonical_json(updated_evaluation_path, evaluation)
+    evaluation_path.unlink()
     # The strict loader consumes the immutable plan reference itself; publish
     # the exact plan bytes as a test-only canonical handoff.
-    plan = prepare_s25_rebind(spec)
+    plan = prepare_s25_rebind(_spec(tmp_path))
     plan_path = tmp_path / "evidence/stage2/s205-rebind.json"
     write_canonical_json(plan_path, plan)
     loaded = load_s25_rebind_plan(tmp_path, "evidence/stage2/s205-rebind.json")
@@ -361,16 +488,32 @@ def test_s25_preflight_is_read_only_and_binds_sampling_plan(tmp_path: Path) -> N
     _write_ready_inputs(tmp_path)
     spec = _spec(tmp_path)
     evaluation_path = next(
-        (tmp_path / spec.g23_evaluation_root / "g2.3-attempts").glob("*/evaluation.json")
+        (tmp_path / G23_ROOT / "g2.3-attempts").glob("*/evaluation.json")
     )
     evaluation = load_canonical_json(evaluation_path)
     assert isinstance(evaluation, dict)
     for cell in evaluation["cells"]:
-        cell["metrics"] = {"h_ref_model_total": 0.0, "h_ref_layer": 0.0, "h_ref_module": 0.0}
+        metrics = cell["metrics"]
+        cell["metrics"] = {
+            "h_ref_model_total": 0.0,
+            "h_ref_layer": 0.0,
+            "h_ref_module": 0.0,
+            **{key: metrics[key] for key in (
+                "corrected_delta_sci_hash",
+                "corrected_delta_sci_ref",
+                "corrected_delta_sci_batch_sizes",
+                "delta_sci_source",
+            )},
+        }
     evaluation["artifact_hash"] = canonical_json_hash(
         {key: value for key, value in evaluation.items() if key != "artifact_hash"}
     )
-    write_canonical_json(evaluation_path, evaluation)
+    updated_evaluation_path = (
+        tmp_path / G23_ROOT / "g2.3-attempts" / evaluation["artifact_hash"] / "evaluation.json"
+    )
+    write_canonical_json(updated_evaluation_path, evaluation)
+    evaluation_path.unlink()
+    spec = _spec(tmp_path)
     rebind = prepare_s25_rebind(spec)
     rebind_path = tmp_path / "evidence/stage2/s205-rebind.json"
     write_canonical_json(rebind_path, rebind)

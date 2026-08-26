@@ -57,6 +57,10 @@ EXCLUDED_PCI = "0000:50:00.0"
 _HASH_RE = re.compile(r"^[0-9a-f]{64}$")
 _COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
 _G23_GATE_ID = "stage2.G2.3"
+_G23_SCHEMA = "stage2-g23-reference-evaluation-v1"
+_CORRECTED_DELTA_SCHEMA = "stage2-g23-corrected-delta-sci-v1"
+_CORRECTED_DELTA_BATCH_SIZES = (32, 64, 128, 256)
+_CORRECTED_DELTA_SOURCE = "g23_output_derived_corrected_sidecar"
 _S204_STATUS_SCHEMA = "stage2-s204-cell-final-status-v3"
 _TASK_RESULT_SCHEMA = "task-run-result-v2"
 _FORMAL_EXECUTION_SCHEMA = "formal-execution-evidence-v1"
@@ -228,7 +232,8 @@ class S25RebindSpec:
     data_root: Path
     s204_run_root: str
     s204_prepared_root: str
-    g23_evaluation_root: str
+    g23_evaluation_ref: str
+    g23_evaluation_hash: str
     s205_output_root: str
     operations_root: str
     g3_ref: str
@@ -239,70 +244,144 @@ class S25RebindSpec:
         for field in (
             "s204_run_root",
             "s204_prepared_root",
-            "g23_evaluation_root",
+            "g23_evaluation_ref",
             "s205_output_root",
             "operations_root",
         ):
             _logical_path(self.data_root.resolve(), getattr(self, field), field=field)
         _logical_path(self.data_root.resolve(), self.g3_ref, field="g3_ref")
+        if not isinstance(self.g23_evaluation_hash, str) or _HASH_RE.fullmatch(self.g23_evaluation_hash) is None:
+            raise S25RebindBlocked("g23_evaluation_hash:INVALID")
         if not isinstance(self.g3_artifact_hash, str) or _HASH_RE.fullmatch(self.g3_artifact_hash) is None:
             raise S25RebindBlocked("g3_artifact_hash:INVALID")
         if not isinstance(self.execution_commit, str) or _COMMIT_RE.fullmatch(self.execution_commit) is None:
             raise S25RebindBlocked("execution_commit:INVALID")
 
 
-def _latest_g23(spec: S25RebindSpec) -> tuple[str, dict[str, Any]]:
-    root = spec.data_root.resolve()
-    evaluation_root = _logical_path(root, spec.g23_evaluation_root, field="g23_evaluation_root")
-    candidates = sorted(evaluation_root.glob("g2.3-attempts/*/evaluation.json"))
-    if not candidates:
-        raise S25RebindBlocked("G2.3_EVALUATION_MISSING")
-    valid: list[tuple[str, dict[str, Any]]] = []
-    for candidate in candidates:
-        try:
-            value = _load_object(candidate, field="g23_evaluation")
-        except S25RebindBlocked:
-            continue
-        if value.get("schema_version") != "stage2-g23-reference-evaluation-v1":
-            continue
-        if value.get("gate_id") != _G23_GATE_ID:
-            continue
-        if value.get("status") != "PASS" or value.get("formal_eligible") is not True:
-            continue
-        if value.get("required_cell_count") != 6 or value.get("complete_cell_count") != 6:
-            continue
-        if value.get("expected_cell_ids") != list(EXPECTED_CELL_IDS):
-            continue
-        cells = value.get("cells")
-        if (
-            not isinstance(cells, list)
-            or len(cells) != len(EXPECTED_CELL_IDS)
-            or tuple(
-                item.get("cell_id") if isinstance(item, dict) else None
-                for item in cells
-            )
-            != EXPECTED_CELL_IDS
-        ):
-            continue
-        if any(
-            not isinstance(item, dict)
-            or item.get("status") != "PASS"
-            or not isinstance(item.get("identities"), dict)
-            or _HASH_RE.fullmatch(str(item["identities"].get("result_hash", ""))) is None
-            or _HASH_RE.fullmatch(str(item["identities"].get("config_hash", ""))) is None
-            for item in cells
-        ):
-            continue
-        if value.get("artifact_hash") != _canonical_hash_without_artifact(value):
-            continue
-        try:
-            relative = candidate.resolve().relative_to(root).as_posix()
-        except ValueError:
-            continue
-        valid.append((relative, value))
-    if not valid:
-        raise S25RebindBlocked("G2.3_STRICT_PASS_NOT_FOUND")
-    return valid[-1]
+def _validate_corrected_delta_binding(
+    root: Path,
+    evaluation_path: Path,
+    cell: Mapping[str, Any],
+    *,
+    field: str,
+) -> None:
+    """Require the evaluator-owned corrected S2.6 sidecar for every cell.
+
+    The sidecar is deliberately checked relative to the selected evaluation
+    artifact.  This prevents a valid-looking cell from borrowing a corrected
+    artifact from another amendment or from an unrelated evaluation root.
+    """
+
+    identities = cell.get("identities")
+    metrics = cell.get("metrics")
+    if not isinstance(identities, Mapping) or not isinstance(metrics, Mapping):
+        raise S25RebindBlocked(f"{field}:IDENTITIES_AND_METRICS_REQUIRED")
+    sidecar_hash = _require_hash(
+        identities.get("corrected_delta_sci_hash"),
+        field=f"{field}.identities.corrected_delta_sci_hash",
+    )
+    if metrics.get("corrected_delta_sci_hash") != sidecar_hash:
+        raise S25RebindBlocked(f"{field}:CORRECTED_DELTA_HASH_BINDING_MISMATCH")
+    sidecar_ref = identities.get("corrected_delta_sci_ref")
+    if not isinstance(sidecar_ref, str) or not sidecar_ref:
+        raise S25RebindBlocked(f"{field}.identities.corrected_delta_sci_ref:REQUIRED")
+    if metrics.get("corrected_delta_sci_ref") != sidecar_ref:
+        raise S25RebindBlocked(f"{field}:CORRECTED_DELTA_REF_BINDING_MISMATCH")
+    if metrics.get("corrected_delta_sci_batch_sizes") != list(_CORRECTED_DELTA_BATCH_SIZES):
+        raise S25RebindBlocked(f"{field}:CORRECTED_DELTA_BATCH_DOMAIN_INVALID")
+    if metrics.get("delta_sci_source") != _CORRECTED_DELTA_SOURCE:
+        raise S25RebindBlocked(f"{field}:CORRECTED_DELTA_SOURCE_INVALID")
+
+    sidecar_path = _logical_path(root, sidecar_ref, field=f"{field}.corrected_delta_sci_ref")
+    expected_output_root = evaluation_path.parent.parent.parent
+    expected_sidecar_root = expected_output_root / "g2.3-corrected-delta-sci"
+    if sidecar_path.parent != expected_sidecar_root or sidecar_path.name != f"{sidecar_hash}.json":
+        raise S25RebindBlocked(f"{field}:CORRECTED_DELTA_REF_NOT_BOUND_TO_EVALUATION")
+    sidecar = _load_object(sidecar_path, field=f"{field}.corrected_delta_sci")
+    if sidecar.get("schema_version") != _CORRECTED_DELTA_SCHEMA:
+        raise S25RebindBlocked(f"{field}:CORRECTED_DELTA_SCHEMA_INVALID")
+    if _validate_hashed_object(sidecar, field=f"{field}.corrected_delta_sci") != sidecar_hash:
+        raise S25RebindBlocked(f"{field}:CORRECTED_DELTA_HASH_INVALID")
+    if sidecar.get("delta_sci_batch_sizes") != list(_CORRECTED_DELTA_BATCH_SIZES):
+        raise S25RebindBlocked(f"{field}:CORRECTED_DELTA_SIDECAR_BATCH_DOMAIN_INVALID")
+    source_ref = sidecar.get("source_producer_ref")
+    source_hash = _require_hash(
+        sidecar.get("source_producer_artifact_hash"),
+        field=f"{field}.corrected_delta_sci.source_producer_artifact_hash",
+    )
+    source_path = _logical_path(
+        root,
+        source_ref,
+        field=f"{field}.corrected_delta_sci.source_producer_ref",
+    )
+    source = _load_object(source_path, field=f"{field}.corrected_delta_sci.source_producer")
+    if _validate_hashed_object(source, field=f"{field}.corrected_delta_sci.source_producer") != source_hash:
+        raise S25RebindBlocked(f"{field}:CORRECTED_DELTA_SOURCE_HASH_INVALID")
+
+
+def validate_g23_evaluation(
+    data_root: str | Path,
+    evaluation_ref: object,
+    evaluation_hash: object,
+) -> tuple[str, dict[str, Any]]:
+    """Load exactly one content-addressed, corrected G2.3 PASS artifact.
+
+    No candidate discovery is performed.  Callers must provide the exact
+    evaluation reference and artifact hash supplied by the approved G2.3
+    amendment; this is the fail-closed boundary against stale PASS attempts.
+    """
+
+    root = Path(data_root).resolve()
+    expected_hash = _require_hash(evaluation_hash, field="g23_evaluation_hash")
+    path = _logical_path(root, evaluation_ref, field="g23_evaluation_ref")
+    if (
+        path.name != "evaluation.json"
+        or path.parent.parent.name != "g2.3-attempts"
+        or path.parent.name != expected_hash
+    ):
+        raise S25RebindBlocked("G2.3_EVALUATION_REF_NOT_CONTENT_ADDRESSED")
+    try:
+        value = _load_object(path, field="g23_evaluation")
+    except S25RebindBlocked as error:
+        if str(error).endswith(":CANONICAL_JSON_REQUIRED"):
+            raise S25RebindBlocked("G2.3_EVALUATION_MISSING") from error
+        raise
+    digest = _validate_hashed_object(value, field="g23_evaluation")
+    if digest != expected_hash:
+        raise S25RebindBlocked("G2.3_EVALUATION_HASH_MISMATCH")
+    if (
+        value.get("schema_version") != _G23_SCHEMA
+        or value.get("gate_id") != _G23_GATE_ID
+        or value.get("status") != "PASS"
+        or value.get("formal_eligible") is not True
+        or value.get("required_cell_count") != len(EXPECTED_CELL_IDS)
+        or value.get("complete_cell_count") != len(EXPECTED_CELL_IDS)
+        or value.get("expected_cell_ids") != list(EXPECTED_CELL_IDS)
+    ):
+        raise S25RebindBlocked("G2.3_STRICT_PASS_REQUIRED")
+    cells = value.get("cells")
+    if (
+        not isinstance(cells, list)
+        or len(cells) != len(EXPECTED_CELL_IDS)
+        or tuple(item.get("cell_id") if isinstance(item, Mapping) else None for item in cells)
+        != EXPECTED_CELL_IDS
+    ):
+        raise S25RebindBlocked("G2.3_CELL_ORDER_INVALID")
+    for cell in cells:
+        if not isinstance(cell, Mapping) or cell.get("status") != "PASS":
+            raise S25RebindBlocked("G2.3_CELL_PASS_REQUIRED")
+        identities = cell.get("identities")
+        if not isinstance(identities, Mapping):
+            raise S25RebindBlocked("G2.3_CELL_IDENTITIES_REQUIRED")
+        _require_hash(identities.get("result_hash"), field="G2.3.cell.result_hash")
+        _require_hash(identities.get("config_hash"), field="G2.3.cell.config_hash")
+        _validate_corrected_delta_binding(
+            root,
+            path,
+            cell,
+            field=f"G2.3.{cell.get('cell_id')}",
+        )
+    return path.relative_to(root).as_posix(), value
 
 
 def _validate_task_result(
@@ -521,7 +600,11 @@ def prepare_s25_rebind(spec: S25RebindSpec) -> dict[str, Any]:
 
     root = spec.data_root.resolve()
     g3 = _validate_g3_resolution(spec)
-    evaluation_ref, evaluation = _latest_g23(spec)
+    evaluation_ref, evaluation = validate_g23_evaluation(
+        root,
+        spec.g23_evaluation_ref,
+        spec.g23_evaluation_hash,
+    )
     rows = _complete_statuses(spec, evaluation)
     output = _logical_path(root, spec.s205_output_root, field="s205_output_root")
     if output.exists():
@@ -544,7 +627,7 @@ def prepare_s25_rebind(spec: S25RebindSpec) -> dict[str, Any]:
         "excluded_pci": EXCLUDED_PCI,
         "approved_gpu_uuids": list(APPROVED_GPU_UUIDS),
         "g23_evaluation_ref": evaluation_ref,
-        "g23_evaluation_hash": evaluation["artifact_hash"],
+        "g23_evaluation_hash": spec.g23_evaluation_hash,
         "s204_run_root": spec.s204_run_root,
         "s204_prepared_root": spec.s204_prepared_root,
         "s205_output_root": spec.s205_output_root,
@@ -558,6 +641,7 @@ __all__ = [
     "CELL_COMPONENTS",
     "EXPECTED_CELL_IDS",
     "EXCLUDED_PCI",
+    "validate_g23_evaluation",
     "S25RebindBlocked",
     "S25RebindSpec",
     "prepare_s25_rebind",

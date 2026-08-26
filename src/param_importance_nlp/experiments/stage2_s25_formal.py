@@ -49,6 +49,8 @@ from .stage2_s25_rebind import (
     CELL_COMPONENTS,
     EXPECTED_CELL_IDS,
     EXCLUDED_PCI,
+    S25RebindBlocked,
+    validate_g23_evaluation,
 )
 from .stage2_s25_inputs import (
     S205_SWEEP_SCHEMA,
@@ -558,33 +560,19 @@ def _finite(value: object, *, field: str) -> None:
 
 
 def _validate_g23(root: Path, plan: Mapping[str, object]) -> tuple[str, dict[str, Any]]:
-    ref = plan.get("g23_evaluation_ref")
-    path, value = _load_object(root, ref, field="s205_plan.g23_evaluation_ref")
-    digest = _verify_artifact(value, field="g23_evaluation")
-    if (
-        value.get("schema_version") != S25_G23_SCHEMA
-        or value.get("gate_id") != "stage2.G2.3"
-        or value.get("status") != "PASS"
-        or value.get("formal_eligible") is not True
-        or value.get("required_cell_count") != 6
-        or value.get("complete_cell_count") != 6
-        or digest != plan.get("g23_evaluation_hash")
-    ):
-        raise S25ExecutionBlocked("G2.3_STRICT_PASS_OR_HASH_INVALID")
-    cells = value.get("cells")
-    if not isinstance(cells, list) or tuple(
-        item.get("cell_id") if isinstance(item, Mapping) else None for item in cells
-    ) != EXPECTED_CELL_IDS:
-        raise S25ExecutionBlocked("G2.3_CELL_ORDER_INVALID")
-    for item in cells:
-        if not isinstance(item, Mapping) or item.get("status") != "PASS":
-            raise S25ExecutionBlocked("G2.3_CELL_PASS_REQUIRED")
-        if not isinstance(item.get("identities"), Mapping):
-            raise S25ExecutionBlocked("G2.3_CELL_IDENTITIES_REQUIRED")
-        if not isinstance(item.get("metrics"), Mapping):
+    try:
+        path, value = validate_g23_evaluation(
+            root,
+            plan.get("g23_evaluation_ref"),
+            plan.get("g23_evaluation_hash"),
+        )
+    except S25RebindBlocked as error:
+        raise S25ExecutionBlocked(str(error)) from error
+    for item in value["cells"]:
+        if not isinstance(item, Mapping) or not isinstance(item.get("metrics"), Mapping):
             raise S25ExecutionBlocked("G2.3_OUTPUT_METRICS_REQUIRED")
         _finite(item["metrics"], field=f"G2.3.metrics.{item.get('cell_id')}")
-    return path.relative_to(root).as_posix(), value
+    return path, value
 
 
 def _validate_source_row(
