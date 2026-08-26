@@ -6,6 +6,7 @@ import pytest
 
 from param_importance_nlp.contracts.jsonio import canonical_json_hash, write_canonical_json
 from param_importance_nlp.experiments.stage2_s204_ids import EXPECTED_CELL_IDS
+from param_importance_nlp.experiments.stage2_s208_g26 import analyze_s208_g26
 from param_importance_nlp.experiments.stage2_s209_accuracy import (
     S209AccuracyBlocked,
     S209_ACCURACY_SCHEMA,
@@ -154,3 +155,35 @@ def test_producer_rejects_unknown_summary_method(tmp_path: Path) -> None:
             output_ref="s209/accuracy.json",
             run_id="s209-run",
         )
+
+
+def test_producer_consumes_current_s208_summary_and_long_table_schema(tmp_path: Path) -> None:
+    """Bind the sidecar to the real S2.8 producer output, not a reduced fixture."""
+
+    # Importing the complete formal-input builder from the S2.8 integration
+    # test keeps this test aligned with the current six-cell analysis schema.
+    from test_stage2_s208_g26 import _formal_inputs
+
+    values = _formal_inputs(tmp_path)
+    analysis_root = tmp_path / "g26-real-schema"
+    analysis = analyze_s208_g26(
+        raw_manifest=values["manifest"],
+        raw_root=values["raw_root"],
+        references=values["refs"],
+        matrix=values["matrix"],
+        preregistration=values["prereg"],
+        hypothesis_contract=values["hypothesis"],
+        upstream_gates=values["gates"],
+        output_root=analysis_root,
+        bootstrap_replicates=100,
+        bootstrap_seed=19,
+    )
+    assert analysis["schema_version"] == "stage2-s208-g26-analysis-v1"
+    sidecar = produce_s209_accuracy_sidecar(
+        data_root=tmp_path,
+        g26_root_ref="g26-real-schema",
+        output_ref="s209/accuracy-real-schema.json",
+        run_id="s209-real-schema",
+    )
+    assert len(sidecar["rows"]) == 18
+    assert all(set(row) == {"row_id", "cell_id", "method", "corrected_nmse", "mse", "spearman", "overlap_1pct"} for row in sidecar["rows"])

@@ -14,6 +14,8 @@ from pathlib import Path
 import sys
 
 _REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
+if str(_REPOSITORY_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPOSITORY_ROOT))
 if str(_REPOSITORY_ROOT / "src") not in sys.path:
     sys.path.insert(0, str(_REPOSITORY_ROOT / "src"))
 
@@ -29,8 +31,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--backend",
-        required=True,
-        help="real backend import path in module:function form",
+        default="param_importance_nlp.experiments.stage2_s209_production:run_s209_production_backend",
+        help=(
+            "real backend import path in module:function form; defaults to the "
+            "repository-contained approved S2.7/Torch adapter"
+        ),
     )
     parser.add_argument(
         "--config",

@@ -1340,6 +1340,8 @@ class S29ProfilerRunner:
             "S29_PAIRED_RUN_IDENTITY_HASH": str(task["paired_run_identity_hash"]),
             "S29_SHARED_METHOD_ORDER": json.dumps(task["shared_method_order"], separators=(",", ":")),
             "S29_SHARED_POOL_REF": str(task["shared_pool_ref"]),
+            "S29_IO_EVIDENCE_HASH": str(self.preflight.io_evidence["artifact_hash"]),
+            "S29_COST_IO_QUIESCENT": str(bool(self.preflight.io_evidence.get("cost_io_quiescent"))).lower(),
         }
 
     def _shared_manifest(self, rows: Iterable[Mapping[str, Any]]) -> list[dict[str, Any]]:
@@ -1483,6 +1485,8 @@ class S29ProfilerRunner:
             "S29_REPETITION": "0",
             "S29_GPU_UUIDS": ",".join(task["gpu_uuids"]),
             "CUDA_VISIBLE_DEVICES": ",".join(task["gpu_uuids"]),
+            "S29_IO_EVIDENCE_HASH": str(self.preflight.io_evidence["artifact_hash"]),
+            "S29_COST_IO_QUIESCENT": str(bool(self.preflight.io_evidence.get("cost_io_quiescent"))).lower(),
         }
         try:
             measured = self.profiler(task, environment=env)
@@ -1708,6 +1712,8 @@ class S29ProfilerRunner:
                 # _run_shared_group as one paired worker invocation.
                 "S29_GPU_UUIDS": str(task["gpu_uuid"]),
                 "CUDA_VISIBLE_DEVICES": str(task["gpu_uuid"]),
+                "S29_IO_EVIDENCE_HASH": str(self.preflight.io_evidence["artifact_hash"]),
+                "S29_COST_IO_QUIESCENT": str(bool(self.preflight.io_evidence.get("cost_io_quiescent"))).lower(),
             }
             try:
                 measured = self.profiler(task, environment=env)
