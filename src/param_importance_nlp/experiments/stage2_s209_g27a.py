@@ -3,6 +3,9 @@
 This module is a detached consumer.  It does not start a worker, enumerate a
 GPU, or launch a CUDA wave.  A caller supplies the already sealed G2.4b
 matrix, the S2.7 raw-results manifest, health evidence, and profiler rows.
+Scientific rows must carry the paired-run and shared-gradient-pool identity
+published by the one serial paired worker; the reducer rejects rows that only
+claim the shared semantic.
 The small control plane deliberately keeps the three cost meanings separate:
 ``scientific_equal_sample_cost`` is a shared paired-run accounting,
 ``isolated_estimator_cost`` is a fixed-state method run, and
@@ -32,6 +35,8 @@ from .stage2_s207_formal import APPROVED_GPU_UUIDS, EXCLUDED_GPU_UUID, EXCLUDED_
 S29_SCHEMA = "stage2-s209-g27a-cost-system-validation-v1"
 S29_GATE_SCHEMA = "stage2-s209-g27a-gate-v1"
 S29_MEASUREMENT_PLAN_SCHEMA = "stage2-s209-g27a-measurement-plan-v1"
+S29_SHARED_RUN_SCHEMA = "stage2-s209-g27a-shared-paired-run-v1"
+S29_SHARED_POOL_SCHEMA = "stage2-s209-g27a-shared-gradient-pool-v1"
 S29_TASK_ID = "stage2.09_cost_and_system_validation"
 S29_MATRIX_SCHEMA = "stage2-formal-pilot-matrix-freeze-v1"
 S29_COST_SEMANTICS = (
@@ -60,6 +65,20 @@ S29_COUNT_FIELDS = (
     "backward_count",
     "communication_bytes",
     "output_bytes",
+)
+S29_SHARED_ROW_FIELDS = (
+    "paired_run_id",
+    "paired_run_identity_hash",
+    "measurement_plan_hash",
+    "shared_pool_id",
+    "shared_pool_artifact_hash",
+    "shared_pool_ref",
+    "shared_sample_mapping_hash",
+    "shared_gradient_pool_hash",
+    "shared_method_order",
+    "shared_method_index",
+    "shared_sample_sequence_count",
+    "shared_sample_token_count",
 )
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _SAFE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,159}$")
@@ -150,6 +169,63 @@ def _method(value: Any, *, field: str) -> str:
     if lowered in {"raw", "double"}:
         return lowered
     raise S29G27ABlocked(f"{field}:UNKNOWN_METHOD")
+
+
+def shared_paired_run_identity(
+    *,
+    run_id: str,
+    measurement_plan_hash: str,
+    matrix_hash: str,
+    raw_manifest_hash: str,
+    source_raw_run_id: str,
+    anchor_id: str,
+    repetition: int,
+    gpu_uuid: str,
+    device_count: int,
+    method_order: Sequence[str],
+) -> dict[str, Any]:
+    """Return the deterministic identity for one shared scientific pair.
+
+    A shared pair is one serial worker invocation over one sample/gradient
+    pool.  The identity includes every frozen input that can change the pool,
+    plus the planned method order, so a row cannot be rebound to another
+    pooled run by changing only its semantic label.
+    """
+
+    run_id = _id(run_id, field="shared_pair.run_id")
+    measurement_plan_hash = _sha(measurement_plan_hash, field="shared_pair.measurement_plan_hash")
+    matrix_hash = _sha(matrix_hash, field="shared_pair.matrix_hash")
+    raw_manifest_hash = _sha(raw_manifest_hash, field="shared_pair.raw_manifest_hash")
+    source_raw_run_id = _id(source_raw_run_id, field="shared_pair.source_raw_run_id")
+    anchor_id = _id(anchor_id, field="shared_pair.anchor_id")
+    if isinstance(repetition, bool) or not isinstance(repetition, int) or repetition < 0:
+        raise S29G27ABlocked("shared_pair.repetition:INTEGER_REQUIRED")
+    if not isinstance(gpu_uuid, str) or not gpu_uuid:
+        raise S29G27ABlocked("shared_pair.gpu_uuid:REQUIRED")
+    _positive(device_count, field="shared_pair.device_count")
+    normalized_order = list(method_order)
+    if len(normalized_order) != len(S29_METHODS) or len(set(normalized_order)) != len(S29_METHODS) or set(normalized_order) != set(S29_METHODS):
+        raise S29G27ABlocked("shared_pair.method_order:METHOD_SET_INVALID")
+    body: dict[str, Any] = {
+        "schema_version": S29_SHARED_RUN_SCHEMA,
+        "run_id": run_id,
+        "measurement_plan_hash": measurement_plan_hash,
+        "matrix_hash": matrix_hash,
+        "raw_manifest_hash": raw_manifest_hash,
+        "source_raw_run_id": source_raw_run_id,
+        "anchor_id": anchor_id,
+        "repetition": repetition,
+        "gpu_uuid": gpu_uuid,
+        "device_count": device_count,
+        "method_order": normalized_order,
+        "methods": list(S29_METHODS),
+    }
+    identity_hash = canonical_json_hash(body)
+    return {
+        **body,
+        "paired_run_id": f"paired-{identity_hash}",
+        "paired_run_identity_hash": identity_hash,
+    }
 
 
 @dataclass(frozen=True, slots=True)
@@ -427,9 +503,7 @@ def _normalize_record(
     if declared_semantic is not None and declared_semantic != semantic:
         raise S29G27ABlocked(f"{semantic}:SEMANTIC_MIXED")
     result["semantic"] = semantic
-    result["method"] = _method(result.get("method", "shared" if semantic == S29_COST_SEMANTICS[0] else None), field=f"{semantic}.method") if semantic != S29_COST_SEMANTICS[0] else str(result.get("method", "shared"))
-    if semantic != S29_COST_SEMANTICS[0] and result["method"] not in S29_METHODS:
-        raise S29G27ABlocked(f"{semantic}:METHOD_REQUIRED")
+    result["method"] = _method(result.get("method"), field=f"{semantic}.method")
     result["run_id"] = _id(result.get("run_id", frozen.raw_run_id), field=f"{semantic}.run_id")
     source_run = result.get("source_raw_run_id", result.get("raw_run_id", frozen.raw_run_id))
     if source_run != frozen.raw_run_id:
@@ -496,6 +570,49 @@ def _normalize_record(
         raise S29G27ABlocked(f"{semantic}:SHARED_ANCHOR_REQUIRED")
     if semantic != S29_COST_SEMANTICS[0] and result["anchor_kind"] not in {"method_only", "fixed_state_method_only"}:
         raise S29G27ABlocked(f"{semantic}:METHOD_ONLY_ANCHOR_REQUIRED")
+    if semantic == S29_COST_SEMANTICS[0]:
+        if result["method"] not in S29_METHODS:
+            raise S29G27ABlocked(f"{semantic}:METHOD_REQUIRED")
+        for name in S29_SHARED_ROW_FIELDS:
+            if name not in result:
+                raise S29G27ABlocked(f"{semantic}:{name}:REQUIRED")
+        _id(result["paired_run_id"], field=f"{semantic}.paired_run_id")
+        _sha(result["paired_run_identity_hash"], field=f"{semantic}.paired_run_identity_hash")
+        _sha(result["measurement_plan_hash"], field=f"{semantic}.measurement_plan_hash")
+        _sha(result["shared_pool_id"], field=f"{semantic}.shared_pool_id")
+        _sha(result["shared_pool_artifact_hash"], field=f"{semantic}.shared_pool_artifact_hash")
+        _sha(result["shared_sample_mapping_hash"], field=f"{semantic}.shared_sample_mapping_hash")
+        _sha(result["shared_gradient_pool_hash"], field=f"{semantic}.shared_gradient_pool_hash")
+        ref = result["shared_pool_ref"]
+        if not isinstance(ref, str) or "\\" in ref or not re.fullmatch(r"shared-pools/[A-Za-z0-9][A-Za-z0-9._:-]{0,159}\.json", ref):
+            raise S29G27ABlocked(f"{semantic}.shared_pool_ref:INVALID")
+        order = result["shared_method_order"]
+        if not isinstance(order, list) or len(order) != len(S29_METHODS) or len(set(order)) != len(S29_METHODS) or set(order) != set(S29_METHODS):
+            raise S29G27ABlocked(f"{semantic}.shared_method_order:METHOD_SET_INVALID")
+        index = result["shared_method_index"]
+        if isinstance(index, bool) or not isinstance(index, int) or index < 0 or index >= len(S29_METHODS) or order[index] != result["method"]:
+            raise S29G27ABlocked(f"{semantic}.shared_method_index:INVALID")
+        for name in ("shared_sample_sequence_count", "shared_sample_token_count"):
+            _positive(result[name], field=f"{semantic}.{name}")
+        if result["sequence_count"] != result["shared_sample_sequence_count"] or result["token_count"] != result["shared_sample_token_count"]:
+            raise S29G27ABlocked(f"{semantic}:SHARED_SAMPLE_COUNT_MISMATCH")
+        expected_pair = shared_paired_run_identity(
+            run_id=str(result["run_id"]),
+            measurement_plan_hash=str(metadata.get("measurement_plan_hash", result.get("measurement_plan_hash", frozen.plan_hash))),
+            matrix_hash=frozen.matrix_hash,
+            raw_manifest_hash=frozen.raw_manifest_hash,
+            source_raw_run_id=frozen.raw_run_id,
+            anchor_id=str(result["anchor_id"]),
+            repetition=int(result["repetition"]),
+            gpu_uuid=str(result["gpu_uuid"]),
+            device_count=int(result["device_count"]),
+            method_order=order,
+        )
+        if result["paired_run_id"] != expected_pair["paired_run_id"] or result["paired_run_identity_hash"] != expected_pair["paired_run_identity_hash"]:
+            raise S29G27ABlocked(f"{semantic}:PAIRED_RUN_IDENTITY_MISMATCH")
+        declared_plan_hash = metadata.get("measurement_plan_hash")
+        if declared_plan_hash is not None and result.get("measurement_plan_hash") != declared_plan_hash:
+            raise S29G27ABlocked(f"{semantic}:MEASUREMENT_PLAN_HASH_MISMATCH")
     return result
 
 
@@ -520,6 +637,8 @@ class StrictS29Reducer:
         if selected not in S29_COST_SEMANTICS:
             raise S29G27ABlocked("COST_SEMANTIC_REQUIRED")
         normalized = _normalize_record(row, semantic=selected, frozen=self.frozen, metadata=metadata or {})
+        if normalized["run_id"] != self.run_id:
+            raise S29G27ABlocked("RUN_ID_MISMATCH")
         method = str(normalized["method"])
         key = (selected, method, str(normalized["anchor_id"]), int(normalized["repetition"]), str(normalized["run_id"]))
         digest = canonical_json_hash(normalized)
@@ -542,6 +661,135 @@ class StrictS29Reducer:
             raise S29G27ABlocked(f"COST_SEMANTICS_MISSING:{','.join(sorted(missing))}")
         self._sealed = True
         return self.records
+
+
+def _shared_pair_checks(
+    rows: Sequence[Mapping[str, Any]],
+    metadata: Mapping[str, Any],
+) -> tuple[list[str], list[dict[str, Any]]]:
+    """Verify that scientific rows came from one real pooled worker each.
+
+    The reducer cannot inspect a worker's private gradient tensors, so the
+    worker must publish a hash-bound pool identity on every method row.  This
+    check requires the complete raw/double/U set for each pair, a common pool
+    identity, and a metadata manifest that is copied into the G2.7a report.
+    """
+
+    shared = [row for row in rows if row["semantic"] == S29_COST_SEMANTICS[0]]
+    if not shared:
+        return ["SHARED_COST_OBSERVATIONS_MISSING"], []
+    blockers: list[str] = []
+    if metadata.get("shared_paired_runner_schema") != S29_SHARED_RUN_SCHEMA:
+        blockers.append("SHARED_PAIRED_RUN_SCHEMA_REQUIRED")
+    if metadata.get("shared_pool_schema") != S29_SHARED_POOL_SCHEMA:
+        blockers.append("SHARED_POOL_SCHEMA_REQUIRED")
+    entries = metadata.get("shared_paired_runs")
+    if not isinstance(entries, list) or any(not isinstance(item, Mapping) for item in entries):
+        blockers.append("SHARED_PAIRED_RUN_MANIFEST_REQUIRED")
+        entries = []
+    grouped: dict[str, list[Mapping[str, Any]]] = {}
+    for row in shared:
+        grouped.setdefault(str(row["paired_run_id"]), []).append(row)
+    summary: list[dict[str, Any]] = []
+    for paired_run_id, group in sorted(grouped.items()):
+        methods = {str(row["method"]) for row in group}
+        if methods != set(S29_METHODS) or len(group) != len(S29_METHODS):
+            blockers.append(f"SHARED_PAIRED_METHOD_SET_INVALID:{paired_run_id}")
+            continue
+        if any(row.get("cost_io_quiescent") is not True for row in group):
+            blockers.append(f"SHARED_PAIRED_IO_NOT_QUIESCENT:{paired_run_id}")
+        identity_fields = (
+            "paired_run_identity_hash",
+            "measurement_plan_hash",
+            "anchor_id",
+            "repetition",
+            "gpu_uuid",
+            "device_count",
+            "shared_pool_id",
+            "shared_pool_artifact_hash",
+            "shared_pool_ref",
+            "shared_sample_mapping_hash",
+            "shared_gradient_pool_hash",
+            "shared_method_order",
+            "shared_sample_sequence_count",
+            "shared_sample_token_count",
+        )
+        first = group[0]
+        for field in identity_fields:
+            if any(row.get(field) != first.get(field) for row in group[1:]):
+                blockers.append(f"SHARED_PAIRED_IDENTITY_DRIFT:{paired_run_id}:{field}")
+        indexes = [row.get("shared_method_index") for row in group]
+        if sorted(indexes) != list(range(len(S29_METHODS))):
+            blockers.append(f"SHARED_PAIRED_METHOD_INDEX_INVALID:{paired_run_id}")
+        order = first.get("shared_method_order")
+        if not isinstance(order, list) or any(row.get("method") != order[int(row["shared_method_index"])] for row in group if isinstance(row.get("shared_method_index"), int)):
+            blockers.append(f"SHARED_PAIRED_METHOD_ORDER_INVALID:{paired_run_id}")
+        try:
+            expected = shared_paired_run_identity(
+                run_id=str(first["run_id"]),
+                measurement_plan_hash=str(first["measurement_plan_hash"]),
+                matrix_hash=str(first["matrix_hash"]),
+                raw_manifest_hash=str(first["raw_manifest_hash"]),
+                source_raw_run_id=str(first["source_raw_run_id"]),
+                anchor_id=str(first["anchor_id"]),
+                repetition=int(first["repetition"]),
+                gpu_uuid=str(first["gpu_uuid"]),
+                device_count=int(first["device_count"]),
+                method_order=order if isinstance(order, list) else (),
+            )
+        except Exception:
+            blockers.append(f"SHARED_PAIRED_IDENTITY_INVALID:{paired_run_id}")
+        else:
+            if paired_run_id != expected["paired_run_id"] or first.get("paired_run_identity_hash") != expected["paired_run_identity_hash"]:
+                blockers.append(f"SHARED_PAIRED_IDENTITY_MISMATCH:{paired_run_id}")
+        summary.append(
+            {
+                "paired_run_id": paired_run_id,
+                "paired_run_identity_hash": first.get("paired_run_identity_hash"),
+                "measurement_plan_hash": first.get("measurement_plan_hash"),
+                "anchor_id": first.get("anchor_id"),
+                "repetition": first.get("repetition"),
+                "gpu_uuid": first.get("gpu_uuid"),
+                "device_count": first.get("device_count"),
+                "shared_pool_id": first.get("shared_pool_id"),
+                "shared_pool_artifact_hash": first.get("shared_pool_artifact_hash"),
+                "shared_pool_ref": first.get("shared_pool_ref"),
+                "shared_sample_mapping_hash": first.get("shared_sample_mapping_hash"),
+                "shared_gradient_pool_hash": first.get("shared_gradient_pool_hash"),
+                "shared_method_order": list(order) if isinstance(order, list) else order,
+                "shared_sample_sequence_count": first.get("shared_sample_sequence_count"),
+                "shared_sample_token_count": first.get("shared_sample_token_count"),
+            }
+        )
+    declared = {str(item.get("paired_run_id")): dict(item) for item in entries if isinstance(item, Mapping)}
+    if len(declared) != len(entries):
+        blockers.append("SHARED_PAIRED_RUN_MANIFEST_DUPLICATE")
+    if set(declared) != set(grouped):
+        blockers.append("SHARED_PAIRED_RUN_MANIFEST_SET_INVALID")
+    manifest_fields = {
+        "paired_run_id",
+        "paired_run_identity_hash",
+        "measurement_plan_hash",
+        "anchor_id",
+        "repetition",
+        "gpu_uuid",
+        "device_count",
+        "shared_pool_id",
+        "shared_pool_artifact_hash",
+        "shared_pool_ref",
+        "shared_sample_mapping_hash",
+        "shared_gradient_pool_hash",
+        "shared_method_order",
+        "shared_sample_sequence_count",
+        "shared_sample_token_count",
+    }
+    for item in summary:
+        declared_item = declared.get(str(item["paired_run_id"]))
+        if declared_item is None:
+            continue
+        if set(declared_item) != manifest_fields or any(declared_item[field] != item[field] for field in manifest_fields):
+            blockers.append(f"SHARED_PAIRED_RUN_MANIFEST_MISMATCH:{item['paired_run_id']}")
+    return blockers, summary
 
 
 def _health_reasons(snapshot: Any, *, expected_io: bool) -> tuple[list[str], list[str]]:
@@ -918,16 +1166,28 @@ def run_s209_g27a(
     )
     _id(run_id, field="s29.run_id")
     validated_measurement_plan = _validate_measurement_plan(measurement_plan, frozen=frozen) if measurement_plan is not None else None
+    if validated_measurement_plan is not None and validated_measurement_plan["run_id"] != run_id:
+        raise S29G27ABlocked("MEASUREMENT_PLAN_RUN_ID_MISMATCH")
     if not isinstance(cost_observations, Mapping) or set(cost_observations) != set(S29_COST_SEMANTICS):
         raise S29G27ABlocked("COST_SEMANTICS_EXACTLY_THREE_REQUIRED")
     reducer = StrictS29Reducer(frozen, run_id=run_id)
     metadata: dict[str, Mapping[str, Any]] = {}
     for semantic in S29_COST_SEMANTICS:
         meta, rows = _semantic_rows(cost_observations[semantic], semantic=semantic)
+        if semantic == S29_COST_SEMANTICS[0] and validated_measurement_plan is not None:
+            # The worker's pair identity is rooted in the immutable plan hash;
+            # make the reducer compare against the validated producer rather
+            # than trusting a row/metadata value supplied by the caller.
+            meta = dict(meta)
+            meta["measurement_plan_hash"] = validated_measurement_plan["artifact_hash"]
         metadata[semantic] = meta
         for row in rows:
             reducer.add(row, semantic=semantic, metadata=meta)
     reduced = reducer.seal()
+    shared_blockers, shared_pairs = _shared_pair_checks(
+        reduced,
+        metadata["scientific_equal_sample_cost"],
+    )
     expected_io = cost_io_quiescent
     if expected_io is None:
         values = [row.get("cost_io_quiescent") for row in reduced]
@@ -960,6 +1220,7 @@ def run_s209_g27a(
         blockers.append("COST_SYSTEM_CONSISTENCY_FAILED")
     online_blockers, online_aggregates, online_ratios = _online_checks(reduced, metadata["online_training_incremental_cost"])
     blockers.extend(online_blockers)
+    blockers.extend(shared_blockers)
     blockers.extend(_crosscheck(reduced, shared_attribution_cross_check))
     pareto, pareto_reasons = _pareto(reduced, accuracy_rows)
     blockers.extend(pareto_reasons)
@@ -992,6 +1253,8 @@ def run_s209_g27a(
         "capacity_evidence_hash": capacity.get("capacity_evidence_hash"),
         "ulimit_evidence_hash": capacity.get("ulimit_evidence_hash"),
         "ulimit_nofile_soft": capacity.get("ulimit_nofile_soft"),
+        "shared_paired_run_count": len(shared_pairs),
+        "shared_pool_artifact_hashes": sorted({str(item["shared_pool_artifact_hash"]) for item in shared_pairs}),
     }
     gate = GateRecord(
         gate_id="stage2.G2.7a",
@@ -999,7 +1262,7 @@ def run_s209_g27a(
         status=gate_status,
         checked_at=now,
         measured=measured,
-        threshold={"online_training_incremental_cost_ratio": S29_DECISION_RATIO, "shared_crosscheck_relative_difference": S29_CROSSCHECK_TOLERANCE, "four_gpu_required": True, "cost_io_quiescent": True},
+        threshold={"online_training_incremental_cost_ratio": S29_DECISION_RATIO, "shared_crosscheck_relative_difference": S29_CROSSCHECK_TOLERANCE, "four_gpu_required": True, "cost_io_quiescent": True, "shared_paired_runner_schema": S29_SHARED_RUN_SCHEMA, "shared_gradient_pool_schema": S29_SHARED_POOL_SCHEMA},
         evidence_refs=(matrix_ref, raw_manifest_ref, f"s209/{run_id}/cost-system-validation.json"),
         reasons=reasons if gate_status is not GateStatus.PASS else (),
     )
@@ -1014,6 +1277,10 @@ def run_s209_g27a(
             "wall_seconds_median": statistics.median(float(row["wall_seconds"]) for row in subset) if subset else None,
             "decision_eligible": semantic == "online_training_incremental_cost",
         }
+        if semantic == "scientific_equal_sample_cost":
+            semantic_summary[semantic]["shared_paired_runner_schema"] = S29_SHARED_RUN_SCHEMA
+            semantic_summary[semantic]["shared_pool_schema"] = S29_SHARED_POOL_SCHEMA
+            semantic_summary[semantic]["shared_paired_runs"] = shared_pairs
     report: dict[str, Any] = {
         "schema_version": S29_SCHEMA,
         "task_id": S29_TASK_ID,
@@ -1030,6 +1297,7 @@ def run_s209_g27a(
         "cost_io_quiescent": expected_io,
         "consistency": consistency,
         "shared_attribution_cross_check": dict(shared_attribution_cross_check) if isinstance(shared_attribution_cross_check, Mapping) else None,
+        "shared_paired_runs": shared_pairs,
         "online_training_incremental_cost": {"aggregates": online_aggregates, "ratios": online_ratios, "decision_source": "online_training_incremental_cost"},
         "pareto": pareto,
         "capacity": capacity,
@@ -1060,6 +1328,9 @@ __all__ = [
     "S29_CROSSCHECK_TOLERANCE",
     "S29_DECISION_RATIO",
     "S29_MEASUREMENT_PLAN_SCHEMA",
+    "S29_SHARED_POOL_SCHEMA",
+    "S29_SHARED_RUN_SCHEMA",
+    "S29_SHARED_ROW_FIELDS",
     "S29FrozenInputs",
     "S29G27ABlocked",
     "StrictS29Reducer",
@@ -1067,5 +1338,6 @@ __all__ = [
     "orchestrate_s209_g27a",
     "prepare_s209_measurement_plan",
     "run_s209_g27a",
+    "shared_paired_run_identity",
     "validate_g27a",
 ]

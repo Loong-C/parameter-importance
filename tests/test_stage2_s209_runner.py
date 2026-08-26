@@ -20,11 +20,14 @@ from param_importance_nlp.experiments.stage2_s209_runner import (
     S29_COUNT_FIELDS,
     S29_INVENTORY_SCHEMA,
     S29_IO_SCHEMA,
+    S29_SHARED_POOL_SCHEMA,
+    S29_SHARED_RUN_SCHEMA,
     S29_TIMING_FIELDS,
     S29RunnerBlocked,
     S29ProfilerRunner,
     S29StatusStore,
     _task_list,
+    _validate_shared_bundle,
     _validate_measured_row,
     _load_inventory_envelope,
     validate_s209_gpu_inventory,
@@ -213,11 +216,27 @@ def test_s209_task_list_is_single_gpu_for_every_method_task() -> None:
     preflight = SimpleNamespace(
         measurement_plan={
             "run_id": "s209-run",
+            "artifact_hash": "d" * 64,
             "rows": [
                 {"anchor_id": "anchor-a", "repetition": 0, "method_order": ["double", "raw", "u"]},
                 {"anchor_id": "anchor-a", "repetition": 1, "method_order": ["raw", "u", "double"]},
             ]
-        }
+        },
+        plan_hash="d" * 64,
+        frozen=S29FrozenInputs(
+            matrix_hash="a" * 64,
+            g24b_gate_hash="b" * 64,
+            raw_manifest_hash="c" * 64,
+            raw_run_id="s207-run",
+            plan_hash="e" * 64,
+            mapping_hash="f" * 64,
+            sampling_plan_hash="1" * 64,
+            expected_unit_ids=("unit-0",),
+            batch_size=32,
+            microbatch_count=16,
+            repetitions=2,
+            completion_denominator=1,
+        ),
     )
     tasks = _task_list(preflight, run_id="s209-run")
     assert tasks
@@ -236,10 +255,208 @@ def test_s209_task_list_rejects_plan_run_id_rebinding() -> None:
             "rows": [
                 {"anchor_id": "anchor-a", "repetition": 0, "method_order": ["double", "raw", "u"]},
             ],
-        }
+        },
+        plan_hash="d" * 64,
+        frozen=S29FrozenInputs(
+            matrix_hash="a" * 64,
+            g24b_gate_hash="b" * 64,
+            raw_manifest_hash="c" * 64,
+            raw_run_id="s207-run",
+            plan_hash="e" * 64,
+            mapping_hash="f" * 64,
+            sampling_plan_hash="1" * 64,
+            expected_unit_ids=("unit-0",),
+            batch_size=32,
+            microbatch_count=16,
+            repetitions=2,
+            completion_denominator=1,
+        ),
     )
     with pytest.raises(S29RunnerBlocked, match="MEASUREMENT_PLAN_RUN_ID_MISMATCH"):
         _task_list(preflight, run_id="different-run")
+
+
+def _shared_group_fixture() -> tuple[SimpleNamespace, list[dict[str, object]], dict[str, object], dict[str, object]]:
+    frozen = S29FrozenInputs(
+        matrix_hash="a" * 64,
+        g24b_gate_hash="b" * 64,
+        raw_manifest_hash="c" * 64,
+        raw_run_id="s207-run",
+        plan_hash="e" * 64,
+        mapping_hash="f" * 64,
+        sampling_plan_hash="1" * 64,
+        expected_unit_ids=("unit-0",),
+        batch_size=32,
+        microbatch_count=16,
+        repetitions=2,
+        completion_denominator=1,
+    )
+    plan = {
+        "run_id": "s209-run",
+        "artifact_hash": "d" * 64,
+        "rows": [{"anchor_id": "shared-a", "repetition": 0, "method_order": ["double", "raw", "u"]}],
+    }
+    preflight = SimpleNamespace(
+        measurement_plan=plan,
+        plan_hash="d" * 64,
+        frozen=frozen,
+        inventory={"inventory_identity": {"artifact_hash": "1" * 64, "source_sha256": "2" * 64}},
+        io_evidence={"artifact_hash": "3" * 64, "cost_io_quiescent": True},
+    )
+    tasks = [task for task in _task_list(preflight, run_id="s209-run") if task["semantic"] == "scientific_equal_sample_cost"]
+    return preflight, tasks, {"artifact_hash": "3" * 64, "cost_io_quiescent": True}, {"artifact_hash": "1" * 64, "source_sha256": "2" * 64}
+
+
+def _shared_bundle(tasks: list[dict[str, object]]) -> dict[str, object]:
+    task = tasks[0]
+    pool: dict[str, object] = {
+        "schema_version": S29_SHARED_POOL_SCHEMA,
+        "paired_run_id": task["paired_run_id"],
+        "paired_run_identity_hash": task["paired_run_identity_hash"],
+        "measurement_plan_hash": task["measurement_plan_hash"],
+        "matrix_hash": "a" * 64,
+        "raw_manifest_hash": "c" * 64,
+        "source_raw_run_id": "s207-run",
+        "anchor_id": task["anchor_id"],
+        "repetition": task["repetition"],
+        "gpu_uuid": task["gpu_uuid"],
+        "device_count": 1,
+        "batch_size": 32,
+        "microbatch_count": 16,
+        "method_order": list(task["shared_method_order"]),
+        "pool_id": "4" * 64,
+        "sample_mapping_hash": "5" * 64,
+        "gradient_pool_hash": "6" * 64,
+        "sequence_count": 32,
+        "token_count": 1024,
+        "backward_count": 1,
+        "cost_io_quiescent": True,
+        "shared_pool_ref": task["shared_pool_ref"],
+    }
+    pool["artifact_hash"] = canonical_json_hash(pool)
+    rows: list[dict[str, object]] = []
+    for method_task in tasks:
+        method = str(method_task["method"])
+        row: dict[str, object] = {
+            "measurement_kind": "actual",
+            "measured": True,
+            "semantic": "scientific_equal_sample_cost",
+            "method": method,
+            "anchor_id": method_task["anchor_id"],
+            "repetition": method_task["repetition"],
+            "run_id": method_task["run_id"],
+            "source_raw_run_id": "s207-run",
+            "matrix_hash": "a" * 64,
+            "raw_manifest_hash": "c" * 64,
+            "gpu_uuid": method_task["gpu_uuid"],
+            "device_count": 1,
+            "inventory_artifact_hash": "1" * 64,
+            "inventory_source_sha256": "2" * 64,
+            "cost_io_quiescent": True,
+            "health_ok": True,
+            "batch_size": 32,
+            "microbatch_count": 16,
+            "sequence_count": 32,
+            "token_count": 1024,
+            "backward_count": 1,
+            "communication_bytes": 0,
+            "output_bytes": 4096,
+            "data_wait_seconds": 0.5,
+            "forward_seconds": 2.0,
+            "backward_seconds": 3.0,
+            "gradient_aggregation_seconds": 0.5,
+            "formula_seconds": 0.5,
+            "statistics_seconds": 0.5,
+            "communication_seconds": 0.0,
+            "write_seconds": 1.0,
+            "wall_seconds": 20.0,
+            "allocated_peak_bytes": 100,
+            "reserved_peak_bytes": 120,
+            "device_peak_bytes": 140,
+            "anchor_kind": "shared_runner",
+            "paired_run_id": method_task["paired_run_id"],
+            "paired_run_identity_hash": method_task["paired_run_identity_hash"],
+            "measurement_plan_hash": method_task["measurement_plan_hash"],
+            "shared_pool_id": pool["pool_id"],
+            "shared_pool_artifact_hash": pool["artifact_hash"],
+            "shared_pool_ref": pool["shared_pool_ref"],
+            "shared_sample_mapping_hash": pool["sample_mapping_hash"],
+            "shared_gradient_pool_hash": pool["gradient_pool_hash"],
+            "shared_method_order": list(method_task["shared_method_order"]),
+            "shared_method_index": method_task["shared_method_index"],
+            "shared_sample_sequence_count": pool["sequence_count"],
+            "shared_sample_token_count": pool["token_count"],
+        }
+        rows.append(row)
+    return {
+        "schema_version": S29_SHARED_RUN_SCHEMA,
+        "semantic": "scientific_equal_sample_cost",
+        "paired_run_id": task["paired_run_id"],
+        "paired_run_identity_hash": task["paired_run_identity_hash"],
+        "run_id": task["run_id"],
+        "measurement_plan_hash": task["measurement_plan_hash"],
+        "anchor_id": task["anchor_id"],
+        "repetition": task["repetition"],
+        "gpu_uuid": task["gpu_uuid"],
+        "device_count": 1,
+        "method_order": list(task["shared_method_order"]),
+        "methods": ["raw", "double", "u"],
+        "shared_pool": pool,
+        "rows": rows,
+    }
+
+
+def test_s209_shared_semantic_uses_one_serial_pooled_worker(tmp_path: Path) -> None:
+    preflight, tasks, io_evidence, inventory_identity = _shared_group_fixture()
+    calls: list[dict[str, str]] = []
+
+    def profiler(_task, *, environment):
+        calls.append(dict(environment))
+        return _shared_bundle(tasks)
+
+    runner = S29ProfilerRunner(preflight=preflight, run_id="s209-run", run_root=tmp_path, profiler=profiler)
+    completed: dict[str, dict[str, object]] = {}
+    runner._run_shared_group(tasks, completed=completed)
+    assert len(calls) == 1
+    assert calls[0]["S29_METHOD"] == "shared"
+    assert calls[0]["CUDA_VISIBLE_DEVICES"] == APPROVED_GPU_UUIDS[0]
+    assert len(completed) == 3
+    assert (tmp_path / "shared-pools" / f"{tasks[0]['paired_run_id']}.json").exists()
+
+
+def test_s209_shared_bundle_rejects_pool_tamper_and_method_mislabel() -> None:
+    preflight, tasks, io_evidence, inventory_identity = _shared_group_fixture()
+    bundle = _shared_bundle(tasks)
+    tampered_pool = dict(bundle["shared_pool"])
+    tampered_pool["token_count"] = 2048
+    with pytest.raises(S29RunnerBlocked, match="SHARED_POOL_HASH_MISMATCH"):
+        _validate_shared_bundle(
+            {**bundle, "shared_pool": tampered_pool},
+            tasks=tasks,
+            frozen=preflight.frozen,
+            io_evidence=io_evidence,
+            inventory_identity=inventory_identity,
+        )
+    tampered_rows = [dict(row) for row in bundle["rows"]]
+    tampered_rows[0]["anchor_kind"] = "method_only"
+    with pytest.raises(S29RunnerBlocked, match="PROFILER_IDENTITY_DRIFT:anchor_kind"):
+        _validate_shared_bundle(
+            {**bundle, "rows": tampered_rows},
+            tasks=tasks,
+            frozen=preflight.frozen,
+            io_evidence=io_evidence,
+            inventory_identity=inventory_identity,
+        )
+    drifted_tasks = [dict(task) for task in tasks]
+    drifted_tasks[1]["anchor_id"] = "other-anchor"
+    with pytest.raises(S29RunnerBlocked, match="PROFILER_SHARED_TASK_IDENTITY_DRIFT"):
+        _validate_shared_bundle(
+            bundle,
+            tasks=drifted_tasks,
+            frozen=preflight.frozen,
+            io_evidence=io_evidence,
+            inventory_identity=inventory_identity,
+        )
 
 
 def test_s209_four_card_anchor_requires_worker_gpu_uuid_set() -> None:
