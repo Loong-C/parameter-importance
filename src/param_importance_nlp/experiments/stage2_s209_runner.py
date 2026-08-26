@@ -1153,10 +1153,36 @@ class S29ProfilerRunner:
         self.attempt_root.mkdir(parents=True, exist_ok=True)
         self.failure_root.mkdir(parents=True, exist_ok=True)
         current = self.status_store.acquire(expected_tasks=len(tasks) + 2)
-        if self.single_gpu_anchor is None:
-            self.single_gpu_anchor = self._run_measured_anchor(self._anchor_task(device_count=1))
-        if self.four_gpu_anchor is None:
-            self.four_gpu_anchor = self._run_measured_anchor(self._anchor_task(device_count=4))
+        anchor_completed = 0
+        try:
+            if self.single_gpu_anchor is None:
+                self.single_gpu_anchor = self._run_measured_anchor(self._anchor_task(device_count=1))
+            anchor_completed += 1
+            if self.four_gpu_anchor is None:
+                self.four_gpu_anchor = self._run_measured_anchor(self._anchor_task(device_count=4))
+            anchor_completed += 1
+        except Exception as error:
+            # Anchor failures happen before method rows can be reduced.  Do not
+            # leave a detached run claiming RUNNING after its owner exits;
+            # publish a terminal blocked state with the number of anchors that
+            # actually reached a valid boundary.
+            self.status_store.publish(
+                S29DetachedStatus(
+                    self.run_id,
+                    self.preflight.plan_hash,
+                    "BLOCKED",
+                    anchor_completed,
+                    len(tasks) + 2,
+                    _now(),
+                    terminal_reason=f"ANCHOR_MEASUREMENT_FAILED:{type(error).__name__}:{error}",
+                )
+            )
+            return {
+                "status": "BLOCKED",
+                "completed_tasks": anchor_completed,
+                "expected_tasks": len(tasks) + 2,
+                "failure_evidence": sorted(path.name for path in self.failure_root.glob("*.json")),
+            }
         completed = self._load_completed(tasks)
         for task in tasks:
             key = self._task_key(task)
