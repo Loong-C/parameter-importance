@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
+import os
 
 import pytest
 
@@ -20,6 +21,7 @@ from param_importance_nlp.experiments.stage2_s209_runner import (
     S29_IO_SCHEMA,
     S29RunnerBlocked,
     S29StatusStore,
+    _task_list,
     _load_inventory_envelope,
     validate_s209_gpu_inventory,
     validate_s209_io_evidence,
@@ -182,6 +184,91 @@ def test_s209_status_store_resumes_only_after_owner_exits(tmp_path) -> None:
     status = store.acquire(expected_tasks=2)
     assert status.status == "RUNNING"
     assert store.load().owner_pid is not None
+
+
+def test_s209_status_store_rejects_frozen_identity_tamper(tmp_path: Path) -> None:
+    path = tmp_path / "status.json"
+    store = S29StatusStore(
+        path,
+        run_id="s29-run",
+        plan_hash="a" * 64,
+        inventory_identity={"artifact_hash": "b" * 64, "source_sha256": "c" * 64},
+        cost_identity={"matrix_hash": "d" * 64, "raw_manifest_hash": "e" * 64},
+    )
+    store.acquire(expected_tasks=2)
+    tampered = load = store.load().to_dict()
+    tampered["matrix_hash"] = "f" * 64
+    tampered["artifact_hash"] = canonical_json_hash({key: value for key, value in tampered.items() if key != "artifact_hash"})
+    write_canonical_json(path, tampered)
+    with pytest.raises(S29RunnerBlocked, match="STATUS_MATRIX_HASH_DRIFT"):
+        store.load()
+
+
+def test_s209_task_list_is_single_gpu_for_every_method_task() -> None:
+    preflight = SimpleNamespace(
+        measurement_plan={
+            "rows": [
+                {"anchor_id": "anchor-a", "repetition": 0, "method_order": ["double", "raw", "u"]},
+                {"anchor_id": "anchor-a", "repetition": 1, "method_order": ["raw", "u", "double"]},
+            ]
+        }
+    )
+    tasks = _task_list(preflight, run_id="s209-run")
+    assert tasks
+    assert len(tasks) == 18
+    assert {task["anchor_id"] for task in tasks} == {"anchor-a"}
+    assert {task["repetition"] for task in tasks} == {0, 1}
+    assert all(task["device_count"] == 1 for task in tasks)
+    assert all(task["gpu_uuid"] in APPROVED_GPU_UUIDS for task in tasks)
+    assert all(len(str(task["gpu_uuid"])) > 0 for task in tasks)
+
+
+def test_s209_detach_rejects_duplicate_launch_lease(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(launcher, "_preflight", lambda _args: {})
+    monkeypatch.setattr(launcher.subprocess, "Popen", lambda *args, **kwargs: SimpleNamespace(pid=os.getpid()))
+    args = SimpleNamespace(
+        profiler_command=["profiler"],
+        data_root=tmp_path,
+        run_root="runs/s209",
+        run_id="s209-run",
+    )
+    launcher._detach(args)
+    with pytest.raises(S29RunnerBlocked, match="ALREADY_RUNNING"):
+        launcher._detach(args)
+
+
+def test_s209_detach_rejects_stale_lease_without_relaunch_or_unlink(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(launcher, "_preflight", lambda _args: {})
+    monkeypatch.setattr(launcher.subprocess, "Popen", lambda *args, **kwargs: pytest.fail("stale lease must block before Popen"))
+    run_root = tmp_path / "runs" / "s209"
+    run_root.mkdir(parents=True)
+    lease = {
+        "schema_version": "stage2-s209-g27a-detached-lease-v1",
+        "owner_pid": 999999,
+        "run_id": "s209-run",
+        "started_at": "2026-08-26T00:00:00+00:00",
+    }
+    lease["artifact_hash"] = canonical_json_hash(lease)
+    lease_path = run_root / "launcher.lease.json"
+    write_canonical_json(lease_path, lease)
+    before = lease_path.read_bytes()
+    args = SimpleNamespace(profiler_command=["profiler"], data_root=tmp_path, run_root="runs/s209", run_id="s209-run")
+    with pytest.raises(S29RunnerBlocked, match="ALREADY_RUNNING"):
+        launcher._detach(args)
+    assert lease_path.read_bytes() == before
+
+
+def test_s209_detach_rejects_existing_dead_pid_manifest(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(launcher, "_preflight", lambda _args: {})
+    monkeypatch.setattr(launcher.subprocess, "Popen", lambda *args, **kwargs: pytest.fail("PID manifest must block before Popen"))
+    run_root = tmp_path / "runs" / "s209"
+    run_root.mkdir(parents=True)
+    payload = {"schema_version": "stage2-s209-g27a-detached-launch-v1", "pid": 999999, "run_id": "s209-run"}
+    payload["artifact_hash"] = canonical_json_hash(payload)
+    write_canonical_json(run_root / "launcher.pid.json", payload)
+    args = SimpleNamespace(profiler_command=["profiler"], data_root=tmp_path, run_root="runs/s209", run_id="s209-run")
+    with pytest.raises(S29RunnerBlocked, match="ALREADY_RUNNING"):
+        launcher._detach(args)
 
 
 def test_s209_detach_runs_preflight_before_popen(monkeypatch, tmp_path: Path) -> None:

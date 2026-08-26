@@ -202,6 +202,36 @@ def test_s209_binds_frozen_matrix_and_sealed_raw_manifest() -> None:
         bind_s209_inputs(matrix=matrix, g24b_gate=gate, raw_manifest=tampered)
 
 
+def test_s209_binds_and_verifies_g25_gate_identity() -> None:
+    matrix, gate, manifest = _inputs()
+    g25 = GateRecord(
+        gate_id="stage2.G2.5",
+        stage=2,
+        status="PASS",
+        checked_at="2026-08-25T00:00:00+00:00",
+        measured={"raw_manifest_hash": manifest["artifact_hash"]},
+        threshold={},
+        evidence_refs=("s207/g2.5-gate.json",),
+    ).to_dict()
+    frozen = bind_s209_inputs(matrix=matrix, g24b_gate=gate, raw_manifest=manifest, g25_gate=g25, require_g25=True)
+    assert frozen.g25_gate_hash == g25["artifact_hash"]
+    tampered = dict(g25)
+    tampered["measured"] = {"raw_manifest_hash": "f" * 64}
+    tampered["artifact_hash"] = GateRecord(
+        gate_id="stage2.G2.5",
+        stage=2,
+        status="PASS",
+        checked_at="2026-08-25T00:00:00+00:00",
+        measured=tampered["measured"],
+        threshold={},
+        evidence_refs=("s207/g2.5-gate.json",),
+    ).artifact_hash
+    with pytest.raises(S29G27ABlocked, match="G25_RAW_MANIFEST_HASH_MISMATCH"):
+        bind_s209_inputs(matrix=matrix, g24b_gate=gate, raw_manifest=manifest, g25_gate=tampered, require_g25=True)
+    with pytest.raises(S29G27ABlocked, match="G25_GATE_REQUIRED"):
+        bind_s209_inputs(matrix=matrix, g24b_gate=gate, raw_manifest=manifest, require_g25=True)
+
+
 def test_s209_reducer_is_strict_and_idempotent() -> None:
     matrix, gate, manifest = _inputs()
     frozen = bind_s209_inputs(matrix=matrix, g24b_gate=gate, raw_manifest=manifest)

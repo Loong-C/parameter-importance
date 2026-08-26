@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 from datetime import datetime, timezone
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -23,7 +24,7 @@ _REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 if str(_REPOSITORY_ROOT / "src") not in sys.path:
     sys.path.insert(0, str(_REPOSITORY_ROOT / "src"))
 
-from param_importance_nlp.contracts.jsonio import load_canonical_json, write_canonical_json
+from param_importance_nlp.contracts.jsonio import canonical_json_bytes, canonical_json_hash, load_canonical_json, write_canonical_json
 from param_importance_nlp.experiments.stage2_s209_runner import (
     S29RunnerBlocked,
     S29ProfilerRunner,
@@ -60,6 +61,97 @@ def _load_optional(root: Path, reference: str | None, *, field: str) -> Any:
     return value
 
 
+def _pid_alive(pid: Any) -> bool:
+    if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    return True
+
+
+def _claim_detach_lease(run_root: Path, *, run_id: str) -> Path:
+    """Atomically reserve a run namespace before the detached child starts."""
+
+    lease_path = run_root / "launcher.lease.json"
+    pid_path = run_root / "launcher.pid.json"
+    # A detached launch is a formal attempt identity, not a disposable mutex.
+    # Once either manifest exists, the run-root cannot be fresh-launched again,
+    # even if its previous owner has exited.  Reusing a dead PID would erase
+    # provenance and permit a second measurement attempt under the same ID.
+    if pid_path.exists():
+        try:
+            previous = load_canonical_json(pid_path)
+        except Exception as error:
+            raise S29RunnerBlocked("S29_DETACHED_LAUNCH_PID_INVALID") from error
+        if not isinstance(previous, Mapping) or previous.get("run_id") != run_id:
+            raise S29RunnerBlocked("S29_DETACHED_LAUNCH_PID_IDENTITY_MISMATCH")
+        declared = previous.get("artifact_hash")
+        body = {key: value for key, value in previous.items() if key != "artifact_hash"}
+        if (
+            previous.get("schema_version") != "stage2-s209-g27a-detached-launch-v1"
+            or isinstance(previous.get("pid"), bool)
+            or not isinstance(previous.get("pid"), int)
+            or previous.get("pid") <= 0
+            or not isinstance(declared, str)
+            or canonical_json_hash(body) != declared
+        ):
+            raise S29RunnerBlocked("S29_DETACHED_LAUNCH_PID_INVALID")
+        raise S29RunnerBlocked(f"S29_DETACHED_LAUNCH_ALREADY_RUNNING:{previous.get('pid')}")
+    try:
+        descriptor = os.open(str(lease_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    except FileExistsError:
+        try:
+            lease = load_canonical_json(lease_path)
+        except Exception as error:
+            raise S29RunnerBlocked("S29_DETACHED_LAUNCH_LEASE_INVALID") from error
+        if not isinstance(lease, Mapping):
+            raise S29RunnerBlocked("S29_DETACHED_LAUNCH_LEASE_INVALID")
+        declared = lease.get("artifact_hash")
+        body = {key: value for key, value in lease.items() if key != "artifact_hash"}
+        if (
+            lease.get("schema_version") != "stage2-s209-g27a-detached-lease-v1"
+            or lease.get("run_id") != run_id
+            or not isinstance(lease.get("owner_pid"), int)
+            or lease.get("owner_pid") <= 0
+            or not isinstance(declared, str)
+            or canonical_json_hash(body) != declared
+        ):
+            raise S29RunnerBlocked("S29_DETACHED_LAUNCH_LEASE_INVALID")
+        raise S29RunnerBlocked(f"S29_DETACHED_LAUNCH_ALREADY_RUNNING:{lease['owner_pid']}")
+    payload = {
+        "schema_version": "stage2-s209-g27a-detached-lease-v1",
+        "owner_pid": os.getpid(),
+        "run_id": run_id,
+        "started_at": _now(),
+    }
+    payload["artifact_hash"] = canonical_json_hash(payload)
+    try:
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(canonical_json_bytes(payload))
+    except BaseException:
+        # Keep the lease as an append-only failed launch marker.  Removing it
+        # would make a retry under the same run identity indistinguishable from
+        # a new formal attempt.
+        raise
+    return lease_path
+
+
+def _write_once(path: Path, value: Mapping[str, Any], *, field: str) -> None:
+    """Publish one detached manifest without overwriting prior provenance."""
+
+    if path.exists():
+        try:
+            existing = load_canonical_json(path)
+        except Exception as error:
+            raise S29RunnerBlocked(f"{field}:INVALID_EXISTING") from error
+        if isinstance(existing, Mapping) and dict(existing) == dict(value):
+            return
+        raise S29RunnerBlocked(f"{field}:IMMUTABLE_OUTPUT_EXISTS")
+    write_canonical_json(path, value)
+
+
 def _inventory_envelope(root: Path, reference: str) -> Mapping[str, Any]:
     value = _load_optional(root, reference, field="gpu_inventory")
     if not isinstance(value, Mapping):
@@ -73,6 +165,7 @@ def _preflight(args: argparse.Namespace) -> dict[str, Any]:
         matrix_ref=args.matrix_ref,
         gate_ref=args.gate_ref,
         raw_manifest_ref=args.raw_manifest_ref,
+        g25_gate_ref=args.g25_gate_ref,
         measurement_plan_ref=args.measurement_plan_ref,
         gpu_inventory_ref=args.gpu_inventory_ref,
         io_evidence_ref=args.io_evidence_ref,
@@ -90,6 +183,7 @@ def _preflight(args: argparse.Namespace) -> dict[str, Any]:
         "matrix_hash": preflight.frozen.matrix_hash,
         "raw_manifest_hash": preflight.frozen.raw_manifest_hash,
         "raw_run_id": preflight.frozen.raw_run_id,
+        "g25_gate_hash": preflight.frozen.g25_gate_hash,
         "approved_gpu_uuids": preflight.inventory["approved_gpu_uuids"],
         "excluded_gpu_uuid": preflight.inventory["excluded_gpu_uuid"],
         "excluded_pci": preflight.inventory["excluded_pci"],
@@ -117,6 +211,7 @@ def _prepare(args: argparse.Namespace) -> dict[str, Any]:
         matrix_ref=args.matrix_ref,
         gate_ref=args.gate_ref,
         raw_manifest_ref=args.raw_manifest_ref,
+        g25_gate_ref=args.g25_gate_ref,
         run_id=args.run_id,
         anchor_ids=tuple(args.anchor_id),
         repetitions=args.repetitions,
@@ -134,6 +229,7 @@ def _execute(args: argparse.Namespace) -> dict[str, Any]:
         matrix_ref=args.matrix_ref,
         gate_ref=args.gate_ref,
         raw_manifest_ref=args.raw_manifest_ref,
+        g25_gate_ref=args.g25_gate_ref,
         measurement_plan_ref=args.measurement_plan_ref,
         gpu_inventory_ref=args.gpu_inventory_ref,
         io_evidence_ref=args.io_evidence_ref,
@@ -175,29 +271,24 @@ def _detach(args: argparse.Namespace) -> dict[str, Any]:
     root = args.data_root.resolve()
     run_root = _logical(root, args.run_root, field="run_root")
     run_root.mkdir(parents=True, exist_ok=True)
-    pid_path = run_root / "launcher.pid.json"
-    if pid_path.exists():
-        previous = load_canonical_json(pid_path)
-        if isinstance(previous, Mapping) and isinstance(previous.get("pid"), int):
-            try:
-                import os
-                os.kill(int(previous["pid"]), 0)
-            except OSError:
-                pass
-            else:
-                raise S29RunnerBlocked(f"S29_DETACHED_LAUNCH_ALREADY_RUNNING:{previous['pid']}")
+    lease_path = _claim_detach_lease(run_root, run_id=args.run_id)
     log_path = run_root / "launcher.log"
     child = [str(item) for item in sys.argv[1:] if item != "--detach"]
-    with log_path.open("ab") as handle:
-        process = subprocess.Popen(
-            [sys.executable, str(Path(__file__).resolve()), *child],
-            cwd=_REPOSITORY_ROOT,
-            stdin=subprocess.DEVNULL,
-            stdout=handle,
-            stderr=subprocess.STDOUT,
-            start_new_session=True,
-            close_fds=True,
-        )
+    try:
+        with log_path.open("ab") as handle:
+            process = subprocess.Popen(
+                [sys.executable, str(Path(__file__).resolve()), *child],
+                cwd=_REPOSITORY_ROOT,
+                stdin=subprocess.DEVNULL,
+                stdout=handle,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+                close_fds=True,
+            )
+    except BaseException:
+        # The lease remains as an immutable launch-attempt marker; do not make
+        # a failed Popen look like an unused formal run-root.
+        raise
     payload: dict[str, Any] = {
         "schema_version": "stage2-s209-g27a-detached-launch-v1",
         "pid": int(process.pid),
@@ -205,26 +296,55 @@ def _detach(args: argparse.Namespace) -> dict[str, Any]:
         "run_root": args.run_root,
         "log_ref": args.run_root.rstrip("/") + "/launcher.log",
         "status_ref": args.run_root.rstrip("/") + "/status.json",
+        "lease_ref": args.run_root.rstrip("/") + "/launcher.lease.json",
         "started_at": _now(),
     }
-    from param_importance_nlp.contracts.jsonio import canonical_json_hash
     payload["artifact_hash"] = canonical_json_hash(payload)
-    write_canonical_json(pid_path, payload)
+    _write_once(run_root / "launcher.pid.json", payload, field="detached_launch")
     return payload
 
 
 def _status(args: argparse.Namespace, *, wait: bool) -> int:
     # Status/replay consumers must reject inventory or frozen-cost identity drift
     # before trusting an existing detached status file.
-    _preflight(args)
+    preflight = load_s209_preflight(
+        data_root=args.data_root,
+        matrix_ref=args.matrix_ref,
+        gate_ref=args.gate_ref,
+        raw_manifest_ref=args.raw_manifest_ref,
+        g25_gate_ref=args.g25_gate_ref,
+        measurement_plan_ref=args.measurement_plan_ref,
+        gpu_inventory_ref=args.gpu_inventory_ref,
+        io_evidence_ref=args.io_evidence_ref,
+        capacity_ref=args.capacity_ref,
+        ulimit_ref=args.ulimit_ref,
+    )
+    inventory_identity = preflight.inventory.get("inventory_identity")
+    if not isinstance(inventory_identity, Mapping):
+        raise S29RunnerBlocked("STATUS_INVENTORY_IDENTITY_MISSING")
+    if (
+        inventory_identity.get("artifact_hash") != preflight.inventory.get("inventory_artifact_hash")
+        or inventory_identity.get("source_sha256") != preflight.inventory.get("inventory_source_sha256")
+    ):
+        raise S29RunnerBlocked("STATUS_INVENTORY_IDENTITY_DRIFT")
+    store = S29StatusStore(
+        _logical(args.data_root.resolve(), args.run_root, field="run_root") / "status.json",
+        run_id=args.run_id,
+        plan_hash=preflight.plan_hash,
+        inventory_identity=inventory_identity,
+        cost_identity={
+            "matrix_hash": preflight.frozen.matrix_hash,
+            "raw_manifest_hash": preflight.frozen.raw_manifest_hash,
+        },
+    )
     path = _logical(args.data_root.resolve(), args.run_root, field="run_root") / "status.json"
     deadline = None if args.timeout_seconds is None else time.monotonic() + args.timeout_seconds
     while True:
         if path.exists():
-            value = load_canonical_json(path)
+            value = store.load().to_dict()
             print(json.dumps(value, ensure_ascii=False, sort_keys=True, indent=2))
-            if not wait or (isinstance(value, Mapping) and value.get("status") in {"SEALED", "FAILED", "BLOCKED"}):
-                return 0 if isinstance(value, Mapping) and value.get("status") == "SEALED" else 3
+            if not wait or value.get("status") in {"SEALED", "FAILED", "BLOCKED"}:
+                return 0 if value.get("status") == "SEALED" else 3
         elif not wait:
             return 4
         if deadline is not None and time.monotonic() >= deadline:
@@ -246,6 +366,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--run-id", default="s209-g27a-formal")
     parser.add_argument("--matrix-ref", required=True)
     parser.add_argument("--gate-ref", required=True)
+    parser.add_argument("--g25-gate-ref", required=True)
     parser.add_argument("--raw-manifest-ref", required=True)
     parser.add_argument("--measurement-plan-ref", required=True)
     parser.add_argument("--gpu-inventory-ref", required=True)

@@ -39,6 +39,7 @@ S29_COST_SEMANTICS = (
     "isolated_estimator_cost",
     "online_training_incremental_cost",
 )
+S29_G25_GATE_ID = "stage2.G2.5"
 S29_METHODS = ("raw", "double", "u")
 S29_CELL_IDS = EXPECTED_CELL_IDS
 S29_DECISION_RATIO = 1.25
@@ -167,12 +168,15 @@ class S29FrozenInputs:
     microbatch_count: int
     repetitions: int
     completion_denominator: int
+    g25_gate_hash: str | None = None
     matrix_ref: str = "g24b-matrix.json"
     raw_manifest_ref: str = "raw-results-manifest.json"
 
     def __post_init__(self) -> None:
         for name in ("matrix_hash", "g24b_gate_hash", "raw_manifest_hash", "plan_hash", "mapping_hash", "sampling_plan_hash"):
             _sha(getattr(self, name), field=name)
+        if self.g25_gate_hash is not None:
+            _sha(self.g25_gate_hash, field="g25_gate_hash")
         _id(self.raw_run_id, field="raw_run_id")
         if not self.expected_unit_ids or len(set(self.expected_unit_ids)) != len(self.expected_unit_ids):
             raise S29G27ABlocked("expected_unit_ids:NONEMPTY_UNIQUE_REQUIRED")
@@ -197,6 +201,7 @@ class S29FrozenInputs:
             "microbatch_count": self.microbatch_count,
             "repetitions": self.repetitions,
             "completion_denominator": self.completion_denominator,
+            "g25_gate_hash": self.g25_gate_hash,
             "matrix_ref": self.matrix_ref,
             "raw_manifest_ref": self.raw_manifest_ref,
         }
@@ -239,6 +244,7 @@ def prepare_s209_measurement_plan(
         "source_raw_run_id": frozen.raw_run_id,
         "matrix_hash": frozen.matrix_hash,
         "raw_manifest_hash": frozen.raw_manifest_hash,
+        "g25_gate_hash": frozen.g25_gate_hash,
         "cost_semantics": list(S29_COST_SEMANTICS),
         "method_only": True,
         "randomized_method_order": True,
@@ -265,7 +271,7 @@ def _validate_measurement_plan(value: Any, *, frozen: S29FrozenInputs) -> dict[s
     if payload.get("schema_version") != S29_MEASUREMENT_PLAN_SCHEMA or payload.get("task_id") != S29_TASK_ID:
         raise S29G27ABlocked("MEASUREMENT_PLAN_SCHEMA_INVALID")
     _verify_hash(payload, field="measurement_plan")
-    for field, expected in (("matrix_hash", frozen.matrix_hash), ("raw_manifest_hash", frozen.raw_manifest_hash), ("source_raw_run_id", frozen.raw_run_id)):
+    for field, expected in (("matrix_hash", frozen.matrix_hash), ("raw_manifest_hash", frozen.raw_manifest_hash), ("source_raw_run_id", frozen.raw_run_id), ("g25_gate_hash", frozen.g25_gate_hash)):
         if payload.get(field) != expected:
             raise S29G27ABlocked(f"MEASUREMENT_PLAN_{field.upper()}_MISMATCH")
     if payload.get("cost_semantics") != list(S29_COST_SEMANTICS) or payload.get("required_methods") != list(S29_METHODS) or payload.get("method_only") is not True or payload.get("randomized_method_order") is not True:
@@ -275,9 +281,24 @@ def _validate_measurement_plan(value: Any, *, frozen: S29FrozenInputs) -> dict[s
     rows = payload.get("rows")
     if not isinstance(rows, list) or not rows:
         raise S29G27ABlocked("MEASUREMENT_PLAN_ROWS_REQUIRED")
+    anchor_ids = payload.get("anchor_ids")
+    repetitions = payload.get("repetitions")
+    if not isinstance(anchor_ids, list) or not anchor_ids or len(set(anchor_ids)) != len(anchor_ids) or isinstance(repetitions, bool) or not isinstance(repetitions, int) or repetitions < 2:
+        raise S29G27ABlocked("MEASUREMENT_PLAN_ANCHOR_CONTRACT_INVALID")
+    expected_rows = len(anchor_ids) * repetitions
+    if len(rows) != expected_rows:
+        raise S29G27ABlocked("MEASUREMENT_PLAN_ROW_COUNT_INVALID")
+    seen: set[tuple[str, int]] = set()
     for index, row in enumerate(rows):
-        if not isinstance(row, Mapping) or set(row) != {"anchor_id", "repetition", "method_order"} or set(row["method_order"]) != set(S29_METHODS):
+        if not isinstance(row, Mapping) or set(row) != {"anchor_id", "repetition", "method_order"} or row.get("anchor_id") not in anchor_ids or isinstance(row.get("repetition"), bool) or not isinstance(row.get("repetition"), int) or not 0 <= row["repetition"] < repetitions:
             raise S29G27ABlocked(f"MEASUREMENT_PLAN_ROW_INVALID:{index}")
+        method_order = row["method_order"]
+        if not isinstance(method_order, list) or len(method_order) != len(S29_METHODS) or len(set(method_order)) != len(S29_METHODS) or set(method_order) != set(S29_METHODS):
+            raise S29G27ABlocked(f"MEASUREMENT_PLAN_METHOD_ORDER_INVALID:{index}")
+        key = (str(row["anchor_id"]), int(row["repetition"]))
+        if key in seen:
+            raise S29G27ABlocked(f"MEASUREMENT_PLAN_DUPLICATE_ROW:{index}")
+        seen.add(key)
     return dict(payload)
 
 
@@ -286,6 +307,8 @@ def bind_s209_inputs(
     matrix: Mapping[str, Any] | str | Path,
     g24b_gate: Mapping[str, Any] | str | Path,
     raw_manifest: Mapping[str, Any] | str | Path,
+    g25_gate: Mapping[str, Any] | str | Path | None = None,
+    require_g25: bool = False,
     matrix_ref: str = "g24b-matrix.json",
     raw_manifest_ref: str = "raw-results-manifest.json",
 ) -> S29FrozenInputs:
@@ -335,6 +358,22 @@ def bind_s209_inputs(
         _sha(unit.get("raw_artifact_hash"), field=f"s27.units[{index}].raw_artifact_hash")
     if len(set(unit_ids)) != len(unit_ids):
         raise S29G27ABlocked("S27_UNIT_IDS_NOT_UNIQUE")
+    g25_gate_hash: str | None = None
+    if g25_gate is None:
+        if require_g25:
+            raise S29G27ABlocked("G25_GATE_REQUIRED")
+    else:
+        gate25_payload = _load(g25_gate, field="g25_gate")
+        try:
+            gate25 = GateRecord.from_mapping(dict(gate25_payload))
+        except Exception as error:
+            raise S29G27ABlocked("G25_GATE_RECORD_INVALID") from error
+        if gate25.gate_id != S29_G25_GATE_ID or gate25.effective_status() is not GateStatus.PASS:
+            raise S29G27ABlocked("G25_GATE_PASS_REQUIRED")
+        g25_gate_hash = gate25.artifact_hash
+        measured = gate25.measured
+        if measured.get("raw_manifest_hash") != manifest_hash:
+            raise S29G27ABlocked("G25_RAW_MANIFEST_HASH_MISMATCH")
     plan_hash = _sha(manifest_payload.get("plan_hash"), field="s27.plan_hash")
     mapping_hash = _sha(manifest_payload.get("mapping_hash"), field="s27.mapping_hash")
     sampling_hash = _sha(manifest_payload.get("sampling_plan_hash"), field="s27.sampling_plan_hash")
@@ -354,6 +393,7 @@ def bind_s209_inputs(
         microbatch_count=microbatch_count,
         repetitions=repetitions,
         completion_denominator=expected,
+        g25_gate_hash=g25_gate_hash,
         matrix_ref=matrix_ref,
         raw_manifest_ref=raw_manifest_ref,
     )
@@ -361,7 +401,9 @@ def bind_s209_inputs(
 
 def _semantic_rows(value: Any, *, semantic: str) -> tuple[dict[str, Any], list[Mapping[str, Any]]]:
     if isinstance(value, list):
-        return {}, [dict(item) for item in value if isinstance(item, Mapping)]
+        if any(not isinstance(item, Mapping) for item in value):
+            raise S29G27ABlocked(f"{semantic}:OBSERVATION_OBJECT_REQUIRED")
+        return {}, [dict(item) for item in value]
     if not isinstance(value, Mapping):
         raise S29G27ABlocked(f"{semantic}:OBSERVATIONS_OBJECT_REQUIRED")
     rows = value.get("observations", value.get("rows"))
@@ -587,14 +629,16 @@ def _online_checks(rows: Sequence[Mapping[str, Any]], metadata: Mapping[str, Any
     methods = {str(row["method"]) for row in rows if row["semantic"] == "online_training_incremental_cost"}
     if methods != set(S29_METHODS):
         blockers.append("ONLINE_METHOD_SET_INCOMPLETE")
+    repetition_groups: dict[tuple[str, int], list[Mapping[str, Any]]] = {}
     for anchor_id, anchor_rows in groups.items():
-        if {str(row["method"]) for row in anchor_rows} != set(S29_METHODS):
-            blockers.append(f"METHOD_ONLY_ANCHOR_METHOD_SET_INVALID:{anchor_id}")
-        if len({int(row["repetition"]) for row in anchor_rows}) != 1:
-            blockers.append(f"METHOD_ONLY_ANCHOR_REPETITION_INVALID:{anchor_id}")
-        if any(row.get("cost_io_quiescent") is not True or row.get("health_ok") is not True for row in anchor_rows):
-            blockers.append(f"METHOD_ONLY_ANCHOR_HEALTH_INVALID:{anchor_id}")
-    if len(groups) < 2:
+        for row in anchor_rows:
+            repetition_groups.setdefault((anchor_id, int(row["repetition"])), []).append(row)
+    for (anchor_id, repetition), repetition_rows in repetition_groups.items():
+        if {str(row["method"]) for row in repetition_rows} != set(S29_METHODS):
+            blockers.append(f"METHOD_ONLY_ANCHOR_METHOD_SET_INVALID:{anchor_id}:r{repetition}")
+        if any(row.get("cost_io_quiescent") is not True or row.get("health_ok") is not True for row in repetition_rows):
+            blockers.append(f"METHOD_ONLY_ANCHOR_HEALTH_INVALID:{anchor_id}:r{repetition}")
+    if len(repetition_groups) < 2:
         blockers.append("METHOD_ONLY_ANCHOR_REPETITIONS_LT_TWO")
     randomized = metadata.get("randomized_method_order")
     seed = metadata.get("randomization_seed")
@@ -839,6 +883,7 @@ def run_s209_g27a(
     matrix: Mapping[str, Any] | str | Path,
     g24b_gate: Mapping[str, Any] | str | Path,
     raw_manifest: Mapping[str, Any] | str | Path,
+    g25_gate: Mapping[str, Any] | str | Path | None = None,
     cost_observations: Mapping[str, Any],
     health_snapshot: Mapping[str, Any],
     single_gpu_anchor: Mapping[str, Any] | None,
@@ -861,7 +906,15 @@ def run_s209_g27a(
     formal evidence fields (including four-card data) are present.
     """
 
-    frozen = bind_s209_inputs(matrix=matrix, g24b_gate=g24b_gate, raw_manifest=raw_manifest, matrix_ref=matrix_ref, raw_manifest_ref=raw_manifest_ref)
+    frozen = bind_s209_inputs(
+        matrix=matrix,
+        g24b_gate=g24b_gate,
+        raw_manifest=raw_manifest,
+        g25_gate=g25_gate,
+        require_g25=g25_gate is not None,
+        matrix_ref=matrix_ref,
+        raw_manifest_ref=raw_manifest_ref,
+    )
     _id(run_id, field="s29.run_id")
     validated_measurement_plan = _validate_measurement_plan(measurement_plan, frozen=frozen) if measurement_plan is not None else None
     if not isinstance(cost_observations, Mapping) or set(cost_observations) != set(S29_COST_SEMANTICS):
@@ -927,6 +980,7 @@ def run_s209_g27a(
         "matrix_hash": frozen.matrix_hash,
         "raw_manifest_hash": frozen.raw_manifest_hash,
         "raw_run_id": frozen.raw_run_id,
+        "g25_gate_hash": frozen.g25_gate_hash,
         "s29_run_id": run_id,
         "cost_io_quiescent": expected_io,
         "record_count": len(reduced),
