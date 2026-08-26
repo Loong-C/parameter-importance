@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
+import torch
 
 from param_importance_nlp.contracts.jsonio import canonical_json_hash
 from param_importance_nlp.contracts.status import GateRecord
@@ -13,12 +14,16 @@ from param_importance_nlp.experiments.stage2_s209_g27a import (
     S29_CROSSCHECK_SCHEMA,
     S29_SHARED_POOL_SCHEMA,
     S29_SHARED_RUN_SCHEMA,
+    S29_STAGE1_NUMERIC_CANDIDATE_REF,
+    S29_STAGE1_NUMERIC_REFERENCE_REF,
     S29G27ABlocked,
     StrictS29Reducer,
     bind_s209_inputs,
     run_s209_g27a,
     shared_paired_run_identity,
     _anchor_reasons,
+    _stage1_numeric_artifact,
+    _stage1_numeric_comparison,
 )
 
 INVENTORY_ARTIFACT_HASH = "1" * 64
@@ -230,6 +235,35 @@ def _anchor(device_count: int, uuids: list[str]) -> dict[str, object]:
         "communication_bytes": 0,
         "output_bytes": 4096,
     }
+    reference_artifact = _stage1_numeric_artifact(
+        {"weight": torch.tensor([1.0], dtype=torch.float64)},
+        role="single_gpu_reference",
+        fixed_checkpoint_id="checkpoint-fixed",
+        checkpoint_hash="d" * 64,
+        mapping_hash="e" * 64,
+        sample_mapping_hash="5" * 64,
+        state_digest="f" * 64,
+        state_digest_after="0" * 64,
+        statistical_binding={
+            "global_s1_hash": "8" * 64,
+            "global_s2_hash": "9" * 64,
+            "estimate_hash": "a" * 64,
+            "global_weight": 1024.0,
+            "global_statistical_unit_count": 16,
+        },
+    )
+    value.update(
+        {
+            "stage1_numeric_artifact": reference_artifact,
+            "stage1_numeric_artifact_hash": reference_artifact["artifact_hash"],
+            "stage1_numeric_artifact_ref": S29_STAGE1_NUMERIC_REFERENCE_REF,
+            "global_s1_hash": "8" * 64,
+            "global_s2_hash": "9" * 64,
+            "estimate_hash": "a" * 64,
+            "global_weight": 1024.0,
+            "global_statistical_unit_count": 16,
+        }
+    )
     if device_count == 4:
         local_devices = [
             {
@@ -310,6 +344,35 @@ def _anchor(device_count: int, uuids: list[str]) -> dict[str, object]:
                 "per_device_measurements": local_devices,
             }
         )
+        candidate_artifact = _stage1_numeric_artifact(
+            {"weight": torch.tensor([1.0], dtype=torch.float64)},
+            role="four_gpu_candidate",
+            fixed_checkpoint_id="checkpoint-fixed",
+            checkpoint_hash="d" * 64,
+            mapping_hash="e" * 64,
+            sample_mapping_hash="5" * 64,
+            state_digest="f" * 64,
+            state_digest_after="0" * 64,
+            statistical_binding={
+                "global_s1_hash": "8" * 64,
+                "global_s2_hash": "9" * 64,
+                "estimate_hash": "a" * 64,
+                "global_weight": 1024.0,
+                "global_statistical_unit_count": 16,
+            },
+        )
+        numeric_comparison = _stage1_numeric_comparison(candidate_artifact, reference_artifact)
+        value.update(
+            {
+                "stage1_numeric_artifact": candidate_artifact,
+                "stage1_numeric_artifact_hash": candidate_artifact["artifact_hash"],
+                "stage1_numeric_artifact_ref": S29_STAGE1_NUMERIC_CANDIDATE_REF,
+                "stage1_numeric_comparison": numeric_comparison,
+                "stage1_numeric_comparison_hash": numeric_comparison["artifact_hash"],
+                "stage1_numeric_reference_ref": S29_STAGE1_NUMERIC_REFERENCE_REF,
+                "stage1_numeric_reference_hash": reference_artifact["artifact_hash"],
+            }
+        )
         value["all_reduce_identity_hash"] = canonical_json_hash(
             [
                 {"rank": int(item["rank"]), "gpu_uuid": str(item["gpu_uuid"]), "identity_hash": str(item["all_reduce_identity_hash"])}
@@ -368,6 +431,15 @@ def test_s209_four_card_anchor_preserves_measured_efficiency_above_one() -> None
     anchor = {**_anchor(4, list(APPROVED_GPU_UUIDS)), "strong_scaling_efficiency": 1.1}
     reasons = _anchor_reasons(anchor, frozen=frozen, expected_devices=4)
     assert not any("STRONG_SCALING_EFFICIENCY_INVALID" in reason for reason in reasons)
+
+
+def test_s209_numeric_artifact_refs_are_persistent_posix_paths() -> None:
+    matrix, gate, manifest = _inputs()
+    frozen = bind_s209_inputs(matrix=matrix, g24b_gate=gate, raw_manifest=manifest)
+    anchor = _anchor(4, list(APPROVED_GPU_UUIDS))
+    inline = {**anchor, "stage1_numeric_artifact_ref": "inline:four-gpu-anchor#stage1_numeric_artifact"}
+    reasons = _anchor_reasons(inline, frozen=frozen, expected_devices=4, reference_anchor=_anchor(1, [APPROVED_GPU_UUIDS[0]]))
+    assert "FOUR_CARD_STAGE1_NUMERIC_ARTIFACT_REF_INVALID" in reasons
 
 
 def test_s209_binds_frozen_matrix_and_sealed_raw_manifest() -> None:

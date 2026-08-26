@@ -27,6 +27,11 @@ from .stage2_s209_g27a import (
     S29_SHARED_POOL_SCHEMA,
     S29_SHARED_RUN_SCHEMA,
     S29_TIMING_FIELDS,
+    S29_STAGE1_NUMERIC_CANDIDATE_REF,
+    S29_STAGE1_NUMERIC_REFERENCE_REF,
+    _validate_stage1_numeric_artifact,
+    _validate_stage1_numeric_comparison,
+    _valid_stage1_numeric_ref,
 )
 
 
@@ -119,6 +124,17 @@ def _task_from_environment(environment: Mapping[str, str]) -> dict[str, Any]:
         "gpu_uuids": visible,
         "device_count": len(visible),
     }
+    if semantic == "anchor":
+        candidate_or_reference_ref = _required_text(environment, "S29_STAGE1_NUMERIC_ARTIFACT_REF")
+        try:
+            _valid_stage1_numeric_ref(
+                candidate_or_reference_ref,
+                suffix="anchors/single-gpu-anchor.json" if len(visible) == 1 else "anchors/four-gpu-stage1-numeric.json",
+                field="environment.stage1_numeric_artifact_ref",
+            )
+        except Exception as error:
+            raise S209WorkerBlocked("ENV_S29_STAGE1_NUMERIC_ARTIFACT_REF_INVALID") from error
+        task["stage1_numeric_artifact_ref"] = candidate_or_reference_ref
     # The detached runner can bind the launch-time I/O snapshot into the
     # child environment.  Keep this optional for the small boundary fixtures,
     # but expose it to a production backend so it cannot assert quiescence from
@@ -137,6 +153,9 @@ def _task_from_environment(environment: Mapping[str, str]) -> dict[str, Any]:
             "token_count": _required_int(environment, "S29_SINGLE_ANCHOR_TOKEN_COUNT"),
             "backward_count": _required_int(environment, "S29_SINGLE_ANCHOR_BACKWARD_COUNT"),
             "identity_hash": _required_sha(environment, "S29_SINGLE_ANCHOR_IDENTITY_HASH"),
+            "numeric_ref": _required_text(environment, "S29_SINGLE_ANCHOR_NUMERIC_REF"),
+            "numeric_hash": _required_sha(environment, "S29_SINGLE_ANCHOR_NUMERIC_HASH"),
+            "numeric_artifact_ref": task["stage1_numeric_artifact_ref"],
         }
         expected_baseline_hash = canonical_json_hash(
             {
@@ -153,6 +172,9 @@ def _task_from_environment(environment: Mapping[str, str]) -> dict[str, Any]:
         if baseline["identity_hash"] != expected_baseline_hash:
             raise S209WorkerBlocked("ENV_SINGLE_ANCHOR_IDENTITY_DRIFT")
         task["single_gpu_anchor"] = baseline
+        task["single_gpu_anchor_numeric_ref"] = baseline["numeric_ref"]
+        task["single_gpu_anchor_numeric_hash"] = baseline["numeric_hash"]
+        task["single_gpu_anchor_numeric_artifact_ref"] = baseline["numeric_artifact_ref"]
     if semantic == "scientific_equal_sample_cost":
         if _required_text(environment, "S29_SHARED_RUN_SCHEMA") != S29_SHARED_RUN_SCHEMA:
             raise S209WorkerBlocked("ENV_SHARED_RUN_SCHEMA_INVALID")
@@ -214,6 +236,34 @@ def _finite_json(value: Any, *, field: str) -> None:
             _finite_json(item, field=f"{field}.{key}")
         return
     raise S209WorkerBlocked(f"{field}_JSON_INVALID")
+
+
+def _load_single_numeric_reference(task: Mapping[str, Any]) -> dict[str, Any]:
+    reference = task.get("single_gpu_anchor_numeric_ref")
+    declared_hash = task.get("single_gpu_anchor_numeric_hash")
+    if not isinstance(reference, str) or not Path(reference).is_absolute():
+        raise S209WorkerBlocked("FOUR_GPU_STAGE1_NUMERIC_REFERENCE_PATH_REQUIRED")
+    if not isinstance(declared_hash, str) or len(declared_hash) != _SHA256_LENGTH or any(char not in "0123456789abcdef" for char in declared_hash):
+        raise S209WorkerBlocked("FOUR_GPU_STAGE1_NUMERIC_REFERENCE_HASH_REQUIRED")
+    try:
+        value = load_canonical_json(Path(reference).resolve())
+        if not isinstance(value, Mapping):
+            raise ValueError("anchor object required")
+        artifact = _validate_stage1_numeric_artifact(value.get("stage1_numeric_artifact"), role="single_gpu_reference")
+    except Exception as error:
+        if isinstance(error, S209WorkerBlocked):
+            raise
+        raise S209WorkerBlocked("FOUR_GPU_STAGE1_NUMERIC_REFERENCE_INVALID") from error
+    if artifact["artifact_hash"] != declared_hash or value.get("stage1_numeric_artifact_hash") != declared_hash:
+        raise S209WorkerBlocked("FOUR_GPU_STAGE1_NUMERIC_REFERENCE_HASH_MISMATCH")
+    reference_ref = task.get("single_gpu_anchor_numeric_artifact_ref", S29_STAGE1_NUMERIC_REFERENCE_REF)
+    try:
+        _valid_stage1_numeric_ref(reference_ref, suffix="anchors/single-gpu-anchor.json", field="worker.stage1_numeric_reference_ref")
+    except Exception as error:
+        raise S209WorkerBlocked("FOUR_GPU_STAGE1_NUMERIC_REFERENCE_REF_INVALID") from error
+    if value.get("stage1_numeric_artifact_ref") != reference_ref:
+        raise S209WorkerBlocked("FOUR_GPU_STAGE1_NUMERIC_REFERENCE_REF_INVALID")
+    return artifact
 
 
 def _require_actual_measurement(value: Mapping[str, Any], *, task: Mapping[str, Any]) -> None:
@@ -287,6 +337,41 @@ def _require_four_gpu_system_anchor(value: Mapping[str, Any], *, task: Mapping[s
         raise S209WorkerBlocked("FOUR_GPU_SINGLE_ANCHOR_REFERENCE_REQUIRED")
     if value.get("single_anchor_identity_hash") != baseline.get("identity_hash"):
         raise S209WorkerBlocked("FOUR_GPU_SINGLE_ANCHOR_IDENTITY_DRIFT")
+    reference_artifact = _load_single_numeric_reference(task)
+    reference_ref = task.get("single_gpu_anchor_numeric_artifact_ref", S29_STAGE1_NUMERIC_REFERENCE_REF)
+    try:
+        candidate_artifact = _validate_stage1_numeric_artifact(value.get("stage1_numeric_artifact"), role="four_gpu_candidate")
+        if value.get("stage1_numeric_artifact_hash") != candidate_artifact["artifact_hash"]:
+            raise S209WorkerBlocked("FOUR_GPU_STAGE1_NUMERIC_ARTIFACT_HASH_MISMATCH")
+        stats_binding = candidate_artifact["statistical_binding"]
+        if any(
+            stats_binding[name] != value[expected]
+            for name, expected in (
+                ("global_s1_hash", "global_s1_hash"),
+                ("global_s2_hash", "global_s2_hash"),
+                ("estimate_hash", "estimate_hash"),
+                ("global_weight", "global_weight"),
+                ("global_statistical_unit_count", "global_statistical_unit_count"),
+            )
+        ):
+            raise S209WorkerBlocked("FOUR_GPU_STAGE1_NUMERIC_STATISTICAL_BINDING_DRIFT")
+        candidate_ref = task.get("stage1_numeric_artifact_ref", S29_STAGE1_NUMERIC_CANDIDATE_REF)
+        if value.get("stage1_numeric_artifact_ref") != candidate_ref:
+            raise S209WorkerBlocked("FOUR_GPU_STAGE1_NUMERIC_ARTIFACT_REF_INVALID")
+        comparison = _validate_stage1_numeric_comparison(
+            value.get("stage1_numeric_comparison"),
+            candidate=candidate_artifact,
+            reference=reference_artifact,
+            reference_ref=str(reference_ref),
+        )
+    except S209WorkerBlocked:
+        raise
+    except Exception as error:
+        raise S209WorkerBlocked("FOUR_GPU_STAGE1_NUMERIC_COMPARISON_INVALID") from error
+    if value.get("stage1_numeric_comparison_hash") != comparison["artifact_hash"]:
+        raise S209WorkerBlocked("FOUR_GPU_STAGE1_NUMERIC_COMPARISON_HASH_MISMATCH")
+    if value.get("stage1_numeric_reference_ref") != reference_ref or value.get("stage1_numeric_reference_hash") != reference_artifact["artifact_hash"]:
+        raise S209WorkerBlocked("FOUR_GPU_STAGE1_NUMERIC_REFERENCE_BINDING_INVALID")
     if not isinstance(value.get("fixed_checkpoint_id"), str) or not value["fixed_checkpoint_id"]:
         raise S209WorkerBlocked("FOUR_GPU_CHECKPOINT_ID_INVALID")
     for name in ("checkpoint_hash", "mapping_hash", "sample_mapping_hash", "four_process_identity_hash", "global_s1_hash", "global_s2_hash", "estimate_hash", "gradient_pool_hash", "state_digest", "state_digest_after", "all_reduce_identity_hash", "single_anchor_identity_hash"):
@@ -427,6 +512,16 @@ def _validate_backend_output(value: Any, *, task: Mapping[str, Any]) -> dict[str
                 raise S209WorkerBlocked("PROFILER_SHARED_SAMPLE_COUNT_MISMATCH")
         return output
     _require_actual_measurement(output, task=task)
+    if task["semantic"] == "anchor" and task.get("device_count") == 1:
+        try:
+            artifact = _validate_stage1_numeric_artifact(output.get("stage1_numeric_artifact"), role="single_gpu_reference")
+        except Exception as error:
+            raise S209WorkerBlocked("SINGLE_GPU_STAGE1_NUMERIC_ARTIFACT_INVALID") from error
+        if output.get("stage1_numeric_artifact_hash") != artifact["artifact_hash"] or output.get("stage1_numeric_artifact_ref") != task.get("stage1_numeric_artifact_ref"):
+            raise S209WorkerBlocked("SINGLE_GPU_STAGE1_NUMERIC_ARTIFACT_BINDING_INVALID")
+        stats_binding = artifact["statistical_binding"]
+        if any(name not in output or stats_binding[name] != output[name] for name in stats_binding):
+            raise S209WorkerBlocked("SINGLE_GPU_STAGE1_NUMERIC_STATISTICAL_BINDING_DRIFT")
     if task["semantic"] == "anchor" and task.get("device_count") == 4:
         _require_four_gpu_system_anchor(output, task=task)
     return output
