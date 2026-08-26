@@ -41,6 +41,7 @@ from param_importance_nlp.experiments.stage2_s206_formal import (
     APPROVED_GPU_UUIDS,
     CELL_GPU_BINDINGS,
     EXCLUDED_PCI,
+    EXCLUDED_UUID,
     GPU_INVENTORY_SCHEMA,
     PILOT_B_VALUES,
     PILOT_REPETITIONS,
@@ -135,6 +136,130 @@ def _file_sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+_FORMAL_GPU_INVENTORY_FIELDS = frozenset(
+    {
+        "schema_version",
+        "scope",
+        "status",
+        "checked_at",
+        "artifact_ref",
+        "source_ref",
+        "source_sha256",
+        "rows",
+        "compute_apps",
+        "approved_gpu_uuids",
+        "excluded_pci",
+        "excluded_gpu_uuid",
+        "artifact_hash",
+    }
+)
+_FORMAL_GPU_ROW_FIELDS = frozenset(
+    {
+        "uuid",
+        "pci_bus_id",
+        "gpu_name",
+        "temperature_c",
+        "memory_used_mib",
+        "memory_total_mib",
+        "utilization_gpu_percent",
+        "compute_mode",
+        "ecc_uncorrected_volatile",
+        "ecc_uncorrected_aggregate",
+        "row_remap_failure",
+        "row_remap_pending",
+        "row_remap_status",
+        "gpu_recovery_action",
+        "health_state",
+        "compute_apps",
+    }
+)
+_FORMAL_GPU_APP_FIELDS = frozenset({"pid", "gpu_uuid", "process_name", "used_memory"})
+
+
+def _validate_formal_gpu_inventory_schema(value: Mapping[str, object]) -> None:
+    """Validate the exact formal inventory wire schema before normalization."""
+
+    if "gpus" in value:
+        raise S206PreparationBlocked("GPU_INVENTORY_GPUS_ALIAS_FORBIDDEN")
+    if "artifact_ref" not in value:
+        raise S206PreparationBlocked("GPU_INVENTORY_ARTIFACT_REF_REQUIRED")
+    if "source_sha256" not in value:
+        raise S206PreparationBlocked("GPU_INVENTORY_SOURCE_SHA256_REQUIRED")
+    unknown = set(value) - _FORMAL_GPU_INVENTORY_FIELDS
+    if unknown:
+        raise S206PreparationBlocked("GPU_INVENTORY_TOP_LEVEL_UNKNOWN_FIELDS")
+    if set(value) != _FORMAL_GPU_INVENTORY_FIELDS:
+        raise S206PreparationBlocked("GPU_INVENTORY_TOP_LEVEL_FIELDS_REQUIRED")
+    if value.get("scope") != "formal":
+        raise S206PreparationBlocked("GPU_INVENTORY_SCOPE_INVALID")
+    if value.get("status") != "OBSERVED":
+        raise S206PreparationBlocked("GPU_INVENTORY_STATUS_INVALID")
+    checked_at = value.get("checked_at")
+    if not isinstance(checked_at, str) or not checked_at:
+        raise S206PreparationBlocked("GPU_INVENTORY_CHECKED_AT_REQUIRED")
+    try:
+        checked = datetime.fromisoformat(checked_at)
+    except ValueError as error:
+        raise S206PreparationBlocked("GPU_INVENTORY_CHECKED_AT_INVALID") from error
+    if checked.tzinfo is None:
+        raise S206PreparationBlocked("GPU_INVENTORY_CHECKED_AT_TIMEZONE_REQUIRED")
+    approved = value.get("approved_gpu_uuids")
+    if not isinstance(approved, list) or tuple(approved) != APPROVED_GPU_UUIDS:
+        raise S206PreparationBlocked("GPU_INVENTORY_APPROVED_UUIDS_IDENTITY_DRIFT")
+    if value.get("excluded_pci") != EXCLUDED_PCI or value.get("excluded_gpu_uuid") != EXCLUDED_UUID:
+        raise S206PreparationBlocked("GPU_INVENTORY_EXCLUDED_IDENTITY_DRIFT")
+    rows = value.get("rows")
+    if not isinstance(rows, list):
+        raise S206PreparationBlocked("GPU_INVENTORY_ROWS_REQUIRED")
+    for index, item in enumerate(rows):
+        if not isinstance(item, Mapping):
+            raise S206PreparationBlocked(f"GPU_INVENTORY_ROW_INVALID:{index}")
+        unknown_row = set(item) - _FORMAL_GPU_ROW_FIELDS
+        if unknown_row or set(item) != _FORMAL_GPU_ROW_FIELDS:
+            raise S206PreparationBlocked(f"GPU_INVENTORY_ROW_FIELDS_INVALID:{index}")
+        for field in (
+            "uuid",
+            "pci_bus_id",
+            "gpu_name",
+            "compute_mode",
+            "row_remap_status",
+            "gpu_recovery_action",
+            "health_state",
+        ):
+            if not isinstance(item[field], str) or not item[field]:
+                raise S206PreparationBlocked(f"GPU_INVENTORY_ROW_{field.upper()}_INVALID:{index}")
+        for field in (
+            "temperature_c",
+            "utilization_gpu_percent",
+        ):
+            number = item[field]
+            if isinstance(number, bool) or not isinstance(number, (int, float)) or not math.isfinite(float(number)):
+                raise S206PreparationBlocked(f"GPU_INVENTORY_ROW_{field.upper()}_INVALID:{index}")
+        for field in (
+            "memory_used_mib",
+            "memory_total_mib",
+            "ecc_uncorrected_volatile",
+            "ecc_uncorrected_aggregate",
+            "row_remap_failure",
+            "row_remap_pending",
+        ):
+            number = item[field]
+            if isinstance(number, bool) or not isinstance(number, int) or number < 0:
+                raise S206PreparationBlocked(f"GPU_INVENTORY_ROW_{field.upper()}_INVALID:{index}")
+        row_apps = item["compute_apps"]
+        if not isinstance(row_apps, list):
+            raise S206PreparationBlocked(f"GPU_INVENTORY_ROW_COMPUTE_APPS_INVALID:{index}")
+        for app_index, app in enumerate(row_apps):
+            if not isinstance(app, Mapping) or set(app) != _FORMAL_GPU_APP_FIELDS:
+                raise S206PreparationBlocked(f"GPU_INVENTORY_ROW_APP_FIELDS_INVALID:{index}:{app_index}")
+    apps = value.get("compute_apps")
+    if not isinstance(apps, list):
+        raise S206PreparationBlocked("GPU_INVENTORY_COMPUTE_APPS_REQUIRED")
+    for index, app in enumerate(apps):
+        if not isinstance(app, Mapping) or set(app) != _FORMAL_GPU_APP_FIELDS:
+            raise S206PreparationBlocked(f"GPU_INVENTORY_APP_FIELDS_INVALID:{index}")
+
+
 def _load_inventory_snapshot(
     path: Path | None,
     *,
@@ -167,10 +292,14 @@ def _load_inventory_snapshot(
         raise S206PreparationBlocked("GPU_INVENTORY_JSON_ENVELOPE_REQUIRED")
     if value.get("schema_version") != GPU_INVENTORY_SCHEMA:
         raise S206PreparationBlocked("GPU_INVENTORY_SCHEMA_INVALID")
+    if not _allow_legacy:
+        _validate_formal_gpu_inventory_schema(value)
     rows = value.get("rows")
     if rows is None:
-        # ``gpus`` was the older supported wire key.  It remains accepted only
-        # inside the same hash-bound envelope; raw lists are not formal input.
+        if not _allow_legacy:
+            raise S206PreparationBlocked("GPU_INVENTORY_ROWS_REQUIRED")
+        # ``gpus`` is retained only inside the explicitly private legacy
+        # compatibility wrapper; it is never a formal input.
         rows = value.get("gpus")
     if not isinstance(rows, list) or not all(isinstance(row, Mapping) for row in rows):
         raise S206PreparationBlocked("GPU_INVENTORY_JSON_ROWS_REQUIRED")
@@ -2252,6 +2381,51 @@ def _wait(args: argparse.Namespace) -> int:
         time.sleep(args.poll_seconds)
 
 
+_DETACHED_REF_FIELDS = (
+    "attempt_ref",
+    "operations_root",
+    "log_ref",
+    "status_ref",
+    "gpu_inventory_ref",
+    "gpu_inventory_source_ref",
+    "gpu_inventory_path",
+    "execution_evidence_ref",
+)
+
+
+def _validate_detached_receipt_refs(value: Mapping[str, object]) -> None:
+    for field in _DETACHED_REF_FIELDS:
+        ref = value.get(field)
+        if (
+            not isinstance(ref, str)
+            or not ref
+            or "\\" in ref
+            or PurePosixPath(ref).is_absolute()
+            or PurePosixPath(ref).as_posix() != ref
+            or any(part in {"", ".", ".."} for part in PurePosixPath(ref).parts)
+        ):
+            raise S206PreparationBlocked(f"DETACHED_ATTEMPT_RECEIPT_{field.upper()}_REF_INVALID")
+    attempt_id = value.get("attempt_id")
+    if (
+        not isinstance(attempt_id, str)
+        or not attempt_id
+        or "/" in attempt_id
+        or "\\" in attempt_id
+        or PurePosixPath(attempt_id).parts != (attempt_id,)
+    ):
+        raise S206PreparationBlocked("DETACHED_ATTEMPT_RECEIPT_ATTEMPT_ID_INVALID")
+    operations_root = value["operations_root"]
+    attempt_ref = value["attempt_ref"]
+    if attempt_ref != f"{operations_root}/attempts/{attempt_id}":
+        raise S206PreparationBlocked("DETACHED_ATTEMPT_RECEIPT_ATTEMPT_REF_MISMATCH")
+    if value["log_ref"] != f"{attempt_ref}/launcher.log":
+        raise S206PreparationBlocked("DETACHED_ATTEMPT_RECEIPT_LOG_REF_MISMATCH")
+    if value["status_ref"] != f"{operations_root}/status.json":
+        raise S206PreparationBlocked("DETACHED_ATTEMPT_RECEIPT_STATUS_REF_MISMATCH")
+    if value["gpu_inventory_path"] != value["gpu_inventory_ref"]:
+        raise S206PreparationBlocked("DETACHED_ATTEMPT_RECEIPT_GPU_INVENTORY_PATH_MISMATCH")
+
+
 def _detached_receipt_hash(value: Mapping[str, object]) -> int:
     """Verify a detached attempt receipt and return its validated PID."""
 
@@ -2264,29 +2438,33 @@ def _detached_receipt_hash(value: Mapping[str, object]) -> int:
         raise S206PreparationBlocked("DETACHED_ATTEMPT_RECEIPT_HASH_REQUIRED")
     if canonical_json_hash({key: item for key, item in value.items() if key != "artifact_hash"}) != declared:
         raise S206PreparationBlocked("DETACHED_ATTEMPT_RECEIPT_HASH_MISMATCH")
-    for field in (
-        "attempt_ref",
-        "operations_root",
-        "log_ref",
-        "status_ref",
-        "gpu_inventory_ref",
-        "gpu_inventory_source_ref",
-        "gpu_inventory_path",
-        "execution_evidence_ref",
-    ):
-        ref = value.get(field)
-        if (
-            not isinstance(ref, str)
-            or not ref
-            or "\\" in ref
-            or PurePosixPath(ref).is_absolute()
-            or PurePosixPath(ref).as_posix() != ref
-            or any(part in {"", ".", ".."} for part in PurePosixPath(ref).parts)
-        ):
-            raise S206PreparationBlocked(f"DETACHED_ATTEMPT_RECEIPT_{field.upper()}_REF_INVALID")
+    _validate_detached_receipt_refs(value)
     pid = value.get("pid")
     if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
         raise S206PreparationBlocked("DETACHED_ATTEMPT_RECEIPT_PID_INVALID")
+    return pid
+
+
+def _detached_failure_hash(value: Mapping[str, object]) -> int | None:
+    """Verify a durable failed-launch marker and return its optional PID."""
+
+    if value.get("schema_version") != "stage2-s206-detached-failure-v1":
+        raise S206PreparationBlocked("DETACHED_FAILURE_RECEIPT_SCHEMA_INVALID")
+    if value.get("status") not in {"SPAWN_FAILED", "RECEIPT_WRITE_FAILED"}:
+        raise S206PreparationBlocked("DETACHED_FAILURE_RECEIPT_STATUS_INVALID")
+    declared = value.get("artifact_hash")
+    if not isinstance(declared, str) or len(declared) != 64 or any(
+        char not in "0123456789abcdef" for char in declared
+    ):
+        raise S206PreparationBlocked("DETACHED_FAILURE_RECEIPT_HASH_REQUIRED")
+    if canonical_json_hash({key: item for key, item in value.items() if key != "artifact_hash"}) != declared:
+        raise S206PreparationBlocked("DETACHED_FAILURE_RECEIPT_HASH_MISMATCH")
+    _validate_detached_receipt_refs(value)
+    pid = value.get("pid")
+    if pid is None:
+        return None
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+        raise S206PreparationBlocked("DETACHED_FAILURE_RECEIPT_PID_INVALID")
     return pid
 
 
@@ -2316,26 +2494,98 @@ def _scan_detached_attempts(operations: Path, *, operations_ref: str | None = No
         if entry.is_symlink() or not entry.is_dir():
             raise S206PreparationBlocked("DETACHED_ATTEMPT_DIRECTORY_INVALID")
         receipt = entry / "launcher.pid.json"
+        failure = entry / "launcher.failure.json"
         if receipt.is_symlink():
             raise S206PreparationBlocked("DETACHED_ATTEMPT_RECEIPT_SYMLINK_FORBIDDEN")
-        if not receipt.exists() or not receipt.is_file():
-            raise S206PreparationBlocked("DETACHED_ATTEMPT_RECEIPT_REQUIRED")
-        try:
-            raw = load_canonical_json(receipt)
-        except (OSError, TypeError, ValueError) as error:
-            raise S206PreparationBlocked("DETACHED_ATTEMPT_RECEIPT_INVALID") from error
-        if not isinstance(raw, Mapping):
-            raise S206PreparationBlocked("DETACHED_ATTEMPT_RECEIPT_OBJECT_REQUIRED")
-        pid = _detached_receipt_hash(raw)
+        if failure.is_symlink():
+            raise S206PreparationBlocked("DETACHED_FAILURE_RECEIPT_SYMLINK_FORBIDDEN")
+        if receipt.exists() or receipt.is_symlink():
+            if not receipt.is_file():
+                raise S206PreparationBlocked("DETACHED_ATTEMPT_RECEIPT_REQUIRED")
+            if failure.exists() or failure.is_symlink():
+                raise S206PreparationBlocked("DETACHED_ATTEMPT_MULTIPLE_RECEIPTS")
+            try:
+                raw = load_canonical_json(receipt)
+            except (OSError, TypeError, ValueError) as error:
+                raise S206PreparationBlocked("DETACHED_ATTEMPT_RECEIPT_INVALID") from error
+            if not isinstance(raw, Mapping):
+                raise S206PreparationBlocked("DETACHED_ATTEMPT_RECEIPT_OBJECT_REQUIRED")
+            pid = _detached_receipt_hash(raw)
+        else:
+            if not failure.exists() or not failure.is_file():
+                raise S206PreparationBlocked("DETACHED_ATTEMPT_RECEIPT_REQUIRED")
+            try:
+                raw = load_canonical_json(failure)
+            except (OSError, TypeError, ValueError) as error:
+                raise S206PreparationBlocked("DETACHED_FAILURE_RECEIPT_INVALID") from error
+            if not isinstance(raw, Mapping):
+                raise S206PreparationBlocked("DETACHED_FAILURE_RECEIPT_OBJECT_REQUIRED")
+            pid = _detached_failure_hash(raw)
         if (
             raw.get("attempt_id") != entry.name
             or (operations_ref is not None and raw.get("operations_root") != operations_ref)
-            or raw.get("attempt_ref")
-            != f"{raw.get('operations_root')}/attempts/{entry.name}"
         ):
             raise S206PreparationBlocked("DETACHED_ATTEMPT_RECEIPT_IDENTITY_MISMATCH")
+        if pid is None:
+            continue
         if _pid_is_live(pid):
             raise S206PreparationBlocked(f"DETACHED_LAUNCH_ALREADY_RUNNING:{pid}")
+
+
+def _publish_detached_failure(path: Path, payload: Mapping[str, object]) -> None:
+    """Publish a new-attempt failure marker without replacing evidence."""
+
+    if path.exists() or path.is_symlink():
+        raise S206PreparationBlocked("DETACHED_FAILURE_RECEIPT_PATH_CONFLICT")
+    write_canonical_json(path, dict(payload))
+
+
+def _cleanup_provisional_attempt(attempt_dir: Path, log_path: Path) -> None:
+    """Remove only this new attempt's provisional log and empty directory."""
+
+    try:
+        if (
+            attempt_dir.is_symlink()
+            or not attempt_dir.is_dir()
+            or attempt_dir.parent.name != "attempts"
+            or log_path.is_symlink()
+        ):
+            return
+        if log_path.exists():
+            if not log_path.is_file():
+                return
+            log_path.unlink()
+        if any(attempt_dir.iterdir()):
+            return
+        attempt_dir.rmdir()
+    except OSError:
+        # Leaving a malformed/unremovable provisional attempt is safer than
+        # deleting an object whose identity could no longer be verified.
+        return
+
+
+def _terminate_and_wait(process: subprocess.Popen[bytes]) -> str | None:
+    """Terminate a child and wait for confirmation, retaining any error text."""
+
+    errors: list[str] = []
+    try:
+        process.terminate()
+    except Exception as error:  # pragma: no cover - defensive process boundary
+        errors.append(f"terminate:{type(error).__name__}:{error}")
+    try:
+        process.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        try:
+            process.kill()
+        except Exception as error:  # pragma: no cover - defensive process boundary
+            errors.append(f"kill:{type(error).__name__}:{error}")
+        try:
+            process.wait(timeout=10)
+        except Exception as error:  # pragma: no cover - defensive process boundary
+            errors.append(f"wait_after_kill:{type(error).__name__}:{error}")
+    except Exception as error:  # pragma: no cover - defensive process boundary
+        errors.append(f"wait:{type(error).__name__}:{error}")
+    return ";".join(errors) or None
 
 
 def _detach(args: argparse.Namespace) -> int:
@@ -2369,10 +2619,44 @@ def _detach(args: argparse.Namespace) -> int:
         raise S206PreparationBlocked("DETACHED_ATTEMPT_ID_COLLISION") from error
     log_path = attempt_dir / "launcher.log"
     pid_path = attempt_dir / "launcher.pid.json"
+    failure_path = attempt_dir / "launcher.failure.json"
     attempt_ref = f"{operations_ref}/attempts/{attempt_id}"
     log_ref = f"{attempt_ref}/launcher.log"
     status_ref = f"{operations_ref}/status.json"
     child_argv = [item for item in sys.argv[1:] if item != "--detach"]
+
+    def publish_failure(
+        *,
+        status: str,
+        pid: int | None,
+        error: BaseException,
+        cleanup_error: str | None = None,
+    ) -> None:
+        failure_payload: dict[str, object] = {
+            "schema_version": "stage2-s206-detached-failure-v1",
+            "attempt_id": attempt_id,
+            "attempt_ref": attempt_ref,
+            "pid": pid,
+            "run_id": args.run_id,
+            "operations_root": operations_ref,
+            "log_ref": log_ref,
+            "status_ref": status_ref,
+            "gpu_inventory_ref": preflight["gpu_inventory_ref"],
+            "gpu_inventory_source_ref": preflight["gpu_inventory_source_ref"],
+            "gpu_inventory_artifact_hash": preflight["gpu_inventory_artifact_hash"],
+            "gpu_inventory_source_sha256": preflight["gpu_inventory_source_sha256"],
+            "gpu_inventory_path": preflight["gpu_inventory_ref"],
+            "preflight_artifact_hash": preflight["preflight_artifact_hash"],
+            "execution_evidence_ref": execution_ref,
+            "execution_evidence_hash": execution.artifact_hash,
+            "status": status,
+            "failure_reason": f"{type(error).__name__}:{error}",
+            "cleanup_error": cleanup_error,
+        }
+        _validate_detached_receipt_refs(failure_payload)
+        failure_payload["artifact_hash"] = canonical_json_hash(failure_payload)
+        _publish_detached_failure(failure_path, failure_payload)
+
     try:
         with log_path.open("ab") as handle:
             process = subprocess.Popen(
@@ -2384,13 +2668,12 @@ def _detach(args: argparse.Namespace) -> int:
                 start_new_session=True,
                 close_fds=True,
             )
-    except Exception:
-        # A failed spawn must not leave an unreceipted attempt directory that
-        # could later be mistaken for a resumable stale attempt.
+    except Exception as error:
         try:
-            attempt_dir.rmdir()
-        except OSError:
-            pass
+            publish_failure(status="SPAWN_FAILED", pid=None, error=error)
+        except Exception as failure_error:
+            _cleanup_provisional_attempt(attempt_dir, log_path)
+            raise S206PreparationBlocked("DETACHED_SPAWN_FAILURE_UNRECORDED") from failure_error
         raise
     payload = {
         "schema_version": "stage2-s206-detached-launch-v1",
@@ -2424,8 +2707,18 @@ def _detach(args: argparse.Namespace) -> int:
     payload["artifact_hash"] = canonical_json_hash(payload)
     try:
         write_canonical_json(pid_path, payload)
-    except Exception:
-        process.terminate()
+    except Exception as error:
+        cleanup_error = _terminate_and_wait(process)
+        try:
+            publish_failure(
+                status="RECEIPT_WRITE_FAILED",
+                pid=int(process.pid),
+                error=error,
+                cleanup_error=cleanup_error,
+            )
+        except Exception as failure_error:
+            _cleanup_provisional_attempt(attempt_dir, log_path)
+            raise S206PreparationBlocked("DETACHED_RECEIPT_FAILURE_UNRECORDED") from failure_error
         raise
     print(json.dumps(payload, ensure_ascii=False, sort_keys=True, indent=2))
     return 0
