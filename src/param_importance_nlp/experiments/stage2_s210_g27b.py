@@ -792,6 +792,10 @@ def run_s210_g27b(
     output_root: str | Path | None = None,
     run_id: str = "s210-g27b",
     checked_at: str | None = None,
+    producer_commit: str | None = None,
+    consumer_commit: str | None = None,
+    input_refs: Mapping[str, Any] | None = None,
+    code_identity: Mapping[str, Any] | None = None,
     **aliases: Any,
 ) -> dict[str, Any]:
     """Consume sealed G2.6/G2.7a evidence and publish S2.10 artifacts.
@@ -1019,9 +1023,14 @@ def run_s210_g27b(
         "schema_version": S210_LINEAGE_SCHEMA,
         "task_id": S210_TASK_ID,
         "run_id": run_id,
-        "producer_commit": "record_at_execution",
-        "consumer_commit": "record_at_execution",
+        # Direct in-memory fixture calls intentionally remain non-formal when
+        # provenance is omitted.  The formal CLI always supplies the verified
+        # clean-head identities and rejects this fallback before execution.
+        "producer_commit": producer_commit if producer_commit is not None else "unbound",
+        "consumer_commit": consumer_commit if consumer_commit is not None else "unbound",
         "input_artifacts": upstream,
+        "input_refs": dict(input_refs) if isinstance(input_refs, Mapping) else {},
+        "code_identity": dict(code_identity) if isinstance(code_identity, Mapping) else {},
         "source_tables": source_descriptors,
         "chart_specs": [chart["artifact_hash"] for chart in charts],
         "decision_hash": decision["artifact_hash"],
