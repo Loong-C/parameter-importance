@@ -1,9 +1,11 @@
 """Run one strict, UUID-bound S2.9 profiler backend.
 
 The detached S2.9 runner supplies the frozen task through environment
-variables.  This entrypoint only loads an operator-provided *real* backend,
-captures its diagnostics on stderr, and writes exactly one JSON object on
-stdout.  It has no synthetic fallback and never fabricates measurements.
+variables.  By default this entrypoint loads the repository-contained real
+S2.7/Torch adapter, including the synchronized approved-four-UUID system
+anchor; an explicit backend remains available for a separately reviewed
+adapter.  Diagnostics go to stderr and exactly one JSON object goes to
+stdout.  There is no synthetic fallback and no fabricated measurement.
 """
 
 from __future__ import annotations
@@ -34,7 +36,8 @@ def build_parser() -> argparse.ArgumentParser:
         default="param_importance_nlp.experiments.stage2_s209_production:run_s209_production_backend",
         help=(
             "real backend import path in module:function form; defaults to the "
-            "repository-contained approved S2.7/Torch adapter"
+            "repository-contained approved S2.7/Torch adapter (including the "
+            "four-process approved-UUID system anchor)"
         ),
     )
     parser.add_argument(
