@@ -62,6 +62,7 @@ from .stage2_s207_formal import (
     S27RawUnit,
     S27StatusStore,
     StrictG25Reducer,
+    _anchor_to_cell_id,
     validate_gpu_inventory,
 )
 
@@ -673,9 +674,11 @@ def load_s27_frozen_mappings(
         if not isinstance(cell, Mapping):
             raise S27ExecutionBlocked("S27_MAPPING_CELL_NOT_OBJECT")
         anchor = cell.get("anchor_id")
-        if not isinstance(anchor, str) or (cell_id is not None and anchor != cell_id):
-            if cell_id is None:
-                raise S27ExecutionBlocked("S27_MAPPING_ANCHOR_INVALID")
+        try:
+            canonical_cell_id = _anchor_to_cell_id(anchor, field=f"S27_MAPPING_ANCHOR:{anchor}")
+        except ValueError as error:
+            raise S27ExecutionBlocked("S27_MAPPING_ANCHOR_INVALID") from error
+        if cell_id is not None and canonical_cell_id != cell_id:
             continue
         rows = cell.get("mappings")
         if not isinstance(rows, list):
@@ -687,7 +690,7 @@ def load_s27_frozen_mappings(
                 mapping = RepetitionMapping.from_manifest(raw)
             except (TypeError, ValueError) as error:
                 raise S27ExecutionBlocked(f"S27_MAPPING_REPETITION_INVALID:{anchor}") from error
-            unit_id = f"{anchor}::{mapping.repetition_id}"
+            unit_id = f"{canonical_cell_id}::{mapping.repetition_id}"
             expected = expected_units.get(unit_id)
             if expected is None:
                 raise S27ExecutionBlocked(f"S27_MAPPING_UNEXPECTED_UNIT:{unit_id}")
@@ -1313,12 +1316,15 @@ def _success_record(
         raise S27ExecutionBlocked(f"S27_PROVIDER_STATE_DRIFT:{unit.unit_id}")
     assumptions = state.get("weighting_assumptions")
     mean_consistent = mean_gradient_audit.get("passed") is True
+    if cell.corrected_delta_sci_binding is None:
+        raise S27ExecutionBlocked(f"S27_CORRECTED_DELTA_BINDING_MISSING:{cell.cell_id}")
     metrics: dict[str, object] = {
         "finite": True,
         "raw_double_shared_gradient_pool": True,
         "nested_m_shared_gradient_pool": True,
         "mean_gradient_audit": dict(mean_gradient_audit),
         "inner_attempt_id": state.get("attempt_id"),
+        "corrected_delta_sci_binding": dict(cell.corrected_delta_sci_binding),
     }
     return S27RawUnit(
         unit_id=unit.unit_id,
@@ -1381,6 +1387,8 @@ def _failure_record(
         "draw_ids": list(unit.draw_ids),
         "sample_ids": list(unit.sample_ids),
     }
+    if cell.corrected_delta_sci_binding is not None:
+        body["corrected_delta_sci_binding"] = dict(cell.corrected_delta_sci_binding)
     body["artifact_hash"] = canonical_json_hash(body)
     artifact_path = run_root / "raw-artifacts" / f"{_unit_file_name(unit.unit_id)[:-5]}-failure.json"
     _write_once(artifact_path, body, field=f"S27_FAILURE_ARTIFACT:{unit.unit_id}")
@@ -1401,7 +1409,15 @@ def _failure_record(
         sample_ids=unit.sample_ids,
         raw_artifact_ref=_relative_ref(data_root, artifact_path, field=f"S27_FAILURE_REF:{unit.unit_id}"),
         raw_artifact_hash=str(body["artifact_hash"]),
-        metrics={"finite": False, "failed": True},
+        metrics={
+            "finite": False,
+            "failed": True,
+            **(
+                {"corrected_delta_sci_binding": dict(cell.corrected_delta_sci_binding)}
+                if cell.corrected_delta_sci_binding is not None
+                else {}
+            ),
+        },
         methods=("raw", "double", "u_m2", f"u_m{unit.microbatch_count}"),
         m2_identity_max_abs=None,
         mean_gradient_consistent=False,
@@ -2100,6 +2116,9 @@ def validate_s27_quality_wave(
             raise S27ExecutionBlocked(f"S27_QUALITY_UNIT_FAILED:{unit.unit_id}")
         if record.mean_gradient_consistent is not True or record.m2_identity_max_abs is None or record.m2_identity_max_abs > 1e-12 or record.clamp_applied or record.clip_mode != "none" or record.cost.get("valid") is not True:
             raise S27ExecutionBlocked(f"S27_QUALITY_INTEGRITY_FAILED:{unit.unit_id}")
+        cell = next(item for item in plan.cells if item.cell_id == cell_id)
+        if cell.corrected_delta_sci_binding is not None and record.metrics.get("corrected_delta_sci_binding") != dict(cell.corrected_delta_sci_binding):
+            raise S27ExecutionBlocked(f"S27_QUALITY_CORRECTED_DELTA_BINDING_FAILED:{unit.unit_id}")
         audit = record.metrics.get("mean_gradient_audit")
         if not isinstance(audit, Mapping) or audit.get("passed") is not True:
             raise S27ExecutionBlocked(f"S27_QUALITY_MEAN_GRADIENT_AUDIT_FAILED:{unit.unit_id}")
@@ -2214,6 +2233,7 @@ def build_s27_worker_command(
     gpu_uuid: str,
     materialization_index_ref: str,
     execution_evidence_ref: str,
+    gpu_inventory_json: str | Path | None = None,
     shard_plan_ref: str | None = None,
     shard_index: int | None = None,
 ) -> tuple[str, ...]:
@@ -2240,6 +2260,8 @@ def build_s27_worker_command(
         "--execution-evidence-ref",
         execution_evidence_ref,
     ]
+    if gpu_inventory_json is not None:
+        command.extend(("--gpu-inventory-json", str(gpu_inventory_json)))
     if (shard_plan_ref is None) != (shard_index is None):
         raise S27ExecutionBlocked("S27_WORKER_COMMAND_SHARD_METADATA_INCOMPLETE")
     if shard_plan_ref is not None and shard_index is not None:
@@ -2264,9 +2286,13 @@ class S27DetachedLauncher:
         materialization_index_ref: str,
         execution_evidence_ref: str,
         approved_inventory: Sequence[Mapping[str, object]],
+        gpu_inventory_json: str | Path | None = None,
+        gpu_inventory_identity: Mapping[str, object] | None = None,
     ) -> None:
         self.data_root = Path(data_root).resolve()
         self.plan = load_s27_plan(self.data_root, plan_ref)
+        if any(cell.corrected_delta_sci_binding is None for cell in self.plan.cells):
+            raise S27ExecutionBlocked("S27_CORRECTED_DELTA_BINDINGS_REQUIRED")
         self.plan_ref = plan_ref
         self.run_root = Path(run_root).resolve()
         self.run_id = run_id
@@ -2275,6 +2301,16 @@ class S27DetachedLauncher:
         self.materialization_index_ref = materialization_index_ref
         self.execution_evidence_ref = execution_evidence_ref
         validate_s27_gpu_inventory(approved_inventory, compute_apps=())
+        if gpu_inventory_json is None or gpu_inventory_identity is None:
+            raise S27ExecutionBlocked("S27_GPU_INVENTORY_IDENTITY_REQUIRED")
+        required_identity = {"source_ref", "artifact_hash", "source_sha256", "schema_version"}
+        if set(gpu_inventory_identity) != required_identity:
+            raise S27ExecutionBlocked("S27_GPU_INVENTORY_IDENTITY_FIELDS_INVALID")
+        for field in required_identity:
+            if not isinstance(gpu_inventory_identity.get(field), str) or not gpu_inventory_identity[field]:
+                raise S27ExecutionBlocked(f"S27_GPU_INVENTORY_IDENTITY_{field.upper()}_INVALID")
+        self.gpu_inventory_json = Path(gpu_inventory_json).resolve()
+        self.gpu_inventory_identity = dict(gpu_inventory_identity)
         self.run_root.mkdir(parents=True, exist_ok=True)
         if self.run_root.is_relative_to(self.data_root) is False:
             raise S27ExecutionBlocked("S27_RUN_ROOT_OUTSIDE_DATA_ROOT")
@@ -2288,6 +2324,7 @@ class S27DetachedLauncher:
             "run_id": self.run_id,
             "plan_ref": self.plan_ref,
             "plan_hash": self.plan.artifact_hash,
+            "gpu_inventory_identity": dict(self.gpu_inventory_identity),
             "status": status,
             "wave_order": list(EXPECTED_CELL_IDS),
             "waves": {key: dict(value) for key, value in sorted(waves.items())},
@@ -2321,6 +2358,7 @@ class S27DetachedLauncher:
                 gpu_uuid=shard.gpu_uuid,
                 materialization_index_ref=self.materialization_index_ref,
                 execution_evidence_ref=self.execution_evidence_ref,
+                gpu_inventory_json=self.gpu_inventory_json,
                 shard_plan_ref=shard_plan_ref,
                 shard_index=shard.shard_index,
             )

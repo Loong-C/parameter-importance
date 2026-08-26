@@ -9,6 +9,7 @@ import pytest
 from param_importance_nlp.contracts.jsonio import canonical_json_hash, load_canonical_json, write_canonical_json
 from param_importance_nlp.contracts.status import GateRecord
 from param_importance_nlp.experiments.stage2_s204_ids import EXPECTED_CELL_IDS
+from param_importance_nlp.experiments.sampling import Draw, RepetitionMapping
 from param_importance_nlp.experiments.stage2_s207_formal import (
     APPROVED_GPU_UUIDS,
     EXCLUDED_GPU_UUID,
@@ -23,6 +24,12 @@ from param_importance_nlp.experiments.stage2_s207_formal import (
     S27RawUnit,
     S27StatusStore,
     StrictG25Reducer,
+    S27_ANCHOR_ORDER,
+    S27_CORRECTED_DELTA_BATCH_SIZES,
+    S27_CORRECTED_DELTA_SOURCE,
+    _anchor_to_cell_id,
+    _mapping_units,
+    _validate_corrected_delta_binding,
     prepare_s27_plan,
     validate_gpu_inventory,
 )
@@ -196,6 +203,97 @@ def test_s27_inventory_health_gates_fail_closed(mutation, pattern, tmp_path: Pat
     _write_s27_inventory(path, rows=rows)
     with pytest.raises(S27ExecutionBlocked, match=pattern):
         load_s27_gpu_inventory_envelope(path, data_root=tmp_path)
+
+
+def test_s27_uses_s206_dot_anchors_but_stores_canonical_colon_bindings() -> None:
+    assert S27_ANCHOR_ORDER == tuple(cell.replace(":", ".", 1) for cell in EXPECTED_CELL_IDS)
+    assert _anchor_to_cell_id(S27_ANCHOR_ORDER[0]) == EXPECTED_CELL_IDS[0]
+    with pytest.raises(ValueError, match="S206_DOT_ANCHOR_REQUIRED"):
+        _anchor_to_cell_id(EXPECTED_CELL_IDS[0])
+
+    binding = {
+        "cell_id": EXPECTED_CELL_IDS[0],
+        "config_hash": "1" * 64,
+        "result_hash": "2" * 64,
+        "corrected_delta_sci_hash": "3" * 64,
+        "corrected_delta_sci_ref": (
+            "evidence/stage2/s204/run/g2.3-corrected-delta-sci/"
+            + "3" * 64
+            + ".json"
+        ),
+        "corrected_delta_sci_batch_sizes": list(S27_CORRECTED_DELTA_BATCH_SIZES),
+        "delta_sci_source": S27_CORRECTED_DELTA_SOURCE,
+    }
+    assert _validate_corrected_delta_binding(
+        binding,
+        expected_cell_id=EXPECTED_CELL_IDS[0],
+        field="binding",
+    ) == binding
+    cell = S27CellPlan(
+        cell_id=EXPECTED_CELL_IDS[0],
+        model_id="pythia-14m",
+        training_stage="initialization",
+        checkpoint_ref="s203/checkpoint.json",
+        checkpoint_hash="4" * 64,
+        checkpoint_id="checkpoint-init",
+        reference_ref="s204/reference.json",
+        reference_hash="5" * 64,
+        reference_gate_ref="s204/g23.json",
+        reference_gate_hash="6" * 64,
+        expected_unit_ids=("unit-0001",),
+        assigned_gpu_uuid=APPROVED_GPU_UUIDS[0],
+        corrected_delta_sci_binding=binding,
+    )
+    assert S27CellPlan.from_mapping(cell.to_dict()).corrected_delta_sci_binding == binding
+
+
+def test_s27_mapping_loader_rebinds_s206_dot_anchors_to_colon_units() -> None:
+    cells: list[dict[str, object]] = []
+    all_draw_ids: list[str] = []
+    for cell_index, anchor_id in enumerate(S27_ANCHOR_ORDER):
+        draws = tuple(
+            Draw(
+                draw_id=f"confirmatory:{cell_index * 32 + position:012d}",
+                stream="confirmatory",
+                position=cell_index * 32 + position,
+                sample_id=f"sample-{cell_index * 32 + position}",
+                algorithm_version="stage2-draws-python-randrange-v1",
+            )
+            for position in range(32)
+        )
+        repetition = RepetitionMapping.create(
+            repetition_id="rep-0000",
+            draws=draws,
+            m_values=(2, 16),
+        )
+        cells.append({"anchor_id": anchor_id, "mappings": [repetition.to_dict()]})
+        all_draw_ids.extend(draw.draw_id for draw in draws)
+    mapping = {
+        "cells": cells,
+        "pilot_draw_id_count": 0,
+        "pilot_draw_id_hash": canonical_json_hash([]),
+        "confirmatory_draw_id_count": len(all_draw_ids),
+        "confirmatory_draw_id_hash": canonical_json_hash(all_draw_ids),
+        "sample_collision_count": 0,
+        "draw_id_unique": True,
+        "stream": "confirmatory",
+        "scope": "formal",
+        "formal_eligible": True,
+        "freeze_hash": "a" * 64,
+        "sampling_plan_hash": "c" * 64,
+        "qualification_gate_hash": "d" * 64,
+    }
+    units = _mapping_units(
+        mapping,
+        matrix_hash="a" * 64,
+        mapping_hash="b" * 64,
+        batch_size=32,
+        microbatch_count=16,
+        repetitions=1,
+        sampling_plan_hash="c" * 64,
+    )
+    assert tuple(unit.cell_id for unit in units) == EXPECTED_CELL_IDS
+    assert units[0].unit_id == f"{EXPECTED_CELL_IDS[0]}::rep-0000"
 
 
 def _matrix_payload(gate_hash: str) -> dict[str, object]:
