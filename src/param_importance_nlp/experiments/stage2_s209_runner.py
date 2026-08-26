@@ -38,6 +38,7 @@ from .stage2_s209_g27a import (
     S29_METHODS,
     S29_TIMING_FIELDS,
     S29FrozenInputs,
+    S29_G25_GATE_ID,
     S29G27ABlocked,
     bind_s209_inputs,
     prepare_s209_measurement_plan,
@@ -461,12 +462,14 @@ class S29Preflight:
     frozen: S29FrozenInputs
     matrix: dict[str, Any]
     gate: dict[str, Any]
+    g25_gate: dict[str, Any] | None
     raw_manifest: dict[str, Any]
     measurement_plan: dict[str, Any]
     inventory: dict[str, Any]
     io_evidence: dict[str, Any]
     matrix_ref: str
     gate_ref: str
+    g25_gate_ref: str | None
     raw_manifest_ref: str
     measurement_plan_ref: str
     gpu_inventory_ref: str = "gpu-inventory.json"
@@ -487,6 +490,7 @@ def prepare_s209_plan(
     matrix_ref: str,
     gate_ref: str,
     raw_manifest_ref: str,
+    g25_gate_ref: str | None = None,
     run_id: str,
     anchor_ids: Sequence[str] = ("method-only-anchor-0", "method-only-anchor-1"),
     repetitions: int = 2,
@@ -504,7 +508,18 @@ def prepare_s209_plan(
     matrix = _load_object(matrix_path, field="g24b_matrix")
     gate = _load_object(gate_path, field="g24b_gate")
     raw = _load_object(raw_path, field="s27_raw_manifest")
-    frozen = bind_s209_inputs(matrix=matrix, g24b_gate=gate, raw_manifest=raw, matrix_ref=matrix_ref, raw_manifest_ref=raw_manifest_ref)
+    g25 = None
+    if g25_gate_ref is not None:
+        g25 = _load_object(_logical(root, g25_gate_ref, field="g25_gate"), field="g25_gate")
+    frozen = bind_s209_inputs(
+        matrix=matrix,
+        g24b_gate=gate,
+        raw_manifest=raw,
+        g25_gate=g25,
+        require_g25=g25_gate_ref is not None,
+        matrix_ref=matrix_ref,
+        raw_manifest_ref=raw_manifest_ref,
+    )
     if inventory is not None:
         _load_inventory_envelope(inventory, root=root)
     if io_evidence is not None:
@@ -522,6 +537,7 @@ def load_s209_preflight(
     matrix_ref: str,
     gate_ref: str,
     raw_manifest_ref: str,
+    g25_gate_ref: str | None = None,
     measurement_plan_ref: str,
     gpu_inventory_ref: str,
     io_evidence_ref: str,
@@ -530,6 +546,8 @@ def load_s209_preflight(
 ) -> S29Preflight:
     """Re-read and re-bind all producer artifacts at launch time."""
 
+    if g25_gate_ref is None:
+        raise S29RunnerBlocked("G25_GATE_REFERENCE_REQUIRED")
     root = Path(data_root).resolve()
     refs = {
         "matrix": _logical(root, matrix_ref, field="g24b_matrix"),
@@ -539,10 +557,21 @@ def load_s209_preflight(
         "inventory": _logical(root, gpu_inventory_ref, field="gpu_inventory"),
         "io": _logical(root, io_evidence_ref, field="io_evidence"),
     }
+    if g25_gate_ref is not None:
+        refs["g25"] = _logical(root, g25_gate_ref, field="g25_gate")
     matrix = _load_object(refs["matrix"], field="g24b_matrix")
     gate = _load_object(refs["gate"], field="g24b_gate")
     raw = _load_object(refs["raw"], field="s27_raw_manifest")
-    frozen = bind_s209_inputs(matrix=matrix, g24b_gate=gate, raw_manifest=raw, matrix_ref=matrix_ref, raw_manifest_ref=raw_manifest_ref)
+    g25 = _load_object(refs["g25"], field="g25_gate") if "g25" in refs else None
+    frozen = bind_s209_inputs(
+        matrix=matrix,
+        g24b_gate=gate,
+        raw_manifest=raw,
+        g25_gate=g25,
+        require_g25=g25_gate_ref is not None,
+        matrix_ref=matrix_ref,
+        raw_manifest_ref=raw_manifest_ref,
+    )
     plan = _load_object(refs["plan"], field="measurement_plan")
     # bind_s209_inputs is deliberately invoked before plan validation; a
     # stale plan cannot grant authority to a replaced S2.7 manifest.
@@ -565,12 +594,14 @@ def load_s209_preflight(
         frozen=frozen,
         matrix=matrix,
         gate=gate,
+        g25_gate=g25,
         raw_manifest=raw,
         measurement_plan=plan,
         inventory=inventory,
         io_evidence=io_evidence,
         matrix_ref=matrix_ref,
         gate_ref=gate_ref,
+        g25_gate_ref=g25_gate_ref,
         raw_manifest_ref=raw_manifest_ref,
         measurement_plan_ref=measurement_plan_ref,
         gpu_inventory_ref=gpu_inventory_ref,
@@ -809,6 +840,21 @@ def _validate_measured_row(
     for name, expected in expected_identity.items():
         if name in row and row[name] != expected:
             raise S29RunnerBlocked(f"PROFILER_IDENTITY_DRIFT:{name}")
+    immutable_identity = {
+        "source_raw_run_id": frozen.raw_run_id,
+        "matrix_hash": frozen.matrix_hash,
+        "raw_manifest_hash": frozen.raw_manifest_hash,
+        "batch_size": frozen.batch_size,
+        "microbatch_count": frozen.microbatch_count,
+        "inventory_artifact_hash": inventory_identity.get("artifact_hash"),
+        "inventory_source_sha256": inventory_identity.get("source_sha256"),
+        "io_evidence_hash": io_evidence.get("artifact_hash"),
+        "cost_io_quiescent": io_evidence.get("cost_io_quiescent") is True,
+        "anchor_kind": "shared_runner" if semantic == "scientific_equal_sample_cost" else "method_only",
+    }
+    for name, expected in immutable_identity.items():
+        if name in row and row[name] != expected:
+            raise S29RunnerBlocked(f"PROFILER_IDENTITY_DRIFT:{name}")
     output["semantic"] = semantic
     output["method"] = method
     output["anchor_id"] = str(task["anchor_id"])
@@ -862,25 +908,21 @@ def _task_list(preflight: S29Preflight, *, run_id: str) -> list[dict[str, Any]]:
     if not isinstance(rows, list) or not rows:
         raise S29RunnerBlocked("MEASUREMENT_PLAN_ROWS_REQUIRED")
     tasks: list[dict[str, Any]] = []
-    # The prepared plan randomizes method order for the method-only online
-    # anchors.  Shared and isolated semantics use the same frozen anchors and
-    # repetitions, but remain separate cost namespaces in the reducer.
+    # The prepared plan is the sole source of anchor/repetition/order identity
+    # for every semantic.  Synthetic IDs or hard-coded 2x2 loops would allow a
+    # launcher to measure rows that are absent from the frozen plan.
     for semantic in S29_COST_SEMANTICS:
-        if semantic == "online_training_incremental_cost":
-            semantic_rows = rows
-        else:
-            semantic_rows = [
-                {"anchor_id": f"{semantic}-anchor-{index}", "repetition": repetition, "method_order": list(S29_METHODS)}
-                for index in range(2)
-                for repetition in range(2)
-            ]
-        for source in semantic_rows:
+        for source in rows:
             if not isinstance(source, Mapping):
                 raise S29RunnerBlocked("MEASUREMENT_PLAN_ROW_INVALID")
-            anchor = str(source["anchor_id"])
-            repetition = int(source["repetition"])
+            anchor_value = source.get("anchor_id")
+            repetition_value = source.get("repetition")
+            if not isinstance(anchor_value, str) or not anchor_value or isinstance(repetition_value, bool) or not isinstance(repetition_value, int) or repetition_value < 0:
+                raise S29RunnerBlocked("MEASUREMENT_PLAN_ROW_INVALID")
+            anchor = anchor_value
+            repetition = repetition_value
             order = source.get("method_order")
-            if not isinstance(order, list) or set(order) != set(S29_METHODS):
+            if not isinstance(order, list) or len(order) != len(S29_METHODS) or len(set(order)) != len(S29_METHODS) or set(order) != set(S29_METHODS):
                 raise S29RunnerBlocked("MEASUREMENT_PLAN_METHOD_ORDER_INVALID")
             for method in order:
                 tasks.append({
@@ -968,7 +1010,9 @@ class S29ProfilerRunner:
         anchor_root = self.run_root / "anchors"
         anchor_path = anchor_root / f"{key}.json"
         if anchor_path.exists():
-            return _load_object(anchor_path, field=f"anchor.{key}")
+            cached = _load_object(anchor_path, field=f"anchor.{key}")
+            self._validate_anchor(cached, task)
+            return cached
         env = {
             "S29_RUN_ID": self.run_id,
             "S29_PLAN_HASH": self.preflight.plan_hash,
@@ -1000,6 +1044,9 @@ class S29ProfilerRunner:
                 "source_raw_run_id": self.preflight.frozen.raw_run_id,
                 "device_count": int(task["device_count"]),
                 "gpu_uuids": list(task["gpu_uuids"]),
+                "inventory_artifact_hash": self.preflight.inventory["inventory_artifact_hash"],
+                "inventory_source_sha256": self.preflight.inventory["inventory_source_sha256"],
+                "measurement_plan_hash": self.preflight.plan_hash,
                 "cost_io_quiescent": row["cost_io_quiescent"],
                 "health_ok": row["health_ok"],
                 "numeric_consistency": measured.get("numeric_consistency") is True,
@@ -1020,6 +1067,39 @@ class S29ProfilerRunner:
         except Exception as error:
             self._record_failure(task, code="S29_ANCHOR_PROFILER_FAILED", reason=f"{type(error).__name__}:{error}")
             raise
+
+    def _validate_anchor(self, anchor: Mapping[str, Any], task: Mapping[str, Any]) -> None:
+        """Reject cached anchors whose producer or frozen identity drifted."""
+
+        expected = {
+            "status": "PASS",
+            "matrix_hash": self.preflight.frozen.matrix_hash,
+            "source_raw_run_id": self.preflight.frozen.raw_run_id,
+            "device_count": int(task["device_count"]),
+            "gpu_uuids": list(task["gpu_uuids"]),
+            "cost_io_quiescent": True,
+            "health_ok": True,
+            "numeric_consistency": True,
+            "batch_size": self.preflight.frozen.batch_size,
+            "microbatch_count": self.preflight.frozen.microbatch_count,
+            "inventory_artifact_hash": self.preflight.inventory["inventory_artifact_hash"],
+            "inventory_source_sha256": self.preflight.inventory["inventory_source_sha256"],
+            "measurement_plan_hash": self.preflight.plan_hash,
+            "measurement_kind": "actual",
+            "measurement_source": "profiler_worker",
+            "io_evidence_hash": self.preflight.io_evidence["artifact_hash"],
+        }
+        for name, value in expected.items():
+            if anchor.get(name) != value:
+                raise S29RunnerBlocked(f"ANCHOR_IDENTITY_DRIFT:{task['anchor_id']}:{name}")
+        for name in S29_COUNT_FIELDS:
+            value = anchor.get(name)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise S29RunnerBlocked(f"ANCHOR_COUNT_INVALID:{task['anchor_id']}:{name}")
+        for name in ("wall_seconds", "allocated_peak_bytes", "reserved_peak_bytes", "device_peak_bytes"):
+            value = anchor.get(name)
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or float(value) <= 0:
+                raise S29RunnerBlocked(f"ANCHOR_MEASUREMENT_INVALID:{task['anchor_id']}:{name}")
 
     def _load_completed(self, tasks: Sequence[Mapping[str, Any]]) -> dict[str, dict[str, Any]]:
         completed: dict[str, dict[str, Any]] = {}
@@ -1202,6 +1282,7 @@ class S29ProfilerRunner:
                 matrix=self.preflight.matrix,
                 g24b_gate=self.preflight.gate,
                 raw_manifest=self.preflight.raw_manifest,
+                g25_gate=self.preflight.g25_gate,
                 cost_observations=cost_observations,
                 health_snapshot=health_snapshot,
                 single_gpu_anchor=self.single_gpu_anchor,
@@ -1226,13 +1307,21 @@ class S29ProfilerRunner:
             report_payload = _load_object(report_path, field="g27a.report")
             gate_payload = _load_object(gate_path, field="g27a.gate")
             gate = GateRecord.from_mapping(gate_payload)
-            evidence_refs = tuple(sorted(set(gate.evidence_refs) | {
-                self.preflight.measurement_plan_ref,
-                self.preflight.gpu_inventory_ref,
-                self.preflight.io_evidence_ref,
-                self.preflight.capacity_ref,
-                self.preflight.ulimit_ref,
-            }))
+            evidence_set = set(gate.evidence_refs)
+            evidence_set.update(
+                {
+                    self.preflight.matrix_ref,
+                    self.preflight.raw_manifest_ref,
+                    self.preflight.measurement_plan_ref,
+                    self.preflight.gpu_inventory_ref,
+                    self.preflight.io_evidence_ref,
+                    self.preflight.capacity_ref,
+                    self.preflight.ulimit_ref,
+                }
+            )
+            if self.preflight.g25_gate_ref is not None:
+                evidence_set.add(self.preflight.g25_gate_ref)
+            evidence_refs = tuple(sorted(evidence_set))
             gate_payload = GateRecord(
                 gate_id=gate.gate_id,
                 stage=gate.stage,
@@ -1251,12 +1340,16 @@ class S29ProfilerRunner:
                 "schema_version": S29_RUNNER_SCHEMA,
                 "run_id": self.run_id,
                 "measurement_plan_hash": self.preflight.plan_hash,
+                "g24b_gate_hash": self.preflight.frozen.g24b_gate_hash,
+                "g25_gate_hash": self.preflight.frozen.g25_gate_hash,
+                "raw_manifest_hash": self.preflight.frozen.raw_manifest_hash,
                 "inventory_hash": self.preflight.inventory["inventory_artifact_hash"],
                 "inventory_source_sha256": self.preflight.inventory["inventory_source_sha256"],
                 "capacity_evidence_hash": capacity_inputs.get("capacity_evidence_hash"),
                 "ulimit_evidence_hash": capacity_inputs.get("ulimit_evidence_hash"),
                 "io_evidence_hash": self.preflight.io_evidence["artifact_hash"],
                 "gpu_inventory_ref": self.preflight.gpu_inventory_ref,
+                "g25_gate_ref": self.preflight.g25_gate_ref,
                 "io_evidence_ref": self.preflight.io_evidence_ref,
                 "actual_measurements_only": True,
                 "failure_evidence_ref": "../failures",
