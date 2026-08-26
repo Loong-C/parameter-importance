@@ -102,6 +102,25 @@ def _file_sha256(path: str | Path) -> str:
     return digest.hexdigest()
 
 
+def _git_output(repository: Path, *arguments: str) -> str:
+    """Run one identity probe through the normal subprocess boundary."""
+
+    try:
+        completed = subprocess.run(
+            ["git", "-C", str(repository), *arguments],
+            cwd=repository,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=30,
+            check=True,
+        )
+    except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as error:
+        raise S29RunnerBlocked("REPOSITORY_GIT_PROBE_FAILED") from error
+    return completed.stdout.strip()
+
+
 def _repository_path(repository: Path | str | None) -> Path:
     if repository is None:
         raise S29RunnerBlocked("REPOSITORY_REQUIRED")
@@ -117,13 +136,8 @@ def _repository_path(repository: Path | str | None) -> Path:
             raise S29RunnerBlocked("REPOSITORY_SYMLINK_COMPONENT_FORBIDDEN")
     resolved = candidate.resolve()
     try:
-        top_level = subprocess.run(
-            ["git", "-C", str(resolved), "rev-parse", "--show-toplevel"],
-            capture_output=True,
-            text=True,
-            check=True,
-        ).stdout.strip()
-    except (OSError, subprocess.CalledProcessError) as error:
+        top_level = _git_output(resolved, "rev-parse", "--show-toplevel")
+    except S29RunnerBlocked as error:
         raise S29RunnerBlocked("REPOSITORY_GIT_TOP_LEVEL_UNAVAILABLE") from error
     if not top_level or Path(top_level).resolve() != resolved:
         raise S29RunnerBlocked("REPOSITORY_GIT_TOP_LEVEL_MISMATCH")
@@ -143,19 +157,9 @@ def _execution_identity(command: Sequence[str], repository: Path | str | None = 
     if not launcher.is_file():
         raise S29RunnerBlocked("LAUNCHER_SOURCE_REGULAR_FILE_REQUIRED")
     try:
-        head = subprocess.run(
-            ["git", "-C", str(repo), "rev-parse", "HEAD"],
-            capture_output=True,
-            text=True,
-            check=True,
-        ).stdout.strip()
-        dirty = subprocess.run(
-            ["git", "-C", str(repo), "status", "--porcelain", "--untracked-files=all"],
-            capture_output=True,
-            text=True,
-            check=True,
-        ).stdout
-    except (OSError, subprocess.CalledProcessError) as error:
+        head = _git_output(repo, "rev-parse", "HEAD")
+        dirty = _git_output(repo, "status", "--porcelain", "--untracked-files=all")
+    except S29RunnerBlocked as error:
         raise S29RunnerBlocked("REPOSITORY_IDENTITY_UNAVAILABLE") from error
     if len(head) != 40 or any(char not in "0123456789abcdef" for char in head) or dirty:
         raise S29RunnerBlocked("REPOSITORY_NOT_CLEAN_OR_HEAD_INVALID")
@@ -255,6 +259,16 @@ def _attempt_identity(
     return body
 
 
+def _child_argv_hash(argv: Sequence[str]) -> str:
+    """Hash the child command while treating the per-attempt id as dynamic."""
+
+    normalized = list(argv)
+    for index, token in enumerate(normalized):
+        if token in {"--detached-child-marker", "--attempt-id"} and index + 1 < len(normalized):
+            normalized[index + 1] = "<attempt-id>"
+    return canonical_json_hash(normalized)
+
+
 def _attempt_failure(attempt: Mapping[str, Any], *, reason: str) -> dict[str, Any]:
     body: dict[str, Any] = {
         "schema_version": S29_DETACHED_FAILURE_SCHEMA,
@@ -295,6 +309,9 @@ def _validate_attempt_receipt(
     log_ref = payload["log_ref"]
     if "\\" in log_ref or not log_ref.endswith(f"/attempts/{payload['attempt_id']}/launcher.log"):
         raise S29RunnerBlocked("DETACHED_ATTEMPT_LOG_REF_INVALID")
+    expected_log_ref = f"{payload['run_root_ref'].rstrip('/')}/attempts/{payload['attempt_id']}/launcher.log"
+    if log_ref != expected_log_ref:
+        raise S29RunnerBlocked("DETACHED_ATTEMPT_LOG_REF_DRIFT")
     try:
         log_parts = PurePosixPath(log_ref).parts
     except (TypeError, ValueError) as error:
@@ -401,8 +418,11 @@ def _launch_attempts(run_root: Path, *, run_id: str, identity: Mapping[str, Any]
         for child in entry.iterdir():
             if child.is_symlink():
                 raise S29RunnerBlocked("DETACHED_ATTEMPT_SYMLINK_FORBIDDEN")
-            if child.name not in {"launch-receipt.json", "launch-running.json", "launch-failure.json"}:
+            if child.name not in {"launch-receipt.json", "launch-running.json", "launch-failure.json", "launcher.log"}:
                 raise S29RunnerBlocked("DETACHED_ATTEMPT_UNKNOWN_ARTIFACT")
+        log_path = entry / "launcher.log"
+        if log_path.is_symlink() or (log_path.exists() and not log_path.is_file()):
+            raise S29RunnerBlocked("DETACHED_ATTEMPT_LOG_INVALID")
         receipt_path = entry / "launch-receipt.json"
         if receipt_path.is_symlink() or not receipt_path.is_file():
             raise S29RunnerBlocked("DETACHED_ATTEMPT_RECEIPT_MISSING")
@@ -449,15 +469,14 @@ def _claim_detached_attempt(
             raise S29RunnerBlocked("DETACHED_ATTEMPT_RUNNING_SYMLINK_FORBIDDEN")
         if running_path.exists():
             running = _validate_attempt_receipt(load_canonical_json(running_path), run_id=run_id, identity=identity, running=True)
-            if any(running.get(name) != receipt.get(name) for name in ("attempt_id", "run_root_ref", "child_argv_hash", "execution_identity_hash")):
-                raise S29RunnerBlocked("DETACHED_ATTEMPT_RUNNING_IDENTITY_DRIFT")
-            if running.get("child_argv_hash") != child_argv_hash:
-                raise S29RunnerBlocked("DETACHED_ATTEMPT_COMMAND_DRIFT")
+            _validate_running_lineage(receipt, running)
             child_pid = running.get("child_pid")
             if not isinstance(child_pid, int) or child_pid <= 0:
                 raise S29RunnerBlocked("DETACHED_ATTEMPT_CHILD_PID_INVALID")
             if _pid_alive(child_pid):
                 raise S29RunnerBlocked(f"S29_DETACHED_LAUNCH_ALREADY_RUNNING:{child_pid}")
+            if running.get("child_argv_hash") != child_argv_hash:
+                raise S29RunnerBlocked("DETACHED_ATTEMPT_COMMAND_DRIFT")
         elif not (entry / "launch-failure.json").exists() and _pid_alive(int(receipt["parent_pid"])):
             raise S29RunnerBlocked(f"S29_DETACHED_LAUNCH_ALREADY_RUNNING:{receipt['parent_pid']}")
     attempts_root = run_root / "attempts"
@@ -678,7 +697,7 @@ def _detach(args: argparse.Namespace) -> dict[str, Any]:
     child[action_index] = "--execute"
     attempt_id = f"launch-{uuid.uuid4().hex}"
     child.extend(["--detached-child-marker", attempt_id, "--attempt-id", attempt_id])
-    child_argv_hash = canonical_json_hash(child)
+    child_argv_hash = _child_argv_hash(child)
     attempt_dir, receipt = _claim_detached_attempt(
         run_root,
         run_id=args.run_id,
@@ -749,14 +768,31 @@ def _require_detached_child(args: argparse.Namespace, *, identity: Mapping[str, 
         raise S29RunnerBlocked("DETACHED_CHILD_MARKER_REQUIRED")
     root = _data_root(args.data_root)
     run_root = _logical(root, args.run_root, field="run_root")
-    _launch_attempts(run_root, run_id=args.run_id, identity=identity)
     attempt_dir = run_root / "attempts" / marker
     if attempt_dir.is_symlink() or not attempt_dir.is_dir():
         raise S29RunnerBlocked("DETACHED_CHILD_ATTEMPT_NOT_FOUND")
     receipt_path = attempt_dir / "launch-receipt.json"
     running_path = attempt_dir / "launch-running.json"
-    if receipt_path.is_symlink() or running_path.is_symlink() or not receipt_path.is_file() or not running_path.is_file():
+    if receipt_path.is_symlink() or not receipt_path.is_file():
         raise S29RunnerBlocked("DETACHED_CHILD_RECEIPT_MISSING")
+    if running_path.is_symlink():
+        raise S29RunnerBlocked("DETACHED_CHILD_RECEIPT_MISSING")
+    if not running_path.is_file():
+        # Popen returns before the parent can publish launch-running.json.  A
+        # detached child may wait briefly for this one exact receipt, but may
+        # not wait through a missing/malformed/failure state indefinitely.
+        deadline = time.monotonic() + 10.0
+        while not running_path.exists():
+            failure_path = attempt_dir / "launch-failure.json"
+            if failure_path.exists():
+                _launch_attempts(run_root, run_id=args.run_id, identity=identity)
+                raise S29RunnerBlocked("DETACHED_CHILD_LAUNCH_FAILED")
+            if time.monotonic() >= deadline:
+                raise S29RunnerBlocked("DETACHED_CHILD_RUNNING_RECEIPT_TIMEOUT")
+            time.sleep(0.05)
+        if running_path.is_symlink() or not running_path.is_file():
+            raise S29RunnerBlocked("DETACHED_CHILD_RECEIPT_MISSING")
+    _launch_attempts(run_root, run_id=args.run_id, identity=identity)
     receipt = _validate_attempt_receipt(load_canonical_json(receipt_path), run_id=args.run_id, identity=identity)
     running = _validate_attempt_receipt(load_canonical_json(running_path), run_id=args.run_id, identity=identity, running=True)
     expected_run_root_ref = run_root.relative_to(root).as_posix()
@@ -767,7 +803,7 @@ def _require_detached_child(args: argparse.Namespace, *, identity: Mapping[str, 
     _validate_running_lineage(receipt, running)
     if running["child_pid"] != os.getpid():
         raise S29RunnerBlocked("DETACHED_CHILD_PID_IDENTITY_MISMATCH")
-    if canonical_json_hash(list(sys.argv[1:])) != receipt["child_argv_hash"]:
+    if _child_argv_hash(list(sys.argv[1:])) != receipt["child_argv_hash"]:
         raise S29RunnerBlocked("DETACHED_CHILD_COMMAND_DRIFT")
 
 

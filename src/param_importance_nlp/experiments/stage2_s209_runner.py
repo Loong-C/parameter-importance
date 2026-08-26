@@ -215,7 +215,19 @@ def _logical(root: Path, reference: str, *, field: str) -> Path:
     return target
 
 
+def _assert_no_symlink_path(path: Path, *, field: str) -> None:
+    """Audit lexical parent components before reading or writing an artifact."""
+
+    absolute = Path(path).absolute()
+    current = Path(absolute.anchor)
+    for part in absolute.parts[1:]:
+        current = current / part
+        if current.is_symlink():
+            raise S29RunnerBlocked(f"{field}:SYMLINK_COMPONENT_FORBIDDEN")
+
+
 def _write_once(path: Path, value: Mapping[str, Any], *, field: str) -> None:
+    _assert_no_symlink_path(path, field=field)
     if path.is_symlink():
         raise S29RunnerBlocked(f"{field}:SYMLINK_OUTPUT_FORBIDDEN")
     if path.exists():
@@ -790,6 +802,7 @@ class S29StatusStore:
         return replace(status, **{field: value if value is not None else getattr(status, field) for field, value in expected.items()})
 
     def load(self) -> S29DetachedStatus:
+        _assert_no_symlink_path(self.path, field="status")
         value = _load_object(self.path, field="status")
         required = {
             "schema_version", "run_id", "plan_hash", "status", "completed_tasks",
@@ -832,8 +845,7 @@ class S29StatusStore:
         status = self._bind_identity(status)
         if status.run_id != self.run_id or status.plan_hash != self.plan_hash:
             raise S29RunnerBlocked("STATUS_IDENTITY_MISMATCH")
-        if self.path.is_symlink():
-            raise S29RunnerBlocked("STATUS_SYMLINK_FORBIDDEN")
+        _assert_no_symlink_path(self.path, field="status")
         if self.path.exists():
             previous = self.load()
             if status.status not in self._ALLOWED[previous.status]:
@@ -1343,8 +1355,11 @@ class S29ProfilerRunner:
         self.run_id = _safe_id(run_id, field="runner.run_id")
         if self.preflight.measurement_plan.get("run_id") != self.run_id:
             raise S29RunnerBlocked("MEASUREMENT_PLAN_RUN_ID_MISMATCH")
+        preflight_root = getattr(self.preflight, "root", None)
+        if preflight_root is None:
+            raise S29RunnerBlocked("RUNNER_DATA_ROOT_REQUIRED")
         try:
-            data_root = resolve_data_root(self.preflight.root)
+            data_root = resolve_data_root(preflight_root)
             _run_root_ref, resolved_run_root = resolve_data_root_ref(
                 data_root,
                 run_root,
@@ -1385,6 +1400,25 @@ class S29ProfilerRunner:
             execution_identity=self.execution_identity,
         )
 
+    def _checked_output_path(self, path: Path, *, field: str) -> Path:
+        """Bind an output path to DATA_ROOT without resolving through symlinks."""
+
+        try:
+            data_root = resolve_data_root(self.preflight.root)
+            lexical = Path(path).absolute()
+            relative = lexical.relative_to(data_root.absolute()).as_posix()
+            if not relative:
+                raise ValueError("root is not an output file")
+            _ref, resolved = resolve_data_root_ref(
+                data_root,
+                relative,
+                field=field,
+                allow_absolute=False,
+            )
+        except (DataRootPathError, ValueError) as error:
+            raise S29RunnerBlocked(f"{field}:PATH_INVALID") from error
+        return resolved
+
     def _task_key(self, task: Mapping[str, Any]) -> str:
         return f"{task['semantic']}__{task.get('method','shared')}__{task['anchor_id']}__r{task['repetition']}"
 
@@ -1407,12 +1441,10 @@ class S29ProfilerRunner:
             or any(part in {"", ".", ".."} for part in logical.parts)
         ):
             raise S29RunnerBlocked("SHARED_POOL_REF_INVALID")
-        path = (self.run_root / Path(*logical.parts)).resolve()
-        try:
-            path.relative_to(self.run_root.resolve())
-        except ValueError as error:
-            raise S29RunnerBlocked("SHARED_POOL_REF_PATH_ESCAPE") from error
-        return path
+        return self._checked_output_path(
+            self.run_root / Path(*logical.parts),
+            field="shared_pool",
+        )
 
     def _run_root_ref(self) -> str | None:
         """Return the run-root path relative to DATA_ROOT when available."""
@@ -1604,8 +1636,7 @@ class S29ProfilerRunner:
                 terminal["finished_at"] = _now()
                 terminal["artifact_hash"] = canonical_json_hash({k: v for k, v in terminal.items() if k != "artifact_hash"})
                 terminal_path = self._attempt_path(task)
-                if terminal_path.is_symlink():
-                    raise S29RunnerBlocked("ATTEMPT_SYMLINK_FORBIDDEN")
+                _assert_no_symlink_path(terminal_path, field="attempt")
                 write_canonical_json(terminal_path, terminal)
                 completed[key] = row
         except Exception as error:
@@ -1619,8 +1650,7 @@ class S29ProfilerRunner:
                 failed["failure_reason"] = f"{type(error).__name__}:{error}"
                 failed["artifact_hash"] = canonical_json_hash({k: v for k, v in failed.items() if k != "artifact_hash"})
                 failed_path = self._attempt_path(task)
-                if failed_path.is_symlink():
-                    raise S29RunnerBlocked("ATTEMPT_SYMLINK_FORBIDDEN")
+                _assert_no_symlink_path(failed_path, field="attempt")
                 write_canonical_json(failed_path, failed)
             raise
 
@@ -1643,7 +1673,10 @@ class S29ProfilerRunner:
 
         key = str(task["anchor_id"])
         anchor_root = self.run_root / "anchors"
-        anchor_path = anchor_root / f"{key}.json"
+        anchor_path = self._checked_output_path(
+            anchor_root / f"{key}.json",
+            field=f"anchor.{key}",
+        )
         if anchor_path.exists():
             cached = _load_object(anchor_path, field=f"anchor.{key}")
             self._validate_anchor(cached, task)
@@ -1971,7 +2004,10 @@ class S29ProfilerRunner:
                 raise S29RunnerBlocked("FOUR_GPU_STAGE1_NUMERIC_REFERENCE_BINDING_INVALID")
             if anchor["stage1_numeric_comparison_hash"] != anchor["stage1_numeric_comparison"].get("artifact_hash"):
                 raise S29RunnerBlocked("FOUR_GPU_STAGE1_NUMERIC_COMPARISON_HASH_INVALID")
-            sidecar_path = self.run_root / Path(*S29_STAGE1_NUMERIC_CANDIDATE_REF.split("/"))
+            sidecar_path = self._checked_output_path(
+                self.run_root / Path(*S29_STAGE1_NUMERIC_CANDIDATE_REF.split("/")),
+                field="anchor.four-gpu-stage1-numeric",
+            )
             sidecar = _load_object(sidecar_path, field="anchor.four-gpu-stage1-numeric")
             if sidecar != numeric_artifact:
                 raise S29RunnerBlocked("FOUR_GPU_STAGE1_NUMERIC_SIDECAR_DRIFT")
@@ -2195,6 +2231,7 @@ class S29ProfilerRunner:
                 terminal["artifact_hash"] = canonical_json_hash({k: v for k, v in terminal.items() if k != "artifact_hash"})
                 if attempt.is_symlink():
                     raise S29RunnerBlocked("ATTEMPT_SYMLINK_FORBIDDEN")
+                _assert_no_symlink_path(attempt, field="attempt")
                 write_canonical_json(attempt, terminal)
                 completed[key] = row
             except Exception as error:
@@ -2207,6 +2244,7 @@ class S29ProfilerRunner:
                 failed["artifact_hash"] = canonical_json_hash({k: v for k, v in failed.items() if k != "artifact_hash"})
                 if attempt.is_symlink():
                     raise S29RunnerBlocked("ATTEMPT_SYMLINK_FORBIDDEN")
+                _assert_no_symlink_path(attempt, field="attempt")
                 write_canonical_json(attempt, failed)
         done_count = len(completed)
         status_completed = done_count + 2  # the single/four-card anchors

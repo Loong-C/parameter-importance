@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import hashlib
 from pathlib import Path
+import subprocess
 from types import SimpleNamespace
 import os
 
@@ -10,7 +12,7 @@ import pytest
 import ops.stage2.run_s209_g27a as launcher
 
 from param_importance_nlp.contracts.g21_formal_handoff import ALLOWED_DEVICES
-from param_importance_nlp.contracts.jsonio import canonical_json_hash, write_canonical_json
+from param_importance_nlp.contracts.jsonio import canonical_json_hash, load_canonical_json, write_canonical_json
 from param_importance_nlp.experiments.stage2_s207_formal import (
     APPROVED_GPU_UUIDS,
     EXCLUDED_GPU_UUID,
@@ -33,7 +35,7 @@ from param_importance_nlp.experiments.stage2_s209_runner import (
     validate_s209_gpu_inventory,
     validate_s209_io_evidence,
 )
-from param_importance_nlp.experiments.stage2_s209_g27a import S29FrozenInputs
+from param_importance_nlp.experiments.stage2_s209_g27a import S29FrozenInputs, S29G27ABlocked, _formal_file
 
 
 def _inventory() -> list[dict[str, object]]:
@@ -102,6 +104,68 @@ def _io(status: str = "QUIESCENT") -> dict[str, object]:
     return value
 
 
+def _write_s27_inventory(path: Path) -> dict[str, object]:
+    """Build the real S2.6 13-key wire used by the formal S2.9 loader."""
+
+    data_root = path.parent.parent
+    source_path = path.parent / "gpu-inventory.capture.txt"
+    source_bytes = b"test s2.6 live gpu capture\n"
+    source_path.parent.mkdir(parents=True, exist_ok=True)
+    source_path.write_bytes(source_bytes)
+    rows: list[dict[str, object]] = []
+    for row in _inventory():
+        rows.append(
+            {
+                "uuid": row["uuid"],
+                "pci_bus_id": row["pci_bus_id"],
+                "gpu_name": row["gpu_class"],
+                "temperature_c": 40.0,
+                "memory_used_mib": row["memory_used_mib"],
+                "memory_total_mib": row["memory_total_mib"],
+                "utilization_gpu_percent": row["utilization_gpu_percent"],
+                "compute_mode": "Default",
+                "ecc_uncorrected_volatile": row["ecc_uncorrected_volatile"],
+                "ecc_uncorrected_aggregate": row["ecc_uncorrected_aggregate"],
+                "row_remap_failure": 0,
+                "row_remap_pending": 0,
+                "row_remap_status": row["row_remap_status"],
+                "gpu_recovery_action": row["gpu_recovery_action"],
+                "health_state": "HEALTHY",
+                "compute_apps": [],
+            }
+        )
+    payload: dict[str, object] = {
+        "schema_version": "stage2-s206-gpu-inventory-v1",
+        "scope": "formal",
+        "status": "OBSERVED",
+        "checked_at": "2026-08-26T00:00:00+00:00",
+        "artifact_ref": path.relative_to(data_root).as_posix(),
+        "source_ref": source_path.relative_to(data_root).as_posix(),
+        "source_sha256": hashlib.sha256(source_bytes).hexdigest(),
+        "rows": rows,
+        "compute_apps": [],
+        "approved_gpu_uuids": list(APPROVED_GPU_UUIDS),
+        "excluded_pci": EXCLUDED_PCI,
+        "excluded_gpu_uuid": EXCLUDED_GPU_UUID,
+    }
+    payload["artifact_hash"] = canonical_json_hash(payload)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    write_canonical_json(path, payload)
+    return payload
+
+
+def _identity() -> dict[str, object]:
+    body: dict[str, object] = {
+        "schema_version": launcher.S29_EXECUTION_IDENTITY_SCHEMA,
+        "repository_head": "a" * 40,
+        "launcher_source_sha256": "b" * 64,
+        "profiler_command_hash": "c" * 64,
+        "repository_clean": True,
+    }
+    body["artifact_hash"] = canonical_json_hash(body)
+    return body
+
+
 def test_s209_inventory_keeps_excluded_gpu_out_of_selection() -> None:
     summary = validate_s209_gpu_inventory(_inventory())
     assert summary["selected_gpu_uuids"] == list(APPROVED_GPU_UUIDS)
@@ -118,33 +182,25 @@ def test_s209_inventory_rejects_excluded_pci_bound_to_approved_uuid() -> None:
 
 
 def test_s209_inventory_envelope_is_hash_bound_and_complete(tmp_path: Path) -> None:
-    payload: dict[str, object] = {
-        "schema_version": S29_INVENTORY_SCHEMA,
-        "source_ref": "evidence/gpu-inventory.json",
-        "rows": _inventory(),
-        "compute_apps": [],
-    }
-    payload["artifact_hash"] = canonical_json_hash(payload)
     path = tmp_path / "evidence/gpu-inventory.json"
-    path.parent.mkdir(parents=True)
-    write_canonical_json(path, payload)
-    summary, identity = _load_inventory_envelope(payload, root=tmp_path, inventory_ref=path)
+    payload = _write_s27_inventory(path)
+    summary, identity = _load_inventory_envelope(payload, root=tmp_path, inventory_ref="evidence/gpu-inventory.json")
     assert summary["inventory_count"] == 8
     assert identity["artifact_hash"] == payload["artifact_hash"]
     assert len(identity["source_sha256"]) == 64
     tampered = dict(payload)
     tampered["rows"] = list(payload["rows"])  # type: ignore[arg-type]
     tampered["rows"][0] = {**tampered["rows"][0], "memory_used_mib": 1}  # type: ignore[index]
-    with pytest.raises(S29RunnerBlocked, match="ARTIFACT_HASH_MISMATCH"):
-        _load_inventory_envelope(tampered, root=tmp_path, inventory_ref=path)
+    with pytest.raises(S29RunnerBlocked, match="CALLER_MAPPING_DRIFT"):
+        _load_inventory_envelope(tampered, root=tmp_path, inventory_ref="evidence/gpu-inventory.json")
 
     wrong_ref = dict(payload)
     wrong_ref["source_ref"] = "evidence/another-inventory.json"
     wrong_ref["artifact_hash"] = canonical_json_hash(
         {key: value for key, value in wrong_ref.items() if key != "artifact_hash"}
     )
-    with pytest.raises(S29RunnerBlocked, match="SOURCE_REF_PATH_MISMATCH"):
-        _load_inventory_envelope(wrong_ref, root=tmp_path, inventory_ref=path)
+    with pytest.raises(S29RunnerBlocked, match="CALLER_MAPPING_DRIFT"):
+        _load_inventory_envelope(wrong_ref, root=tmp_path, inventory_ref="evidence/gpu-inventory.json")
 
 
 @pytest.mark.parametrize(
@@ -276,7 +332,7 @@ def test_s209_task_list_rejects_plan_run_id_rebinding() -> None:
         _task_list(preflight, run_id="different-run")
 
 
-def _shared_group_fixture() -> tuple[SimpleNamespace, list[dict[str, object]], dict[str, object], dict[str, object]]:
+def _shared_group_fixture(tmp_path: Path) -> tuple[SimpleNamespace, list[dict[str, object]], dict[str, object], dict[str, object]]:
     frozen = S29FrozenInputs(
         matrix_hash="a" * 64,
         g24b_gate_hash="b" * 64,
@@ -297,6 +353,7 @@ def _shared_group_fixture() -> tuple[SimpleNamespace, list[dict[str, object]], d
         "rows": [{"anchor_id": "shared-a", "repetition": 0, "method_order": ["double", "raw", "u"]}],
     }
     preflight = SimpleNamespace(
+        root=tmp_path,
         measurement_plan=plan,
         plan_hash="d" * 64,
         frozen=frozen,
@@ -407,25 +464,25 @@ def _shared_bundle(tasks: list[dict[str, object]]) -> dict[str, object]:
 
 
 def test_s209_shared_semantic_uses_one_serial_pooled_worker(tmp_path: Path) -> None:
-    preflight, tasks, io_evidence, inventory_identity = _shared_group_fixture()
+    preflight, tasks, io_evidence, inventory_identity = _shared_group_fixture(tmp_path)
     calls: list[dict[str, str]] = []
 
     def profiler(_task, *, environment):
         calls.append(dict(environment))
         return _shared_bundle(tasks)
 
-    runner = S29ProfilerRunner(preflight=preflight, run_id="s209-run", run_root=tmp_path, profiler=profiler)
+    runner = S29ProfilerRunner(preflight=preflight, run_id="s209-run", run_root=tmp_path / "run", profiler=profiler)
     completed: dict[str, dict[str, object]] = {}
     runner._run_shared_group(tasks, completed=completed)
     assert len(calls) == 1
     assert calls[0]["S29_METHOD"] == "shared"
     assert calls[0]["CUDA_VISIBLE_DEVICES"] == APPROVED_GPU_UUIDS[0]
     assert len(completed) == 3
-    assert (tmp_path / "shared-pools" / f"{tasks[0]['paired_run_id']}.json").exists()
+    assert (tmp_path / "run" / "shared-pools" / f"{tasks[0]['paired_run_id']}.json").exists()
 
 
-def test_s209_shared_bundle_rejects_pool_tamper_and_method_mislabel() -> None:
-    preflight, tasks, io_evidence, inventory_identity = _shared_group_fixture()
+def test_s209_shared_bundle_rejects_pool_tamper_and_method_mislabel(tmp_path: Path) -> None:
+    preflight, tasks, io_evidence, inventory_identity = _shared_group_fixture(tmp_path)
     bundle = _shared_bundle(tasks)
     tampered_pool = dict(bundle["shared_pool"])
     tampered_pool["token_count"] = 2048
@@ -520,22 +577,219 @@ def test_s209_four_card_anchor_requires_worker_gpu_uuid_set() -> None:
 
 
 def test_s209_detach_rejects_duplicate_launch_lease(monkeypatch, tmp_path: Path) -> None:
-    monkeypatch.setattr(launcher, "_preflight", lambda _args: {})
+    monkeypatch.setattr(launcher, "_preflight", lambda _args: {"execution_identity": _identity()})
+    monkeypatch.setattr(launcher, "_repository_path", lambda _path: Path(__file__).parents[1])
     monkeypatch.setattr(launcher.subprocess, "Popen", lambda *args, **kwargs: SimpleNamespace(pid=os.getpid()))
     monkeypatch.setattr(launcher.sys, "argv", ["run_s209_g27a.py", "--detach"])
     args = SimpleNamespace(
         profiler_command=["profiler"],
         data_root=tmp_path,
+        repository=Path(__file__).parents[1],
         run_root="runs/s209",
         run_id="s209-run",
     )
-    launcher._detach(args)
+    returned = launcher._detach(args)
+    assert returned["log_ref"] == "runs/s209/attempts/" + returned["attempt_id"] + "/launcher.log"
+    assert returned == load_canonical_json(tmp_path / "runs/s209" / "attempts" / returned["attempt_id"] / "launch-running.json")
     with pytest.raises(S29RunnerBlocked, match="ALREADY_RUNNING"):
         launcher._detach(args)
 
 
+def test_s209_detached_receipts_are_full_lineage_bound(tmp_path: Path) -> None:
+    identity = _identity()
+    run_root = tmp_path / "runs" / "s209"
+    attempt_id = "launch-" + "1" * 32
+    attempt_dir = run_root / "attempts" / attempt_id
+    attempt_dir.mkdir(parents=True)
+    receipt = launcher._attempt_identity(
+        run_id="s209-run",
+        run_root_ref="runs/s209",
+        identity=identity,
+        attempt_id=attempt_id,
+        child_argv_hash="d" * 64,
+        parent_pid=999999,
+    )
+    write_canonical_json(attempt_dir / "launch-receipt.json", receipt)
+    running = dict(receipt)
+    running.update({"status": "RUNNING", "child_pid": 999999, "started_at": "2026-08-26T00:00:00+00:00"})
+    running["artifact_hash"] = canonical_json_hash({key: value for key, value in running.items() if key != "artifact_hash"})
+    write_canonical_json(attempt_dir / "launch-running.json", running)
+    (attempt_dir / "launcher.log").write_bytes(b"worker output\n")
+    assert launcher._launch_attempts(run_root, run_id="s209-run", identity=identity)
+
+    bad_log = dict(receipt, log_ref=f"runs/other/attempts/{attempt_id}/launcher.log")
+    bad_log["artifact_hash"] = canonical_json_hash(
+        {key: value for key, value in bad_log.items() if key != "artifact_hash"}
+    )
+    with pytest.raises(S29RunnerBlocked, match="LOG_REF_DRIFT"):
+        launcher._validate_attempt_receipt(bad_log, run_id="s209-run", identity=identity)
+
+    drifted = dict(
+        running,
+        run_root_ref="runs/other",
+        log_ref=f"runs/other/attempts/{attempt_id}/launcher.log",
+    )
+    drifted["artifact_hash"] = canonical_json_hash({key: value for key, value in drifted.items() if key != "artifact_hash"})
+    write_canonical_json(attempt_dir / "launch-running.json", drifted)
+    with pytest.raises(S29RunnerBlocked, match="RUNNING_RECEIPT_DRIFT"):
+        launcher._launch_attempts(run_root, run_id="s209-run", identity=identity)
+
+    failure = launcher._attempt_failure(receipt, reason="SPAWN_FAILED")
+    bad_failure = dict(
+        failure,
+        attempt=dict(
+            receipt,
+            run_root_ref="runs/other",
+            log_ref=f"runs/other/attempts/{attempt_id}/launcher.log",
+        ),
+    )
+    bad_failure["attempt"]["artifact_hash"] = canonical_json_hash(
+        {key: value for key, value in bad_failure["attempt"].items() if key != "artifact_hash"}
+    )
+    bad_failure["artifact_hash"] = canonical_json_hash(
+        {key: value for key, value in bad_failure.items() if key != "artifact_hash"}
+    )
+    with pytest.raises(S29RunnerBlocked, match="FAILURE_RECEIPT_DRIFT"):
+        launcher._validate_attempt_failure(bad_failure, run_id="s209-run", identity=identity, receipt=receipt)
+
+
+def test_s209_detached_child_waits_for_parent_running_receipt(tmp_path: Path, monkeypatch) -> None:
+    identity = _identity()
+    run_root = tmp_path / "runs" / "s209"
+    attempt_id = "launch-" + "2" * 32
+    attempt_dir = run_root / "attempts" / attempt_id
+    attempt_dir.mkdir(parents=True)
+    child_argv = ["--execute", "--attempt-id", attempt_id, "--detached-child-marker", attempt_id]
+    monkeypatch.setattr(launcher.sys, "argv", ["run_s209_g27a.py", *child_argv])
+    receipt = launcher._attempt_identity(
+        run_id="s209-run",
+        run_root_ref="runs/s209",
+        identity=identity,
+        attempt_id=attempt_id,
+        child_argv_hash=launcher._child_argv_hash(child_argv),
+        parent_pid=999999,
+    )
+    write_canonical_json(attempt_dir / "launch-receipt.json", receipt)
+    state = {"published": False}
+
+    def publish_running(_seconds: float) -> None:
+        if state["published"]:
+            return
+        running = dict(receipt, status="RUNNING", child_pid=os.getpid(), started_at="2026-08-26T00:00:00+00:00")
+        running["artifact_hash"] = canonical_json_hash(
+            {key: value for key, value in running.items() if key != "artifact_hash"}
+        )
+        write_canonical_json(attempt_dir / "launch-running.json", running)
+        state["published"] = True
+
+    monkeypatch.setattr(launcher.time, "sleep", publish_running)
+    args = SimpleNamespace(
+        data_root=tmp_path,
+        run_root="runs/s209",
+        run_id="s209-run",
+        detached_child_marker=attempt_id,
+        attempt_id=attempt_id,
+    )
+    launcher._require_detached_child(args, identity=identity)
+    assert state["published"] is True
+
+
+def test_s209_stale_running_receipt_rejects_command_substitution(tmp_path: Path) -> None:
+    identity = _identity()
+    run_root = tmp_path / "runs" / "s209"
+    attempt_id = "launch-" + "3" * 32
+    attempt_dir = run_root / "attempts" / attempt_id
+    attempt_dir.mkdir(parents=True)
+    receipt = launcher._attempt_identity(
+        run_id="s209-run",
+        run_root_ref="runs/s209",
+        identity=identity,
+        attempt_id=attempt_id,
+        child_argv_hash="d" * 64,
+        parent_pid=999999,
+    )
+    write_canonical_json(attempt_dir / "launch-receipt.json", receipt)
+    running = dict(receipt, status="RUNNING", child_pid=999999, started_at="2026-08-26T00:00:00+00:00")
+    running["artifact_hash"] = canonical_json_hash(
+        {key: value for key, value in running.items() if key != "artifact_hash"}
+    )
+    write_canonical_json(attempt_dir / "launch-running.json", running)
+    with pytest.raises(S29RunnerBlocked, match="COMMAND_DRIFT"):
+        launcher._claim_detached_attempt(
+            run_root,
+            run_id="s209-run",
+            run_root_ref="runs/s209",
+            identity=identity,
+            child_argv_hash="e" * 64,
+            attempt_id="launch-" + "4" * 32,
+        )
+
+
+def test_s209_logical_root_and_component_symlinks_fail_closed(tmp_path: Path) -> None:
+    linked_root = tmp_path / "root-link"
+    try:
+        linked_root.symlink_to(tmp_path, target_is_directory=True)
+    except OSError:
+        pytest.skip("symlink creation is unavailable on this Windows host")
+    with pytest.raises(S29RunnerBlocked, match="SYMLINK_COMPONENT"):
+        launcher._logical(linked_root, "child.json", field="data_root")
+
+    real_dir = tmp_path / "real"
+    real_dir.mkdir()
+    component_link = tmp_path / "component-link"
+    try:
+        component_link.symlink_to(real_dir, target_is_directory=True)
+    except OSError:
+        pytest.skip("symlink creation is unavailable on this Windows host")
+    with pytest.raises(S29RunnerBlocked, match="SYMLINK_COMPONENT"):
+        launcher._logical(tmp_path, "component-link/child.json", field="input")
+
+
+def test_s209_repository_probe_failure_and_timeout_block(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(
+        launcher.subprocess,
+        "run",
+        lambda *args, **kwargs: (_ for _ in ()).throw(OSError("git unavailable")),
+    )
+    with pytest.raises(S29RunnerBlocked, match="GIT_TOP_LEVEL_UNAVAILABLE"):
+        launcher._repository_path(tmp_path)
+
+    def timeout(*args, **kwargs):
+        raise subprocess.TimeoutExpired(cmd="git", timeout=30)
+
+    monkeypatch.setattr(launcher.subprocess, "run", timeout)
+    with pytest.raises(S29RunnerBlocked, match="GIT_TOP_LEVEL_UNAVAILABLE"):
+        launcher._repository_path(tmp_path)
+
+
+def test_s209_formal_anchor_reload_is_disk_and_hash_bound(tmp_path: Path) -> None:
+    path = tmp_path / "run" / "anchors" / "single-gpu-anchor.json"
+    payload: dict[str, object] = {"status": "PASS", "measurement_kind": "actual"}
+    payload["artifact_hash"] = canonical_json_hash(payload)
+    path.parent.mkdir(parents=True)
+    write_canonical_json(path, payload)
+    loaded, reference = _formal_file(
+        tmp_path,
+        "run/anchors/single-gpu-anchor.json",
+        filename="single-gpu-anchor.json",
+        field="single_anchor",
+    )
+    assert loaded == payload
+    assert reference == "run/anchors/single-gpu-anchor.json"
+    tampered = dict(payload, status="BLOCKED")
+    write_canonical_json(path, tampered)
+    with pytest.raises(S29G27ABlocked, match="ARTIFACT_HASH_MISMATCH"):
+        _formal_file(
+            tmp_path,
+            "run/anchors/single-gpu-anchor.json",
+            filename="single-gpu-anchor.json",
+            field="single_anchor",
+        )
+
+
 def test_s209_detach_child_runs_execute_action(monkeypatch, tmp_path: Path) -> None:
-    monkeypatch.setattr(launcher, "_preflight", lambda _args: {})
+    monkeypatch.setattr(launcher, "_preflight", lambda _args: {"execution_identity": _identity()})
+    monkeypatch.setattr(launcher, "_repository_path", lambda _path: Path(__file__).parents[1])
     captured: dict[str, object] = {}
 
     def fake_popen(command, **kwargs):
@@ -547,6 +801,7 @@ def test_s209_detach_child_runs_execute_action(monkeypatch, tmp_path: Path) -> N
     args = SimpleNamespace(
         profiler_command=["profiler"],
         data_root=tmp_path,
+        repository=Path(__file__).parents[1],
         run_root="runs/s209",
         run_id="s209-run",
     )
@@ -558,7 +813,8 @@ def test_s209_detach_child_runs_execute_action(monkeypatch, tmp_path: Path) -> N
 
 
 def test_s209_detach_rewrites_only_launcher_action(monkeypatch, tmp_path: Path) -> None:
-    monkeypatch.setattr(launcher, "_preflight", lambda _args: {})
+    monkeypatch.setattr(launcher, "_preflight", lambda _args: {"execution_identity": _identity()})
+    monkeypatch.setattr(launcher, "_repository_path", lambda _path: Path(__file__).parents[1])
     captured: dict[str, object] = {}
 
     def fake_popen(command, **kwargs):
@@ -582,6 +838,7 @@ def test_s209_detach_rewrites_only_launcher_action(monkeypatch, tmp_path: Path) 
     args = SimpleNamespace(
         profiler_command=["worker", "--detach"],
         data_root=tmp_path,
+        repository=Path(__file__).parents[1],
         run_root="runs/s209",
         run_id="s209-run",
     )
@@ -615,6 +872,7 @@ def test_s209_anchor_failure_publishes_terminal_blocked_status(tmp_path: Path) -
         ],
     }
     preflight = SimpleNamespace(
+        root=tmp_path,
         measurement_plan=plan,
         frozen=frozen,
         inventory={"inventory_identity": {"artifact_hash": "1" * 64, "source_sha256": "2" * 64}},
@@ -637,7 +895,7 @@ def test_s209_anchor_failure_publishes_terminal_blocked_status(tmp_path: Path) -
 
 
 def test_s209_detach_rejects_stale_lease_without_relaunch_or_unlink(monkeypatch, tmp_path: Path) -> None:
-    monkeypatch.setattr(launcher, "_preflight", lambda _args: {})
+    monkeypatch.setattr(launcher, "_preflight", lambda _args: {"execution_identity": _identity()})
     monkeypatch.setattr(launcher.subprocess, "Popen", lambda *args, **kwargs: pytest.fail("stale lease must block before Popen"))
     run_root = tmp_path / "runs" / "s209"
     run_root.mkdir(parents=True)
@@ -651,22 +909,24 @@ def test_s209_detach_rejects_stale_lease_without_relaunch_or_unlink(monkeypatch,
     lease_path = run_root / "launcher.lease.json"
     write_canonical_json(lease_path, lease)
     before = lease_path.read_bytes()
-    args = SimpleNamespace(profiler_command=["profiler"], data_root=tmp_path, run_root="runs/s209", run_id="s209-run")
-    with pytest.raises(S29RunnerBlocked, match="ALREADY_RUNNING"):
+    args = SimpleNamespace(profiler_command=["profiler"], data_root=tmp_path, repository=Path(__file__).parents[1], run_root="runs/s209", run_id="s209-run")
+    monkeypatch.setattr(launcher.sys, "argv", ["run_s209_g27a.py", "--detach"])
+    with pytest.raises(S29RunnerBlocked, match="LEGACY_LAUNCH_MANIFEST"):
         launcher._detach(args)
     assert lease_path.read_bytes() == before
 
 
 def test_s209_detach_rejects_existing_dead_pid_manifest(monkeypatch, tmp_path: Path) -> None:
-    monkeypatch.setattr(launcher, "_preflight", lambda _args: {})
+    monkeypatch.setattr(launcher, "_preflight", lambda _args: {"execution_identity": _identity()})
     monkeypatch.setattr(launcher.subprocess, "Popen", lambda *args, **kwargs: pytest.fail("PID manifest must block before Popen"))
     run_root = tmp_path / "runs" / "s209"
     run_root.mkdir(parents=True)
     payload = {"schema_version": "stage2-s209-g27a-detached-launch-v1", "pid": 999999, "run_id": "s209-run"}
     payload["artifact_hash"] = canonical_json_hash(payload)
     write_canonical_json(run_root / "launcher.pid.json", payload)
-    args = SimpleNamespace(profiler_command=["profiler"], data_root=tmp_path, run_root="runs/s209", run_id="s209-run")
-    with pytest.raises(S29RunnerBlocked, match="ALREADY_RUNNING"):
+    args = SimpleNamespace(profiler_command=["profiler"], data_root=tmp_path, repository=Path(__file__).parents[1], run_root="runs/s209", run_id="s209-run")
+    monkeypatch.setattr(launcher.sys, "argv", ["run_s209_g27a.py", "--detach"])
+    with pytest.raises(S29RunnerBlocked, match="LEGACY_LAUNCH_MANIFEST"):
         launcher._detach(args)
 
 
