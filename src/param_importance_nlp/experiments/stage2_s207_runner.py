@@ -326,6 +326,8 @@ def load_s27_gpu_inventory_envelope(
             source_path.relative_to(root)
         except (OSError, ValueError) as error:
             raise S27ExecutionBlocked("GPU_INVENTORY_SOURCE_REF_PATH_INVALID") from error
+        if source_ref != source_path.relative_to(root).as_posix():
+            raise S27ExecutionBlocked("GPU_INVENTORY_SOURCE_REF_NOT_CANONICAL")
         if source_path == resolved:
             raise S27ExecutionBlocked("GPU_INVENTORY_SOURCE_REF_SELF_REFERENCE")
     else:
