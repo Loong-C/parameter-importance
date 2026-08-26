@@ -343,35 +343,12 @@ def _load_inventory_snapshot(
 
 
 def _inventory(path: Path | None, *, data_root: Path | None = None) -> list[dict[str, object]]:
-    if path is not None:
-        rows, _identity = _load_inventory_snapshot(
-            path,
-            data_root=(data_root.resolve() if data_root is not None else path.resolve().parent),
-        )
-        return rows
-    try:
-        completed = subprocess.run(
-            ["nvidia-smi", "--query-gpu=index,uuid,pci.bus_id,memory.used,memory.total,utilization.gpu,ecc.errors.uncorrected.volatile.total,ecc.errors.uncorrected.aggregate.total", "--format=csv,noheader,nounits"],
-            check=True,
-            capture_output=True,
-            text=True,
-        )
-    except (OSError, subprocess.CalledProcessError) as error:
-        raise S25ExecutionBlocked(f"S205_GPU_INVENTORY_UNAVAILABLE:{type(error).__name__}") from error
-    rows: list[dict[str, object]] = []
-    for line in completed.stdout.splitlines():
-        fields = [item.strip() for item in line.split(",")]
-        if len(fields) == 8:
-            rows.append({
-                "index": fields[0], "uuid": fields[1], "pci_bus_id": fields[2],
-                "memory_used_mib": fields[3], "memory_total_mib": fields[4],
-                "utilization_gpu_percent": fields[5],
-                "ecc_uncorrected_volatile": fields[6],
-                "ecc_uncorrected_aggregate": fields[7],
-                "gpu_recovery_action": "None",
-            })
-    if not rows:
-        raise S25ExecutionBlocked("S205_GPU_INVENTORY_EMPTY")
+    if path is None:
+        raise S25ExecutionBlocked("S205_GPU_INVENTORY_JSON_REQUIRED")
+    rows, _identity = _load_inventory_snapshot(
+        path,
+        data_root=(data_root.resolve() if data_root is not None else path.resolve().parent),
+    )
     return rows
 
 
