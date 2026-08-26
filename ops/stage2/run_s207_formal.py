@@ -19,6 +19,7 @@ from pathlib import Path
 import subprocess
 import sys
 import time
+import uuid
 from typing import Mapping, Sequence
 
 _REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
@@ -39,6 +40,7 @@ from param_importance_nlp.experiments.stage2_s207_formal import (
 from param_importance_nlp.experiments.stage2_s207_runner import (
     S27DetachedLauncher,
     S27ExecutionBlocked,
+    S27_LAUNCH_STATUS_FIELDS,
     S27ProductionWorker,
     build_s27_worker_command,
     load_s27_frozen_mappings,
@@ -46,6 +48,16 @@ from param_importance_nlp.experiments.stage2_s207_runner import (
     load_s27_plan,
     load_s27_shard_plan,
     load_s27_gpu_inventory_envelope,
+)
+from param_importance_nlp.experiments.stage2_path_security import (
+    DataRootPathError,
+    resolve_data_root,
+    resolve_data_root_ref,
+)
+from param_importance_nlp.experiments.stage2_executor_identity import (
+    ExecutorIdentityError,
+    compute_executor_identity,
+    validate_executor_identity,
 )
 from param_importance_nlp.contracts.task_catalog import DEFAULT_TASK_CATALOG
 from param_importance_nlp.runtime.task_runtime import TaskExecutionRequest, TaskRuntimeEnvironment
@@ -56,17 +68,312 @@ def _now() -> str:
 
 
 def _logical(root: Path, value: str, *, field: str) -> Path:
-    if not isinstance(value, str) or not value or "\\" in value:
-        raise S27ExecutionBlocked(f"{field}:INVALID_LOGICAL_REFERENCE")
-    path = Path(value)
-    if path.is_absolute() or any(part in {"", ".", ".."} for part in path.parts):
-        raise S27ExecutionBlocked(f"{field}:PATH_ESCAPE")
-    result = (root / path).resolve()
     try:
-        result.relative_to(root.resolve())
-    except ValueError as error:
-        raise S27ExecutionBlocked(f"{field}:PATH_ESCAPE") from error
+        _ref, result = resolve_data_root_ref(root, value, field=field, allow_absolute=False)
+        return result
+    except DataRootPathError as error:
+        raise S27ExecutionBlocked(str(error)) from error
+
+
+def _canonical_ref(root: Path, value: str | Path, *, field: str) -> tuple[str, Path]:
+    try:
+        return resolve_data_root_ref(root, value, field=field, allow_absolute=False)
+    except DataRootPathError as error:
+        raise S27ExecutionBlocked(str(error)) from error
+
+
+def _data_root(value: str | Path) -> Path:
+    try:
+        return resolve_data_root(value)
+    except DataRootPathError as error:
+        raise S27ExecutionBlocked(f"S27_DATA_ROOT_INVALID:{error}") from error
+
+
+def _executor_identity(repository: str | Path) -> dict[str, object]:
+    try:
+        return compute_executor_identity(repository, Path(__file__))
+    except ExecutorIdentityError as error:
+        raise S27ExecutionBlocked(f"S27_EXECUTOR_IDENTITY_INVALID:{error}") from error
+
+
+def _validate_live_executor_identity(
+    declared: object,
+    *,
+    repository: str | Path,
+) -> dict[str, object]:
+    try:
+        expected = validate_executor_identity(declared)
+        current = compute_executor_identity(repository, Path(__file__))
+    except ExecutorIdentityError as error:
+        raise S27ExecutionBlocked(f"S27_EXECUTOR_IDENTITY_INVALID:{error}") from error
+    if current != expected:
+        raise S27ExecutionBlocked("S27_EXECUTOR_IDENTITY_DRIFT")
+    return expected
+
+
+S27_DETACHED_LAUNCH_FIELDS = frozenset(
+    {
+        "schema_version",
+        "attempt_id",
+        "attempt_ref",
+        "pid",
+        "run_id",
+        "plan_ref",
+        "plan_hash",
+        "run_root_ref",
+        "log_ref",
+        "status_ref",
+        "gpu_inventory_identity",
+        "preflight_artifact_hash",
+        "execution_evidence_ref",
+        "execution_evidence_hash",
+        "recovery_command",
+        "confirmatory_draws_generated",
+        "executor_identity",
+        "artifact_hash",
+    }
+)
+S27_DETACHED_FAILURE_FIELDS = frozenset(
+    {
+        "schema_version",
+        "attempt_id",
+        "attempt_ref",
+        "pid",
+        "run_id",
+        "plan_ref",
+        "plan_hash",
+        "run_root_ref",
+        "log_ref",
+        "status_ref",
+        "gpu_inventory_identity",
+        "preflight_artifact_hash",
+        "execution_evidence_ref",
+        "execution_evidence_hash",
+        "executor_identity",
+        "status",
+        "failure_reason",
+        "cleanup_error",
+        "artifact_hash",
+    }
+)
+
+
+def _validate_detached_ref(value: object, *, field: str) -> str:
+    if (
+        not isinstance(value, str)
+        or not value
+        or "\\" in value
+        or Path(value).is_absolute()
+        or Path(value).as_posix() != value
+        or any(part in {"", ".", ".."} for part in Path(value).parts)
+    ):
+        raise S27ExecutionBlocked(f"S27_DETACHED_RECEIPT_{field.upper()}_REF_INVALID")
+    return value
+
+
+def _validate_receipt_gpu_identity(value: object) -> dict[str, object]:
+    required = {"source_ref", "artifact_ref", "artifact_hash", "source_sha256", "schema_version"}
+    if not isinstance(value, Mapping) or set(value) != required:
+        raise S27ExecutionBlocked("S27_DETACHED_RECEIPT_GPU_INVENTORY_IDENTITY_INVALID")
+    result = dict(value)
+    for field in required:
+        if not isinstance(result.get(field), str) or not result[field]:
+            raise S27ExecutionBlocked(f"S27_DETACHED_RECEIPT_GPU_IDENTITY_{field.upper()}_INVALID")
+    for field in ("artifact_hash", "source_sha256"):
+        if len(str(result[field])) != 64 or any(char not in "0123456789abcdef" for char in str(result[field])):
+            raise S27ExecutionBlocked(f"S27_DETACHED_RECEIPT_GPU_IDENTITY_{field.upper()}_INVALID")
     return result
+
+
+def _validate_receipt_refs(value: Mapping[str, object]) -> None:
+    refs = {field: _validate_detached_ref(value.get(field), field=field) for field in (
+        "attempt_ref", "run_root_ref", "log_ref", "status_ref", "plan_ref", "execution_evidence_ref"
+    )}
+    attempt_id = value.get("attempt_id")
+    if (
+        not isinstance(attempt_id, str)
+        or not attempt_id
+        or "/" in attempt_id
+        or "\\" in attempt_id
+        or Path(attempt_id).parts != (attempt_id,)
+    ):
+        raise S27ExecutionBlocked("S27_DETACHED_RECEIPT_ATTEMPT_ID_INVALID")
+    if refs["attempt_ref"] != f"{refs['run_root_ref']}/attempts/{attempt_id}":
+        raise S27ExecutionBlocked("S27_DETACHED_RECEIPT_ATTEMPT_REF_MISMATCH")
+    if refs["log_ref"] != f"{refs['attempt_ref']}/launcher.log":
+        raise S27ExecutionBlocked("S27_DETACHED_RECEIPT_LOG_REF_MISMATCH")
+    if refs["status_ref"] != f"{refs['run_root_ref']}/launcher-status.json":
+        raise S27ExecutionBlocked("S27_DETACHED_RECEIPT_STATUS_REF_MISMATCH")
+    inventory = _validate_receipt_gpu_identity(value.get("gpu_inventory_identity"))
+    if inventory["schema_version"] != "stage2-s206-gpu-inventory-v1":
+        raise S27ExecutionBlocked("S27_DETACHED_RECEIPT_GPU_IDENTITY_SCHEMA_INVALID")
+    if inventory["source_ref"] == inventory["artifact_ref"]:
+        raise S27ExecutionBlocked("S27_DETACHED_RECEIPT_GPU_IDENTITY_SELF_REFERENCE")
+    _validate_detached_ref(inventory["artifact_ref"], field="gpu_inventory_artifact")
+    _validate_detached_ref(inventory["source_ref"], field="gpu_inventory_source")
+    try:
+        validate_executor_identity(value.get("executor_identity"))
+    except ExecutorIdentityError as error:
+        raise S27ExecutionBlocked(f"S27_DETACHED_RECEIPT_EXECUTOR_IDENTITY_INVALID:{error}") from error
+
+
+def _detached_launch_receipt(value: object) -> int:
+    if not isinstance(value, Mapping) or set(value) != S27_DETACHED_LAUNCH_FIELDS:
+        raise S27ExecutionBlocked("S27_DETACHED_LAUNCH_RECEIPT_FIELDS_INVALID")
+    if value.get("schema_version") != "stage2-s27-detached-launch-v1":
+        raise S27ExecutionBlocked("S27_DETACHED_LAUNCH_RECEIPT_SCHEMA_INVALID")
+    _validate_receipt_refs(value)
+    pid = value.get("pid")
+    if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+        raise S27ExecutionBlocked("S27_DETACHED_LAUNCH_RECEIPT_PID_INVALID")
+    if value.get("recovery_command") != "--wait" or value.get("confirmatory_draws_generated") is not False:
+        raise S27ExecutionBlocked("S27_DETACHED_LAUNCH_RECEIPT_POLICY_INVALID")
+    declared = value.get("artifact_hash")
+    if not isinstance(declared, str) or len(declared) != 64 or any(char not in "0123456789abcdef" for char in declared):
+        raise S27ExecutionBlocked("S27_DETACHED_LAUNCH_RECEIPT_HASH_INVALID")
+    if declared != canonical_json_hash({key: item for key, item in value.items() if key != "artifact_hash"}):
+        raise S27ExecutionBlocked("S27_DETACHED_LAUNCH_RECEIPT_HASH_INVALID")
+    return pid
+
+
+def _detached_failure_receipt(value: object) -> int | None:
+    if not isinstance(value, Mapping) or set(value) != S27_DETACHED_FAILURE_FIELDS:
+        raise S27ExecutionBlocked("S27_DETACHED_FAILURE_RECEIPT_FIELDS_INVALID")
+    if value.get("schema_version") != "stage2-s27-detached-failure-v1":
+        raise S27ExecutionBlocked("S27_DETACHED_FAILURE_RECEIPT_SCHEMA_INVALID")
+    _validate_receipt_refs(value)
+    status = value.get("status")
+    if status not in {"SPAWN_FAILED", "RECEIPT_WRITE_FAILED"}:
+        raise S27ExecutionBlocked("S27_DETACHED_FAILURE_RECEIPT_STATUS_INVALID")
+    if not isinstance(value.get("failure_reason"), str) or not value.get("failure_reason"):
+        raise S27ExecutionBlocked("S27_DETACHED_FAILURE_RECEIPT_REASON_INVALID")
+    if value.get("cleanup_error") is not None and not isinstance(value.get("cleanup_error"), str):
+        raise S27ExecutionBlocked("S27_DETACHED_FAILURE_RECEIPT_CLEANUP_INVALID")
+    declared = value.get("artifact_hash")
+    if not isinstance(declared, str) or len(declared) != 64 or any(char not in "0123456789abcdef" for char in declared):
+        raise S27ExecutionBlocked("S27_DETACHED_FAILURE_RECEIPT_HASH_INVALID")
+    if declared != canonical_json_hash({key: item for key, item in value.items() if key != "artifact_hash"}):
+        raise S27ExecutionBlocked("S27_DETACHED_FAILURE_RECEIPT_HASH_INVALID")
+    pid = value.get("pid")
+    if status == "SPAWN_FAILED":
+        if pid is not None:
+            raise S27ExecutionBlocked("S27_DETACHED_FAILURE_SPAWN_FAILED_PID_MUST_BE_NULL")
+        return None
+    if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+        raise S27ExecutionBlocked("S27_DETACHED_FAILURE_RECEIPT_PID_INVALID")
+    return pid
+
+
+def _pid_is_live(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def _scan_detached_attempts(
+    run_root: Path,
+    *,
+    run_root_ref: str,
+    args: argparse.Namespace,
+    executor_identity: Mapping[str, object],
+    block_live: bool = True,
+) -> None:
+    """Validate all append-only attempts and block only a live valid PID."""
+
+    legacy = run_root / "launcher.pid.json"
+    if legacy.exists() or legacy.is_symlink():
+        raise S27ExecutionBlocked("S27_DETACHED_LEGACY_PID_RECEIPT_FORBIDDEN")
+    attempts = run_root / "attempts"
+    if attempts.is_symlink() or (attempts.exists() and not attempts.is_dir()):
+        raise S27ExecutionBlocked("S27_DETACHED_ATTEMPTS_ROOT_INVALID")
+    if not attempts.exists():
+        return
+    try:
+        entries = sorted(attempts.iterdir(), key=lambda item: item.name)
+    except OSError as error:
+        raise S27ExecutionBlocked("S27_DETACHED_ATTEMPTS_ROOT_UNREADABLE") from error
+    for entry in entries:
+        if entry.is_symlink() or not entry.is_dir():
+            raise S27ExecutionBlocked("S27_DETACHED_ATTEMPT_DIRECTORY_INVALID")
+        receipt = entry / "launcher.pid.json"
+        failure = entry / "launcher.failure.json"
+        if receipt.is_symlink() or failure.is_symlink():
+            raise S27ExecutionBlocked("S27_DETACHED_RECEIPT_SYMLINK_FORBIDDEN")
+        if receipt.exists() and failure.exists():
+            raise S27ExecutionBlocked("S27_DETACHED_ATTEMPT_MULTIPLE_RECEIPTS")
+        if receipt.exists():
+            if not receipt.is_file():
+                raise S27ExecutionBlocked("S27_DETACHED_LAUNCH_RECEIPT_NOT_REGULAR")
+            try:
+                raw = load_canonical_json(receipt)
+            except (OSError, TypeError, ValueError) as error:
+                raise S27ExecutionBlocked("S27_DETACHED_LAUNCH_RECEIPT_INVALID") from error
+            pid = _detached_launch_receipt(raw)
+        elif failure.exists():
+            if not failure.is_file():
+                raise S27ExecutionBlocked("S27_DETACHED_FAILURE_RECEIPT_NOT_REGULAR")
+            try:
+                raw = load_canonical_json(failure)
+            except (OSError, TypeError, ValueError) as error:
+                raise S27ExecutionBlocked("S27_DETACHED_FAILURE_RECEIPT_INVALID") from error
+            pid = _detached_failure_receipt(raw)
+        else:
+            raise S27ExecutionBlocked("S27_DETACHED_ATTEMPT_RECEIPT_REQUIRED")
+        if (
+            not isinstance(raw, Mapping)
+            or raw.get("attempt_id") != entry.name
+            or raw.get("run_root_ref") != run_root_ref
+            or raw.get("run_id") != args.run_id
+            or raw.get("plan_ref") != _canonical_ref(_data_root(args.data_root), args.plan_ref, field="plan_ref")[0]
+            or raw.get("executor_identity") != dict(executor_identity)
+        ):
+            raise S27ExecutionBlocked("S27_DETACHED_RECEIPT_IDENTITY_MISMATCH")
+        if block_live and pid is not None and _pid_is_live(pid):
+            raise S27ExecutionBlocked(f"S27_DETACHED_LAUNCH_ALREADY_RUNNING:{pid}")
+
+
+def _validate_launch_status(
+    value: object,
+    *,
+    args: argparse.Namespace,
+    root: Path,
+    executor_identity: Mapping[str, object],
+) -> Mapping[str, object]:
+    """Require an exact, hash-bound launcher status before worker/status use."""
+
+    if not isinstance(value, Mapping):
+        raise S27ExecutionBlocked("S27_LAUNCH_STATUS_OBJECT_REQUIRED")
+    if set(value) != S27_LAUNCH_STATUS_FIELDS:
+        raise S27ExecutionBlocked("S27_LAUNCH_STATUS_FIELDS_INVALID")
+    if value.get("artifact_hash") != canonical_json_hash(
+        {key: item for key, item in value.items() if key != "artifact_hash"}
+    ):
+        raise S27ExecutionBlocked("S27_LAUNCH_STATUS_HASH_INVALID")
+    expected_plan_ref, _ = _canonical_ref(root, args.plan_ref, field="plan_ref")
+    if value.get("run_id") != args.run_id or value.get("plan_ref") != expected_plan_ref:
+        raise S27ExecutionBlocked("S27_LAUNCH_STATUS_BINDING_INVALID")
+    if value.get("executor_identity") != dict(executor_identity):
+        raise S27ExecutionBlocked("S27_EXECUTOR_IDENTITY_DRIFT")
+    inventory_identity = _validate_receipt_gpu_identity(value.get("gpu_inventory_identity"))
+    if inventory_identity["schema_version"] != "stage2-s206-gpu-inventory-v1" or inventory_identity["source_ref"] == inventory_identity["artifact_ref"]:
+        raise S27ExecutionBlocked("S27_LAUNCH_STATUS_GPU_INVENTORY_IDENTITY_INVALID")
+    inventory_path = getattr(args, "gpu_inventory_json", None)
+    if inventory_path is not None:
+        _summary, current_inventory_identity = load_s27_gpu_inventory_envelope(
+            inventory_path,
+            data_root=root,
+        )
+        if current_inventory_identity != inventory_identity:
+            raise S27ExecutionBlocked("S27_LAUNCH_STATUS_GPU_INVENTORY_IDENTITY_DRIFT")
+    try:
+        validate_executor_identity(value.get("executor_identity"))
+    except ExecutorIdentityError as error:
+        raise S27ExecutionBlocked(f"S27_EXECUTOR_IDENTITY_INVALID:{error}") from error
+    return value
 
 
 def _load_inventory(path: Path | None, *, data_root: Path) -> list[dict[str, object]]:
@@ -219,8 +526,10 @@ def _build_request(
 
 
 def _preflight(args: argparse.Namespace) -> dict[str, object]:
-    root = args.data_root.resolve()
-    plan = load_s27_plan(root, args.plan_ref)
+    root = _data_root(args.data_root)
+    executor_identity = _executor_identity(args.repository)
+    plan_ref, _plan_path = _canonical_ref(root, args.plan_ref, field="plan_ref")
+    plan = load_s27_plan(root, plan_ref)
     _verify_failure_rule(root, plan)
     # Re-read all producer artifacts at launch time.  A prepared plan alone is
     # not permission to consume a replaced matrix, mapping, or G2.4b Gate.
@@ -240,7 +549,12 @@ def _preflight(args: argparse.Namespace) -> dict[str, object]:
         args.gpu_inventory_json,
         data_root=root,
     )
-    execution = _load_execution(root, args.execution_evidence_ref)
+    if not {inventory_identity["artifact_ref"], inventory_identity["source_ref"]}.issubset(
+        set(plan.source_artifact_refs)
+    ):
+        raise S27ExecutionBlocked("S27_PLAN_INVENTORY_SOURCE_ARTIFACT_REFS_MISSING")
+    execution_ref, _execution_path = _canonical_ref(root, args.execution_evidence_ref, field="execution_evidence_ref")
+    execution = _load_execution(root, execution_ref)
     execution_g24b = [gate for gate in execution.prerequisite_gates if gate.gate_id == "stage2.G2.4b"]
     if len(execution_g24b) != 1 or execution_g24b[0].artifact_hash != plan.frozen_inputs.g24b_gate_hash:
         raise S27ExecutionBlocked("S27_EXECUTION_EVIDENCE_G24B_BINDING_INVALID")
@@ -258,11 +572,11 @@ def _preflight(args: argparse.Namespace) -> dict[str, object]:
         ),
         "note": "ideal four-GPU lower bound; frozen checkpoint-wave barriers may increase wall time",
     }
-    return {
+    result: dict[str, object] = {
         "schema_version": "stage2-s27-production-preflight-v1",
         "status": "READY",
         "formal_eligible": True,
-        "plan_ref": args.plan_ref,
+        "plan_ref": plan_ref,
         "plan_hash": plan.artifact_hash,
         "matrix_ref": plan.frozen_inputs.matrix_ref,
         "matrix_hash": plan.frozen_inputs.matrix_hash,
@@ -270,6 +584,8 @@ def _preflight(args: argparse.Namespace) -> dict[str, object]:
         "mapping_hash": plan.frozen_inputs.mapping_hash,
         "g24b_gate_ref": plan.frozen_inputs.g24b_gate_ref,
         "g24b_gate_hash": plan.frozen_inputs.g24b_gate_hash,
+        "execution_evidence_ref": execution_ref,
+        "execution_evidence_hash": execution.artifact_hash,
         "cell_count": len(plan.cells),
         "wave_order": [cell.cell_id for cell in plan.cells],
         "within_wave_shard_count": len(APPROVED_GPU_UUIDS),
@@ -282,6 +598,7 @@ def _preflight(args: argparse.Namespace) -> dict[str, object]:
         "excluded_pci": EXCLUDED_PCI,
         "gpu_inventory": gpu,
         "gpu_inventory_identity": dict(inventory_identity),
+        "executor_identity": executor_identity,
         "confirmatory_draws_generated": False,
         "mapping_units_loaded": len(mapping),
         "optional_stopping": False,
@@ -289,10 +606,13 @@ def _preflight(args: argparse.Namespace) -> dict[str, object]:
         "max_attempts": 1,
         "wall_time_model": wall_model,
     }
+    result["preflight_artifact_hash"] = canonical_json_hash(result)
+    return result
 
 
 def _worker(args: argparse.Namespace) -> dict[str, object]:
-    root = args.data_root.resolve()
+    root = _data_root(args.data_root)
+    executor_identity = _executor_identity(args.repository)
     plan = load_s27_plan(root, args.plan_ref)
     if any(cell.corrected_delta_sci_binding is None for cell in plan.cells):
         raise S27ExecutionBlocked("S27_CORRECTED_DELTA_BINDINGS_REQUIRED")
@@ -338,6 +658,18 @@ def _worker(args: argparse.Namespace) -> dict[str, object]:
     materialized = load_s27_materialized_inputs(root, args.materialization_index_ref)[args.cell_id]
     request = _build_request(root, cell_id=args.cell_id, materialization_index_ref=args.materialization_index_ref, execution_evidence_ref=args.execution_evidence_ref)
     run_root = _logical(root, args.run_root, field="run_root")
+    launcher_status_path = run_root / "launcher-status.json"
+    if launcher_status_path.exists():
+        launch_status = load_canonical_json(launcher_status_path)
+        _validate_launch_status(
+            launch_status,
+            args=args,
+            root=root,
+            executor_identity=_validate_live_executor_identity(
+                launch_status.get("executor_identity") if isinstance(launch_status, Mapping) else None,
+                repository=args.repository,
+            ),
+        )
     cell_status_root = run_root / "waves" / args.cell_id.replace(":", "__")
     status_suffix = "status.json" if shard_index is None else f"shard-{shard_index:02d}-status.json"
     status_store = S27StatusStore(cell_status_root / status_suffix, run_id=f"{args.run_id}-{args.cell_id.replace(':', '-')}{'' if shard_index is None else f'-shard-{shard_index:02d}'}", plan_hash=plan.artifact_hash)
@@ -370,54 +702,154 @@ def _worker(args: argparse.Namespace) -> dict[str, object]:
 def _detach(args: argparse.Namespace) -> dict[str, object]:
     if not args.execute:
         raise S27ExecutionBlocked("S27_DETACH_REQUIRES_EXECUTE")
-    root = args.data_root.resolve()
-    run_root = _logical(root, args.run_root, field="run_root")
+    root = _data_root(args.data_root)
+    preflight = _preflight(args)
+    executor_identity = _validate_live_executor_identity(
+        preflight.get("executor_identity"),
+        repository=args.repository,
+    )
+    run_root_ref, run_root = _canonical_ref(root, args.run_root, field="run_root")
     run_root.mkdir(parents=True, exist_ok=True)
-    pid_path = run_root / "launcher.pid.json"
-    if pid_path.exists():
-        value = load_canonical_json(pid_path)
-        if isinstance(value, Mapping) and isinstance(value.get("pid"), int):
+    _scan_detached_attempts(
+        run_root,
+        run_root_ref=run_root_ref,
+        args=args,
+        executor_identity=executor_identity,
+    )
+    attempts_root = run_root / "attempts"
+    attempts_root.mkdir(parents=True, exist_ok=True)
+    attempt_id = f"{time.time_ns()}-{uuid.uuid4().hex}"
+    attempt_dir = attempts_root / attempt_id
+    try:
+        attempt_dir.mkdir()
+    except FileExistsError as error:
+        raise S27ExecutionBlocked("S27_DETACHED_ATTEMPT_ID_COLLISION") from error
+    log_path = attempt_dir / "launcher.log"
+    pid_path = attempt_dir / "launcher.pid.json"
+    failure_path = attempt_dir / "launcher.failure.json"
+    attempt_ref = f"{run_root_ref}/attempts/{attempt_id}"
+    log_ref = f"{attempt_ref}/launcher.log"
+    status_ref = f"{run_root_ref}/launcher-status.json"
+    plan_ref = str(preflight["plan_ref"])
+    child = [str(item) for item in sys.argv[1:] if item not in {"--detach", "--detached-child"}]
+    child.append("--detached-child")
+
+    def _base_receipt(status: str, pid: int | None, error: BaseException | None = None, cleanup_error: str | None = None) -> dict[str, object]:
+        payload: dict[str, object] = {
+            "schema_version": "stage2-s27-detached-failure-v1" if status else "stage2-s27-detached-launch-v1",
+            "attempt_id": attempt_id,
+            "attempt_ref": attempt_ref,
+            "pid": pid,
+            "run_id": args.run_id,
+            "plan_ref": plan_ref,
+            "plan_hash": preflight["plan_hash"],
+            "run_root_ref": run_root_ref,
+            "log_ref": log_ref,
+            "status_ref": status_ref,
+            "gpu_inventory_identity": dict(preflight["gpu_inventory_identity"]),
+            "preflight_artifact_hash": preflight["preflight_artifact_hash"],
+            "execution_evidence_ref": str(preflight["execution_evidence_ref"]),
+            "execution_evidence_hash": str(preflight["execution_evidence_hash"]),
+            "executor_identity": dict(executor_identity),
+        }
+        if status:
+            payload.update({
+                "status": status,
+                "failure_reason": None if error is None else f"{type(error).__name__}:{error}",
+                "cleanup_error": cleanup_error,
+            })
+        else:
+            payload.update({
+                "recovery_command": "--wait",
+                "confirmatory_draws_generated": False,
+            })
+        return payload
+
+    def publish_failure(*, status: str, pid: int | None, error: BaseException, cleanup_error: str | None = None) -> None:
+        payload = _base_receipt(status, pid, error, cleanup_error)
+        _validate_receipt_refs(payload)
+        payload["artifact_hash"] = canonical_json_hash(payload)
+        if failure_path.exists() or failure_path.is_symlink():
+            raise S27ExecutionBlocked("S27_DETACHED_FAILURE_RECEIPT_PATH_CONFLICT")
+        write_canonical_json(failure_path, payload)
+
+    try:
+        with log_path.open("ab") as handle:
+            process = subprocess.Popen(
+                [str(args.python), str(Path(__file__).absolute()), *child],
+                cwd=Path(args.repository).absolute(),
+                stdin=subprocess.DEVNULL,
+                stdout=handle,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+                close_fds=True,
+            )
+    except Exception as error:
+        try:
+            publish_failure(status="SPAWN_FAILED", pid=None, error=error)
+        except Exception as failure_error:
             try:
-                os.kill(int(value["pid"]), 0)
+                if log_path.exists() and log_path.is_file() and not log_path.is_symlink():
+                    log_path.unlink()
+                if not any(attempt_dir.iterdir()):
+                    attempt_dir.rmdir()
             except OSError:
                 pass
-            else:
-                raise S27ExecutionBlocked(f"S27_DETACHED_LAUNCH_ALREADY_RUNNING:{value['pid']}")
-    child = [str(item) for item in sys.argv[1:] if item != "--detach"]
-    log_path = run_root / "launcher.log"
-    with log_path.open("ab") as handle:
-        process = subprocess.Popen(
-            [str(args.python), str(Path(__file__).resolve()), *child],
-            cwd=_REPOSITORY_ROOT,
-            stdin=subprocess.DEVNULL,
-            stdout=handle,
-            stderr=subprocess.STDOUT,
-            start_new_session=True,
-            close_fds=True,
-        )
-    payload = {
-        "schema_version": "stage2-s27-detached-launch-v1",
-        "pid": int(process.pid),
-        "run_id": args.run_id,
-        "plan_ref": args.plan_ref,
-        "run_root": str(run_root),
-        "log_ref": str(log_path),
-        "status_ref": str(run_root / "launcher-status.json"),
-        "recovery_command": "--wait",
-        "confirmatory_draws_generated": False,
-    }
+            raise S27ExecutionBlocked("S27_DETACHED_SPAWN_FAILURE_UNRECORDED") from failure_error
+        raise
+    payload = _base_receipt("", int(process.pid))
     payload["artifact_hash"] = canonical_json_hash(payload)
-    write_canonical_json(pid_path, payload)
+    try:
+        write_canonical_json(pid_path, payload)
+    except Exception as error:
+        cleanup_error = _terminate_and_wait(process)
+        try:
+            publish_failure(status="RECEIPT_WRITE_FAILED", pid=int(process.pid), error=error, cleanup_error=cleanup_error)
+        except Exception as failure_error:
+            try:
+                if pid_path.exists() and pid_path.is_file() and not pid_path.is_symlink():
+                    pid_path.unlink()
+                if log_path.exists() and log_path.is_file() and not log_path.is_symlink():
+                    log_path.unlink()
+                if not any(attempt_dir.iterdir()):
+                    attempt_dir.rmdir()
+            except OSError:
+                pass
+            raise S27ExecutionBlocked("S27_DETACHED_RECEIPT_FAILURE_UNRECORDED") from failure_error
+        raise
     return payload
 
 
 def _status(args: argparse.Namespace, *, wait: bool) -> int:
-    root = args.data_root.resolve()
-    path = _logical(root, args.run_root, field="run_root") / "launcher-status.json"
+    root = _data_root(args.data_root)
+    executor_identity = _executor_identity(args.repository)
+    run_root_ref, run_root = _canonical_ref(root, args.run_root, field="run_root")
+    _scan_detached_attempts(
+        run_root,
+        run_root_ref=run_root_ref,
+        args=args,
+        executor_identity=executor_identity,
+        block_live=False,
+    )
+    path = run_root / "launcher-status.json"
     deadline = None if args.timeout_seconds is None else time.monotonic() + float(args.timeout_seconds)
     while True:
+        if path.is_symlink():
+            raise S27ExecutionBlocked("S27_LAUNCH_STATUS_SYMLINK_FORBIDDEN")
         if path.exists():
+            if not path.is_file():
+                raise S27ExecutionBlocked("S27_LAUNCH_STATUS_NOT_REGULAR")
             value = load_canonical_json(path)
+            declared_identity = _validate_live_executor_identity(
+                value.get("executor_identity") if isinstance(value, Mapping) else None,
+                repository=args.repository,
+            )
+            _validate_launch_status(
+                value,
+                args=args,
+                root=root,
+                executor_identity=declared_identity,
+            )
             print(json.dumps(value, ensure_ascii=False, sort_keys=True, indent=2))
             if not wait or (isinstance(value, Mapping) and value.get("status") in {"SEALED", "FAILED"}):
                 return 0 if not isinstance(value, Mapping) or value.get("status") == "SEALED" else 3
@@ -455,6 +887,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--timeout-seconds", type=float)
     parser.add_argument("--poll-seconds", type=float, default=30.0)
     parser.add_argument("--throughput-sequences-per-second", type=float)
+    parser.add_argument("--detached-child", action="store_true", help=argparse.SUPPRESS)
     return parser
 
 
@@ -476,27 +909,31 @@ def main(argv: Sequence[str] | None = None) -> int:
                 raise S27ExecutionBlocked("S27_WORKER_REQUIRES_CELL_AND_GPU")
             print(json.dumps(_worker(args), ensure_ascii=False, sort_keys=True, indent=2))
             return 0
+        if args.execute and not args.detached_child:
+            raise S27ExecutionBlocked("S27_EXECUTE_REQUIRES_DETACH")
         # --execute is the only foreground launcher mode.  It repeats the
         # read-only preflight immediately before creating a child process.
         preflight = _preflight(args)
         inventory, inventory_identity = load_s27_gpu_inventory_envelope(
             args.gpu_inventory_json,
-            data_root=args.data_root.resolve(),
+            data_root=_data_root(args.data_root),
         )
         if preflight.get("gpu_inventory_identity") != inventory_identity:
             raise S27ExecutionBlocked("S27_GPU_INVENTORY_PREFLIGHT_IDENTITY_DRIFT")
         result = S27DetachedLauncher(
             data_root=args.data_root,
-            plan_ref=args.plan_ref,
+            plan_ref=preflight["plan_ref"],
             run_root=args.run_root,
             run_id=args.run_id,
             python=args.python,
-            launcher_script=Path(__file__).resolve(),
+            launcher_script=Path(__file__).absolute(),
             materialization_index_ref=args.materialization_index_ref,
             execution_evidence_ref=args.execution_evidence_ref,
             approved_inventory=inventory,
             gpu_inventory_json=args.gpu_inventory_json,
             gpu_inventory_identity=inventory_identity,
+            executor_identity=preflight["executor_identity"],
+            executor_repository=args.repository,
         ).execute()
         print(json.dumps(result, ensure_ascii=False, sort_keys=True, indent=2))
         return 0

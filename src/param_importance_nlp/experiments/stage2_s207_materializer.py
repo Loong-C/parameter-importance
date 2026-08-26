@@ -34,6 +34,11 @@ from .stage2_s207_runner import (
     load_s27_gpu_inventory_envelope,
     load_s27_materialized_inputs,
 )
+from .stage2_path_security import (
+    DataRootPathError,
+    resolve_data_root,
+    resolve_data_root_ref,
+)
 from .stage2_s25_rebind import validate_g23_evaluation
 from .stage2_s25_formal import load_s25_rebind_plan
 
@@ -48,6 +53,13 @@ class S27MaterializationBlocked(RuntimeError):
     """Raised when a formal S2.7 input cannot be proven immutable."""
 
 
+def _data_root(value: str | Path) -> Path:
+    try:
+        return resolve_data_root(value)
+    except DataRootPathError as error:
+        raise S27MaterializationBlocked(f"DATA_ROOT:{error}") from error
+
+
 def _sha(value: object, *, field: str) -> str:
     if not isinstance(value, str) or _SHA.fullmatch(value) is None:
         raise S27MaterializationBlocked(f"{field}:SHA256_REQUIRED")
@@ -57,40 +69,10 @@ def _sha(value: object, *, field: str) -> str:
 def _logical(root: Path, value: object, *, field: str) -> tuple[str, Path]:
     """Normalize an in-root absolute/relative ref to a safe logical POSIX ref."""
 
-    if not isinstance(value, str) or not value:
-        raise S27MaterializationBlocked(f"{field}:LOGICAL_REFERENCE_REQUIRED")
-    supplied = Path(value)
-    # S2.6 freeze commits were written with ``str(Path)`` and therefore use
-    # native Windows separators for absolute refs.  Accept those only for the
-    # initial in-root resolution; every returned identity is canonical POSIX.
-    if "\\" in value and not supplied.is_absolute():
-        raise S27MaterializationBlocked(f"{field}:LOGICAL_REFERENCE_REQUIRED")
-    if supplied.is_absolute():
-        try:
-            resolved = supplied.resolve()
-            relative = resolved.relative_to(root.resolve()).as_posix()
-        except (OSError, ValueError) as error:
-            raise S27MaterializationBlocked(f"{field}:ABSOLUTE_PATH_OUTSIDE_DATA_ROOT") from error
-    else:
-        relative = PurePosixPath(value).as_posix()
-    logical = PurePosixPath(relative)
-    if logical.is_absolute() or not logical.parts or any(part in {"", ".", ".."} for part in logical.parts):
-        raise S27MaterializationBlocked(f"{field}:PATH_ESCAPE")
-    current = root
     try:
-        if current.is_symlink():
-            raise S27MaterializationBlocked(f"{field}:SYMLINK_FORBIDDEN")
-        for part in logical.parts:
-            current = current / part
-            if current.is_symlink():
-                raise S27MaterializationBlocked(f"{field}:SYMLINK_FORBIDDEN")
-        resolved = current.resolve()
-        resolved.relative_to(root.resolve())
-    except S27MaterializationBlocked:
-        raise
-    except (OSError, ValueError) as error:
-        raise S27MaterializationBlocked(f"{field}:PATH_ESCAPE_OR_UNREADABLE") from error
-    return logical.as_posix(), resolved
+        return resolve_data_root_ref(root, value, field=field)
+    except DataRootPathError as error:
+        raise S27MaterializationBlocked(str(error)) from error
 
 
 def _load_json(root: Path, value: object, *, field: str) -> tuple[str, dict[str, object]]:
@@ -159,7 +141,7 @@ def validate_failure_rule(
     the identity stored in the S2.7 plan.
     """
 
-    root = Path(data_root).resolve()
+    root = _data_root(data_root)
     logical, value = _load_json(root, failure_rule_ref, field="failure_rule")
     digest = _hashed(value, field="failure_rule")
     required = {
@@ -289,21 +271,30 @@ def _validate_s206_artifacts(
     execution_ref_logical, execution = _load_execution(root, execution_ref)
     if execution.artifact_hash != freeze.get("execution_evidence_hash"):
         raise S27MaterializationBlocked("s206_freeze:EXECUTION_HASH_BINDING_INVALID")
-    inventory_path = Path(inventory_json).resolve()
-    try:
-        inventory_path.relative_to(root)
-    except ValueError as error:
-        raise S27MaterializationBlocked("gpu_inventory:OUTSIDE_DATA_ROOT") from error
+    inventory_ref, inventory_path = _logical(root, inventory_json, field="gpu_inventory.artifact_ref")
     try:
         summary, identity = load_s27_gpu_inventory_envelope(inventory_path, data_root=root)
     except Exception as error:
         raise S27MaterializationBlocked(f"gpu_inventory:INVALID:{error}") from error
     if (
-        identity.get("source_ref") != freeze.get("gpu_inventory_ref")
+        identity.get("artifact_ref") != freeze.get("gpu_inventory_ref")
+        or identity.get("source_ref") != freeze.get("gpu_inventory_source_ref")
         or identity.get("artifact_hash") != freeze.get("gpu_inventory_artifact_hash")
         or identity.get("source_sha256") != freeze.get("gpu_inventory_source_sha256")
     ):
         raise S27MaterializationBlocked("s206_freeze:GPU_INVENTORY_HASH_BINDING_INVALID")
+    expected_identity = {
+        "source_ref": identity["source_ref"],
+        "artifact_ref": identity["artifact_ref"],
+        "artifact_hash": identity["artifact_hash"],
+        "source_sha256": identity["source_sha256"],
+        "schema_version": identity["schema_version"],
+    }
+    if freeze.get("gpu_inventory_identity") != expected_identity:
+        raise S27MaterializationBlocked("s206_freeze:GPU_INVENTORY_IDENTITY_FIELDS_INVALID")
+    measured_inventory = gate.measured.get("gpu_inventory_identity")
+    if measured_inventory != expected_identity:
+        raise S27MaterializationBlocked("s206_freeze:G24B_GPU_INVENTORY_IDENTITY_DRIFT")
     freeze_inventory_path = freeze.get("gpu_inventory_path")
     try:
         _freeze_inventory_ref, freeze_inventory_path_resolved = _logical(
@@ -322,7 +313,7 @@ def _validate_s206_artifacts(
         execution,
         execution_ref_logical,
         summary,
-        str(identity["source_ref"]),
+        str(identity["artifact_ref"]),
         str(identity["artifact_hash"]),
         dict(identity),
         gate_ref,
@@ -586,7 +577,7 @@ def materialize_s27_plan(
 ) -> S27Plan:
     """Materialize and immutably publish a preflight-ready S2.7 plan."""
 
-    root = Path(data_root).resolve()
+    root = _data_root(data_root)
     if not isinstance(plan_id, str) or _SAFE_ID.fullmatch(plan_id) is None:
         raise S27MaterializationBlocked("plan_id:INVALID")
     plan_ref, _plan_path = _logical(root, plan_output, field="plan_output")
@@ -646,7 +637,23 @@ def materialize_s27_plan(
         s205_rows=s205_rows,
     )
     references: dict[str, dict[str, object]] = {}
-    source_refs: list[str] = [freeze_ref, matrix_ref, mapping_ref, g24b_gate_ref, s205_ref, eval_ref, material_ref, manifest_ref, execution_ref, inventory_ref, rule_ref, *freeze_source_refs, *material_sources, *gate_sources]
+    source_refs: list[str] = [
+        freeze_ref,
+        matrix_ref,
+        mapping_ref,
+        g24b_gate_ref,
+        s205_ref,
+        eval_ref,
+        material_ref,
+        manifest_ref,
+        execution_ref,
+        inventory_ref,
+        str(_inventory_identity["source_ref"]),
+        rule_ref,
+        *freeze_source_refs,
+        *material_sources,
+        *gate_sources,
+    ]
     for cell_id in EXPECTED_CELL_IDS:
         row = s205_rows[cell_id]
         refs_map = row.get("reference_artifact_refs")

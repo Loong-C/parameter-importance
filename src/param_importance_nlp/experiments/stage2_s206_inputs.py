@@ -31,6 +31,11 @@ from .stage2_s206_formal import (
     validate_gpu_inventory,
 )
 from .stage2_s207_runner import validate_s27_gpu_inventory
+from .stage2_path_security import (
+    DataRootPathError,
+    resolve_data_root,
+    resolve_data_root_ref,
+)
 
 
 class S206FormalInputError(ValueError):
@@ -79,17 +84,10 @@ def _hash(value: object, field: str) -> str:
 
 
 def _logical_ref(root: Path, value: str, *, field: str) -> tuple[str, Path]:
-    if not isinstance(value, str) or not value or "\\" in value:
-        raise S206FormalInputError(f"{field}:INVALID_REFERENCE")
-    relative = PurePosixPath(value)
-    if relative.is_absolute() or any(part in {"", ".", ".."} for part in relative.parts):
-        raise S206FormalInputError(f"{field}:PATH_ESCAPE")
-    resolved = (root / Path(*relative.parts)).resolve()
     try:
-        resolved.relative_to(root.resolve())
-    except ValueError as error:
-        raise S206FormalInputError(f"{field}:PATH_ESCAPE") from error
-    return relative.as_posix(), resolved
+        return resolve_data_root_ref(root, value, field=field, allow_absolute=False)
+    except DataRootPathError as error:
+        raise S206FormalInputError(str(error)) from error
 
 
 def _write_immutable(path: Path, payload: Mapping[str, object]) -> None:
@@ -234,13 +232,20 @@ def collect_gpu_inventory(
     inventory JSON's own bytes are never used for that field.
     """
 
-    artifact_path = Path(output).resolve()
-    source_path = Path(source_output).resolve()
-    root = Path(data_root).resolve() if data_root is not None else artifact_path.parent
+    if data_root is None:
+        # Keep the historical convenience API, but still establish and audit
+        # an explicit lexical root before either output path is inspected.
+        artifact_lexical = Path(output).absolute()
+        root = resolve_data_root(artifact_lexical.parent)
+    else:
+        try:
+            root = resolve_data_root(data_root)
+        except DataRootPathError as error:
+            raise S206FormalInputError(str(error)) from error
     try:
-        artifact_ref = artifact_path.relative_to(root).as_posix()
-        source_ref = source_path.relative_to(root).as_posix()
-    except ValueError as error:
+        artifact_ref, artifact_path = resolve_data_root_ref(root, output, field="GPU_INVENTORY_OUTPUT")
+        source_ref, source_path = resolve_data_root_ref(root, source_output, field="GPU_INVENTORY_SOURCE")
+    except DataRootPathError as error:
         raise S206FormalInputError("GPU_INVENTORY_OUTPUT_OUTSIDE_DATA_ROOT") from error
     if artifact_path == source_path:
         raise S206FormalInputError("GPU_INVENTORY_SOURCE_SELF_REFERENCE")

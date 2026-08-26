@@ -47,6 +47,7 @@ from .stage2_pilot import (
     scan_candidates,
 )
 from .stage2_formal import RecoverablePairedWaveRunner
+from .stage2_path_security import DataRootPathError, resolve_data_root, resolve_data_root_ref
 
 
 GLOBAL_PILOT_MAPPING_SCHEMA = "stage2-formal-global-pilot-mapping-v1"
@@ -1449,12 +1450,24 @@ def build_g24b_gate(
     now = (checked_at or datetime.now(timezone.utc)).isoformat()
     inventory_measured = {}
     if gpu_inventory_identity is not None:
-        for field in ("source_ref", "artifact_hash", "source_sha256"):
+        inventory_fields = {
+            "source_ref",
+            "artifact_ref",
+            "artifact_hash",
+            "source_sha256",
+            "schema_version",
+        }
+        if set(gpu_inventory_identity) != inventory_fields:
+            reasons.append("G24B_GPU_INVENTORY_IDENTITY_FIELDS_INVALID")
+        for field in sorted(inventory_fields):
             value = gpu_inventory_identity.get(field)
             if not isinstance(value, str) or not value:
                 reasons.append(f"G24B_GPU_INVENTORY_{field.upper()}_MISSING")
             else:
                 inventory_measured[f"gpu_inventory_{field}"] = value
+        inventory_measured["gpu_inventory_identity"] = {
+            field: gpu_inventory_identity.get(field) for field in sorted(inventory_fields)
+        }
     if reasons:
         return GateRecord(
             gate_id="stage2.G2.4b",
@@ -1682,20 +1695,17 @@ def build_formal_confirmatory_mapping(
 
 
 def _load_root_json(root: Path, reference: str, *, field: str) -> tuple[str, dict[str, Any]]:
-    if not isinstance(reference, str) or not reference or "\\" in reference:
-        raise S206PreparationBlocked(f"{field}:INVALID_REFERENCE")
-    candidate = (root / reference).resolve()
     try:
-        candidate.relative_to(root.resolve())
-    except ValueError as error:
-        raise S206PreparationBlocked(f"{field}:PATH_ESCAPE") from error
+        logical, candidate = resolve_data_root_ref(root, reference, field=field, allow_absolute=False)
+    except DataRootPathError as error:
+        raise S206PreparationBlocked(str(error)) from error
     try:
         value = load_canonical_json(candidate)
     except (OSError, TypeError, ValueError) as error:
         raise S206PreparationBlocked(f"{field}:CANONICAL_JSON_REQUIRED") from error
     if not isinstance(value, dict):
         raise S206PreparationBlocked(f"{field}:OBJECT_REQUIRED")
-    return candidate.relative_to(root.resolve()).as_posix(), dict(value)
+    return logical, dict(value)
 
 
 def _validate_hashed_object(value: Mapping[str, Any], *, field: str) -> None:
@@ -1937,7 +1947,10 @@ def strict_preflight(
 ) -> dict[str, object]:
     """Fail closed before any formal S2.6 process is started."""
 
-    root = spec.data_root.resolve()
+    try:
+        root = resolve_data_root(spec.data_root)
+    except DataRootPathError as error:
+        raise S206PreparationBlocked(f"DATA_ROOT:{error}") from error
     g23_ref, g23 = _load_root_json(root, spec.g23_ref, field="g23_ref")
     g24a_ref, g24a = _load_root_json(root, spec.g24a_ref, field="g24a_ref")
     _validate_g23(g23)
@@ -1946,11 +1959,10 @@ def strict_preflight(
         expected_g23_ref=g23_ref,
         expected_g23_hash=str(g23["artifact_hash"]),
     )
-    s204_root = (root / spec.s204_root).resolve()
     try:
-        s204_root.relative_to(root)
-    except ValueError as error:
-        raise S206PreparationBlocked("s204_root:PATH_ESCAPE") from error
+        _s204_ref, s204_root = resolve_data_root_ref(root, spec.s204_root, field="s204_root", allow_absolute=False)
+    except DataRootPathError as error:
+        raise S206PreparationBlocked(str(error)) from error
     _validate_s204_root(s204_root)
     gpu = validate_gpu_inventory(gpu_inventory, compute_apps=gpu_compute_apps)
     return {
