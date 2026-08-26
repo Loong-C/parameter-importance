@@ -229,6 +229,15 @@ def test_s27_inventory_requires_distinct_source_hash_binding(tmp_path: Path) -> 
         load_s27_gpu_inventory_envelope(path, data_root=tmp_path)
 
     _write_s27_inventory(path)
+    payload = load_canonical_json(path)
+    assert isinstance(payload, dict)
+    payload["source_ref"] = "evidence//gpu-inventory.capture.txt"
+    payload["artifact_hash"] = canonical_json_hash({key: value for key, value in payload.items() if key != "artifact_hash"})
+    write_canonical_json(path, payload)
+    with pytest.raises(S27ExecutionBlocked, match="GPU_INVENTORY_SOURCE_REF_NOT_CANONICAL"):
+        load_s27_gpu_inventory_envelope(path, data_root=tmp_path)
+
+    _write_s27_inventory(path)
     source = path.parent / "gpu-inventory.capture.txt"
     source.write_bytes(b"tampered capture\n")
     with pytest.raises(S27ExecutionBlocked, match="GPU_INVENTORY_SOURCE_SHA256_MISMATCH"):

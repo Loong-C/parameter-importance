@@ -91,6 +91,13 @@ def test_formal_inventory_loader_requires_distinct_source_binding(tmp_path: Path
     with pytest.raises(Exception, match="GPU_INVENTORY_SOURCE_SHA256_REQUIRED"):
         launcher._load_inventory_snapshot(path, data_root=tmp_path)
 
+    payload["source_sha256"] = hashlib.sha256(source.read_bytes()).hexdigest()
+    payload["source_ref"] = "capture.txt//"
+    payload["artifact_hash"] = canonical_json_hash({key: value for key, value in payload.items() if key != "artifact_hash"})
+    write_canonical_json(path, payload)
+    with pytest.raises(Exception, match="GPU_INVENTORY_SOURCE_REF_NOT_CANONICAL"):
+        launcher._load_inventory_snapshot(path, data_root=tmp_path)
+
 
 def test_cost_and_retry_producers_are_frozen_without_guessed_seconds() -> None:
     cost = build_cost_semantics_contract()
