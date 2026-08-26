@@ -64,6 +64,16 @@ from param_importance_nlp.experiments.stage2_s206_delta_consumer import (
     CorrectedDeltaRejected,
     load_bound_corrected_delta,
 )
+from param_importance_nlp.experiments.stage2_path_security import (
+    DataRootPathError,
+    resolve_data_root,
+    resolve_data_root_ref,
+)
+from param_importance_nlp.experiments.stage2_executor_identity import (
+    ExecutorIdentityError,
+    compute_executor_identity,
+    validate_executor_identity,
+)
 from param_importance_nlp.experiments.stage2_pilot import CostSemantics
 from param_importance_nlp.experiments.sampling import SamplingPlan
 from param_importance_nlp.runtime.task_artifacts import load_committed_task_artifact
@@ -108,24 +118,82 @@ def _production_lpt_jobs() -> tuple[tuple[str, int], ...]:
 
 
 def _logical(root: Path, value: str, *, field: str) -> Path:
-    if not isinstance(value, str) or not value or "\\" in value:
-        raise S206PreparationBlocked(f"{field}:INVALID_LOGICAL_PATH")
-    path = Path(value)
-    if path.is_absolute() or any(part in {"", ".", ".."} for part in path.parts):
-        raise S206PreparationBlocked(f"{field}:PATH_ESCAPE")
-    result = (root / path).resolve()
     try:
-        result.relative_to(root.resolve())
-    except ValueError as error:
-        raise S206PreparationBlocked(f"{field}:PATH_ESCAPE") from error
-    return result
+        _logical_ref, result = resolve_data_root_ref(root, value, field=field)
+        return result
+    except DataRootPathError as error:
+        raise S206PreparationBlocked(str(error)) from error
+
+
+def _data_root(value: str | Path) -> Path:
+    try:
+        return resolve_data_root(value)
+    except DataRootPathError as error:
+        raise S206PreparationBlocked(str(error)) from error
+
+
+def _executor_identity(repository: str | Path) -> dict[str, object]:
+    try:
+        return compute_executor_identity(repository, Path(__file__))
+    except ExecutorIdentityError as error:
+        raise S206PreparationBlocked(f"S206_EXECUTOR_IDENTITY_INVALID:{error}") from error
+
+
+def _validate_live_executor_identity(
+    declared: object,
+    *,
+    repository: str | Path,
+) -> dict[str, object]:
+    try:
+        expected = validate_executor_identity(declared)
+        current = compute_executor_identity(repository, Path(__file__))
+    except ExecutorIdentityError as error:
+        raise S206PreparationBlocked(f"S206_EXECUTOR_IDENTITY_INVALID:{error}") from error
+    if current != expected:
+        raise S206PreparationBlocked("S206_EXECUTOR_IDENTITY_DRIFT")
+    return expected
+
+
+def _verify_worker_executor_identity(
+    args: argparse.Namespace,
+    *,
+    expected: Mapping[str, object],
+    root: Path,
+) -> None:
+    """Bind a cell child to the launcher's status identity before execution."""
+
+    status_path = _logical(root, f"{args.operations_root}/status.json", field="operations_status")
+    if status_path.is_symlink():
+        raise S206PreparationBlocked("S206_STATUS_SYMLINK_FORBIDDEN")
+    if not status_path.exists():
+        raise S206PreparationBlocked("S206_EXECUTOR_STATUS_REQUIRED")
+    if not status_path.is_file():
+        raise S206PreparationBlocked("S206_EXECUTOR_STATUS_NOT_REGULAR")
+    try:
+        value = load_canonical_json(status_path)
+    except (OSError, TypeError, ValueError) as error:
+        raise S206PreparationBlocked("S206_EXECUTOR_STATUS_INVALID") from error
+    if not isinstance(value, Mapping):
+        raise S206PreparationBlocked("S206_EXECUTOR_STATUS_OBJECT_REQUIRED")
+    declared = _validate_live_executor_identity(
+        value.get("executor_identity"),
+        repository=getattr(args, "repository", _REPOSITORY_ROOT),
+    )
+    if declared != dict(expected):
+        raise S206PreparationBlocked("S206_EXECUTOR_IDENTITY_DRIFT")
+    preflight = value.get("preflight")
+    if not isinstance(preflight, Mapping) or preflight.get("executor_identity") != declared:
+        raise S206PreparationBlocked("S206_EXECUTOR_STATUS_PREFLIGHT_IDENTITY_DRIFT")
 
 
 def _canonical_logical_ref(root: Path, value: object, *, field: str) -> str:
     """Return one DATA_ROOT-relative POSIX reference for status receipts."""
 
     path = _logical(root, value, field=field)
-    return path.relative_to(root.resolve()).as_posix()
+    try:
+        return path.relative_to(resolve_data_root(root)).as_posix()
+    except (DataRootPathError, ValueError) as error:
+        raise S206PreparationBlocked(f"{field}:OUTSIDE_DATA_ROOT") from error
 
 
 def _file_sha256(path: Path) -> str:
@@ -276,14 +344,15 @@ def _load_inventory_snapshot(
 
     if path is None:
         raise S206PreparationBlocked("GPU_INVENTORY_JSON_REQUIRED")
-    resolved = path.resolve()
-    root = data_root.resolve() if data_root is not None else resolved.parent
-    expected_artifact_ref: str | None = None
-    if data_root is not None:
-        try:
-            expected_artifact_ref = resolved.relative_to(root).as_posix()
-        except ValueError as error:
-            raise S206PreparationBlocked("GPU_INVENTORY_PATH_OUTSIDE_DATA_ROOT") from error
+    try:
+        root = _data_root(data_root) if data_root is not None else _data_root(Path(path).absolute().parent)
+        expected_artifact_ref, resolved = resolve_data_root_ref(
+            root,
+            path,
+            field="GPU_INVENTORY_ARTIFACT",
+        )
+    except DataRootPathError as error:
+        raise S206PreparationBlocked(f"GPU_INVENTORY_PATH_INVALID:{error}") from error
     try:
         value = load_canonical_json(resolved)
     except (OSError, TypeError, ValueError) as error:
@@ -311,13 +380,18 @@ def _load_inventory_snapshot(
     if artifact_ref is not None:
         if not isinstance(artifact_ref, str) or not artifact_ref or "\\" in artifact_ref:
             raise S206PreparationBlocked("GPU_INVENTORY_ARTIFACT_REF_INVALID")
-        if expected_artifact_ref is not None and artifact_ref != expected_artifact_ref:
+        if artifact_ref != expected_artifact_ref:
             raise S206PreparationBlocked("GPU_INVENTORY_ARTIFACT_REF_PATH_MISMATCH")
         try:
-            source_path = _logical(root, source_ref, field="GPU_INVENTORY_SOURCE_REF")
-        except (ValueError, OSError) as error:
+            source_logical, source_path = resolve_data_root_ref(
+                root,
+                source_ref,
+                field="GPU_INVENTORY_SOURCE_REF",
+                allow_absolute=False,
+            )
+        except DataRootPathError as error:
             raise S206PreparationBlocked("GPU_INVENTORY_SOURCE_REF_PATH_INVALID") from error
-        if source_ref != source_path.relative_to(root).as_posix():
+        if source_ref != source_logical:
             raise S206PreparationBlocked("GPU_INVENTORY_SOURCE_REF_NOT_CANONICAL")
         if source_path == resolved:
             raise S206PreparationBlocked("GPU_INVENTORY_SOURCE_REF_SELF_REFERENCE")
@@ -326,7 +400,7 @@ def _load_inventory_snapshot(
             raise S206PreparationBlocked("GPU_INVENTORY_ARTIFACT_REF_REQUIRED")
         # Legacy envelope: source_ref names the inventory itself.  This path
         # is accepted only by the explicitly non-formal compatibility helper.
-        if expected_artifact_ref is not None and source_ref != expected_artifact_ref:
+        if data_root is not None and source_ref != expected_artifact_ref:
             raise S206PreparationBlocked("GPU_INVENTORY_SOURCE_REF_PATH_MISMATCH")
         source_path = resolved
     if not isinstance(artifact_hash, str) or len(artifact_hash) != 64 or any(
@@ -378,13 +452,21 @@ def _write_status(path: Path, payload: Mapping[str, object]) -> None:
         "updated_at": _now(),
         **{key: item for key, item in payload.items() if key != "artifact_hash"},
     }
+    preflight = value.get("preflight")
+    if (
+        "executor_identity" not in value
+        and isinstance(preflight, Mapping)
+        and "executor_identity" in preflight
+    ):
+        value["executor_identity"] = preflight["executor_identity"]
     value["artifact_hash"] = canonical_json_hash(value)
     path.parent.mkdir(parents=True, exist_ok=True)
     write_canonical_json(path, value)
 
 
 def _preflight(args: argparse.Namespace) -> dict[str, object]:
-    root = args.data_root.resolve()
+    root = _data_root(args.data_root)
+    executor_identity = _executor_identity(getattr(args, "repository", _REPOSITORY_ROOT))
     inventory, inventory_identity = _load_inventory_snapshot(
         args.gpu_inventory_json,
         data_root=root,
@@ -427,8 +509,9 @@ def _preflight(args: argparse.Namespace) -> dict[str, object]:
         "artifact_ref": inventory_identity["artifact_ref"],
         "artifact_hash": inventory_identity["artifact_hash"],
         "source_sha256": inventory_identity["source_sha256"],
-        "path": inventory_identity["path"],
+        "schema_version": inventory_identity["schema_version"],
     }
+    result["executor_identity"] = dict(executor_identity)
     result["gpu_inventory_ref"] = inventory_identity["artifact_ref"]
     result["gpu_inventory_source_ref"] = inventory_identity["source_ref"]
     result["gpu_inventory_artifact_hash"] = inventory_identity["artifact_hash"]
@@ -469,7 +552,7 @@ def _run_anchor(
     gpu_uuid: str,
     status_root: Path,
 ) -> list[dict[str, object]]:
-    root = args.data_root.resolve()
+    root = _data_root(args.data_root)
     python = str(args.python)
     records: list[dict[str, object]] = []
     for batch_size in PILOT_B_VALUES:
@@ -574,7 +657,7 @@ def _validate_formal_execution_lineage(
     exact hash-bound lineage.
     """
 
-    root = args.data_root.resolve()
+    root = _data_root(args.data_root)
     metadata = execution.metadata
     if not isinstance(metadata, Mapping):
         raise S206PreparationBlocked("EXECUTION_EVIDENCE_LINEAGE_METADATA_REQUIRED")
@@ -633,7 +716,7 @@ def _load_formal_execution(args: argparse.Namespace) -> FormalExecutionEvidence:
 
     if not args.execution_evidence_ref:
         raise S206PreparationBlocked("EXECUTE_REQUIRES_FORMAL_EXECUTION_EVIDENCE")
-    path = _logical(args.data_root.resolve(), args.execution_evidence_ref, field="execution_evidence_ref")
+    path = _logical(_data_root(args.data_root), args.execution_evidence_ref, field="execution_evidence_ref")
     try:
         value = load_canonical_json(path)
     except (OSError, TypeError, ValueError) as error:
@@ -652,7 +735,7 @@ def _load_formal_execution(args: argparse.Namespace) -> FormalExecutionEvidence:
 def _legacy_execute(args: argparse.Namespace) -> dict[str, object]:
     preflight = _preflight(args)
     execution = _load_formal_execution(args)
-    root = args.data_root.resolve()
+    root = _data_root(args.data_root)
     execution_ref = _canonical_logical_ref(root, args.execution_evidence_ref, field="execution_evidence_ref")
     operations = _logical(root, args.operations_root, field="operations_root")
     operations.mkdir(parents=True, exist_ok=True)
@@ -727,19 +810,11 @@ def _legacy_execute(args: argparse.Namespace) -> dict[str, object]:
 def _absolute_or_logical(root: Path, value: object, *, field: str) -> Path:
     """Resolve a DATA_ROOT reference while accepting S2.4 absolute status refs."""
 
-    if not isinstance(value, str) or not value:
-        raise S206PreparationBlocked(f"{field}:PATH_REQUIRED")
-    path = Path(value)
-    if path.is_absolute():
-        try:
-            root_anchor = root.resolve()
-            _reject_symlink_components(root, path, field=field)
-            relative = path.absolute().relative_to(root_anchor).as_posix()
-        except (OSError, ValueError) as error:
-            raise S206PreparationBlocked(f"{field}:ABSOLUTE_PATH_OUTSIDE_DATA_ROOT") from error
-        return _logical(root_anchor, relative, field=field)
-    _reject_symlink_components(root, path, field=field)
-    return _logical(root, value, field=field)
+    try:
+        _relative, resolved = resolve_data_root_ref(root, value, field=field)
+        return resolved
+    except DataRootPathError as error:
+        raise S206PreparationBlocked(str(error)) from error
 
 
 def _reject_symlink_components(root: Path, value: Path, *, field: str) -> None:
@@ -753,22 +828,10 @@ def _reject_symlink_components(root: Path, value: Path, *, field: str) -> None:
     an unbound alias.
     """
 
-    if root.is_symlink():
-        raise S206PreparationBlocked(f"{field}:DATA_ROOT_SYMLINK_FORBIDDEN")
-    root_anchor = root.resolve()
-    candidate = value if value.is_absolute() else root_anchor / value
-    candidate_absolute = candidate.absolute()
     try:
-        relative = candidate_absolute.relative_to(root_anchor)
-    except ValueError as error:
-        raise S206PreparationBlocked(f"{field}:PATH_ESCAPE") from error
-    if ".." in relative.parts:
-        raise S206PreparationBlocked(f"{field}:PATH_ESCAPE")
-    current = root_anchor
-    for component in relative.parts:
-        current /= component
-        if current.is_symlink():
-            raise S206PreparationBlocked(f"{field}:SYMLINK_COMPONENT_FORBIDDEN")
+        resolve_data_root_ref(root, value, field=field)
+    except DataRootPathError as error:
+        raise S206PreparationBlocked(str(error)) from error
 
 
 def _derive_s206_config(source_config: ResolvedConfigV2) -> ResolvedConfigV2:
@@ -853,7 +916,7 @@ def _load_s205_rebind(args: argparse.Namespace) -> tuple[dict[str, object], dict
 
     if not args.s205_rebind_ref:
         raise S206PreparationBlocked("PRODUCTION_REQUIRES_S205_REBIND_PLAN")
-    root = args.data_root.resolve()
+    root = _data_root(args.data_root)
     _path, plan = _load_object_ref(root, args.s205_rebind_ref, field="s205_rebind_ref")
     if plan.get("schema_version") != "stage2-s205-rebind-plan-v1" or plan.get("status") != "READY" or plan.get("formal_eligible") is not True:
         raise S206PreparationBlocked("S205_REBIND_READY_FORMAL_REQUIRED")
@@ -897,7 +960,7 @@ def _load_s205_rebind(args: argparse.Namespace) -> tuple[dict[str, object], dict
 def _load_g24a_metrics(args: argparse.Namespace) -> dict[str, dict[str, object]]:
     """Return per-anchor G2.4a metrics used only for reference precision inputs."""
 
-    root = args.data_root.resolve()
+    root = _data_root(args.data_root)
     _path, payload = _load_object_ref(root, args.g24a_evaluation, field="g24a_evaluation")
     results = payload.get("results")
     if not isinstance(results, list) or len(results) != len(ANCHOR_IDS):
@@ -964,7 +1027,7 @@ def _load_production_cell_inputs(
 ) -> tuple[object, Mapping[str, object], Mapping[str, Mapping[str, object]], str, dict[str, float], dict[str, float], CorrectedDeltaBinding]:
     """Bind one S2.4 config/environment/reference to the real formal provider."""
 
-    root = args.data_root.resolve()
+    root = _data_root(args.data_root)
     row = s205_rows.get(anchor_id)
     if row is None:
         raise S206PreparationBlocked(f"S205_ROW_MISSING:{anchor_id}")
@@ -1199,7 +1262,13 @@ def _production_cell(args: argparse.Namespace) -> dict[str, object]:
     if not all(required):
         raise S206PreparationBlocked("PRODUCTION_CELL_REQUIRES_MAPPING_REBIND_ARTIFACT_OUTPUT_AND_EXECUTION")
     preflight = _preflight(args)
-    root = args.data_root.resolve()
+    root = _data_root(args.data_root)
+    if getattr(args, "detached_child", False):
+        _verify_worker_executor_identity(
+            args,
+            expected=preflight["executor_identity"],  # type: ignore[arg-type]
+            root=root,
+        )
     mapping_path = _absolute_or_logical(root, args.pilot_mapping_ref, field="pilot_mapping_ref")
     mapping_value = load_canonical_json(mapping_path)
     if not isinstance(mapping_value, Mapping):
@@ -1335,7 +1404,7 @@ def _production_smoke_cell(args: argparse.Namespace) -> dict[str, object]:
         raise S206PreparationBlocked("PRODUCTION_SMOKE_REQUIRES_MAPPING_REBIND_ARTIFACT_OUTPUT_AND_EXECUTION")
 
     preflight = _preflight(args)
-    root = args.data_root.resolve()
+    root = _data_root(args.data_root)
     execution_ref = _canonical_logical_ref(root, args.execution_evidence_ref, field="execution_evidence_ref")
     mapping_path = _absolute_or_logical(root, args.pilot_mapping_ref, field="pilot_mapping_ref")
     mapping_value = load_canonical_json(mapping_path)
@@ -1536,7 +1605,7 @@ def _load_cost_source(args: argparse.Namespace) -> dict[str, object]:
 
     if not args.cost_semantics_ref:
         raise S206PreparationBlocked("PRODUCTION_REQUIRES_COST_SEMANTICS_REF")
-    root = args.data_root.resolve()
+    root = _data_root(args.data_root)
     _path, raw = _load_object_ref(root, args.cost_semantics_ref, field="cost_semantics_ref")
     value = raw
     required = {
@@ -1612,7 +1681,7 @@ def _load_retry_policy(args: argparse.Namespace, max_attempts: int) -> tuple[dic
         return payload, canonical_json_hash(payload)
     if not args.retry_policy_ref:
         raise S206PreparationBlocked("RETRY_POLICY_REF_REQUIRED_WHEN_RETRIES_ENABLED")
-    root = args.data_root.resolve()
+    root = _data_root(args.data_root)
     _path, raw = _load_object_ref(root, args.retry_policy_ref, field="retry_policy_ref")
     required = {
         "schema_version",
@@ -1688,7 +1757,7 @@ def _production_execute(args: argparse.Namespace) -> dict[str, object]:
         raise S206PreparationBlocked("PRODUCTION_EXECUTE_REQUIRES_SAMPLING_AND_MAPPING_OUTPUT")
     if not args.s205_rebind_ref or not args.cost_semantics_ref:
         raise S206PreparationBlocked("PRODUCTION_EXECUTE_REQUIRES_S205_REBIND_AND_COST_SEMANTICS")
-    root = args.data_root.resolve()
+    root = _data_root(args.data_root)
     execution_ref = _canonical_logical_ref(root, args.execution_evidence_ref, field="execution_evidence_ref")
     sampling_path = _absolute_or_logical(root, args.sampling_plan_ref, field="sampling_plan_ref")
     sampling_value = load_canonical_json(sampling_path)
@@ -1729,7 +1798,7 @@ def _production_execute(args: argparse.Namespace) -> dict[str, object]:
         log_path = operations / "cells" / component / "launcher.log"
         log_path.parent.mkdir(parents=True, exist_ok=True)
         command = [
-            str(args.python), str(Path(__file__).resolve()), "--production-cell",
+            str(args.python), str(Path(__file__).absolute()), "--production-cell",
             "--data-root", str(root), "--repository", str(args.repository.resolve()),
             "--s204-root", args.s204_root, "--g23-evaluation", args.g23_evaluation,
             "--g24a-evaluation", args.g24a_evaluation, "--operations-root", args.operations_root,
@@ -1738,6 +1807,7 @@ def _production_execute(args: argparse.Namespace) -> dict[str, object]:
             "--cell-anchor", anchor_id, "--cell-batch-size", str(batch_size),
             "--cell-artifact-root", cell_artifact, "--cell-output", cell_output,
             "--cell-gpu-uuid", gpu_uuid,
+            "--detached-child",
         ]
         command.extend(["--gpu-inventory-json", str(args.gpu_inventory_json.resolve())])
         if args.resource_within_budget:
@@ -2064,6 +2134,7 @@ def _production_execute(args: argparse.Namespace) -> dict[str, object]:
         "gpu_inventory_source_ref": preflight["gpu_inventory_source_ref"],
         "gpu_inventory_artifact_hash": preflight["gpu_inventory_artifact_hash"],
         "gpu_inventory_source_sha256": preflight["gpu_inventory_source_sha256"],
+        "gpu_inventory_identity": dict(preflight["gpu_inventory_identity"]),
         "gpu_inventory_path": preflight["gpu"]["inventory_path"],  # type: ignore[index]
         "preflight_artifact_hash": preflight["preflight_artifact_hash"],
         "cost_semantics_ref": args.cost_semantics_ref,
@@ -2117,7 +2188,7 @@ def _execute(args: argparse.Namespace) -> dict[str, object]:
 
 
 def _reduce(args: argparse.Namespace) -> dict[str, object]:
-    root = args.data_root.resolve()
+    root = _data_root(args.data_root)
     if not args.pilot_mapping_ref or not args.measurements_ref or not args.costs_ref or not args.report_output:
         raise S206PreparationBlocked("REDUCE_REQUIRES_MAPPING_MEASUREMENTS_COSTS_AND_OUTPUT")
     mapping_path = _logical(root, args.pilot_mapping_ref, field="pilot_mapping_ref")
@@ -2156,7 +2227,7 @@ def _synthetic_cell(args: argparse.Namespace) -> dict[str, object]:
     synthetic provider is not an exception to the S2.6 consumer contract.
     """
 
-    root = args.data_root.resolve()
+    root = _data_root(args.data_root)
     # Keep the direct bridge under the same G2.3/G2.4a and approved-GPU
     # preflight as the long-running launcher; synthetic execution is not a
     # bypass around those gates.
@@ -2233,7 +2304,7 @@ def _synthetic_cell(args: argparse.Namespace) -> dict[str, object]:
 
 
 def _qualify(args: argparse.Namespace) -> dict[str, object]:
-    root = args.data_root.resolve()
+    root = _data_root(args.data_root)
     if not args.pilot_mapping_ref or not args.measurements_ref or not args.costs_ref or not args.execution_evidence_ref or not args.matrix_output or not args.gate_output:
         raise S206PreparationBlocked("QUALIFY_REQUIRES_REDUCER_INPUTS_EXECUTION_AND_OUTPUTS")
     mapping_path = _logical(root, args.pilot_mapping_ref, field="pilot_mapping_ref")
@@ -2303,6 +2374,15 @@ def _verify_status_inventory_identity(
         or identity["source_sha256"] != value["gpu_inventory_source_sha256"]
     ):
         raise S206PreparationBlocked("STATUS_GPU_INVENTORY_IDENTITY_DRIFT")
+    expected_identity = {
+        "source_ref": identity["source_ref"],
+        "artifact_ref": identity["artifact_ref"],
+        "artifact_hash": identity["artifact_hash"],
+        "source_sha256": identity["source_sha256"],
+        "schema_version": identity["schema_version"],
+    }
+    if value.get("gpu_inventory_identity") != expected_identity:
+        raise S206PreparationBlocked("STATUS_GPU_INVENTORY_IDENTITY_FIELDS_INVALID")
     preflight = value.get("preflight")
     if not isinstance(preflight, Mapping):
         raise S206PreparationBlocked("STATUS_PREFLIGHT_IDENTITY_MISSING")
@@ -2314,6 +2394,8 @@ def _verify_status_inventory_identity(
         or canonical_json_hash(body) != declared
     ):
         raise S206PreparationBlocked("STATUS_PREFLIGHT_IDENTITY_DRIFT")
+    if preflight.get("gpu_inventory_identity") != expected_identity:
+        raise S206PreparationBlocked("STATUS_PREFLIGHT_GPU_INVENTORY_IDENTITY_FIELDS_INVALID")
 
 
 def _verify_status_execution_identity(
@@ -2327,12 +2409,31 @@ def _verify_status_execution_identity(
     if any(key not in value for key in required):
         raise S206PreparationBlocked("STATUS_EXECUTION_EVIDENCE_IDENTITY_MISSING")
     execution = _load_formal_execution(args)
-    root = args.data_root.resolve()
+    root = _data_root(args.data_root)
     expected_ref = _logical(root, args.execution_evidence_ref, field="execution_evidence_ref").relative_to(root).as_posix()
     if value["execution_evidence_ref"] != expected_ref:
         raise S206PreparationBlocked("STATUS_EXECUTION_EVIDENCE_REF_DRIFT")
     if value["execution_evidence_hash"] != execution.artifact_hash:
         raise S206PreparationBlocked("STATUS_EXECUTION_EVIDENCE_HASH_DRIFT")
+
+
+def _verify_status_executor_identity(
+    value: Mapping[str, object],
+    *,
+    args: argparse.Namespace,
+) -> None:
+    """Recompute the clean launcher identity for every formal status reload."""
+
+    repository = getattr(args, "repository", _REPOSITORY_ROOT)
+    if "executor_identity" not in value:
+        raise S206PreparationBlocked("STATUS_EXECUTOR_IDENTITY_MISSING")
+    expected = _validate_live_executor_identity(
+        value.get("executor_identity"),
+        repository=repository or _REPOSITORY_ROOT,
+    )
+    preflight = value.get("preflight")
+    if isinstance(preflight, Mapping) and preflight.get("executor_identity") != expected:
+        raise S206PreparationBlocked("STATUS_EXECUTOR_IDENTITY_DRIFT")
 
 
 def _verify_status_artifact_hash(value: Mapping[str, object]) -> None:
@@ -2350,14 +2451,34 @@ def _verify_status_artifact_hash(value: Mapping[str, object]) -> None:
 
 
 def _wait(args: argparse.Namespace) -> int:
-    status_path = _logical(args.data_root.resolve(), f"{args.operations_root}/status.json", field="status")
+    root = _data_root(args.data_root)
+    status_path = _logical(root, f"{args.operations_root}/status.json", field="status")
+    repository = getattr(args, "repository", None)
+    executor_identity = (
+        _executor_identity(repository or _REPOSITORY_ROOT)
+        if repository is not None
+        else None
+    )
+    operations_ref = _canonical_logical_ref(root, args.operations_root, field="operations_root")
+    if executor_identity is not None:
+        _scan_detached_attempts(
+            status_path.parent,
+            operations_ref=operations_ref,
+            executor_identity=executor_identity,
+            block_live=False,
+        )
     deadline = None if args.timeout_seconds is None else time.monotonic() + args.timeout_seconds
     while True:
+        if status_path.is_symlink():
+            raise S206PreparationBlocked("STATUS_SYMLINK_FORBIDDEN")
         if status_path.exists():
+            if not status_path.is_file():
+                raise S206PreparationBlocked("STATUS_NOT_REGULAR")
             value = load_canonical_json(status_path)
             if not isinstance(value, Mapping):
                 raise S206PreparationBlocked("STATUS_OBJECT_REQUIRED")
             _verify_status_artifact_hash(value)
+            _verify_status_executor_identity(value, args=args)
             terminal = value.get("stage") in {
                 "PILOT_COMPLETE",
                 "G2.4B_PASS_MATRIX_FROZEN",
@@ -2367,7 +2488,7 @@ def _wait(args: argparse.Namespace) -> int:
             if terminal:
                 _verify_status_inventory_identity(
                     value,
-                    data_root=args.data_root.resolve(),
+                    data_root=root,
                 )
                 # Every formal terminal status must carry and revalidate
                 # the exact execution amendment; inventory-only recovery
@@ -2390,6 +2511,55 @@ _DETACHED_REF_FIELDS = (
     "gpu_inventory_source_ref",
     "gpu_inventory_path",
     "execution_evidence_ref",
+)
+_DETACHED_LAUNCH_FIELDS = frozenset(
+    {
+        "schema_version",
+        "attempt_id",
+        "attempt_ref",
+        "pid",
+        "run_id",
+        "operations_root",
+        "log_ref",
+        "status_ref",
+        "gpu_inventory_ref",
+        "gpu_inventory_source_ref",
+        "gpu_inventory_artifact_hash",
+        "gpu_inventory_source_sha256",
+        "gpu_inventory_path",
+        "preflight_artifact_hash",
+        "execution_evidence_ref",
+        "execution_evidence_hash",
+        "executor_identity",
+        "recovery_command",
+        "confirmatory_draws_generated",
+        "artifact_hash",
+    }
+)
+_DETACHED_FAILURE_FIELDS = frozenset(
+    {
+        "schema_version",
+        "attempt_id",
+        "attempt_ref",
+        "pid",
+        "run_id",
+        "operations_root",
+        "log_ref",
+        "status_ref",
+        "gpu_inventory_ref",
+        "gpu_inventory_source_ref",
+        "gpu_inventory_artifact_hash",
+        "gpu_inventory_source_sha256",
+        "gpu_inventory_path",
+        "preflight_artifact_hash",
+        "execution_evidence_ref",
+        "execution_evidence_hash",
+        "executor_identity",
+        "status",
+        "failure_reason",
+        "cleanup_error",
+        "artifact_hash",
+    }
 )
 
 
@@ -2429,6 +2599,8 @@ def _validate_detached_receipt_refs(value: Mapping[str, object]) -> None:
 def _detached_receipt_hash(value: Mapping[str, object]) -> int:
     """Verify a detached attempt receipt and return its validated PID."""
 
+    if set(value) != _DETACHED_LAUNCH_FIELDS:
+        raise S206PreparationBlocked("DETACHED_ATTEMPT_RECEIPT_FIELDS_INVALID")
     if value.get("schema_version") != "stage2-s206-detached-launch-v1":
         raise S206PreparationBlocked("DETACHED_ATTEMPT_RECEIPT_SCHEMA_INVALID")
     declared = value.get("artifact_hash")
@@ -2439,19 +2611,31 @@ def _detached_receipt_hash(value: Mapping[str, object]) -> int:
     if canonical_json_hash({key: item for key, item in value.items() if key != "artifact_hash"}) != declared:
         raise S206PreparationBlocked("DETACHED_ATTEMPT_RECEIPT_HASH_MISMATCH")
     _validate_detached_receipt_refs(value)
+    try:
+        validate_executor_identity(value.get("executor_identity"))
+    except ExecutorIdentityError as error:
+        raise S206PreparationBlocked(f"DETACHED_ATTEMPT_EXECUTOR_IDENTITY_INVALID:{error}") from error
     pid = value.get("pid")
     if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
         raise S206PreparationBlocked("DETACHED_ATTEMPT_RECEIPT_PID_INVALID")
+    if value.get("confirmatory_draws_generated") is not False:
+        raise S206PreparationBlocked("DETACHED_ATTEMPT_RECEIPT_SCOPE_INVALID")
     return pid
 
 
 def _detached_failure_hash(value: Mapping[str, object]) -> int | None:
     """Verify a durable failed-launch marker and return its optional PID."""
 
+    if set(value) != _DETACHED_FAILURE_FIELDS:
+        raise S206PreparationBlocked("DETACHED_FAILURE_RECEIPT_FIELDS_INVALID")
     if value.get("schema_version") != "stage2-s206-detached-failure-v1":
         raise S206PreparationBlocked("DETACHED_FAILURE_RECEIPT_SCHEMA_INVALID")
     if value.get("status") not in {"SPAWN_FAILED", "RECEIPT_WRITE_FAILED"}:
         raise S206PreparationBlocked("DETACHED_FAILURE_RECEIPT_STATUS_INVALID")
+    if not isinstance(value.get("failure_reason"), str) or not value.get("failure_reason"):
+        raise S206PreparationBlocked("DETACHED_FAILURE_RECEIPT_REASON_INVALID")
+    if value.get("cleanup_error") is not None and not isinstance(value.get("cleanup_error"), str):
+        raise S206PreparationBlocked("DETACHED_FAILURE_RECEIPT_CLEANUP_INVALID")
     declared = value.get("artifact_hash")
     if not isinstance(declared, str) or len(declared) != 64 or any(
         char not in "0123456789abcdef" for char in declared
@@ -2460,8 +2644,15 @@ def _detached_failure_hash(value: Mapping[str, object]) -> int | None:
     if canonical_json_hash({key: item for key, item in value.items() if key != "artifact_hash"}) != declared:
         raise S206PreparationBlocked("DETACHED_FAILURE_RECEIPT_HASH_MISMATCH")
     _validate_detached_receipt_refs(value)
+    try:
+        validate_executor_identity(value.get("executor_identity"))
+    except ExecutorIdentityError as error:
+        raise S206PreparationBlocked(f"DETACHED_FAILURE_EXECUTOR_IDENTITY_INVALID:{error}") from error
     pid = value.get("pid")
-    if pid is None:
+    status = value["status"]
+    if status == "SPAWN_FAILED":
+        if pid is not None:
+            raise S206PreparationBlocked("DETACHED_FAILURE_SPAWN_FAILED_PID_MUST_BE_NULL")
         return None
     if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
         raise S206PreparationBlocked("DETACHED_FAILURE_RECEIPT_PID_INVALID")
@@ -2479,7 +2670,13 @@ def _pid_is_live(pid: int) -> bool:
     return True
 
 
-def _scan_detached_attempts(operations: Path, *, operations_ref: str | None = None) -> None:
+def _scan_detached_attempts(
+    operations: Path,
+    *,
+    operations_ref: str | None = None,
+    executor_identity: Mapping[str, object] | None = None,
+    block_live: bool = True,
+) -> None:
     """Reject malformed attempts and block only an actually live PID."""
 
     legacy = operations / "launcher.pid.json"
@@ -2524,11 +2721,15 @@ def _scan_detached_attempts(operations: Path, *, operations_ref: str | None = No
         if (
             raw.get("attempt_id") != entry.name
             or (operations_ref is not None and raw.get("operations_root") != operations_ref)
+            or (
+                executor_identity is not None
+                and raw.get("executor_identity") != dict(executor_identity)
+            )
         ):
             raise S206PreparationBlocked("DETACHED_ATTEMPT_RECEIPT_IDENTITY_MISMATCH")
         if pid is None:
             continue
-        if _pid_is_live(pid):
+        if block_live and _pid_is_live(pid):
             raise S206PreparationBlocked(f"DETACHED_LAUNCH_ALREADY_RUNNING:{pid}")
 
 
@@ -2600,15 +2801,30 @@ def _detach(args: argparse.Namespace) -> int:
     # amendment lineage before creating a child process so a later wait cannot
     # recover an authorization that was never bound to this command.
     execution = _load_formal_execution(args)
-    execution_ref = _canonical_logical_ref(args.data_root.resolve(), args.execution_evidence_ref, field="execution_evidence_ref")
-    g23_ref = _canonical_logical_ref(args.data_root.resolve(), args.g23_evaluation, field="g23_evaluation")
-    g24a_ref = _canonical_logical_ref(args.data_root.resolve(), args.g24a_evaluation, field="g24a_evaluation")
-    s205_ref = _canonical_logical_ref(args.data_root.resolve(), args.s205_rebind_ref, field="s205_rebind_ref")
-    root = args.data_root.resolve()
+    execution_ref = _canonical_logical_ref(_data_root(args.data_root), args.execution_evidence_ref, field="execution_evidence_ref")
+    g23_ref = _canonical_logical_ref(_data_root(args.data_root), args.g23_evaluation, field="g23_evaluation")
+    g24a_ref = _canonical_logical_ref(_data_root(args.data_root), args.g24a_evaluation, field="g24a_evaluation")
+    s205_ref = _canonical_logical_ref(_data_root(args.data_root), args.s205_rebind_ref, field="s205_rebind_ref")
+    root = _data_root(args.data_root)
     operations_ref = _canonical_logical_ref(root, args.operations_root, field="operations_root")
     operations = _logical(root, args.operations_root, field="operations_root")
     operations.mkdir(parents=True, exist_ok=True)
-    _scan_detached_attempts(operations, operations_ref=operations_ref)
+    declared_executor = preflight.get("executor_identity")
+    if declared_executor is None:
+        # Private legacy tests may replace _preflight with a minimal fixture;
+        # the real preflight always supplies this field and is never allowed
+        # to bypass the live clean-source recomputation.
+        executor_identity = _executor_identity(getattr(args, "repository", _REPOSITORY_ROOT))
+    else:
+        executor_identity = _validate_live_executor_identity(
+            declared_executor,
+            repository=getattr(args, "repository", _REPOSITORY_ROOT),
+        )
+    _scan_detached_attempts(
+        operations,
+        operations_ref=operations_ref,
+        executor_identity=executor_identity,
+    )
     attempts_root = operations / "attempts"
     attempts_root.mkdir(parents=True, exist_ok=True)
     attempt_id = f"{time.time_ns()}-{uuid.uuid4().hex}"
@@ -2623,7 +2839,8 @@ def _detach(args: argparse.Namespace) -> int:
     attempt_ref = f"{operations_ref}/attempts/{attempt_id}"
     log_ref = f"{attempt_ref}/launcher.log"
     status_ref = f"{operations_ref}/status.json"
-    child_argv = [item for item in sys.argv[1:] if item != "--detach"]
+    child_argv = [item for item in sys.argv[1:] if item not in {"--detach", "--detached-child"}]
+    child_argv.append("--detached-child")
 
     def publish_failure(
         *,
@@ -2649,6 +2866,7 @@ def _detach(args: argparse.Namespace) -> int:
             "preflight_artifact_hash": preflight["preflight_artifact_hash"],
             "execution_evidence_ref": execution_ref,
             "execution_evidence_hash": execution.artifact_hash,
+            "executor_identity": dict(executor_identity),
             "status": status,
             "failure_reason": f"{type(error).__name__}:{error}",
             "cleanup_error": cleanup_error,
@@ -2660,8 +2878,8 @@ def _detach(args: argparse.Namespace) -> int:
     try:
         with log_path.open("ab") as handle:
             process = subprocess.Popen(
-                [str(args.python), str(Path(__file__).resolve()), *child_argv],
-                cwd=args.repository.resolve(),
+                [str(args.python), str(Path(__file__).absolute()), *child_argv],
+                cwd=Path(args.repository).absolute(),
                 stdin=subprocess.DEVNULL,
                 stdout=handle,
                 stderr=subprocess.STDOUT,
@@ -2692,9 +2910,10 @@ def _detach(args: argparse.Namespace) -> int:
         "preflight_artifact_hash": preflight["preflight_artifact_hash"],
         "execution_evidence_ref": execution_ref,
         "execution_evidence_hash": execution.artifact_hash,
+        "executor_identity": dict(executor_identity),
         "recovery_command": (
             "--wait "
-            f"--data-root {args.data_root.resolve()} "
+            f"--data-root {root} "
             f"--s204-root {args.s204_root} "
             f"--g23-evaluation {g23_ref} "
             f"--g24a-evaluation {g24a_ref} "
@@ -2783,6 +3002,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--throughput-sequences-per-second", type=float)
     parser.add_argument("--synthetic-sample-count", type=int, default=4096)
     parser.add_argument("--synthetic-seed", type=int, default=0)
+    parser.add_argument("--detached-child", action="store_true", help=argparse.SUPPRESS)
     return parser
 
 
@@ -2805,6 +3025,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             result = _production_smoke_cell(args)
             print(json.dumps(result, ensure_ascii=False, sort_keys=True, indent=2))
             return 0
+        if args.execute and not args.detached_child:
+            raise S206PreparationBlocked("EXECUTE_REQUIRES_DETACH")
         if args.wait:
             if not args.execution_evidence_ref or not args.s205_rebind_ref:
                 raise S206PreparationBlocked(

@@ -65,6 +65,15 @@ from .stage2_s207_formal import (
     _anchor_to_cell_id,
     validate_gpu_inventory,
 )
+from .stage2_path_security import (
+    DataRootPathError,
+    resolve_data_root,
+    resolve_data_root_ref,
+)
+from .stage2_executor_identity import (
+    compute_executor_identity,
+    validate_executor_identity,
+)
 
 
 S27_EXECUTION_SCHEMA = "stage2-s27-production-execution-v1"
@@ -72,6 +81,22 @@ S27_ATTEMPT_SCHEMA = "stage2-s27-unit-attempt-v1"
 S27_WAVE_SEAL_SCHEMA = "stage2-s27-wave-seal-v1"
 S27_LAUNCH_SCHEMA = "stage2-s27-detached-launch-v1"
 S27_LAUNCH_STATUS_SCHEMA = "stage2-s27-launch-status-v1"
+S27_LAUNCH_STATUS_FIELDS = frozenset(
+    {
+        "schema_version",
+        "run_id",
+        "plan_ref",
+        "plan_hash",
+        "gpu_inventory_identity",
+        "executor_identity",
+        "status",
+        "wave_order",
+        "waves",
+        "updated_at",
+        "reason",
+        "artifact_hash",
+    }
+)
 S27_RAW_RESULT_SCHEMA = "stage2-s27-raw-result-v1"
 S27_SHARD_PLAN_SCHEMA = "stage2-s27-unit-shard-plan-v1"
 S27_SHARD_SEAL_SCHEMA = "stage2-s27-unit-shard-seal-v1"
@@ -259,13 +284,11 @@ def validate_s27_gpu_inventory(
 
 
 def _s27_inventory_path(root: Path, path: str | Path) -> Path:
-    resolved_root = root.resolve()
-    resolved = Path(path).resolve()
     try:
-        resolved.relative_to(resolved_root)
-    except ValueError as error:
-        raise S27ExecutionBlocked("GPU_INVENTORY_PATH_OUTSIDE_DATA_ROOT") from error
-    return resolved
+        _ref, resolved = resolve_data_root_ref(root, path, field="GPU_INVENTORY_ARTIFACT")
+        return resolved
+    except DataRootPathError as error:
+        raise S27ExecutionBlocked(f"GPU_INVENTORY_PATH_INVALID:{error}") from error
 
 
 def _s27_file_sha256(path: Path) -> str:
@@ -412,9 +435,15 @@ def load_s27_gpu_inventory_envelope(
 
     if path is None:
         raise S27ExecutionBlocked("GPU_INVENTORY_JSON_REQUIRED")
-    root = Path(data_root).resolve()
+    try:
+        root = resolve_data_root(data_root)
+    except DataRootPathError as error:
+        raise S27ExecutionBlocked(f"GPU_INVENTORY_DATA_ROOT_INVALID:{error}") from error
     resolved = _s27_inventory_path(root, path)
-    expected_artifact_ref = resolved.relative_to(root).as_posix()
+    try:
+        expected_artifact_ref = resolved.relative_to(root).as_posix()
+    except ValueError as error:
+        raise S27ExecutionBlocked("GPU_INVENTORY_PATH_OUTSIDE_DATA_ROOT") from error
     try:
         value = load_canonical_json(resolved)
     except (OSError, TypeError, ValueError) as error:
@@ -436,19 +465,15 @@ def load_s27_gpu_inventory_envelope(
         if artifact_ref != expected_artifact_ref:
             raise S27ExecutionBlocked("GPU_INVENTORY_ARTIFACT_REF_PATH_MISMATCH")
         try:
-            source_posix = PurePosixPath(source_ref)
-            if (
-                source_posix.is_absolute()
-                or Path(source_ref).is_absolute()
-                or Path(source_ref).drive
-                or any(part in {"", ".", ".."} for part in source_posix.parts)
-            ):
-                raise ValueError(source_ref)
-            source_path = (root / Path(*source_posix.parts)).resolve()
-            source_path.relative_to(root)
-        except (OSError, ValueError) as error:
+            source_logical, source_path = resolve_data_root_ref(
+                root,
+                source_ref,
+                field="GPU_INVENTORY_SOURCE_REF",
+                allow_absolute=False,
+            )
+        except DataRootPathError as error:
             raise S27ExecutionBlocked("GPU_INVENTORY_SOURCE_REF_PATH_INVALID") from error
-        if source_ref != source_path.relative_to(root).as_posix():
+        if source_ref != source_logical:
             raise S27ExecutionBlocked("GPU_INVENTORY_SOURCE_REF_NOT_CANONICAL")
         if source_path == resolved:
             raise S27ExecutionBlocked("GPU_INVENTORY_SOURCE_REF_SELF_REFERENCE")
@@ -597,38 +622,38 @@ class S27UnitShard:
 
 
 def _safe_ref(root: Path, value: str, *, field: str) -> Path:
-    if not isinstance(value, str) or not value or "\\" in value:
-        raise S27ExecutionBlocked(f"{field}:INVALID_LOGICAL_REFERENCE")
-    logical = PurePosixPath(value)
-    if logical.is_absolute() or any(part in {"", ".", ".."} for part in logical.parts):
-        raise S27ExecutionBlocked(f"{field}:PATH_ESCAPE")
-    current = root
-    if root.is_symlink():
-        raise S27ExecutionBlocked(f"{field}:SYMLINK_ROOT")
-    for part in logical.parts:
-        current = current / part
-        if current.is_symlink():
-            raise S27ExecutionBlocked(f"{field}:SYMLINK_COMPONENT")
-    target = (root.joinpath(*logical.parts)).resolve()
     try:
-        target.relative_to(root.resolve())
-    except ValueError as error:
-        raise S27ExecutionBlocked(f"{field}:PATH_ESCAPE") from error
-    return target
+        _logical, target = resolve_data_root_ref(root, value, field=field, allow_absolute=False)
+        return target
+    except DataRootPathError as error:
+        raise S27ExecutionBlocked(str(error)) from error
 
 
 def _relative_ref(root: Path, path: Path, *, field: str) -> str:
     try:
-        relative = path.resolve().relative_to(root.resolve()).as_posix()
-    except ValueError as error:
-        raise S27ExecutionBlocked(f"{field}:OUTSIDE_DATA_ROOT") from error
-    if not relative or ".." in PurePosixPath(relative).parts:
-        raise S27ExecutionBlocked(f"{field}:INVALID_RELATIVE_REFERENCE")
-    return relative
+        relative, _target = resolve_data_root_ref(root, path, field=field)
+        return relative
+    except DataRootPathError as error:
+        raise S27ExecutionBlocked(str(error)) from error
 
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _s27_data_root(value: str | Path) -> Path:
+    try:
+        return resolve_data_root(value)
+    except DataRootPathError as error:
+        raise S27ExecutionBlocked(f"S27_DATA_ROOT_INVALID:{error}") from error
+
+
+def _s27_run_root(root: Path, value: str | Path, *, field: str = "S27_RUN_ROOT") -> Path:
+    try:
+        _ref, resolved = resolve_data_root_ref(root, value, field=field)
+        return resolved
+    except DataRootPathError as error:
+        raise S27ExecutionBlocked(str(error)) from error
 
 
 def _canonical_payload(value: Mapping[str, object], *, field: str) -> tuple[dict[str, object], str]:
@@ -664,7 +689,7 @@ def _load_payload(root: Path, reference: str, *, field: str) -> tuple[dict[str, 
 
 
 def load_s27_plan(data_root: str | Path, plan_ref: str) -> S27Plan:
-    root = Path(data_root).resolve()
+    root = _s27_data_root(data_root)
     payload, _, _ = _load_payload(root, plan_ref, field="s27_plan")
     try:
         return S27Plan.from_mapping(payload)
@@ -725,12 +750,8 @@ def write_s27_shard_plan(
 ) -> tuple[S27UnitShard, ...]:
     """Persist the immutable shard partition before any child is launched."""
 
-    root = Path(data_root).resolve()
-    run = Path(run_root).resolve()
-    try:
-        run.relative_to(root)
-    except ValueError as error:
-        raise S27ExecutionBlocked("S27_SHARD_RUN_ROOT_OUTSIDE_DATA_ROOT") from error
+    root = _s27_data_root(data_root)
+    run = _s27_run_root(root, run_root, field="S27_SHARD_RUN_ROOT")
     shards = partition_s27_units(plan, cell_id)
     body: dict[str, object] = {
         "schema_version": S27_SHARD_PLAN_SCHEMA,
@@ -757,9 +778,9 @@ def load_s27_shard_plan(
 ) -> tuple[S27UnitShard, ...]:
     """Reload and rederive the exact four-card partition; never trust CLI IDs."""
 
-    root = Path(data_root).resolve()
-    run = Path(run_root).resolve()
-    expected_path = _shard_plan_path(run, cell_id).resolve()
+    root = _s27_data_root(data_root)
+    run = _s27_run_root(root, run_root, field="S27_SHARD_RUN_ROOT")
+    expected_path = _shard_plan_path(run, cell_id)
     path = expected_path if shard_plan_ref is None else _safe_ref(root, shard_plan_ref, field=f"S27_SHARD_PLAN_REF:{cell_id}")
     if path != expected_path:
         raise S27ExecutionBlocked(f"S27_SHARD_PLAN_REF_MISMATCH:{cell_id}")
@@ -813,7 +834,7 @@ def load_s27_frozen_mappings(
 ) -> dict[str, RepetitionMapping]:
     """Read the exact S2.6 mappings; this function never calls a draw API."""
 
-    root = Path(data_root).resolve()
+    root = _s27_data_root(data_root)
     payload, digest, _ = _load_payload(root, plan.frozen_inputs.mapping_ref, field="s27_mapping")
     if digest != plan.frozen_inputs.mapping_hash:
         raise S27ExecutionBlocked("S27_MAPPING_HASH_DRIFT")
@@ -888,7 +909,7 @@ def load_s27_reference_views(
 ) -> dict[str, Mapping[str, object]]:
     """Load the independent S2.4 reference bundle and its G2.3 PASS gate."""
 
-    root = Path(data_root).resolve()
+    root = _s27_data_root(data_root)
     reference, reference_digest, reference_ref = _load_payload(root, cell.reference_ref, field=f"reference.{cell.cell_id}")
     if reference_digest != cell.reference_hash:
         raise S27ExecutionBlocked(f"S27_REFERENCE_ARTIFACT_HASH_MISMATCH:{cell.cell_id}")
@@ -980,7 +1001,7 @@ class S27MaterializedCellInput:
 
 
 def load_s27_materialized_inputs(data_root: str | Path, index_ref: str) -> dict[str, S27MaterializedCellInput]:
-    root = Path(data_root).resolve()
+    root = _s27_data_root(data_root)
     index_path = _safe_ref(root, index_ref, field="s27_materialization_index")
     raw_index = load_canonical_json(index_path)
     if not isinstance(raw_index, Mapping):
@@ -1637,8 +1658,8 @@ class S27ProductionWorker:
         if gpu_uuid not in APPROVED_GPU_UUIDS:
             raise S27ExecutionBlocked(f"S27_GPU_ASSIGNMENT_INVALID:{cell_id}")
         self.gpu_uuid = gpu_uuid
-        self.data_root = Path(data_root).resolve()
-        self.run_root = Path(run_root).resolve()
+        self.data_root = _s27_data_root(data_root)
+        self.run_root = _s27_run_root(self.data_root, run_root, field="S27_WORKER_RUN_ROOT")
         self.provider_factory = provider_factory or build_s27_torch_provider
         self.request = request
         self.materialized_input = materialized_input
@@ -1991,9 +2012,9 @@ class S27ProductionWorker:
 
 
 def load_s27_raw_records(data_root: str | Path, plan: S27Plan, run_root: str | Path, *, run_id: str) -> StrictG25Reducer:
-    root = Path(data_root).resolve()
+    root = _s27_data_root(data_root)
     reducer = StrictG25Reducer(plan, run_id=run_id)
-    record_root = Path(run_root).resolve() / "raw-units"
+    record_root = _s27_run_root(root, run_root, field="S27_RAW_RUN_ROOT") / "raw-units"
     if not record_root.is_dir():
         raise S27ExecutionBlocked("S27_RAW_UNIT_DIRECTORY_MISSING")
     for path in sorted(record_root.glob("*.json")):
@@ -2110,8 +2131,8 @@ def validate_s27_shard_seals(
 ) -> tuple[S27UnitShard, ...]:
     """Reject overlap, missing shard seals, GPU drift, or raw descriptor drift."""
 
-    root = Path(data_root).resolve()
-    run = Path(run_root).resolve()
+    root = _s27_data_root(data_root)
+    run = _s27_run_root(root, run_root, field="S27_SHARD_SEAL_RUN_ROOT")
     shards = load_s27_shard_plan(root, plan, run, run_id=run_id, cell_id=cell_id)
     reducer = load_s27_raw_records(root, plan, run, run_id=run_id)
     by_unit = {record.unit_id: record for record in reducer.records if record.cell_id == cell_id}
@@ -2181,8 +2202,8 @@ def seal_s27_wave(
 ) -> dict[str, object]:
     """Atomically merge all four shard seals into one checkpoint-wave seal."""
 
-    root = Path(data_root).resolve()
-    run = Path(run_root).resolve()
+    root = _s27_data_root(data_root)
+    run = _s27_run_root(root, run_root, field="S27_WAVE_SEAL_RUN_ROOT")
     shards = validate_s27_shard_seals(root, plan, run, run_id=run_id, cell_id=cell_id)
     reducer = load_s27_raw_records(root, plan, run, run_id=run_id)
     path = run / "wave-seals" / f"{cell_id.replace(':', '__')}.json"
@@ -2212,7 +2233,7 @@ def seal_s27_run(data_root: str | Path, plan: S27Plan, run_root: str | Path, *, 
 
     reducer = load_s27_raw_records(data_root, plan, run_root, run_id=run_id)
     for cell in plan.cells:
-        seal = Path(run_root).resolve() / "wave-seals" / f"{cell.cell_id.replace(':', '__')}.json"
+        seal = _s27_run_root(root, run_root, field="S27_RUN_SEAL_ROOT") / "wave-seals" / f"{cell.cell_id.replace(':', '__')}.json"
         if not seal.is_file():
             raise S27ExecutionBlocked(f"S27_WAVE_SEAL_MISSING:{cell.cell_id}")
         payload = load_canonical_json(seal)
@@ -2244,7 +2265,7 @@ def seal_s27_run(data_root: str | Path, plan: S27Plan, run_root: str | Path, *, 
                 raise S27ExecutionBlocked(f"S27_WAVE_SEAL_RAW_BINDING_INVALID:{cell.cell_id}")
         if seen_descriptors != expected or set(records) != expected:
             raise S27ExecutionBlocked(f"S27_WAVE_SEAL_COVERAGE_INVALID:{cell.cell_id}")
-    return reducer.seal(Path(run_root).resolve() / "sealed")
+    return reducer.seal(_s27_run_root(root, run_root, field="S27_RUN_SEALED_ROOT") / "sealed")
 
 
 def validate_s27_quality_wave(
@@ -2264,8 +2285,8 @@ def validate_s27_quality_wave(
 
     if cell_id != EXPECTED_CELL_IDS[0]:
         raise S27ExecutionBlocked("S27_QUALITY_WAVE_MUST_BE_FIRST_14M_INITIALIZATION")
-    root = Path(data_root).resolve()
-    run = Path(run_root).resolve()
+    root = _s27_data_root(data_root)
+    run = _s27_run_root(root, run_root, field="S27_QUALITY_RUN_ROOT")
     expected = [unit for unit in plan.frozen_inputs.units if unit.cell_id == cell_id]
     found: list[S27RawUnit] = []
     for unit in expected:
@@ -2452,13 +2473,15 @@ class S27DetachedLauncher:
         approved_inventory: Sequence[Mapping[str, object]],
         gpu_inventory_json: str | Path | None = None,
         gpu_inventory_identity: Mapping[str, object] | None = None,
+        executor_identity: Mapping[str, object] | None = None,
+        executor_repository: str | Path | None = None,
     ) -> None:
-        self.data_root = Path(data_root).resolve()
+        self.data_root = _s27_data_root(data_root)
         self.plan = load_s27_plan(self.data_root, plan_ref)
         if any(cell.corrected_delta_sci_binding is None for cell in self.plan.cells):
             raise S27ExecutionBlocked("S27_CORRECTED_DELTA_BINDINGS_REQUIRED")
         self.plan_ref = plan_ref
-        self.run_root = Path(run_root).resolve()
+        self.run_root = _s27_run_root(self.data_root, run_root, field="S27_DETACHED_RUN_ROOT")
         self.run_id = run_id
         self.python = str(python)
         self.launcher_script = str(launcher_script)
@@ -2467,14 +2490,54 @@ class S27DetachedLauncher:
         validate_s27_gpu_inventory(approved_inventory, compute_apps=())
         if gpu_inventory_json is None or gpu_inventory_identity is None:
             raise S27ExecutionBlocked("S27_GPU_INVENTORY_IDENTITY_REQUIRED")
-        required_identity = {"source_ref", "artifact_hash", "source_sha256", "schema_version"}
+        required_identity = {"source_ref", "artifact_ref", "artifact_hash", "source_sha256", "schema_version"}
         if set(gpu_inventory_identity) != required_identity:
             raise S27ExecutionBlocked("S27_GPU_INVENTORY_IDENTITY_FIELDS_INVALID")
         for field in required_identity:
             if not isinstance(gpu_inventory_identity.get(field), str) or not gpu_inventory_identity[field]:
                 raise S27ExecutionBlocked(f"S27_GPU_INVENTORY_IDENTITY_{field.upper()}_INVALID")
-        self.gpu_inventory_json = Path(gpu_inventory_json).resolve()
+        try:
+            _inventory_ref, self.gpu_inventory_json = resolve_data_root_ref(
+                self.data_root,
+                gpu_inventory_json,
+                field="S27_GPU_INVENTORY_ARTIFACT",
+            )
+        except DataRootPathError as error:
+            raise S27ExecutionBlocked(f"S27_GPU_INVENTORY_PATH_INVALID:{error}") from error
         self.gpu_inventory_identity = dict(gpu_inventory_identity)
+        if self.gpu_inventory_identity["artifact_ref"] != _inventory_ref:
+            raise S27ExecutionBlocked("S27_GPU_INVENTORY_IDENTITY_ARTIFACT_REF_MISMATCH")
+        if self.gpu_inventory_identity["schema_version"] != S27_GPU_INVENTORY_SCHEMA:
+            raise S27ExecutionBlocked("S27_GPU_INVENTORY_IDENTITY_SCHEMA_INVALID")
+        if not _SHA256.fullmatch(self.gpu_inventory_identity["artifact_hash"]):
+            raise S27ExecutionBlocked("S27_GPU_INVENTORY_IDENTITY_ARTIFACT_HASH_INVALID")
+        if not _SHA256.fullmatch(self.gpu_inventory_identity["source_sha256"]):
+            raise S27ExecutionBlocked("S27_GPU_INVENTORY_IDENTITY_SOURCE_SHA_INVALID")
+        if self.gpu_inventory_identity["source_ref"] == self.gpu_inventory_identity["artifact_ref"]:
+            raise S27ExecutionBlocked("S27_GPU_INVENTORY_IDENTITY_SELF_REFERENCE")
+        _summary, reloaded_identity = load_s27_gpu_inventory_envelope(
+            self.gpu_inventory_json,
+            data_root=self.data_root,
+        )
+        if reloaded_identity != self.gpu_inventory_identity:
+            raise S27ExecutionBlocked("S27_GPU_INVENTORY_IDENTITY_DRIFT")
+        if executor_identity is None:
+            raise S27ExecutionBlocked("S27_EXECUTOR_IDENTITY_REQUIRED")
+        try:
+            self.executor_identity = validate_executor_identity(executor_identity)
+            source = Path(self.launcher_script).absolute()
+            repository = (
+                Path(executor_repository).absolute()
+                if executor_repository is not None
+                else source.parents[2]
+            )
+            current_executor = compute_executor_identity(repository, source)
+        except (DataRootPathError, ValueError) as error:
+            raise S27ExecutionBlocked(f"S27_EXECUTOR_IDENTITY_INVALID:{error}") from error
+        if current_executor != self.executor_identity:
+            raise S27ExecutionBlocked("S27_EXECUTOR_IDENTITY_DRIFT")
+        self.executor_repository = repository.resolve()
+        self.launcher_script = str(source.resolve())
         self.run_root.mkdir(parents=True, exist_ok=True)
         if self.run_root.is_relative_to(self.data_root) is False:
             raise S27ExecutionBlocked("S27_RUN_ROOT_OUTSIDE_DATA_ROOT")
@@ -2489,6 +2552,7 @@ class S27DetachedLauncher:
             "plan_ref": self.plan_ref,
             "plan_hash": self.plan.artifact_hash,
             "gpu_inventory_identity": dict(self.gpu_inventory_identity),
+            "executor_identity": dict(self.executor_identity),
             "status": status,
             "wave_order": list(EXPECTED_CELL_IDS),
             "waves": {key: dict(value) for key, value in sorted(waves.items())},
@@ -2534,7 +2598,7 @@ class S27DetachedLauncher:
                 with log_path.open("ab") as handle:
                     proc = subprocess.Popen(
                         spec,
-                        cwd=str(Path(self.launcher_script).resolve().parents[2]),
+                        cwd=str(self.executor_repository),
                         env=dict(env),
                         stdin=subprocess.DEVNULL,
                         stdout=handle,
@@ -2638,6 +2702,7 @@ __all__ = [
     "S27DetachedLauncher",
     "S27ExecutionBlocked",
     "S27_GPU_INVENTORY_SCHEMA",
+    "S27_LAUNCH_STATUS_FIELDS",
     "S27_LIVE_GPU_COUNT",
     "S27MaterializedCellInput",
     "S27ProductionWorker",
