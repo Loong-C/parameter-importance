@@ -17,10 +17,14 @@ gradient pool; the other two semantics execute only their requested method.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from contextlib import redirect_stdout
+import io
 import json
 import math
+import multiprocessing as mp
 import os
 from pathlib import Path, PurePosixPath
+import queue as queue_module
 import time
 from typing import Any, Mapping, Sequence
 
@@ -32,7 +36,7 @@ from ..experiments.sampling import RepetitionMapping
 from ..runtime.task_runtime import TaskExecutionRequest, TaskRuntimeEnvironment
 from .stage2 import CoreEstimatorKernel, _vector_digest
 from .stage2_s204_ids import EXPECTED_CELL_IDS
-from .stage2_s207_formal import S27CellPlan
+from .stage2_s207_formal import APPROVED_GPU_UUIDS, S27CellPlan
 from .stage2_s207_runner import (
     S27ExecutionBlocked,
     _load_checkpoint_root,
@@ -507,17 +511,357 @@ def _device_identity(expected_uuid: str) -> None:
     if not torch.cuda.is_available() or torch.cuda.device_count() != 1:
         raise S209ProductionBlocked("CUDA_SINGLE_DEVICE_REQUIRED")
     try:
+        properties = torch.cuda.get_device_properties(0)
+        observed = getattr(properties, "uuid", None)
+        if observed is not None and str(observed) != expected_uuid:
+            raise S209ProductionBlocked("CUDA_UUID_VISIBLE_DEVICE_MISMATCH")
+    except S209ProductionBlocked:
+        raise
+    except Exception:
+        # Older supported torch builds do not expose a UUID property.  The
+        # pre-import CUDA_VISIBLE_DEVICES mask plus NVML UUID handle below are
+        # still required and remain the authoritative binding check.
+        pass
+    try:
         import pynvml
 
         pynvml.nvmlInit()
-        observed_raw = pynvml.nvmlDeviceGetUUID(pynvml.nvmlDeviceGetHandleByIndex(0))
-        observed = observed_raw.decode("utf-8") if isinstance(observed_raw, bytes) else str(observed_raw)
-        if observed != expected_uuid:
-            raise S209ProductionBlocked("CUDA_APPROVED_UUID_MISMATCH")
+        # NVML's global index is not the CUDA-visible index after UUID based
+        # masking.  Resolve by UUID so a launcher cannot claim that visible
+        # device 0 is an approved card merely because it is numerically first.
+        pynvml.nvmlDeviceGetHandleByUUID(expected_uuid.encode("utf-8"))
     except S209ProductionBlocked:
         raise
     except Exception as error:
         raise S209ProductionBlocked("CUDA_UUID_PROBE_REQUIRED") from error
+
+
+def _device_identity_set(expected_uuids: Sequence[str]) -> None:
+    """Verify one process sees exactly the approved four-card UUID set."""
+
+    try:
+        import torch
+    except ImportError as error:
+        raise S209ProductionBlocked("TORCH_REQUIRED") from error
+    expected = tuple(expected_uuids)
+    if len(expected) != 4 or len(set(expected)) != 4:
+        raise S209ProductionBlocked("FOUR_GPU_UUID_SET_INVALID")
+    if tuple(expected) != tuple(APPROVED_GPU_UUIDS):
+        raise S209ProductionBlocked("FOUR_GPU_UUID_ALLOWLIST_DRIFT")
+    if not torch.cuda.is_available() or torch.cuda.device_count() != 4:
+        raise S209ProductionBlocked("CUDA_FOUR_DEVICE_REQUIRED")
+    try:
+        import pynvml
+
+        pynvml.nvmlInit()
+        for uuid in expected:
+            pynvml.nvmlDeviceGetHandleByUUID(uuid.encode("utf-8"))
+    except Exception as error:
+        raise S209ProductionBlocked("CUDA_FOUR_UUID_PROBE_REQUIRED") from error
+
+
+_FOUR_GPU_BARRIER_TIMEOUT_SECONDS = 900.0
+
+
+def _four_gpu_anchor_worker(
+    gpu_uuid: str,
+    *,
+    config: Mapping[str, Any],
+    root: Path,
+    binding: Mapping[str, Any],
+    barrier: Any,
+    result_queue: Any,
+) -> None:
+    """Measure one fixed-state process of the synchronized four-card anchor.
+
+    This function is intentionally top-level and pickleable for the Windows
+    ``spawn`` context.  Each child receives one UUID mask, reloads the same
+    hash-bound S2.7 checkpoint/mapping, and contributes an actual measurement
+    record.  The parent aggregates only after the end barrier; no 4x scaling
+    or label-only row is possible.
+    """
+
+    os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_uuid)
+    try:
+        # Backend/provider implementations are not allowed to leak logs into
+        # the worker's exact-one-JSON stdout stream.
+        with redirect_stdout(io.StringIO()):
+            if os.environ.get("CUDA_VISIBLE_DEVICES") != str(gpu_uuid):
+                raise S209ProductionBlocked("FOUR_GPU_CHILD_MASK_DRIFT")
+            _device_identity(str(gpu_uuid))
+            provider, mapping, unit, _cell = _load_provider_for_binding(root, config, binding)
+            groups = mapping.groups(max(mapping.m_values))
+            if not groups:
+                raise S209ProductionBlocked("FOUR_GPU_ANCHOR_GROUPS_EMPTY")
+            # Loading/model construction happens before the barrier.  The
+            # reported wall interval starts only once all four peers are ready.
+            barrier.wait(timeout=_FOUR_GPU_BARRIER_TIMEOUT_SECONDS)
+            wall_start = time.perf_counter()
+            pool = _measure_pool(provider, groups, mapping=mapping)
+            value, formula_seconds = _method_value(CoreEstimatorKernel(accumulation_dtype="float64"), pool, "raw", mapping)
+            statistics_start = time.perf_counter()
+            estimate_hash = _vector_digest(value)
+            statistics_seconds = time.perf_counter() - statistics_start
+            phase = {
+                "data_wait_seconds": float(pool.data_wait_seconds),
+                "forward_seconds": float(pool.forward_seconds),
+                "backward_seconds": float(pool.backward_seconds),
+                "gradient_aggregation_seconds": float(pool.gradient_aggregation_seconds),
+                "formula_seconds": float(formula_seconds),
+                "statistics_seconds": float(statistics_seconds),
+                "communication_seconds": 0.0,
+                "write_seconds": 0.0,
+            }
+            if any(value < 0 or not math.isfinite(value) for value in phase.values()):
+                raise S209ProductionBlocked("FOUR_GPU_PHASE_TIMING_INVALID")
+            # End timing is barrier-bounded: the slowest peer's synchronization
+            # tail is part of the actual system-anchor wall interval.
+            barrier.wait(timeout=_FOUR_GPU_BARRIER_TIMEOUT_SECONDS)
+            wall_seconds = float(time.perf_counter() - wall_start)
+            if wall_seconds <= 0 or wall_seconds + 1e-9 < sum(phase.values()):
+                raise S209ProductionBlocked("FOUR_GPU_BARRIER_WALL_INVALID")
+            result_queue.put(
+                {
+                    "ok": True,
+                    "gpu_uuid": str(gpu_uuid),
+                    "health_ok": True,
+                    "wall_seconds": wall_seconds,
+                    "phase": phase,
+                    "sequence_count": int(pool.sequence_count),
+                    "token_count": int(pool.token_count),
+                    "backward_count": int(pool.backward_count),
+                    "communication_bytes": 0,
+                    "allocated_peak_bytes": int(pool.allocated_peak_bytes),
+                    "reserved_peak_bytes": int(pool.reserved_peak_bytes),
+                    "device_peak_bytes": int(pool.device_peak_bytes),
+                    "sample_mapping_hash": str(pool.sample_mapping_hash),
+                    "gradient_pool_hash": str(pool.gradient_pool_hash),
+                    "estimate_hash": str(estimate_hash),
+                    "state_digest": str(pool.state_digest),
+                    "state_digest_after": str(pool.state_digest_after),
+                    "fixed_checkpoint_id": str(unit["checkpoint_id"]),
+                    "cuda_gradient_seconds": float(pool.gradient_seconds),
+                }
+            )
+    except BaseException as error:
+        try:
+            barrier.abort()
+        except Exception:
+            pass
+        try:
+            result_queue.put(
+                {
+                    "ok": False,
+                    "gpu_uuid": str(gpu_uuid),
+                    "error": f"{type(error).__name__}:{error}",
+                }
+            )
+        except Exception:
+            pass
+
+
+def _aggregate_four_gpu_anchor_results(
+    *,
+    task: Mapping[str, Any],
+    config: Mapping[str, Any],
+    results: Sequence[Mapping[str, Any]],
+    io_hash: str,
+) -> dict[str, Any]:
+    """Strictly aggregate four actual process records into one anchor row."""
+
+    expected = tuple(task.get("gpu_uuids", ()))
+    if task.get("anchor_id") != "four-gpu-anchor" or task.get("device_count") != 4:
+        raise S209ProductionBlocked("FOUR_GPU_ANCHOR_TASK_REQUIRED")
+    if expected != tuple(APPROVED_GPU_UUIDS) or len(expected) != 4:
+        raise S209ProductionBlocked("FOUR_GPU_ANCHOR_UUID_SET_INVALID")
+    _sha(io_hash, field="four_gpu.io_evidence_hash")
+    if len(results) != 4:
+        raise S209ProductionBlocked("FOUR_GPU_ANCHOR_RESULT_COUNT_INVALID")
+    by_uuid: dict[str, Mapping[str, Any]] = {}
+    for result in results:
+        if not isinstance(result, Mapping) or result.get("ok") is not True:
+            raise S209ProductionBlocked("FOUR_GPU_ANCHOR_CHILD_FAILED")
+        uuid = result.get("gpu_uuid")
+        if uuid not in expected or uuid in by_uuid:
+            raise S209ProductionBlocked("FOUR_GPU_ANCHOR_CHILD_UUID_DRIFT")
+        by_uuid[str(uuid)] = result
+    if set(by_uuid) != set(expected):
+        raise S209ProductionBlocked("FOUR_GPU_ANCHOR_CHILD_UUID_SET_INVALID")
+    required = {
+        "health_ok", "wall_seconds", "phase", "sequence_count", "token_count", "backward_count",
+        "communication_bytes", "allocated_peak_bytes", "reserved_peak_bytes", "device_peak_bytes",
+        "sample_mapping_hash", "gradient_pool_hash", "estimate_hash", "state_digest", "state_digest_after",
+        "fixed_checkpoint_id", "cuda_gradient_seconds",
+    }
+    for uuid, result in by_uuid.items():
+        if set(result) < required or result.get("health_ok") is not True:
+            raise S209ProductionBlocked(f"FOUR_GPU_CHILD_HEALTH_INVALID:{uuid}")
+        phase = result["phase"]
+        if not isinstance(phase, Mapping) or set(phase) != set(S29_TIMING_FIELDS):
+            raise S209ProductionBlocked(f"FOUR_GPU_CHILD_PHASE_FIELDS_INVALID:{uuid}")
+        for name in S29_TIMING_FIELDS:
+            value = phase[name]
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value)) or float(value) < 0:
+                raise S209ProductionBlocked(f"FOUR_GPU_CHILD_PHASE_INVALID:{uuid}:{name}")
+        wall = result["wall_seconds"]
+        if isinstance(wall, bool) or not isinstance(wall, (int, float)) or not math.isfinite(float(wall)) or float(wall) <= 0 or float(wall) + 1e-9 < sum(float(phase[name]) for name in S29_TIMING_FIELDS):
+            raise S209ProductionBlocked(f"FOUR_GPU_CHILD_WALL_INVALID:{uuid}")
+        for name in ("sequence_count", "token_count", "backward_count", "communication_bytes"):
+            value = result[name]
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise S209ProductionBlocked(f"FOUR_GPU_CHILD_COUNTER_INVALID:{uuid}:{name}")
+        memory = [result[name] for name in ("allocated_peak_bytes", "reserved_peak_bytes", "device_peak_bytes")]
+        if any(isinstance(value, bool) or not isinstance(value, int) or value <= 0 for value in memory) or not memory[0] <= memory[1] <= memory[2]:
+            raise S209ProductionBlocked(f"FOUR_GPU_CHILD_MEMORY_INVALID:{uuid}")
+        if not isinstance(result["fixed_checkpoint_id"], str) or not result["fixed_checkpoint_id"]:
+            raise S209ProductionBlocked(f"FOUR_GPU_CHILD_CHECKPOINT_INVALID:{uuid}")
+        for name in ("sample_mapping_hash", "gradient_pool_hash", "estimate_hash", "state_digest", "state_digest_after"):
+            _sha(result[name], field=f"four_gpu.{uuid}.{name}")
+
+    identity_fields = ("fixed_checkpoint_id", "sample_mapping_hash", "gradient_pool_hash", "estimate_hash", "state_digest", "state_digest_after")
+    for name in identity_fields:
+        if len({str(result[name]) for result in by_uuid.values()}) != 1:
+            raise S209ProductionBlocked(f"FOUR_GPU_NUMERIC_CONSISTENCY_FAILED:{name}")
+    slowest = max(by_uuid.values(), key=lambda result: float(result["wall_seconds"]))
+    phase = {name: float(slowest["phase"][name]) for name in S29_TIMING_FIELDS}
+    per_device = []
+    for uuid in expected:
+        result = by_uuid[uuid]
+        per_device.append(
+            {
+                "gpu_uuid": uuid,
+                "wall_seconds": float(result["wall_seconds"]),
+                **{name: float(result["phase"][name]) for name in S29_TIMING_FIELDS},
+                "sequence_count": int(result["sequence_count"]),
+                "token_count": int(result["token_count"]),
+                "backward_count": int(result["backward_count"]),
+                "communication_bytes": int(result["communication_bytes"]),
+                "allocated_peak_bytes": int(result["allocated_peak_bytes"]),
+                "reserved_peak_bytes": int(result["reserved_peak_bytes"]),
+                "device_peak_bytes": int(result["device_peak_bytes"]),
+                "cuda_gradient_seconds": float(result["cuda_gradient_seconds"]),
+            }
+        )
+    row: dict[str, Any] = {
+        "measurement_kind": "device_actual",
+        "measurement_source": "stage2_s209_production.synchronized_four_process",
+        "measured": True,
+        "semantic": "anchor",
+        "method": "anchor",
+        "run_id": task["run_id"],
+        "anchor_id": task["anchor_id"],
+        "repetition": task["repetition"],
+        "gpu_uuid": task["gpu_uuid"],
+        "gpu_uuids": list(expected),
+        "device_count": 4,
+        "health_ok": True,
+        "numeric_consistency": True,
+        "cost_io_quiescent": True,
+        "io_evidence_hash": io_hash,
+        **phase,
+        "write_seconds": 0.0,
+        "wall_seconds": float(slowest["wall_seconds"]),
+        "allocated_peak_bytes": max(int(result["allocated_peak_bytes"]) for result in by_uuid.values()),
+        "reserved_peak_bytes": max(int(result["reserved_peak_bytes"]) for result in by_uuid.values()),
+        "device_peak_bytes": max(int(result["device_peak_bytes"]) for result in by_uuid.values()),
+        "sequence_count": sum(int(result["sequence_count"]) for result in by_uuid.values()),
+        "token_count": sum(int(result["token_count"]) for result in by_uuid.values()),
+        "backward_count": sum(int(result["backward_count"]) for result in by_uuid.values()),
+        "communication_bytes": sum(int(result["communication_bytes"]) for result in by_uuid.values()),
+        "batch_size": config["frozen"]["batch_size"],
+        "microbatch_count": config["frozen"]["microbatch_count"],
+        "source_unit_ids": [str(task.get("unit_id", "four-gpu-fixed-anchor"))],
+        "fixed_checkpoint_id": str(slowest["fixed_checkpoint_id"]),
+        "cuda_gradient_seconds": max(float(result["cuda_gradient_seconds"]) for result in by_uuid.values()),
+        "gradient_timing_source": "torch_cuda_event",
+        "memory_counter_source": "torch_cuda_peak_and_mem_get_info",
+        "system_anchor_mode": "synchronized_fixed_state_four_process",
+        "communication_mode": "barrier_only_no_gradient_collective",
+        "sample_mapping_hash": str(slowest["sample_mapping_hash"]),
+        "gradient_pool_hash": str(slowest["gradient_pool_hash"]),
+        "estimate_hash": str(slowest["estimate_hash"]),
+        "four_process_identity_hash": canonical_json_hash(
+            {
+                "gpu_uuids": list(expected),
+                "sample_mapping_hash": str(slowest["sample_mapping_hash"]),
+                "gradient_pool_hash": str(slowest["gradient_pool_hash"]),
+                "estimate_hash": str(slowest["estimate_hash"]),
+                "state_digest": str(slowest["state_digest"]),
+                "state_digest_after": str(slowest["state_digest_after"]),
+            }
+        ),
+        "per_device_measurements": per_device,
+    }
+    if row["wall_seconds"] + 1e-9 < sum(float(row[name]) for name in S29_TIMING_FIELDS):
+        raise S209ProductionBlocked("FOUR_GPU_AGGREGATE_WALL_INVALID")
+    _row_bytes(row)
+    write_start = time.perf_counter()
+    _row_bytes(row)
+    row["write_seconds"] = max(0.0, float(time.perf_counter() - write_start))
+    row["wall_seconds"] = float(slowest["wall_seconds"]) + row["write_seconds"]
+    return row
+
+
+def _run_four_gpu_anchor(*, task: Mapping[str, Any], config: Mapping[str, Any], checked: Mapping[str, Any], root: Path) -> dict[str, Any]:
+    """Launch the approved UUID set as four synchronized fixed-state workers."""
+
+    expected = tuple(task.get("gpu_uuids", ()))
+    if task.get("device_count") != 4 or expected != tuple(APPROVED_GPU_UUIDS):
+        raise S209ProductionBlocked("FOUR_GPU_ANCHOR_UUID_BINDING_INVALID")
+    if os.environ.get("CUDA_VISIBLE_DEVICES") != ",".join(expected):
+        raise S209ProductionBlocked("FOUR_GPU_PARENT_MASK_INVALID")
+    _device_identity_set(expected)
+    plan = load_s27_plan(root, str(checked["s27_plan_ref"]))
+    cell_id = EXPECTED_CELL_IDS[0]
+    unit_id = checked["frozen"]["expected_unit_ids"][0]
+    mapping = load_s27_frozen_mappings(root, plan, cell_id=cell_id).get(unit_id)
+    if mapping is None:
+        raise S209ProductionBlocked("FOUR_GPU_ANCHOR_MAPPING_MISSING")
+    binding = {"cell_id": cell_id, "unit_id": unit_id, "mapping_hash": mapping.digest}
+    context = mp.get_context("spawn")
+    barrier = context.Barrier(4)
+    result_queue = context.Queue()
+    processes = [
+        context.Process(
+            target=_four_gpu_anchor_worker,
+            kwargs={"gpu_uuid": uuid, "config": checked, "root": root, "binding": binding, "barrier": barrier, "result_queue": result_queue},
+            name=f"s209-four-gpu-anchor-{index}",
+        )
+        for index, uuid in enumerate(expected)
+    ]
+    try:
+        for process in processes:
+            process.start()
+        for process in processes:
+            process.join(timeout=_FOUR_GPU_BARRIER_TIMEOUT_SECONDS + 60.0)
+        alive = [process for process in processes if process.is_alive()]
+        if alive:
+            for process in alive:
+                process.terminate()
+            for process in alive:
+                process.join(timeout=10.0)
+            raise S209ProductionBlocked("FOUR_GPU_ANCHOR_PROCESS_TIMEOUT")
+        if any(process.exitcode != 0 for process in processes):
+            raise S209ProductionBlocked("FOUR_GPU_ANCHOR_PROCESS_FAILED")
+        results: list[Mapping[str, Any]] = []
+        for _ in expected:
+            try:
+                result = result_queue.get(timeout=10.0)
+            except queue_module.Empty as error:
+                raise S209ProductionBlocked("FOUR_GPU_ANCHOR_RESULT_MISSING") from error
+            if not isinstance(result, Mapping):
+                raise S209ProductionBlocked("FOUR_GPU_ANCHOR_RESULT_INVALID")
+            results.append(dict(result))
+        aggregate_task = dict(task)
+        aggregate_task["unit_id"] = unit_id
+        return _aggregate_four_gpu_anchor_results(task=aggregate_task, config=checked, results=results, io_hash=str(task["io_evidence_hash"]))
+    finally:
+        for process in processes:
+            if process.is_alive():
+                process.terminate()
+        for process in processes:
+            if process.is_alive():
+                process.join(timeout=10.0)
 
 
 def _device_measurement_start() -> tuple[Any, float, int]:
@@ -782,6 +1126,8 @@ def run_s209_production_backend(*, task: Mapping[str, Any], config: Mapping[str,
     if task.get("cost_io_quiescent") is not True or not isinstance(task.get("io_evidence_hash"), str):
         raise S209ProductionBlocked("LAUNCH_IO_EVIDENCE_REQUIRED")
     _sha(task["io_evidence_hash"], field="io_evidence_hash")
+    if task.get("semantic") == "anchor" and task.get("anchor_id") == "four-gpu-anchor":
+        return _run_four_gpu_anchor(task=task, config=config, checked=checked, root=root)
     if task.get("device_count") != 1:
         raise S209ProductionBlocked("PRODUCTION_BACKEND_FOUR_GPU_REQUIRES_DDP_ADAPTER")
     _device_identity(str(task["gpu_uuid"]))
