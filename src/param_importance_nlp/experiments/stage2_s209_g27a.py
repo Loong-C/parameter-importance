@@ -32,6 +32,7 @@ from ..contracts.status import GateRecord, GateStatus
 from ..core.oracles import compare_tensor_maps_fp64
 from ..core.tensors import TensorMap
 from .stage2_s204_ids import EXPECTED_CELL_IDS
+from .stage2_path_security import DataRootPathError, resolve_data_root, resolve_data_root_ref
 from .stage2_s207_formal import APPROVED_GPU_UUIDS, EXCLUDED_GPU_UUID, EXCLUDED_PCI, S27_RAW_MANIFEST_SCHEMA
 
 
@@ -93,16 +94,18 @@ def _formal_file(root: Path, reference: Any, *, filename: str, field: str) -> tu
     path_ref = PurePosixPath(reference)
     if path_ref.is_absolute() or any(part in {"", ".", ".."} for part in path_ref.parts) or not reference.endswith(filename):
         raise S29G27ABlocked(f"{field}:PERSISTED_POSIX_REF_INVALID")
-    current = root.resolve()
-    for part in path_ref.parts:
-        current = current / part
-        if current.is_symlink():
-            raise S29G27ABlocked(f"{field}:SYMLINK_COMPONENT_FORBIDDEN")
-    path = current.resolve()
     try:
-        path.relative_to(root.resolve())
-    except ValueError as error:
-        raise S29G27ABlocked(f"{field}:PATH_ESCAPE") from error
+        root = resolve_data_root(root)
+        persisted_ref, path = resolve_data_root_ref(
+            root,
+            reference,
+            field=field,
+            allow_absolute=False,
+        )
+    except DataRootPathError as error:
+        raise S29G27ABlocked(f"{field}:PATH_INVALID:{error}") from error
+    if persisted_ref != reference:
+        raise S29G27ABlocked(f"{field}:PERSISTED_POSIX_REF_NONCANONICAL")
     if path.name != filename or not path.is_file():
         raise S29G27ABlocked(f"{field}:PERSISTED_FILE_REQUIRED")
     try:
@@ -117,7 +120,7 @@ def _formal_file(root: Path, reference: Any, *, filename: str, field: str) -> tu
         raise S29G27ABlocked(f"{field}:ARTIFACT_HASH_REQUIRED")
     if canonical_json_hash({key: item for key, item in payload.items() if key != "artifact_hash"}) != declared:
         raise S29G27ABlocked(f"{field}:ARTIFACT_HASH_MISMATCH")
-    return payload, reference
+    return payload, persisted_ref
 
 
 def _validate_execution_identity(value: Any) -> dict[str, Any]:
@@ -1822,7 +1825,10 @@ def run_s209_g27a(
     if validated_execution_identity is not None:
         if data_root is None or single_gpu_anchor_ref is None or four_gpu_anchor_ref is None or four_gpu_numeric_ref is None:
             raise S29G27ABlocked("FORMAL_ANCHOR_PERSISTED_REFERENCES_REQUIRED")
-        formal_root = Path(data_root).resolve()
+        try:
+            formal_root = resolve_data_root(data_root)
+        except DataRootPathError as error:
+            raise S29G27ABlocked(f"FORMAL_DATA_ROOT_INVALID:{error}") from error
         persisted_single, persisted_single_ref = _formal_file(
             formal_root,
             single_gpu_anchor_ref,

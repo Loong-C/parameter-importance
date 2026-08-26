@@ -35,6 +35,7 @@ from typing import Any, Callable, Mapping, Protocol, Sequence
 from ..contracts.jsonio import canonical_json_hash, load_canonical_json, write_canonical_json
 from ..contracts.status import GateRecord
 from ..contracts.g21_formal_handoff import ALLOWED_DEVICES, EXCLUDED_UUID
+from .stage2_path_security import DataRootPathError, resolve_data_root, resolve_data_root_ref
 from .stage2_s207_formal import APPROVED_GPU_UUIDS, EXCLUDED_GPU_UUID, EXCLUDED_PCI
 from .stage2_s207_runner import (
     S27_GPU_INVENTORY_SCHEMA,
@@ -203,23 +204,14 @@ def _verify_hash(payload: Mapping[str, Any], *, field: str, key: str = "artifact
 
 
 def _logical(root: Path, reference: str, *, field: str) -> Path:
-    if not isinstance(reference, str) or not reference or "\\" in reference:
+    """Resolve a formal DATA_ROOT ref through the shared lexical guard."""
+
+    if not isinstance(reference, str):
         raise S29RunnerBlocked(f"{field}:INVALID_LOGICAL_REFERENCE")
-    parts = reference.split("/")
-    logical = PurePosixPath(reference)
-    if logical.is_absolute() or any(part in {"", ".", ".."} for part in parts):
-        raise S29RunnerBlocked(f"{field}:PATH_ESCAPE")
-    root = root.resolve()
-    current = root
-    for part in parts:
-        current = current / part
-        if current.is_symlink():
-            raise S29RunnerBlocked(f"{field}:SYMLINK_COMPONENT_FORBIDDEN")
-    target = current.resolve()
     try:
-        target.relative_to(root)
-    except ValueError as error:
-        raise S29RunnerBlocked(f"{field}:PATH_ESCAPE") from error
+        _ref, target = resolve_data_root_ref(root, reference, field=field, allow_absolute=False)
+    except DataRootPathError as error:
+        raise S29RunnerBlocked(f"{field}:{error}") from error
     return target
 
 
@@ -553,7 +545,10 @@ def prepare_s209_plan(
 ) -> dict[str, Any]:
     """Prepare an immutable measurement plan after binding all S2.7 inputs."""
 
-    root = Path(data_root).resolve()
+    try:
+        root = resolve_data_root(data_root)
+    except DataRootPathError as error:
+        raise S29RunnerBlocked(f"DATA_ROOT_INVALID:{error}") from error
     matrix_path = _logical(root, matrix_ref, field="g24b_matrix")
     gate_path = _logical(root, gate_ref, field="g24b_gate")
     raw_path = _logical(root, raw_manifest_ref, field="s27_raw_manifest")
@@ -600,7 +595,10 @@ def load_s209_preflight(
 
     if g25_gate_ref is None:
         raise S29RunnerBlocked("G25_GATE_REFERENCE_REQUIRED")
-    root = Path(data_root).resolve()
+    try:
+        root = resolve_data_root(data_root)
+    except DataRootPathError as error:
+        raise S29RunnerBlocked(f"DATA_ROOT_INVALID:{error}") from error
     refs = {
         "matrix": _logical(root, matrix_ref, field="g24b_matrix"),
         "gate": _logical(root, gate_ref, field="g24b_gate"),
@@ -637,7 +635,7 @@ def load_s209_preflight(
     inventory, inventory_identity = _load_inventory_envelope(
         inventory_raw,
         root=root,
-        inventory_ref=refs["inventory"],
+        inventory_ref=gpu_inventory_ref,
     )
     io_evidence = validate_s209_io_evidence(_load_object(refs["io"], field="io_evidence"))
     capacity_inputs, capacity_identity = _load_capacity_evidence(root, capacity_ref)
@@ -1345,7 +1343,17 @@ class S29ProfilerRunner:
         self.run_id = _safe_id(run_id, field="runner.run_id")
         if self.preflight.measurement_plan.get("run_id") != self.run_id:
             raise S29RunnerBlocked("MEASUREMENT_PLAN_RUN_ID_MISMATCH")
-        self.run_root = Path(run_root).resolve()
+        try:
+            data_root = resolve_data_root(self.preflight.root)
+            _run_root_ref, resolved_run_root = resolve_data_root_ref(
+                data_root,
+                run_root,
+                field="runner.run_root",
+                allow_absolute=True,
+            )
+        except DataRootPathError as error:
+            raise S29RunnerBlocked(f"RUN_ROOT_INVALID:{error}") from error
+        self.run_root = resolved_run_root
         self.profiler = profiler
         self.single_gpu_anchor = single_gpu_anchor
         self.four_gpu_anchor = four_gpu_anchor
