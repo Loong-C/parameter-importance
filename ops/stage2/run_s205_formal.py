@@ -1092,9 +1092,15 @@ def _detach(args: argparse.Namespace, raw_argv: Sequence[str] | None = None) -> 
             existing = load_canonical_json(existing_path)
         except (OSError, TypeError, ValueError) as error:
             raise S25ExecutionBlocked("S205_DETACHED_PID_INVALID") from error
-        if not isinstance(existing, Mapping) or existing.get("artifact_hash") != canonical_json_hash(
-            {key: item for key, item in existing.items() if key != "artifact_hash"}
-        ) or not isinstance(existing.get("pid"), int):
+        if (
+            not isinstance(existing, Mapping)
+            or existing.get("schema_version") != "stage2-s205-detached-launch-v1"
+            or existing.get("artifact_hash") != canonical_json_hash(
+                {key: item for key, item in existing.items() if key != "artifact_hash"}
+            )
+            or not isinstance(existing.get("pid"), int)
+            or int(existing["pid"]) <= 0
+        ):
             raise S25ExecutionBlocked("S205_DETACHED_PID_INVALID")
         try:
             os.kill(int(existing["pid"]), 0)
