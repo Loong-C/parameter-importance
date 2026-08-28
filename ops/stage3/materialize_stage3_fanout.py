@@ -373,7 +373,13 @@ def materialize(
             _merge_section(
                 retry_overrides,
                 "recovery",
-                {"resume_ref": str(source["cache_root"])},
+                # The first shard's refinement commits live below the shared
+                # task artifact root.  The cache root may contain reusable
+                # node gradients from an earlier immutable attempt, but those
+                # objects are not task-resume authority.  Bind a retry to the
+                # actual partial task output so a warm cache remains a fresh
+                # run while a failed first shard can resume its commits.
+                {"resume_ref": str(source["artifact_output_dir"])},
             )
             retry_resolved = ResolvedConfigV2.resolve(
                 base,

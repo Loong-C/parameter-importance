@@ -433,6 +433,12 @@ def test_materializer_emits_real_v2_selectors_and_exact_pilot_schedule(
     assert manifest["steps"][0]["action"] == "run"
     assert manifest["steps"][-1]["action"] == "resume"
     assert manifest["steps"][-1]["expected_status"] == "PASS"
+    first_retry = ResolvedConfigV2.from_mapping(
+        formal._load_json(tmp_path / manifest["steps"][0]["retry_config_ref"])
+    )
+    assert first_retry.section("recovery")["resume_ref"] == source[
+        "artifact_output_dir"
+    ]
     final_config = ResolvedConfigV2.from_mapping(
         formal._load_json(tmp_path / receipt["final_config_ref"])
     )
