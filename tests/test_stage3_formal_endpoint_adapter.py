@@ -644,6 +644,89 @@ def test_formal_reference_ladder_identity_requires_recomputable_hash() -> None:
     assert simpson == (2, 4, 8)
 
 
+def test_formal_reference_ladder_loads_from_hash_bound_environment(
+    tmp_path: Path,
+) -> None:
+    body = {
+        "schema_version": "stage3-protocol-v1",
+        "families": {
+            "gauss_legendre": [8, 16, 32, 64],
+            "composite_simpson": [16, 32, 64, 128],
+        },
+        "frozen": True,
+    }
+    ladder = {**body, "artifact_hash": canonical_json_hash(body)}
+    write_canonical_json(tmp_path / "reference-ladder.json", ladder)
+    config = _Config(_BaseConfig({"path_integration": {}}), {})
+    request = SimpleNamespace(
+        config=config,
+        environment=SimpleNamespace(
+            evidence_refs={
+                "stage3_reference_ladder": "reference-ladder.json",
+            }
+        ),
+    )
+
+    document, ladder_hash, gauss, simpson = (
+        stage23._stage3_reference_ladder_document(
+            request,
+            tmp_path,
+            require_artifact_hash=True,
+        )
+    )
+
+    assert document == ladder
+    assert ladder_hash == ladder["artifact_hash"]
+    assert gauss == (8, 16, 32, 64)
+    assert simpson == (16, 32, 64, 128)
+
+
+def test_formal_reference_ladder_rejects_environment_config_conflict(
+    tmp_path: Path,
+) -> None:
+    environment_body = {
+        "families": {
+            "gauss_legendre": [8, 16],
+            "composite_simpson": [16, 32],
+        },
+        "frozen": True,
+    }
+    environment_ladder = {
+        **environment_body,
+        "artifact_hash": canonical_json_hash(environment_body),
+    }
+    write_canonical_json(tmp_path / "environment-ladder.json", environment_ladder)
+    config_body = {
+        "families": {
+            "gauss_legendre": [8, 32],
+            "composite_simpson": [16, 64],
+        },
+        "frozen": True,
+    }
+    config_ladder = {
+        **config_body,
+        "artifact_hash": canonical_json_hash(config_body),
+    }
+    request = SimpleNamespace(
+        config=_Config(
+            _BaseConfig({"path_integration": {"reference_ladder": config_ladder}}),
+            {},
+        ),
+        environment=SimpleNamespace(
+            evidence_refs={
+                "stage3_reference_ladder": "environment-ladder.json",
+            }
+        ),
+    )
+
+    with pytest.raises(TaskBlockedError, match="冲突"):
+        stage23._stage3_reference_ladder_document(
+            request,
+            tmp_path,
+            require_artifact_hash=True,
+        )
+
+
 def test_formal_reference_ladder_identity_rejects_unhashed_frozen_document() -> None:
     ladder = {
         "families": {

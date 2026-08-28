@@ -8246,6 +8246,40 @@ def _stage3_reference_ladder_document(
     """
 
     raw: object = None
+    environment = getattr(request, "environment", None)
+    environment_refs_raw = getattr(environment, "evidence_refs", {})
+    environment_refs = (
+        environment_refs_raw
+        if isinstance(environment_refs_raw, Mapping)
+        else {}
+    )
+    environment_candidates = [
+        value
+        for key in ("stage3_reference_ladder", "reference_ladder")
+        if isinstance((value := environment_refs.get(key)), str) and value
+    ]
+    if len(set(environment_candidates)) > 1:
+        raise _blocked(
+            BlockerCode.CONTRACT_UNFROZEN,
+            "stage3_reference_ladder",
+            "runtime environment 声明了冲突的 formal reference ladder",
+            retryable=False,
+            evidence_refs=tuple(dict.fromkeys(environment_candidates)),
+        )
+    if environment_candidates:
+        reference = environment_candidates[0]
+        try:
+            raw = load_canonical_json(
+                _workspace_path(root, reference, field="stage3_reference_ladder")
+            )
+        except (FileNotFoundError, OSError, TypeError, ValueError) as error:
+            raise _blocked(
+                BlockerCode.ASSET_UNAVAILABLE,
+                "stage3_reference_ladder",
+                f"formal reference ladder 无法读取：{error}",
+                retryable=False,
+                evidence_refs=(reference,),
+            ) from error
     for config, section_name in (
         (request.config, "path_integration"),
         (request.config, "orchestration"),
@@ -8258,12 +8292,21 @@ def _stage3_reference_ladder_document(
         if not isinstance(section, Mapping):
             continue
         if isinstance(section.get("reference_ladder"), Mapping):
-            raw = section["reference_ladder"]
+            candidate = section["reference_ladder"]
+            if raw is not None and candidate != raw:
+                raise _blocked(
+                    BlockerCode.CONTRACT_UNFROZEN,
+                    "stage3_reference_ladder",
+                    "config 与 runtime environment 的 formal reference ladder 冲突",
+                    retryable=False,
+                    evidence_refs=tuple(dict.fromkeys(environment_candidates)),
+                )
+            raw = candidate
             break
         ref = section.get("reference_ladder_ref")
         if isinstance(ref, str):
             try:
-                raw = load_canonical_json(
+                candidate = load_canonical_json(
                     _workspace_path(root, ref, field="reference_ladder_ref")
                 )
             except (FileNotFoundError, OSError, TypeError, ValueError) as error:
@@ -8274,6 +8317,17 @@ def _stage3_reference_ladder_document(
                     retryable=False,
                     evidence_refs=(ref,),
                 ) from error
+            if raw is not None and candidate != raw:
+                raise _blocked(
+                    BlockerCode.CONTRACT_UNFROZEN,
+                    "stage3_reference_ladder",
+                    "config 与 runtime environment 的 formal reference ladder 冲突",
+                    retryable=False,
+                    evidence_refs=tuple(
+                        dict.fromkeys((*environment_candidates, ref))
+                    ),
+                )
+            raw = candidate
             break
     if not isinstance(raw, Mapping):
         raise _blocked(
