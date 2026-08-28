@@ -1226,8 +1226,30 @@ def formal_pile_route(
     evaluation: bool,
     declared_sampling_design: str,
     configured_split: str,
+    endpoint_trajectory: bool = False,
 ) -> FormalPileRoute:
     """Map a formal stage to one frozen Pile interval and sampling owner."""
+
+    if endpoint_trajectory:
+        if stage != 3 or evaluation:
+            raise G3RuntimeAssetError(
+                "G3_RUNTIME_ENDPOINT_TRAJECTORY_ROUTE_INVALID"
+            )
+        if declared_sampling_design != "without_replacement_frozen_epoch":
+            raise G3RuntimeAssetError(
+                "G3_RUNTIME_ENDPOINT_TRAJECTORY_SAMPLING_DECLARATION_DRIFT"
+            )
+        if configured_split != "train":
+            raise G3RuntimeAssetError(
+                "G3_RUNTIME_ENDPOINT_TRAJECTORY_SPLIT_DECLARATION_DRIFT"
+            )
+        # Stage 3 path evaluation owns the frozen ``probe`` resolver, while
+        # endpoint production must first execute real optimizer updates. Keep
+        # those updates on the disjoint training interval and sample without
+        # replacement so endpoint update identities remain unique.
+        return FormalPileRoute(
+            "train", PythiaSamplingDesign.WITHOUT_REPLACEMENT
+        )
 
     expected_declaration = _DECLARED_SAMPLING_DESIGNS.get(stage)
     if (

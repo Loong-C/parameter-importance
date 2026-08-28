@@ -603,6 +603,9 @@ def _training_resources(
     model_config = request.config.base_config.section("model")
     assert isinstance(model_config, dict) and isinstance(data, dict)
     runtime_assets = FormalG3RuntimeAssets.from_request(request, root)
+    endpoint_trajectory = (
+        request.task.task_id == "stage3.03_endpoint_and_probe_pipeline"
+    )
     expected_data_kind = "pile" if task_name == "pile" else "glue_derived"
     model_asset = runtime_assets.resolve(
         str(model_config["asset_id"]), expected_kind="model"
@@ -623,6 +626,7 @@ def _training_resources(
             evaluation=False,
             declared_sampling_design=str(data["sampling_design"]),
             configured_split=str(data["split"]),
+            endpoint_trajectory=endpoint_trajectory,
         )
         runtime_assets.validate_pile_budget(
             stage=stage,
@@ -675,6 +679,9 @@ def _training_resources(
                 evaluation=evaluation_route,
                 declared_sampling_design=str(data["sampling_design"]),
                 configured_split=split,
+                endpoint_trajectory=(
+                    endpoint_trajectory and not evaluation_route
+                ),
             )
             start, stop = runtime_assets.pile_split_interval(data_asset, route.split)
             return PythiaMMapDatasetAdapter(
@@ -728,6 +735,7 @@ def _training_resources(
             evaluation=False,
             declared_sampling_design=str(data["sampling_design"]),
             configured_split=str(data["split"]),
+            endpoint_trajectory=endpoint_trajectory,
         )
         runtime_assets.validate_pile_budget(
             stage=stage,

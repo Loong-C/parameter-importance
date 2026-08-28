@@ -689,6 +689,30 @@ def test_stage2_and_stage3_routes_own_sampling_outside_the_mmap_reader() -> None
 
     assert (stage2.split, stage2.sampling_design) == ("sampling_universe", None)
     assert (stage3.split, stage3.sampling_design) == ("probe", None)
+
+    trajectory = formal_pile_route(
+        stage=3,
+        evaluation=False,
+        declared_sampling_design="without_replacement_frozen_epoch",
+        configured_split="train",
+        endpoint_trajectory=True,
+    )
+    assert (trajectory.split, trajectory.sampling_design) == (
+        "train",
+        PythiaSamplingDesign.WITHOUT_REPLACEMENT,
+    )
+    with pytest.raises(
+        G3RuntimeAssetError,
+        match="ENDPOINT_TRAJECTORY_SAMPLING_DECLARATION_DRIFT",
+    ):
+        formal_pile_route(
+            stage=3,
+            evaluation=False,
+            declared_sampling_design="disjoint_frozen_probe_panel",
+            configured_split="train",
+            endpoint_trajectory=True,
+        )
+
     with pytest.raises(G3RuntimeAssetError, match="PILE_SPLIT_DECLARATION_DRIFT"):
         formal_pile_route(
             stage=2,
