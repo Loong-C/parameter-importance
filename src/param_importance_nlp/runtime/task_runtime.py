@@ -30,6 +30,7 @@ from param_importance_nlp.contracts.jsonio import (
     JSONValue,
     canonical_json_bytes,
     canonical_json_hash,
+    load_canonical_json,
 )
 from param_importance_nlp.contracts.runtime_evidence import RuntimeCapabilityEvidence
 from param_importance_nlp.contracts.status import GateRecord, GateStatus
@@ -56,6 +57,19 @@ from param_importance_nlp.runtime.task_artifacts import (
 TASK_RUN_RESULT_SCHEMA_VERSION = "task-run-result-v2"
 TASK_RUNTIME_ENVIRONMENT_SCHEMA_VERSION = "task-runtime-environment-v1"
 _NAME_RE = re.compile(r"^[a-z][a-z0-9_]*$")
+
+_STAGE3_PATH_AUXILIARY_CONSUMERS = frozenset(
+    {
+        "stage3.03_endpoint_and_probe_pipeline",
+        "stage3.04_quadrature_engine_and_unit_tests",
+        "stage3.05_reference_integral_and_precision",
+        "stage3.06_pilot_and_threshold_freeze",
+        "stage3.07_formal_experiment_matrix",
+        "stage3.08_error_analysis_and_stability",
+        "stage3.09_cost_and_method_selection",
+        "stage3.10_reports_visualizations_and_handoff",
+    }
+)
 
 
 class TaskRuntimeError(RuntimeError):
@@ -742,6 +756,31 @@ class TaskRuntime:
                 f"FORMAL_EVIDENCE_COMMIT_INVALID:{type(error).__name__}:{error}"
             ) from error
 
+    def _is_hash_bound_stage3_auxiliary(self, reference: str) -> bool:
+        """Recognize a raw, immutable Stage 3 plan/endpoint auxiliary.
+
+        Stage 3 path tasks consume two disjoint input classes: catalog
+        predecessor commits and hash-bound path assets such as endpoint
+        commits, probe plans, production indexes, and frozen quadrature plans.
+        The specialized Stage 3 runner validates the latter deeply.  The
+        generic preflight must therefore admit their immutable envelope shape
+        without allowing them to satisfy any catalog predecessor contract.
+        """
+
+        try:
+            logical = PurePosixPath(reference)
+            candidate = self._workspace_root.joinpath(*logical.parts).resolve()
+            candidate.relative_to(self._workspace_root)
+            value = load_canonical_json(candidate)
+            if not isinstance(value, Mapping):
+                return False
+            declared = value.get("artifact_hash")
+            return isinstance(declared, str) and declared == canonical_json_hash(
+                {key: item for key, item in value.items() if key != "artifact_hash"}
+            )
+        except (FileNotFoundError, OSError, TypeError, ValueError):
+            return False
+
     @staticmethod
     def _extract_schema_payload(
         value: Mapping[str, object],
@@ -948,6 +987,14 @@ class TaskRuntime:
             try:
                 loaded = self._load_environment_evidence(reference)
             except Exception:
+                if (
+                    config.task_id in _STAGE3_PATH_AUXILIARY_CONSUMERS
+                    and self._is_hash_bound_stage3_auxiliary(reference)
+                ):
+                    # Raw Stage 3 auxiliaries remain outside
+                    # ``loaded_by_identity`` and therefore cannot satisfy a
+                    # required catalog predecessor by construction.
+                    continue
                 blockers.append(
                     TaskBlocker(
                         BlockerCode.ASSET_UNAVAILABLE,
@@ -977,6 +1024,16 @@ class TaskRuntime:
                     "stage1.10_checkpoint_resume_and_artifacts",
                     "stage1.11_reporting_and_exit_gate",
                 }
+            ):
+                matched = True
+            # Stage 3 path units bind one model-specific S2.4 parameter
+            # registry in addition to their direct scientific predecessor.
+            # The specialized runner revalidates the registry envelope,
+            # source manifest, coordinate hash, and live model identity.
+            if (
+                not matched
+                and config.task_id in _STAGE3_PATH_AUXILIARY_CONSUMERS
+                and identity.artifact_kind == "parameter_registry"
             ):
                 matched = True
             if not matched:

@@ -14,6 +14,7 @@ from param_importance_nlp.contracts import (
     GateStatus,
     ResolvedConfig,
     RuntimeCapabilityEvidence,
+    canonical_json_hash,
     load_canonical_json,
     write_canonical_json,
 )
@@ -175,15 +176,80 @@ def _formal_environment(
 
 
 def _formal_config(root: Path, task_id: str, input_refs: tuple[str, ...]) -> ResolvedConfigV2:
+    base = _base_config(task_id=task_id, formal=True)
+    providers: dict[str, object] = {"num_labels": 3}
+    if task_id == "stage3.03_endpoint_and_probe_pipeline":
+        base_value = base.to_dict()
+        base_value["runtime"]["device"] = "cuda"  # type: ignore[index]
+        base = ResolvedConfig.from_mapping(base_value)
+        providers.update(
+            {
+                "kind": "offline_hf",
+                "task_name": "sst2",
+                "num_labels": 2,
+            }
+        )
     return ResolvedConfigV2.resolve(
-        _base_config(task_id=task_id, formal=True),
+        base,
         task_id=task_id,
         overrides={
-            "providers": {"num_labels": 3},
+            "providers": providers,
             "orchestration": {"input_result_refs": list(input_refs)},
             "artifacts": {"output_dir": f"runs/formal/{task_id}"},
         },
     )
+
+
+def test_stage3_preflight_accepts_hash_bound_path_auxiliaries_without_using_them_as_predecessors(
+    tmp_path: Path,
+) -> None:
+    task_id = "stage3.03_endpoint_and_probe_pipeline"
+    _environment, predecessor_refs = _formal_environment(tmp_path, task_id)
+    registry_ref = _publish(
+        tmp_path,
+        "formal-evidence/stage3-path/parameter-registry",
+        task_id="stage2.04_reference_target",
+        kind="parameter_registry",
+        payload={"schema_version": "formal-registry-test-v1", "verified": True},
+    )
+    auxiliary_refs: list[str] = []
+    for name, schema in (
+        ("endpoint.json", "endpoint-commit-v1"),
+        ("probe-plan.json", "stage3-probe-plan-v1"),
+    ):
+        body = {"schema_version": schema, "scope": "pilot", "formal_eligible": False}
+        path = tmp_path / "formal-evidence" / "stage3-path" / name
+        write_canonical_json(path, body | {"artifact_hash": canonical_json_hash(body)})
+        auxiliary_refs.append(path.relative_to(tmp_path).as_posix())
+
+    config = _formal_config(
+        tmp_path,
+        task_id,
+        predecessor_refs + tuple(auxiliary_refs) + (registry_ref,),
+    )
+    blockers = TaskRuntime(workspace_root=tmp_path)._formal_input_blockers(
+        config, config.task_definition
+    )
+
+    assert blockers == ()
+
+
+def test_stage3_preflight_rejects_unhashed_raw_auxiliary(tmp_path: Path) -> None:
+    task_id = "stage3.03_endpoint_and_probe_pipeline"
+    _environment, predecessor_refs = _formal_environment(tmp_path, task_id)
+    path = tmp_path / "formal-evidence" / "stage3-path" / "unbound-plan.json"
+    write_canonical_json(path, {"schema_version": "stage3-probe-plan-v1"})
+    config = _formal_config(
+        tmp_path,
+        task_id,
+        predecessor_refs + (path.relative_to(tmp_path).as_posix(),),
+    )
+
+    blockers = TaskRuntime(workspace_root=tmp_path)._formal_input_blockers(
+        config, config.task_definition
+    )
+
+    assert [item.requirement for item in blockers] == ["formal_input_commit"]
 
 
 def test_claim_sets_without_committed_evidence_never_unlock_formal(tmp_path: Path) -> None:
