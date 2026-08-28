@@ -45,3 +45,55 @@
 - 提交和推送后 Stage 3 工作树 clean；服务器主 repo 仍为 clean detached `44f934dd62d1b86fcb951230c81f3bfa647791aa`，既有 Stage 2 direct-all 工作树仍为 clean `7cd29ed6a2acb958095f96ad1514d8609b74c535`。
 - 根工作树的三个用户 presentation dirty 文件保持原状且未进入 Stage 3 提交。
 - 未创建服务器 Stage 3 worktree、未同步代码到服务器、未启动 GPU 作业；这是 G3-0 fail-closed 的预期结果。
+
+## 2026-08-28 12:01–12:46 CST — runner、独立 Gate 与恢复边界加固
+
+- 正式多 probe panel 不再隐式取第一条：多 probe 必须用 `active_probe_id` 或 `active_unit_id` 唯一绑定；单 probe 仍保持无歧义兼容。
+- 正式 reference 不再沿用本地低节点 fixture ladder：要求显式、冻结、可复算的 Gauss–Legendre 与 composite Simpson 双家族逐级加密配置。
+- 路径 runner 分开记录理论唯一节点数与真实 callback 成本，新增 gradient/loss、forward/backward、wall-clock、peak GPU memory、cache hit/miss 诊断；fixture wall-clock 固定为零以保持跨工作树 artifact hash 可复现。
+- 新增按 `execution_evidence_hash` 隔离的 per-unit observation ledger；恢复时复算 ledger hash、核对 unit、候选集合与 execution evidence，禁止旧 run 的同名 unit 混入跨 unit 推荐。
+- 新增独立 Stage 3 Gate evaluator、CLI 与 JSON Schema。Gate 强制绑定 G3-0..G3-5、完成且 clean 的 formal provenance、冻结阈值、完整候选集合、完整 unit 集合和源 artifact。
+- 代码审查修正了两个科学判据错误：失败候选只被淘汰，不再要求所有候选同时通过；完备性绝对/相对残差由 pilot 冻结，不再擅自套用 1% 阈值。S3.2 明定的 L1/L2/L∞、active Spearman、top-q、sign、层/模块 TV、reference error 与节点上限仍禁止放宽。
+- Gate 现在实际执行 `max_unique_nodes`，递归拒绝 fixture/synthetic 标签，并要求 observation evidence 是已声明 source refs 的子集，source refs 又必须由 provenance 绑定。正式 recommendation 的资格化还需 G3-7、Gate evaluation、provenance、execution、threshold、unit 与 passing-rule 一致。
+- 定向回归：Gate `8 passed`；runner/endpoint `37 passed`；formal orchestration `18 passed`；最终 Gate+runner+orchestration 合并回归 `63 passed`。扩大后的 Stage 3/CLI 套件为 `98 passed, 1 failed`；唯一失败是既有 `test_run_ready_source_examples_compile_with_their_public_schemas` 对 Stage 2 已新增三个 source example 的静态集合仍写死旧四项，与本批 Stage 3 代码无关，未做无关一致性修复。
+- JSON Schema draft 2020-12 自检通过；`git diff --check` 通过（仅 Windows LF/CRLF 提示）。
+- 独立 G3-0 复核再次确认原阻塞未变化，并发现服务器 GPU/ECC、formal Stage 2 chain 和 Agent 文档名的当前漂移。刷新证据写入 `reports/stage3/g3-0-refresh-20260828.json`，artifact hash `cec23e3f6241dbf0141ebb0838c863bc5b90d4337a07930a1f1a8434d302f490`。
+- Beamer、PDF、分析报告和可视化技能已按要求读取；由于没有合法 formal 数据，未创建会被误读为真实结论的报告、图或 slides，也未写 PDF artifact marker。
+
+## 12:46 CST 当前完成边界
+
+- 已完成的是不越 G3-0 的生产 runner/Gate 基础设施、严格回归与刷新审计；这些结果不能替代真实 pilot/formal 数据。
+- 仍未启动任何 Stage 3 GPU 作业。PID 724839 保持不触碰；没有服务器写入或同步。
+- G3-0 仍需两项明确外部决定：续期 Stage 0 persistence-risk acceptance（或建立第二故障域并完成恢复演练），以及授权 append-only 的 Stage 2 formal validation/replay 来补齐覆盖并发布正式 G2.7/G2.8/S2.11。没有这两项决定时，G3-5 及其后全部正式数据、报告和 Beamer 仍被硬阻断。
+
+## 2026-08-28 15:11 CST — 用户明确变更 Stage 3 前置范围
+
+- 用户明确指示：不再处理此前 Stage 的补做；Stage 0 和 Stage 1 视为全部通过且仍可用；直接采用已完成 Stage 2 的估计器结论进入 Stage 3。
+- 本次 Stage 3 输入固定为：默认估计器 `U-32`、`B=32`，`Raw` 仅保留为敏感性对照；Stage 2 来源仍是 `pythia-grid-20260826T145530Z`、分支 `exp/stage2-direct-all-20260826`、提交 `000ce1e79af791ce1eae2e2b62da221a10dd3c9a`。
+- 该指令记录为本次 Stage 3 的显式 G3-0 前置范围决定，允许启动 Stage 3 真实实验；它不把任何 `direct-unvalidated` 产物改标为 formal，也不放宽 G3-1 及之后任何科学阈值、tolerance、margin 或数学判据。
+- 机器可读证据：`reports/stage3/g3-0-user-scope-decision-20260828.json`；正式 GateRecord：`reports/stage3/g3-0-user-scope-gate-20260828.json`。此前两份 `BLOCKED` 审计原样保留，作为范围变更前的历史证据。
+
+## 2026-08-28 15:11–16:10 CST — 正式观测、矩阵和 Gate 生产闭环加固
+
+- `FormalExecutionEvidence` 与真实 fixed-state provider 已能显式消费用户 G3-0 范围决定；Stage 3 不再要求重验 Stage 0/1 handoff，但 Stage 2 runner 的旧严格边界保持不变。
+- 正式求积计划新增逐 `unit_id` 冻结的 `model/stage/update/probe` 分层映射；CLI、JSON Schema、runner 与独立 Gate 都复算并核对这份映射，观测行不能事后改写阶段或 probe 标签。
+- 正式参考不再使用硬编码 `1e-12`/单次相邻一致；其归一化 L1 上限来自冻结计划的 `max_reference_normalized_l1_error`，且要求两个家族连续两轮同时通过，避免单个相邻级别偶然一致。
+- 正式 observation wire 已补齐 normalized L1/L2/L∞、三种完备性残差、active Spearman、cosine、sign consistency、top-q overlap/Jaccard、layer/module quality TV、reference uncertainty、真实 callback 成本、分层与源证据引用。层/模块标签从上游冻结 S2.3 registry 重载，不重新猜测。
+- 完备性相对残差使用冻结稳定常数重算；L1-scaled 残差使用独立 reference contribution 的 L1 质量，不再使用候选自身质量作为分母。
+- 独立 Gate 不再信任 producer 提供的 `worst_case` 布尔值；最坏单元按每个冻结分层和所有 Gate 指标从完整表派生，并写出 `worst_case_source=derived_from_complete_frozen_table`。
+- 正式矩阵 runner 在 G3-7 前固定 `selected_rule=null`，执行并保存全部冻结候选；G3-6 只在全部预注册单元完成后冻结观测表，G3-9 分析只发布 `PENDING_G3_7` 的未资格化 recommendation 和独立 Gate evaluation。
+- 新增 authority-aware recommendation loader：只有同时提供当前 execution、G3-7 PASS、独立 Gate evaluation 与完成/clean provenance 才能重载并资格化正式 recommendation；仅有哈希的 payload 继续 fail-closed。
+- 定向回归先后为 `49 passed`、`48 passed`、G3-0/Gate `13 passed`；扩展 Stage 3/CLI 套件为 `88 passed, 1 failed`，唯一失败为测试中漏导入新 authority loader 类，修正后专项通过。run-ready source schema 单独验证为 PASS；既有 source example 静态集合失败仍是 Stage 2 三个历史新增文件导致，未做无关修复。
+
+## 2026-08-29 — 真实执行控制面闭环（服务器启动前）
+
+- 新增严格的单任务物化器、S3.05/S3.06/S3.07 endpoint×probe fan-out 物化器与 runner、pilot/formal phase manifest 组装器；这些组件只编译 hash-bound 配置、selector、状态和命令，不生成科学结果。
+- pilot DAG 明确为 S3.01–S3.06，formal DAG 明确为 S3.07–S3.09；S3.01 自身真实执行，不再把 G3-0 scope authority 误当成 S3.01 输出。S3.05 reference coverage 不提前完成 unit ledger；pilot 在 S3.06、formal 在 S3.07 才可提交完整 observation coverage。
+- pilot 固定 12 个路径单元；formal 固定 99 个路径单元。S3.07 调度为 99 次 reference 覆盖加 98 次剩余 observation 覆盖，共 197 步；每一步使用不可变 `stage3-path-unit-selector-v1`，正式 S3.03/S3.04 使用独立 `stage3-probe-selector-v1`。
+- 修复每任务配置哈希、初始 execution 配置哈希、同根引用解析、Windows live-PID lock 与 G3-5 threshold 重构校验；不放宽任何数值阈值。
+- 当前短批回归：orchestrator/fan-out/phase `18 passed`；endpoint/lineage/finalization/scope/trajectory `25 passed`；G3-0/G36/G37/G38/Gate `30 passed`；production plan `5 passed`；Stage 3 task runner 子集 `7 passed`；合计本轮 85 项通过。21 个 `stage3-*.json` 使用 Draft 2020-12 元 schema 校验通过，Python compileall 与 `git diff --check` 通过。
+- 当前完成边界仍是服务器启动前：本轮尚未同步服务器、未创建 Stage 3 服务器 worktree、未启动 GPU 作业，也没有任何 pilot/formal 数值结果。下一边界是完成代码审计、提交并推送 clean baseline 后，再按服务器事实物化并 detached 启动真实 pilot。
+- 启动前独立审计发现并修复四个真实阻断：fan-out 现在按 endpoint digest 绑定唯一 endpoint/probe refs；S3.03/S3.04 物化必须绑定 canonical formal probe selector；首 shard 失败后使用独立 resume config 恢复；formal phase 现覆盖 S3.07–S3.10，而 G3-8 仍在 S3.10 输出完成后独立发布，消除循环依赖。
+- CLI/producer 审计同时修复：pilot endpoint/probe 计划可被严格 dispatcher 接受；endpoint metadata 不再被丢弃；probe selector 从 `record.endpoint_digest` 读取真实 digest；生产索引可消费带 `qualification_gate_hash` 的 probe panel；selector schema `$id` 恢复为仓库统一 `.invalid` authority。
+- 审计修复后回归：critical endpoint/fanout/index `26 passed`；orchestrator/fanout/phase `19 passed`；CLI selector/builders `2 passed`；task DAG `1 passed`；21 个 Stage 3 schema 的 Draft 2020-12 与仓库 `$id` 前缀检查均通过。
+- 独立报告链审计确认 S3.10 当前仍不足以完成中文报告、PNG/SVG、Beamer 和 G3-8 delivery authority。该缺口不影响 pilot 启动，但属于 Stage 3 最终闭环的硬未完成项，必须在 pilot 长跑期间补齐并在 G3-8 前做端到端验收。

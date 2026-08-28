@@ -1,0 +1,121 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://parameter-importance.invalid/schemas/shared/stage3-production-unit-index-v1.json",
+  "title": "Stage 3 production endpoint/probe unit index",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version", "index_id", "scope", "formal_eligible",
+    "endpoint_count", "probe_count", "unit_count", "units", "coverage",
+    "artifact_hash"
+  ],
+  "properties": {
+    "schema_version": {"const": "stage3-production-unit-index-v1"},
+    "index_id": {"$ref": "#/$defs/id"},
+    "scope": {"enum": ["pilot", "formal"]},
+    "formal_eligible": {"type": "boolean"},
+    "endpoint_count": {"type": "integer", "minimum": 1},
+    "probe_count": {"type": "integer", "minimum": 1},
+    "unit_count": {"type": "integer", "minimum": 1},
+    "units": {"type": "array", "items": {"$ref": "#/$defs/unit"}},
+    "coverage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["by_model", "by_model_seed_stage"],
+      "properties": {
+        "by_model": {
+          "type": "object",
+          "additionalProperties": {"type": "integer", "minimum": 1}
+        },
+        "by_model_seed_stage": {
+          "type": "object",
+          "additionalProperties": {"type": "integer", "minimum": 1}
+        }
+      }
+    },
+    "artifact_hash": {"$ref": "#/$defs/hash"}
+  },
+  "allOf": [
+    {
+      "if": {"properties": {"scope": {"const": "pilot"}}, "required": ["scope"]},
+      "then": {
+        "properties": {
+          "formal_eligible": {"const": false},
+          "endpoint_count": {"const": 6},
+          "probe_count": {"const": 12},
+          "unit_count": {"const": 12},
+          "units": {"minItems": 12, "maxItems": 12}
+        }
+      }
+    },
+    {
+      "if": {"properties": {"scope": {"const": "formal"}}, "required": ["scope"]},
+      "then": {
+        "properties": {
+          "formal_eligible": {"const": true},
+          "endpoint_count": {"const": 33},
+          "probe_count": {"const": 99},
+          "unit_count": {"const": 99},
+          "units": {"minItems": 99, "maxItems": 99}
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "id": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,159}$"
+    },
+    "hash": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "sample": {
+      "oneOf": [
+        {"type": "string"},
+        {"type": "integer"}
+      ]
+    },
+    "unit": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "path_unit_id", "scope", "model", "seed", "stage", "update",
+        "update_sample_ids", "probe", "probe_sample_ids", "endpoint_ref",
+        "endpoint_hash", "endpoint_digest", "probe_ref", "probe_hash",
+        "probe_digest", "probe_content_hash", "loss_contract_hash",
+        "effective_weight_unit"
+      ],
+      "properties": {
+        "path_unit_id": {"$ref": "#/$defs/id"},
+        "scope": {"enum": ["pilot", "formal"]},
+        "model": {"$ref": "#/$defs/id"},
+        "seed": {"type": "integer"},
+        "stage": {"enum": ["early", "middle", "late"]},
+        "update": {"$ref": "#/$defs/id"},
+        "update_sample_ids": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {"$ref": "#/$defs/sample"}
+        },
+        "probe": {"$ref": "#/$defs/id"},
+        "probe_sample_ids": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {"$ref": "#/$defs/sample"}
+        },
+        "endpoint_ref": {"type": "string", "minLength": 1},
+        "endpoint_hash": {"$ref": "#/$defs/hash"},
+        "endpoint_digest": {"$ref": "#/$defs/hash"},
+        "probe_ref": {"type": "string", "minLength": 1},
+        "probe_hash": {"$ref": "#/$defs/hash"},
+        "probe_digest": {"$ref": "#/$defs/hash"},
+        "probe_content_hash": {"$ref": "#/$defs/hash"},
+        "loss_contract_hash": {"$ref": "#/$defs/hash"},
+        "effective_weight_unit": {"type": "string", "minLength": 1}
+      }
+    }
+  }
+}

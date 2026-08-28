@@ -93,7 +93,10 @@ def test_generic_output_payload_schema_requires_machine_schema_version() -> None
 def test_dependency_dag_and_required_input_contracts_are_logically_closed() -> None:
     by_id = {task.task_id: task for task in DEFAULT_TASK_CATALOG.tasks}
     roots = [task.task_id for task in DEFAULT_TASK_CATALOG.tasks if not task.predecessor_task_ids]
-    assert roots == ["stage0.01_baseline_and_safety"]
+    assert roots == [
+        "stage0.01_baseline_and_safety",
+        "stage3.01_prerequisites_and_scope",
+    ]
 
     for task in DEFAULT_TASK_CATALOG.tasks:
         required_producers = {

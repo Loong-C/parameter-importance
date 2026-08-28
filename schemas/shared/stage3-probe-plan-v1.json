@@ -39,11 +39,30 @@
     },
     "minimum_formal_probes": {"type": "integer", "minimum": 1},
     "execution_evidence_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
-    "scope": {"enum": ["local_fixture", "formal"]},
+    "scope": {"enum": ["local_fixture", "pilot", "formal"]},
     "formal_eligible": {"type": "boolean"},
     "artifact_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
   },
   "allOf": [
+    {
+      "if": {
+        "properties": {"scope": {"const": "pilot"}},
+        "required": ["scope"]
+      },
+      "then": {
+        "properties": {
+          "formal_eligible": {"const": false},
+          "entries": {
+            "minItems": 2,
+            "maxItems": 2,
+            "items": {
+              "properties": {"role": {"const": "pilot"}},
+              "required": ["role"]
+            }
+          }
+        }
+      }
+    },
     {
       "if": {
         "properties": {"formal_eligible": {"const": true}},

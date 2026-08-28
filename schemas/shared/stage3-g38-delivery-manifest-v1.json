@@ -1,0 +1,98 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://parameter-importance.invalid/schemas/shared/stage3-g38-delivery-manifest-v1.json",
+  "title": "Stage 3.10 formal delivery inventory consumed by G3-8",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version", "manifest_id", "scope", "status", "formal_eligible",
+    "source_tables", "analysis_scripts", "figures",
+    "chinese_report", "beamer", "replay_reports", "server_large_artifact_manifest",
+    "git_sync", "worklog", "artifact_hash"
+  ],
+  "properties": {
+    "schema_version": {"const": "stage3-g38-delivery-manifest-v1"},
+    "manifest_id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,159}$"},
+    "scope": {"const": "formal"},
+    "status": {"const": "PASS"},
+    "formal_eligible": {"const": true},
+    "publication_config_hash": {"anyOf": [{"$ref": "#/$defs/hash"}, {"type": "null"}]},
+    "source_tables": {
+      "type": "object", "additionalProperties": false,
+      "required": ["csv", "json"],
+      "properties": {"csv": {"$ref": "#/$defs/files"}, "json": {"$ref": "#/$defs/files"}}
+    },
+    "analysis_scripts": {"$ref": "#/$defs/files"},
+    "figures": {
+      "type": "array", "minItems": 1,
+      "items": {
+        "type": "object", "additionalProperties": false,
+        "required": ["id", "png", "svg"],
+        "properties": {
+          "id": {"type": "string", "minLength": 1},
+          "png": {"$ref": "#/$defs/file"},
+          "svg": {"$ref": "#/$defs/file"},
+          "source_table_refs": {"type": "array", "items": {"$ref": "#/$defs/ref"}}
+        }
+      }
+    },
+    "chinese_report": {
+      "type": "object", "additionalProperties": false,
+      "required": ["tex", "pdf"],
+      "properties": {"tex": {"$ref": "#/$defs/file"}, "pdf": {"$ref": "#/$defs/file"}}
+    },
+    "beamer": {
+      "type": "object", "additionalProperties": false,
+      "required": ["tex", "pdf", "notes", "backups"],
+      "properties": {
+        "tex": {"$ref": "#/$defs/file"},
+        "pdf": {"$ref": "#/$defs/file"},
+        "notes": {"$ref": "#/$defs/files"},
+        "backups": {"type": "array", "minItems": 3, "maxItems": 5, "items": {"$ref": "#/$defs/file"}}
+      }
+    },
+    "replay_reports": {
+      "type": "object", "additionalProperties": false,
+      "required": ["local_cpu", "server_locked", "frozen_endpoint_uncached"],
+      "properties": {
+        "local_cpu": {"$ref": "#/$defs/file"},
+        "server_locked": {"$ref": "#/$defs/file"},
+        "frozen_endpoint_uncached": {"$ref": "#/$defs/file"}
+      }
+    },
+    "server_large_artifact_manifest": {"$ref": "#/$defs/file"},
+    "git_sync": {
+      "type": "object", "additionalProperties": false,
+      "required": ["branch", "commit", "push", "remote", "server_clean_head", "sync"],
+      "properties": {
+        "branch": {"$ref": "#/$defs/file"},
+        "commit": {"$ref": "#/$defs/file"},
+        "push": {"$ref": "#/$defs/file"},
+        "remote": {"$ref": "#/$defs/file"},
+        "server_clean_head": {"$ref": "#/$defs/file"},
+        "sync": {"$ref": "#/$defs/file"}
+      }
+    },
+    "worklog": {"$ref": "#/$defs/file"},
+    "artifact_hash": {"$ref": "#/$defs/hash"}
+  },
+  "$defs": {
+    "hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "ref": {
+      "type": "string", "minLength": 1,
+      "pattern": "^(?!.*[?])(?!.*://)(?!.*\\\\)(?!.*fixture)(?!.*synthetic).+$"
+    },
+    "file": {
+      "type": "object", "additionalProperties": false,
+      "required": ["path", "sha256", "size"],
+      "properties": {
+        "path": {"$ref": "#/$defs/ref"},
+        "sha256": {"$ref": "#/$defs/hash"},
+        "size": {"type": "integer", "minimum": 0},
+        "role": {"type": "string", "minLength": 1},
+        "source_refs": {"type": "array", "items": {"$ref": "#/$defs/ref"}}
+      }
+    },
+    "files": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/file"}}
+  }
+}

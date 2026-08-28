@@ -13,6 +13,7 @@ from param_importance_nlp.cli import main
 from param_importance_nlp.contracts import (
     ArtifactApproval,
     ArtifactReview,
+    canonical_json_hash,
     GateRecord,
     GateStatus,
     LocalValidationRecord,
@@ -141,6 +142,63 @@ def test_endpoint_and_probe_plan_builders_compute_hashes_without_temporary_code(
     assert probe["formal_eligible"] is False
     assert main(["artifact-validate", str(probe_path)]) == 0
     assert json.loads(capsys.readouterr().out)["kind"] == "stage3_probe_plan"
+
+
+def test_stage3_probe_selector_reads_nested_endpoint_digest(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    endpoint_digest = hashlib.sha256(b"formal-endpoint").hexdigest()
+    endpoint = {
+        "schema_version": "stage3-endpoint-capture-v1",
+        "record": {"endpoint_digest": endpoint_digest},
+        "scope": "formal",
+        "formal_eligible": True,
+    }
+    endpoint["artifact_hash"] = canonical_json_hash(endpoint)
+    endpoint_path = tmp_path / "endpoint.json"
+    write_canonical_json(endpoint_path, endpoint)
+    plan = {
+        "schema_version": "stage3-probe-plan-v1",
+        "panel_id": "formal-panel",
+        "endpoint_digest": endpoint_digest,
+        "entries": [
+            {
+                "role": "formal",
+                "probe_id": "formal-probe-0",
+                "sample_ids": ["sample-0"],
+                "content_hash": hashlib.sha256(b"sample-0").hexdigest(),
+                "loss_contract_hash": hashlib.sha256(b"loss").hexdigest(),
+                "effective_weight_unit": "effective_token",
+                "metadata": {},
+            }
+        ],
+        "minimum_formal_probes": 1,
+        "execution_evidence_hash": "a" * 64,
+        "scope": "formal",
+        "formal_eligible": True,
+    }
+    plan["artifact_hash"] = canonical_json_hash(plan)
+    plan_path = tmp_path / "probe-plan.json"
+    write_canonical_json(plan_path, plan)
+    output = tmp_path / "selector.json"
+    assert main(
+        [
+            "artifact",
+            "stage3-probe-selector-build",
+            "--endpoint-commit",
+            str(endpoint_path),
+            "--probe-plan",
+            str(plan_path),
+            "--active-probe-id",
+            "formal-probe-0",
+            "--output",
+            str(output),
+        ]
+    ) == 0
+    emitted = json.loads(capsys.readouterr().out)
+    assert emitted["endpoint_digest"] == endpoint_digest
+    assert load_canonical_json(output)["artifact_hash"] == emitted["artifact_hash"]
 
 
 class _PassingContractRunner:

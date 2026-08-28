@@ -1,0 +1,78 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://parameter-importance.invalid/schemas/shared/stage3-task-path-integral-reference-v1.json",
+  "title": "Stage 3 path-integral reference artifact",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "refinement",
+    "contribution_bundle_ref",
+    "contribution_bundle_manifest_hash",
+    "path_identity_hash",
+    "node_gradient_cache",
+    "evaluation_costs",
+    "cost_semantics",
+    "scope",
+    "formal_eligible",
+    "execution_evidence_hash"
+  ],
+  "properties": {
+    "schema_version": {"const": "stage3-task-path-integral-reference-v1"},
+    "refinement": {"$ref": "stage3-reference-refinement-v1.json"},
+    "contribution_bundle_ref": {"type": "string", "minLength": 1},
+    "contribution_bundle_manifest_hash": {"$ref": "#/$defs/hash"},
+    "path_identity_hash": {"$ref": "#/$defs/hash"},
+    "node_gradient_cache": {"type": "object"},
+    "evaluation_costs": {"type": "array"},
+    "cost_semantics": {"type": "string", "minLength": 1},
+    "scope": {"enum": ["local_fixture", "formal"]},
+    "formal_eligible": {"const": false},
+    "execution_evidence_hash": {"$ref": "#/$defs/hash"},
+    "formal_plan_ref": {"type": "string", "minLength": 1},
+    "formal_plan_hash": {"$ref": "#/$defs/hash"},
+    "thresholds_hash": {"$ref": "#/$defs/hash"},
+    "reference_tolerance": {"type": "number", "exclusiveMinimum": 0},
+    "reference_ladder_hash": {"$ref": "#/$defs/hash"},
+    "reference_ladder_levels": {"$ref": "#/$defs/family_nodes"},
+    "reference_ladder_nodes": {"$ref": "#/$defs/family_nodes"},
+    "required_consecutive": {"type": "integer", "minimum": 1},
+    "primary_family": {"type": "string", "minLength": 1},
+    "reference_binding_hash": {"$ref": "#/$defs/hash"}
+  },
+  "allOf": [
+    {
+      "if": {"properties": {"scope": {"const": "formal"}}, "required": ["scope"]},
+      "then": {
+        "required": [
+          "formal_plan_ref",
+          "formal_plan_hash",
+          "thresholds_hash",
+          "reference_tolerance",
+          "reference_ladder_hash",
+          "reference_ladder_levels",
+          "reference_ladder_nodes",
+          "required_consecutive",
+          "primary_family",
+          "reference_binding_hash"
+        ],
+        "properties": {"required_consecutive": {"const": 2}}
+      }
+    }
+  ],
+  "$defs": {
+    "hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "family_nodes": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "array",
+        "minItems": 2,
+        "items": {"type": "integer", "minimum": 1}
+      },
+      "propertyNames": {"enum": ["gauss_legendre", "composite_simpson"]},
+      "required": ["gauss_legendre", "composite_simpson"],
+      "minProperties": 2,
+      "maxProperties": 2
+    }
+  }
+}

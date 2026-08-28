@@ -342,15 +342,18 @@ def _validate_known_artifact(value: dict[str, Any]) -> tuple[str, str | None]:
             "include_checkpoint_steps", "scope", "formal_eligible",
             "qualification_evidence_hash", "probe_plan_ref", "artifact_hash",
         }
-        if set(value) != expected:
+        if frozenset(value) not in {
+            frozenset(expected),
+            frozenset(expected | {"endpoint_metadata"}),
+        }:
             raise ValueError("TRAINING_ENDPOINT_CAPTURE_PLAN_FIELDS_MISMATCH")
-        digest = canonical_json_hash(
+        artifact_digest = canonical_json_hash(
             {key: item for key, item in value.items() if key != "artifact_hash"}
         )
-        if value["artifact_hash"] != digest:
+        if value["artifact_hash"] != artifact_digest:
             raise ValueError("TRAINING_ENDPOINT_CAPTURE_PLAN_HASH_MISMATCH")
         scope = value["scope"]
-        if scope not in {"local_fixture", "formal"} or value["formal_eligible"] != (
+        if scope not in {"local_fixture", "pilot", "formal"} or value["formal_eligible"] != (
             scope == "formal"
         ):
             raise ValueError("TRAINING_ENDPOINT_CAPTURE_PLAN_SCOPE_MISMATCH")
@@ -367,7 +370,30 @@ def _validate_known_artifact(value: dict[str, Any]) -> tuple[str, str | None]:
             raise ValueError("TRAINING_ENDPOINT_CAPTURE_PLAN_STEPS_INVALID")
         if not steps and value["include_checkpoint_steps"] is not True:
             raise ValueError("TRAINING_ENDPOINT_CAPTURE_PLAN_EMPTY")
-        return "training_endpoint_capture_plan", digest
+        metadata = value.get("endpoint_metadata")
+        if scope in {"pilot", "formal"}:
+            if not isinstance(metadata, Mapping) or not set(steps).issubset(
+                {int(item) for item in metadata if isinstance(item, str) and item.isdecimal()}
+            ):
+                raise ValueError("TRAINING_ENDPOINT_CAPTURE_PLAN_METADATA_MISSING")
+        if metadata is not None and (
+            not isinstance(metadata, Mapping)
+            or any(
+                not isinstance(step, str)
+                or not step.isdecimal()
+                or int(step) <= 0
+                or not isinstance(item, Mapping)
+                or set(item) != {"model", "seed", "stage"}
+                or item["model"] not in {"14M", "31M"}
+                or isinstance(item["seed"], bool)
+                or not isinstance(item["seed"], int)
+                or item["seed"] < 0
+                or item["stage"] not in {"early", "middle", "late"}
+                for step, item in metadata.items()
+            )
+        ):
+            raise ValueError("TRAINING_ENDPOINT_CAPTURE_PLAN_METADATA_INVALID")
+        return "training_endpoint_capture_plan", artifact_digest
     if schema == "stage3-probe-plan-v1":
         expected = {
             "schema_version", "panel_id", "endpoint_digest", "entries",
@@ -376,13 +402,13 @@ def _validate_known_artifact(value: dict[str, Any]) -> tuple[str, str | None]:
         }
         if set(value) != expected:
             raise ValueError("STAGE3_PROBE_PLAN_FIELDS_MISMATCH")
-        digest = canonical_json_hash(
+        artifact_digest = canonical_json_hash(
             {key: item for key, item in value.items() if key != "artifact_hash"}
         )
-        if value["artifact_hash"] != digest:
+        if value["artifact_hash"] != artifact_digest:
             raise ValueError("STAGE3_PROBE_PLAN_HASH_MISMATCH")
         scope = value["scope"]
-        if scope not in {"local_fixture", "formal"} or value["formal_eligible"] != (
+        if scope not in {"local_fixture", "pilot", "formal"} or value["formal_eligible"] != (
             scope == "formal"
         ):
             raise ValueError("STAGE3_PROBE_PLAN_SCOPE_MISMATCH")
@@ -425,10 +451,10 @@ def _validate_known_artifact(value: dict[str, Any]) -> tuple[str, str | None]:
             if overlap:
                 raise ValueError(f"STAGE3_PROBE_PLAN_SAMPLE_OVERLAP:{index}")
             for hash_field in ("content_hash", "loss_contract_hash"):
-                digest = raw_entry[hash_field]
+                field_digest = raw_entry[hash_field]
                 if (
-                    not isinstance(digest, str)
-                    or re.fullmatch(r"[0-9a-f]{64}", digest) is None
+                    not isinstance(field_digest, str)
+                    or re.fullmatch(r"[0-9a-f]{64}", field_digest) is None
                 ):
                     raise ValueError(
                         f"STAGE3_PROBE_PLAN_ENTRY_HASH_INVALID:{index}:{hash_field}"
@@ -445,18 +471,30 @@ def _validate_known_artifact(value: dict[str, Any]) -> tuple[str, str | None]:
             formal_count += int(role == "formal")
         if len(loss_contract_hashes) != 1:
             raise ValueError("STAGE3_PROBE_PLAN_LOSS_CONTRACT_DRIFT")
+        if scope == "pilot" and (
+            len(value["entries"]) != 2
+            or any(item["role"] != "pilot" for item in value["entries"])
+        ):
+            raise ValueError("STAGE3_PROBE_PLAN_PILOT_PROBE_COUNT_INVALID")
         if scope == "formal" and (minimum < 3 or formal_count < minimum):
             raise ValueError("STAGE3_PROBE_PLAN_FORMAL_PROBE_COUNT_LT_THREE")
-        return "stage3_probe_plan", digest
+        return "stage3_probe_plan", artifact_digest
     if schema == "stage3-formal-pilot-plan-v1":
         from .experiments import QuadratureThresholds
 
         expected = {
             "schema_version", "plan_id", "scope", "candidate_rules",
-            "required_unit_ids", "thresholds", "execution_evidence_hash",
+            "required_unit_ids", "unit_strata", "thresholds", "execution_evidence_hash",
             "formal_eligible", "artifact_hash",
         }
-        if set(value) != expected:
+        index_fields = {
+            "production_unit_index_ref", "production_unit_index_hash"
+        }
+        plan_fields = {"plan_kind", "production_unit_index_scope"}
+        if (
+            set(value) != expected
+            and set(value) != expected | index_fields | plan_fields
+        ):
             raise ValueError("STAGE3_FORMAL_PILOT_PLAN_FIELDS_MISMATCH")
         digest = canonical_json_hash(
             {key: item for key, item in value.items() if key != "artifact_hash"}
@@ -473,12 +511,50 @@ def _validate_known_artifact(value: dict[str, Any]) -> tuple[str, str | None]:
             for item in (candidates, units)
         ):
             raise ValueError("STAGE3_FORMAL_PILOT_PLAN_ARRAYS_INVALID")
+        unit_strata = value["unit_strata"]
+        if (
+            not isinstance(unit_strata, Mapping)
+            or set(unit_strata) != set(units)
+            or any(
+                not isinstance(item, Mapping)
+                or set(item) != {"model", "stage", "update", "probe"}
+                or any(not isinstance(child, str) or not child for child in item.values())
+                for item in unit_strata.values()
+            )
+        ):
+            raise ValueError("STAGE3_FORMAL_PILOT_PLAN_UNIT_STRATA_INVALID")
         thresholds = value["thresholds"]
         if not isinstance(thresholds, Mapping):
             raise TypeError("STAGE3_FORMAL_PILOT_PLAN_THRESHOLDS_INVALID")
-        QuadratureThresholds(**dict(thresholds))  # type: ignore[arg-type]
+        QuadratureThresholds(  # type: ignore[arg-type]
+            **dict(thresholds)
+        ).require_formal_contract()
         if value["scope"] != "formal" or value["formal_eligible"] is not True:
             raise ValueError("STAGE3_FORMAL_PILOT_PLAN_SCOPE_INVALID")
+        if set(value) == expected | index_fields | plan_fields:
+            index_ref = value["production_unit_index_ref"]
+            index_hash = value["production_unit_index_hash"]
+            plan_kind = value["plan_kind"]
+            index_scope = value["production_unit_index_scope"]
+            if (
+                not isinstance(index_ref, str)
+                or not index_ref
+                or not isinstance(index_hash, str)
+                or re.fullmatch(r"[0-9a-f]{64}", index_hash) is None
+                or plan_kind not in {"pilot", "matrix"}
+                or index_scope != ("pilot" if plan_kind == "pilot" else "formal")
+            ):
+                raise ValueError("STAGE3_FORMAL_PILOT_PLAN_INDEX_BINDING_INVALID")
+            expected_unit_count = 12 if plan_kind == "pilot" else 99
+            if len(units) != expected_unit_count:
+                raise ValueError(
+                    "STAGE3_FORMAL_PILOT_PLAN_UNIT_COVERAGE_INVALID:"
+                    f"expected={expected_unit_count},actual={len(units)}"
+                )
+        elif isinstance(units, list) and len(units) in {12, 99}:
+            raise ValueError(
+                "STAGE3_FORMAL_PILOT_PLAN_INDEX_REQUIRED_FOR_PRODUCTION_UNITS"
+            )
         evidence_hash = value["execution_evidence_hash"]
         if not isinstance(evidence_hash, str) or len(evidence_hash) != 64:
             raise ValueError("STAGE3_FORMAL_PILOT_PLAN_EVIDENCE_HASH_INVALID")
@@ -631,6 +707,11 @@ def _validate_known_artifact(value: dict[str, Any]) -> tuple[str, str | None]:
 
         manifest = AssetResolutionManifest.from_mapping(value)
         return "stage2_asset_resolution", manifest.digest
+    if schema == "stage3-gate-evaluation-v1":
+        from .experiments.stage3_gate import Stage3GateEvaluation
+
+        evaluation = Stage3GateEvaluation.from_mapping(value)
+        return "stage3_gate_evaluation", evaluation.artifact_hash
     if isinstance(schema, str) and (
         schema.startswith("stage2-") or schema.startswith("stage3-")
     ):
@@ -1169,6 +1250,42 @@ def _execute_task(arguments: argparse.Namespace) -> int:
     _publish_if_requested(arguments.result, result.to_dict())
     _emit(result.to_dict())
     return _task_exit_code(result.status)
+
+
+def _task_stage3_trajectory(arguments: argparse.Namespace) -> int:
+    """Run the real training endpoint producer without publishing Stage3.03."""
+
+    from .experiments.stage3_trajectory import Stage3TrajectoryProducer
+    from .runtime import TaskExecutionRequest
+
+    config = _load_v2_config(arguments.config)
+    if config.task_id != "stage3.03_endpoint_and_probe_pipeline":
+        raise ValueError("STAGE3_TRAJECTORY_REQUIRES_STAGE3_03_CONFIG")
+    environment = _load_task_environment(arguments.environment)
+    workspace_root = _task_workspace_root(config)
+    runtime = _build_default_task_runtime(workspace_root)
+    blockers = runtime.preflight(config, environment=environment)
+    if blockers:
+        report = {
+            "schema_version": "stage3-trajectory-preflight-v1",
+            "task_id": config.task_id,
+            "config_hash": config.config_hash,
+            "ready": False,
+            "blockers": [item.to_dict() for item in blockers],
+        }
+        _emit(report)
+        return 3
+    request = TaskExecutionRequest(
+        config=config,
+        task=runtime.catalog.get(config.task_id),
+        environment=environment,
+    )
+    receipt = Stage3TrajectoryProducer(workspace_root).run(
+        request,
+        receipt_path=arguments.receipt,
+    )
+    _emit(receipt.to_dict())
+    return 0
 
 
 def _task_status(arguments: argparse.Namespace) -> int:
@@ -1743,6 +1860,27 @@ def _artifact_endpoint_plan_build(arguments: argparse.Namespace) -> int:
         raise ValueError("--step 必须为正整数")
     if not steps and not arguments.include_checkpoint_steps:
         raise ValueError("至少传一个 --step 或 --include-checkpoint-steps")
+    endpoint_metadata: Mapping[str, object] | None = None
+    if arguments.endpoint_metadata is not None:
+        endpoint_metadata = _load_mapping(arguments.endpoint_metadata)
+        for raw_step, raw_metadata in endpoint_metadata.items():
+            if (
+                not isinstance(raw_step, str)
+                or not raw_step.isdecimal()
+                or int(raw_step) <= 0
+                or not isinstance(raw_metadata, Mapping)
+                or set(raw_metadata) != {"model", "seed", "stage"}
+                or raw_metadata["model"] not in {"14M", "31M"}
+                or isinstance(raw_metadata["seed"], bool)
+                or not isinstance(raw_metadata["seed"], int)
+                or raw_metadata["seed"] < 0
+                or raw_metadata["stage"] not in {"early", "middle", "late"}
+            ):
+                raise ValueError("ENDPOINT_METADATA_INVALID")
+        if not set(steps).issubset({int(item) for item in endpoint_metadata}):
+            raise ValueError("ENDPOINT_METADATA_SELECTED_STEP_COVERAGE_MISSING")
+    elif arguments.scope in {"pilot", "formal"}:
+        raise ValueError("pilot/formal endpoint plan 必须传 --endpoint-metadata")
     payload: dict[str, Any] = {
         "schema_version": "training-endpoint-capture-plan-v1",
         "plan_id": arguments.plan_id,
@@ -1757,6 +1895,11 @@ def _artifact_endpoint_plan_build(arguments: argparse.Namespace) -> int:
             arguments.probe_plan_ref, field="probe_plan_ref"
         ),
     }
+    if endpoint_metadata is not None:
+        payload["endpoint_metadata"] = {
+            step: dict(endpoint_metadata[step])
+            for step in sorted(endpoint_metadata, key=int)
+        }
     payload["artifact_hash"] = canonical_json_hash(payload)
     _validate_known_artifact(payload)
     publish_canonical_immutable(arguments.output, payload)
@@ -1806,40 +1949,220 @@ def _artifact_quadrature_pilot_plan_build(arguments: argparse.Namespace) -> int:
         scope="formal",
     )
     spec = _load_mapping(arguments.spec)
-    expected = {"plan_id", "candidate_rules", "required_unit_ids", "thresholds"}
-    if set(spec) != expected:
+    expected = {
+        "plan_id", "candidate_rules", "required_unit_ids", "unit_strata", "thresholds"
+    }
+    index_fields = {
+        "production_unit_index_ref", "production_unit_index_hash"
+    }
+    plan_fields = {"plan_kind", "production_unit_index_scope"}
+    if set(spec) != expected and set(spec) != expected | index_fields | plan_fields:
         raise ValueError(
             "STAGE3_FORMAL_PILOT_PLAN_SOURCE_FIELDS_MISMATCH:"
             f"missing={sorted(expected-set(spec))}:extra={sorted(set(spec)-expected)}"
         )
-    candidates = spec["candidate_rules"]
+    candidate_rules = spec["candidate_rules"]
     units = spec["required_unit_ids"]
     if not all(
         isinstance(item, list)
         and item
         and all(isinstance(child, str) and child for child in item)
         and len(item) == len(set(item))
-        for item in (candidates, units)
+        for item in (candidate_rules, units)
     ):
         raise ValueError("STAGE3_FORMAL_PILOT_PLAN_SOURCE_ARRAYS_INVALID")
+    unit_strata = spec["unit_strata"]
+    if (
+        not isinstance(unit_strata, Mapping)
+        or set(unit_strata) != set(units)
+        or any(
+            not isinstance(item, Mapping)
+            or set(item) != {"model", "stage", "update", "probe"}
+            or any(not isinstance(child, str) or not child for child in item.values())
+            or item["stage"] not in {"early", "middle", "late"}
+            for item in unit_strata.values()
+        )
+    ):
+        raise ValueError("STAGE3_FORMAL_PILOT_PLAN_SOURCE_UNIT_STRATA_INVALID")
+    production_index = None
+    production_index_ref = spec.get("production_unit_index_ref")
+    production_index_hash = spec.get("production_unit_index_hash")
+    if (production_index_ref is None) != (production_index_hash is None):
+        raise ValueError("STAGE3_FORMAL_PILOT_PLAN_SOURCE_INDEX_BINDING_INVALID")
+    if production_index_ref is not None:
+        from .experiments.stage3_production_plan import load_production_unit_index
+
+        if (
+            not isinstance(production_index_ref, str)
+            or not production_index_ref
+            or not isinstance(production_index_hash, str)
+        ):
+            raise ValueError("STAGE3_FORMAL_PILOT_PLAN_SOURCE_INDEX_BINDING_INVALID")
+        plan_kind = spec.get("plan_kind")
+        index_scope = spec.get("production_unit_index_scope")
+        if plan_kind not in {"pilot", "matrix"}:
+            raise ValueError("STAGE3_FORMAL_PLAN_KIND_INVALID")
+        expected_scope = "pilot" if plan_kind == "pilot" else "formal"
+        if index_scope != expected_scope:
+            raise ValueError("STAGE3_FORMAL_PLAN_INDEX_SCOPE_INVALID")
+        raw_index_path = Path(production_index_ref)
+        index_path_candidates = [
+            raw_index_path,
+            Path(arguments.spec).resolve().parent / raw_index_path,
+            Path.cwd() / raw_index_path,
+        ]
+        index_path = next(
+            (item for item in index_path_candidates if item.is_file()), None
+        )
+        if index_path is None:
+            raise ValueError(
+                "STAGE3_FORMAL_PILOT_PLAN_SOURCE_INDEX_NOT_FOUND:"
+                f"{production_index_ref}"
+            )
+        production_index = load_production_unit_index(
+            index_path, expected_scope=expected_scope
+        )
+        if production_index_hash != production_index.artifact_hash:
+            raise ValueError("STAGE3_FORMAL_PILOT_PLAN_SOURCE_INDEX_HASH_MISMATCH")
+        indexed_units = [unit.path_unit_id for unit in production_index.units]
+        indexed_strata = production_index.unit_strata()
+        if list(units) != indexed_units or dict(unit_strata) != indexed_strata:
+            raise ValueError(
+                "STAGE3_FORMAL_PILOT_PLAN_SOURCE_INDEX_DERIVATION_MISMATCH"
+            )
+    elif len(units) in {12, 99} or any(key in spec for key in plan_fields):
+        raise ValueError(
+            "STAGE3_FORMAL_PLAN_SOURCE_INDEX_REQUIRED_FOR_PRODUCTION_PLAN"
+        )
     thresholds = spec["thresholds"]
     if not isinstance(thresholds, Mapping):
         raise TypeError("STAGE3_FORMAL_PILOT_PLAN_SOURCE_THRESHOLDS_INVALID")
     normalized_thresholds = QuadratureThresholds(
         **dict(thresholds)  # type: ignore[arg-type]
-    ).to_dict()
+    ).require_formal_contract().to_dict()
     payload: dict[str, Any] = {
         "schema_version": "stage3-formal-pilot-plan-v1",
         "plan_id": spec["plan_id"],
         "scope": "formal",
-        "candidate_rules": list(candidates),
+        "candidate_rules": list(candidate_rules),
         "required_unit_ids": list(units),
+        "unit_strata": {
+            unit_id: dict(unit_strata[unit_id]) for unit_id in units
+        },
         "thresholds": normalized_thresholds,
         "execution_evidence_hash": evidence.artifact_hash,
         "formal_eligible": True,
     }
+    if production_index is not None:
+        payload["plan_kind"] = str(spec["plan_kind"])
+        payload["production_unit_index_scope"] = str(
+            spec["production_unit_index_scope"]
+        )
+        payload["production_unit_index_ref"] = str(production_index_ref)
+        payload["production_unit_index_hash"] = str(production_index_hash)
     payload["artifact_hash"] = canonical_json_hash(payload)
     _validate_known_artifact(payload)
+    publish_canonical_immutable(arguments.output, payload)
+    _emit(payload)
+    return 0
+
+
+def _artifact_stage3_production_index_build(arguments: argparse.Namespace) -> int:
+    """Build the exact 12/99 endpoint×probe production index from real files."""
+
+    from .experiments.stage3_production_plan import (
+        build_production_unit_index,
+        write_production_unit_index,
+    )
+
+    index = build_production_unit_index(
+        tuple(arguments.endpoint_commit),
+        tuple(arguments.probe_plan),
+        scope=arguments.scope,
+        workspace_root=arguments.workspace_root,
+        index_id=arguments.index_id,
+    )
+    write_production_unit_index(arguments.output, index)
+    _emit(index.to_dict())
+    return 0
+
+
+def _artifact_stage3_path_unit_selector_build(arguments: argparse.Namespace) -> int:
+    """Publish one canonical config-route selector bound to a production index."""
+
+    from .contracts import canonical_json_hash
+    from .experiments.stage3_production_plan import load_production_unit_index
+    from .runtime import publish_canonical_immutable
+
+    index = load_production_unit_index(
+        arguments.unit_index, expected_scope=arguments.scope
+    )
+    index.unit(arguments.active_unit_id)
+    payload: dict[str, Any] = {
+        "schema_version": "stage3-path-unit-selector-v1",
+        "scope": arguments.scope,
+        "unit_index_hash": index.artifact_hash,
+        "active_unit_id": arguments.active_unit_id,
+    }
+    payload["artifact_hash"] = canonical_json_hash(payload)
+    publish_canonical_immutable(arguments.output, payload)
+    _emit(payload)
+    return 0
+
+
+def _artifact_stage3_probe_selector_build(arguments: argparse.Namespace) -> int:
+    """Publish a canonical formal probe selector for pre-index S3.03/S3.04."""
+
+    from .contracts import canonical_json_hash
+    from .runtime import publish_canonical_immutable
+
+    endpoint = _load_mapping(arguments.endpoint_commit)
+    plan = _load_mapping(arguments.probe_plan)
+    record = endpoint.get("record")
+    endpoint_digest = record.get("endpoint_digest") if isinstance(record, Mapping) else None
+    if (
+        endpoint.get("schema_version") != "stage3-endpoint-capture-v1"
+        or endpoint.get("scope") != "formal"
+        or endpoint.get("formal_eligible") is not True
+        or endpoint.get("artifact_hash")
+        != canonical_json_hash(
+            {key: value for key, value in endpoint.items() if key != "artifact_hash"}
+        )
+    ):
+        raise ValueError("STAGE3_PROBE_SELECTOR_ENDPOINT_INVALID")
+    if (
+        plan.get("schema_version") != "stage3-probe-plan-v1"
+        or plan.get("scope") != "formal"
+        or plan.get("formal_eligible") is not True
+        or plan.get("endpoint_digest") != endpoint_digest
+        or plan.get("artifact_hash")
+        != canonical_json_hash(
+            {key: value for key, value in plan.items() if key != "artifact_hash"}
+        )
+    ):
+        raise ValueError("STAGE3_PROBE_SELECTOR_PLAN_INVALID")
+    entries = plan.get("entries")
+    matches = (
+        [
+            item
+            for item in entries
+            if isinstance(item, Mapping)
+            and item.get("role") == "formal"
+            and item.get("probe_id") == arguments.active_probe_id
+        ]
+        if isinstance(entries, list)
+        else []
+    )
+    if len(matches) != 1:
+        raise ValueError("STAGE3_PROBE_SELECTOR_PROBE_NOT_UNIQUE")
+    payload: dict[str, Any] = {
+        "schema_version": "stage3-probe-selector-v1",
+        "scope": "formal",
+        "endpoint_digest": endpoint_digest,
+        "probe_plan_hash": plan["artifact_hash"],
+        "active_probe_id": arguments.active_probe_id,
+    }
+    payload["artifact_hash"] = canonical_json_hash(payload)
     publish_canonical_immutable(arguments.output, payload)
     _emit(payload)
     return 0
@@ -2082,6 +2405,254 @@ def _gate_build(arguments: argparse.Namespace) -> int:
     return 0
 
 
+def _artifact_stage3_scope_authority_publish(arguments: argparse.Namespace) -> int:
+    """Publish the explicit G3-0 user authority as formal task commits."""
+
+    from .experiments.stage3_scope_authority import (
+        publish_stage3_scope_authority,
+    )
+
+    result = publish_stage3_scope_authority(
+        workspace_root=arguments.workspace_root,
+        output_dir=arguments.output_dir,
+        decision_path=arguments.decision,
+        gate_path=arguments.gate,
+        config_hash=arguments.config_hash,
+    )
+    _emit(result)
+    return 0
+
+
+def _artifact_stage3_g36_publish(arguments: argparse.Namespace) -> int:
+    """Reload committed Stage3.08 authorities and publish independent G3-6."""
+
+    from .experiments.stage3_g36_publisher import Stage3G36Publisher
+    from .runtime import publish_canonical_immutable
+
+    publication = Stage3G36Publisher().publish(
+        workspace_root=arguments.workspace_root,
+        output_dir=arguments.output_dir,
+        config_hash=arguments.config_hash,
+        frozen_source_table_ref=arguments.frozen_source_table_ref,
+        provenance_ref=arguments.provenance_ref,
+        formal_plan_ref=arguments.formal_plan_ref,
+        execution_evidence_ref=arguments.execution_evidence_ref,
+        stage3_scope_decision_ref=arguments.stage3_scope_decision_ref,
+        stage3_scope_gate_ref=arguments.stage3_scope_gate_ref,
+        publication_id=arguments.publication_id,
+    )
+    if arguments.receipt is not None:
+        publish_canonical_immutable(arguments.receipt, publication.to_dict())
+    _emit(publication.to_dict())
+    return 0 if publication.formal_eligible else 3
+
+
+def _artifact_stage3_g37_publish(arguments: argparse.Namespace) -> int:
+    """Reload committed Stage3.09 inputs and publish independent G3-7."""
+
+    from .experiments.stage3_g37_publisher import Stage3G37Publisher
+    from .runtime import publish_canonical_immutable
+
+    publication = Stage3G37Publisher().publish(
+        workspace_root=arguments.workspace_root,
+        output_dir=arguments.output_dir,
+        frozen_source_table_ref=arguments.frozen_source_table_ref,
+        cost_accuracy_table_ref=arguments.cost_accuracy_table_ref,
+        quadrature_decision_ref=arguments.quadrature_decision_ref,
+        formal_plan_ref=arguments.formal_plan_ref,
+        execution_evidence_ref=arguments.execution_evidence_ref,
+        provenance_ref=arguments.provenance_ref,
+        evaluation_ref=arguments.evaluation_ref,
+        g3_6_ref=arguments.g3_6_ref,
+        stage3_scope_decision_ref=arguments.stage3_scope_decision_ref,
+        stage3_scope_gate_ref=arguments.stage3_scope_gate_ref,
+        config_hash=arguments.config_hash,
+        publication_id=arguments.publication_id,
+    )
+    if arguments.receipt is not None:
+        publish_canonical_immutable(arguments.receipt, publication.to_dict())
+    _emit(publication.to_dict())
+    return 0 if publication.formal_eligible else 3
+
+
+def _artifact_stage3_g38_publish(arguments: argparse.Namespace) -> int:
+    """Independently verify the complete delivery and publish G3-8."""
+
+    from .experiments.stage3_g38_publisher import Stage3G38Publisher
+    from .runtime import publish_canonical_immutable
+
+    gate_refs: dict[str, str] = {}
+    for raw in arguments.gate_ref:
+        gate_id, separator, reference = raw.partition("=")
+        if not separator or not gate_id or not reference or gate_id in gate_refs:
+            raise ValueError("STAGE3_G38_GATE_REF_MUST_BE_UNIQUE_GATE_ID_EQUALS_REF")
+        gate_refs[gate_id] = reference
+    stage3_10_refs = {
+        "analysis_report": arguments.analysis_report_ref,
+        "chart_artifacts": arguments.chart_artifacts_ref,
+        "handoff_manifest": arguments.handoff_manifest_ref,
+        "gate_summary": arguments.gate_summary_ref,
+    }
+    publication = Stage3G38Publisher().publish(
+        workspace_root=arguments.workspace_root,
+        output_dir=arguments.output_dir,
+        config_hash=arguments.config_hash,
+        gate_refs=gate_refs,
+        stage3_10_refs=stage3_10_refs,
+        execution_evidence_ref=arguments.execution_evidence_ref,
+        g3_7_publication_ref=arguments.g3_7_publication_ref,
+        recommendation_ref=arguments.recommendation_ref,
+        finalization_ref=arguments.finalization_ref,
+        delivery_manifest_ref=arguments.delivery_manifest_ref,
+        publication_id=arguments.publication_id,
+        publication_config_hash=arguments.publication_config_hash,
+        checked_at=arguments.checked_at,
+    )
+    if arguments.receipt is not None:
+        publish_canonical_immutable(arguments.receipt, publication.to_dict())
+    _emit(publication.to_dict())
+    return 0
+
+
+def _artifact_stage3_control_publish(arguments: argparse.Namespace) -> int:
+    """Wrap a validated Stage 3 control-plane document in a formal commit."""
+
+    from .contracts import FormalExecutionEvidence
+    from .contracts.provenance import ProvenanceRecord
+    from .runtime import TaskArtifactStore
+
+    root = Path(arguments.workspace_root).resolve()
+    source = Path(arguments.source)
+    source_path = source.resolve() if source.is_absolute() else (root / source).resolve()
+    try:
+        source_ref = source_path.relative_to(root).as_posix()
+    except ValueError as error:
+        raise ValueError("STAGE3_CONTROL_SOURCE_OUTSIDE_WORKSPACE") from error
+    payload = _load_mapping(source_path)
+    declarations = {
+        "formal-plan": (
+            "stage3.formal_plan_authority",
+            "stage3_formal_plan",
+            "stage3-formal-pilot-plan-v1",
+        ),
+        "execution-evidence": (
+            "stage3.formal_execution_authority",
+            "formal_execution_evidence",
+            "formal-execution-evidence-v1",
+        ),
+        "provenance": (
+            "stage3.formal_provenance_authority",
+            "provenance_record",
+            "provenance-record-v1",
+        ),
+    }
+    task_id, artifact_kind, schema_version = declarations[arguments.control_kind]
+    if payload.get("schema_version") != schema_version:
+        raise ValueError("STAGE3_CONTROL_SCHEMA_MISMATCH")
+    if arguments.control_kind == "formal-plan":
+        _validate_known_artifact(payload)
+        if (
+            payload.get("scope") != "formal"
+            or payload.get("formal_eligible") is not True
+            or payload.get("plan_kind") not in {"pilot", "matrix"}
+        ):
+            raise ValueError("STAGE3_FORMAL_PLAN_NOT_QUALIFIED")
+    elif arguments.control_kind == "execution-evidence":
+        FormalExecutionEvidence.from_mapping(payload).require_for_stage(3)
+    else:
+        provenance = ProvenanceRecord.from_mapping(dict(payload))
+        if (
+            provenance.scope != "formal"
+            or not provenance.formal_eligible
+            or provenance.status.value != "COMPLETED"
+            or not provenance.worktree_clean
+        ):
+            raise ValueError("STAGE3_PROVENANCE_NOT_COMPLETED_CLEAN_FORMAL")
+    refs = tuple(dict.fromkeys((source_ref, *arguments.source_ref)))
+    published = TaskArtifactStore(root, arguments.output_dir).publish(
+        task_id=task_id,
+        artifact_kind=artifact_kind,
+        config_hash=arguments.config_hash,
+        run_intent="formal",
+        payload=payload,
+        formal_eligible=True,
+        source_refs=refs,
+    )
+    result = {
+        "schema_version": "stage3-control-publication-v1",
+        "control_kind": arguments.control_kind,
+        "task_id": task_id,
+        "artifact_kind": artifact_kind,
+        "config_hash": arguments.config_hash,
+        "source_ref": source_ref,
+        "commit_ref": published.commit_ref,
+        "object_ref": published.object_ref,
+        "artifact_hash": published.artifact_hash,
+    }
+    _emit(result)
+    return 0
+
+
+def _stage3_gate_evaluate(arguments: argparse.Namespace) -> int:
+    """Evaluate the independent Stage 3 G3-0..G3-5 evidence chain.
+
+    This command only reads canonical artifacts and writes the audit artifact;
+    it never starts a formal runner.  Exit code 3 denotes a valid but blocked
+    evidence audit, matching the existing formal-readiness convention.
+    """
+
+    from .contracts import FormalExecutionEvidence, GateRecord, write_canonical_json
+    from .experiments.stage3_gate import Stage3GateEvaluator
+
+    execution = FormalExecutionEvidence.from_mapping(
+        _load_mapping(arguments.execution_evidence)
+    )
+    gates = tuple(
+        GateRecord.from_mapping(_load_mapping(path)) for path in arguments.gate
+    )
+    scope_decision = _load_mapping(arguments.stage3_scope_decision)
+    scope_gate = GateRecord.from_mapping(
+        _load_mapping(arguments.stage3_scope_gate)
+    )
+    observations_value = _load_mapping(arguments.observations)
+    observations = observations_value.get("observations", observations_value)
+    if not isinstance(observations, list):
+        raise TypeError("STAGE3_GATE_OBSERVATIONS_MUST_BE_ARRAY")
+    thresholds = _load_mapping(arguments.thresholds)
+    provenance = (
+        None
+        if arguments.provenance is None
+        else _load_mapping(arguments.provenance)
+    )
+    source_refs = tuple(
+        dict.fromkeys(
+            (
+                *arguments.source_artifact_ref,
+                arguments.stage3_scope_decision_ref,
+                arguments.stage3_scope_gate_ref,
+            )
+        )
+    )
+    result = Stage3GateEvaluator().evaluate(
+        evaluation_id=arguments.evaluation_id,
+        execution=execution,
+        observations=observations,
+        formal_plan=_load_mapping(arguments.formal_plan),
+        formal_plan_ref=arguments.formal_plan_ref,
+        thresholds=thresholds,
+        gates=gates or None,
+        provenance=provenance,
+        source_artifact_refs=source_refs,
+        stage3_scope_decision=scope_decision,
+        stage3_scope_gate=scope_gate,
+        stage3_scope_decision_ref=arguments.stage3_scope_decision_ref,
+        stage3_scope_gate_ref=arguments.stage3_scope_gate_ref,
+    )
+    write_canonical_json(arguments.output, result.to_dict())
+    _emit(result.to_dict())
+    return 0 if result.formal_eligible else 3
+
+
 def build_parser(*, prog: str | None = None) -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog=prog)
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -2220,6 +2791,20 @@ def build_parser(*, prog: str | None = None) -> argparse.ArgumentParser:
     task_run = task_commands.add_parser("run", help="执行新任务")
     add_task_execute_arguments(task_run)
     task_run.set_defaults(handler=_execute_task)
+
+    task_stage3_trajectory = task_commands.add_parser(
+        "stage3-trajectory",
+        help="运行真实 Stage3.03 training endpoint 轨迹并仅发布 completion receipt",
+    )
+    task_stage3_trajectory.add_argument("--config", type=Path, required=True)
+    task_stage3_trajectory.add_argument("--environment", type=Path, required=True)
+    task_stage3_trajectory.add_argument(
+        "--receipt",
+        type=Path,
+        required=True,
+        help="DATA_ROOT 内不可变 receipt 路径",
+    )
+    task_stage3_trajectory.set_defaults(handler=_task_stage3_trajectory)
 
     task_resume = task_commands.add_parser(
         "resume", help="按 v2 recovery.resume_ref 从权威边界恢复"
@@ -2408,10 +2993,15 @@ def build_parser(*, prog: str | None = None) -> argparse.ArgumentParser:
     endpoint_plan.add_argument("--step", type=int, action="append", default=[])
     endpoint_plan.add_argument("--include-checkpoint-steps", action="store_true")
     endpoint_plan.add_argument(
-        "--scope", choices=("local_fixture", "formal"), required=True
+        "--scope", choices=("local_fixture", "pilot", "formal"), required=True
     )
     endpoint_plan.add_argument("--formal-execution-evidence", type=Path)
     endpoint_plan.add_argument("--probe-plan-ref")
+    endpoint_plan.add_argument(
+        "--endpoint-metadata",
+        type=Path,
+        help="pilot/formal 必填：step 到 model/seed/stage 的冻结 JSON/YAML mapping",
+    )
     endpoint_plan.add_argument("--output", type=Path, required=True)
     endpoint_plan.set_defaults(handler=_artifact_endpoint_plan_build)
 
@@ -2421,7 +3011,7 @@ def build_parser(*, prog: str | None = None) -> argparse.ArgumentParser:
     )
     probe_plan.add_argument("--spec", type=Path, required=True)
     probe_plan.add_argument(
-        "--scope", choices=("local_fixture", "formal"), required=True
+        "--scope", choices=("local_fixture", "pilot", "formal"), required=True
     )
     probe_plan.add_argument("--formal-execution-evidence", type=Path)
     probe_plan.add_argument("--output", type=Path, required=True)
@@ -2439,6 +3029,157 @@ def build_parser(*, prog: str | None = None) -> argparse.ArgumentParser:
     quadrature_pilot_plan.set_defaults(
         handler=_artifact_quadrature_pilot_plan_build
     )
+
+    stage3_production_index = artifact_commands.add_parser(
+        "stage3-production-index-build",
+        help="从真实 endpoint commits/probe plans 构建严格的 12/99 unit index",
+    )
+    stage3_production_index.add_argument(
+        "--endpoint-commit", type=Path, action="append", required=True
+    )
+    stage3_production_index.add_argument(
+        "--probe-plan", type=Path, action="append", required=True
+    )
+    stage3_production_index.add_argument(
+        "--scope", choices=("pilot", "formal"), required=True
+    )
+    stage3_production_index.add_argument(
+        "--workspace-root", type=Path, required=True
+    )
+    stage3_production_index.add_argument("--index-id")
+    stage3_production_index.add_argument("--output", type=Path, required=True)
+    stage3_production_index.set_defaults(
+        handler=_artifact_stage3_production_index_build
+    )
+
+    stage3_path_unit_selector = artifact_commands.add_parser(
+        "stage3-path-unit-selector-build",
+        help="构建绑定 production index 的单一 Stage 3 path-unit selector",
+    )
+    stage3_path_unit_selector.add_argument(
+        "--unit-index", type=Path, required=True
+    )
+    stage3_path_unit_selector.add_argument(
+        "--scope", choices=("pilot", "formal"), required=True
+    )
+    stage3_path_unit_selector.add_argument("--active-unit-id", required=True)
+    stage3_path_unit_selector.add_argument("--output", type=Path, required=True)
+    stage3_path_unit_selector.set_defaults(
+        handler=_artifact_stage3_path_unit_selector_build
+    )
+
+    stage3_probe_selector = artifact_commands.add_parser(
+        "stage3-probe-selector-build",
+        help="为 S3.03/S3.04 构建绑定 formal endpoint/probe plan 的 selector",
+    )
+    stage3_probe_selector.add_argument(
+        "--endpoint-commit", type=Path, required=True
+    )
+    stage3_probe_selector.add_argument("--probe-plan", type=Path, required=True)
+    stage3_probe_selector.add_argument("--active-probe-id", required=True)
+    stage3_probe_selector.add_argument("--output", type=Path, required=True)
+    stage3_probe_selector.set_defaults(
+        handler=_artifact_stage3_probe_selector_build
+    )
+
+    stage3_scope_authority = artifact_commands.add_parser(
+        "stage3-scope-authority-publish",
+        help="把已审核的用户 G3-0 范围决定发布为 formal task commits",
+    )
+    stage3_scope_authority.add_argument(
+        "--workspace-root", type=Path, required=True
+    )
+    stage3_scope_authority.add_argument("--output-dir", required=True)
+    stage3_scope_authority.add_argument("--decision", type=Path, required=True)
+    stage3_scope_authority.add_argument("--gate", type=Path, required=True)
+    stage3_scope_authority.add_argument("--config-hash", required=True)
+    stage3_scope_authority.set_defaults(
+        handler=_artifact_stage3_scope_authority_publish
+    )
+
+    stage3_control_publish = artifact_commands.add_parser(
+        "stage3-control-publish",
+        help="把已严格验证的 Stage 3 plan/execution/provenance 包装为 formal commit",
+    )
+    stage3_control_publish.add_argument(
+        "--control-kind",
+        choices=("formal-plan", "execution-evidence", "provenance"),
+        required=True,
+    )
+    stage3_control_publish.add_argument(
+        "--workspace-root", type=Path, required=True
+    )
+    stage3_control_publish.add_argument("--output-dir", required=True)
+    stage3_control_publish.add_argument("--source", type=Path, required=True)
+    stage3_control_publish.add_argument("--source-ref", action="append", default=[])
+    stage3_control_publish.add_argument("--config-hash", required=True)
+    stage3_control_publish.set_defaults(handler=_artifact_stage3_control_publish)
+
+    stage3_g36_publish = artifact_commands.add_parser(
+        "stage3-g36-publish",
+        help="从已提交 Stage3.08 表与 formal authority 独立发布 G3-6",
+    )
+    stage3_g36_publish.add_argument("--workspace-root", type=Path, required=True)
+    stage3_g36_publish.add_argument("--output-dir", required=True)
+    stage3_g36_publish.add_argument("--config-hash", required=True)
+    stage3_g36_publish.add_argument("--publication-id")
+    stage3_g36_publish.add_argument("--frozen-source-table-ref", required=True)
+    stage3_g36_publish.add_argument("--provenance-ref", required=True)
+    stage3_g36_publish.add_argument("--formal-plan-ref", required=True)
+    stage3_g36_publish.add_argument("--execution-evidence-ref", required=True)
+    stage3_g36_publish.add_argument("--stage3-scope-decision-ref", required=True)
+    stage3_g36_publish.add_argument("--stage3-scope-gate-ref", required=True)
+    stage3_g36_publish.add_argument("--receipt", type=Path)
+    stage3_g36_publish.set_defaults(handler=_artifact_stage3_g36_publish)
+
+    stage3_g37_publish = artifact_commands.add_parser(
+        "stage3-g37-publish",
+        help="从已提交 Stage3.09 成本表与候选、G3-6 权威独立发布 G3-7",
+    )
+    stage3_g37_publish.add_argument("--workspace-root", type=Path, required=True)
+    stage3_g37_publish.add_argument("--output-dir", required=True)
+    stage3_g37_publish.add_argument("--config-hash")
+    stage3_g37_publish.add_argument("--publication-id")
+    stage3_g37_publish.add_argument("--frozen-source-table-ref", required=True)
+    stage3_g37_publish.add_argument("--cost-accuracy-table-ref", required=True)
+    stage3_g37_publish.add_argument("--quadrature-decision-ref", required=True)
+    stage3_g37_publish.add_argument("--formal-plan-ref", required=True)
+    stage3_g37_publish.add_argument("--execution-evidence-ref", required=True)
+    stage3_g37_publish.add_argument("--provenance-ref", required=True)
+    stage3_g37_publish.add_argument("--evaluation-ref", required=True)
+    stage3_g37_publish.add_argument("--g3-6-ref", required=True)
+    stage3_g37_publish.add_argument("--stage3-scope-decision-ref")
+    stage3_g37_publish.add_argument("--stage3-scope-gate-ref")
+    stage3_g37_publish.add_argument("--receipt", type=Path)
+    stage3_g37_publish.set_defaults(handler=_artifact_stage3_g37_publish)
+
+    stage3_g38_publish = artifact_commands.add_parser(
+        "stage3-g38-publish",
+        help="独立验收 Stage3.10 交付文件与 G0–G7 权威并发布 G3-8",
+    )
+    stage3_g38_publish.add_argument("--workspace-root", type=Path, required=True)
+    stage3_g38_publish.add_argument("--output-dir", required=True)
+    stage3_g38_publish.add_argument("--config-hash")
+    stage3_g38_publish.add_argument("--publication-id")
+    stage3_g38_publish.add_argument("--publication-config-hash")
+    stage3_g38_publish.add_argument("--checked-at")
+    stage3_g38_publish.add_argument(
+        "--gate-ref",
+        action="append",
+        required=True,
+        help="重复八次：stage3.G3-N=commit/ref.json",
+    )
+    stage3_g38_publish.add_argument("--analysis-report-ref", required=True)
+    stage3_g38_publish.add_argument("--chart-artifacts-ref", required=True)
+    stage3_g38_publish.add_argument("--handoff-manifest-ref", required=True)
+    stage3_g38_publish.add_argument("--gate-summary-ref", required=True)
+    stage3_g38_publish.add_argument("--execution-evidence-ref", required=True)
+    stage3_g38_publish.add_argument("--g3-7-publication-ref", required=True)
+    stage3_g38_publish.add_argument("--recommendation-ref", required=True)
+    stage3_g38_publish.add_argument("--finalization-ref", required=True)
+    stage3_g38_publish.add_argument("--delivery-manifest-ref", required=True)
+    stage3_g38_publish.add_argument("--receipt", type=Path)
+    stage3_g38_publish.set_defaults(handler=_artifact_stage3_g38_publish)
 
     route_build = artifact_commands.add_parser(
         "route-build",
@@ -2489,6 +3230,51 @@ def build_parser(*, prog: str | None = None) -> argparse.ArgumentParser:
     gate_nested_summary = gate_commands.add_parser("summary")
     gate_nested_summary.add_argument("paths", type=Path, nargs="+")
     gate_nested_summary.set_defaults(handler=_gate_summary)
+
+    gate_stage3 = gate_commands.add_parser(
+        "stage3-evaluate", help="严格评估 Stage 3 G3-0..G3-5 与全量指标"
+    )
+    gate_stage3.add_argument("--evaluation-id", required=True)
+    gate_stage3.add_argument("--execution-evidence", type=Path, required=True)
+    gate_stage3.add_argument("--gate", type=Path, action="append", default=[])
+    gate_stage3.add_argument("--observations", type=Path, required=True)
+    gate_stage3.add_argument("--thresholds", type=Path, required=True)
+    gate_stage3.add_argument("--formal-plan", type=Path, required=True)
+    gate_stage3.add_argument("--formal-plan-ref", required=True)
+    gate_stage3.add_argument("--provenance", type=Path)
+    gate_stage3.add_argument("--source-artifact-ref", action="append", default=[])
+    gate_stage3.add_argument(
+        "--stage3-scope-decision",
+        "--scope-decision",
+        dest="stage3_scope_decision",
+        type=Path,
+        required=True,
+        help="hash-bound explicit user G3-0 scope decision",
+    )
+    gate_stage3.add_argument(
+        "--stage3-scope-gate",
+        "--scope-gate",
+        dest="stage3_scope_gate",
+        type=Path,
+        required=True,
+        help="hash-bound explicit user G3-0 GateRecord",
+    )
+    gate_stage3.add_argument(
+        "--stage3-scope-decision-ref",
+        "--scope-decision-ref",
+        dest="stage3_scope_decision_ref",
+        required=True,
+        help="stable source reference for the explicit G3-0 decision",
+    )
+    gate_stage3.add_argument(
+        "--stage3-scope-gate-ref",
+        "--scope-gate-ref",
+        dest="stage3_scope_gate_ref",
+        required=True,
+        help="stable source reference for the explicit G3-0 GateRecord",
+    )
+    gate_stage3.add_argument("--output", type=Path, required=True)
+    gate_stage3.set_defaults(handler=_stage3_gate_evaluate)
     return parser
 
 

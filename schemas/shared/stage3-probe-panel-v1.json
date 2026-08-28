@@ -12,12 +12,31 @@
     "entries": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/entry"}},
     "minimum_formal_probes": {"type": "integer", "minimum": 1},
     "execution_evidence_hash": {"$ref": "#/$defs/hash"},
-    "scope": {"enum": ["local_fixture", "formal"]},
+    "scope": {"enum": ["local_fixture", "pilot", "formal"]},
     "formal_eligible": {"type": "boolean"},
     "qualification_gate_hash": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/hash"}]},
     "artifact_hash": {"$ref": "#/$defs/hash"}
   },
   "allOf": [
+    {
+      "if": {
+        "properties": {"scope": {"const": "pilot"}},
+        "required": ["scope"]
+      },
+      "then": {
+        "properties": {
+          "formal_eligible": {"const": false},
+          "entries": {
+            "minItems": 2,
+            "maxItems": 2,
+            "items": {
+              "properties": {"role": {"const": "pilot"}},
+              "required": ["role"]
+            }
+          }
+        }
+      }
+    },
     {
       "if": {"properties": {"formal_eligible": {"const": true}}, "required": ["formal_eligible"]},
       "then": {

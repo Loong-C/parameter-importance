@@ -19,13 +19,18 @@
     "scope": {"enum": ["local_fixture", "formal"]},
     "formal_eligible": {"type": "boolean"},
     "qualification_gate_hash": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/hash"}]},
+    "gate_evaluation_hash": {"$ref": "#/$defs/hash"},
+    "provenance_hash": {"$ref": "#/$defs/hash"},
     "reasons": {"type": "array", "items": {"type": "string", "minLength": 1}},
     "artifact_hash": {"$ref": "#/$defs/hash"}
   },
   "allOf": [
     {
       "if": {"properties": {"formal_eligible": {"const": true}}, "required": ["formal_eligible"]},
-      "then": {"properties": {"scope": {"const": "formal"}, "status": {"const": "QUALIFIED"}, "qualification_gate_hash": {"$ref": "#/$defs/hash"}}},
+      "then": {
+        "required": ["gate_evaluation_hash", "provenance_hash"],
+        "properties": {"scope": {"const": "formal"}, "status": {"const": "QUALIFIED"}, "qualification_gate_hash": {"$ref": "#/$defs/hash"}}
+      },
       "else": {"properties": {"qualification_gate_hash": {"type": "null"}}}
     }
   ],
@@ -41,7 +46,24 @@
         "max_completeness_absolute_residual": {"type": "number", "minimum": 0},
         "min_spearman": {"type": "number", "minimum": -1, "maximum": 1},
         "min_topk_overlap": {"type": "number", "minimum": 0, "maximum": 1},
-        "max_unique_nodes": {"type": "integer", "minimum": 1}
+        "max_unique_nodes": {"type": "integer", "minimum": 1},
+        "max_normalized_l2_error": {"type": "number", "minimum": 0},
+        "max_normalized_linf_error": {"type": "number", "minimum": 0},
+        "max_completeness_relative_residual": {"type": "number", "minimum": 0},
+        "max_completeness_l1_scaled_residual": {"type": "number", "minimum": 0},
+        "min_active_spearman": {"type": "number", "minimum": -1, "maximum": 1},
+        "min_cosine_similarity": {"type": "number", "minimum": -1, "maximum": 1},
+        "min_sign_consistency": {"type": "number", "minimum": 0, "maximum": 1},
+        "min_topq_overlap": {"type": "number", "minimum": 0, "maximum": 1},
+        "min_topq_jaccard": {"type": "number", "minimum": 0, "maximum": 1},
+        "max_layer_quality_tv": {"type": "number", "minimum": 0},
+        "max_module_quality_tv": {"type": "number", "minimum": 0},
+        "max_reference_normalized_l1_error": {"type": "number", "minimum": 0},
+        "completeness_stability_epsilon": {"type": "number", "exclusiveMinimum": 0},
+        "active_set_threshold": {"type": "number", "minimum": 0},
+        "top_q_values": {"type": "array", "items": {"type": "number", "exclusiveMinimum": 0, "maximum": 1}},
+        "required_strata": {"type": "array", "items": {"type": "string", "minLength": 1}},
+        "require_worst_case": {"const": true}
       }
     }
   }

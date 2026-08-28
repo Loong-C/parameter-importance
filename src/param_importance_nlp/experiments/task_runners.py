@@ -56,7 +56,7 @@ from ..providers import (
 from ..providers.optional import DependencyUnavailable
 from ..runtime.checkpoint import CheckpointStore
 from ..runtime.events import JsonlEventSink, read_event_stream
-from ..runtime.task_artifacts import TaskArtifactStore
+from ..runtime.task_artifacts import TaskArtifactStore, load_committed_task_artifact
 from ..runtime.telemetry import ResourceProfile, ResourceSampler
 from ..runtime.task_runtime import (
     BlockerCode,
@@ -198,6 +198,7 @@ class _EndpointCapturePlan:
     formal_eligible: bool
     qualification_evidence_hash: str | None
     probe_plan_ref: str | None
+    metadata_by_step: Mapping[int, Mapping[str, object]] | None = None
 
 
 def _endpoint_capture_plan(
@@ -214,7 +215,18 @@ def _endpoint_capture_plan(
     orchestration = request.config.section("orchestration")
     assert isinstance(orchestration, dict)
     candidates: list[tuple[str, Mapping[str, object]]] = []
-    for reference in orchestration["input_result_refs"]:
+    auxiliary_ref = request.environment.evidence_refs.get(
+        "stage3_endpoint_capture_plan"
+    )
+    candidate_refs = tuple(
+        dict.fromkeys(
+            (
+                *orchestration["input_result_refs"],
+                *((auxiliary_ref,) if isinstance(auxiliary_ref, str) else ()),
+            )
+        )
+    )
+    for reference in candidate_refs:
         path = _resolve_workspace_path(root, str(reference), field="input_result_refs")
         if path.suffix.casefold() != ".json":
             continue
@@ -233,7 +245,7 @@ def _endpoint_capture_plan(
                 TaskBlocker(
                     BlockerCode.CONTRACT_UNFROZEN,
                     "training_endpoint_capture_plan",
-                    "formal 路径审计必须在 input_result_refs 中绑定版本化 endpoint 选择计划",
+                    "formal 路径审计必须绑定版本化 endpoint 选择计划",
                     False,
                 )
             )
@@ -243,7 +255,7 @@ def _endpoint_capture_plan(
         if not selected:
             selected = frozenset({spec.max_steps})
         return _EndpointCapturePlan(
-            None, selected, True, "local_fixture", False, None, None
+            None, selected, True, "local_fixture", False, None, None, None
         )
     if len(candidates) != 1:
         raise ValueError("TRAINING_ENDPOINT_CAPTURE_PLAN_NOT_UNIQUE")
@@ -259,7 +271,8 @@ def _endpoint_capture_plan(
         "probe_plan_ref",
         "artifact_hash",
     }
-    if set(value) != expected:
+    optional = {"endpoint_metadata"}
+    if set(value) not in (expected, expected | optional):
         raise ValueError("TRAINING_ENDPOINT_CAPTURE_PLAN_FIELDS_MISMATCH")
     declared = value["artifact_hash"]
     body = {key: item for key, item in value.items() if key != "artifact_hash"}
@@ -279,7 +292,15 @@ def _endpoint_capture_plan(
     evidence_hash = value["qualification_evidence_hash"]
     if type(include) is not bool or type(formal) is not bool:
         raise TypeError("TRAINING_ENDPOINT_CAPTURE_PLAN_BOOLEAN_INVALID")
-    if scope != request.config.run_intent or formal != (scope == "formal"):
+    if scope not in {"local_fixture", "pilot", "formal"}:
+        raise ValueError("TRAINING_ENDPOINT_CAPTURE_PLAN_SCOPE_INVALID")
+    if scope == "local_fixture" and request.config.run_intent != "local_fixture":
+        raise ValueError("TRAINING_ENDPOINT_CAPTURE_PLAN_SCOPE_MISMATCH")
+    if scope == "formal" and request.config.run_intent != "formal":
+        raise ValueError("TRAINING_ENDPOINT_CAPTURE_PLAN_SCOPE_MISMATCH")
+    if scope == "pilot" and formal:
+        raise ValueError("TRAINING_ENDPOINT_CAPTURE_PLAN_PILOT_FORMAL_MISMATCH")
+    if formal != (scope == "formal"):
         raise ValueError("TRAINING_ENDPOINT_CAPTURE_PLAN_SCOPE_MISMATCH")
     selected = set(raw_steps)
     if include:
@@ -288,6 +309,41 @@ def _endpoint_capture_plan(
         )
     if not selected:
         raise ValueError("TRAINING_ENDPOINT_CAPTURE_PLAN_EMPTY")
+    metadata_by_step: dict[int, Mapping[str, object]] | None = None
+    if "endpoint_metadata" in value:
+        raw_metadata = value["endpoint_metadata"]
+        if not isinstance(raw_metadata, Mapping):
+            raise TypeError("TRAINING_ENDPOINT_CAPTURE_PLAN_METADATA_INVALID")
+        metadata_by_step = {}
+        for raw_step, metadata in raw_metadata.items():
+            if not isinstance(raw_step, str) or not raw_step.isdigit() or int(raw_step) <= 0:
+                raise ValueError("TRAINING_ENDPOINT_CAPTURE_PLAN_METADATA_STEP_INVALID")
+            if not isinstance(metadata, Mapping) or set(metadata) != {"model", "seed", "stage"}:
+                raise ValueError("TRAINING_ENDPOINT_CAPTURE_PLAN_METADATA_FIELDS_MISMATCH")
+            model, seed, stage = metadata["model"], metadata["seed"], metadata["stage"]
+            if model not in {"14M", "31M"}:
+                raise ValueError("TRAINING_ENDPOINT_CAPTURE_PLAN_METADATA_MODEL_INVALID")
+            if isinstance(seed, bool) or not isinstance(seed, int) or seed < 0:
+                raise ValueError("TRAINING_ENDPOINT_CAPTURE_PLAN_METADATA_SEED_INVALID")
+            if stage not in {"early", "middle", "late"}:
+                raise ValueError("TRAINING_ENDPOINT_CAPTURE_PLAN_METADATA_STAGE_INVALID")
+            metadata_by_step[int(raw_step)] = {
+                "model": model,
+                "seed": seed,
+                "stage": stage,
+            }
+        if set(metadata_by_step) != selected:
+            raise ValueError("TRAINING_ENDPOINT_CAPTURE_PLAN_METADATA_PLAN_COVERAGE_DRIFT")
+    elif scope in {"pilot", "formal"}:
+        raise TaskBlockedError(
+            TaskBlocker(
+                BlockerCode.CONTRACT_UNFROZEN,
+                "training_endpoint_capture_plan",
+                "real pilot/formal endpoint capture requires per-step model/seed/stage metadata",
+                request.config.run_intent == "formal",
+                (reference,),
+            )
+        )
     if request.config.run_intent == "formal":
         evidence_ref = request.environment.evidence_refs.get("formal_execution")
         if evidence_ref is None:
@@ -300,15 +356,19 @@ def _endpoint_capture_plan(
                     (reference,),
                 )
             )
-        evidence_value = load_canonical_json(
-            _resolve_workspace_path(root, evidence_ref, field="formal_execution")
-        )
+        evidence_path = _resolve_workspace_path(root, evidence_ref, field="formal_execution")
+        evidence_value = load_canonical_json(evidence_path)
+        if isinstance(evidence_value, Mapping) and evidence_value.get("schema_version") == "task-output-commit-v1":
+            loaded_evidence = load_committed_task_artifact(root, evidence_ref, require_formal=True)
+            evidence_value = loaded_evidence.payload
         if not isinstance(evidence_value, Mapping):
             raise ValueError("FORMAL_EXECUTION_EVIDENCE_ROOT_INVALID")
         evidence = FormalExecutionEvidence.from_mapping(evidence_value)
         evidence.require_for_stage(3)
-        if evidence_hash != evidence.artifact_hash:
+        if scope == "formal" and evidence_hash != evidence.artifact_hash:
             raise ValueError("TRAINING_ENDPOINT_CAPTURE_EVIDENCE_HASH_MISMATCH")
+        if scope == "pilot" and evidence_hash is not None:
+            raise ValueError("PILOT_ENDPOINT_PLAN_CANNOT_CARRY_FORMAL_EVIDENCE")
     elif evidence_hash is not None:
         raise ValueError("LOCAL_ENDPOINT_PLAN_CANNOT_CARRY_FORMAL_EVIDENCE")
     probe_ref = value["probe_plan_ref"]
@@ -322,6 +382,7 @@ def _endpoint_capture_plan(
         formal,
         None if evidence_hash is None else str(evidence_hash),
         None if probe_ref is None else str(probe_ref),
+        metadata_by_step,
     )
 
 
@@ -1372,6 +1433,7 @@ class TrainingTaskRunner(TaskRunner):
                 qualification_evidence_hash=(
                     endpoint_plan.qualification_evidence_hash
                 ),
+                endpoint_metadata=endpoint_plan.metadata_by_step,
             )
             endpoint_observer.bind_engine(engine)
             engine.register_observer(endpoint_observer)

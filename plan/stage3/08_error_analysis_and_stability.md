@@ -6,7 +6,7 @@
 
 ## 前置条件
 
-- G3-6 通过。
+- G3-5 通过，S3.7 的 99 个正式单元与逐单元 reference/observation ledger 已完整提交。
 - 原始结果目录已冻结，派生分析只读加载。
 - 指标公式、阈值、active-set 和 tie 处理与 G3-5 摘要一致。
 
@@ -184,7 +184,9 @@
 
 ## Gate 与后续依赖
 
-- 本子任务不单独放行 Stage 4；它为 S3.9 的 G3-7 方法选择 gate 提供唯一指标源表。
+- 本子任务不在同一任务内自证 Gate；它只发布冻结、可重放的唯一指标源表。
+- S3.8 commits 与 completed clean provenance 形成后，由独立 `stage3.08_g3_6_publisher` 重载源表、formal plan、execution evidence 和 G3-0..G3-5，先提交 evaluation，再提交 G3-6。
+- S3.9 只消费独立发布且状态为 `PASS` 的 G3-6；不得从 S3.8 payload 内嵌或合成 Gate。
 - 发现输入不完整、参考未收敛、指标合同漂移或聚合无法重现时，退回 S3.7 修复原始单元，不得在分析层补造数值。
 
 ## 失败与恢复

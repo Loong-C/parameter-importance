@@ -33,6 +33,13 @@ from param_importance_nlp.contracts.jsonio import (
 )
 from param_importance_nlp.contracts.runtime_evidence import RuntimeCapabilityEvidence
 from param_importance_nlp.contracts.status import GateRecord, GateStatus
+from param_importance_nlp.contracts.stage3_scope import (
+    STAGE3_SCOPE_ARTIFACT_KIND,
+    STAGE3_SCOPE_DECISION_SCHEMA_VERSION,
+    STAGE3_SCOPE_GATE_ID,
+    STAGE3_SCOPE_TASK_ID,
+    validate_stage3_scope_authority,
+)
 from param_importance_nlp.contracts.task_catalog import (
     DEFAULT_TASK_CATALOG,
     RecoveryMode,
@@ -848,6 +855,56 @@ class TaskRuntime:
             return False, (reference,)
         return evidence.capability == capability and evidence.verified, (reference,)
 
+    def _verified_stage3_scope_estimator_authority(
+        self,
+        environment: TaskRuntimeEnvironment,
+    ) -> tuple[bool, tuple[str, ...]]:
+        """Accept the explicit user U-32 decision only as a Stage 3 authority.
+
+        Both objects must be formal content-addressed task envelopes, share one
+        config identity, and the G3-0 payload must bind the decision commit.
+        This method is never consulted for Stage 2 or Stage 4+.
+        """
+
+        decision_ref = environment.evidence_refs.get("stage3_scope_decision")
+        gate_ref = environment.evidence_refs.get("stage3_g30_gate")
+        refs = tuple(
+            item for item in (decision_ref, gate_ref) if isinstance(item, str)
+        )
+        if decision_ref is None or gate_ref is None:
+            return False, refs
+        try:
+            decision_artifact = self._load_environment_evidence(decision_ref)
+            gate_artifact = self._load_environment_evidence(gate_ref)
+            if (
+                decision_artifact.identity.task_id != STAGE3_SCOPE_TASK_ID
+                or decision_artifact.identity.artifact_kind
+                != STAGE3_SCOPE_ARTIFACT_KIND
+                or gate_artifact.identity.task_id != STAGE3_SCOPE_TASK_ID
+                or gate_artifact.identity.artifact_kind != "gate_record"
+                or decision_artifact.identity.config_hash
+                != gate_artifact.identity.config_hash
+            ):
+                raise TaskRuntimeError("STAGE3_SCOPE_ENVELOPE_IDENTITY_INVALID")
+            decision = self._extract_schema_payload(
+                decision_artifact.payload,
+                STAGE3_SCOPE_DECISION_SCHEMA_VERSION,
+            )
+            gates = self._find_gate_records(
+                gate_artifact.payload,
+                STAGE3_SCOPE_GATE_ID,
+            )
+            if len(gates) != 1:
+                raise TaskRuntimeError("STAGE3_SCOPE_G30_GATE_NOT_UNIQUE")
+            validate_stage3_scope_authority(
+                decision,
+                gates[0],
+                decision_ref=decision_ref,
+            )
+        except Exception:
+            return False, refs
+        return True, refs
+
     def register(self, runner: TaskRunner) -> None:
         kind = getattr(runner, "runner_kind", None)
         if not isinstance(kind, RunnerKind):
@@ -1087,14 +1144,28 @@ class TaskRuntime:
                         decision_valid = False
                     else:
                         decision_valid = True
+                authority_refs: tuple[str, ...] = ()
+                if not decision_valid and task.stage == 3:
+                    decision_valid, authority_refs = (
+                        self._verified_stage3_scope_estimator_authority(environment)
+                    )
                 if not decision_valid:
                     blockers.append(
                         TaskBlocker(
                             BlockerCode.ESTIMATOR_DECISION_UNAVAILABLE,
                             "estimator_decision",
-                            "formal 任务缺少已通过 Gate 且 hash-bound 的 EstimatorDecision",
+                            (
+                                "formal Stage 3 任务缺少 hash-bound 的 EstimatorDecision "
+                                "或显式用户 U-32/G3-0 范围授权"
+                                if task.stage == 3
+                                else "formal 任务缺少已通过 Gate 且 hash-bound 的 EstimatorDecision"
+                            ),
                             True,
-                            (() if decision_ref is None else (decision_ref,)),
+                            (
+                                authority_refs
+                                if authority_refs
+                                else (() if decision_ref is None else (decision_ref,))
+                            ),
                         )
                     )
         return tuple(

@@ -546,10 +546,393 @@ _STAGE23_ARTIFACT_FIELDS: dict[str, set[str]] = {
         "scope",
         "formal_eligible",
         "qualification_gate_hash",
+        "gate_evaluation_hash",
+        "provenance_hash",
+        "reasons",
+        "artifact_hash",
+    },
+    "stage3-gate-evaluation-v1": {
+        "schema_version",
+        "evaluation_id",
+        "status",
+        "scope",
+        "formal_eligible",
+        "execution_evidence_hash",
+        "formal_plan_hash",
+        "formal_plan_ref",
+        "thresholds_hash",
+        "required_gate_ids",
+        "gate_hashes",
+        "required_rule_names",
+        "required_unit_ids",
+        "required_strata",
+        "required_top_q",
+        "rule_evaluations",
+        "provenance_hash",
+        "source_artifact_refs",
+        "reasons",
+        "stage3_scope_decision_ref",
+        "stage3_scope_decision_hash",
+        "stage3_scope_gate_ref",
+        "stage3_scope_gate_hash",
+        "artifact_hash",
+    },
+    "stage3-finalization-v1": {
+        "schema_version",
+        "finalization_id",
+        "status",
+        "scope",
+        "formal_eligible",
+        "execution_evidence_hash",
+        "frozen_table_ref",
+        "frozen_table_hash",
+        "formal_plan_ref",
+        "formal_plan_hash",
+        "evaluation_ref",
+        "evaluation_hash",
+        "provenance_ref",
+        "provenance_hash",
+        "recommendation_ref",
+        "g3_6_ref",
+        "g3_7_ref",
+        "recommendation",
+        "candidate_recommendation",
+        "gate_evaluation",
+        "prerequisite_gates",
+        "g3_6_gate",
+        "g3_7_gate",
+        "method_selection",
+        "source_artifact_refs",
+        "reasons",
+        "checked_at",
+        "artifact_hash",
+    },
+    "stage3-g36-publication-v1": {
+        "schema_version",
+        "publication_id",
+        "task_id",
+        "config_hash",
+        "status",
+        "scope",
+        "formal_eligible",
+        "frozen_source_table_ref",
+        "frozen_source_table_hash",
+        "formal_plan_ref",
+        "formal_plan_hash",
+        "execution_evidence_ref",
+        "execution_evidence_hash",
+        "provenance_ref",
+        "provenance_hash",
+        "stage3_scope_decision_ref",
+        "stage3_scope_decision_hash",
+        "stage3_scope_gate_ref",
+        "stage3_scope_gate_hash",
+        "evaluation_ref",
+        "evaluation_hash",
+        "g3_6_ref",
+        "g3_6_hash",
+        "gate_evaluation",
+        "g3_6_gate",
+        "source_artifact_refs",
         "reasons",
         "artifact_hash",
     },
 }
+
+
+def _validate_stage3_finalization_wire(value: Mapping[str, object]) -> None:
+    """Validate finalization's nested formal authorities without upgrading it.
+
+    A qualified recommendation is intentionally not passed to
+    ``QuadratureRecommendation.from_mapping`` here: that class requires live
+    execution/evaluation/provenance authorities.  This loader only checks the
+    immutable wire hashes and nested Gate/evaluation contracts; callers that
+    need scientific qualification must use ``Stage3Finalizer.reload_live``.
+    """
+
+    if value.get("schema_version") != "stage3-finalization-v1":
+        raise ValueError("STAGE3_FINALIZATION_SCHEMA_UNSUPPORTED")
+    if value.get("scope") != "formal":
+        raise ValueError("STAGE3_FINALIZATION_SCOPE_INVALID")
+    status = value.get("status")
+    if status not in {"PASS", "BLOCKED"}:
+        raise ValueError("STAGE3_FINALIZATION_STATUS_INVALID")
+    if type(value.get("formal_eligible")) is not bool:
+        raise TypeError("STAGE3_FINALIZATION_FORMAL_ELIGIBLE_INVALID")
+    if value["formal_eligible"] is not (status == "PASS"):
+        raise FormalRunRejected("STAGE3_FINALIZATION_ELIGIBILITY_MISMATCH")
+
+    def nullable_hash(field_name: str) -> None:
+        raw = value[field_name]
+        if raw is not None:
+            _require_sha256(raw, field_name=field_name)
+
+    def nullable_ref(field_name: str) -> None:
+        raw = value[field_name]
+        if raw is not None:
+            if not isinstance(raw, str) or not raw or "?" in raw or "://" in raw:
+                raise ValueError(f"{field_name} 必须是稳定 artifact ref")
+            if any(marker in raw.casefold() for marker in ("fixture", "synthetic")):
+                raise FormalRunRejected(f"{field_name} 禁止 fixture/synthetic formal ref")
+
+    for field_name in (
+        "execution_evidence_hash",
+        "frozen_table_hash",
+        "formal_plan_hash",
+        "evaluation_hash",
+        "provenance_hash",
+    ):
+        nullable_hash(field_name)
+    for field_name in (
+        "frozen_table_ref",
+        "formal_plan_ref",
+        "evaluation_ref",
+        "provenance_ref",
+        "recommendation_ref",
+        "g3_6_ref",
+        "g3_7_ref",
+    ):
+        nullable_ref(field_name)
+
+    refs = value["source_artifact_refs"]
+    if not isinstance(refs, list) or any(not isinstance(item, str) or not item for item in refs):
+        raise TypeError("STAGE3_FINALIZATION_SOURCE_REFS_INVALID")
+    if len(set(refs)) != len(refs):
+        raise ValueError("STAGE3_FINALIZATION_SOURCE_REFS_DUPLICATE")
+    if any(any(marker in item.casefold() for marker in ("fixture", "synthetic")) for item in refs):
+        raise FormalRunRejected("STAGE3_FINALIZATION_SOURCE_REF_FORBIDDEN")
+    reasons = value["reasons"]
+    if not isinstance(reasons, list) or any(not isinstance(item, str) or not item for item in reasons):
+        raise TypeError("STAGE3_FINALIZATION_REASONS_INVALID")
+    if status == "BLOCKED" and not reasons:
+        raise FormalRunRejected("STAGE3_FINALIZATION_BLOCKED_REASON_REQUIRED")
+
+    from ..experiments.stage3_gate import REQUIRED_STAGE3_GATE_IDS, Stage3GateEvaluation
+    from .status import GateRecord, GateStatus
+
+    raw_pre = value["prerequisite_gates"]
+    if not isinstance(raw_pre, list) or any(not isinstance(item, Mapping) for item in raw_pre):
+        raise TypeError("STAGE3_FINALIZATION_PREREQUISITE_GATES_INVALID")
+    pre = tuple(GateRecord.from_mapping(dict(item)) for item in raw_pre)
+    if status == "PASS":
+        if tuple(item.gate_id for item in pre) != REQUIRED_STAGE3_GATE_IDS:
+            raise FormalRunRejected("STAGE3_FINALIZATION_PREREQUISITE_GATES_INCOMPLETE")
+        if any(item.status is not GateStatus.PASS or item.effective_status() is not GateStatus.PASS for item in pre):
+            raise FormalRunRejected("STAGE3_FINALIZATION_PREREQUISITE_GATE_NOT_PASS")
+
+    raw_eval = value["gate_evaluation"]
+    if status == "PASS":
+        if not isinstance(raw_eval, Mapping):
+            raise TypeError("STAGE3_FINALIZATION_GATE_EVALUATION_REQUIRED")
+        evaluation = Stage3GateEvaluation.from_mapping(dict(raw_eval))
+        if evaluation.status != "PASS" or not evaluation.formal_eligible:
+            raise FormalRunRejected("STAGE3_FINALIZATION_GATE_EVALUATION_NOT_PASS")
+        if value["evaluation_hash"] != evaluation.artifact_hash:
+            raise ValueError("STAGE3_FINALIZATION_EVALUATION_HASH_MISMATCH")
+    elif raw_eval is not None:
+        if not isinstance(raw_eval, Mapping):
+            raise TypeError("STAGE3_FINALIZATION_GATE_EVALUATION_INVALID")
+        Stage3GateEvaluation.from_mapping(dict(raw_eval))
+
+    def verify_nested_hash(raw: object, *, field_name: str) -> Mapping[str, object]:
+        if not isinstance(raw, Mapping):
+            raise TypeError(f"{field_name} 必须是 object")
+        supplied_hash = raw.get("artifact_hash")
+        _require_sha256(supplied_hash, field_name=f"{field_name}.artifact_hash")
+        observed_hash = canonical_json_hash({key: item for key, item in raw.items() if key != "artifact_hash"})
+        if supplied_hash != observed_hash:
+            raise ValueError(f"{field_name}.artifact_hash 与内容不一致")
+        return raw
+
+    raw_candidate = value["candidate_recommendation"]
+    if status == "PASS":
+        if not isinstance(raw_candidate, Mapping):
+            raise TypeError("STAGE3_FINALIZATION_CANDIDATE_REQUIRED")
+        candidate = verify_nested_hash(raw_candidate, field_name="candidate_recommendation")
+        if candidate.get("schema_version") != "stage3-quadrature-recommendation-v1" or candidate.get("status") != "FORMAL_CANDIDATE" or candidate.get("formal_eligible") is not False:
+            raise FormalRunRejected("STAGE3_FINALIZATION_CANDIDATE_STATUS_INVALID")
+        # The candidate is unqualified, so the normal Stage 2/3 wire checker
+        # can validate its threshold/hash contract without accepting it as a
+        # formal result.
+        validate_stage23_artifact(candidate)
+        raw_recommendation = verify_nested_hash(value["recommendation"], field_name="recommendation")
+        if raw_recommendation.get("schema_version") != "stage3-quadrature-recommendation-v1" or raw_recommendation.get("status") != "QUALIFIED" or raw_recommendation.get("formal_eligible") is not True:
+            raise FormalRunRejected("STAGE3_FINALIZATION_RECOMMENDATION_NOT_QUALIFIED")
+        if value["recommendation_ref"] is None:
+            raise FormalRunRejected("STAGE3_FINALIZATION_RECOMMENDATION_REF_REQUIRED")
+        for field_name in ("g3_6_gate", "g3_7_gate", "method_selection"):
+            if value[field_name] is None:
+                raise FormalRunRejected(f"STAGE3_FINALIZATION_{field_name.upper()}_REQUIRED")
+        g36 = GateRecord.from_mapping(dict(value["g3_6_gate"]))
+        g37 = GateRecord.from_mapping(dict(value["g3_7_gate"]))
+        if g36.gate_id != "stage3.G3-6" or g37.gate_id != "stage3.G3-7" or g36.status is not GateStatus.PASS or g37.status is not GateStatus.PASS:
+            raise FormalRunRejected("STAGE3_FINALIZATION_G3_6_G3_7_NOT_PASS")
+        if not isinstance(value["g3_6_ref"], str) or not isinstance(value["g3_7_ref"], str):
+            raise FormalRunRejected("STAGE3_FINALIZATION_GATE_REFS_REQUIRED")
+        if value["g3_6_ref"] not in refs or value["g3_7_ref"] not in refs:
+            raise FormalRunRejected("STAGE3_FINALIZATION_GATE_REFS_UNBOUND")
+        if not {
+            value["frozen_table_ref"],
+            value["evaluation_ref"],
+            value["provenance_ref"],
+            value["formal_plan_ref"],
+        }.issubset(set(g36.evidence_refs)):
+            raise FormalRunRejected("STAGE3_FINALIZATION_G3_6_EVIDENCE_UNBOUND")
+        selection = value["method_selection"]
+        if not isinstance(selection, Mapping) or selection.get("status") != "QUALIFIED":
+            raise FormalRunRejected("STAGE3_FINALIZATION_METHOD_SELECTION_INVALID")
+        expected_selection = {
+            "default_rule": raw_recommendation.get("default_rule"),
+            "fallback_rule": raw_recommendation.get("fallback_rule"),
+            "passing_rules": raw_recommendation.get("passing_rules"),
+            "required_unit_ids": raw_recommendation.get("required_unit_ids"),
+            "thresholds_hash": raw_recommendation.get("thresholds_hash"),
+            "execution_evidence_hash": value["execution_evidence_hash"],
+            "frozen_table_ref": value["frozen_table_ref"],
+            "frozen_table_hash": value["frozen_table_hash"],
+            "formal_plan_ref": value["formal_plan_ref"],
+            "formal_plan_hash": value["formal_plan_hash"],
+            "evaluation_ref": value["evaluation_ref"],
+            "evaluation_hash": value["evaluation_hash"],
+            "provenance_ref": value["provenance_ref"],
+            "provenance_hash": value["provenance_hash"],
+        }
+        for field_name, expected_value in expected_selection.items():
+            if selection.get(field_name) != expected_value:
+                raise ValueError(f"STAGE3_FINALIZATION_METHOD_SELECTION_BINDING_MISMATCH:{field_name}")
+        if selection.get("g3_6_gate_hash") != g36.artifact_hash or selection.get("g3_7_gate_hash") != g37.artifact_hash:
+            raise ValueError("STAGE3_FINALIZATION_METHOD_SELECTION_GATE_HASH_MISMATCH")
+    else:
+        if raw_candidate is not None:
+            verify_nested_hash(raw_candidate, field_name="candidate_recommendation")
+        if value["recommendation"] is not None:
+            verify_nested_hash(value["recommendation"], field_name="recommendation")
+        for field_name in ("g3_6_gate", "g3_7_gate"):
+            if value[field_name] is not None:
+                GateRecord.from_mapping(dict(value[field_name]))
+
+
+def _validate_stage3_g36_publication_wire(value: Mapping[str, object]) -> None:
+    """Validate the acyclic Stage3.08→G3-6 publication receipt.
+
+    This is a wire-only check.  It verifies the nested evaluator/Gate hashes
+    and their declared bindings; it does not reload source commits or turn a
+    receipt into live authority.
+    """
+
+    if value.get("schema_version") != "stage3-g36-publication-v1":
+        raise ValueError("STAGE3_G36_PUBLICATION_SCHEMA_UNSUPPORTED")
+    if value.get("scope") != "formal":
+        raise ValueError("STAGE3_G36_PUBLICATION_SCOPE_INVALID")
+    status = value.get("status")
+    if status not in {"PASS", "BLOCKED"}:
+        raise ValueError("STAGE3_G36_PUBLICATION_STATUS_INVALID")
+    if value.get("formal_eligible") is not (status == "PASS"):
+        raise FormalRunRejected("STAGE3_G36_PUBLICATION_ELIGIBILITY_MISMATCH")
+    for field_name in (
+        "config_hash",
+        "frozen_source_table_hash",
+        "formal_plan_hash",
+        "execution_evidence_hash",
+        "provenance_hash",
+        "stage3_scope_decision_hash",
+        "stage3_scope_gate_hash",
+        "evaluation_hash",
+        "g3_6_hash",
+    ):
+        _require_sha256(value[field_name], field_name=field_name)
+    refs = value.get("source_artifact_refs")
+    if not isinstance(refs, list) or not refs or len(set(refs)) != len(refs):
+        raise ValueError("STAGE3_G36_PUBLICATION_SOURCE_REFS_INVALID")
+    if any(
+        not isinstance(item, str)
+        or not item
+        or "?" in item
+        or "://" in item
+        or any(marker in item.casefold() for marker in ("fixture", "synthetic"))
+        for item in refs
+    ):
+        raise ValueError("STAGE3_G36_PUBLICATION_SOURCE_REFS_INVALID")
+    for field_name in (
+        "frozen_source_table_ref",
+        "formal_plan_ref",
+        "execution_evidence_ref",
+        "provenance_ref",
+        "stage3_scope_decision_ref",
+        "stage3_scope_gate_ref",
+        "evaluation_ref",
+        "g3_6_ref",
+    ):
+        ref = value[field_name]
+        if (
+            not isinstance(ref, str)
+            or not ref
+            or "?" in ref
+            or "://" in ref
+            or any(marker in ref.casefold() for marker in ("fixture", "synthetic"))
+        ):
+            raise ValueError(f"STAGE3_G36_PUBLICATION_REF_INVALID:{field_name}")
+    required_refs = {
+        value["frozen_source_table_ref"],
+        value["formal_plan_ref"],
+        value["execution_evidence_ref"],
+        value["provenance_ref"],
+        value["stage3_scope_decision_ref"],
+        value["stage3_scope_gate_ref"],
+        value["evaluation_ref"],
+        value["g3_6_ref"],
+    }
+    if not required_refs.issubset(set(refs)):
+        raise FormalRunRejected("STAGE3_G36_PUBLICATION_OUTPUT_REFS_UNBOUND")
+    reasons = value.get("reasons")
+    if not isinstance(reasons, list) or any(not isinstance(item, str) or not item for item in reasons):
+        raise ValueError("STAGE3_G36_PUBLICATION_REASONS_INVALID")
+    if status == "BLOCKED" and not reasons:
+        raise FormalRunRejected("STAGE3_G36_PUBLICATION_BLOCKED_REASON_REQUIRED")
+    from ..experiments.stage3_gate import Stage3GateEvaluation
+    from .status import GateRecord, GateStatus
+
+    raw_eval = value.get("gate_evaluation")
+    raw_gate = value.get("g3_6_gate")
+    if not isinstance(raw_eval, Mapping) or not isinstance(raw_gate, Mapping):
+        raise TypeError("STAGE3_G36_PUBLICATION_NESTED_OBJECTS_REQUIRED")
+    evaluation = Stage3GateEvaluation.from_mapping(dict(raw_eval))
+    gate = GateRecord.from_mapping(dict(raw_gate))
+    if evaluation.artifact_hash != value["evaluation_hash"]:
+        raise ValueError("STAGE3_G36_PUBLICATION_EVALUATION_HASH_MISMATCH")
+    if gate.artifact_hash != value["g3_6_hash"]:
+        raise ValueError("STAGE3_G36_PUBLICATION_GATE_HASH_MISMATCH")
+    if gate.gate_id != "stage3.G3-6" or gate.status.value != status:
+        raise FormalRunRejected("STAGE3_G36_PUBLICATION_GATE_STATUS_MISMATCH")
+    if evaluation.status != status or evaluation.formal_eligible != (status == "PASS"):
+        raise FormalRunRejected("STAGE3_G36_PUBLICATION_EVALUATION_STATUS_MISMATCH")
+    if (
+        evaluation.execution_evidence_hash != value["execution_evidence_hash"]
+        or evaluation.formal_plan_hash != value["formal_plan_hash"]
+        or evaluation.formal_plan_ref != value["formal_plan_ref"]
+        or evaluation.provenance_hash != value["provenance_hash"]
+        or evaluation.stage3_scope_decision_ref != value["stage3_scope_decision_ref"]
+        or evaluation.stage3_scope_decision_hash != value["stage3_scope_decision_hash"]
+        or evaluation.stage3_scope_gate_ref != value["stage3_scope_gate_ref"]
+        or evaluation.stage3_scope_gate_hash != value["stage3_scope_gate_hash"]
+    ):
+        raise ValueError("STAGE3_G36_PUBLICATION_EVALUATION_BINDING_MISMATCH")
+    if value["provenance_ref"] in evaluation.source_artifact_refs:
+        raise FormalRunRejected("STAGE3_G36_PUBLICATION_PROVENANCE_SELF_BINDING")
+    if not {
+        value["frozen_source_table_ref"],
+        value["evaluation_ref"],
+        value["provenance_ref"],
+        value["formal_plan_ref"],
+    }.issubset(set(gate.evidence_refs)):
+        raise FormalRunRejected("STAGE3_G36_PUBLICATION_GATE_EVIDENCE_UNBOUND")
+    measured = gate.measured
+    if (
+        not isinstance(measured, Mapping)
+        or measured.get("source_table_hash") != value["frozen_source_table_hash"]
+        or measured.get("evaluation_hash") != evaluation.artifact_hash
+    ):
+        raise ValueError("STAGE3_G36_PUBLICATION_GATE_MEASURED_BINDING_MISMATCH")
 
 
 def validate_stage23_artifact(value: Mapping[str, object]) -> object:
@@ -567,6 +950,14 @@ def validate_stage23_artifact(value: Mapping[str, object]) -> object:
         raise ValueError(f"未知 Stage2/3 artifact schema: {schema!r}")
     required = _STAGE23_ARTIFACT_FIELDS[schema]
     allowed_field_sets = (required,)
+    if schema == "stage3-quadrature-recommendation-v1":
+        # Local/legacy fixture recommendations predate the independent Gate
+        # evaluator.  They may omit the two optional bindings, but a
+        # QUALIFIED/formal artifact must carry both and is checked below.
+        allowed_field_sets = (
+            required,
+            required - {"gate_evaluation_hash", "provenance_hash"},
+        )
     if schema == "stage2-reference-sizing-plan-v1":
         legacy = required - {
             "draw_start_position",
@@ -586,6 +977,14 @@ def validate_stage23_artifact(value: Mapping[str, object]) -> object:
     payload = {name: item for name, item in value.items() if name != "artifact_hash"}
     if canonical_json_hash(payload) != supplied:
         raise ValueError(f"{schema} artifact_hash 与完整 wire object 不一致")
+    if schema == "stage3-gate-evaluation-v1":
+        from ..experiments.stage3_gate import Stage3GateEvaluation
+
+        Stage3GateEvaluation.from_mapping(value)
+    if schema == "stage3-finalization-v1":
+        _validate_stage3_finalization_wire(value)
+    if schema == "stage3-g36-publication-v1":
+        _validate_stage3_g36_publication_wire(value)
 
     def string_array(field_name: str, *, allow_empty: bool = True) -> tuple[str, ...]:
         raw = value[field_name]
@@ -1077,6 +1476,12 @@ def validate_stage23_artifact(value: Mapping[str, object]) -> object:
             raise TypeError("thresholds 必须是 object")
         if canonical_json_hash(thresholds) != value["thresholds_hash"]:
             raise ValueError("thresholds_hash 与 thresholds 不一致")
+        for field_name in ("gate_evaluation_hash", "provenance_hash"):
+            if field_name in value and value[field_name] is not None:
+                field_value = value[field_name]
+                if not isinstance(field_value, str):
+                    raise TypeError(f"{field_name} 必须是字符串或缺省")
+                _require_sha256(field_value, field_name=field_name)
 
     if "execution_evidence_hash" in value:
         evidence_hash = value["execution_evidence_hash"]
@@ -1086,7 +1491,12 @@ def validate_stage23_artifact(value: Mapping[str, object]) -> object:
     # formal experiment plan 是运行前的授权输入，不是等待本阶段 Gate 资格化的科学
     # 输出，因此没有 qualification_gate_hash；其 FROZEN/formal_eligible 已在专属
     # 分支中复核。其余带 scope 的 Stage2/3 结果仍执行统一 Gate 边界。
-    if "scope" in value and schema != "stage2-formal-experiment-plan-v1":
+    if "scope" in value and schema not in {
+        "stage2-formal-experiment-plan-v1",
+        "stage3-gate-evaluation-v1",
+        "stage3-finalization-v1",
+        "stage3-g36-publication-v1",
+    }:
         scope = value["scope"]
         if scope not in {"local_fixture", "formal"}:
             raise ValueError("artifact scope 不受支持")
@@ -1112,6 +1522,17 @@ def validate_stage23_artifact(value: Mapping[str, object]) -> object:
         if schema == "stage3-quadrature-recommendation-v1":
             if formal_eligible != (value["status"] == "QUALIFIED"):
                 raise FormalRunRejected("QUADRATURE_QUALIFICATION_STATUS_MISMATCH")
+            if formal_eligible and (
+                not isinstance(value.get("gate_evaluation_hash"), str)
+                or not isinstance(value.get("provenance_hash"), str)
+            ):
+                raise FormalRunRejected(
+                    "FORMAL_RECOMMENDATION_REQUIRES_GATE_EVALUATION_AND_PROVENANCE"
+                )
+            if formal_eligible:
+                raise FormalRunRejected(
+                    "QUALIFIED_RECOMMENDATION_REQUIRES_AUTHORITY_AWARE_VALIDATION"
+                )
 
     from .artifacts import ValidatedArtifact
 

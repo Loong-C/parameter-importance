@@ -9,7 +9,7 @@
     "schema_version": {"const": "stage3-endpoint-capture-v1"},
     "record": {"$ref": "#/$defs/record"},
     "execution_evidence_hash": {"$ref": "#/$defs/hash"},
-    "scope": {"enum": ["local_fixture", "formal"]},
+    "scope": {"enum": ["local_fixture", "pilot", "formal"]},
     "formal_eligible": {"type": "boolean"},
     "qualification_gate_hash": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/hash"}]},
     "artifact_hash": {"$ref": "#/$defs/hash"}
@@ -19,6 +19,10 @@
       "if": {"properties": {"formal_eligible": {"const": true}}, "required": ["formal_eligible"]},
       "then": {"properties": {"scope": {"const": "formal"}, "qualification_gate_hash": {"$ref": "#/$defs/hash"}}},
       "else": {"properties": {"qualification_gate_hash": {"type": "null"}}}
+    },
+    {
+      "if": {"properties": {"scope": {"const": "pilot"}}, "required": ["scope"]},
+      "then": {"properties": {"formal_eligible": {"const": false}}}
     }
   ],
   "$defs": {

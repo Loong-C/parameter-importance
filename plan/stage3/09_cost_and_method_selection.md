@@ -183,7 +183,8 @@
 
 ## Gate 与后续依赖
 
-- 本子任务通过形成 **G3-7 方法选择 gate**。
+- 本子任务只发布成本表与未资格化的 `FORMAL_CANDIDATE`，不在同一 task 内自证 G3-7。
+- 独立 `stage3.09_g3_7_publisher` 必须先重载并验证已提交 candidate、成本表、G3-6 evaluation/Gate、formal plan、execution evidence 与 provenance，再提交 G3-7；只有随后由该真实 Gate 资格化的独立 recommendation commit 才能交给 S3.10/Stage 4。
 - G3-7 要求唯一默认、明确回退、适用边界和 31M 确认同时成立。
 - G3-7 未通过时 Stage 4 不能使用“路径积分数值方案已验证”的表述。
 - 任何 waiver 必须由用户明确决定并写入工作日志，不能由执行脚本自动生成。

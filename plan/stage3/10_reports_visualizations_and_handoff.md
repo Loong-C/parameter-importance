@@ -203,7 +203,8 @@
 
 ## Gate 与后续依赖
 
-- 本子任务通过形成 **G3-8 交付 gate**。
+- 本子任务先发布报告、图表、handoff 与 gate summary 的正式 commits；它不在这些文件尚未提交、编译和同步时自证 G3-8。
+- 独立 G3-8 delivery publisher 必须重载 S3.10 commits、G3-7 authority 和完整 delivery manifest，逐文件核对 CSV/JSON、PNG/SVG、中文报告、Beamer/notes/backup、三层重放、服务器 manifest、Git push 与多端 clean HEAD/sync 证据后，才发布 **G3-8 交付 gate**。
 - 只有 G3-0 至 G3-8 全部通过，才能宣称“第 3 阶段完成”并进入 Stage 4。
 - 若 G3-7 形成的是失败结论，S3.10 仍应完整交付失败报告和重放证据，但不得把 G3-8 标记为 Stage 4 放行。
 - Stage 4 必须读取机器可读 gate，而不是只依赖报告中的文字结论。

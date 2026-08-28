@@ -8,9 +8,32 @@ candidate_rules:
   - gauss_legendre_4
 required_unit_ids:
   - FILL_PATH_UNIT_ID
+unit_strata:
+  FILL_PATH_UNIT_ID:
+    model: 14M
+    stage: early
+    update: FILL_ENDPOINT_ID
+    probe: FILL_PROBE_ID
 thresholds:
-  max_normalized_l1_error: 0.05
+  max_normalized_l1_error: 0.01
+  max_normalized_l2_error: 0.01
+  max_normalized_linf_error: 0.01
   max_completeness_absolute_residual: 0.01
-  min_spearman: 0.95
-  min_topk_overlap: 0.9
+  max_completeness_relative_residual: 0.01
+  max_completeness_l1_scaled_residual: 0.01
+  min_spearman: 0.99
+  min_active_spearman: 0.99
+  min_cosine_similarity: 0.99
+  min_sign_consistency: 0.99
+  min_topk_overlap: 0.95
+  min_topq_overlap: 0.95
+  min_topq_jaccard: 0.95
+  max_layer_quality_tv: 0.01
+  max_module_quality_tv: 0.01
+  max_reference_normalized_l1_error: 0.001
+  completeness_stability_epsilon: 1.0e-12
+  active_set_threshold: 0.0
   max_unique_nodes: 16
+  top_q_values: [0.001, 0.01, 0.05]
+  required_strata: [model, stage, update, probe]
+  require_worst_case: true

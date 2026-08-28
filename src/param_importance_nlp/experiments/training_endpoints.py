@@ -12,6 +12,7 @@ import copy
 from dataclasses import dataclass, replace
 import hashlib
 import json
+import math
 from pathlib import Path
 import re
 from typing import Callable, Mapping, TYPE_CHECKING
@@ -21,6 +22,7 @@ import torch
 
 from ..atomic import atomic_write_json, stable_json_hash
 from ..contracts.jsonio import load_canonical_json
+from ..contracts.immutable import thaw_json_value
 from ..runtime.tensor_bundle import load_tensor_bundle, publish_tensor_bundle
 from ..runtime.training import (
     AttemptCommitEvent,
@@ -202,7 +204,7 @@ def _record_dict(record: EndpointRecord) -> dict[str, object]:
         "full_update_delta_hash": record.full_update_delta_hash,
         "update_sample_ids": list(record.update_sample_ids),
         "replay_verified": record.replay_verified,
-        "metadata": dict(record.metadata),
+        "metadata": thaw_json_value(record.metadata),
         "endpoint_digest": record.digest,
     }
 
@@ -239,6 +241,90 @@ ReplayVerifier = Callable[[EndpointRecord], bool]
 ProbeBufferHash = Callable[[], str]
 
 
+def _tensor_map_l2_norm(values: Mapping[str, torch.Tensor]) -> float:
+    """Return the finite FP64 L2 norm of an update tensor map.
+
+    The optimizer bridge exposes the exact update decomposition on ``StepOutcome``.
+    This helper deliberately only reduces those tensors; it never derives an update
+    from a learning rate and a parameter value.
+    """
+
+    squared = 0.0
+    for tensor in values.values():
+        current = tensor.detach().to(device="cpu", dtype=torch.float64)
+        squared += float(torch.sum(current * current).item())
+    norm = math.sqrt(squared)
+    if not math.isfinite(norm):
+        raise ValueError("ENDPOINT_UPDATE_NORM_NONFINITE")
+    return norm
+
+
+def _gradient_norm(values: Mapping[str, torch.Tensor]) -> float:
+    return _tensor_map_l2_norm(values)
+
+
+def _diagnostics(
+    gradient_event: GradientReadyEvent,
+    outcome: object,
+    *,
+    max_grad_norm: float | None,
+) -> dict[str, object]:
+    """Materialize true per-step diagnostics from the engine transition event."""
+
+    raw = _gradient_norm(gradient_event.mean_gradient)
+    applied = _gradient_norm(gradient_event.optimizer_gradient)
+    if max_grad_norm is not None and raw > 0:
+        clip_factor = min(1.0, max_grad_norm / (raw + 1e-12))
+    elif raw > 0:
+        # This branch is only for custom engines which do not expose a max norm.
+        # The ratio is still measured from the actual applied tensors.
+        clip_factor = applied / raw
+    else:
+        clip_factor = 1.0
+    # ``StepOutcome`` is intentionally duck-typed here to avoid importing the
+    # optimizer implementation into the persistence layer.  The training engine
+    # always supplies this concrete contract on ``ParameterPostEvent``.
+    if not hasattr(outcome, "total_delta"):
+        raise TypeError("ENDPOINT_STEP_OUTCOME_MISSING")
+    total_hash = _tensor_map_hash(outcome.total_delta)
+    data_hash = _tensor_map_hash(outcome.data_delta)
+    decay_hash = _tensor_map_hash(outcome.weight_decay_delta)
+    learning_rates = {
+        str(name): float(rate) for name, rate in sorted(outcome.learning_rates.items())
+    }
+    learning_rate_identity = stable_json_hash({"learning_rates": learning_rates})
+    total_norm = _tensor_map_l2_norm(outcome.total_delta)
+    data_norm = _tensor_map_l2_norm(outcome.data_delta)
+    decay_norm = _tensor_map_l2_norm(outcome.weight_decay_delta)
+    diagnostics: dict[str, object] = {
+        "raw_gradient_norm": raw,
+        "raw_global_gradient_norm": raw,
+        "global_gradient_norm": raw,
+        "applied_optimizer_gradient_norm": applied,
+        "applied_gradient_norm": applied,
+        "optimizer_gradient_l2_norm": applied,
+        "optimizer_gradient_norm": applied,
+        "clip_factor": float(clip_factor),
+        "total_update_l2_norm": total_norm,
+        "data_update_l2_norm": data_norm,
+        "decay_update_l2_norm": decay_norm,
+        "weight_decay_update_l2_norm": decay_norm,
+        "total_update_delta_hash": total_hash,
+        "total_delta_hash": total_hash,
+        "data_update_delta_hash": data_hash,
+        "data_delta_hash": data_hash,
+        "decay_update_delta_hash": decay_hash,
+        "weight_decay_delta_hash": decay_hash,
+        "decay_delta_hash": decay_hash,
+        "full_update_delta_hash": total_hash,
+        "learning_rates": learning_rates,
+        "learning_rate_identity": learning_rate_identity,
+        "learning_rate_hash": learning_rate_identity,
+        "optimizer_step_called": bool(outcome.optimizer_step_called),
+    }
+    return diagnostics
+
+
 class TrainingEndpointObserver(TrainingStepObserver):
     """按选定成功 step 捕获 endpoint，并发布 replay-verified bundle。
 
@@ -263,11 +349,14 @@ class TrainingEndpointObserver(TrainingStepObserver):
         scope: str = "local_fixture",
         formal_eligible: bool = False,
         qualification_evidence_hash: str | None = None,
+        endpoint_metadata: Mapping[int, Mapping[str, object]] | None = None,
+        metadata_by_step: Mapping[int, Mapping[str, object]] | None = None,
+        step_metadata: Mapping[int, Mapping[str, object]] | None = None,
     ) -> None:
         _safe_id(source_run_id)
         if len(parameter_registry_hash) != 64:
             raise ValueError("ENDPOINT_REGISTRY_HASH_INVALID")
-        if scope not in {"local_fixture", "formal"}:
+        if scope not in {"local_fixture", "pilot", "formal"}:
             raise ValueError("ENDPOINT_SCOPE_INVALID")
         if type(formal_eligible) is not bool:
             raise TypeError("ENDPOINT_FORMAL_ELIGIBILITY_NOT_BOOL")
@@ -275,6 +364,8 @@ class TrainingEndpointObserver(TrainingStepObserver):
         # 冒充 formal。训练 task 的正式 capture plan 会要求此值为 true。
         if formal_eligible and scope != "formal":
             raise ValueError("ENDPOINT_FORMAL_ELIGIBILITY_SCOPE_MISMATCH")
+        if scope == "pilot" and formal_eligible:
+            raise ValueError("PILOT_ENDPOINT_CANNOT_BE_FORMAL_ELIGIBLE")
         if formal_eligible and (
             not isinstance(qualification_evidence_hash, str)
             or not re.fullmatch(r"[0-9a-f]{64}", qualification_evidence_hash)
@@ -287,18 +378,53 @@ class TrainingEndpointObserver(TrainingStepObserver):
             for step in selected_steps
         ):
             raise ValueError("ENDPOINT_SELECTED_STEPS_INVALID")
+        selected_steps = frozenset(selected_steps)
+        supplied_metadata = [
+            item for item in (endpoint_metadata, metadata_by_step, step_metadata)
+            if item is not None
+        ]
+        if supplied_metadata and any(dict(item) != dict(supplied_metadata[0]) for item in supplied_metadata[1:]):
+            raise ValueError("ENDPOINT_METADATA_ARGUMENTS_CONFLICT")
+        metadata_by_step = supplied_metadata[0] if supplied_metadata else None
+        normalized_metadata: dict[int, dict[str, object]] | None = None
+        if metadata_by_step is not None:
+            normalized_metadata = {}
+            for raw_step, raw_metadata in metadata_by_step.items():
+                if isinstance(raw_step, bool) or not isinstance(raw_step, int) or raw_step <= 0:
+                    raise ValueError("ENDPOINT_METADATA_STEP_INVALID")
+                if not isinstance(raw_metadata, Mapping):
+                    raise TypeError("ENDPOINT_METADATA_ENTRY_INVALID")
+                if set(raw_metadata) != {"model", "seed", "stage"}:
+                    raise ValueError("ENDPOINT_METADATA_FIELDS_MISMATCH")
+                model = raw_metadata["model"]
+                seed = raw_metadata["seed"]
+                stage = raw_metadata["stage"]
+                if model not in {"14M", "31M"}:
+                    raise ValueError("ENDPOINT_METADATA_MODEL_INVALID")
+                if isinstance(seed, bool) or not isinstance(seed, int) or seed < 0:
+                    raise ValueError("ENDPOINT_METADATA_SEED_INVALID")
+                if stage not in {"early", "middle", "late"}:
+                    raise ValueError("ENDPOINT_METADATA_STAGE_INVALID")
+                normalized_metadata[raw_step] = {
+                    "model": model,
+                    "seed": seed,
+                    "stage": stage,
+                }
+            if set(normalized_metadata) != set(selected_steps):
+                raise ValueError("ENDPOINT_METADATA_PLAN_COVERAGE_DRIFT")
         callbacks = (state_capture, replay_verifier, probe_buffer_hash)
         if any(item is None for item in callbacks) and any(item is not None for item in callbacks):
             raise ValueError("ENDPOINT_CALLBACK_SET_INCOMPLETE")
         self.source_run_id = source_run_id
         self.parameter_registry_hash = parameter_registry_hash
-        self.selected_steps = frozenset(selected_steps)
+        self.selected_steps = selected_steps
         self.state_capture = state_capture
         self.replay_verifier = replay_verifier
         self.probe_buffer_hash = probe_buffer_hash
         self.scope = scope
         self.formal_eligible = formal_eligible
         self.qualification_evidence_hash = qualification_evidence_hash
+        self.endpoint_metadata = normalized_metadata
         self.root = Path(output_root).resolve()
         self.workspace_root = (
             None if workspace_root is None else Path(workspace_root).resolve()
@@ -321,6 +447,7 @@ class TrainingEndpointObserver(TrainingStepObserver):
         self._pre: EndpointState | None = None
         self._post: EndpointState | None = None
         self._delta_hash: str | None = None
+        self._step_diagnostics: dict[str, object] | None = None
         self._bundles: list[EndpointBundle] = []
         self._captured_steps: set[int] = set()
         self._discover_existing()
@@ -424,6 +551,13 @@ class TrainingEndpointObserver(TrainingStepObserver):
         if self._gradient_event is not None:
             raise RuntimeError("ENDPOINT_CAPTURE_OVERLAPPING_ATTEMPT")
         self._gradient_event = event
+        if self.endpoint_metadata is not None and target_step not in self.endpoint_metadata:
+            raise RuntimeError("ENDPOINT_METADATA_PLAN_COVERAGE_DRIFT")
+        max_grad_norm: float | None = None
+        if self._engine is not None:
+            candidate = getattr(self._engine.spec, "max_grad_norm", None)
+            if isinstance(candidate, (int, float)) and not isinstance(candidate, bool):
+                max_grad_norm = float(candidate)
         self._active_endpoint_id = _safe_id(
             f"{self.source_run_id}-step-{target_step:08d}"
         )
@@ -441,6 +575,16 @@ class TrainingEndpointObserver(TrainingStepObserver):
             event.transaction.attempt_index,
         )
         self._delta_hash = _tensor_map_hash(event.outcome.total_delta)
+        max_grad_norm: float | None = None
+        if self._engine is not None:
+            candidate = getattr(self._engine.spec, "max_grad_norm", None)
+            if isinstance(candidate, (int, float)) and not isinstance(candidate, bool):
+                max_grad_norm = float(candidate)
+        self._step_diagnostics = _diagnostics(
+            self._gradient_event,
+            event.outcome,
+            max_grad_norm=max_grad_norm,
+        )
 
     def on_attempt_commit(self, event: AttemptCommitEvent) -> None:
         if self._gradient_event is None:
@@ -455,6 +599,17 @@ class TrainingEndpointObserver(TrainingStepObserver):
         if self._active_endpoint_id is None:
             raise RuntimeError("ENDPOINT_ACTIVE_ID_MISSING")
         endpoint_id = self._active_endpoint_id
+        endpoint_metadata = {}
+        if self.endpoint_metadata is not None:
+            planned = self.endpoint_metadata.get(event.transaction.global_step + 1)
+            if planned is None:
+                raise RuntimeError("ENDPOINT_METADATA_PLAN_COVERAGE_DRIFT")
+            endpoint_metadata.update(planned)
+        if self._step_diagnostics is not None:
+            endpoint_metadata["step_diagnostics"] = dict(self._step_diagnostics)
+            # Keep the key diagnostics available to consumers that predate the
+            # nested diagnostics envelope.  Both views are derived from StepOutcome.
+            endpoint_metadata.update(self._step_diagnostics)
         provisional = EndpointRecord(
             path_state_id=endpoint_id,
             source_run_id=self.source_run_id,
@@ -469,6 +624,7 @@ class TrainingEndpointObserver(TrainingStepObserver):
             update_sample_ids=self._gradient_event.sample_ids,
             replay_verified=False,
             metadata={
+                **endpoint_metadata,
                 "attempt_index": event.transaction.attempt_index,
                 "microbatch_ids": list(self._gradient_event.microbatch_ids),
             },
@@ -498,6 +654,7 @@ class TrainingEndpointObserver(TrainingStepObserver):
         self._pre = None
         self._post = None
         self._delta_hash = None
+        self._step_diagnostics = None
         self._active_endpoint_id = None
         self._state_bundle_refs = {}
 

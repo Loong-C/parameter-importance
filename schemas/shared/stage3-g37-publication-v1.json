@@ -1,0 +1,98 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://parameter-importance.invalid/schemas/shared/stage3-g37-publication-v1.json",
+  "title": "Independent Stage 3 G3-7 publication receipt",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version", "publication_id", "task_id", "config_hash", "input_config_hash",
+    "input_config_hashes", "publication_config_hash",
+    "status", "scope", "formal_eligible",
+    "frozen_source_table_ref", "frozen_source_table_hash",
+    "cost_accuracy_table_ref", "cost_accuracy_table_hash",
+    "quadrature_decision_ref", "quadrature_decision_hash",
+    "formal_plan_ref", "formal_plan_hash",
+    "execution_evidence_ref", "execution_evidence_hash",
+    "provenance_ref", "provenance_hash",
+    "evaluation_ref", "evaluation_hash", "g3_6_ref", "g3_6_hash",
+    "g3_7_ref", "g3_7_hash",
+    "recommendation_ref", "recommendation_hash", "finalization_ref", "finalization_hash",
+    "candidate_recommendation", "recommendation", "finalization",
+    "gate_evaluation", "g3_6_gate", "g3_7_gate",
+    "source_artifact_refs", "reasons", "artifact_hash"
+  ],
+  "properties": {
+    "schema_version": {"const": "stage3-g37-publication-v1"},
+    "publication_id": {"$ref": "#/$defs/id"},
+    "task_id": {"$ref": "#/$defs/id"},
+    "config_hash": {"$ref": "#/$defs/hash"},
+    "input_config_hash": {"$ref": "#/$defs/hash"},
+    "input_config_hashes": {
+      "type": "object",
+      "minProperties": 8,
+      "additionalProperties": {"$ref": "#/$defs/hash"}
+    },
+    "publication_config_hash": {"$ref": "#/$defs/hash"},
+    "status": {"enum": ["PASS", "BLOCKED"]},
+    "scope": {"const": "formal"},
+    "formal_eligible": {"type": "boolean"},
+    "frozen_source_table_ref": {"$ref": "#/$defs/ref"},
+    "frozen_source_table_hash": {"$ref": "#/$defs/hash"},
+    "cost_accuracy_table_ref": {"$ref": "#/$defs/ref"},
+    "cost_accuracy_table_hash": {"$ref": "#/$defs/hash"},
+    "quadrature_decision_ref": {"$ref": "#/$defs/ref"},
+    "quadrature_decision_hash": {"$ref": "#/$defs/hash"},
+    "formal_plan_ref": {"$ref": "#/$defs/ref"},
+    "formal_plan_hash": {"$ref": "#/$defs/hash"},
+    "execution_evidence_ref": {"$ref": "#/$defs/ref"},
+    "execution_evidence_hash": {"$ref": "#/$defs/hash"},
+    "provenance_ref": {"$ref": "#/$defs/ref"},
+    "provenance_hash": {"$ref": "#/$defs/hash"},
+    "evaluation_ref": {"$ref": "#/$defs/ref"},
+    "evaluation_hash": {"$ref": "#/$defs/hash"},
+    "g3_6_ref": {"$ref": "#/$defs/ref"},
+    "g3_6_hash": {"$ref": "#/$defs/hash"},
+    "g3_7_ref": {"$ref": "#/$defs/ref"},
+    "g3_7_hash": {"$ref": "#/$defs/hash"},
+    "recommendation_ref": {"oneOf": [{"$ref": "#/$defs/ref"}, {"type": "null"}]},
+    "recommendation_hash": {"oneOf": [{"$ref": "#/$defs/hash"}, {"type": "null"}]},
+    "finalization_ref": {"oneOf": [{"$ref": "#/$defs/ref"}, {"type": "null"}]},
+    "finalization_hash": {"oneOf": [{"$ref": "#/$defs/hash"}, {"type": "null"}]},
+    "candidate_recommendation": {"$ref": "#/$defs/object"},
+    "recommendation": {"oneOf": [{"$ref": "#/$defs/object"}, {"type": "null"}]},
+    "finalization": {"oneOf": [{"$ref": "#/$defs/object"}, {"type": "null"}]},
+    "gate_evaluation": {"$ref": "#/$defs/object"},
+    "g3_6_gate": {"$ref": "#/$defs/object"},
+    "g3_7_gate": {"$ref": "#/$defs/object"},
+    "source_artifact_refs": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"$ref": "#/$defs/ref"}},
+    "reasons": {"type": "array", "items": {"type": "string", "minLength": 1}},
+    "artifact_hash": {"$ref": "#/$defs/hash"}
+  },
+  "allOf": [
+    {
+      "if": {"properties": {"status": {"const": "PASS"}}, "required": ["status"]},
+      "then": {
+        "properties": {
+          "formal_eligible": {"const": true},
+          "reasons": {"maxItems": 0},
+          "recommendation": {"type": "object"},
+          "finalization": {"type": "object"},
+          "recommendation_ref": {"type": "string"},
+          "recommendation_hash": {"$ref": "#/$defs/hash"},
+          "finalization_ref": {"type": "string"},
+          "finalization_hash": {"$ref": "#/$defs/hash"},
+          "g3_7_gate": {"properties": {"gate_id": {"const": "stage3.G3-7"}, "status": {"const": "PASS"}}}
+        }
+      },
+      "else": {
+        "properties": {"formal_eligible": {"const": false}, "reasons": {"minItems": 1}}
+      }
+    }
+  ],
+  "$defs": {
+    "id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,159}$"},
+    "hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "ref": {"type": "string", "minLength": 1, "maxLength": 4096, "pattern": "^(?!.*[?])(?!.*://)(?!.*fixture)(?!.*synthetic).+$"},
+    "object": {"type": "object"}
+  }
+}

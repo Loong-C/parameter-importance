@@ -1,0 +1,51 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://parameter-importance.invalid/schemas/shared/stage3-trajectory-completion-receipt-v1.json",
+  "title": "Stage 3 real endpoint trajectory completion receipt v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version", "receipt_id", "task_id", "config_hash", "purpose_scope",
+    "formal_eligible", "capture_plan_ref", "capture_plan_hash", "training_run_id",
+    "selected_steps", "endpoint_commit_refs", "endpoint_digests", "replay_verified_steps",
+    "estimator_authority_ref", "formal_execution_ref", "g30_scope_decision_ref",
+    "g30_gate_hash", "g31_gate_hash", "artifact_hash"
+  ],
+  "properties": {
+    "schema_version": {"const": "stage3-trajectory-completion-receipt-v1"},
+    "receipt_id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,159}$"},
+    "task_id": {"const": "stage3.03_endpoint_and_probe_pipeline"},
+    "config_hash": {"$ref": "#/$defs/hash"},
+    "purpose_scope": {"enum": ["pilot", "formal"]},
+    "formal_eligible": {"type": "boolean"},
+    "capture_plan_ref": {"type": "string", "minLength": 1},
+    "capture_plan_hash": {"$ref": "#/$defs/hash"},
+    "training_run_id": {"type": "string", "minLength": 1},
+    "selected_steps": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"type": "integer", "minimum": 1}},
+    "endpoint_commit_refs": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"type": "string", "minLength": 1}},
+    "endpoint_digests": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"$ref": "#/$defs/hash"}},
+    "replay_verified_steps": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"type": "integer", "minimum": 1}},
+    "estimator_authority_ref": {"type": "string", "minLength": 1},
+    "formal_execution_ref": {"oneOf": [{"type": "null"}, {"type": "string", "minLength": 1}]},
+    "g30_scope_decision_ref": {"oneOf": [{"type": "null"}, {"type": "string", "minLength": 1}]},
+    "g30_gate_hash": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/hash"}]},
+    "g31_gate_hash": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/hash"}]},
+    "artifact_hash": {"$ref": "#/$defs/hash"}
+  },
+  "allOf": [
+    {
+      "if": {"properties": {"purpose_scope": {"const": "formal"}}, "required": ["purpose_scope"]},
+      "then": {
+        "properties": {
+          "formal_eligible": {"const": true},
+          "formal_execution_ref": {"type": "string"},
+          "g30_scope_decision_ref": {"type": "string"},
+          "g30_gate_hash": {"$ref": "#/$defs/hash"},
+          "g31_gate_hash": {"$ref": "#/$defs/hash"}
+        }
+      },
+      "else": {"properties": {"formal_eligible": {"const": false}}}
+    }
+  ],
+  "$defs": {"hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"}}
+}

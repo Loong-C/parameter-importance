@@ -1,0 +1,56 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://parameter-importance.invalid/schemas/shared/stage3-g38-publication-v1.json",
+  "title": "Independent Stage 3 G3-8 delivery acceptance receipt",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version", "publication_id", "task_id", "config_hash", "input_config_hash", "publication_config_hash",
+    "execution_evidence_ref", "execution_evidence_hash", "g3_7_publication_ref", "g3_7_publication_hash",
+    "status", "scope", "formal_eligible", "gate_refs", "gate_hashes", "input_config_hashes", "stage3_10_refs",
+    "stage3_10_hashes", "recommendation_ref", "recommendation_hash", "finalization_ref",
+    "finalization_hash", "delivery_manifest_ref", "delivery_manifest_hash", "g3_8_ref",
+    "g3_8_hash", "g3_8_gate", "source_artifact_refs", "reasons", "artifact_hash"
+  ],
+  "properties": {
+    "schema_version": {"const": "stage3-g38-publication-v1"},
+    "publication_id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,159}$"},
+    "task_id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,159}$"},
+    "config_hash": {"$ref": "#/$defs/hash"},
+    "input_config_hash": {"$ref": "#/$defs/hash"},
+    "publication_config_hash": {"$ref": "#/$defs/hash"},
+    "execution_evidence_ref": {"$ref": "#/$defs/ref"},
+    "execution_evidence_hash": {"$ref": "#/$defs/hash"},
+    "g3_7_publication_ref": {"$ref": "#/$defs/ref"},
+    "g3_7_publication_hash": {"$ref": "#/$defs/hash"},
+    "status": {"enum": ["PASS", "BLOCKED"]},
+    "scope": {"const": "formal"},
+    "formal_eligible": {"type": "boolean"},
+    "gate_refs": {"$ref": "#/$defs/ref_map"},
+    "gate_hashes": {"$ref": "#/$defs/hash_map"},
+    "input_config_hashes": {"$ref": "#/$defs/hash_map"},
+    "stage3_10_refs": {"$ref": "#/$defs/ref_map"},
+    "stage3_10_hashes": {"$ref": "#/$defs/hash_map"},
+    "recommendation_ref": {"$ref": "#/$defs/ref"},
+    "recommendation_hash": {"$ref": "#/$defs/hash"},
+    "finalization_ref": {"$ref": "#/$defs/ref"},
+    "finalization_hash": {"$ref": "#/$defs/hash"},
+    "delivery_manifest_ref": {"$ref": "#/$defs/ref"},
+    "delivery_manifest_hash": {"$ref": "#/$defs/hash"},
+    "g3_8_ref": {"$ref": "#/$defs/ref"},
+    "g3_8_hash": {"$ref": "#/$defs/hash"},
+    "g3_8_gate": {"type": "object", "required": ["gate_id", "stage", "status", "artifact_hash"], "properties": {"gate_id": {"const": "stage3.G3-8"}, "stage": {"const": 3}, "status": {"enum": ["PASS", "BLOCKED"]}, "artifact_hash": {"$ref": "#/$defs/hash"}}},
+    "source_artifact_refs": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"$ref": "#/$defs/ref"}},
+    "reasons": {"type": "array", "items": {"type": "string", "minLength": 1}},
+    "artifact_hash": {"$ref": "#/$defs/hash"}
+  },
+  "allOf": [
+    {"if": {"properties": {"status": {"const": "PASS"}}, "required": ["status"]}, "then": {"properties": {"formal_eligible": {"const": true}, "reasons": {"maxItems": 0}}}, "else": {"properties": {"formal_eligible": {"const": false}, "reasons": {"minItems": 1}}}}
+  ],
+  "$defs": {
+    "hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "ref": {"type": "string", "minLength": 1, "pattern": "^(?!.*[?])(?!.*://)(?!.*fixture)(?!.*synthetic).+$"},
+    "ref_map": {"type": "object", "minProperties": 1, "additionalProperties": {"$ref": "#/$defs/ref"}},
+    "hash_map": {"type": "object", "minProperties": 1, "additionalProperties": {"$ref": "#/$defs/hash"}}
+  }
+}

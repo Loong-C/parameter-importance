@@ -1,0 +1,70 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://parameter-importance.invalid/schemas/shared/stage3-finalization-v1.json",
+  "title": "Stage 3 formal G3-6/G3-7 finalization",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version", "finalization_id", "status", "scope", "formal_eligible",
+    "execution_evidence_hash", "frozen_table_ref", "frozen_table_hash",
+    "formal_plan_ref", "formal_plan_hash", "evaluation_ref", "evaluation_hash",
+    "provenance_ref", "provenance_hash", "recommendation_ref", "g3_6_ref", "g3_7_ref", "recommendation",
+    "candidate_recommendation", "gate_evaluation", "prerequisite_gates", "g3_6_gate",
+    "g3_7_gate", "method_selection", "source_artifact_refs", "reasons", "checked_at",
+    "artifact_hash"
+  ],
+  "properties": {
+    "schema_version": {"const": "stage3-finalization-v1"},
+    "finalization_id": {"$ref": "stage3-quadrature-recommendation-v1.json#/$defs/id"},
+    "status": {"enum": ["PASS", "BLOCKED"]},
+    "scope": {"const": "formal"},
+    "formal_eligible": {"type": "boolean"},
+    "execution_evidence_hash": {"$ref": "stage3-quadrature-recommendation-v1.json#/$defs/hash"},
+    "frozen_table_ref": {"type": ["string", "null"], "minLength": 1},
+    "frozen_table_hash": {"oneOf": [{"$ref": "stage3-quadrature-recommendation-v1.json#/$defs/hash"}, {"type": "null"}]},
+    "formal_plan_ref": {"type": ["string", "null"], "minLength": 1},
+    "formal_plan_hash": {"oneOf": [{"$ref": "stage3-quadrature-recommendation-v1.json#/$defs/hash"}, {"type": "null"}]},
+    "evaluation_ref": {"type": ["string", "null"], "minLength": 1},
+    "evaluation_hash": {"oneOf": [{"$ref": "stage3-quadrature-recommendation-v1.json#/$defs/hash"}, {"type": "null"}]},
+    "provenance_ref": {"type": ["string", "null"], "minLength": 1},
+    "provenance_hash": {"oneOf": [{"$ref": "stage3-quadrature-recommendation-v1.json#/$defs/hash"}, {"type": "null"}]},
+    "recommendation_ref": {"type": ["string", "null"], "minLength": 1},
+    "g3_6_ref": {"type": ["string", "null"], "minLength": 1},
+    "g3_7_ref": {"type": ["string", "null"], "minLength": 1},
+    "recommendation": {"oneOf": [{"$ref": "stage3-quadrature-recommendation-v1.json"}, {"type": "null"}]},
+    "candidate_recommendation": {"oneOf": [{"$ref": "stage3-quadrature-recommendation-v1.json"}, {"type": "null"}]},
+    "gate_evaluation": {"oneOf": [{"$ref": "stage3-gate-evaluation-v1.json"}, {"type": "null"}]},
+    "prerequisite_gates": {"type": "array", "items": {"$ref": "gate-record-v1.json"}},
+    "g3_6_gate": {"oneOf": [{"$ref": "gate-record-v1.json"}, {"type": "null"}]},
+    "g3_7_gate": {"oneOf": [{"$ref": "gate-record-v1.json"}, {"type": "null"}]},
+    "method_selection": {"oneOf": [{"type": "object"}, {"type": "null"}]},
+    "source_artifact_refs": {"type": "array", "uniqueItems": true, "items": {"type": "string", "minLength": 1}},
+    "reasons": {"type": "array", "items": {"type": "string", "minLength": 1}},
+    "checked_at": {"type": ["string", "null"]},
+    "artifact_hash": {"$ref": "stage3-quadrature-recommendation-v1.json#/$defs/hash"}
+  },
+  "allOf": [
+    {
+      "if": {"properties": {"status": {"const": "PASS"}}, "required": ["status"]},
+      "then": {
+        "properties": {
+          "formal_eligible": {"const": true},
+          "execution_evidence_hash": {"$ref": "stage3-quadrature-recommendation-v1.json#/$defs/hash"},
+          "frozen_table_ref": {"type": "string", "minLength": 1},
+          "frozen_table_hash": {"$ref": "stage3-quadrature-recommendation-v1.json#/$defs/hash"},
+          "formal_plan_ref": {"type": "string", "minLength": 1},
+          "formal_plan_hash": {"$ref": "stage3-quadrature-recommendation-v1.json#/$defs/hash"},
+          "evaluation_ref": {"type": "string", "minLength": 1},
+          "evaluation_hash": {"$ref": "stage3-quadrature-recommendation-v1.json#/$defs/hash"},
+          "provenance_ref": {"type": "string", "minLength": 1},
+          "provenance_hash": {"$ref": "stage3-quadrature-recommendation-v1.json#/$defs/hash"},
+          "recommendation_ref": {"type": "string", "minLength": 1},
+          "g3_6_ref": {"type": "string", "minLength": 1},
+          "g3_7_ref": {"type": "string", "minLength": 1}
+        },
+        "required": ["execution_evidence_hash", "frozen_table_ref", "frozen_table_hash", "formal_plan_ref", "formal_plan_hash", "evaluation_ref", "evaluation_hash", "provenance_ref", "provenance_hash", "recommendation_ref", "g3_6_ref", "g3_7_ref", "recommendation", "candidate_recommendation", "gate_evaluation", "g3_6_gate", "g3_7_gate", "method_selection"]
+      },
+      "else": {"properties": {"formal_eligible": {"const": false}}}
+    }
+  ]
+}

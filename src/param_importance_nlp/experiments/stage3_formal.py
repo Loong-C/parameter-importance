@@ -39,7 +39,7 @@ from param_importance_nlp.contracts.stage23 import (
     FormalExecutionEvidence,
     require_accepted_gate,
 )
-from param_importance_nlp.contracts.status import GateRecord
+from param_importance_nlp.contracts.status import GateRecord, GateStatus
 from param_importance_nlp.runtime.tensor_bundle import (
     load_tensor_bundle,
     publish_tensor_bundle,
@@ -900,6 +900,185 @@ def _rule_hash(rule: object) -> str:
     return _require_sha256(value, field_name="rule.artifact_hash")
 
 
+@dataclass(frozen=True, slots=True)
+class FormalReferenceBinding:
+    """Immutable contract identity for a formal cross-family reference.
+
+    The contribution vector is only one part of a reference.  The formal plan,
+    threshold contract, tolerance and complete family ladders determine which
+    numerical object was measured and at what cost.  Keeping this identity in
+    a small standalone value object lets the producer and every consumer use
+    exactly the same canonical hash without changing the legacy fixture result
+    wire.
+    """
+
+    formal_plan_ref: str
+    formal_plan_hash: str
+    thresholds_hash: str
+    reference_tolerance: float
+    reference_ladder_hash: str
+    reference_ladder_levels: Mapping[str, Sequence[int]]
+    reference_ladder_nodes: Mapping[str, Sequence[int]]
+    required_consecutive: int = 2
+    primary_family: str = "gauss_legendre"
+    schema_version: str = "stage3-formal-reference-binding-v1"
+
+    def __post_init__(self) -> None:
+        if self.schema_version != "stage3-formal-reference-binding-v1":
+            raise ValueError("不支持的 FormalReferenceBinding schema")
+        if (
+            not isinstance(self.formal_plan_ref, str)
+            or not self.formal_plan_ref
+            or "?" in self.formal_plan_ref
+            or "://" in self.formal_plan_ref
+        ):
+            raise ValueError("formal_plan_ref 必须是非空稳定 artifact ref")
+        if any(
+            marker in self.formal_plan_ref.casefold()
+            for marker in ("fixture", "synthetic")
+        ):
+            raise FormalRunRejected("FORMAL_REFERENCE_PLAN_REF_FORBIDS_FIXTURE_LABEL")
+        for name, value in (
+            ("formal_plan_hash", self.formal_plan_hash),
+            ("thresholds_hash", self.thresholds_hash),
+            ("reference_ladder_hash", self.reference_ladder_hash),
+        ):
+            _require_sha256(value, field_name=name)
+        if not math.isfinite(float(self.reference_tolerance)) or self.reference_tolerance <= 0:
+            raise ValueError("reference_tolerance 必须是有限正数")
+        if (
+            isinstance(self.required_consecutive, bool)
+            or not isinstance(self.required_consecutive, int)
+            or self.required_consecutive != 2
+        ):
+            raise ValueError("formal reference required_consecutive 必须固定为 2")
+        families = ("gauss_legendre", "composite_simpson")
+        _require_identifier(self.primary_family, field_name="primary_family")
+        if self.primary_family not in families:
+            raise ValueError("primary_family 必须是冻结 reference family")
+
+        def normalize(
+            value: Mapping[str, Sequence[int]],
+            *,
+            field_name: str,
+        ) -> Mapping[str, tuple[int, ...]]:
+            if not isinstance(value, Mapping) or set(value) != set(families):
+                raise ValueError(
+                    f"{field_name} 必须精确覆盖 gauss_legendre/composite_simpson"
+                )
+            result: dict[str, tuple[int, ...]] = {}
+            for family in families:
+                raw = value[family]
+                if (
+                    not isinstance(raw, (list, tuple))
+                    or len(raw) < 2
+                    or any(
+                        isinstance(item, bool)
+                        or not isinstance(item, int)
+                        or item <= 0
+                        for item in raw
+                    )
+                    or tuple(raw) != tuple(sorted(set(raw)))
+                ):
+                    raise ValueError(
+                        f"{field_name}.{family} 必须是严格递增的至少两个正整数"
+                    )
+                result[family] = tuple(raw)
+            return MappingProxyType(result)
+
+        object.__setattr__(
+            self,
+            "reference_ladder_levels",
+            normalize(self.reference_ladder_levels, field_name="reference_ladder_levels"),
+        )
+        object.__setattr__(
+            self,
+            "reference_ladder_nodes",
+            normalize(self.reference_ladder_nodes, field_name="reference_ladder_nodes"),
+        )
+
+    def payload_dict(self) -> dict[str, object]:
+        return {
+            "schema_version": self.schema_version,
+            "formal_plan_ref": self.formal_plan_ref,
+            "formal_plan_hash": self.formal_plan_hash,
+            "thresholds_hash": self.thresholds_hash,
+            "reference_tolerance": float(self.reference_tolerance),
+            "reference_ladder_hash": self.reference_ladder_hash,
+            "reference_ladder_levels": {
+                family: list(values)
+                for family, values in sorted(self.reference_ladder_levels.items())
+            },
+            "reference_ladder_nodes": {
+                family: list(values)
+                for family, values in sorted(self.reference_ladder_nodes.items())
+            },
+            "required_consecutive": self.required_consecutive,
+            "primary_family": self.primary_family,
+        }
+
+    @property
+    def artifact_hash(self) -> str:
+        return canonical_json_hash(self.payload_dict())
+
+    @property
+    def binding_hash(self) -> str:
+        """Hash of the flattened identity embedded in path reference output."""
+
+        return canonical_json_hash(
+            {
+                key: value
+                for key, value in self.payload_dict().items()
+                if key != "schema_version"
+            }
+        )
+
+    def to_dict(self) -> dict[str, object]:
+        return self.payload_dict() | {"artifact_hash": self.artifact_hash}
+
+    def artifact_fields(self) -> dict[str, object]:
+        """Return the flattened fields embedded in the outer reference artifact."""
+
+        return {
+            key: value
+            for key, value in self.payload_dict().items()
+            if key != "schema_version"
+        } | {"reference_binding_hash": self.binding_hash}
+
+    @classmethod
+    def from_mapping(cls, value: Mapping[str, object]) -> "FormalReferenceBinding":
+        expected = {
+            "schema_version",
+            "formal_plan_ref",
+            "formal_plan_hash",
+            "thresholds_hash",
+            "reference_tolerance",
+            "reference_ladder_hash",
+            "reference_ladder_levels",
+            "reference_ladder_nodes",
+            "required_consecutive",
+            "primary_family",
+            "artifact_hash",
+        }
+        if set(value) != expected:
+            raise ValueError("FormalReferenceBinding 字段集合不匹配")
+        binding = cls(
+            formal_plan_ref=value["formal_plan_ref"],  # type: ignore[arg-type]
+            formal_plan_hash=value["formal_plan_hash"],  # type: ignore[arg-type]
+            thresholds_hash=value["thresholds_hash"],  # type: ignore[arg-type]
+            reference_tolerance=float(value["reference_tolerance"]),
+            reference_ladder_hash=value["reference_ladder_hash"],  # type: ignore[arg-type]
+            reference_ladder_levels=value["reference_ladder_levels"],  # type: ignore[arg-type]
+            reference_ladder_nodes=value["reference_ladder_nodes"],  # type: ignore[arg-type]
+            required_consecutive=value["required_consecutive"],  # type: ignore[arg-type]
+            primary_family=value["primary_family"],  # type: ignore[arg-type]
+            schema_version=value["schema_version"],  # type: ignore[arg-type]
+        )
+        if value["artifact_hash"] != binding.artifact_hash:
+            raise ValueError("FormalReferenceBinding artifact_hash 与内容不一致")
+        return binding
+
+
 def _extract_path_evaluation(result: object) -> tuple[dict[str, np.ndarray], dict[str, object]]:
     if isinstance(result, Mapping):
         contribution = _as_vector(result, field_name="reference contribution")
@@ -1151,6 +1330,10 @@ class ReferenceRefinementRunner:
             raise ValueError("tolerance 必须是有限正数")
         if required_consecutive <= 0:
             raise ValueError("required_consecutive 必须为正")
+        if execution.run_intent == "formal" and required_consecutive != 2:
+            raise FormalRunRejected(
+                "FORMAL_REFERENCE_REQUIRED_CONSECUTIVE_MUST_BE_TWO"
+            )
         if max_new_evaluations is not None and max_new_evaluations <= 0:
             raise ValueError("max_new_evaluations 必须为正或 null")
         grouped: dict[str, list[ReferenceRuleLevel]] = {}
@@ -1365,6 +1548,29 @@ class QuadratureThresholds:
     min_spearman: float
     min_topk_overlap: float
     max_unique_nodes: int
+    # The first five fields are retained for wire compatibility with the
+    # original fixture recommendation.  The fields below are deliberately
+    # optional here: local fixture observations do not pretend to contain the
+    # formal Stage 3 metric contract.  The independent stage3_gate evaluator
+    # requires every one of these fields before it can qualify a formal
+    # recommendation.
+    max_normalized_l2_error: float | None = None
+    max_normalized_linf_error: float | None = None
+    max_completeness_relative_residual: float | None = None
+    max_completeness_l1_scaled_residual: float | None = None
+    min_active_spearman: float | None = None
+    min_cosine_similarity: float | None = None
+    min_sign_consistency: float | None = None
+    min_topq_overlap: float | None = None
+    min_topq_jaccard: float | None = None
+    max_layer_quality_tv: float | None = None
+    max_module_quality_tv: float | None = None
+    max_reference_normalized_l1_error: float | None = None
+    completeness_stability_epsilon: float | None = None
+    active_set_threshold: float | None = None
+    top_q_values: tuple[float, ...] | None = None
+    required_strata: tuple[str, ...] | None = None
+    require_worst_case: bool | None = None
 
     def __post_init__(self) -> None:
         for name in ("max_normalized_l1_error", "max_completeness_absolute_residual"):
@@ -1382,15 +1588,136 @@ class QuadratureThresholds:
             or self.max_unique_nodes <= 0
         ):
             raise ValueError("max_unique_nodes 必须是正整数")
+        for name in (
+            "max_normalized_l2_error",
+            "max_normalized_linf_error",
+            "max_completeness_relative_residual",
+            "max_completeness_l1_scaled_residual",
+            "max_layer_quality_tv",
+            "max_module_quality_tv",
+            "max_reference_normalized_l1_error",
+            "active_set_threshold",
+        ):
+            value = getattr(self, name)
+            if value is not None and (not math.isfinite(float(value)) or float(value) < 0):
+                raise ValueError(f"{name} 必须是非负有限数或 null")
+        if self.completeness_stability_epsilon is not None and (
+            not math.isfinite(float(self.completeness_stability_epsilon))
+            or float(self.completeness_stability_epsilon) <= 0
+        ):
+            raise ValueError("completeness_stability_epsilon 必须是正有限数或 null")
+        for name in (
+            "min_active_spearman",
+            "min_cosine_similarity",
+            "min_sign_consistency",
+            "min_topq_overlap",
+            "min_topq_jaccard",
+        ):
+            value = getattr(self, name)
+            if value is not None:
+                lower = -1.0 if name in {"min_active_spearman", "min_cosine_similarity"} else 0.0
+                if not math.isfinite(float(value)) or not lower <= float(value) <= 1:
+                    raise ValueError(f"{name} 必须位于 [{lower:g},1] 或为 null")
+        if self.top_q_values is not None:
+            values = tuple(float(item) for item in self.top_q_values)
+            if (
+                not values
+                or len(set(values)) != len(values)
+                or any(not math.isfinite(item) or not 0 < item <= 1 for item in values)
+            ):
+                raise ValueError("top_q_values 必须是 (0,1] 内不重复的有限数列")
+            object.__setattr__(self, "top_q_values", values)
+        if self.required_strata is not None:
+            values = tuple(self.required_strata)
+            if not values or len(set(values)) != len(values) or any(
+                not isinstance(item, str) or not item for item in values
+            ):
+                raise ValueError("required_strata 必须是非空无重复字符串数组")
+            object.__setattr__(self, "required_strata", values)
+        if self.require_worst_case is not None and type(self.require_worst_case) is not bool:
+            raise TypeError("require_worst_case 必须是 bool 或 null")
 
     def to_dict(self) -> dict[str, object]:
-        return {
+        value: dict[str, object] = {
             "max_normalized_l1_error": self.max_normalized_l1_error,
             "max_completeness_absolute_residual": self.max_completeness_absolute_residual,
             "min_spearman": self.min_spearman,
             "min_topk_overlap": self.min_topk_overlap,
             "max_unique_nodes": self.max_unique_nodes,
         }
+        for name in (
+            "max_normalized_l2_error",
+            "max_normalized_linf_error",
+            "max_completeness_relative_residual",
+            "max_completeness_l1_scaled_residual",
+            "min_active_spearman",
+            "min_cosine_similarity",
+            "min_sign_consistency",
+            "min_topq_overlap",
+            "min_topq_jaccard",
+            "max_layer_quality_tv",
+            "max_module_quality_tv",
+            "max_reference_normalized_l1_error",
+            "completeness_stability_epsilon",
+            "active_set_threshold",
+            "top_q_values",
+            "required_strata",
+            "require_worst_case",
+        ):
+            current = getattr(self, name)
+            if current is not None:
+                value[name] = list(current) if isinstance(current, tuple) else current
+        return value
+
+    def require_formal_contract(self) -> "QuadratureThresholds":
+        """Reject the legacy five-column fixture contract for formal use."""
+
+        required = (
+            "max_normalized_l2_error",
+            "max_normalized_linf_error",
+            "max_completeness_relative_residual",
+            "max_completeness_l1_scaled_residual",
+            "min_active_spearman",
+            "min_cosine_similarity",
+            "min_sign_consistency",
+            "min_topq_overlap",
+            "min_topq_jaccard",
+            "max_layer_quality_tv",
+            "max_module_quality_tv",
+            "max_reference_normalized_l1_error",
+            "completeness_stability_epsilon",
+            "active_set_threshold",
+            "top_q_values",
+            "required_strata",
+            "require_worst_case",
+        )
+        missing = tuple(name for name in required if getattr(self, name) is None)
+        if missing:
+            raise FormalRunRejected(
+                "FORMAL_QUADRATURE_THRESHOLDS_INCOMPLETE:" + ",".join(missing)
+            )
+        if self.top_q_values != (0.001, 0.01, 0.05):
+            raise FormalRunRejected("FORMAL_QUADRATURE_TOP_Q_NOT_PREREGISTERED")
+        if self.required_strata != ("model", "stage", "update", "probe"):
+            raise FormalRunRejected("FORMAL_QUADRATURE_STRATA_NOT_PREREGISTERED")
+        if self.require_worst_case is not True:
+            raise FormalRunRejected("FORMAL_QUADRATURE_WORST_CASE_REQUIRED")
+        from .stage3_protocol import DEFAULT_THRESHOLDS
+
+        observed = self.to_dict()
+        for name, bound in DEFAULT_THRESHOLDS.items():
+            value = observed.get(name)
+            if value is None:
+                raise FormalRunRejected(f"FORMAL_QUADRATURE_THRESHOLD_MISSING:{name}")
+            if name.startswith("max_") and float(value) > float(bound):
+                raise FormalRunRejected(f"FORMAL_QUADRATURE_THRESHOLD_WIDENED:{name}")
+            if name.startswith("min_") and float(value) < float(bound):
+                raise FormalRunRejected(f"FORMAL_QUADRATURE_THRESHOLD_WIDENED:{name}")
+        if float(self.max_reference_normalized_l1_error) > (
+            self.max_normalized_l1_error / 10.0
+        ):
+            raise FormalRunRejected("FORMAL_REFERENCE_ERROR_NOT_TEN_TIMES_STRICTER")
+        return self
 
     @property
     def artifact_hash(self) -> str:
@@ -1407,6 +1734,33 @@ class QuadratureObservation:
     spearman: float
     topk_overlap: float
     wall_seconds: float
+    normalized_l2_error: float | None = None
+    normalized_linf_error: float | None = None
+    completeness_relative_residual: float | None = None
+    completeness_l1_scaled_residual: float | None = None
+    active_spearman: float | None = None
+    cosine_similarity: float | None = None
+    sign_consistency: float | None = None
+    topq_overlap: Mapping[float | str, float] = field(default_factory=dict)
+    topq_jaccard: Mapping[float | str, float] = field(default_factory=dict)
+    layer_quality_tv: float | None = None
+    module_quality_tv: float | None = None
+    reference_normalized_l1_error: float | None = None
+    strata: Mapping[str, object] = field(default_factory=dict)
+    evidence_refs: tuple[str, ...] = ()
+    scope: str = "local_fixture"
+    # Deprecated producer diagnostic retained for old fixture wire rows.  A
+    # formal Gate derives worst cases from the complete table and never trusts
+    # this flag.
+    worst_case: bool | None = None
+    # These fields deliberately remain optional/defaulted for older fixture
+    # observations.  Formal runners must populate them from the callback
+    # accounting rather than substituting ``unique_nodes`` for elapsed time.
+    gradient_evaluations: int = 0
+    loss_evaluations: int = 0
+    forward_evaluations: int = 0
+    backward_evaluations: int = 0
+    peak_gpu_memory_bytes: int | None = None
 
     def __post_init__(self) -> None:
         _require_identifier(self.unit_id, field_name="unit_id")
@@ -1428,6 +1782,60 @@ class QuadratureObservation:
             raise ValueError("wall_seconds 不能为负")
         if not -1 <= self.spearman <= 1 or not 0 <= self.topk_overlap <= 1:
             raise ValueError("spearman/topk_overlap 超出定义域")
+        for name in (
+            "normalized_l2_error",
+            "normalized_linf_error",
+            "completeness_relative_residual",
+            "completeness_l1_scaled_residual",
+            "layer_quality_tv",
+            "module_quality_tv",
+            "reference_normalized_l1_error",
+        ):
+            value = getattr(self, name)
+            if value is not None and (not math.isfinite(float(value)) or float(value) < 0):
+                raise ValueError(f"{name} 必须是非负有限数或 null")
+        for name in ("active_spearman", "cosine_similarity"):
+            value = getattr(self, name)
+            if value is not None and (not math.isfinite(float(value)) or not -1 <= float(value) <= 1):
+                raise ValueError(f"{name} 必须位于 [-1,1] 或为 null")
+        for name in ("sign_consistency",):
+            value = getattr(self, name)
+            if value is not None and (not math.isfinite(float(value)) or not 0 <= float(value) <= 1):
+                raise ValueError(f"{name} 必须位于 [0,1] 或为 null")
+        for name in ("topq_overlap", "topq_jaccard"):
+            raw = getattr(self, name)
+            normalized = {str(key): float(value) for key, value in raw.items()}
+            if any(not math.isfinite(value) or not 0 <= value <= 1 for value in normalized.values()):
+                raise ValueError(f"{name} 必须只包含 [0,1] 内的有限数")
+            object.__setattr__(self, name, MappingProxyType(normalized))
+        if any(not isinstance(key, str) or not key for key in self.strata):
+            raise ValueError("strata key 必须是非空字符串")
+        object.__setattr__(self, "strata", MappingProxyType(dict(self.strata)))
+        refs = tuple(self.evidence_refs)
+        if any(not isinstance(item, str) or not item for item in refs):
+            raise ValueError("evidence_refs 必须是非空字符串数组")
+        object.__setattr__(self, "evidence_refs", refs)
+        if self.scope not in {"local_fixture", "formal"}:
+            raise ValueError("QuadratureObservation scope 不受支持")
+        if self.scope == "formal" and not refs:
+            raise FormalRunRejected("FORMAL_QUADRATURE_OBSERVATION_EVIDENCE_REQUIRED")
+        if self.worst_case is not None and type(self.worst_case) is not bool:
+            raise TypeError("worst_case 必须是 bool 或 null")
+        for name in (
+            "gradient_evaluations",
+            "loss_evaluations",
+            "forward_evaluations",
+            "backward_evaluations",
+        ):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(f"{name} 必须是非负整数")
+        if self.peak_gpu_memory_bytes is not None and (
+            isinstance(self.peak_gpu_memory_bytes, bool)
+            or not isinstance(self.peak_gpu_memory_bytes, int)
+            or self.peak_gpu_memory_bytes < 0
+        ):
+            raise ValueError("peak_gpu_memory_bytes 必须是非负整数或 null")
 
 
 @dataclass(frozen=True, slots=True)
@@ -1442,6 +1850,11 @@ class QuadratureRecommendation:
     execution_evidence_hash: str
     qualification: ArtifactQualification
     reasons: tuple[str, ...] = ()
+    # Formal qualification is intentionally bound to the independent Gate
+    # evaluation and to the completed provenance record, not just to G3-5.
+    # ``None`` keeps legacy/local fixture wire artifacts round-trippable.
+    gate_evaluation_hash: str | None = None
+    provenance_hash: str | None = None
     schema_version: str = "stage3-quadrature-recommendation-v1"
 
     def __post_init__(self) -> None:
@@ -1457,13 +1870,27 @@ class QuadratureRecommendation:
             raise FormalRunRejected("QUALIFIED_RECOMMENDATION_REQUIRES_GATE")
         if self.qualification.formal_eligible and self.status != "QUALIFIED":
             raise FormalRunRejected("FORMAL_ELIGIBLE_RECOMMENDATION_MUST_BE_QUALIFIED")
+        if self.gate_evaluation_hash is not None:
+            _require_sha256(self.gate_evaluation_hash, field_name="gate_evaluation_hash")
+        if self.provenance_hash is not None:
+            _require_sha256(self.provenance_hash, field_name="provenance_hash")
+        if self.qualification.formal_eligible and (
+            self.gate_evaluation_hash is None or self.provenance_hash is None
+        ):
+            raise FormalRunRejected(
+                "FORMAL_RECOMMENDATION_REQUIRES_GATE_EVALUATION_AND_PROVENANCE"
+            )
+        if self.status != "QUALIFIED" and (
+            self.gate_evaluation_hash is not None or self.provenance_hash is not None
+        ):
+            raise FormalRunRejected("UNQUALIFIED_RECOMMENDATION_CANNOT_CARRY_FORMAL_BINDINGS")
 
     @property
     def scope(self) -> str:
         return self.qualification.scope
 
     def payload_dict(self) -> dict[str, object]:
-        return {
+        value: dict[str, object] = {
             "schema_version": self.schema_version,
             "recommendation_id": self.recommendation_id,
             "status": self.status,
@@ -1479,6 +1906,11 @@ class QuadratureRecommendation:
             "qualification_gate_hash": self.qualification.qualification_gate_hash,
             "reasons": list(self.reasons),
         }
+        if self.gate_evaluation_hash is not None:
+            value["gate_evaluation_hash"] = self.gate_evaluation_hash
+        if self.provenance_hash is not None:
+            value["provenance_hash"] = self.provenance_hash
+        return value
 
     @property
     def artifact_hash(self) -> str:
@@ -1511,16 +1943,39 @@ class QuadratureRecommendation:
             "reasons",
             "artifact_hash",
         }
-        if set(value) != expected:
+        optional = {"gate_evaluation_hash", "provenance_hash"}
+        # Sets are unhashable; use explicit equality rather than putting the
+        # accepted key sets inside another set.
+        if set(value) != expected and set(value) != expected | optional:
             raise ValueError("QUADRATURE_RECOMMENDATION_FIELDS_MISMATCH")
         thresholds_raw = value["thresholds"]
-        if not isinstance(thresholds_raw, Mapping) or set(thresholds_raw) != {
+        if not isinstance(thresholds_raw, Mapping):
+            raise ValueError("QUADRATURE_RECOMMENDATION_THRESHOLDS_INVALID")
+        allowed_thresholds = {
             "max_normalized_l1_error",
             "max_completeness_absolute_residual",
             "min_spearman",
             "min_topk_overlap",
             "max_unique_nodes",
-        }:
+            "max_normalized_l2_error",
+            "max_normalized_linf_error",
+            "max_completeness_relative_residual",
+            "max_completeness_l1_scaled_residual",
+            "min_active_spearman",
+            "min_cosine_similarity",
+            "min_sign_consistency",
+            "min_topq_overlap",
+            "min_topq_jaccard",
+            "max_layer_quality_tv",
+            "max_module_quality_tv",
+            "max_reference_normalized_l1_error",
+            "completeness_stability_epsilon",
+            "active_set_threshold",
+            "top_q_values",
+            "required_strata",
+            "require_worst_case",
+        }
+        if not set(thresholds_raw).issubset(allowed_thresholds):
             raise ValueError("QUADRATURE_RECOMMENDATION_THRESHOLDS_INVALID")
         passing = value["passing_rules"]
         units = value["required_unit_ids"]
@@ -1535,6 +1990,14 @@ class QuadratureRecommendation:
         thresholds = QuadratureThresholds(**dict(thresholds_raw))  # type: ignore[arg-type]
         if value["thresholds_hash"] != thresholds.artifact_hash:
             raise ValueError("QUADRATURE_RECOMMENDATION_THRESHOLDS_HASH_MISMATCH")
+        if value["formal_eligible"] is True or value["status"] == "QUALIFIED":
+            # A payload containing only hashes cannot prove that the referenced
+            # Gate/provenance artifacts were parsed and matched.  Qualified
+            # recommendations must be reconstructed by an authority-aware
+            # loader supplied with those canonical objects.
+            raise FormalRunRejected(
+                "QUALIFIED_RECOMMENDATION_REQUIRES_AUTHORITY_AWARE_LOADER"
+            )
         recommendation = cls(
             recommendation_id=value["recommendation_id"],  # type: ignore[arg-type]
             status=value["status"],  # type: ignore[arg-type]
@@ -1550,6 +2013,8 @@ class QuadratureRecommendation:
                 qualification_gate_hash=value["qualification_gate_hash"],  # type: ignore[arg-type]
             ),
             reasons=tuple(reasons),
+            gate_evaluation_hash=value.get("gate_evaluation_hash"),  # type: ignore[arg-type]
+            provenance_hash=value.get("provenance_hash"),  # type: ignore[arg-type]
             schema_version=value["schema_version"],  # type: ignore[arg-type]
         )
         if value["artifact_hash"] != recommendation.artifact_hash:
@@ -1562,20 +2027,127 @@ class QuadratureRecommendation:
         execution: FormalExecutionEvidence,
         gate: GateRecord,
         artifact_ref: str | None = None,
+        gate_evaluation: object | None = None,
+        provenance: object | None = None,
     ) -> "QuadratureRecommendation":
+        from param_importance_nlp.contracts.provenance import ProvenanceRecord
+        from param_importance_nlp.experiments.stage3_gate import Stage3GateEvaluation
+
         execution.require_for_stage(3)
         if self.scope != "formal" or self.status != "FORMAL_CANDIDATE":
             raise FormalRunRejected("QUADRATURE_RECOMMENDATION_NOT_FORMAL_CANDIDATE")
         if execution.artifact_hash != self.execution_evidence_hash:
             raise FormalRunRejected("QUADRATURE_EXECUTION_EVIDENCE_MISMATCH")
+        self.thresholds.require_formal_contract()
+        # A single G3-5 record is not sufficient authorization for a formal
+        # recommendation.  The independent evaluator must first bind all six
+        # G3-0..G3-5 records and a clean completed provenance record.
+        required_gate_ids = {f"stage3.G3-{index}" for index in range(6)}
+        observed_gate_ids = {
+            item.gate_id
+            for item in execution.prerequisite_gates
+            if isinstance(item, GateRecord)
+        }
+        if not required_gate_ids.issubset(observed_gate_ids):
+            raise FormalRunRejected("FORMAL_RECOMMENDATION_REQUIRES_G3_0_THROUGH_G3_5")
+        if gate.gate_id != "stage3.G3-7":
+            raise FormalRunRejected("FORMAL_RECOMMENDATION_REQUIRES_G3_7")
         accepted = require_accepted_gate(gate, stage=3)
         _require_gate_binding(accepted, artifact_ref)
+        if not isinstance(gate_evaluation, Stage3GateEvaluation) or not isinstance(
+            provenance, ProvenanceRecord
+        ):
+            raise FormalRunRejected(
+                "FORMAL_RECOMMENDATION_REQUIRES_GATE_EVALUATION_AND_PROVENANCE"
+            )
+        evaluation_hash = gate_evaluation.artifact_hash
+        provenance_hash = provenance.artifact_hash
+        if gate_evaluation.formal_eligible is not True:
+            raise FormalRunRejected("FORMAL_GATE_EVALUATION_NOT_ELIGIBLE")
+        if provenance.formal_eligible is not True:
+            raise FormalRunRejected("FORMAL_PROVENANCE_NOT_ELIGIBLE")
+        if gate_evaluation.execution_evidence_hash != execution.artifact_hash:
+            raise FormalRunRejected("FORMAL_GATE_EVALUATION_EXECUTION_MISMATCH")
+        if gate_evaluation.thresholds_hash != self.thresholds.artifact_hash:
+            raise FormalRunRejected("FORMAL_GATE_EVALUATION_THRESHOLDS_MISMATCH")
+        if gate_evaluation.required_unit_ids != self.required_unit_ids:
+            raise FormalRunRejected("FORMAL_GATE_EVALUATION_UNITS_MISMATCH")
+        expected_gate_hashes = tuple(
+            gate.artifact_hash
+            for gate in execution.prerequisite_gates
+            if gate.gate_id in required_gate_ids
+        )
+        expected_by_id = {
+            gate.gate_id: gate
+            for gate in execution.prerequisite_gates
+            if gate.gate_id in required_gate_ids
+        }
+        if set(expected_by_id) != required_gate_ids or any(
+            item.status is not GateStatus.PASS
+            or item.effective_status() is not GateStatus.PASS
+            for item in expected_by_id.values()
+        ):
+            raise FormalRunRejected("FORMAL_GATE_EVALUATION_REQUIRES_REAL_PASS_GATES")
+        expected_gate_hashes = tuple(
+            expected_by_id[f"stage3.G3-{index}"].artifact_hash for index in range(6)
+        )
+        if gate_evaluation.gate_hashes != expected_gate_hashes:
+            raise FormalRunRejected("FORMAL_GATE_EVALUATION_GATE_HASHES_MISMATCH")
+        evaluated_passing = tuple(
+            rule
+            for rule, raw in gate_evaluation.rule_evaluations.items()
+            if isinstance(raw, Mapping) and raw.get("passing") is True
+        )
+        if set(evaluated_passing) != set(self.passing_rules):
+            raise FormalRunRejected("FORMAL_GATE_EVALUATION_PASSING_RULES_MISMATCH")
+        if gate_evaluation.provenance_hash != provenance_hash:
+            raise FormalRunRejected("FORMAL_GATE_EVALUATION_PROVENANCE_MISMATCH")
+        if (
+            provenance.scope != "formal"
+            or provenance.status.value != "COMPLETED"
+            or not provenance.worktree_clean
+            or not provenance.formal_eligible
+            or not set(gate_evaluation.source_artifact_refs).issubset(
+                set(provenance.artifact_refs)
+            )
+        ):
+            raise FormalRunRejected("FORMAL_PROVENANCE_NOT_COMPLETED_CLEAN_BOUND")
         return replace(
             self,
             status="QUALIFIED",
             qualification=ArtifactQualification.from_gate(
                 scope="formal", gate=accepted, stage=3
             ),
+            gate_evaluation_hash=evaluation_hash,
+            provenance_hash=provenance_hash,
+        )
+
+    @classmethod
+    def from_mapping_authorized(
+        cls,
+        value: Mapping[str, object],
+        *,
+        execution: FormalExecutionEvidence,
+        gate: GateRecord,
+        gate_evaluation: object,
+        provenance: object,
+        artifact_ref: str | None = None,
+    ) -> "QuadratureRecommendation":
+        """Reload and qualify a candidate only with canonical authorities.
+
+        ``from_mapping`` intentionally rejects already-qualified hash-only
+        payloads.  This loader instead reconstructs an unqualified candidate
+        and immediately verifies the live G3-7 Gate, independent Gate
+        evaluation, completed provenance and execution evidence objects.
+        """
+
+        candidate = cls.from_mapping(value)
+        return candidate.qualify(
+            execution=execution,
+            gate=gate,
+            artifact_ref=artifact_ref,
+            gate_evaluation=gate_evaluation,
+            provenance=provenance,
         )
 
 
@@ -1594,6 +2166,7 @@ class QuadratureRecommendationEngine:
         execution = execution or FormalExecutionEvidence("local_fixture")
         if execution.run_intent == "formal":
             execution.require_for_stage(3)
+            thresholds.require_formal_contract()
         units = tuple(required_unit_ids)
         if not units or len(set(units)) != len(units):
             raise ValueError("required_unit_ids 必须非空且无重复")
@@ -1620,6 +2193,77 @@ class QuadratureRecommendationEngine:
                 and row.unique_nodes <= thresholds.max_unique_nodes
                 for row in rows
             )
+            if passed and execution.run_intent == "formal":
+                # Formal recommendation cannot silently fall back to the old
+                # five-column fixture contract.  The independent evaluator is
+                # still the authority for six-Gate/provenance binding, but the
+                # recommendation engine must at least reject incomplete rows.
+                required_thresholds = (
+                    "max_normalized_l2_error",
+                    "max_normalized_linf_error",
+                    "max_completeness_relative_residual",
+                    "max_completeness_l1_scaled_residual",
+                    "min_active_spearman",
+                    "min_cosine_similarity",
+                    "min_sign_consistency",
+                    "min_topq_overlap",
+                    "min_topq_jaccard",
+                    "max_layer_quality_tv",
+                    "max_module_quality_tv",
+                    "max_reference_normalized_l1_error",
+                )
+                passed = all(
+                    getattr(thresholds, name) is not None for name in required_thresholds
+                ) and all(
+                    row.normalized_l2_error is not None
+                    and row.normalized_linf_error is not None
+                    and row.completeness_relative_residual is not None
+                    and row.completeness_l1_scaled_residual is not None
+                    and row.active_spearman is not None
+                    and row.cosine_similarity is not None
+                    and row.sign_consistency is not None
+                    and row.layer_quality_tv is not None
+                    and row.module_quality_tv is not None
+                    and row.reference_normalized_l1_error is not None
+                    and row.topq_overlap
+                    and row.topq_jaccard
+                    and row.strata
+                    and row.scope == "formal"
+                    and row.evidence_refs
+                    and row.normalized_l2_error <= float(thresholds.max_normalized_l2_error)
+                    and row.normalized_linf_error <= float(thresholds.max_normalized_linf_error)
+                    and row.completeness_relative_residual <= float(thresholds.max_completeness_relative_residual)
+                    and row.completeness_l1_scaled_residual <= float(thresholds.max_completeness_l1_scaled_residual)
+                    and row.active_spearman >= float(thresholds.min_active_spearman)
+                    and row.cosine_similarity >= float(thresholds.min_cosine_similarity)
+                    and row.sign_consistency >= float(thresholds.min_sign_consistency)
+                    and row.layer_quality_tv <= float(thresholds.max_layer_quality_tv)
+                    and row.module_quality_tv <= float(thresholds.max_module_quality_tv)
+                    and row.reference_normalized_l1_error <= float(thresholds.max_reference_normalized_l1_error)
+                    for row in rows
+                )
+                top_q_values = thresholds.top_q_values or (0.001, 0.01, 0.05)
+                if passed:
+                    passed = all(
+                        all(str(q) in row.topq_overlap or f"{q:g}" in row.topq_overlap for q in top_q_values)
+                        and all(str(q) in row.topq_jaccard or f"{q:g}" in row.topq_jaccard for q in top_q_values)
+                        and all(
+                            row.topq_overlap.get(str(q), row.topq_overlap.get(f"{q:g}", -math.inf))
+                            >= float(thresholds.min_topq_overlap)
+                            for q in top_q_values
+                        )
+                        and all(
+                            row.topq_jaccard.get(str(q), row.topq_jaccard.get(f"{q:g}", -math.inf))
+                            >= float(thresholds.min_topq_jaccard)
+                            for q in top_q_values
+                        )
+                        for row in rows
+                    )
+                if passed and thresholds.required_strata:
+                    passed = all(
+                        all(key in row.strata for key in thresholds.required_strata)
+                        for row in rows
+                    )
             if not passed:
                 reasons.append(f"{rule_name}:threshold_failed")
                 continue
@@ -1660,6 +2304,7 @@ __all__ = [
     "EndpointCaptureAdapter",
     "EndpointCaptureCoordinator",
     "EndpointCaptureRequest",
+    "FormalReferenceBinding",
     "NodeValueCodec",
     "PersistentNodeGradientCache",
     "ProbePanel",

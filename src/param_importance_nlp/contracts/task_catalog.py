@@ -657,8 +657,14 @@ class TaskCatalog:
                     )
                 if predecessor.stage > task.stage:
                     raise TaskCatalogError("任务不能依赖未来 Stage 的 predecessor")
-        if roots != ["stage0.01_baseline_and_safety"]:
-            raise TaskCatalogError("完整 StageTaskCatalog 只能有 stage0.01 一个根任务")
+        allowed_roots = ["stage0.01_baseline_and_safety"]
+        if "stage3.01_prerequisites_and_scope" in by_id:
+            allowed_roots.append("stage3.01_prerequisites_and_scope")
+        if roots != allowed_roots:
+            raise TaskCatalogError(
+                "完整 StageTaskCatalog 只允许 stage0.01 与显式 G3-0 授权的 "
+                "stage3.01 作为根任务"
+            )
 
         # 显式 DFS 检查同 Stage 内的环。只比较 stage 数无法发现 A -> B -> A，若不在
         # catalog 冻结时拒绝，运行器可能永远等待一个不可能发布的上游 commit。
@@ -925,15 +931,27 @@ _TASKS_RAW: Final = (
     _task("stage2.11_delivery_and_exit_gate", "Stage 2 交付与退出 Gate", "plan/stage2/11_delivery_and_exit_gate.md", RunnerKind.DELIVERY, ("delivery_manifest", "replay_report", "gate_summary", "sync_report"), RecoveryMode.MANUAL_EXTERNAL, SafeBoundary.IMMUTABLE_PUBLISH, gates=("stage2.G2.7b",), capabilities=("git", "github", "server")),
 
     # Stage 3：端点状态、求积 reference、正式矩阵与唯一方法决策。
-    _task("stage3.01_prerequisites_and_scope", "Stage 3 前置 Gate 与范围", "plan/stage3/01_prerequisites_and_scope.md", RunnerKind.AUDIT, ("prerequisite_report", "scope_freeze", "gate_record"), RecoveryMode.RESTART_IDEMPOTENT, SafeBoundary.IMMUTABLE_PUBLISH, gates=("stage0.G10", "stage1.G1-EXIT", "stage2.G2.7b", "stage2.G2.8"), capabilities=("server",), estimator_decision=True),
+    # The explicit user Stage 3 scope authority is represented by G3-0 and is
+    # the sole entry Gate for this task.  It does not relabel historical Stage
+    # 2 artifacts; later Stage 3 Gates remain unchanged and fully enforced.
+    _task("stage3.01_prerequisites_and_scope", "Stage 3 前置 Gate 与范围", "plan/stage3/01_prerequisites_and_scope.md", RunnerKind.AUDIT, ("prerequisite_report", "scope_freeze", "gate_record"), RecoveryMode.RESTART_IDEMPOTENT, SafeBoundary.IMMUTABLE_PUBLISH, gates=("stage3.G3-0",), capabilities=("server",), estimator_decision=True),
     _task("stage3.02_math_and_metric_contract", "路径积分数学与指标合同", "plan/stage3/02_math_and_metric_contract.md", RunnerKind.CONTRACT, ("path_math_contract", "metric_contract", "gate_record"), RecoveryMode.RESTART_IDEMPOTENT, SafeBoundary.IMMUTABLE_PUBLISH, gates=("stage3.G3-0",), estimator_decision=True),
     _task("stage3.03_endpoint_and_probe_pipeline", "端点、probe 与状态管线", "plan/stage3/03_endpoint_and_probe_pipeline.md", RunnerKind.PATH_INTEGRATION, ("path_spec", "probe_manifest", "state_restoration_report", "gate_record"), RecoveryMode.RECONCILE_STATE, SafeBoundary.CHECKPOINT_COMMIT, gates=("stage3.G3-0", "stage3.G3-1"), capabilities=("server", "cuda", "model_assets", "data_assets"), estimator_decision=True),
     _task("stage3.04_quadrature_engine_and_unit_tests", "求积引擎与解析测试", "plan/stage3/04_quadrature_engine_and_unit_tests.md", RunnerKind.VALIDATION, ("quadrature_rules", "analytic_validation_report", "gate_record"), RecoveryMode.RESTART_IDEMPOTENT, SafeBoundary.IMMUTABLE_PUBLISH, gates=("stage3.G3-1",), estimator_decision=True),
     _task("stage3.05_reference_integral_and_precision", "参考积分与精度预算", "plan/stage3/05_reference_integral_and_precision.md", RunnerKind.REFERENCE, ("path_integral_reference", "precision_budget", "gate_record"), RecoveryMode.RESUME_SHARDS, SafeBoundary.SHARD_COMMIT, gates=("stage3.G3-2", "stage3.G3-3"), capabilities=("server", "cuda"), estimator_decision=True),
     _task("stage3.06_pilot_and_threshold_freeze", "Pilot、阈值与预算冻结", "plan/stage3/06_pilot_and_threshold_freeze.md", RunnerKind.PILOT, ("quadrature_pilot_report", "threshold_freeze", "gate_record"), RecoveryMode.RESUME_SHARDS, SafeBoundary.SHARD_COMMIT, gates=("stage3.G3-4",), capabilities=("server", "cuda"), estimator_decision=True),
     _task("stage3.07_formal_experiment_matrix", "路径积分正式实验矩阵", "plan/stage3/07_formal_experiment_matrix.md", RunnerKind.PATH_INTEGRATION, ("formal_path_results", "completeness_report", "gate_record"), RecoveryMode.RESUME_SHARDS, SafeBoundary.SHARD_COMMIT, gates=("stage3.G3-5",), capabilities=("server", "cuda"), estimator_decision=True),
-    _task("stage3.08_error_analysis_and_stability", "误差分析与排序稳定性", "plan/stage3/08_error_analysis_and_stability.md", RunnerKind.STATISTICS, ("path_error_table", "stability_report", "frozen_source_table"), RecoveryMode.REBUILD_DERIVED, SafeBoundary.CANONICAL_SOURCE, gates=("stage3.G3-6",), estimator_decision=True),
-    _task("stage3.09_cost_and_method_selection", "成本与求积方法选择", "plan/stage3/09_cost_and_method_selection.md", RunnerKind.ANALYSIS, ("cost_accuracy_table", "quadrature_decision", "gate_record"), RecoveryMode.REBUILD_DERIVED, SafeBoundary.CANONICAL_SOURCE, gates=("stage3.G3-6",), estimator_decision=True),
+    # Stage3.08 only freezes the complete observation table.  G3-6 is
+    # published by the independent ``stage3.08_g3_6_publisher`` after these
+    # three commits and their completed provenance already exist.  Keeping the
+    # Gate outside the numbered producer prevents a provenance/self-evaluation
+    # cycle and makes Stage3.09 consume a real, separately committed authority.
+    _task("stage3.08_error_analysis_and_stability", "误差分析与排序稳定性", "plan/stage3/08_error_analysis_and_stability.md", RunnerKind.STATISTICS, ("path_error_table", "stability_report", "frozen_source_table"), RecoveryMode.REBUILD_DERIVED, SafeBoundary.CANONICAL_SOURCE, gates=("stage3.G3-5",), estimator_decision=True),
+    # Stage3.09 publishes the immutable cost table and an unqualified
+    # FORMAL_CANDIDATE only.  The independent G3-7 publisher reloads those
+    # commits plus G3-6, publishes G3-7 first, and only then publishes the
+    # qualified recommendation/finalization without a future-ref cycle.
+    _task("stage3.09_cost_and_method_selection", "成本与求积方法选择", "plan/stage3/09_cost_and_method_selection.md", RunnerKind.ANALYSIS, ("cost_accuracy_table", "quadrature_decision"), RecoveryMode.REBUILD_DERIVED, SafeBoundary.CANONICAL_SOURCE, gates=("stage3.G3-6",), estimator_decision=True),
     _task("stage3.10_reports_visualizations_and_handoff", "报告、图表与后续交接", "plan/stage3/10_reports_visualizations_and_handoff.md", RunnerKind.REPORTING, ("analysis_report", "chart_artifacts", "handoff_manifest", "gate_summary"), RecoveryMode.REBUILD_DERIVED, SafeBoundary.CANONICAL_SOURCE, gates=("stage3.G3-7",), capabilities=("git", "server"), estimator_decision=True),
 
     # Stage 4--9 的旧顶层 ID 保持兼容；其后叶任务才是可独立调度的原子单元。
@@ -1077,6 +1095,12 @@ _STAGE2_DIRECT_PREDECESSORS: Final[dict[str, tuple[str, ...]]] = {
     ),
 }
 
+# The user explicitly accepted the existing Stage 2 estimator conclusion and
+# directed execution to enter Stage 3 without replaying or relabelling the old
+# Stage 2 delivery.  G3-0 is the immutable authority edge; Stage 3.02 onward
+# continues to consume the ordinary numbered Stage 3 chain.
+_STAGE3_ENTRY_TASK: Final = "stage3.01_prerequisites_and_scope"
+
 
 def _freeze_dependency_contracts(
     raw_tasks: Sequence[TaskDefinition],
@@ -1127,6 +1151,8 @@ def _freeze_dependency_contracts(
     for task in raw_tasks:
         if task.task_id in _STAGE2_DIRECT_PREDECESSORS:
             predecessors = _STAGE2_DIRECT_PREDECESSORS[task.task_id]
+        elif task.task_id == _STAGE3_ENTRY_TASK:
+            predecessors = ()
         elif task.stage <= 3:
             predecessors = numbered_predecessors[task.task_id]
         else:

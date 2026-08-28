@@ -765,7 +765,34 @@ def test_stage3_pilot_runner_builds_quadrature_recommendation_without_gate_pass(
     assert recommendation["status"] == "FIXTURE_RECOMMENDATION"
     assert recommendation["default_rule"] == "midpoint"
     assert recommendation["formal_eligible"] is False
-    assert pilot["cost_semantics"] == "deterministic_unique_node_units_not_wall_clock"
+    assert pilot["cost_semantics"] == "callback_cost_separate_from_unique_nodes_v1"
+    observations = pilot["observations"]
+    assert isinstance(observations, list)
+    assert all(float(row["wall_seconds"]) >= 0 for row in observations)
+    assert all(
+        int(row["deterministic_node_cost_units"]) == int(row["unique_nodes"])
+        for row in observations
+    )
+    assert all(
+        {
+            "normalized_l2_error",
+            "normalized_linf_error",
+            "completeness_relative_residual",
+            "completeness_l1_scaled_residual",
+            "active_spearman",
+            "cosine_similarity",
+            "sign_consistency",
+            "topq_overlap",
+            "topq_jaccard",
+            "layer_quality_tv",
+            "module_quality_tv",
+            "reference_normalized_l1_error",
+            "strata",
+            "evidence_refs",
+            "scope",
+        }.issubset(row)
+        for row in observations
+    )
     cache = pilot["node_gradient_cache"]
     assert isinstance(cache, dict)
     assert cache["cross_rule_reused_key_count"] == 3

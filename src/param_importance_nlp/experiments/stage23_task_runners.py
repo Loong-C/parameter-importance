@@ -24,7 +24,7 @@ CLI 或训练入口。
 from __future__ import annotations
 
 from collections.abc import Callable, Hashable, Iterable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import hashlib
 import math
 from pathlib import Path, PurePosixPath
@@ -33,6 +33,7 @@ import re
 import shutil
 import subprocess
 from time import perf_counter
+from types import MappingProxyType
 
 import numpy as np
 import torch
@@ -63,8 +64,22 @@ from ..contracts.stage0_handoff import (
 )
 from ..contracts.seed import SeedPlan
 from ..contracts.stage23 import FormalExecutionEvidence
+from ..contracts.stage3_scope import (
+    STAGE3_SCOPE_ARTIFACT_KIND,
+    STAGE3_SCOPE_TASK_ID,
+    validate_stage3_scope_authority,
+)
+from ..contracts.status import GateRecord, GateStatus
 from ..contracts.freeze import ContractFreeze
 from ..contracts.task_catalog import DEFAULT_TASK_CATALOG, RecoveryMode, RunnerKind
+from .stage3_production_plan import (
+    FORMAL_SCOPE,
+    PILOT_SCOPE,
+    ProductionUnit,
+    ProductionUnitIndex,
+    load_production_unit_index,
+)
+from .stage3_protocol import DEFAULT_CANDIDATE_RULES
 from ..analysis import (
     AnalysisReportBuilder,
     ChartArtifact,
@@ -201,6 +216,7 @@ from .training_endpoints import validate_endpoint_state_bundle
 from .stage3_formal import (
     EndpointCaptureCoordinator,
     EndpointCaptureRequest,
+    FormalReferenceBinding,
     ProbePanel,
     ProbePanelEntry,
     QuadratureObservation,
@@ -219,6 +235,7 @@ from .stage3_metrics import (
     normalized_l1 as stage3_normalized_l1,
     normalized_l2 as stage3_normalized_l2,
     normalized_linf as stage3_normalized_linf,
+    quality_total_variation as stage3_quality_total_variation,
     sign_consistency as stage3_sign_consistency,
     top_q_metrics as stage3_top_q_metrics,
 )
@@ -242,6 +259,15 @@ _STAGE3_ENDPOINT_TASK = "stage3.03_endpoint_and_probe_pipeline"
 _STAGE3_REFERENCE_TASK = "stage3.05_reference_integral_and_precision"
 _STAGE3_PILOT_TASK = "stage3.06_pilot_and_threshold_freeze"
 _STAGE3_MATRIX_TASK = "stage3.07_formal_experiment_matrix"
+_STAGE3_PILOT_PLAN_TASKS = frozenset({_STAGE3_REFERENCE_TASK, _STAGE3_PILOT_TASK})
+_STAGE3_MATRIX_PLAN_TASKS = frozenset(
+    {
+        _STAGE3_MATRIX_TASK,
+        "stage3.08_error_analysis_and_stability",
+        "stage3.09_cost_and_method_selection",
+        "stage3.10_reports_visualizations_and_handoff",
+    }
+)
 
 _STAGE23_TASK_ORDER = (
     "stage2.01_scope_hypotheses_and_preregistration",
@@ -446,7 +472,51 @@ def _authoritative_partial_paths(
         if resolved.parent == store.commits.resolve():
             continue
         paths.append(resolved)
+
+    # Stage 3 formal fan-out state is deliberately shared by the individually
+    # scheduled endpoint/probe shards.  The configured cache root is allowed to
+    # live beside (rather than below) the task output, so the generic nested
+    # ``commits`` scan above cannot discover these immutable JSON shard records.
+    # Discover only the two Stage 3 fan-out namespaces; node-cache objects and
+    # arbitrary cache JSON must never turn an unrelated task into a resume.
+    if request.config.run_intent == "formal" and request.task.task_id in {
+        _STAGE3_REFERENCE_TASK,
+        _STAGE3_PILOT_TASK,
+        _STAGE3_MATRIX_TASK,
+    }:
+        for fanout_root in _stage3_fanout_state_roots(request, root, store):
+            if not fanout_root.exists():
+                continue
+            if request.task.task_id == _STAGE3_REFERENCE_TASK:
+                patterns = ("stage3-reference-ledger/pilot/**/*.json",)
+            elif request.task.task_id == _STAGE3_MATRIX_TASK:
+                patterns = (
+                    "stage3-reference-ledger/matrix/**/*.json",
+                    "stage3-quadrature-observations/**/*.json",
+                )
+            else:
+                patterns = ("stage3-quadrature-observations/**/*.json",)
+            for pattern in patterns:
+                paths.extend(path.resolve() for path in fanout_root.glob(pattern))
     return tuple(dict.fromkeys(paths))
+
+
+def _stage3_fanout_state_roots(
+    request: TaskExecutionRequest,
+    root: Path,
+    store: TaskArtifactStore,
+) -> tuple[Path, ...]:
+    """Return the only roots in which formal Stage 3 fan-out state may live."""
+
+    roots: list[Path] = [store.root / "resume"]
+    try:
+        runtime = request.config.base_config.section("runtime")
+    except (AttributeError, KeyError, TypeError):
+        runtime = None
+    cache_root = runtime.get("cache_root") if isinstance(runtime, Mapping) else None
+    if isinstance(cache_root, str):
+        roots.append(_workspace_path(root, cache_root, field="runtime.cache_root"))
+    return tuple(dict.fromkeys(path.resolve() for path in roots))
 
 
 def _authorize_partial_resume(
@@ -481,7 +551,23 @@ def _authorize_partial_resume(
     try:
         resume_path.relative_to(store.root.resolve())
     except ValueError as error:
-        raise ValueError("STAGE23_RESUME_REF_OUTSIDE_TASK_OUTPUT") from error
+        # Formal Stage 3 fan-out ledgers intentionally use the configured
+        # runtime cache so all endpoint/probe shards see one append-only state
+        # tree.  Keep the exception narrow: every other task still binds its
+        # resume reference to its own output directory.
+        if not (
+            request.config.run_intent == "formal"
+            and request.task.task_id in {
+                _STAGE3_REFERENCE_TASK,
+                _STAGE3_PILOT_TASK,
+                _STAGE3_MATRIX_TASK,
+            }
+            and any(
+                resume_path == candidate or resume_path.is_relative_to(candidate)
+                for candidate in _stage3_fanout_state_roots(request, root, store)
+            )
+        ):
+            raise ValueError("STAGE23_RESUME_REF_OUTSIDE_TASK_OUTPUT") from error
     if not resume_path.exists():
         raise FileNotFoundError("STAGE23_RESUME_REF_NOT_FOUND")
     if not any(
@@ -689,6 +775,10 @@ class _ProviderContext:
     # authorization/provenance boundary; this field records the actual model
     # root loaded for gradients.
     checkpoint_identity: Mapping[str, JSONValue] | None = None
+    # Stage 3 may be entered under an explicit user scope decision that keeps
+    # historical Stage 0/1 evidence intact without requiring a Stage 2 replay.
+    # The decision is an authority/provenance object, never scientific data.
+    stage3_scope_decision: Mapping[str, JSONValue] | None = None
 
     def to_payload(self) -> dict[str, JSONValue]:
         payload: dict[str, JSONValue] = {
@@ -719,6 +809,8 @@ class _ProviderContext:
         }
         if self.checkpoint_identity is not None:
             payload["checkpoint_identity"] = dict(self.checkpoint_identity)
+        if self.stage3_scope_decision is not None:
+            payload["stage3_scope_decision"] = dict(self.stage3_scope_decision)
         return payload
 
 
@@ -894,6 +986,39 @@ class _PredecessorContext:
             raise RuntimeError(
                 f"STAGE23_PREDECESSOR_PAYLOAD_NOT_UNIQUE:{artifact_kind}:{len(matches)}"
             )
+        return matches[0]
+
+
+def _predecessor_payload_or_auxiliary(
+    inputs: _PredecessorContext,
+    artifact_kind: str,
+    *,
+    root: Path,
+) -> Mapping[str, object]:
+    """Load a payload from the direct predecessor or an explicitly listed input.
+
+    Stage 3.07's direct DAG predecessor is the completed 3.06 pilot fan-out,
+    while the per-unit reference aggregate is produced by 3.05.  The latter
+    therefore travels as an explicit auxiliary task commit in the matrix
+    launch, never as an implicit filesystem lookup.
+    """
+
+    try:
+        return inputs.payload(artifact_kind)
+    except RuntimeError as direct_error:
+        matches: list[Mapping[str, object]] = []
+        for reference in inputs.auxiliary_refs:
+            try:
+                loaded = load_committed_task_artifact(root, reference)
+            except (FileNotFoundError, OSError, TypeError, ValueError):
+                continue
+            if loaded.identity.artifact_kind == artifact_kind:
+                matches.append(loaded.payload)
+        if len(matches) != 1:
+            raise RuntimeError(
+                "STAGE23_PREDECESSOR_PAYLOAD_NOT_UNIQUE:"
+                f"{artifact_kind}:{len(matches)}"
+            ) from direct_error
         return matches[0]
 
     def payload_for(self, task_id: str, artifact_kind: str) -> Mapping[str, object]:
@@ -1172,6 +1297,61 @@ def validate_formal_s203_task_artifacts(
     return loaded, next(iter(hashes))
 
 
+def _stage3_scope_authority(
+    request: TaskExecutionRequest,
+    root: Path,
+    *,
+    evidence: FormalExecutionEvidence | None = None,
+) -> tuple[Mapping[str, JSONValue], GateRecord, str, str]:
+    """Load the explicit user Stage 3 entry decision and its G3-0 GateRecord.
+
+    This is deliberately limited to Stage 3.  It does not mutate or promote
+    Stage 2 artifacts and cannot satisfy any Stage 3 gate after G3-0.
+    """
+
+    decision_ref = request.environment.evidence_refs.get("stage3_scope_decision")
+    gate_ref = request.environment.evidence_refs.get("stage3_g30_gate")
+    if not all(isinstance(item, str) and item for item in (decision_ref, gate_ref)):
+        raise ValueError("STAGE3_EXPLICIT_SCOPE_AUTHORITY_REFS_REQUIRED")
+    decision_artifact = load_committed_task_artifact(
+        root,
+        decision_ref,
+        require_formal=True,
+    )
+    gate_artifact = load_committed_task_artifact(
+        root,
+        gate_ref,
+        require_formal=True,
+    )
+    if (
+        decision_artifact.identity.task_id != STAGE3_SCOPE_TASK_ID
+        or decision_artifact.identity.artifact_kind != STAGE3_SCOPE_ARTIFACT_KIND
+        or gate_artifact.identity.task_id != STAGE3_SCOPE_TASK_ID
+        or gate_artifact.identity.artifact_kind != "gate_record"
+        or decision_artifact.identity.config_hash
+        != gate_artifact.identity.config_hash
+    ):
+        raise ValueError("STAGE3_EXPLICIT_SCOPE_ENVELOPE_IDENTITY_INVALID")
+    decision_value = decision_artifact.payload
+    gate = GateRecord.from_mapping(dict(gate_artifact.payload))
+    validate_stage3_scope_authority(
+        decision_value,
+        gate,
+        decision_ref=decision_ref,
+    )
+    if evidence is not None:
+        bound = tuple(
+            item for item in evidence.prerequisite_gates if item.gate_id == gate.gate_id
+        )
+        if (
+            len(bound) != 1
+            or bound[0].artifact_hash != gate.artifact_hash
+            or gate_ref not in evidence.metadata.get("stage3_scope_authority_refs", ())
+        ):
+            raise FormalRunRejected("STAGE3_EXPLICIT_SCOPE_EVIDENCE_BINDING_MISMATCH")
+    return decision_value, gate, decision_ref, gate_ref  # type: ignore[return-value]
+
+
 def _formal_execution_evidence(
     request: TaskExecutionRequest,
     root: Path,
@@ -1184,9 +1364,24 @@ def _formal_execution_evidence(
             "formal Stage 2/3 缺少 FormalExecutionEvidence commit 引用",
         )
     try:
-        value = load_canonical_json(
-            _workspace_path(root, reference, field="formal_execution")
-        )
+        if request.task.stage == 3:
+            committed = load_committed_task_artifact(
+                root,
+                reference,
+                require_formal=True,
+            )
+            if committed.identity.artifact_kind not in {
+                "formal_execution_evidence",
+                "execution_evidence",
+            }:
+                raise ValueError(
+                    "STAGE3_FORMAL_EXECUTION_COMMIT_ARTIFACT_KIND_INVALID"
+                )
+            value = committed.payload
+        else:
+            value = load_canonical_json(
+                _workspace_path(root, reference, field="formal_execution")
+            )
         if not isinstance(value, Mapping):
             raise ValueError("FORMAL_EXECUTION_EVIDENCE_ROOT_NOT_OBJECT")
         evidence = FormalExecutionEvidence.from_mapping(value)
@@ -1199,45 +1394,62 @@ def _formal_execution_evidence(
             evidence_refs=(reference,),
         ) from error
 
-    stage1_ref = request.environment.evidence_refs.get("stage1_g1_exit")
-    if not isinstance(stage1_ref, str) or not stage1_ref:
-        raise _blocked(
-            BlockerCode.CONTRACT_UNFROZEN,
-            "stage1_g1_exit",
-            "formal Stage 2/3 必须绑定 Stage 1 G1-EXIT 正式 index，不能消费 Git fixture",
-            evidence_refs=(reference,),
-        )
-    try:
-        validate_stage1_exit_evidence(root, stage1_ref)
-    except (Stage1HandoffError, FileNotFoundError, OSError, TypeError, ValueError) as error:
-        raise _blocked(
-            BlockerCode.CONTRACT_UNFROZEN,
-            "stage1_g1_exit",
-            f"Stage 1 G1-EXIT 正式 handoff 不可接受：{type(error).__name__}: {error}",
-            retryable=False,
-            evidence_refs=(stage1_ref, reference),
-        ) from error
+    stage1_ref: str | None = None
+    if request.task.stage == 3:
+        try:
+            _stage3_scope_authority(request, root, evidence=evidence)
+        except (
+            FileNotFoundError,
+            OSError,
+            TypeError,
+            ValueError,
+            FormalRunRejected,
+        ) as error:
+            raise _blocked(
+                BlockerCode.CONTRACT_UNFROZEN,
+                "stage3_explicit_scope_authority",
+                f"Stage 3 显式范围授权不可接受：{type(error).__name__}: {error}",
+                retryable=False,
+                evidence_refs=(reference,),
+            ) from error
+    else:
+        stage1_ref = request.environment.evidence_refs.get("stage1_g1_exit")
+        if not isinstance(stage1_ref, str) or not stage1_ref:
+            raise _blocked(
+                BlockerCode.CONTRACT_UNFROZEN,
+                "stage1_g1_exit",
+                "formal Stage 2 必须绑定 Stage 1 G1-EXIT 正式 index，不能消费 Git fixture",
+                evidence_refs=(reference,),
+            )
+        try:
+            validate_stage1_exit_evidence(root, stage1_ref)
+        except (Stage1HandoffError, FileNotFoundError, OSError, TypeError, ValueError) as error:
+            raise _blocked(
+                BlockerCode.CONTRACT_UNFROZEN,
+                "stage1_g1_exit",
+                f"Stage 1 G1-EXIT 正式 handoff 不可接受：{type(error).__name__}: {error}",
+                retryable=False,
+                evidence_refs=(stage1_ref, reference),
+            ) from error
 
-    stage0_ref = request.environment.evidence_refs.get("stage0_handoff")
-    if not isinstance(stage0_ref, str) or not stage0_ref:
-        raise _blocked(
-            BlockerCode.CONTRACT_UNFROZEN,
-            "stage0_handoff",
-            "formal Stage 2/3 必须绑定 Stage 0 handoff manifest",
-            evidence_refs=(reference, stage1_ref),
-        )
-    try:
-        # ``require_ready`` is deliberate: a complete historical role/hash
-        # index is not a current hardware or persistence authorization.
-        validate_stage0_handoff(root, stage0_ref, require_ready=True)
-    except (Stage0HandoffError, FileNotFoundError, OSError, TypeError, ValueError) as error:
-        raise _blocked(
-            BlockerCode.CONTRACT_UNFROZEN,
-            "stage0_handoff",
-            f"Stage 0 handoff 不可作为当前 formal authority：{type(error).__name__}: {error}",
-            retryable=False,
-            evidence_refs=(stage0_ref, stage1_ref, reference),
-        ) from error
+        stage0_ref = request.environment.evidence_refs.get("stage0_handoff")
+        if not isinstance(stage0_ref, str) or not stage0_ref:
+            raise _blocked(
+                BlockerCode.CONTRACT_UNFROZEN,
+                "stage0_handoff",
+                "formal Stage 2 必须绑定 Stage 0 handoff manifest",
+                evidence_refs=(reference, stage1_ref),
+            )
+        try:
+            validate_stage0_handoff(root, stage0_ref, require_ready=True)
+        except (Stage0HandoffError, FileNotFoundError, OSError, TypeError, ValueError) as error:
+            raise _blocked(
+                BlockerCode.CONTRACT_UNFROZEN,
+                "stage0_handoff",
+                f"Stage 0 handoff 不可作为当前 formal authority：{type(error).__name__}: {error}",
+                retryable=False,
+                evidence_refs=(stage0_ref, stage1_ref, reference),
+            ) from error
 
     required_gates = set(request.task.formal_eligibility.required_gate_ids)
     evidence_gates = {gate.gate_id for gate in evidence.prerequisite_gates}
@@ -1249,17 +1461,18 @@ def _formal_execution_evidence(
             f"FormalExecutionEvidence 未绑定任务所需 Gate：{missing}",
             evidence_refs=(reference,),
         )
-    stage1_gates = tuple(
-        gate for gate in evidence.prerequisite_gates if gate.gate_id == "stage1.G1-EXIT"
-    )
-    if len(stage1_gates) != 1 or stage1_ref not in stage1_gates[0].evidence_refs:
-        raise _blocked(
-            BlockerCode.CONTRACT_UNFROZEN,
-            "stage1_g1_exit",
-            "FormalExecutionEvidence 的 stage1.G1-EXIT 未绑定同一正式 index ref",
-            retryable=False,
-            evidence_refs=(stage1_ref, reference),
+    if request.task.stage != 3:
+        stage1_gates = tuple(
+            gate for gate in evidence.prerequisite_gates if gate.gate_id == "stage1.G1-EXIT"
         )
+        if len(stage1_gates) != 1 or stage1_ref not in stage1_gates[0].evidence_refs:
+            raise _blocked(
+                BlockerCode.CONTRACT_UNFROZEN,
+                "stage1_g1_exit",
+                "FormalExecutionEvidence 的 stage1.G1-EXIT 未绑定同一正式 index ref",
+                retryable=False,
+                evidence_refs=(stage1_ref or "<missing>", reference),
+            )
     runtime_gates = set(request.environment.passed_gate_ids)
     if not required_gates.issubset(runtime_gates):
         missing_runtime = sorted(required_gates - runtime_gates)
@@ -1676,31 +1889,51 @@ def _formal_provider(request: TaskExecutionRequest, root: Path) -> _ProviderCont
     if request.config.run_intent != "formal":
         raise RuntimeError("FORMAL_PROVIDER_REQUIRES_FORMAL_INTENT")
     evidence, evidence_ref = _formal_execution_evidence(request, root)
-    stage1_ref = request.environment.evidence_refs["stage1_g1_exit"]
-    stage0_ref = request.environment.evidence_refs["stage0_handoff"]
-    try:
-        stage1_exit = validate_stage1_exit_evidence(root, stage1_ref)
-    except (Stage1HandoffError, FileNotFoundError, OSError, TypeError, ValueError) as error:
-        # Keep this second read deliberate: the provider context stores the
-        # exact hashes it consumed, so later handoff payloads cannot infer them
-        # from a mutable request mapping.
-        raise _blocked(
-            BlockerCode.CONTRACT_UNFROZEN,
-            "stage1_g1_exit",
-            f"Stage 1 G1-EXIT 正式 handoff 不可接受：{type(error).__name__}: {error}",
-            retryable=False,
-            evidence_refs=(stage1_ref, evidence_ref),
-        ) from error
-    try:
-        stage0_handoff = validate_stage0_handoff(root, stage0_ref, require_ready=True)
-    except (Stage0HandoffError, FileNotFoundError, OSError, TypeError, ValueError) as error:
-        raise _blocked(
-            BlockerCode.CONTRACT_UNFROZEN,
-            "stage0_handoff",
-            f"Stage 0 handoff 不可作为当前 formal authority：{type(error).__name__}: {error}",
-            retryable=False,
-            evidence_refs=(stage0_ref, stage1_ref, evidence_ref),
-        ) from error
+    stage3_scope_decision: Mapping[str, JSONValue] | None = None
+    if request.task.stage == 3:
+        try:
+            stage3_scope_decision, _gate, _decision_ref, _gate_ref = (
+                _stage3_scope_authority(request, root, evidence=evidence)
+            )
+        except (
+            FileNotFoundError,
+            OSError,
+            TypeError,
+            ValueError,
+            FormalRunRejected,
+        ) as error:
+            raise _blocked(
+                BlockerCode.CONTRACT_UNFROZEN,
+                "stage3_explicit_scope_authority",
+                f"Stage 3 显式范围授权不可接受：{type(error).__name__}: {error}",
+                retryable=False,
+                evidence_refs=(evidence_ref,),
+            ) from error
+        stage1_exit = None
+        stage0_handoff = None
+    else:
+        stage1_ref = request.environment.evidence_refs["stage1_g1_exit"]
+        stage0_ref = request.environment.evidence_refs["stage0_handoff"]
+        try:
+            stage1_exit = validate_stage1_exit_evidence(root, stage1_ref)
+        except (Stage1HandoffError, FileNotFoundError, OSError, TypeError, ValueError) as error:
+            raise _blocked(
+                BlockerCode.CONTRACT_UNFROZEN,
+                "stage1_g1_exit",
+                f"Stage 1 G1-EXIT 正式 handoff 不可接受：{type(error).__name__}: {error}",
+                retryable=False,
+                evidence_refs=(stage1_ref, evidence_ref),
+            ) from error
+        try:
+            stage0_handoff = validate_stage0_handoff(root, stage0_ref, require_ready=True)
+        except (Stage0HandoffError, FileNotFoundError, OSError, TypeError, ValueError) as error:
+            raise _blocked(
+                BlockerCode.CONTRACT_UNFROZEN,
+                "stage0_handoff",
+                f"Stage 0 handoff 不可作为当前 formal authority：{type(error).__name__}: {error}",
+                retryable=False,
+                evidence_refs=(stage0_ref, stage1_ref, evidence_ref),
+            ) from error
     providers = request.config.section("providers")
     if not isinstance(providers, dict) or providers.get("kind") != "offline_hf":
         raise _blocked(
@@ -1927,6 +2160,7 @@ def _formal_provider(request: TaskExecutionRequest, root: Path) -> _ProviderCont
             if selected_checkpoint is not None
             else None
         ),
+        stage3_scope_decision=stage3_scope_decision,
     )
 
 
@@ -2739,6 +2973,40 @@ def _run_stage2_assets_and_sampling(
     return payloads, inputs.references
 
 
+def _load_formal_document_ref(
+    root: Path,
+    reference: str,
+    *,
+    field: str,
+    schema_version: str,
+) -> Mapping[str, object]:
+    """Load a frozen document either directly or from a formal task commit.
+
+    Stage 3 production uses the committed form so the independent G3-6
+    publisher can bind the exact plan artifact.  The direct form remains a
+    read-only compatibility path for earlier Stage 2 plans and unit fixtures.
+    """
+
+    path = _workspace_path(root, reference, field=field)
+    raw = load_canonical_json(path)
+    if isinstance(raw, Mapping) and raw.get("schema_version") == schema_version:
+        return raw
+    try:
+        committed = load_committed_task_artifact(
+            root,
+            reference,
+            require_formal=True,
+        )
+    except (FileNotFoundError, OSError, TypeError, ValueError) as error:
+        raise ValueError(f"FORMAL_DOCUMENT_REF_INVALID:{field}") from error
+    payload = committed.payload
+    if payload.get("schema_version") != schema_version:
+        raise ValueError(
+            f"FORMAL_DOCUMENT_SCHEMA_MISMATCH:{field}:{schema_version}"
+        )
+    return payload
+
+
 def _formal_input_document(
     request: TaskExecutionRequest,
     root: Path,
@@ -2759,24 +3027,19 @@ def _formal_input_document(
     environment_ref = request.environment.evidence_refs.get(requirement)
     if environment_ref is not None:
         try:
-            value = load_canonical_json(
-                _workspace_path(root, environment_ref, field=requirement)
+            value = _load_formal_document_ref(
+                root,
+                environment_ref,
+                field=requirement,
+                schema_version=schema_version,
             )
-        except (FileNotFoundError, ValueError) as error:
+        except (FileNotFoundError, OSError, TypeError, ValueError) as error:
             raise _blocked(
                 BlockerCode.CONTRACT_UNFROZEN,
                 requirement,
                 f"正式辅助计划不可读：{type(error).__name__}: {error}",
                 evidence_refs=(environment_ref,),
             ) from error
-        if not isinstance(value, Mapping) or value.get("schema_version") != schema_version:
-            raise _blocked(
-                BlockerCode.CONTRACT_UNFROZEN,
-                requirement,
-                f"环境证据不是所需 {schema_version}",
-                retryable=False,
-                evidence_refs=(environment_ref,),
-            )
         return value, environment_ref
 
     matches: list[tuple[Mapping[str, object], str]] = []
@@ -2784,13 +3047,15 @@ def _formal_input_document(
         str(item) for item in orchestration["input_result_refs"]
     ):
         try:
-            value = load_canonical_json(
-                _workspace_path(root, reference, field=requirement)
+            value = _load_formal_document_ref(
+                root,
+                reference,
+                field=requirement,
+                schema_version=schema_version,
             )
-        except (FileNotFoundError, ValueError):
+        except (FileNotFoundError, OSError, TypeError, ValueError):
             continue
-        if isinstance(value, Mapping) and value.get("schema_version") == schema_version:
-            matches.append((value, reference))
+        matches.append((value, reference))
     if len(matches) != 1:
         raise _blocked(
             BlockerCode.CONTRACT_UNFROZEN,
@@ -5652,6 +5917,55 @@ def _run_stage3_prerequisites(
 ) -> tuple[Mapping[str, Mapping[str, JSONValue]], tuple[str, ...]]:
     """验证 Stage 2 交付和 estimator decision，再冻结 Stage 3 fixture 范围。"""
 
+    if request.config.run_intent == "formal":
+        try:
+            decision, gate, decision_ref, gate_ref = _stage3_scope_authority(
+                request, root
+            )
+        except (OSError, TypeError, ValueError, FormalRunRejected) as error:
+            raise _blocked(
+                BlockerCode.CONTRACT_UNFROZEN,
+                "stage3_explicit_scope_authority",
+                f"Stage 3 用户范围授权不可验证：{error}",
+                retryable=False,
+            ) from error
+        stage2 = decision["accepted_stage_inputs"]["stage2"]  # type: ignore[index]
+        prerequisite: dict[str, JSONValue] = {
+            "schema_version": "stage3-task-prerequisite-report-v1",
+            "entry_authority": "explicit_user_direction",
+            "stage3_scope_decision_hash": str(decision["artifact_hash"]),
+            "stage3_g30_gate_hash": gate.artifact_hash,
+            "stage2_run_id": str(stage2["run_id"]),  # type: ignore[index]
+            "stage2_estimator": str(stage2["default_estimator"]),  # type: ignore[index]
+            "stage2_batch_size": int(stage2["batch_size"]),  # type: ignore[index]
+            "stage2_sensitivity_control": str(stage2["sensitivity_control"]),  # type: ignore[index]
+            "stage2_artifacts_relabelled": False,
+            "local_validation_status": "PASS",
+            "formal_gate_status": "PASS",
+        }
+        scope_freeze: dict[str, JSONValue] = {
+            "schema_version": "stage3-task-scope-freeze-v1",
+            "path_family": "linear_parameter_endpoint",
+            "probe_roles": ["pilot", "formal", "replay"],
+            "required_views": ["signed", "positive", "negative_mass", "absolute"],
+            "reference_policy": "two_independent_rule_families_with_continuous_refinement",
+            "estimator": "U-32",
+            "batch_size": 32,
+            "sensitivity_control": "Raw",
+            "formal_default_rule_status": "UNFROZEN",
+            "formal_probe_count_status": "UNFROZEN",
+            "formal_node_budget_status": "UNFROZEN",
+            "scope": "formal",
+            "formal_eligible": False,
+        }
+        return (
+            {
+                "prerequisite_report": prerequisite,
+                "scope_freeze": scope_freeze,
+                "gate_record": _gate_candidate(request),
+            },
+            (decision_ref, gate_ref),
+        )
     inputs = _predecessor_context(request, root, store)
     delivery = inputs.payload("delivery_manifest")
     replay = inputs.payload("replay_report")
@@ -5864,6 +6178,27 @@ class _PathStateController:
 
 
 @dataclass(frozen=True, slots=True)
+class _PathEvaluationCost:
+    """Measured cost of one rule invocation.
+
+    ``gradient_evaluations`` is the number of cache misses, not the number of
+    quadrature nodes requested.  ``loss_evaluations`` includes every node loss
+    and both endpoint losses, which are intentionally not free.  The latter
+    distinction is important for the formal provider because its loss API
+    currently executes a complete forward/backward evaluation.
+    """
+
+    gradient_evaluations: int = 0
+    loss_evaluations: int = 0
+    forward_evaluations: int = 0
+    backward_evaluations: int = 0
+    wall_seconds: float = 0.0
+    peak_gpu_memory_bytes: int | None = None
+    cache_hits: int = 0
+    cache_misses: int = 0
+
+
+@dataclass(frozen=True, slots=True)
 class _PathContext:
     """同一份 local/formal 路径执行上下文。
 
@@ -5887,6 +6222,13 @@ class _PathContext:
     state_controller: _PathStateController
     node_cache: PersistentNodeGradientCache
     node_cache_root_ref: str
+    # Mutable only as a per-context diagnostic log; scientific path state and
+    # cache identities remain frozen.  Keeping this outside PathIntegralResult
+    # avoids changing the core quadrature contract while still binding the
+    # reported cost to the exact rule invocation that produced the result.
+    _cost_by_rule: dict[str, "_PathEvaluationCost"] = field(
+        default_factory=dict, compare=False, repr=False
+    )
 
     @property
     def precision(self) -> str:
@@ -5909,7 +6251,20 @@ class _PathContext:
 
     def integrate(self, rule: object) -> PathIntegralResult:
         """经公共只读事务与持久节点缓存执行一次真实求积。"""
+        gradient_callbacks = 0
+        loss_callbacks = 0
 
+        def counted_gradient(alpha: float, state: TensorMap) -> TensorMap:
+            nonlocal gradient_callbacks
+            gradient_callbacks += 1
+            return self.gradient_fn(alpha, state)
+
+        def counted_loss(state: TensorMap) -> torch.Tensor:
+            nonlocal loss_callbacks
+            loss_callbacks += 1
+            return self.loss_fn(state)
+
+        started = perf_counter()
         evaluation = PathAnalysisRunner(node_cache=self.node_cache).run_bound(
             unit_id=self.unit_id,
             precision=self.precision,
@@ -5917,16 +6272,62 @@ class _PathContext:
             loss_contract_hash=self.primary_probe.loss_contract_hash,
             path_spec=self.path,
             rule=rule,
-            gradient_callback=self.gradient_fn,
-            loss_callback=self.loss_fn,
+            gradient_callback=counted_gradient,
+            loss_callback=counted_loss,
             state_controller=self.state_controller,
             scope=self.execution.run_intent,
             formal_eligible=self.execution.formal_eligible,
         )
+        elapsed = perf_counter() - started
         result = evaluation.result
         if not isinstance(result, PathIntegralResult):
             raise TypeError("STAGE3_PATH_INTEGRATOR_RESULT_INVALID")
+        peak_memory: int | None = None
+        if self.execution.run_intent == "formal" and torch.cuda.is_available():
+            # Do not reset the process-wide CUDA peak counter here: a reset
+            # would race with an embedding training job.  The value is still a
+            # real observed upper bound for this process and is explicitly
+            # labelled as such in the payload.
+            peak_memory = int(
+                max(
+                    torch.cuda.max_memory_allocated(device)
+                    for device in range(torch.cuda.device_count())
+                )
+            )
+        rule_key = str(getattr(rule, "artifact_hash", getattr(rule, "name", "unknown-rule")))
+        self._cost_by_rule[rule_key] = _PathEvaluationCost(
+            gradient_evaluations=int(evaluation.cache_misses),
+            loss_evaluations=loss_callbacks,
+            # The formal provider's loss_at is intentionally implemented via
+            # gradient_at_parameter_state, so every callback is one forward
+            # and one backward.  Fixture callbacks are analytic and therefore
+            # report no autograd forward/backward work.
+            forward_evaluations=(gradient_callbacks + loss_callbacks)
+            if self.execution.run_intent == "formal"
+            else 0,
+            backward_evaluations=(gradient_callbacks + loss_callbacks)
+            if self.execution.run_intent == "formal"
+            else 0,
+            # Wall-clock is an observed production cost, not part of the
+            # analytic fixture identity.  Keeping fixture artifacts at zero
+            # preserves cross-workspace reproducibility while formal runs
+            # retain the real measurement.
+            wall_seconds=(
+                max(0.0, float(elapsed))
+                if self.execution.run_intent == "formal"
+                else 0.0
+            ),
+            peak_gpu_memory_bytes=peak_memory,
+            cache_hits=int(evaluation.cache_hits),
+            cache_misses=int(evaluation.cache_misses),
+        )
         return result
+
+    def cost_for(self, rule: object) -> "_PathEvaluationCost":
+        """Return measured cost for the most recent invocation of ``rule``."""
+
+        rule_key = str(getattr(rule, "artifact_hash", getattr(rule, "name", "unknown-rule")))
+        return self._cost_by_rule.get(rule_key, _PathEvaluationCost())
 
     def cache_evidence(self, rules: Sequence[object]) -> dict[str, JSONValue]:
         """生成与规则集合绑定、fresh/resume 一致的节点缓存证据。
@@ -6327,6 +6728,14 @@ def _load_formal_endpoint_and_probe_plan(
 
     orchestration = request.config.section("orchestration")
     assert isinstance(orchestration, dict)
+    expected_scope = _stage3_production_index_scope(request)
+    # Stage 3.05/3.06 are formal *executions* of the frozen pilot index.  The
+    # endpoint/probe assets they consume remain pilot-scoped and ineligible;
+    # only Stage 3.07 and its downstream consumers use formal assets.  Do not
+    # silently widen this to ``formal`` merely because the enclosing run has a
+    # formal execution evidence object.
+    if request.config.run_intent == "formal" and expected_scope is None:
+        expected_scope = FORMAL_SCOPE
     endpoint_commits: list[tuple[str, Mapping[str, object]]] = []
     probe_plans: list[tuple[str, Mapping[str, object]]] = []
     for raw_ref in orchestration["input_result_refs"]:
@@ -6375,15 +6784,22 @@ def _load_formal_endpoint_and_probe_plan(
             retryable=False,
             evidence_refs=(probe_ref,),
         )
+    expected_formal_eligible = expected_scope == FORMAL_SCOPE
     if (
-        probe_plan.get("scope") != "formal"
-        or probe_plan.get("formal_eligible") is not True
-        or probe_plan.get("execution_evidence_hash") != evidence.artifact_hash
+        probe_plan.get("scope") != expected_scope
+        or probe_plan.get("formal_eligible") is not expected_formal_eligible
+        or (
+            expected_scope == FORMAL_SCOPE
+            and probe_plan.get("execution_evidence_hash") != evidence.artifact_hash
+        )
     ):
         raise _blocked(
             BlockerCode.CONTRACT_UNFROZEN,
             "stage3_probe_plan_qualification",
-            "probe plan 未绑定当前 formal execution evidence",
+            (
+                "probe plan 未绑定当前 Stage 3 production scope/execution evidence："
+                f"expected_scope={expected_scope}"
+            ),
             retryable=False,
             evidence_refs=(probe_ref,),
         )
@@ -6411,14 +6827,24 @@ def _load_formal_endpoint_and_probe_plan(
             evidence_refs=(endpoint_ref,),
         )
     if (
-        commit.get("scope") != "formal"
-        or commit.get("formal_eligible") is not True
-        or commit.get("qualification_evidence_hash") != evidence.artifact_hash
+        commit.get("scope") != expected_scope
+        or commit.get("formal_eligible") is not expected_formal_eligible
+        # A pilot endpoint is deliberately not formally eligible and therefore
+        # cannot carry qualification evidence.  The current formal execution
+        # is still required by ``_formal_provider``/G3-1; it is not an asset
+        # qualification claim on the pilot capture itself.
+        or (
+            commit.get("qualification_evidence_hash")
+            != (evidence.artifact_hash if expected_scope == FORMAL_SCOPE else None)
+        )
     ):
         raise _blocked(
             BlockerCode.CONTRACT_UNFROZEN,
             "training_endpoint_qualification",
-            "endpoint commit 未由当前 formal execution evidence 资格化",
+            (
+                "endpoint commit 未绑定当前 Stage 3 production scope/execution "
+                f"evidence：expected_scope={expected_scope}"
+            ),
             retryable=False,
             evidence_refs=(endpoint_ref,),
         )
@@ -6443,6 +6869,13 @@ def _load_formal_endpoint_and_probe_plan(
             {key: item for key, item in object_value.items() if key != "artifact_hash"}
         ):
             raise ValueError("endpoint object artifact_hash 不可复算")
+        if (
+            object_value.get("scope") != expected_scope
+            or object_value.get("formal_eligible") is not expected_formal_eligible
+            or object_value.get("qualification_evidence_hash")
+            != commit.get("qualification_evidence_hash")
+        ):
+            raise ValueError("endpoint object scope/qualification 与 commit 不一致")
         record = _endpoint_record_from_wire(object_value.get("record"))
         if record.digest != commit.get("endpoint_digest"):
             raise ValueError("endpoint record 与 commit digest 不一致")
@@ -6508,6 +6941,177 @@ def _normalize_ddp_names(
     return {name: stripped[name] for name in expected_names}
 
 
+def _formal_stage3_probe_selector(
+    request: TaskExecutionRequest,
+    root: Path,
+) -> tuple[
+    str | None,
+    str | None,
+    str | None,
+    tuple[str, str] | None,
+]:
+    """Read the explicit formal path-unit binding from orchestration config.
+
+    ``probe_count`` describes the panel; it is not a selection.  Formal runs
+    with more than one probe therefore cannot silently use the first entry.
+    The selector is intentionally an optional orchestration/runtime field so
+    old local fixture configs remain valid while production matrix shards can
+    bind either a probe id or its derived path-unit id.
+    """
+
+    candidates: list[tuple[str, str]] = []
+    selector_index_hash: str | None = None
+    probe_selector_binding: tuple[str, str] | None = None
+    configs: tuple[object, ...] = (request.config, request.config.base_config)
+    for config in configs:
+        for section_name in ("orchestration", "path_integration"):
+            try:
+                section = config.section(section_name)  # type: ignore[attr-defined]
+            except (AttributeError, KeyError, TypeError):
+                continue
+            if not isinstance(section, Mapping):
+                continue
+            for key in ("active_probe_id", "active_unit_id"):
+                value = section.get(key)
+                if value is None:
+                    continue
+                if not isinstance(value, str) or not value:
+                    raise _blocked(
+                        BlockerCode.CONTRACT_UNFROZEN,
+                        "stage3_formal_probe_selector",
+                        f"{section_name}.{key} 必须是非空字符串",
+                        retryable=False,
+                    )
+                candidates.append((key, value))
+    if request.config.run_intent == "formal":
+        orchestration = request.config.section("orchestration")
+        if isinstance(orchestration, Mapping):
+            route_spec_ref = orchestration.get("route_spec_ref")
+            if route_spec_ref is not None:
+                if not isinstance(route_spec_ref, str) or not route_spec_ref:
+                    raise _blocked(
+                        BlockerCode.CONTRACT_UNFROZEN,
+                        "stage3_formal_probe_selector",
+                        "orchestration.route_spec_ref 必须是非空逻辑引用",
+                        retryable=False,
+                    )
+                try:
+                    selector = load_canonical_json(
+                        _workspace_path(
+                            root,
+                            route_spec_ref,
+                            field="orchestration.route_spec_ref",
+                        )
+                    )
+                    if not isinstance(selector, Mapping):
+                        raise TypeError("selector 不是 object")
+                    if selector.get("artifact_hash") != canonical_json_hash(
+                        {
+                            key: value
+                            for key, value in selector.items()
+                            if key != "artifact_hash"
+                        }
+                    ):
+                        raise ValueError("selector hash 不可复算")
+                    expected_scope = _stage3_production_index_scope(request)
+                    selector_schema = selector.get("schema_version")
+                    if selector_schema == "stage3-path-unit-selector-v1":
+                        expected = {
+                            "schema_version",
+                            "scope",
+                            "unit_index_hash",
+                            "active_unit_id",
+                            "artifact_hash",
+                        }
+                        if set(selector) != expected or expected_scope is None:
+                            raise ValueError("path-unit selector task/字段不匹配")
+                        if selector.get("scope") != expected_scope:
+                            raise ValueError("selector scope 与 task production scope 不一致")
+                        unit_id = selector.get("active_unit_id")
+                        if not isinstance(unit_id, str) or not unit_id:
+                            raise ValueError("selector active_unit_id 无效")
+                        index_hash = selector.get("unit_index_hash")
+                        if (
+                            not isinstance(index_hash, str)
+                            or re.fullmatch(r"[0-9a-f]{64}", index_hash) is None
+                        ):
+                            raise ValueError("selector unit_index_hash 无效")
+                        candidates.append(("active_unit_id", unit_id))
+                        selector_index_hash = index_hash
+                    elif selector_schema == "stage3-probe-selector-v1":
+                        expected = {
+                            "schema_version",
+                            "scope",
+                            "endpoint_digest",
+                            "probe_plan_hash",
+                            "active_probe_id",
+                            "artifact_hash",
+                        }
+                        if set(selector) != expected or expected_scope is not None:
+                            raise ValueError("probe selector task/字段不匹配")
+                        if selector.get("scope") != FORMAL_SCOPE:
+                            raise ValueError("probe selector scope 必须为 formal")
+                        probe_id = selector.get("active_probe_id")
+                        if not isinstance(probe_id, str) or not probe_id:
+                            raise ValueError("selector active_probe_id 无效")
+                        for field in ("endpoint_digest", "probe_plan_hash"):
+                            digest = selector.get(field)
+                            if (
+                                not isinstance(digest, str)
+                                or re.fullmatch(r"[0-9a-f]{64}", digest) is None
+                            ):
+                                raise ValueError(f"probe selector {field} 无效")
+                        candidates.append(("active_probe_id", probe_id))
+                        probe_selector_binding = (
+                            str(selector["endpoint_digest"]),
+                            str(selector["probe_plan_hash"]),
+                        )
+                    else:
+                        raise ValueError("selector schema 不匹配")
+                except (FileNotFoundError, OSError, TypeError, ValueError) as error:
+                    raise _blocked(
+                        BlockerCode.CONTRACT_UNFROZEN,
+                        "stage3_formal_probe_selector",
+                        f"path-unit selector 无法严格加载：{error}",
+                        retryable=False,
+                        evidence_refs=(route_spec_ref,),
+                    ) from error
+    unique = tuple(dict.fromkeys(candidates))
+    if len({key for key, _value in unique}) > 1:
+        raise _blocked(
+            BlockerCode.CONTRACT_UNFROZEN,
+            "stage3_formal_probe_selector",
+            "active_probe_id/active_unit_id 声明冲突",
+            retryable=False,
+        )
+    if len(unique) > 1:
+        values = {value for _key, value in unique}
+        if len(values) != 1:
+            raise _blocked(
+                BlockerCode.CONTRACT_UNFROZEN,
+                "stage3_formal_probe_selector",
+                "formal probe selector 在配置层级间不一致",
+                retryable=False,
+            )
+    if not unique:
+        return None, None, None, None
+    key, value = unique[0]
+    if key == "active_probe_id":
+        return value, None, selector_index_hash, probe_selector_binding
+    return None, value, selector_index_hash, probe_selector_binding
+
+
+def _stage3_production_index_scope(request: TaskExecutionRequest) -> str | None:
+    """Return the frozen production-index scope required by this Stage 3 task."""
+
+    task_id = getattr(getattr(request, "task", None), "task_id", None)
+    if task_id in _STAGE3_PILOT_PLAN_TASKS:
+        return "pilot"
+    if task_id in _STAGE3_MATRIX_PLAN_TASKS:
+        return "formal"
+    return None
+
+
 def _formal_path_context(
     request: TaskExecutionRequest,
     root: Path,
@@ -6517,6 +7121,9 @@ def _formal_path_context(
 
     provider_context = _formal_provider(request, root)
     evidence = provider_context.evidence.require_for_stage(3)
+    expected_scope = _stage3_production_index_scope(request)
+    if request.config.run_intent == "formal" and expected_scope is None:
+        expected_scope = FORMAL_SCOPE
     endpoint, probe_plan, probe_ref, bundle_refs = _load_formal_endpoint_and_probe_plan(
         request, root, evidence
     )
@@ -6559,18 +7166,37 @@ def _formal_path_context(
                 evidence_refs=(binding["ref"],),
             ) from error
 
-    base_optimizer = request.config.base_config.section("optimizer")
-    optimizer_runtime = request.config.section("optimizer_runtime")
-    assert isinstance(base_optimizer, dict) and isinstance(optimizer_runtime, dict)
     try:
-        registry_optimizer = build_optimizer(
-            provider.model_adapter.module.parameters(),
-            base_optimizer,
-            optimizer_runtime,
-        )
-        registry = ParameterRegistry.from_model(
-            provider.model_adapter.module, registry_optimizer
-        )
+        if provider_context.provider_kind == "offline_hf_torch_fixed_state":
+            registry_ref = request.environment.evidence_refs.get(
+                "stage2_parameter_registry"
+            )
+            if not isinstance(registry_ref, str) or not registry_ref:
+                raise ValueError("FORMAL_PARAMETER_REGISTRY_REF_REQUIRED")
+            # Reload the exact upstream S2.3 coordinate registry, including
+            # its frozen layer/module tags.  Re-inferring a fresh registry
+            # here would allow grouping labels to drift while parameter names
+            # still match.
+            registry = _load_formal_parameter_registry(
+                root, registry_ref, provider.model_adapter.module
+            )
+        else:
+            # In-memory formal-shaped adapter tests have no external S2.3
+            # artifact.  They remain non-production because the only real
+            # provider kind accepted above is handled by the strict branch.
+            base_optimizer = request.config.base_config.section("optimizer")
+            optimizer_runtime = request.config.section("optimizer_runtime")
+            assert isinstance(base_optimizer, dict) and isinstance(
+                optimizer_runtime, dict
+            )
+            registry_optimizer = build_optimizer(
+                provider.model_adapter.module.parameters(),
+                base_optimizer,
+                optimizer_runtime,
+            )
+            registry = ParameterRegistry.from_model(
+                provider.model_adapter.module, registry_optimizer
+            )
         pre_raw = loaded_states["pre"].get("parameters")
         post_raw = loaded_states["parameter_post"].get("parameters")
         buffers_raw = loaded_states["pre"].get("buffers")
@@ -6629,6 +7255,29 @@ def _formal_path_context(
             retryable=False,
             evidence_refs=(probe_ref,),
         )
+    expected_entry_role = "formal" if expected_scope == FORMAL_SCOPE else "pilot"
+    expected_entry_count = 3 if expected_scope == FORMAL_SCOPE else 2
+    raw_entries = probe_plan.get("entries")
+    if (
+        not isinstance(raw_entries, list)
+        or len(raw_entries) != expected_entry_count
+        or any(
+            not isinstance(item, Mapping)
+            or item.get("role") != expected_entry_role
+            for item in raw_entries
+        )
+    ):
+        raise _blocked(
+            BlockerCode.CONTRACT_UNFROZEN,
+            "stage3_probe_plan_scope",
+            (
+                "probe plan 必须严格匹配当前 production scope："
+                f"scope={expected_scope}, role={expected_entry_role}, "
+                f"count={expected_entry_count}"
+            ),
+            retryable=False,
+            evidence_refs=(probe_ref,),
+        )
     try:
         entries: list[ProbePanelEntry] = []
         available = set(provider_context.sample_ids)
@@ -6654,21 +7303,32 @@ def _formal_path_context(
                     ),
                 )
             )
+        # ``ProbePanel`` models local_fixture/formal qualification, while the
+        # production plan has a third, pilot-only scope.  Keep the raw pilot
+        # roles and ineligible qualification rather than relabeling them as
+        # formal probes; the enclosing FormalExecutionEvidence still gates the
+        # actual provider and G3-1 environment.
+        panel_execution = (
+            evidence
+            if expected_scope == FORMAL_SCOPE
+            else FormalExecutionEvidence("local_fixture")
+        )
         panel = ProbePanel.build(
             panel_id=str(probe_plan["panel_id"]),
             endpoint=record,
             entries=entries,
-            execution=evidence,
+            execution=panel_execution,
             minimum_formal_probes=int(probe_plan["minimum_formal_probes"]),
         )
-        qualification_gate = next(
-            gate for gate in evidence.prerequisite_gates if gate.gate_id == "stage3.G3-1"
-        )
-        panel = panel.qualify(
-            execution=evidence,
-            gate=qualification_gate,
-            artifact_ref=probe_ref,
-        )
+        if expected_scope == FORMAL_SCOPE:
+            qualification_gate = next(
+                gate for gate in evidence.prerequisite_gates if gate.gate_id == "stage3.G3-1"
+            )
+            panel = panel.qualify(
+                execution=evidence,
+                gate=qualification_gate,
+                artifact_ref=probe_ref,
+            )
     except (StopIteration, TypeError, ValueError, FormalRunRejected) as error:
         raise _blocked(
             BlockerCode.CONTRACT_UNFROZEN,
@@ -6677,15 +7337,174 @@ def _formal_path_context(
             retryable=False,
             evidence_refs=(probe_ref,),
         ) from error
-    primary = next((entry.probe for entry in panel.entries if entry.role == "formal"), None)
-    if primary is None:
+    precision = request.config.base_config.section("precision")
+    accumulation = (
+        torch.float64
+        if precision["path_accumulation_dtype"] == "float64"
+        else torch.float32
+    )
+    selected_entries = tuple(
+        entry for entry in panel.entries if entry.role == expected_entry_role
+    )
+    if len(selected_entries) != expected_entry_count:
         raise _blocked(
             BlockerCode.CONTRACT_UNFROZEN,
             "stage3_formal_probe",
-            "probe panel 缺少 formal role",
+            "probe panel 与 production scope 的 probe 数量/role 不一致",
             retryable=False,
             evidence_refs=(probe_ref,),
         )
+
+    production_index: ProductionUnitIndex | None = None
+    production_index_ref: str | None = None
+    expected_index_scope = _stage3_production_index_scope(request)
+    if request.config.run_intent == "formal" and expected_index_scope is not None:
+        try:
+            production_index, production_index_ref = _load_stage3_production_index(
+                request, root, expected_scope=expected_index_scope
+            )
+        except (FileNotFoundError, OSError, TypeError, ValueError) as error:
+            raise _blocked(
+                BlockerCode.CONTRACT_UNFROZEN,
+                "stage3_production_unit_index",
+                f"formal production unit index 不可验证：{type(error).__name__}: {error}",
+                retryable=False,
+                evidence_refs=(
+                    (production_index_ref,) if production_index_ref is not None else ()
+                ),
+            ) from error
+
+    (
+        selector_probe_id,
+        selector_unit_id,
+        selector_index_hash,
+        probe_selector_binding,
+    ) = (
+        _formal_stage3_probe_selector(request, root)
+    )
+    if (
+        selector_index_hash is not None
+        and production_index is not None
+        and selector_index_hash != production_index.artifact_hash
+    ):
+        raise _blocked(
+            BlockerCode.CONTRACT_UNFROZEN,
+            "stage3_formal_probe_selector",
+            "path-unit selector 与 production unit index hash 不一致",
+            retryable=False,
+            evidence_refs=(production_index_ref or "stage3/production-unit-index.json",),
+        )
+    if probe_selector_binding is not None and probe_selector_binding != (
+        record.digest,
+        str(probe_plan.get("artifact_hash")),
+    ):
+        raise _blocked(
+            BlockerCode.CONTRACT_UNFROZEN,
+            "stage3_formal_probe_selector",
+            "probe selector 与 endpoint/probe-plan hash 不一致",
+            retryable=False,
+            evidence_refs=(probe_ref,),
+        )
+    if selector_probe_id is not None and selector_unit_id is not None:
+        raise _blocked(
+            BlockerCode.CONTRACT_UNFROZEN,
+            "stage3_formal_probe_selector",
+            "active_probe_id 与 active_unit_id 不能同时声明",
+            retryable=False,
+            evidence_refs=(probe_ref,),
+        )
+
+    def candidate_path(entry: ProbePanelEntry) -> PathSpec:
+        probe = entry.probe
+        return PathSpec(
+            pre,
+            post,
+            path_id=f"formal-path-{record.digest[:20]}",
+            probe_id=probe.probe_id,
+            loss_id=f"formal-loss-{probe.loss_contract_hash[:20]}",
+            accumulation_dtype=accumulation,
+        )
+
+    def candidate_unit_id(entry: ProbePanelEntry) -> str:
+        probe = entry.probe
+        if production_index is not None:
+            matches = tuple(
+                unit
+                for unit in production_index.units
+                if unit.endpoint_digest == record.digest
+                and unit.probe == probe.probe_id
+                and unit.probe_content_hash == probe.content_hash
+                and unit.loss_contract_hash == probe.loss_contract_hash
+                and unit.effective_weight_unit == probe.effective_weight_unit
+            )
+            if len(matches) != 1:
+                raise _blocked(
+                    BlockerCode.CONTRACT_UNFROZEN,
+                    "stage3_production_unit_index_binding",
+                    "endpoint/probe 无法唯一绑定 production unit index",
+                    retryable=False,
+                    evidence_refs=(production_index_ref or probe_ref,),
+                )
+            return matches[0].path_unit_id
+        candidate = candidate_path(entry)
+        unit_hash = canonical_json_hash(
+            {
+                "endpoint_digest": record.digest,
+                "probe_digest": probe.digest,
+                "path_identity_hash": candidate.identity_hash,
+                "execution_evidence_hash": evidence.artifact_hash,
+            }
+        )
+        return f"path-unit-{unit_hash[:20]}"
+
+    selected_entry: ProbePanelEntry | None = None
+    if selector_probe_id is not None:
+        selected = tuple(
+            entry
+            for entry in selected_entries
+            if entry.probe.probe_id == selector_probe_id
+        )
+        if len(selected) != 1:
+            raise _blocked(
+                BlockerCode.CONTRACT_UNFROZEN,
+                "stage3_formal_probe_selector",
+                f"active_probe_id 未唯一匹配 formal probe：{selector_probe_id}",
+                retryable=False,
+                evidence_refs=(probe_ref,),
+            )
+        selected_entry = selected[0]
+    elif selector_unit_id is not None:
+        selected = tuple(
+            entry
+            for entry in selected_entries
+            if candidate_unit_id(entry) == selector_unit_id
+        )
+        if len(selected) != 1:
+            raise _blocked(
+                BlockerCode.CONTRACT_UNFROZEN,
+                "stage3_formal_probe_selector",
+                f"active_unit_id 未唯一匹配 formal probe：{selector_unit_id}",
+                retryable=False,
+                evidence_refs=(probe_ref,),
+            )
+        selected_entry = selected[0]
+    elif len(selected_entries) == 1:
+        # A singleton formal panel is unambiguous and needs no extra
+        # orchestration field.  A multi-probe panel must always bind a unit
+        # explicitly; selecting the first entry would silently make the other
+        # probes unreachable in a 99-unit matrix.
+        selected_entry = selected_entries[0]
+    else:
+        raise _blocked(
+            BlockerCode.CONTRACT_UNFROZEN,
+            "stage3_formal_probe_selector",
+            "formal panel 含多个 probe，必须声明 active_probe_id 或 active_unit_id",
+            retryable=False,
+            evidence_refs=(probe_ref,),
+        )
+
+    assert selected_entry is not None
+    primary = selected_entry.probe
     draws = primary.sample_ids
     frozen_buffers = {
         name: value for name, value in buffer_values.items()  # type: ignore[assignment]
@@ -6718,29 +7537,8 @@ def _formal_path_context(
             raise RuntimeError("FORMAL_PATH_PROVIDER_LOSS_MISSING")
         return torch.tensor(float(batch.loss), dtype=torch.float64)
 
-    precision = request.config.base_config.section("precision")
-    accumulation = (
-        torch.float64
-        if precision["path_accumulation_dtype"] == "float64"
-        else torch.float32
-    )
-    path = PathSpec(
-        pre,
-        post,
-        path_id=f"formal-path-{record.digest[:20]}",
-        probe_id=primary.probe_id,
-        loss_id=f"formal-loss-{primary.loss_contract_hash[:20]}",
-        accumulation_dtype=accumulation,
-    )
-    unit_hash = canonical_json_hash(
-        {
-            "endpoint_digest": record.digest,
-            "probe_digest": primary.digest,
-            "path_identity_hash": path.identity_hash,
-            "execution_evidence_hash": evidence.artifact_hash,
-        }
-    )
-    unit_id = f"path-unit-{unit_hash[:20]}"
+    path = candidate_path(selected_entry)
+    unit_id = candidate_unit_id(selected_entry)
     node_cache, node_cache_root_ref = _stage3_node_cache(
         request,
         root,
@@ -6787,8 +7585,12 @@ def _fixture_loss(state: TensorMap) -> torch.Tensor:
     return 0.5 * sum(torch.square(value).sum() for value in difference.values())
 
 
-def _path_result_payload(result: PathIntegralResult) -> dict[str, JSONValue]:
-    return {
+def _path_result_payload(
+    result: PathIntegralResult,
+    *,
+    cost: _PathEvaluationCost | None = None,
+) -> dict[str, JSONValue]:
+    payload: dict[str, JSONValue] = {
         "rule": result.rule.to_dict(),
         "path_identity_hash": result.path_identity_hash,
         "signed": {
@@ -6815,6 +7617,23 @@ def _path_result_payload(result: PathIntegralResult) -> dict[str, JSONValue]:
         "completeness_l1_scaled_residual": result.completeness_l1_scaled_residual,
         "unique_gradient_evaluations": result.unique_gradient_evaluations,
     }
+    if cost is not None:
+        payload["evaluation_cost"] = {
+            "gradient_evaluations": cost.gradient_evaluations,
+            "loss_evaluations": cost.loss_evaluations,
+            "forward_evaluations": cost.forward_evaluations,
+            "backward_evaluations": cost.backward_evaluations,
+            "wall_seconds": cost.wall_seconds,
+            "peak_gpu_memory_bytes": cost.peak_gpu_memory_bytes,
+            "cache_hits": cost.cache_hits,
+            "cache_misses": cost.cache_misses,
+            "cost_semantics": (
+                "formal_callback_forward_backward_v1"
+                if cost.forward_evaluations or cost.backward_evaluations
+                else "analytic_or_non_autograd_callback_v1"
+            ),
+        }
+    return payload
 
 
 def _run_stage3_endpoint(
@@ -6888,8 +7707,13 @@ def _run_stage3_quadrature_validation(
             "composite_right_4": composite_right_rule(4),
             "composite_midpoint_4": composite_midpoint_rule(4),
             "composite_trapezoid_4": composite_trapezoid_rule(4),
+            "composite_trapezoid_8": composite_trapezoid_rule(8),
             "composite_simpson_4": composite_simpson_rule(4),
+            "composite_simpson_8": composite_simpson_rule(8),
+            "composite_simpson_16": composite_simpson_rule(16),
+            "gauss_legendre_2": gauss_legendre_rule(2),
             "gauss_legendre_4": gauss_legendre_rule(4),
+            "gauss_legendre_8": gauss_legendre_rule(8),
         }
     )
     rows: list[dict[str, object]] = []
@@ -6967,29 +7791,815 @@ def _run_stage3_quadrature_validation(
     )
 
 
+def _stage3_reference_ladder_document(
+    request: TaskExecutionRequest,
+    root: Path,
+    *,
+    require_artifact_hash: bool,
+) -> tuple[Mapping[str, object], str | None, tuple[int, ...], tuple[int, ...]]:
+    """Load and normalize the immutable two-family reference ladder.
+
+    The ladder loader remains permissive for the narrow direct unit-test helper
+    (``require_artifact_hash=False``).  Formal reference publication and every
+    formal consumer use ``True`` so a frozen ladder without a recomputable
+    content hash cannot silently define node cost.
+    """
+
+    raw: object = None
+    for config, section_name in (
+        (request.config, "path_integration"),
+        (request.config, "orchestration"),
+        (request.config.base_config, "path_integration"),
+    ):
+        try:
+            section = config.section(section_name)  # type: ignore[attr-defined]
+        except (AttributeError, KeyError, TypeError):
+            continue
+        if not isinstance(section, Mapping):
+            continue
+        if isinstance(section.get("reference_ladder"), Mapping):
+            raw = section["reference_ladder"]
+            break
+        ref = section.get("reference_ladder_ref")
+        if isinstance(ref, str):
+            try:
+                raw = load_canonical_json(
+                    _workspace_path(root, ref, field="reference_ladder_ref")
+                )
+            except (FileNotFoundError, OSError, TypeError, ValueError) as error:
+                raise _blocked(
+                    BlockerCode.ASSET_UNAVAILABLE,
+                    "stage3_reference_ladder",
+                    f"formal reference ladder 无法读取：{error}",
+                    retryable=False,
+                    evidence_refs=(ref,),
+                ) from error
+            break
+    if not isinstance(raw, Mapping):
+        raise _blocked(
+            BlockerCode.CONTRACT_UNFROZEN,
+            "stage3_reference_ladder",
+            "formal reference 必须提供显式 frozen reference_ladder（两家族各至少两个 level）",
+            retryable=False,
+        )
+
+    # Accept either the protocol's ``families`` shape or the equivalent flat
+    # names used by ResolvedConfig.  Formal publication requires the declared
+    # hash even when the document is supplied inline.
+    declared_hash = raw.get("artifact_hash")
+    body = {key: value for key, value in raw.items() if key != "artifact_hash"}
+    if declared_hash is None and require_artifact_hash:
+        raise _blocked(
+            BlockerCode.CONTRACT_UNFROZEN,
+            "stage3_reference_ladder",
+            "formal reference ladder 必须声明 artifact_hash",
+            retryable=False,
+        )
+    if declared_hash is not None:
+        if not isinstance(declared_hash, str) or declared_hash != canonical_json_hash(body):
+            raise _blocked(
+                BlockerCode.CONTRACT_UNFROZEN,
+                "stage3_reference_ladder",
+                "formal reference ladder artifact_hash 不可复算",
+                retryable=False,
+            )
+    if raw.get("frozen") is not True:
+        raise _blocked(
+            BlockerCode.CONTRACT_UNFROZEN,
+            "stage3_reference_ladder",
+            "formal reference ladder 必须 frozen=true",
+            retryable=False,
+        )
+    families = raw.get("families")
+    if isinstance(families, Mapping):
+        if set(families) != {"gauss_legendre", "composite_simpson"}:
+            raise _blocked(
+                BlockerCode.CONTRACT_UNFROZEN,
+                "stage3_reference_ladder",
+                "formal reference ladder families 必须精确覆盖两个独立规则家族",
+                retryable=False,
+            )
+        gauss_raw = families.get("gauss_legendre")
+        simpson_raw = families.get("composite_simpson")
+    else:
+        gauss_raw = raw.get("gauss_legendre_levels")
+        simpson_raw = raw.get("composite_simpson_levels")
+
+    def levels(value: object, field_name: str) -> tuple[int, ...]:
+        if (
+            not isinstance(value, list)
+            or len(value) < 2
+            or not all(
+                isinstance(item, int)
+                and not isinstance(item, bool)
+                and item > 0
+                for item in value
+            )
+            or tuple(value) != tuple(sorted(set(value)))
+        ):
+            raise _blocked(
+                BlockerCode.CONTRACT_UNFROZEN,
+                "stage3_reference_ladder",
+                f"{field_name} 必须为严格递增的至少两个正整数 level",
+                retryable=False,
+            )
+        return tuple(value)
+
+    gauss_levels = levels(gauss_raw, "gauss_legendre")
+    simpson_levels = levels(simpson_raw, "composite_simpson")
+    return (
+        raw,
+        None if declared_hash is None else str(declared_hash),
+        gauss_levels,
+        simpson_levels,
+    )
+
+
+def _stage3_reference_levels(
+    request: TaskExecutionRequest,
+    root: Path,
+    context: _PathContext,
+) -> tuple[ReferenceRuleLevel, ...]:
+    """Build the frozen two-family reference ladder for Stage 3.
+
+    The small GL2/4 + Simpson2/4 ladder remains a local-fixture default only.
+    Formal execution must carry an explicit frozen ladder in configuration (or
+    a hash-bound JSON document); otherwise the runner blocks instead of
+    quietly under-resolving a 99-unit production matrix.
+    """
+
+    if context.execution.run_intent == "local_fixture":
+        return (
+            ReferenceRuleLevel("gauss_legendre", 0, gauss_legendre_rule(2)),
+            ReferenceRuleLevel("gauss_legendre", 1, gauss_legendre_rule(4)),
+            ReferenceRuleLevel("composite_simpson", 0, composite_simpson_rule(2)),
+            ReferenceRuleLevel("composite_simpson", 1, composite_simpson_rule(4)),
+        )
+
+    _raw, _hash, gauss_levels, simpson_levels = _stage3_reference_ladder_document(
+        request, root, require_artifact_hash=False
+    )
+    return tuple(
+        [
+            *(
+                ReferenceRuleLevel("gauss_legendre", index, gauss_legendre_rule(nodes))
+                for index, nodes in enumerate(gauss_levels)
+            ),
+            *(
+                ReferenceRuleLevel("composite_simpson", index, composite_simpson_rule(nodes))
+                for index, nodes in enumerate(simpson_levels)
+            ),
+        ]
+    )
+
+
+def _stage3_formal_reference_binding(
+    request: TaskExecutionRequest,
+    root: Path,
+    context: _PathContext,
+    *,
+    plan_kind: str = "pilot",
+) -> dict[str, JSONValue]:
+    """Resolve the immutable contract identity consumed by formal reference.
+
+    A formal reference is not identified only by its contribution vector.  The
+    plan, thresholds, tolerance and the complete two-family node ladder are
+    scientific inputs and therefore must be included in the reference
+    artifact's own identity.  This helper is intentionally called at
+    publication *and* at every formal consumer boundary.
+    """
+
+    if context.execution.run_intent != "formal":
+        raise ValueError("STAGE3_FORMAL_REFERENCE_BINDING_REQUIRES_FORMAL")
+    if plan_kind not in {"pilot", "matrix"}:
+        raise ValueError("STAGE3_FORMAL_REFERENCE_PLAN_KIND_INVALID")
+    plan_loader = (
+        _formal_stage3_pilot_plan
+        if plan_kind == "pilot"
+        else _formal_stage3_matrix_plan
+    )
+    thresholds, _rules, _units, _strata, plan_ref = plan_loader(request, root, context)
+    try:
+        plan = _load_formal_document_ref(
+            root,
+            plan_ref,
+            field=(
+                "formal_stage3_pilot_plan"
+                if plan_kind == "pilot"
+                else "formal_stage3_matrix_plan"
+            ),
+            schema_version="stage3-formal-pilot-plan-v1",
+        )
+    except (FileNotFoundError, OSError, TypeError, ValueError) as error:
+        raise _blocked(
+            BlockerCode.CONTRACT_UNFROZEN,
+            "stage3_formal_reference_binding",
+            f"formal plan 无法重新读取：{error}",
+            retryable=False,
+            evidence_refs=(plan_ref,),
+        ) from error
+    if not isinstance(plan, Mapping):
+        raise _blocked(
+            BlockerCode.CONTRACT_UNFROZEN,
+            "stage3_formal_reference_binding",
+            "formal plan 不是 object",
+            retryable=False,
+            evidence_refs=(plan_ref,),
+        )
+    declared_plan_hash = plan.get("artifact_hash")
+    plan_body = {key: value for key, value in plan.items() if key != "artifact_hash"}
+    if (
+        not isinstance(declared_plan_hash, str)
+        or declared_plan_hash != canonical_json_hash(plan_body)
+    ):
+        raise _blocked(
+            BlockerCode.CONTRACT_UNFROZEN,
+            "stage3_formal_reference_binding",
+            "formal plan artifact_hash 不可复算",
+            retryable=False,
+            evidence_refs=(plan_ref,),
+        )
+
+    _ladder, ladder_hash, gauss_levels, simpson_levels = (
+        _stage3_reference_ladder_document(
+            request, root, require_artifact_hash=True
+        )
+    )
+    if ladder_hash is None:  # defensive: require_artifact_hash=True above
+        raise _blocked(
+            BlockerCode.CONTRACT_UNFROZEN,
+            "stage3_formal_reference_binding",
+            "formal reference ladder hash 缺失",
+            retryable=False,
+        )
+
+    # The stored family nodes are the actual unique gradient evaluations used
+    # by the runner, not merely the family-specific interval labels.  Keeping
+    # both labels and node counts prevents an equivalent-looking ladder from
+    # changing the measured cost semantics (Simpson's n intervals uses n+1
+    # distinct nodes).
+    family_levels: dict[str, JSONValue] = {
+        "gauss_legendre": list(gauss_levels),
+        "composite_simpson": list(simpson_levels),
+    }
+    family_nodes: dict[str, JSONValue] = {
+        "gauss_legendre": [
+            gauss_legendre_rule(nodes).unique_gradient_evaluations
+            for nodes in gauss_levels
+        ],
+        "composite_simpson": [
+            composite_simpson_rule(nodes).unique_gradient_evaluations
+            for nodes in simpson_levels
+        ],
+    }
+    binding = FormalReferenceBinding(
+        formal_plan_ref=plan_ref,
+        formal_plan_hash=declared_plan_hash,
+        thresholds_hash=thresholds.artifact_hash,
+        reference_tolerance=float(thresholds.max_reference_normalized_l1_error),
+        reference_ladder_hash=ladder_hash,
+        reference_ladder_levels=family_levels,  # type: ignore[arg-type]
+        reference_ladder_nodes=family_nodes,  # type: ignore[arg-type]
+        required_consecutive=2,
+        primary_family="gauss_legendre",
+    )
+    return binding.artifact_fields()  # type: ignore[return-value]
+
+
+def _verify_stage3_formal_reference_binding(
+    reference: Mapping[str, object],
+    request: TaskExecutionRequest,
+    root: Path,
+    context: _PathContext,
+    *,
+    plan_kind: str = "pilot",
+) -> Mapping[str, JSONValue]:
+    """Fail closed when a formal shard consumes a stale/mismatched reference."""
+
+    expected = _stage3_formal_reference_binding(
+        request, root, context, plan_kind=plan_kind
+    )
+    for field_name, expected_value in expected.items():
+        if field_name == "reference_binding_hash":
+            continue
+        if reference.get(field_name) != expected_value:
+            raise _blocked(
+                BlockerCode.CONTRACT_UNFROZEN,
+                "stage3_formal_reference_binding",
+                f"formal reference {field_name} 与当前冻结输入不一致",
+                retryable=False,
+                evidence_refs=(str(expected["formal_plan_ref"]),),
+            )
+    declared_binding_hash = reference.get("reference_binding_hash")
+    binding_body = {
+        key: value
+        for key, value in expected.items()
+        if key != "reference_binding_hash"
+    }
+    if declared_binding_hash != canonical_json_hash(binding_body):
+        raise _blocked(
+            BlockerCode.CONTRACT_UNFROZEN,
+            "stage3_formal_reference_binding",
+            "formal reference binding hash 不可复算",
+            retryable=False,
+            evidence_refs=(str(expected["formal_plan_ref"]),),
+        )
+    return expected
+
+
 def _stage3_reference(
     request: TaskExecutionRequest,
     root: Path,
     store: TaskArtifactStore,
+    *,
+    plan_kind: str = "pilot",
 ) -> tuple[_PathContext, object, tuple[object, ...]]:
     context = _fixture_path_context(request, root, store)
-    levels = (
-        ReferenceRuleLevel("gauss_legendre", 0, gauss_legendre_rule(2)),
-        ReferenceRuleLevel("gauss_legendre", 1, gauss_legendre_rule(4)),
-        ReferenceRuleLevel("composite_simpson", 0, composite_simpson_rule(2)),
-        ReferenceRuleLevel("composite_simpson", 1, composite_simpson_rule(4)),
+    result, rules = _stage3_reference_refinement(
+        request, root, store, context, plan_kind=plan_kind
     )
+    return context, result, rules
+
+
+def _stage3_reference_refinement(
+    request: TaskExecutionRequest,
+    root: Path,
+    store: TaskArtifactStore,
+    context: _PathContext,
+    *,
+    plan_kind: str = "pilot",
+) -> tuple[object, tuple[object, ...]]:
+    """Run the immutable reference refinement for one selected path unit.
+
+    Stage3.07 calls this directly with its matrix context.  This keeps the
+    formal reference producer inside the matrix shard instead of pretending
+    that Stage3.06 publishes a 99-unit predecessor artifact.
+    """
+
+    levels = _stage3_reference_levels(request, root, context)
+    tolerance = 1e-12
+    required_consecutive = 1
+    if context.execution.run_intent == "formal":
+        binding = _stage3_formal_reference_binding(
+            request, root, context, plan_kind=plan_kind
+        )
+        tolerance = float(binding["reference_tolerance"])
+        # Two consecutive passing refinement rounds require at least three
+        # completed levels per family and prevent one lucky adjacent pair from
+        # becoming the canonical reference.
+        required_consecutive = int(binding["required_consecutive"])
+    artifact_root = store.root / "resume" / "path-reference"
+    if context.execution.run_intent == "formal":
+        if plan_kind not in {"pilot", "matrix"}:
+            raise ValueError("STAGE3_FORMAL_REFERENCE_PLAN_KIND_INVALID")
+        # Pilot and matrix unit IDs may overlap in an environment containing
+        # both indexes.  Keep their refinement commits in disjoint immutable
+        # namespaces so a pilot convergence cannot be resumed as a matrix
+        # reference (or vice versa).
+        artifact_root = artifact_root / plan_kind
     result = ReferenceRefinementRunner().run(
         unit_id=context.unit_id,
         levels=levels,
         evaluator=context.integrate,
-        artifact_root=store.root / "resume" / "path-reference",
-        tolerance=1e-12,
-        required_consecutive=1,
+        artifact_root=artifact_root,
+        tolerance=tolerance,
+        required_consecutive=required_consecutive,
         primary_family="gauss_legendre",
         execution=context.execution,
     )
-    return context, result, tuple(level.rule for level in levels)
+    return result, tuple(level.rule for level in levels)
+
+
+def _stage3_reference_ledger_root(
+    request: TaskExecutionRequest,
+    root: Path,
+    store: TaskArtifactStore,
+    *,
+    execution_evidence_hash: str,
+    reference_scope: str = "pilot",
+) -> Path:
+    """Return the append-only reference shard namespace for one execution."""
+
+    if (
+        not isinstance(execution_evidence_hash, str)
+        or re.fullmatch(r"[0-9a-f]{64}", execution_evidence_hash) is None
+    ):
+        raise ValueError("STAGE3_REFERENCE_LEDGER_EXECUTION_HASH_INVALID")
+    try:
+        runtime = request.config.base_config.section("runtime")
+    except (AttributeError, KeyError, TypeError):
+        runtime = None
+    cache_root = runtime.get("cache_root") if isinstance(runtime, Mapping) else None
+    base = (
+        _workspace_path(root, cache_root, field="runtime.cache_root")
+        if isinstance(cache_root, str)
+        else store.root / "resume"
+    )
+    if reference_scope not in {"pilot", "matrix"}:
+        raise ValueError("STAGE3_REFERENCE_LEDGER_SCOPE_INVALID")
+    return (
+        base / "stage3-reference-ledger" / reference_scope / execution_evidence_hash
+    ).resolve()
+
+
+def _reference_scientific_identity(value: Mapping[str, object]) -> str:
+    """Hash reference identity while excluding machine timing diagnostics."""
+
+    reference = value.get("reference")
+    if not isinstance(reference, Mapping):
+        raise ValueError("STAGE3_REFERENCE_SHARD_REFERENCE_INVALID")
+    costs = reference.get("evaluation_costs")
+    stable_costs: object = costs
+    if isinstance(costs, list):
+        stable_costs = [
+            {
+                key: item
+                for key, item in raw.items()
+                if key
+                not in {
+                    "wall_seconds",
+                    "gradient_evaluations",
+                    "loss_evaluations",
+                    "forward_evaluations",
+                    "backward_evaluations",
+                    "peak_gpu_memory_bytes",
+                }
+            }
+            if isinstance(raw, Mapping)
+            else raw
+            for raw in costs
+        ]
+    stable_reference = dict(reference)
+    stable_reference["evaluation_costs"] = stable_costs  # type: ignore[index]
+    return canonical_json_hash(
+        {
+            "unit_id": value.get("unit_id"),
+            "path_identity_hash": value.get("path_identity_hash"),
+            "execution_evidence_hash": value.get("execution_evidence_hash"),
+            "reference_binding_hash": value.get("reference_binding_hash"),
+            "reference": stable_reference,
+            "contribution_bundle_manifest_hash": value.get(
+                "contribution_bundle_manifest_hash"
+            ),
+        }
+    )
+
+
+def _persist_stage3_reference_shard(
+    request: TaskExecutionRequest,
+    root: Path,
+    store: TaskArtifactStore,
+    *,
+    context: _PathContext,
+    reference: Mapping[str, JSONValue],
+    required_unit_ids: Sequence[str],
+    reference_binding_hash: str | None,
+    reference_scope: str = "pilot",
+) -> tuple[Mapping[str, JSONValue], str]:
+    """Persist one immutable Stage 3.05 path-unit reference shard."""
+
+    if context.execution.run_intent != "formal":
+        raise ValueError("STAGE3_REFERENCE_SHARD_FORMAL_ONLY")
+    if context.unit_id not in required_unit_ids:
+        raise ValueError("STAGE3_REFERENCE_SHARD_UNIT_NOT_REQUIRED")
+    if not isinstance(reference_binding_hash, str) or re.fullmatch(
+        r"[0-9a-f]{64}", reference_binding_hash
+    ) is None:
+        raise ValueError("STAGE3_REFERENCE_SHARD_BINDING_HASH_REQUIRED")
+    if reference.get("path_identity_hash") != context.path.identity_hash:
+        raise ValueError("STAGE3_REFERENCE_SHARD_PATH_IDENTITY_MISMATCH")
+    if reference.get("execution_evidence_hash") != context.execution.artifact_hash:
+        raise ValueError("STAGE3_REFERENCE_SHARD_EXECUTION_IDENTITY_MISMATCH")
+    if reference.get("scope") != "formal" or reference.get("formal_eligible") is not False:
+        raise ValueError("STAGE3_REFERENCE_SHARD_SCOPE_INVALID")
+    refinement = reference.get("refinement")
+    if not isinstance(refinement, Mapping) or refinement.get("converged") is not True:
+        raise ValueError("STAGE3_REFERENCE_SHARD_NOT_CONVERGED")
+    payload: dict[str, JSONValue] = {
+        "schema_version": "stage3-reference-shard-v1",
+        "unit_id": context.unit_id,
+        "path_identity_hash": context.path.identity_hash,
+        "execution_evidence_hash": context.execution.artifact_hash,
+        "reference_binding_hash": reference_binding_hash,
+        "reference_artifact_hash": canonical_json_hash(reference),
+        "reference": dict(reference),
+        "contribution_bundle_ref": str(reference["contribution_bundle_ref"]),
+        "contribution_bundle_manifest_hash": str(
+            reference["contribution_bundle_manifest_hash"]
+        ),
+        "required_unit_ids": list(required_unit_ids),
+    }
+    payload["scientific_identity_hash"] = _reference_scientific_identity(payload)
+    payload["artifact_hash"] = canonical_json_hash(payload)
+    ledger_root = _stage3_reference_ledger_root(
+        request,
+        root,
+        store,
+        execution_evidence_hash=context.execution.artifact_hash,
+        reference_scope=reference_scope,
+    )
+    path = ledger_root / f"{context.unit_id}.json"
+    if path.exists():
+        try:
+            existing = load_canonical_json(path)
+            if not isinstance(existing, Mapping):
+                raise ValueError("reference shard 不是 object")
+            if set(existing) != set(payload):
+                raise ValueError("reference shard fields drifted")
+            if existing.get("artifact_hash") != canonical_json_hash(
+                {key: item for key, item in existing.items() if key != "artifact_hash"}
+            ):
+                raise ValueError("reference shard artifact_hash 不可复算")
+            if existing.get("scientific_identity_hash") != payload[
+                "scientific_identity_hash"
+            ]:
+                raise ValueError("reference shard scientific identity drifted")
+            return (
+                existing,
+                path.relative_to(root).as_posix()
+                if path.is_relative_to(root.resolve())
+                else str(path),
+            )  # type: ignore[return-value]
+        except (OSError, TypeError, ValueError) as error:
+            raise _blocked(
+                BlockerCode.CONTRACT_UNFROZEN,
+                "stage3_reference_ledger",
+                f"已有 per-unit reference shard 无法严格恢复：{error}",
+                retryable=False,
+            ) from error
+    write_canonical_json(path, payload)
+    return (
+        payload,
+        path.relative_to(root).as_posix()
+        if path.is_relative_to(root.resolve())
+        else str(path),
+    )
+
+
+def _load_stage3_reference_aggregate(
+    request: TaskExecutionRequest,
+    root: Path,
+    store: TaskArtifactStore,
+    *,
+    required_unit_ids: Sequence[str],
+    execution_evidence_hash: str,
+    reference_binding_hash: str,
+    reference_scope: str = "pilot",
+) -> tuple[
+    Mapping[str, Mapping[str, JSONValue]],
+    Mapping[str, Mapping[str, JSONValue]],
+    tuple[str, ...],
+    tuple[str, ...],
+]:
+    """Load and strictly validate all immutable Stage 3.05 reference shards."""
+
+    ledger_root = _stage3_reference_ledger_root(
+        request,
+        root,
+        store,
+        execution_evidence_hash=execution_evidence_hash,
+        reference_scope=reference_scope,
+    )
+    references: dict[str, Mapping[str, JSONValue]] = {}
+    entries: dict[str, Mapping[str, JSONValue]] = {}
+    complete: list[str] = []
+    missing: list[str] = []
+    for unit_id in required_unit_ids:
+        path = ledger_root / f"{unit_id}.json"
+        if not path.exists():
+            missing.append(unit_id)
+            continue
+        try:
+            value = load_canonical_json(path)
+            if not isinstance(value, Mapping):
+                raise ValueError("reference shard 不是 object")
+            expected = {
+                "schema_version",
+                "unit_id",
+                "path_identity_hash",
+                "execution_evidence_hash",
+                "reference_binding_hash",
+                "reference_artifact_hash",
+                "reference",
+                "contribution_bundle_ref",
+                "contribution_bundle_manifest_hash",
+                "required_unit_ids",
+                "scientific_identity_hash",
+                "artifact_hash",
+            }
+            if set(value) != expected or value.get("schema_version") != "stage3-reference-shard-v1":
+                raise ValueError("reference shard fields/schema 不匹配")
+            if value.get("artifact_hash") != canonical_json_hash(
+                {key: item for key, item in value.items() if key != "artifact_hash"}
+            ):
+                raise ValueError("reference shard artifact_hash 不可复算")
+            if value.get("unit_id") != unit_id or value.get(
+                "execution_evidence_hash"
+            ) != execution_evidence_hash:
+                raise ValueError("reference shard unit/execution identity 不匹配")
+            if value.get("required_unit_ids") != list(required_unit_ids):
+                raise ValueError("reference shard required unit set 不匹配")
+            if value.get("reference_binding_hash") != reference_binding_hash:
+                raise ValueError("reference shard binding hash 不匹配")
+            reference = value.get("reference")
+            if not isinstance(reference, Mapping):
+                raise ValueError("reference shard reference 不是 object")
+            if value.get("reference_artifact_hash") != canonical_json_hash(reference):
+                raise ValueError("reference shard reference hash 不可复算")
+            if reference.get("path_identity_hash") != value.get("path_identity_hash"):
+                raise ValueError("reference shard path identity 不匹配")
+            if reference.get("reference_binding_hash") != reference_binding_hash:
+                raise ValueError("reference payload binding hash 不匹配")
+            if reference.get("execution_evidence_hash") != execution_evidence_hash:
+                raise ValueError("reference payload execution identity 不匹配")
+            refinement = reference.get("refinement")
+            if not isinstance(refinement, Mapping) or refinement.get("converged") is not True:
+                raise ValueError("reference shard 未收敛")
+            if value.get("scientific_identity_hash") != _reference_scientific_identity(value):
+                raise ValueError("reference shard scientific identity 不可复算")
+            ledger_ref = (
+                path.relative_to(root).as_posix()
+                if path.is_relative_to(root.resolve())
+                else str(path)
+            )
+            entries[unit_id] = {
+                "ledger_ref": ledger_ref,
+                "ledger_artifact_hash": str(value["artifact_hash"]),
+                "reference_artifact_hash": str(value["reference_artifact_hash"]),
+                "path_identity_hash": str(value["path_identity_hash"]),
+                "contribution_bundle_ref": str(value["contribution_bundle_ref"]),
+                "contribution_bundle_manifest_hash": str(
+                    value["contribution_bundle_manifest_hash"]
+                ),
+                "reference_binding_hash": str(value["reference_binding_hash"]),
+            }
+            references[unit_id] = dict(reference)  # type: ignore[assignment]
+            complete.append(unit_id)
+        except (OSError, TypeError, ValueError) as error:
+            raise _blocked(
+                BlockerCode.CONTRACT_UNFROZEN,
+                "stage3_reference_ledger",
+                f"per-unit reference ledger 无法严格加载：{error}",
+                retryable=False,
+            ) from error
+    return references, entries, tuple(complete), tuple(missing)
+
+
+def _publish_stage3_reference_aggregate(
+    request: TaskExecutionRequest,
+    root: Path,
+    store: TaskArtifactStore,
+    *,
+    required_unit_ids: Sequence[str],
+    execution_evidence_hash: str,
+    reference_binding_hash: str,
+    reference_scope: str = "pilot",
+) -> tuple[Mapping[str, JSONValue], str]:
+    """Write a content-addressed aggregate snapshot for completed ref shards."""
+
+    _references, entries, complete, missing = _load_stage3_reference_aggregate(
+        request,
+        root,
+        store,
+        required_unit_ids=required_unit_ids,
+        execution_evidence_hash=execution_evidence_hash,
+        reference_binding_hash=reference_binding_hash,
+        reference_scope=reference_scope,
+    )
+    body: dict[str, JSONValue] = {
+        "schema_version": "stage3-reference-aggregate-v1",
+        "reference_scope": reference_scope,
+        "execution_evidence_hash": execution_evidence_hash,
+        "reference_binding_hash": reference_binding_hash,
+        "required_unit_ids": list(required_unit_ids),
+        "complete_unit_ids": list(complete),
+        "missing_unit_ids": list(missing),
+        "unit_references": {
+            unit_id: dict(entries[unit_id]) for unit_id in complete
+        },
+    }
+    body["artifact_hash"] = canonical_json_hash(body)
+    ledger_root = _stage3_reference_ledger_root(
+        request,
+        root,
+        store,
+        execution_evidence_hash=execution_evidence_hash,
+        reference_scope=reference_scope,
+    )
+    path = ledger_root / f"aggregate-{body['artifact_hash']}.json"
+    if path.exists():
+        existing = load_canonical_json(path)
+        if existing != body:
+            raise ValueError("STAGE3_REFERENCE_AGGREGATE_IMMUTABLE_CONFLICT")
+    else:
+        write_canonical_json(path, body)
+    return (
+        body,
+        path.relative_to(root).as_posix()
+        if path.is_relative_to(root.resolve())
+        else str(path),
+    )
+
+
+def _select_stage3_reference(
+    reference: Mapping[str, object],
+    request: TaskExecutionRequest,
+    root: Path,
+    store: TaskArtifactStore,
+    context: _PathContext,
+) -> Mapping[str, object]:
+    """Select exactly the active path-unit reference from the strict aggregate."""
+
+    if context.execution.run_intent != "formal":
+        return reference
+    aggregate_ref = reference.get("reference_aggregate_ref")
+    aggregate_hash = reference.get("reference_aggregate_hash")
+    if not isinstance(aggregate_ref, str) or not isinstance(aggregate_hash, str):
+        raise _blocked(
+            BlockerCode.CONTRACT_UNFROZEN,
+            "stage3_reference_aggregate",
+            "formal consumer 缺少 per-unit reference aggregate binding",
+            retryable=False,
+        )
+    try:
+        aggregate = load_canonical_json(
+            _workspace_path(root, aggregate_ref, field="stage3_reference_aggregate")
+        )
+        if not isinstance(aggregate, Mapping):
+            raise ValueError("aggregate 不是 object")
+        if aggregate.get("artifact_hash") != aggregate_hash:
+            raise ValueError("aggregate hash 与引用不一致")
+        if aggregate.get("artifact_hash") != canonical_json_hash(
+            {key: item for key, item in aggregate.items() if key != "artifact_hash"}
+        ):
+            raise ValueError("aggregate artifact_hash 不可复算")
+        if aggregate.get("reference_scope") != "pilot":
+            raise ValueError("aggregate scope 不是 Stage3.05 pilot reference")
+        if aggregate.get("missing_unit_ids") != []:
+            raise ValueError("aggregate coverage 尚未完成")
+        required = aggregate.get("required_unit_ids")
+        complete = aggregate.get("complete_unit_ids")
+        unit_refs = aggregate.get("unit_references")
+        if (
+            not isinstance(required, list)
+            or not isinstance(complete, list)
+            or complete != required
+            or not isinstance(unit_refs, Mapping)
+            or set(unit_refs) != set(required)
+            or context.unit_id not in required
+        ):
+            raise ValueError("aggregate required/complete unit 集不匹配")
+        entry = unit_refs.get(context.unit_id)
+        if not isinstance(entry, Mapping):
+            raise ValueError("active unit reference entry 缺失")
+        ledger_ref = entry.get("ledger_ref")
+        if not isinstance(ledger_ref, str):
+            raise ValueError("active unit ledger ref 缺失")
+        shard = load_canonical_json(
+            _workspace_path(root, ledger_ref, field="stage3_reference_shard")
+        )
+        if not isinstance(shard, Mapping):
+            raise ValueError("active unit reference shard 不是 object")
+        if shard.get("artifact_hash") != entry.get("ledger_artifact_hash"):
+            raise ValueError("active unit ledger hash 与 aggregate 不一致")
+        selected = shard.get("reference")
+        if not isinstance(selected, Mapping):
+            raise ValueError("active unit reference payload 缺失")
+        if selected.get("path_identity_hash") != context.path.identity_hash:
+            raise ValueError("active unit reference path identity 不匹配")
+        selected_execution_hash = selected.get("execution_evidence_hash")
+        selected_plan_ref = selected.get("formal_plan_ref")
+        if (
+            not isinstance(selected_execution_hash, str)
+            or not isinstance(selected_plan_ref, str)
+            or not _stage3_execution_matches_or_extends_plan(
+                request,
+                root,
+                current=context.execution,
+                declared_hash=selected_execution_hash,
+                plan_ref=selected_plan_ref,
+                plan_kind="pilot",
+            )
+        ):
+            raise ValueError("active unit reference execution identity 不匹配")
+        if selected.get("reference_binding_hash") != aggregate.get(
+            "reference_binding_hash"
+        ):
+            raise ValueError("active unit reference binding 不匹配")
+        if selected.get("contribution_bundle_ref") != entry.get(
+            "contribution_bundle_ref"
+        ) or selected.get("contribution_bundle_manifest_hash") != entry.get(
+            "contribution_bundle_manifest_hash"
+        ):
+            raise ValueError("active unit contribution bundle 与 aggregate 不一致")
+        return dict(selected)
+    except (FileNotFoundError, OSError, TypeError, ValueError) as error:
+        raise _blocked(
+            BlockerCode.CONTRACT_UNFROZEN,
+            "stage3_reference_aggregate",
+            f"formal per-unit reference aggregate 无法严格选择：{error}",
+            retryable=False,
+        ) from error
 
 
 def _run_stage3_reference(
@@ -7007,31 +8617,152 @@ def _run_stage3_reference(
             evidence_refs=inputs.references,
         )
     context, result, reference_rules = _stage3_reference(request, root, store)
-    if validation.get("path_identity_hash") != context.path.identity_hash:
+    # The analytic G3-3 suite certifies the quadrature implementation, not one
+    # neural-network endpoint.  Production Stage3.05 fans the same committed
+    # suite out over 12 preregistered endpoint/probe paths; requiring every
+    # path to equal the representative Stage3.04 path would make units 2--12
+    # structurally impossible.  Keep the historical fixture binding, while a
+    # formal run instead verifies the independently committed rule registry is
+    # complete and has a recomputable identity.
+    rules_payload = inputs.payload("quadrature_rules")
+    formal_rule_registry_valid = False
+    if request.config.run_intent == "formal":
+        raw_rules = rules_payload.get("rules")
+        registry_hash = rules_payload.get("registry_hash")
+        formal_rule_registry_valid = (
+            rules_payload.get("schema_version")
+            == "stage3-task-quadrature-rules-v1"
+            and isinstance(raw_rules, Mapping)
+            and bool(raw_rules)
+            and registry_hash == canonical_json_hash(dict(raw_rules))
+            and all(name in raw_rules for name in DEFAULT_CANDIDATE_RULES)
+        )
+    if (
+        request.config.run_intent != "formal"
+        and validation.get("path_identity_hash") != context.path.identity_hash
+    ) or (
+        request.config.run_intent == "formal" and not formal_rule_registry_valid
+    ):
         raise _blocked(
             BlockerCode.CONTRACT_UNFROZEN,
-            "stage3_path_identity",
-            "解析验证与 reference refinement 的路径身份不一致",
+            "stage3_quadrature_validation_identity",
+            (
+                "解析验证与 reference refinement 的路径身份不一致"
+                if request.config.run_intent != "formal"
+                else "formal reference 缺少可复算且完整的 G3-3 规则注册表"
+            ),
             retryable=False,
             evidence_refs=inputs.references,
         )
-    contribution_path = store.root / "tensor-bundles" / "path-reference"
+    reference_binding: Mapping[str, JSONValue] = {}
+    required_units: tuple[str, ...] = (context.unit_id,)
+    if context.execution.run_intent == "formal":
+        reference_binding = _stage3_formal_reference_binding(request, root, context)
+        if result.converged is not True or result.status != "FORMAL_CANDIDATE":
+            raise _blocked(
+                BlockerCode.ASSET_UNAVAILABLE,
+                "stage3_converged_reference",
+                "formal reference shard 未达到跨规则收敛边界",
+                evidence_refs=inputs.references,
+            )
+        _thresholds, _candidate_rules, required_units, _strata, _plan_ref = (
+            _formal_stage3_pilot_plan(request, root, context)
+        )
+    # A contribution bundle is itself immutable.  The unit id is part of its
+    # path so two unrelated endpoint/probe paths can never overwrite or reuse
+    # one another's reference vector.
+    contribution_path = (
+        store.root / "tensor-bundles" / "path-reference" / context.unit_id
+        if context.execution.run_intent == "formal"
+        else store.root / "tensor-bundles" / "path-reference"
+    )
     contribution_bundle = _publish_or_load_bundle(
         contribution_path,
         {"reference_contribution": result.reference_contribution},
     )
+    reference_payload: dict[str, JSONValue] = {
+        "schema_version": "stage3-task-path-integral-reference-v1",
+        "refinement": result.to_dict(),
+        "contribution_bundle_ref": contribution_path.relative_to(root).as_posix(),
+        "contribution_bundle_manifest_hash": contribution_bundle.manifest_sha256,
+        "path_identity_hash": context.path.identity_hash,
+        "node_gradient_cache": context.cache_evidence(reference_rules),
+        "evaluation_costs": [
+            {
+                "rule": rule.name,
+                "unique_gradient_evaluations": rule.unique_gradient_evaluations,
+                "gradient_evaluations": context.cost_for(rule).gradient_evaluations,
+                "loss_evaluations": context.cost_for(rule).loss_evaluations,
+                "forward_evaluations": context.cost_for(rule).forward_evaluations,
+                "backward_evaluations": context.cost_for(rule).backward_evaluations,
+                "wall_seconds": context.cost_for(rule).wall_seconds,
+                "peak_gpu_memory_bytes": context.cost_for(rule).peak_gpu_memory_bytes,
+            }
+            for rule in reference_rules
+        ],
+        "cost_semantics": "callback_cost_separate_from_unique_nodes_v1",
+        "scope": context.execution.run_intent,
+        "formal_eligible": False,
+        "execution_evidence_hash": context.execution.artifact_hash,
+        **reference_binding,
+    }
+    aggregate_ref: str | None = None
+    aggregate_hash: str | None = None
+    if context.execution.run_intent == "formal":
+        _shard, shard_ref = _persist_stage3_reference_shard(
+            request,
+            root,
+            store,
+            context=context,
+            reference=reference_payload,
+            required_unit_ids=required_units,
+            reference_binding_hash=str(reference_binding["reference_binding_hash"]),
+        )
+        _refs, _entries, complete_units, missing_units = _load_stage3_reference_aggregate(
+            request,
+            root,
+            store,
+            required_unit_ids=required_units,
+            execution_evidence_hash=context.execution.artifact_hash,
+            reference_binding_hash=str(reference_binding["reference_binding_hash"]),
+        )
+        aggregate, aggregate_ref = _publish_stage3_reference_aggregate(
+            request,
+            root,
+            store,
+            required_unit_ids=required_units,
+            execution_evidence_hash=context.execution.artifact_hash,
+            reference_binding_hash=str(reference_binding["reference_binding_hash"]),
+        )
+        aggregate_hash = str(aggregate["artifact_hash"])
+        if missing_units or tuple(complete_units) != tuple(required_units):
+            raise _blocked(
+                BlockerCode.ASSET_UNAVAILABLE,
+                "stage3.05_reference_coverage",
+                (
+                    "formal Stage3.05 reference fan-out 尚未覆盖全部 path units "
+                    f"({len(complete_units)}/{len(required_units)})"
+                ),
+                evidence_refs=tuple(
+                    dict.fromkeys(
+                        (
+                            *inputs.references,
+                            shard_ref,
+                            aggregate_ref,
+                        )
+                    )
+                ),
+            )
+    if aggregate_ref is not None:
+        reference_payload.update(
+            {
+                "active_unit_id": context.unit_id,
+                "reference_aggregate_ref": aggregate_ref,
+                "reference_aggregate_hash": aggregate_hash,
+            }
+        )
     payloads: dict[str, Mapping[str, JSONValue]] = {
-        "path_integral_reference": {
-            "schema_version": "stage3-task-path-integral-reference-v1",
-            "refinement": result.to_dict(),
-            "contribution_bundle_ref": contribution_path.relative_to(root).as_posix(),
-            "contribution_bundle_manifest_hash": contribution_bundle.manifest_sha256,
-            "path_identity_hash": context.path.identity_hash,
-            "node_gradient_cache": context.cache_evidence(reference_rules),
-            "scope": context.execution.run_intent,
-            "formal_eligible": False,
-            "execution_evidence_hash": context.execution.artifact_hash,
-        },
+        "path_integral_reference": reference_payload,
         "precision_budget": {
             "schema_version": "stage3-task-precision-budget-v1",
             "gradient_dtype": "float64",
@@ -7045,7 +8776,10 @@ def _run_stage3_reference(
         },
         "gate_record": _gate_candidate(request),
     }
-    return payloads, inputs.references
+    source_refs = inputs.references
+    if aggregate_ref is not None:
+        source_refs = tuple(dict.fromkeys((*source_refs, aggregate_ref)))
+    return payloads, source_refs
 
 
 def _quadrature_rule_from_name(name: str) -> object:
@@ -7097,18 +8831,293 @@ def _load_path_reference_vector(
     return contribution
 
 
+def _stage3_production_index_reference(
+    request: TaskExecutionRequest,
+    root: Path,
+    *,
+    formal_plan: Mapping[str, object] | None = None,
+) -> str | None:
+    """Resolve the immutable production unit-index reference.
+
+    The reference may be supplied as formal environment evidence, as an
+    orchestration field, or (for a plan-driven launch) by the plan itself.
+    We require all declarations to agree; there is no task-local ID
+    reconstruction fallback once a formal index is available.
+    """
+
+    candidates: list[str] = []
+    environment = getattr(request, "environment", None)
+    env_refs_raw = getattr(environment, "evidence_refs", {})
+    env_refs = env_refs_raw if isinstance(env_refs_raw, Mapping) else {}
+    for key in (
+        "stage3_production_unit_index",
+        "production_unit_index",
+    ):
+        value = env_refs.get(key)
+        if value is not None:
+            if not isinstance(value, str) or not value:
+                raise ValueError("STAGE3_PRODUCTION_UNIT_INDEX_REF_INVALID")
+            candidates.append(value)
+    configs: tuple[object, ...] = (request.config, request.config.base_config)
+    for config in configs:
+        for section_name in ("orchestration", "path_integration"):
+            try:
+                section = config.section(section_name)  # type: ignore[attr-defined]
+            except (AttributeError, KeyError, TypeError):
+                continue
+            if not isinstance(section, Mapping):
+                continue
+            for key in (
+                "stage3_production_unit_index_ref",
+                "production_unit_index_ref",
+            ):
+                value = section.get(key)
+                if value is not None:
+                    if not isinstance(value, str) or not value:
+                        raise ValueError("STAGE3_PRODUCTION_UNIT_INDEX_REF_INVALID")
+                    candidates.append(value)
+    # A plan may be supplied through the formal environment or ordinary input
+    # refs.  Discover its index declaration before the endpoint selector runs
+    # so the path context receives the canonical ID from the beginning.  When
+    # both plans are present in a shared environment, only the plan selected by
+    # this task's frozen DAG edge is admissible; otherwise a pilot launch would
+    # spuriously conflict with the 99-unit matrix index (and vice versa).
+    expected_scope = _stage3_production_index_scope(request)
+    expected_plan_kind = (
+        "pilot" if expected_scope == PILOT_SCOPE
+        else "matrix" if expected_scope == FORMAL_SCOPE
+        else None
+    )
+    discovery_refs: list[str] = []
+    plan_keys = (
+        (
+            "formal_stage3_pilot_plan",
+            "stage3_formal_pilot_plan",
+        ) if expected_plan_kind == "pilot" else (
+            "formal_stage3_matrix_plan",
+            "stage3_formal_matrix_plan",
+        ) if expected_plan_kind == "matrix" else (
+            "formal_stage3_pilot_plan",
+            "stage3_formal_pilot_plan",
+            "formal_stage3_matrix_plan",
+            "stage3_formal_matrix_plan",
+        )
+    )
+    for key in plan_keys:
+        value = env_refs.get(key)
+        if isinstance(value, str) and value:
+            discovery_refs.append(value)
+    try:
+        orchestration = request.config.section("orchestration")
+    except (AttributeError, KeyError, TypeError):
+        orchestration = None
+    if isinstance(orchestration, Mapping):
+        raw_refs = orchestration.get("input_result_refs", ())
+        if isinstance(raw_refs, (list, tuple)):
+            discovery_refs.extend(
+                item for item in raw_refs if isinstance(item, str) and item
+            )
+    for discovery_ref in dict.fromkeys(discovery_refs):
+        discovered: Mapping[str, object] | None = None
+        try:
+            raw_discovered = load_canonical_json(
+                _workspace_path(root, discovery_ref, field="stage3_plan_discovery")
+            )
+        except (FileNotFoundError, OSError, TypeError, ValueError):
+            raw_discovered = None
+        if isinstance(raw_discovered, Mapping):
+            discovered = raw_discovered
+        # Production plans are normally immutable formal task commits.  The
+        # endpoint selector runs before the task-specific plan loader, so it
+        # must unwrap that commit here or it would silently lose the canonical
+        # 12/99-unit index declaration.  A failed unwrap is only a discovery
+        # miss; the strict plan consumer later emits the authoritative error.
+        if (
+            discovered is None
+            or discovered.get("schema_version")
+            != "stage3-formal-pilot-plan-v1"
+        ):
+            try:
+                discovered = _load_formal_document_ref(
+                    root,
+                    discovery_ref,
+                    field="stage3_plan_discovery",
+                    schema_version="stage3-formal-pilot-plan-v1",
+                )
+            except (FileNotFoundError, OSError, TypeError, ValueError):
+                pass
+        if discovered is None:
+            continue
+        if discovered.get("schema_version") == "stage3-production-unit-index-v1":
+            candidates.append(discovery_ref)
+        elif discovered.get("schema_version") == "stage3-formal-pilot-plan-v1":
+            if expected_plan_kind is not None and (
+                discovered.get("plan_kind") != expected_plan_kind
+                or discovered.get("production_unit_index_scope") != expected_scope
+            ):
+                continue
+            value = discovered.get("production_unit_index_ref")
+            if isinstance(value, str) and value:
+                candidates.append(value)
+    if isinstance(formal_plan, Mapping):
+        value = formal_plan.get("production_unit_index_ref")
+        if value is not None:
+            if not isinstance(value, str) or not value:
+                raise ValueError("STAGE3_PRODUCTION_UNIT_INDEX_REF_INVALID")
+            candidates.append(value)
+    unique = tuple(dict.fromkeys(candidates))
+    if len(unique) > 1:
+        raise ValueError("STAGE3_PRODUCTION_UNIT_INDEX_REF_CONFLICT")
+    return unique[0] if unique else None
+
+
+def _load_stage3_production_index(
+    request: TaskExecutionRequest,
+    root: Path,
+    *,
+    formal_plan: Mapping[str, object] | None = None,
+    expected_scope: str = FORMAL_SCOPE,
+) -> tuple[ProductionUnitIndex | None, str | None]:
+    reference = _stage3_production_index_reference(
+        request, root, formal_plan=formal_plan
+    )
+    if reference is None:
+        return None, None
+    return (
+        load_production_unit_index(
+            _workspace_path(root, reference, field="stage3_production_unit_index"),
+            workspace_root=root,
+            expected_scope=expected_scope,
+        ),
+        reference,
+    )
+
+
+def _stage3_execution_is_append_only_extension(
+    base: FormalExecutionEvidence,
+    current: FormalExecutionEvidence,
+) -> bool:
+    """Return whether ``current`` only appends exact Stage 3 Gate records.
+
+    A formal plan is necessarily frozen before the Gate produced by the task
+    which consumes it.  Consequently its execution-evidence hash cannot equal
+    every later evidence revision.  Scientific identity remains unchanged only
+    when contract, assets and metadata are byte-equivalent and every Gate in
+    the frozen revision survives with the exact same artifact hash.
+    """
+
+    if (
+        base.run_intent != "formal"
+        or current.run_intent != "formal"
+        or base.contract_freeze_hash != current.contract_freeze_hash
+        or base.asset_manifest_hashes != current.asset_manifest_hashes
+        or dict(base.metadata) != dict(current.metadata)
+    ):
+        return False
+    base_gates = {gate.gate_id: gate for gate in base.prerequisite_gates}
+    current_gates = {gate.gate_id: gate for gate in current.prerequisite_gates}
+    if not set(base_gates).issubset(current_gates):
+        return False
+    if any(
+        current_gates[gate_id].artifact_hash != gate.artifact_hash
+        for gate_id, gate in base_gates.items()
+    ):
+        return False
+    added = set(current_gates) - set(base_gates)
+    return all(
+        gate_id.startswith("stage3.G3-")
+        and current_gates[gate_id].stage == 3
+        and current_gates[gate_id].status is GateStatus.PASS
+        and current_gates[gate_id].effective_status() is GateStatus.PASS
+        for gate_id in added
+    )
+
+
+def _stage3_execution_matches_or_extends_plan(
+    request: TaskExecutionRequest,
+    root: Path,
+    *,
+    current: FormalExecutionEvidence,
+    declared_hash: str,
+    plan_ref: str,
+    plan_kind: str,
+) -> bool:
+    """Validate the exact plan execution or its content-bound Gate extension.
+
+    For a committed plan the original execution commit must be one of the
+    plan envelope's source refs.  A direct-plan compatibility path may provide
+    the same authority explicitly in the runtime environment.  Merely knowing
+    a SHA-256 is never sufficient to claim ancestry.
+    """
+
+    if declared_hash == current.artifact_hash:
+        return True
+    candidate_refs: list[str] = []
+    try:
+        plan_artifact = load_committed_task_artifact(
+            root, plan_ref, require_formal=True
+        )
+    except (FileNotFoundError, OSError, TypeError, ValueError):
+        plan_artifact = None
+    if plan_artifact is not None:
+        candidate_refs.extend(plan_artifact.source_refs)
+    env_key = (
+        "stage3_pilot_plan_execution"
+        if plan_kind == "pilot"
+        else "stage3_matrix_plan_execution"
+    )
+    env_ref = request.environment.evidence_refs.get(env_key)
+    if isinstance(env_ref, str) and env_ref:
+        candidate_refs.append(env_ref)
+    matches: list[FormalExecutionEvidence] = []
+    for candidate_ref in dict.fromkeys(candidate_refs):
+        try:
+            artifact = load_committed_task_artifact(
+                root, candidate_ref, require_formal=True
+            )
+            if artifact.identity.artifact_kind not in {
+                "formal_execution_evidence",
+                "execution_evidence",
+            }:
+                continue
+            evidence = FormalExecutionEvidence.from_mapping(artifact.payload)
+        except (
+            FileNotFoundError,
+            OSError,
+            TypeError,
+            ValueError,
+            FormalRunRejected,
+        ):
+            continue
+        if evidence.artifact_hash == declared_hash:
+            matches.append(evidence)
+    return len(matches) == 1 and _stage3_execution_is_append_only_extension(
+        matches[0], current
+    )
+
+
 def _formal_stage3_pilot_plan(
     request: TaskExecutionRequest,
     root: Path,
     context: _PathContext,
-) -> tuple[QuadratureThresholds, tuple[str, ...], tuple[str, ...], str]:
+    *,
+    plan_kind: str = "pilot",
+    requirement: str = "formal_stage3_pilot_plan",
+    expected_index_scope: str = "pilot",
+) -> tuple[
+    QuadratureThresholds,
+    tuple[str, ...],
+    tuple[str, ...],
+    Mapping[str, Mapping[str, str]],
+    str,
+]:
     """严格加载预注册的 formal 候选规则、阈值与路径单元集合。"""
 
     value, reference = _formal_input_document(
         request,
         root,
         schema_version="stage3-formal-pilot-plan-v1",
-        requirement="formal_stage3_pilot_plan",
+        requirement=requirement,
     )
     expected = {
         "schema_version",
@@ -7116,7 +9125,12 @@ def _formal_stage3_pilot_plan(
         "scope",
         "candidate_rules",
         "required_unit_ids",
+        "unit_strata",
         "thresholds",
+        "plan_kind",
+        "production_unit_index_scope",
+        "production_unit_index_ref",
+        "production_unit_index_hash",
         "execution_evidence_hash",
         "formal_eligible",
         "artifact_hash",
@@ -7124,7 +9138,7 @@ def _formal_stage3_pilot_plan(
     if set(value) != expected:
         raise _blocked(
             BlockerCode.CONTRACT_UNFROZEN,
-            "formal_stage3_pilot_plan",
+            requirement,
             "formal pilot plan 字段集合不匹配",
             retryable=False,
             evidence_refs=(reference,),
@@ -7134,13 +9148,41 @@ def _formal_stage3_pilot_plan(
     if declared != canonical_json_hash(body):
         raise _blocked(
             BlockerCode.CONTRACT_UNFROZEN,
-            "formal_stage3_pilot_plan",
+            requirement,
             "formal pilot plan artifact_hash 不可复算",
             retryable=False,
             evidence_refs=(reference,),
         )
+    try:
+        production_index, production_index_ref = _load_stage3_production_index(
+            request,
+            root,
+            formal_plan=value,
+            expected_scope=expected_index_scope,
+        )
+        if production_index is None or production_index_ref != value.get(
+            "production_unit_index_ref"
+        ):
+            raise ValueError("production unit index ref 缺失或冲突")
+        if value.get("production_unit_index_hash") != production_index.artifact_hash:
+            raise ValueError("production unit index hash 与文件不一致")
+        if production_index.scope != expected_index_scope:
+            raise ValueError("production unit index scope 与计划不一致")
+        if value.get("plan_kind") != plan_kind:
+            raise ValueError("formal plan kind 与任务不一致")
+        if value.get("production_unit_index_scope") != expected_index_scope:
+            raise ValueError("formal plan index scope 与任务不一致")
+    except (FileNotFoundError, OSError, TypeError, ValueError) as error:
+        raise _blocked(
+            BlockerCode.CONTRACT_UNFROZEN,
+            "stage3_production_unit_index",
+            f"formal production unit index 不可严格加载：{error}",
+            retryable=False,
+            evidence_refs=(reference,),
+        ) from error
     candidates = value.get("candidate_rules")
     units = value.get("required_unit_ids")
+    unit_strata_raw = value.get("unit_strata")
     thresholds_raw = value.get("thresholds")
     try:
         if (
@@ -7157,39 +9199,99 @@ def _formal_stage3_pilot_plan(
             or len(set(units)) != len(units)
         ):
             raise ValueError("required_unit_ids 必须为非空无重复字符串数组")
-        if not isinstance(thresholds_raw, Mapping) or set(thresholds_raw) != {
-            "max_normalized_l1_error",
-            "max_completeness_absolute_residual",
-            "min_spearman",
-            "min_topk_overlap",
-            "max_unique_nodes",
-        }:
-            raise ValueError("thresholds 字段集合无效")
-        thresholds = QuadratureThresholds(**dict(thresholds_raw))  # type: ignore[arg-type]
+        if not isinstance(thresholds_raw, Mapping):
+            raise ValueError("thresholds 必须是完整 formal contract object")
+        if (
+            not isinstance(unit_strata_raw, Mapping)
+            or set(unit_strata_raw) != set(units)
+            or any(
+                not isinstance(item, Mapping)
+                or set(item) != {"model", "stage", "update", "probe"}
+                or any(not isinstance(child, str) or not child for child in item.values())
+                or item["stage"] not in {"early", "middle", "late"}
+                for item in unit_strata_raw.values()
+            )
+        ):
+            raise ValueError("unit_strata 必须逐单元冻结 model/stage/update/probe")
+        index_units = [unit.path_unit_id for unit in production_index.units]
+        if units != index_units:
+            raise ValueError("required_unit_ids 必须与 production unit index 顺序及集合完全一致")
+        if unit_strata_raw != production_index.unit_strata():
+            raise ValueError("unit_strata 必须由 production unit index 派生")
+        thresholds = QuadratureThresholds(  # type: ignore[arg-type]
+            **dict(thresholds_raw)
+        ).require_formal_contract()
         for name in candidates:
             _quadrature_rule_from_name(name)
-    except (TypeError, ValueError) as error:
+    except (FormalRunRejected, TypeError, ValueError) as error:
         raise _blocked(
             BlockerCode.CONTRACT_UNFROZEN,
-            "formal_stage3_pilot_plan",
+            requirement,
             f"formal pilot plan 无法严格加载：{error}",
             retryable=False,
             evidence_refs=(reference,),
         ) from error
+    plan_execution_hash = value.get("execution_evidence_hash")
+    execution_binding_valid = (
+        isinstance(plan_execution_hash, str)
+        and _stage3_execution_matches_or_extends_plan(
+            request,
+            root,
+            current=context.execution,
+            declared_hash=plan_execution_hash,
+            plan_ref=reference,
+            plan_kind=plan_kind,
+        )
+    )
     if (
         value.get("scope") != "formal"
         or value.get("formal_eligible") is not True
-        or value.get("execution_evidence_hash") != context.execution.artifact_hash
+        or not execution_binding_valid
         or context.unit_id not in units
     ):
         raise _blocked(
             BlockerCode.CONTRACT_UNFROZEN,
-            "formal_stage3_pilot_plan_qualification",
+            f"{requirement}_qualification",
             "formal pilot plan 未绑定当前 execution evidence/path unit",
             retryable=False,
             evidence_refs=(reference,),
         )
-    return thresholds, tuple(candidates), tuple(units), reference
+    unit_strata = {
+        str(unit_id): MappingProxyType(
+            {str(key): str(child) for key, child in item.items()}
+        )
+        for unit_id, item in unit_strata_raw.items()  # type: ignore[union-attr]
+    }
+    return (
+        thresholds,
+        tuple(candidates),
+        tuple(units),
+        MappingProxyType(unit_strata),
+        reference,
+    )
+
+
+def _formal_stage3_matrix_plan(
+    request: TaskExecutionRequest,
+    root: Path,
+    context: _PathContext,
+) -> tuple[
+    QuadratureThresholds,
+    tuple[str, ...],
+    tuple[str, ...],
+    Mapping[str, Mapping[str, str]],
+    str,
+]:
+    """Load the separate 99-unit matrix plan for Stage 3.07 and downstream."""
+
+    return _formal_stage3_pilot_plan(
+        request,
+        root,
+        context,
+        plan_kind="matrix",
+        requirement="formal_stage3_matrix_plan",
+        expected_index_scope=FORMAL_SCOPE,
+    )
 
 
 def _quadrature_observations(
@@ -7197,26 +9299,104 @@ def _quadrature_observations(
     *,
     candidate_rule_names: Sequence[str] = ("midpoint", "trapezoid", "simpson"),
     reference_contribution: Mapping[str, object] | None = None,
+    thresholds: QuadratureThresholds | None = None,
+    reference_normalized_l1_error: float | None = None,
+    strata: Mapping[str, object] | None = None,
+    evidence_refs: Sequence[str] = (),
 ) -> tuple[tuple[QuadratureObservation, ...], Mapping[str, PathIntegralResult]]:
     if reference_contribution is None:
         reference_contribution = context.integrate(gauss_legendre_rule(4)).signed
+    formal = context.execution.run_intent == "formal"
+    if formal:
+        if thresholds is None:
+            raise ValueError("FORMAL_STAGE3_OBSERVATION_THRESHOLDS_REQUIRED")
+        thresholds.require_formal_contract()
+        if reference_normalized_l1_error is None or not math.isfinite(
+            float(reference_normalized_l1_error)
+        ):
+            raise ValueError("FORMAL_STAGE3_REFERENCE_ERROR_REQUIRED")
+        if not isinstance(strata, Mapping) or set(strata) != {
+            "model", "stage", "update", "probe"
+        }:
+            raise ValueError("FORMAL_STAGE3_UNIT_STRATA_REQUIRED")
+        if not evidence_refs:
+            raise ValueError("FORMAL_STAGE3_OBSERVATION_EVIDENCE_REQUIRED")
     reference_vector = _flatten(reference_contribution)
     reference_l1 = float(np.abs(reference_vector).sum())
     if reference_l1 <= 0:
         raise ValueError("STAGE3_REFERENCE_ZERO_L1")
+    reference_arrays = _as_numpy_vector(reference_contribution)
+    coordinate_ids: list[str] = []
+    layer_groups: list[str] = []
+    module_groups: list[str] = []
+    for name, array in reference_arrays.items():
+        record = context.registry.record(name)
+        if record.numel != array.size:
+            raise ValueError(f"STAGE3_REGISTRY_VECTOR_SIZE_MISMATCH:{name}")
+        coordinate_ids.extend(f"{name}[{index}]" for index in range(array.size))
+        layer_groups.extend([record.tags["layer"]] * array.size)
+        module_groups.extend([record.tags["module"]] * array.size)
+
+    def metric_value(result: Stage3MetricResult) -> float | None:
+        return None if not result.defined else result.value
+
     results: dict[str, PathIntegralResult] = {}
     observations: list[QuadratureObservation] = []
     for rule_name in candidate_rule_names:
         rule = _quadrature_rule_from_name(rule_name)
-        # 执行真实积分；计时只用于运行期诊断，不进入 canonical artifact。
-        started = perf_counter()
         result = context.integrate(rule)
-        _elapsed = perf_counter() - started
         vector = _flatten(result.signed)
         residual = result.completeness_absolute_residual
         if residual is None:
             raise ValueError("STAGE3_COMPLETENESS_RESIDUAL_UNDEFINED")
         results[rule_name] = result
+        cost = context.cost_for(rule)
+        active_threshold = (
+            0.0
+            if thresholds is None or thresholds.active_set_threshold is None
+            else float(thresholds.active_set_threshold)
+        )
+        q_values = (
+            (0.001, 0.01, 0.05)
+            if thresholds is None or thresholds.top_q_values is None
+            else thresholds.top_q_values
+        )
+        normalized_l2 = stage3_normalized_l2(vector, reference_vector)
+        normalized_linf = stage3_normalized_linf(vector, reference_vector)
+        cosine = stage3_cosine(vector, reference_vector)
+        active_spearman = stage3_active_set_spearman(
+            vector, reference_vector, active_threshold=active_threshold
+        )
+        sign_consistency = stage3_sign_consistency(
+            vector, reference_vector, active_threshold=active_threshold
+        )
+        top_q = stage3_top_q_metrics(
+            vector,
+            reference_vector,
+            q_values=q_values,
+            coordinate_ids=coordinate_ids,
+        )
+        layer_tv = stage3_quality_total_variation(
+            vector, reference_vector, layer_groups, quality_view="absolute"
+        )
+        module_tv = stage3_quality_total_variation(
+            vector, reference_vector, module_groups, quality_view="absolute"
+        )
+        epsilon = (
+            1e-12
+            if thresholds is None
+            or thresholds.completeness_stability_epsilon is None
+            else float(thresholds.completeness_stability_epsilon)
+        )
+        completeness_relative = result.completeness_relative_residual
+        completeness_l1_scaled = result.completeness_l1_scaled_residual
+        if result.loss_drop is not None:
+            completeness_relative = float(residual) / (
+                abs(float(result.loss_drop)) + epsilon
+            )
+        # The Stage 3 contract scales this residual by the independent
+        # reference contribution mass, not by the candidate's own mass.
+        completeness_l1_scaled = float(residual) / (reference_l1 + epsilon)
         observations.append(
             QuadratureObservation(
                 unit_id=context.unit_id,
@@ -7226,9 +9406,35 @@ def _quadrature_observations(
                 completeness_absolute_residual=float(residual),
                 spearman=_spearman(vector, reference_vector),
                 topk_overlap=_topk_overlap(vector, reference_vector),
-                # 推荐器在 node count 相同后才比较本字段；fixture 使用确定性的节点成本单位，
-                # payload 会明确声明它不是墙钟秒数。
-                wall_seconds=float(result.unique_gradient_evaluations),
+                wall_seconds=cost.wall_seconds,
+                normalized_l2_error=metric_value(normalized_l2),
+                normalized_linf_error=metric_value(normalized_linf),
+                completeness_relative_residual=completeness_relative,
+                completeness_l1_scaled_residual=completeness_l1_scaled,
+                active_spearman=metric_value(active_spearman),
+                cosine_similarity=metric_value(cosine),
+                sign_consistency=metric_value(sign_consistency),
+                topq_overlap={
+                    f"{q:g}": value
+                    for q, row in top_q.items()
+                    if (value := metric_value(row["overlap"])) is not None  # type: ignore[arg-type]
+                },
+                topq_jaccard={
+                    f"{q:g}": value
+                    for q, row in top_q.items()
+                    if (value := metric_value(row["jaccard"])) is not None  # type: ignore[arg-type]
+                },
+                layer_quality_tv=metric_value(layer_tv),
+                module_quality_tv=metric_value(module_tv),
+                reference_normalized_l1_error=reference_normalized_l1_error,
+                strata={} if strata is None else dict(strata),
+                evidence_refs=tuple(evidence_refs),
+                scope=context.execution.run_intent,
+                gradient_evaluations=cost.gradient_evaluations,
+                loss_evaluations=cost.loss_evaluations,
+                forward_evaluations=cost.forward_evaluations,
+                backward_evaluations=cost.backward_evaluations,
+                peak_gpu_memory_bytes=cost.peak_gpu_memory_bytes,
             )
         )
     return tuple(observations), results
@@ -7240,7 +9446,10 @@ def _stage3_recommendation(
     thresholds: QuadratureThresholds | None = None,
     candidate_rule_names: Sequence[str] = ("midpoint", "trapezoid", "simpson"),
     reference_contribution: Mapping[str, object] | None = None,
+    reference_normalized_l1_error: float | None = None,
     required_unit_ids: Sequence[str] | None = None,
+    strata: Mapping[str, object] | None = None,
+    evidence_refs: Sequence[str] = (),
 ) -> tuple[
     QuadratureRecommendation,
     tuple[QuadratureObservation, ...],
@@ -7251,6 +9460,10 @@ def _stage3_recommendation(
         context,
         candidate_rule_names=candidate_rule_names,
         reference_contribution=reference_contribution,
+        thresholds=thresholds,
+        reference_normalized_l1_error=reference_normalized_l1_error,
+        strata=strata,
+        evidence_refs=evidence_refs,
     )
     if thresholds is None:
         if context.execution.run_intent != "local_fixture":
@@ -7280,11 +9493,499 @@ def _observation_payload(item: QuadratureObservation) -> dict[str, JSONValue]:
         "rule_name": item.rule_name,
         "unique_nodes": item.unique_nodes,
         "normalized_l1_error": item.normalized_l1_error,
+        "normalized_l2_error": item.normalized_l2_error,
+        "normalized_linf_error": item.normalized_linf_error,
         "completeness_absolute_residual": item.completeness_absolute_residual,
+        "completeness_relative_residual": item.completeness_relative_residual,
+        "completeness_l1_scaled_residual": item.completeness_l1_scaled_residual,
         "spearman": item.spearman,
+        "active_spearman": item.active_spearman,
+        "cosine_similarity": item.cosine_similarity,
+        "sign_consistency": item.sign_consistency,
         "topk_overlap": item.topk_overlap,
-        "deterministic_node_cost_units": item.wall_seconds,
+        "topq_overlap": dict(item.topq_overlap),
+        "topq_jaccard": dict(item.topq_jaccard),
+        "layer_quality_tv": item.layer_quality_tv,
+        "module_quality_tv": item.module_quality_tv,
+        "reference_normalized_l1_error": item.reference_normalized_l1_error,
+        "strata": dict(item.strata),  # type: ignore[dict-item]
+        "worst_case": item.worst_case,
+        "evidence_refs": list(item.evidence_refs),
+        "scope": item.scope,
+        # Node count is the deterministic theoretical cost; elapsed wall time
+        # is separately recorded and must never be replaced by this value.
+        "deterministic_node_cost_units": item.unique_nodes,
+        "wall_seconds": item.wall_seconds,
+        "gradient_evaluations": item.gradient_evaluations,
+        "loss_evaluations": item.loss_evaluations,
+        "forward_evaluations": item.forward_evaluations,
+        "backward_evaluations": item.backward_evaluations,
+        "peak_gpu_memory_bytes": item.peak_gpu_memory_bytes,
     }
+
+
+def _stage3_observation_ledger_root(
+    request: TaskExecutionRequest,
+    root: Path,
+    store: TaskArtifactStore,
+    *,
+    execution_evidence_hash: str,
+) -> Path:
+    """Resolve the local, resumable per-unit observation ledger.
+
+    Production shards share the configured runtime cache, while direct tests
+    without a runtime section stay inside the task output.  The ledger only
+    stores JSON diagnostics and never replaces the authoritative task commit.
+    """
+
+    try:
+        runtime = request.config.base_config.section("runtime")
+    except (AttributeError, KeyError, TypeError):
+        runtime = None
+    cache_root = runtime.get("cache_root") if isinstance(runtime, Mapping) else None
+    if isinstance(cache_root, str):
+        base = _workspace_path(root, cache_root, field="runtime.cache_root")
+    else:
+        base = store.root / "resume" / "stage3-observation-ledger"
+    if (
+        len(execution_evidence_hash) != 64
+        or any(character not in "0123456789abcdef" for character in execution_evidence_hash)
+    ):
+        raise ValueError("STAGE3_OBSERVATION_LEDGER_EXECUTION_HASH_INVALID")
+    return (
+        base / "stage3-quadrature-observations" / execution_evidence_hash
+    ).resolve()
+
+
+def _observation_from_payload(value: Mapping[str, object]) -> QuadratureObservation:
+    """Strictly reconstruct one persisted observation, including measured cost."""
+
+    expected = {
+        "unit_id",
+        "rule_name",
+        "unique_nodes",
+        "normalized_l1_error",
+        "normalized_l2_error",
+        "normalized_linf_error",
+        "completeness_absolute_residual",
+        "completeness_relative_residual",
+        "completeness_l1_scaled_residual",
+        "spearman",
+        "active_spearman",
+        "cosine_similarity",
+        "sign_consistency",
+        "topk_overlap",
+        "topq_overlap",
+        "topq_jaccard",
+        "layer_quality_tv",
+        "module_quality_tv",
+        "reference_normalized_l1_error",
+        "strata",
+        "worst_case",
+        "evidence_refs",
+        "scope",
+        "deterministic_node_cost_units",
+        "wall_seconds",
+        "gradient_evaluations",
+        "loss_evaluations",
+        "forward_evaluations",
+        "backward_evaluations",
+        "peak_gpu_memory_bytes",
+    }
+    if set(value) != expected:
+        raise ValueError("STAGE3_OBSERVATION_FIELDS_MISMATCH")
+    if value["deterministic_node_cost_units"] != value["unique_nodes"]:
+        raise ValueError("STAGE3_OBSERVATION_NODE_COST_MISMATCH")
+    topq_overlap = value["topq_overlap"]
+    topq_jaccard = value["topq_jaccard"]
+    strata = value["strata"]
+    evidence_refs = value["evidence_refs"]
+    if not all(isinstance(item, Mapping) for item in (topq_overlap, topq_jaccard, strata)):
+        raise TypeError("STAGE3_OBSERVATION_MAPPING_FIELDS_INVALID")
+    if not isinstance(evidence_refs, list) or any(
+        not isinstance(item, str) for item in evidence_refs
+    ):
+        raise TypeError("STAGE3_OBSERVATION_EVIDENCE_REFS_INVALID")
+
+    def optional_float(name: str) -> float | None:
+        raw = value[name]
+        return None if raw is None else float(raw)
+
+    return QuadratureObservation(
+        unit_id=str(value["unit_id"]),
+        rule_name=str(value["rule_name"]),
+        unique_nodes=int(value["unique_nodes"]),
+        normalized_l1_error=float(value["normalized_l1_error"]),
+        completeness_absolute_residual=float(value["completeness_absolute_residual"]),
+        spearman=float(value["spearman"]),
+        topk_overlap=float(value["topk_overlap"]),
+        wall_seconds=float(value["wall_seconds"]),
+        normalized_l2_error=optional_float("normalized_l2_error"),
+        normalized_linf_error=optional_float("normalized_linf_error"),
+        completeness_relative_residual=optional_float(
+            "completeness_relative_residual"
+        ),
+        completeness_l1_scaled_residual=optional_float(
+            "completeness_l1_scaled_residual"
+        ),
+        active_spearman=optional_float("active_spearman"),
+        cosine_similarity=optional_float("cosine_similarity"),
+        sign_consistency=optional_float("sign_consistency"),
+        topq_overlap=topq_overlap,  # type: ignore[arg-type]
+        topq_jaccard=topq_jaccard,  # type: ignore[arg-type]
+        layer_quality_tv=optional_float("layer_quality_tv"),
+        module_quality_tv=optional_float("module_quality_tv"),
+        reference_normalized_l1_error=optional_float(
+            "reference_normalized_l1_error"
+        ),
+        strata=strata,  # type: ignore[arg-type]
+        worst_case=value["worst_case"],  # type: ignore[arg-type]
+        evidence_refs=tuple(evidence_refs),
+        scope=str(value["scope"]),
+        gradient_evaluations=int(value["gradient_evaluations"]),
+        loss_evaluations=int(value["loss_evaluations"]),
+        forward_evaluations=int(value["forward_evaluations"]),
+        backward_evaluations=int(value["backward_evaluations"]),
+        peak_gpu_memory_bytes=(
+            None
+            if value["peak_gpu_memory_bytes"] is None
+            else int(value["peak_gpu_memory_bytes"])
+        ),
+    )
+
+
+def _persist_stage3_observations(
+    request: TaskExecutionRequest,
+    root: Path,
+    store: TaskArtifactStore,
+    *,
+    context: _PathContext,
+    observations: Sequence[QuadratureObservation],
+    candidate_rule_names: Sequence[str],
+    reference_artifact_hash: str,
+    reference_binding_hash: str | None = None,
+    production_index: ProductionUnitIndex | None = None,
+    production_unit: ProductionUnit | None = None,
+) -> tuple[tuple[QuadratureObservation, ...], str]:
+    """Publish one immutable per-unit observation row and return its ref.
+
+    A retry reuses the first committed row, including its measured wall time;
+    it may not overwrite a completed unit with a second timing sample.  This
+    keeps recommendation identity stable while allowing the full matrix to be
+    assembled from independently scheduled endpoint/probe shards.
+    """
+
+    if not observations:
+        raise ValueError("STAGE3_OBSERVATION_LEDGER_EMPTY")
+    by_rule = {item.rule_name: item for item in observations}
+    if set(by_rule) != set(candidate_rule_names):
+        raise ValueError("STAGE3_OBSERVATION_LEDGER_RULE_SET_MISMATCH")
+    formal = context.execution.run_intent == "formal"
+    if formal and (
+        production_index is None
+        or production_unit is None
+        or production_unit.path_unit_id != context.unit_id
+    ):
+        raise ValueError("FORMAL_STAGE3_PRODUCTION_UNIT_BINDING_REQUIRED")
+    ledger_root = _stage3_observation_ledger_root(
+        request,
+        root,
+        store,
+        execution_evidence_hash=context.execution.artifact_hash,
+    )
+    path = ledger_root / f"{context.unit_id}.json"
+    payload: dict[str, JSONValue] = {
+        "schema_version": "stage3-quadrature-observation-v1",
+        "unit_id": context.unit_id,
+        "path_identity_hash": context.path.identity_hash,
+        "execution_evidence_hash": context.execution.artifact_hash,
+        "reference_artifact_hash": reference_artifact_hash,
+        "candidate_rule_names": list(candidate_rule_names),
+        "observations": [
+            _observation_payload(by_rule[name]) for name in candidate_rule_names
+        ],
+    }
+    if production_index is not None and production_unit is not None:
+        if formal and (
+            not isinstance(reference_binding_hash, str)
+            or len(reference_binding_hash) != 64
+            or any(character not in "0123456789abcdef" for character in reference_binding_hash)
+        ):
+            raise ValueError("FORMAL_STAGE3_REFERENCE_BINDING_HASH_REQUIRED")
+        payload.update(
+            {
+                "production_unit_index_hash": production_index.artifact_hash,
+                "production_unit_identity_hash": production_unit.scientific_identity_hash,
+                "production_unit": production_unit.to_dict(),
+                "reference_binding_hash": (
+                    reference_binding_hash
+                    if reference_binding_hash is not None
+                    else canonical_json_hash(
+                        {
+                            "path_identity_hash": context.path.identity_hash,
+                            "reference_artifact_hash": reference_artifact_hash,
+                        }
+                    )
+                ),
+            }
+        )
+    # Wall time, cache hits and peak memory are machine/run diagnostics.  They
+    # must be persisted, but must not make a retry look like a scientific
+    # identity conflict when only timing/cache state changed.
+    stable_rows = [
+        {
+            key: item
+            for key, item in _observation_payload(by_rule[name]).items()
+            if key
+            not in {
+                "wall_seconds",
+                "gradient_evaluations",
+                "loss_evaluations",
+                "forward_evaluations",
+                "backward_evaluations",
+                "peak_gpu_memory_bytes",
+            }
+        }
+        for name in candidate_rule_names
+    ]
+    payload["scientific_identity_hash"] = canonical_json_hash(
+        {
+            "unit_id": context.unit_id,
+            "path_identity_hash": context.path.identity_hash,
+            "execution_evidence_hash": context.execution.artifact_hash,
+            "reference_artifact_hash": reference_artifact_hash,
+            "production_unit_index_hash": payload.get(
+                "production_unit_index_hash"
+            ),
+            "production_unit_identity_hash": payload.get(
+                "production_unit_identity_hash"
+            ),
+            "reference_binding_hash": payload.get("reference_binding_hash"),
+            "candidate_rule_names": list(candidate_rule_names),
+            "observations": stable_rows,
+        }
+    )
+    payload["artifact_hash"] = canonical_json_hash(payload)
+    if path.exists():
+        try:
+            existing = load_canonical_json(path)
+            if not isinstance(existing, Mapping):
+                raise ValueError("ledger root 不是 object")
+            existing_body = {
+                key: item for key, item in existing.items() if key != "artifact_hash"
+            }
+            if (
+                set(existing) != set(payload)
+                or existing.get("artifact_hash") != canonical_json_hash(existing_body)
+                or existing.get("scientific_identity_hash")
+                != payload["scientific_identity_hash"]
+            ):
+                raise ValueError("已有 observation ledger 与当前科学身份不一致")
+            rows = existing.get("observations")
+            if not isinstance(rows, list):
+                raise ValueError("已有 observation ledger rows 不是数组")
+            return (
+                tuple(
+                    _observation_from_payload(row)
+                    for row in rows
+                    if isinstance(row, Mapping)
+                ),
+                path.relative_to(root).as_posix()
+                if path.is_relative_to(root.resolve())
+                else str(path),
+            )
+        except (OSError, TypeError, ValueError) as error:
+            raise _blocked(
+                BlockerCode.CONTRACT_UNFROZEN,
+                "stage3_observation_ledger",
+                f"已有 per-unit observation ledger 无法严格恢复：{error}",
+                retryable=False,
+            ) from error
+    write_canonical_json(path, payload)
+    return (
+        observations,
+        path.relative_to(root).as_posix()
+        if path.is_relative_to(root.resolve())
+        else str(path),
+    )
+
+
+def _load_stage3_observation_aggregate(
+    request: TaskExecutionRequest,
+    root: Path,
+    store: TaskArtifactStore,
+    *,
+    required_unit_ids: Sequence[str],
+    candidate_rule_names: Sequence[str],
+    execution_evidence_hash: str,
+    production_index: ProductionUnitIndex | None = None,
+    expected_reference_binding_hash: str | None = None,
+) -> tuple[tuple[QuadratureObservation, ...], tuple[str, ...], tuple[str, ...]]:
+    """Load every required unit, returning rows, complete units and missing units."""
+
+    ledger_root = _stage3_observation_ledger_root(
+        request,
+        root,
+        store,
+        execution_evidence_hash=execution_evidence_hash,
+    )
+    rows: list[QuadratureObservation] = []
+    complete: list[str] = []
+    missing: list[str] = []
+    for unit_id in required_unit_ids:
+        path = ledger_root / f"{unit_id}.json"
+        if not path.exists():
+            missing.append(unit_id)
+            continue
+        try:
+            value = load_canonical_json(path)
+            if not isinstance(value, Mapping):
+                raise ValueError("ledger root 不是 object")
+            base_fields = {
+                "schema_version",
+                "unit_id",
+                "path_identity_hash",
+                "execution_evidence_hash",
+                "reference_artifact_hash",
+                "candidate_rule_names",
+                "observations",
+                "scientific_identity_hash",
+                "artifact_hash",
+            }
+            expected_fields = base_fields | (
+                {
+                    "production_unit_index_hash",
+                    "production_unit_identity_hash",
+                    "production_unit",
+                    "reference_binding_hash",
+                }
+                if production_index is not None
+                else set()
+            )
+            if set(value) != expected_fields:
+                raise ValueError("ledger fields 与 formal production identity 不匹配")
+            if value.get("artifact_hash") != canonical_json_hash(
+                {key: item for key, item in value.items() if key != "artifact_hash"}
+            ):
+                raise ValueError("ledger artifact_hash 不可复算")
+            if value.get("unit_id") != unit_id:
+                raise ValueError("ledger unit_id 不匹配")
+            if value.get("execution_evidence_hash") != execution_evidence_hash:
+                raise ValueError("ledger execution evidence 不匹配")
+            if production_index is not None:
+                expected_unit = production_index.unit(unit_id)
+                if value.get("production_unit_index_hash") != production_index.artifact_hash:
+                    raise ValueError("ledger production unit index hash 不匹配")
+                if value.get("production_unit_identity_hash") != expected_unit.scientific_identity_hash:
+                    raise ValueError("ledger production unit identity 不匹配")
+                if value.get("production_unit") != expected_unit.to_dict():
+                    raise ValueError("ledger production unit declaration 不匹配")
+                reference_binding = value.get("reference_binding_hash")
+                if expected_reference_binding_hash is not None:
+                    if reference_binding != expected_reference_binding_hash:
+                        raise ValueError("ledger reference binding 不匹配当前 formal reference")
+                elif reference_binding != canonical_json_hash(
+                    {
+                        "path_identity_hash": value.get("path_identity_hash"),
+                        "reference_artifact_hash": value.get("reference_artifact_hash"),
+                    }
+                ):
+                    raise ValueError("ledger reference binding 不匹配")
+                if not isinstance(value.get("reference_artifact_hash"), str):
+                    raise ValueError("ledger reference artifact hash 缺失")
+                for field_name in (
+                    "path_identity_hash",
+                    "reference_artifact_hash",
+                ):
+                    field_value = value.get(field_name)
+                    if (
+                        not isinstance(field_value, str)
+                        or re.fullmatch(r"[0-9a-f]{64}", field_value) is None
+                    ):
+                        raise ValueError(
+                            f"ledger {field_name} 不是合法 hash"
+                        )
+            names = value.get("candidate_rule_names")
+            raw_rows = value.get("observations")
+            if names != list(candidate_rule_names) or not isinstance(raw_rows, list):
+                raise ValueError("ledger candidate rule set 不匹配")
+            unit_rows = tuple(
+                _observation_from_payload(row)
+                for row in raw_rows
+                if isinstance(row, Mapping)
+            )
+            if len(unit_rows) != len(candidate_rule_names) or {
+                item.rule_name for item in unit_rows
+            } != set(candidate_rule_names):
+                raise ValueError("ledger observations 不完整")
+            if any(item.unit_id != unit_id for item in unit_rows):
+                raise ValueError("ledger observation unit_id 不匹配")
+            if production_index is not None:
+                expected_unit = production_index.unit(unit_id)
+                if any(
+                    item.scope != "formal"
+                    or not item.evidence_refs
+                    or item.strata
+                    != {
+                        "model": expected_unit.model,
+                        "stage": expected_unit.stage,
+                        "update": expected_unit.update,
+                        "probe": expected_unit.probe,
+                    }
+                    for item in unit_rows
+                ):
+                    raise ValueError("ledger observation strata 与 production unit 不匹配")
+                if expected_reference_binding_hash is not None and value.get(
+                    "reference_binding_hash"
+                ) != expected_reference_binding_hash:
+                    raise ValueError("ledger observation reference binding 与当前 formal reference 不匹配")
+            stable_rows = [
+                {
+                    key: item
+                    for key, item in _observation_payload(
+                        next(item for item in unit_rows if item.rule_name == name)
+                    ).items()
+                    if key
+                    not in {
+                        "wall_seconds",
+                        "gradient_evaluations",
+                        "loss_evaluations",
+                        "forward_evaluations",
+                        "backward_evaluations",
+                        "peak_gpu_memory_bytes",
+                    }
+                }
+                for name in candidate_rule_names
+            ]
+            expected_scientific_identity = canonical_json_hash(
+                {
+                    "unit_id": unit_id,
+                    "path_identity_hash": value.get("path_identity_hash"),
+                    "execution_evidence_hash": execution_evidence_hash,
+                    "reference_artifact_hash": value.get("reference_artifact_hash"),
+                    "candidate_rule_names": list(candidate_rule_names),
+                    "production_unit_index_hash": value.get(
+                        "production_unit_index_hash"
+                    ),
+                    "production_unit_identity_hash": value.get(
+                        "production_unit_identity_hash"
+                    ),
+                    "reference_binding_hash": value.get("reference_binding_hash"),
+                    "observations": stable_rows,
+                }
+            )
+            if value.get("scientific_identity_hash") != expected_scientific_identity:
+                raise ValueError("ledger scientific identity hash 不可复算")
+            rows.extend(unit_rows)
+            complete.append(unit_id)
+        except (OSError, TypeError, ValueError) as error:
+            raise _blocked(
+                BlockerCode.CONTRACT_UNFROZEN,
+                "stage3_observation_ledger",
+                f"per-unit observation ledger 无法严格加载：{error}",
+                retryable=False,
+            ) from error
+    return tuple(rows), tuple(complete), tuple(missing)
 
 
 def _run_stage3_pilot(
@@ -7293,7 +9994,20 @@ def _run_stage3_pilot(
     store: TaskArtifactStore,
 ) -> tuple[Mapping[str, Mapping[str, JSONValue]], tuple[str, ...]]:
     inputs = _predecessor_context(request, root, store)
-    reference = inputs.payload("path_integral_reference")
+    reference = _predecessor_payload_or_auxiliary(
+        inputs,
+        "path_integral_reference",
+        root=root,
+    )
+    context = _fixture_path_context(request, root, store)
+    # Formal Stage 3.05 publishes a complete per-unit reference aggregate.
+    # Select the active unit before inspecting refinement/path identity; using
+    # the predecessor's top-level convenience fields would broadcast one path
+    # across unrelated endpoint/probe units.
+    selected_reference = _select_stage3_reference(
+        reference, request, root, store, context
+    )
+    reference = selected_reference
     refinement = reference.get("refinement")
     if not isinstance(refinement, Mapping) or refinement.get("converged") is not True:
         raise _blocked(
@@ -7302,7 +10016,6 @@ def _run_stage3_pilot(
             "quadrature pilot 必须消费已收敛的跨规则 reference",
             evidence_refs=inputs.references,
         )
-    context = _fixture_path_context(request, root, store)
     if reference.get("path_identity_hash") != context.path.identity_hash:
         raise _blocked(
             BlockerCode.CONTRACT_UNFROZEN,
@@ -7311,22 +10024,135 @@ def _run_stage3_pilot(
             retryable=False,
             evidence_refs=inputs.references,
         )
+    if request.config.run_intent == "formal":
+        reference_binding = _verify_stage3_formal_reference_binding(
+            reference, request, root, context
+        )
+        reference_binding_hash = str(reference_binding["reference_binding_hash"])
+    else:
+        reference_binding = {}
+        reference_binding_hash = None
     plan_ref: str | None = None
+    unit_strata: Mapping[str, Mapping[str, str]] = {}
+    production_index: ProductionUnitIndex | None = None
+    production_unit: ProductionUnit | None = None
+    production_index_ref: str | None = None
     reference_contribution = _load_path_reference_vector(reference, root)
     if request.config.run_intent == "formal":
-        thresholds, candidate_rules, required_units, plan_ref = (
+        thresholds, candidate_rules, required_units, unit_strata, plan_ref = (
             _formal_stage3_pilot_plan(request, root, context)
         )
+        try:
+            formal_plan = _load_formal_document_ref(
+                root,
+                plan_ref,
+                field="formal_stage3_pilot_plan",
+                schema_version="stage3-formal-pilot-plan-v1",
+            )
+            if not isinstance(formal_plan, Mapping):
+                raise ValueError("formal plan 不是 object")
+            production_index, production_index_ref = _load_stage3_production_index(
+                request,
+                root,
+                formal_plan=formal_plan,
+                expected_scope=PILOT_SCOPE,
+            )
+            if production_index is None:
+                raise ValueError("formal plan production unit index 缺失")
+            production_unit = production_index.unit(context.unit_id)
+        except (FileNotFoundError, OSError, TypeError, ValueError) as error:
+            raise _blocked(
+                BlockerCode.CONTRACT_UNFROZEN,
+                "stage3_production_unit_index_binding",
+                f"formal pilot 无法绑定 production unit：{error}",
+                retryable=False,
+                evidence_refs=((plan_ref,) if plan_ref is not None else ()),
+            ) from error
     else:
         thresholds = None
         candidate_rules = ("midpoint", "trapezoid", "simpson")
         required_units = (context.unit_id,)
-    recommendation, observations, _results, thresholds = _stage3_recommendation(
+    _current_recommendation, current_observations, _results, thresholds = _stage3_recommendation(
         context,
         thresholds=thresholds,
         candidate_rule_names=candidate_rules,
         reference_contribution=reference_contribution,
+        reference_normalized_l1_error=(
+            None
+            if refinement.get("conservative_error") is None
+            else float(refinement["conservative_error"])
+        ),
+        # A shard may only execute its explicitly selected endpoint/probe.
+        # Aggregate recommendation qualification happens below after loading
+        # every committed unit from the resumable ledger.
+        required_unit_ids=(context.unit_id,),
+        strata=unit_strata.get(context.unit_id),
+        evidence_refs=tuple(
+            dict.fromkeys(
+                (*inputs.references, *((plan_ref,) if plan_ref is not None else ()))
+            )
+        ),
+    )
+    reference_artifact_hash = canonical_json_hash(reference)
+    persisted_observations, ledger_ref = _persist_stage3_observations(
+        request,
+        root,
+        store,
+        context=context,
+        observations=current_observations,
+        candidate_rule_names=candidate_rules,
+        reference_artifact_hash=reference_artifact_hash,
+        reference_binding_hash=reference_binding_hash,
+        production_index=production_index,
+        production_unit=production_unit,
+    )
+    observations, complete_units, missing_units = _load_stage3_observation_aggregate(
+        request,
+        root,
+        store,
         required_unit_ids=required_units,
+        candidate_rule_names=candidate_rules,
+        execution_evidence_hash=context.execution.artifact_hash,
+        production_index=production_index,
+        expected_reference_binding_hash=reference_binding_hash,
+    )
+    if missing_units or tuple(complete_units) != tuple(required_units):
+        raise _blocked(
+            BlockerCode.ASSET_UNAVAILABLE,
+            "stage3.06_pilot_coverage",
+            (
+                "formal Stage3.06 pilot fan-out 尚未覆盖全部 path units "
+                f"({len(complete_units)}/{len(required_units)})"
+            ),
+            evidence_refs=tuple(
+                dict.fromkeys(
+                    (
+                        *inputs.references,
+                        ledger_ref,
+                    )
+                )
+            ),
+        )
+    # The current shard must be represented even when the ledger was just
+    # initialized; this also guards against an implementation accidentally
+    # dropping its own rows during aggregation.
+    if not any(item.unit_id == context.unit_id for item in observations):
+        observations = tuple(persisted_observations) + tuple(observations)
+    recommendation = QuadratureRecommendationEngine().recommend(
+        recommendation_id=(
+            "quadrature-"
+            + canonical_json_hash(
+                {
+                    "path_identity_hash": context.path.identity_hash,
+                    "required_unit_ids": list(required_units),
+                    "candidate_rules": list(candidate_rules),
+                }
+            )[:16]
+        ),
+        observations=observations,
+        required_unit_ids=required_units,
+        thresholds=thresholds,
+        execution=context.execution,
     )
     node_cache_evidence = context.cache_evidence(
         tuple(_quadrature_rule_from_name(name) for name in candidate_rules)
@@ -7336,10 +10162,17 @@ def _run_stage3_pilot(
         "quadrature_pilot_report": {
             "schema_version": "stage3-task-quadrature-pilot-report-v1",
             "observations": [_observation_payload(item) for item in observations],
-            "cost_semantics": "deterministic_unique_node_units_not_wall_clock",
+            "cost_semantics": "callback_cost_separate_from_unique_nodes_v1",
+            "observation_ledger_ref": ledger_ref,
+            "observation_progress": {
+                "complete_unit_ids": list(complete_units),
+                "missing_unit_ids": list(missing_units),
+                "observed_unit_count": len(complete_units),
+                "required_unit_count": len(required_units),
+            },
             "recommendation": recommendation.to_dict(),
             "path_identity_hash": context.path.identity_hash,
-            "reference_artifact_hash": canonical_json_hash(reference),
+            "reference_artifact_hash": reference_artifact_hash,
             "reference_bundle_ref": reference.get("contribution_bundle_ref"),
             "reference_bundle_manifest_hash": reference.get(
                 "contribution_bundle_manifest_hash"
@@ -7349,6 +10182,10 @@ def _run_stage3_pilot(
             "scope": scope,
             "formal_eligible": False,
             "pilot_plan_ref": plan_ref,
+            "production_unit_index_ref": production_index_ref,
+            "production_unit_index_hash": (
+                None if production_index is None else production_index.artifact_hash
+            ),
         },
         "threshold_freeze": {
             "schema_version": "stage3-task-threshold-freeze-v1",
@@ -7372,6 +10209,8 @@ def _run_stage3_matrix(
     root: Path,
     store: TaskArtifactStore,
 ) -> tuple[Mapping[str, Mapping[str, JSONValue]], tuple[str, ...]]:
+    if request.config.run_intent == "formal":
+        return _run_stage3_formal_matrix_shard(request, root, store)
     inputs = _predecessor_context(request, root, store)
     pilot = inputs.payload("quadrature_pilot_report")
     threshold_freeze = inputs.payload("threshold_freeze")
@@ -7469,6 +10308,7 @@ def _run_stage3_matrix(
     if selected not in results:
         raise ValueError("STAGE3_SELECTED_RULE_NOT_IN_FROZEN_CANDIDATES")
     result = results[selected]
+    selected_rule_object = _quadrature_rule_from_name(selected)
     # 结果表中的 independent reference 直接来自 Stage 3.05 跨规则连续加密产物，
     # 不允许候选方法重新以自身充当零误差 reference。
     independent_reference = {
@@ -7505,11 +10345,16 @@ def _run_stage3_matrix(
             ),
             "selected_rule": selected,
             "quadrature_recommendation": recommendation.to_dict(),
-            "result": _path_result_payload(result),
+            "result": _path_result_payload(
+                result, cost=context.cost_for(selected_rule_object)
+            ),
             "candidate_results": {
-                name: _path_result_payload(candidate)
+                name: _path_result_payload(
+                    candidate, cost=context.cost_for(_quadrature_rule_from_name(name))
+                )
                 for name, candidate in sorted(results.items())
             },
+            "cost_semantics": "callback_cost_separate_from_unique_nodes_v1",
             "node_gradient_cache": node_cache_evidence,
             "independent_reference": independent_reference,
             "upstream_binding_hash": inputs.binding_hash,
@@ -7530,6 +10375,374 @@ def _run_stage3_matrix(
         "gate_record": _gate_candidate(request),
     }
     return payloads, inputs.references
+
+
+def _run_stage3_formal_matrix_shard(
+    request: TaskExecutionRequest,
+    root: Path,
+    store: TaskArtifactStore,
+) -> tuple[Mapping[str, Mapping[str, JSONValue]], tuple[str, ...]]:
+    """Execute one preregistered formal endpoint/probe shard.
+
+    The matrix runner records every frozen candidate and never selects a rule.
+    Selection belongs to G3-7 after G3-6 has proved that all 99 units are
+    present.  Each shard consumes its own cross-family reference; a pilot
+    reference can therefore never be broadcast across unrelated paths.
+    """
+
+    inputs = _predecessor_context(request, root, store)
+    context = _fixture_path_context(request, root, store)
+    (
+        thresholds,
+        candidate_names,
+        required_units,
+        unit_strata,
+        plan_ref,
+    ) = _formal_stage3_matrix_plan(request, root, context)
+    try:
+        formal_plan = _load_formal_document_ref(
+            root,
+            plan_ref,
+            field="formal_stage3_matrix_plan",
+            schema_version="stage3-formal-pilot-plan-v1",
+        )
+        if not isinstance(formal_plan, Mapping):
+            raise ValueError("formal plan 不是 object")
+        production_index, production_index_ref = _load_stage3_production_index(
+            request,
+            root,
+            formal_plan=formal_plan,
+            expected_scope=FORMAL_SCOPE,
+        )
+        if production_index is None or production_index_ref is None:
+            raise ValueError("formal plan 缺少 production unit index")
+        production_unit = production_index.unit(context.unit_id)
+    except (FileNotFoundError, OSError, TypeError, ValueError) as error:
+        raise _blocked(
+            BlockerCode.CONTRACT_UNFROZEN,
+            "stage3_production_unit_index_binding",
+            f"正式矩阵无法绑定 production unit：{error}",
+            retryable=False,
+            evidence_refs=(plan_ref,),
+        ) from error
+    threshold_freeze = inputs.payload("threshold_freeze")
+    g35 = next(
+        (
+            gate
+            for gate in context.execution.prerequisite_gates
+            if gate.gate_id == "stage3.G3-5"
+        ),
+        None,
+    )
+    if (
+        threshold_freeze.get("thresholds_hash") != thresholds.artifact_hash
+        or g35 is None
+        or plan_ref not in g35.evidence_refs
+    ):
+        raise _blocked(
+            BlockerCode.CONTRACT_UNFROZEN,
+            "stage3_formal_threshold_freeze",
+            "正式矩阵与 G3-5 冻结阈值/计划不一致",
+            retryable=False,
+            evidence_refs=inputs.references,
+        )
+    # Stage3.06 is the only numbered predecessor of Stage3.07 and does not
+    # publish a path_integral_reference artifact.  Produce/resume the exact
+    # active matrix unit's cross-family reference here, under the matrix plan
+    # and the same node cache, before running any candidate rule.
+    reference_binding = _stage3_formal_reference_binding(
+        request, root, context, plan_kind="matrix"
+    )
+    reference_result, reference_rules = _stage3_reference_refinement(
+        request, root, store, context, plan_kind="matrix"
+    )
+    if (
+        reference_result.converged is not True
+        or reference_result.status != "FORMAL_CANDIDATE"
+    ):
+        raise _blocked(
+            BlockerCode.ASSET_UNAVAILABLE,
+            "stage3.07_reference_convergence",
+            (
+                "formal Stage3.07 matrix unit reference 尚未达到跨规则收敛边界："
+                f"unit={context.unit_id}"
+            ),
+            evidence_refs=tuple(dict.fromkeys((*inputs.references, plan_ref))),
+        )
+    matrix_contribution_path = (
+        store.root / "tensor-bundles" / "path-reference" / "matrix" / context.unit_id
+    )
+    matrix_contribution_bundle = _publish_or_load_bundle(
+        matrix_contribution_path,
+        {"reference_contribution": reference_result.reference_contribution},
+    )
+    matrix_reference: dict[str, JSONValue] = {
+        "schema_version": "stage3-task-path-integral-reference-v1",
+        "refinement": reference_result.to_dict(),
+        "contribution_bundle_ref": matrix_contribution_path.relative_to(root).as_posix(),
+        "contribution_bundle_manifest_hash": matrix_contribution_bundle.manifest_sha256,
+        "path_identity_hash": context.path.identity_hash,
+        "node_gradient_cache": context.cache_evidence(reference_rules),
+        "evaluation_costs": [
+            {
+                "rule": rule.name,
+                "unique_gradient_evaluations": rule.unique_gradient_evaluations,
+                "gradient_evaluations": context.cost_for(rule).gradient_evaluations,
+                "loss_evaluations": context.cost_for(rule).loss_evaluations,
+                "forward_evaluations": context.cost_for(rule).forward_evaluations,
+                "backward_evaluations": context.cost_for(rule).backward_evaluations,
+                "wall_seconds": context.cost_for(rule).wall_seconds,
+                "peak_gpu_memory_bytes": context.cost_for(rule).peak_gpu_memory_bytes,
+            }
+            for rule in reference_rules
+        ],
+        "cost_semantics": "callback_cost_separate_from_unique_nodes_v1",
+        "scope": "formal",
+        "formal_eligible": False,
+        "execution_evidence_hash": context.execution.artifact_hash,
+        **reference_binding,
+    }
+    _reference_shard, reference_ledger_ref = _persist_stage3_reference_shard(
+        request,
+        root,
+        store,
+        context=context,
+        reference=matrix_reference,
+        required_unit_ids=required_units,
+        reference_binding_hash=str(reference_binding["reference_binding_hash"]),
+        reference_scope="matrix",
+    )
+    _reference_rows, _reference_entries, reference_complete, reference_missing = (
+        _load_stage3_reference_aggregate(
+            request,
+            root,
+            store,
+            required_unit_ids=required_units,
+            execution_evidence_hash=context.execution.artifact_hash,
+            reference_binding_hash=str(reference_binding["reference_binding_hash"]),
+            reference_scope="matrix",
+        )
+    )
+    reference_aggregate, reference_aggregate_ref = _publish_stage3_reference_aggregate(
+        request,
+        root,
+        store,
+        required_unit_ids=required_units,
+        execution_evidence_hash=context.execution.artifact_hash,
+        reference_binding_hash=str(reference_binding["reference_binding_hash"]),
+        reference_scope="matrix",
+    )
+    if reference_missing or tuple(reference_complete) != tuple(required_units):
+        raise _blocked(
+            BlockerCode.ASSET_UNAVAILABLE,
+            "stage3.07_reference_coverage",
+            (
+                "formal Stage3.07 matrix reference fan-out 尚未覆盖全部 path units "
+                f"({len(reference_complete)}/{len(required_units)})"
+            ),
+            evidence_refs=tuple(
+                dict.fromkeys(
+                    (*inputs.references, reference_ledger_ref, reference_aggregate_ref)
+                )
+            ),
+        )
+    reference_aggregate_hash = str(reference_aggregate["artifact_hash"])
+    # The shard's immutable reference hash intentionally excludes this
+    # aggregate convenience binding.  The aggregate itself is content
+    # addressed and is included in the top-level matrix result below.
+    reference = dict(matrix_reference)
+    refinement = reference.get("refinement")
+    if (
+        not isinstance(refinement, Mapping)
+        or refinement.get("converged") is not True
+        or refinement.get("status") != "FORMAL_CANDIDATE"
+        or reference.get("path_identity_hash") != context.path.identity_hash
+        or reference.get("execution_evidence_hash") != context.execution.artifact_hash
+    ):
+        raise _blocked(
+            BlockerCode.CONTRACT_UNFROZEN,
+            "stage3_formal_unit_reference",
+            "正式矩阵单元缺少同路径、同 execution evidence 的已收敛参考",
+            retryable=False,
+            evidence_refs=inputs.references,
+        )
+    reference_error = refinement.get("conservative_error")
+    if reference_error is None:
+        raise _blocked(
+            BlockerCode.CONTRACT_UNFROZEN,
+            "stage3_formal_reference_uncertainty",
+            "正式参考缺少保守归一化 L1 不确定度",
+            retryable=False,
+            evidence_refs=inputs.references,
+        )
+    reference_binding = _verify_stage3_formal_reference_binding(
+        reference, request, root, context, plan_kind="matrix"
+    )
+    reference_contribution = _load_path_reference_vector(reference, root)
+    observation_refs = tuple(dict.fromkeys((*inputs.references, plan_ref)))
+    current_observations, results = _quadrature_observations(
+        context,
+        candidate_rule_names=candidate_names,
+        reference_contribution=reference_contribution,
+        thresholds=thresholds,
+        reference_normalized_l1_error=float(reference_error),
+        strata=unit_strata[context.unit_id],
+        evidence_refs=observation_refs,
+    )
+    reference_artifact_hash = canonical_json_hash(reference)
+    _persisted, ledger_ref = _persist_stage3_observations(
+        request,
+        root,
+        store,
+        context=context,
+        observations=current_observations,
+        candidate_rule_names=candidate_names,
+        reference_artifact_hash=reference_artifact_hash,
+        reference_binding_hash=str(reference_binding["reference_binding_hash"]),
+        production_index=production_index,
+        production_unit=production_unit,
+    )
+    observations, complete_units, missing_units = _load_stage3_observation_aggregate(
+        request,
+        root,
+        store,
+        required_unit_ids=required_units,
+        candidate_rule_names=candidate_names,
+        execution_evidence_hash=context.execution.artifact_hash,
+        production_index=production_index,
+        expected_reference_binding_hash=str(reference_binding["reference_binding_hash"]),
+    )
+    if missing_units or tuple(complete_units) != tuple(required_units):
+        raise _blocked(
+            BlockerCode.ASSET_UNAVAILABLE,
+            "stage3.07_matrix_coverage",
+            (
+                "formal Stage3.07 matrix fan-out 尚未覆盖全部 path units "
+                f"({len(complete_units)}/{len(required_units)})"
+            ),
+            evidence_refs=tuple(
+                dict.fromkeys(
+                    (
+                        *inputs.references,
+                        ledger_ref,
+                    )
+                )
+            ),
+        )
+    node_cache_evidence = context.cache_evidence(
+        tuple(_quadrature_rule_from_name(name) for name in candidate_names)
+    )
+    independent_reference = {
+        "rule": {"name": "stage3.05_cross_family_refinement"},
+        "path_identity_hash": context.path.identity_hash,
+        "signed": {
+            name: (
+                value.detach().cpu().to(torch.float64).tolist()
+                if isinstance(value, torch.Tensor)
+                else np.asarray(value, dtype=np.float64).tolist()
+            )
+            for name, value in reference_contribution.items()
+        },
+        "positive": {},
+        "negative_mass": {},
+        "absolute": {},
+        "endpoint_loss_pre": None,
+        "endpoint_loss_post": None,
+        "loss_drop": None,
+        "completeness_absolute_residual": None,
+        "completeness_relative_residual": None,
+        "completeness_l1_scaled_residual": None,
+        "node_losses": [],
+        "unique_gradient_evaluations": None,
+        "reference_artifact_hash": reference_artifact_hash,
+        "reference_normalized_l1_error": float(reference_error),
+    }
+    return (
+        {
+            "formal_path_results": {
+                "schema_version": "stage3-task-path-results-v1",
+                "scope": "formal",
+                "formal_eligible": False,
+                "formal_gate_status": "PENDING_G3_6_AND_G3_7",
+                "selected_rule": None,
+                "quadrature_recommendation": None,
+                "active_unit_id": context.unit_id,
+                "execution_evidence_hash": context.execution.artifact_hash,
+                "observations": [
+                    _observation_payload(item) for item in observations
+                ],
+                "observation_ledger_ref": ledger_ref,
+                "reference_ledger_ref": reference_ledger_ref,
+                "reference_aggregate_ref": reference_aggregate_ref,
+                "reference_aggregate_hash": reference_aggregate_hash,
+                "observation_progress": {
+                    "complete_unit_ids": list(complete_units),
+                    "missing_unit_ids": list(missing_units),
+                    "observed_unit_count": len(complete_units),
+                    "required_unit_count": len(required_units),
+                },
+                "candidate_results": {
+                    name: _path_result_payload(
+                        result,
+                        cost=context.cost_for(_quadrature_rule_from_name(name)),
+                    )
+                    for name, result in sorted(results.items())
+                },
+                "cost_semantics": "callback_cost_separate_from_unique_nodes_v1",
+                "node_gradient_cache": node_cache_evidence,
+                "independent_reference": independent_reference,
+                "thresholds_hash": thresholds.artifact_hash,
+                "formal_plan_ref": plan_ref,
+                "formal_plan_hash": reference_binding["formal_plan_hash"],
+                "reference_artifact_hash": reference_artifact_hash,
+                "reference_binding_hash": reference_binding["reference_binding_hash"],
+                "reference_ladder_hash": reference_binding["reference_ladder_hash"],
+                "reference_ladder_levels": reference_binding["reference_ladder_levels"],
+                "reference_ladder_nodes": reference_binding["reference_ladder_nodes"],
+                "reference_tolerance": reference_binding["reference_tolerance"],
+                "required_consecutive": reference_binding["required_consecutive"],
+                "primary_family": reference_binding["primary_family"],
+                "production_unit_index_ref": production_index_ref,
+                "production_unit_index_hash": production_index.artifact_hash,
+                "upstream_binding_hash": inputs.binding_hash,
+            },
+            "completeness_report": {
+                "schema_version": "stage3-task-completeness-report-v1",
+                "path_identity_hash": context.path.identity_hash,
+                "active_unit_id": context.unit_id,
+                "selected_rule": None,
+                "candidate_residuals": {
+                    name: {
+                        "absolute": result.completeness_absolute_residual,
+                        "relative": next(
+                            item.completeness_relative_residual
+                            for item in current_observations
+                            if item.rule_name == name
+                        ),
+                        "l1_scaled": next(
+                            item.completeness_l1_scaled_residual
+                            for item in current_observations
+                            if item.rule_name == name
+                        ),
+                    }
+                    for name, result in sorted(results.items())
+                },
+                "defined": all(
+                    result.completeness_absolute_residual is not None
+                    for result in results.values()
+                ),
+                "node_gradient_cache_evidence_hash": node_cache_evidence[
+                    "evidence_hash"
+                ],
+            },
+            "gate_record": _gate_candidate(request),
+        },
+        tuple(
+            dict.fromkeys(
+                (*inputs.references, plan_ref, reference_aggregate_ref)
+            )
+        ),
+    )
 
 
 def _path_wire_vector(
@@ -7567,6 +10780,8 @@ def _run_stage3_statistics(
 ) -> tuple[Mapping[str, Mapping[str, JSONValue]], tuple[str, ...]]:
     """用独立 reference 计算逐规则误差、相关性、top-k 与完备性表。"""
 
+    if request.config.run_intent == "formal":
+        return _run_stage3_formal_statistics(request, root, store)
     inputs = _predecessor_context(request, root, store)
     formal_results = inputs.payload("formal_path_results")
     completeness = inputs.payload("completeness_report")
@@ -7706,6 +10921,210 @@ def _run_stage3_statistics(
     )
 
 
+def _run_stage3_formal_statistics(
+    request: TaskExecutionRequest,
+    root: Path,
+    store: TaskArtifactStore,
+) -> tuple[Mapping[str, Mapping[str, JSONValue]], tuple[str, ...]]:
+    """Freeze the complete formal observation ledger without selecting a rule."""
+
+    inputs = _predecessor_context(request, root, store)
+    formal_results = inputs.payload("formal_path_results")
+    if (
+        formal_results.get("scope") != "formal"
+        or formal_results.get("selected_rule") is not None
+        or formal_results.get("formal_eligible") is not False
+    ):
+        raise _blocked(
+            BlockerCode.CONTRACT_UNFROZEN,
+            "stage3_formal_unselected_matrix",
+            "G3-6 只能消费尚未选方法的正式矩阵",
+            retryable=False,
+            evidence_refs=inputs.references,
+        )
+    progress = formal_results.get("observation_progress")
+    raw_rows = formal_results.get("observations")
+    if (
+        not isinstance(progress, Mapping)
+        or progress.get("missing_unit_ids") != []
+        or progress.get("observed_unit_count") != progress.get("required_unit_count")
+        or not isinstance(raw_rows, list)
+        or not raw_rows
+    ):
+        raise _blocked(
+            BlockerCode.GATE_NOT_READY,
+            "stage3.G3-6",
+            "正式矩阵尚未覆盖全部预注册 endpoint×probe 单元",
+            evidence_refs=inputs.references,
+        )
+    try:
+        observations = tuple(
+            _observation_from_payload(row)
+            for row in raw_rows
+            if isinstance(row, Mapping)
+        )
+        if len(observations) != len(raw_rows):
+            raise ValueError("formal observation 行含非 object")
+        plan_ref = formal_results.get("formal_plan_ref")
+        if not isinstance(plan_ref, str):
+            raise ValueError("formal plan ref 缺失")
+        plan = _load_formal_document_ref(
+            root,
+            plan_ref,
+            field="formal_plan_ref",
+            schema_version="stage3-formal-pilot-plan-v1",
+        )
+        if not isinstance(plan, Mapping):
+            raise ValueError("formal plan 不是 object")
+        production_index, production_index_ref = _load_stage3_production_index(
+            request, root, formal_plan=plan, expected_scope=FORMAL_SCOPE
+        )
+        if production_index is None or production_index_ref is None:
+            raise ValueError("formal plan production unit index 缺失")
+        if (
+            plan.get("plan_kind") != "matrix"
+            or plan.get("production_unit_index_scope") != FORMAL_SCOPE
+        ):
+            raise ValueError("G3-6 必须消费 formal matrix plan")
+        if formal_results.get("production_unit_index_hash") != production_index.artifact_hash:
+            raise ValueError("formal matrix production unit index hash 不匹配")
+        units = plan.get("required_unit_ids")
+        rules = plan.get("candidate_rules")
+        if (
+            not isinstance(units, list)
+            or not isinstance(rules, list)
+            or units != [unit.path_unit_id for unit in production_index.units]
+        ):
+            raise ValueError("formal plan coverage 缺失")
+        execution_hash = formal_results.get("execution_evidence_hash")
+        if (
+            not isinstance(execution_hash, str)
+            or re.fullmatch(r"[0-9a-f]{64}", execution_hash) is None
+        ):
+            raise ValueError("formal matrix execution evidence hash 缺失")
+        expected_reference_binding_hash = formal_results.get(
+            "reference_binding_hash"
+        )
+        if (
+            not isinstance(expected_reference_binding_hash, str)
+            or re.fullmatch(r"[0-9a-f]{64}", expected_reference_binding_hash)
+            is None
+        ):
+            raise ValueError("formal matrix reference binding hash 缺失")
+        aggregated, aggregate_complete, aggregate_missing = (
+            _load_stage3_observation_aggregate(
+                request,
+                root,
+                store,
+                required_unit_ids=tuple(str(item) for item in units),
+                candidate_rule_names=tuple(str(item) for item in rules),
+                execution_evidence_hash=execution_hash,
+                production_index=production_index,
+                expected_reference_binding_hash=expected_reference_binding_hash,
+            )
+        )
+        if aggregate_missing or tuple(aggregate_complete) != tuple(str(item) for item in units):
+            raise ValueError("formal observation ledger aggregate 不完整")
+        aggregate_rows = {
+            (item.unit_id, item.rule_name): _observation_payload(item)
+            for item in aggregated
+        }
+        provided_rows = {
+            (item.unit_id, item.rule_name): _observation_payload(item)
+            for item in (
+                _observation_from_payload(row)
+                for row in raw_rows
+                if isinstance(row, Mapping)
+            )
+        }
+        if aggregate_rows != provided_rows:
+            raise ValueError("G3-6 formal 矩阵未与 per-unit ledger aggregate 一致")
+        observed_pairs = {(item.unit_id, item.rule_name) for item in observations}
+        expected_pairs = {(str(unit), str(rule)) for unit in units for rule in rules}
+        if observed_pairs != expected_pairs:
+            raise ValueError("formal observation endpoint×probe×rule coverage 不完整")
+        if any(item.scope != "formal" or not item.evidence_refs for item in observations):
+            raise ValueError("formal observation scope/evidence 无效")
+    except (OSError, TypeError, ValueError, FormalRunRejected) as error:
+        raise _blocked(
+            BlockerCode.CONTRACT_UNFROZEN,
+            "stage3_formal_observation_table",
+            f"正式观测表无法冻结：{error}",
+            retryable=False,
+            evidence_refs=inputs.references,
+        ) from error
+    table = FrozenSourceTable.from_rows(
+        name="stage3_formal_quadrature_observations",
+        schema_version="stage3-formal-quadrature-observation-table-v1",
+        rows=[_observation_payload(item) for item in observations],
+    )
+    all_finite = all(
+        all(
+            value is not None and math.isfinite(float(value))
+            for value in (
+                item.normalized_l1_error,
+                item.normalized_l2_error,
+                item.normalized_linf_error,
+                item.completeness_absolute_residual,
+                item.completeness_relative_residual,
+                item.completeness_l1_scaled_residual,
+                item.active_spearman,
+                item.cosine_similarity,
+                item.sign_consistency,
+                item.layer_quality_tv,
+                item.module_quality_tv,
+                item.reference_normalized_l1_error,
+            )
+        )
+        for item in observations
+    )
+    # This task intentionally stops at the immutable source-table boundary.
+    # Only after these commits and a completed clean provenance record exist
+    # may ``Stage3G36Publisher`` reload them and publish the independent
+    # evaluation/G3-6 commits.  Constructing that Gate here would make the
+    # producer attest its own not-yet-committed output.
+    return (
+        {
+            "path_error_table": {
+                "schema_version": "stage3-task-path-error-table-wrapper-v1",
+                "scope": "formal",
+                "formal_eligible": False,
+                "source_table": table.to_dict(),
+                "formal_plan_ref": plan_ref,
+                "production_unit_index_ref": production_index_ref,
+                "production_unit_index_hash": production_index.artifact_hash,
+                "thresholds_hash": formal_results.get("thresholds_hash"),
+            },
+            "stability_report": {
+                "schema_version": "stage3-task-stability-report-v1",
+                "scope": "formal",
+                "formal_eligible": False,
+                "selected_rule": None,
+                "all_rows_finite": all_finite,
+                "observation_count": len(observations),
+                "unit_count": len(units),
+                "rule_count": len(rules),
+                "production_unit_index_ref": production_index_ref,
+                "production_unit_index_hash": production_index.artifact_hash,
+                "source_table_hash": table.content_hash,
+                "formal_gate_status": "PENDING_INDEPENDENT_G3_6",
+                "upstream_binding_hash": inputs.binding_hash,
+            },
+            "frozen_source_table": table.to_dict(),
+        },
+        tuple(
+            dict.fromkeys(
+                (
+                    *inputs.references,
+                    plan_ref,
+                    production_index_ref,
+                    *(ref for item in observations for ref in item.evidence_refs),
+                )
+            )
+        ),
+    )
+
+
 def _run_stage3_analysis(
     request: TaskExecutionRequest,
     root: Path,
@@ -7715,12 +11134,7 @@ def _run_stage3_analysis(
 
     inputs = _predecessor_context(request, root, store)
     if request.config.run_intent == "formal":
-        raise _blocked(
-            BlockerCode.GATE_NOT_READY,
-            "stage3.G3-7",
-            "formal QuadratureDecision 需要独立 Gate；分析 runner 不得自签正式方法",
-            evidence_refs=inputs.references,
-        )
+        return _run_stage3_formal_analysis(request, root, inputs)
     try:
         source = FrozenSourceTable.from_mapping(inputs.payload("frozen_source_table"))
     except (TypeError, ValueError) as error:
@@ -7796,9 +11210,257 @@ def _run_stage3_analysis(
         {
             "cost_accuracy_table": cost_table.to_dict(),  # type: ignore[dict-item]
             "quadrature_decision": decision.to_dict(),  # type: ignore[dict-item]
-            "gate_record": _gate_candidate(request),
         },
         inputs.references,
+    )
+
+
+def _run_stage3_formal_analysis(
+    request: TaskExecutionRequest,
+    root: Path,
+    inputs: _PredecessorContext,
+) -> tuple[Mapping[str, Mapping[str, JSONValue]], tuple[str, ...]]:
+    """Select a rule only after reloading the committed G3-6 evaluation."""
+
+    from ..contracts.provenance import ProvenanceRecord
+    from .stage3_g36_publisher import (
+        STAGE3_G36_TASK_ID,
+        Stage3G36Publication,
+    )
+    from .stage3_gate import Stage3GateEvaluation
+
+    evidence, evidence_ref = _formal_execution_evidence(request, root)
+    try:
+        scope_decision, scope_gate, scope_decision_ref, scope_gate_ref = (
+            _stage3_scope_authority(request, root, evidence=evidence)
+        )
+    except (OSError, TypeError, ValueError, FormalRunRejected) as error:
+        raise _blocked(
+            BlockerCode.CONTRACT_UNFROZEN,
+            "stage3_explicit_scope_authority",
+            f"正式方法选择缺少可重放的 G3-0 用户范围授权：{error}",
+            retryable=False,
+            evidence_refs=inputs.references,
+        ) from error
+    try:
+        source = FrozenSourceTable.from_mapping(inputs.payload("frozen_source_table"))
+        wrapper = inputs.payload("path_error_table")
+        plan_ref = wrapper.get("formal_plan_ref")
+        if not isinstance(plan_ref, str) or not plan_ref:
+            raise ValueError("formal plan ref 缺失")
+        plan = _load_formal_document_ref(
+            root,
+            plan_ref,
+            field="formal_plan_ref",
+            schema_version="stage3-formal-pilot-plan-v1",
+        )
+        if not isinstance(plan, Mapping):
+            raise TypeError("formal plan 不是 object")
+        if plan.get("artifact_hash") != canonical_json_hash(
+            {key: item for key, item in plan.items() if key != "artifact_hash"}
+        ):
+            raise ValueError("formal plan hash 不可复算")
+        production_index, production_index_ref = _load_stage3_production_index(
+            request, root, formal_plan=plan, expected_scope=FORMAL_SCOPE
+        )
+        if production_index is None or production_index_ref is None:
+            raise ValueError("formal plan production unit index 缺失")
+        if (
+            plan.get("plan_kind") != "matrix"
+            or plan.get("production_unit_index_scope") != FORMAL_SCOPE
+        ):
+            raise ValueError("G3-7 必须消费 formal matrix plan")
+        if (
+            wrapper.get("production_unit_index_ref") != production_index_ref
+            or wrapper.get("production_unit_index_hash") != production_index.artifact_hash
+        ):
+            raise ValueError("G3-6 输出未绑定同一 production unit index")
+        raw_rules = plan.get("candidate_rules")
+        raw_units = plan.get("required_unit_ids")
+        raw_thresholds = plan.get("thresholds")
+        if (
+            not isinstance(raw_rules, list)
+            or not isinstance(raw_units, list)
+            or raw_units != [unit.path_unit_id for unit in production_index.units]
+        ):
+            raise ValueError("formal plan coverage 缺失")
+        if not isinstance(raw_thresholds, Mapping):
+            raise ValueError("formal plan thresholds 缺失")
+        thresholds = QuadratureThresholds(
+            **dict(raw_thresholds)  # type: ignore[arg-type]
+        ).require_formal_contract()
+        observations = tuple(
+            _observation_from_payload(row) for row in source.rows
+        )
+        expected_pairs = {
+            (str(unit), str(rule)) for unit in raw_units for rule in raw_rules
+        }
+        if {(item.unit_id, item.rule_name) for item in observations} != expected_pairs:
+            raise ValueError("formal table coverage 与 frozen plan 不一致")
+        refs_by_kind = {
+            item.artifact_kind: item.commit_ref for item in inputs.artifacts
+        }
+        frozen_table_ref = refs_by_kind["frozen_source_table"]
+
+        provenance_ref = request.environment.evidence_refs.get(
+            "stage3_formal_provenance"
+        )
+        evaluation_ref = request.environment.evidence_refs.get(
+            "stage3_g36_evaluation"
+        )
+        g36_ref = request.environment.evidence_refs.get("gate_stage3_g3_6")
+        g36_publication_ref = request.environment.evidence_refs.get(
+            "stage3_g36_publication"
+        )
+        if any(
+            not isinstance(ref, str) or not ref
+            for ref in (
+                provenance_ref,
+                evaluation_ref,
+                g36_ref,
+                g36_publication_ref,
+            )
+        ):
+            raise ValueError(
+                "G3-6 provenance/evaluation/Gate/publication commit refs 缺失"
+            )
+        assert isinstance(provenance_ref, str)
+        assert isinstance(evaluation_ref, str)
+        assert isinstance(g36_ref, str)
+        assert isinstance(g36_publication_ref, str)
+        provenance_artifact = load_committed_task_artifact(
+            root, provenance_ref, require_formal=True
+        )
+        evaluation_artifact = load_committed_task_artifact(
+            root, evaluation_ref, require_formal=True
+        )
+        g36_artifact = load_committed_task_artifact(
+            root, g36_ref, require_formal=True
+        )
+        g36_publication_artifact = load_committed_task_artifact(
+            root, g36_publication_ref, require_formal=True
+        )
+        if provenance_artifact.identity.artifact_kind not in {
+            "provenance",
+            "provenance_record",
+        }:
+            raise ValueError("stage3_formal_provenance artifact kind 无效")
+        if (
+            evaluation_artifact.identity.task_id != STAGE3_G36_TASK_ID
+            or evaluation_artifact.identity.artifact_kind != "gate_evaluation"
+            or g36_artifact.identity.task_id != STAGE3_G36_TASK_ID
+            or g36_artifact.identity.artifact_kind != "gate_record"
+            or g36_publication_artifact.identity.task_id != STAGE3_G36_TASK_ID
+            or g36_publication_artifact.identity.artifact_kind
+            != "g36_publication"
+            or evaluation_artifact.identity.config_hash
+            != g36_artifact.identity.config_hash
+            or evaluation_artifact.identity.config_hash
+            != g36_publication_artifact.identity.config_hash
+        ):
+            raise ValueError("独立 G3-6 publisher commit 身份不一致")
+        provenance = ProvenanceRecord.from_mapping(
+            dict(provenance_artifact.payload)
+        )
+        evaluation = Stage3GateEvaluation.from_mapping(
+            dict(evaluation_artifact.payload)
+        )
+        g36 = GateRecord.from_mapping(dict(g36_artifact.payload))
+        g36_publication = Stage3G36Publication.from_mapping(
+            dict(g36_publication_artifact.payload)
+        )
+        if (
+            evaluation.status != "PASS"
+            or not evaluation.formal_eligible
+            or evaluation.execution_evidence_hash != evidence.artifact_hash
+            or evaluation.formal_plan_ref != plan_ref
+            or evaluation.formal_plan_hash != plan.get("artifact_hash")
+            or evaluation.provenance_hash != provenance.artifact_hash
+            or g36.gate_id != "stage3.G3-6"
+            or g36.status is not GateStatus.PASS
+            or evaluation_ref not in g36.evidence_refs
+            or frozen_table_ref not in g36.evidence_refs
+            or g36_publication.status != "PASS"
+            or not g36_publication.formal_eligible
+            or g36_publication.frozen_source_table_ref != frozen_table_ref
+            or g36_publication.formal_plan_ref != plan_ref
+            or g36_publication.execution_evidence_ref != evidence_ref
+            or g36_publication.execution_evidence_hash != evidence.artifact_hash
+            or g36_publication.provenance_ref != provenance_ref
+            or g36_publication.evaluation_ref != evaluation_ref
+            or g36_publication.evaluation_hash != evaluation.artifact_hash
+            or g36_publication.g3_6_ref != g36_ref
+            or g36_publication.g3_6_hash != g36.artifact_hash
+        ):
+            raise ValueError("独立 G3-6 authority 与当前冻结输入不一致")
+    except (OSError, TypeError, ValueError, FormalRunRejected) as error:
+        raise _blocked(
+            BlockerCode.CONTRACT_UNFROZEN,
+            "stage3_formal_selection_inputs",
+            f"正式方法选择输入不可验证：{error}",
+            retryable=False,
+            evidence_refs=inputs.references,
+        ) from error
+    source_refs = tuple(
+        dict.fromkeys(
+            (
+                *inputs.references,
+                evidence_ref,
+                plan_ref,
+                frozen_table_ref,
+                evaluation_ref,
+                g36_ref,
+                g36_publication_ref,
+                provenance_ref,
+                scope_decision_ref,
+                scope_gate_ref,
+                *(ref for item in observations for ref in item.evidence_refs),
+            )
+        )
+    )
+    recommendation = QuadratureRecommendationEngine().recommend(
+        recommendation_id=f"stage3-formal-{source.content_hash[:16]}",
+        observations=observations,
+        required_unit_ids=tuple(str(item) for item in raw_units),
+        thresholds=thresholds,
+        execution=evidence,
+    )
+    evaluated_passing = {
+        rule
+        for rule, raw in evaluation.rule_evaluations.items()
+        if isinstance(raw, Mapping) and raw.get("passing") is True
+    }
+    if evaluated_passing != set(recommendation.passing_rules):
+        raise _blocked(
+            BlockerCode.CONTRACT_UNFROZEN,
+            "stage3_selection_evaluator_agreement",
+            "独立 Gate evaluator 与 recommendation engine 的通过规则集合不一致",
+            retryable=False,
+            evidence_refs=source_refs,
+        )
+    ordered_rows = sorted(
+        (dict(thaw_json_value(row)) for row in source.rows),
+        key=lambda row: (
+            int(row["unique_nodes"]),
+            float(row["wall_seconds"]),
+            str(row["rule_name"]),
+            str(row["unit_id"]),
+        ),
+    )
+    cost_table = FrozenSourceTable.from_rows(
+        name="stage3_formal_cost_accuracy",
+        schema_version="stage3-formal-cost-accuracy-table-v1",
+        rows=ordered_rows,
+    )
+    return (
+        {
+            "cost_accuracy_table": cost_table.to_dict(),
+            # This is deliberately unqualified.  The independent G3-7
+            # publisher consumes this committed candidate/cost table, commits
+            # the Gate, and only then publishes a qualified recommendation.
+            "quadrature_decision": recommendation.to_dict(),
+        },
+        source_refs,
     )
 
 
@@ -7810,6 +11472,8 @@ def _run_stage3_reporting(
     """从 hash 绑定成本表重建 Stage 3 报告、图表与后续交接。"""
 
     inputs = _predecessor_context(request, root, store)
+    if request.config.run_intent == "formal":
+        return _run_stage3_formal_reporting(request, root, inputs)
     try:
         table = FrozenSourceTable.from_mapping(inputs.payload("cost_accuracy_table"))
         from .stage3 import QuadratureDecision
@@ -7889,6 +11553,379 @@ def _run_stage3_reporting(
     )
 
 
+def _run_stage3_formal_reporting(
+    request: TaskExecutionRequest,
+    root: Path,
+    inputs: _PredecessorContext,
+) -> tuple[Mapping[str, Mapping[str, JSONValue]], tuple[str, ...]]:
+    """Live-reload G3-7 and publish reporting-safe formal handoff artifacts."""
+
+    from ..contracts.provenance import ProvenanceRecord
+    from .stage3_finalization import Stage3Finalizer
+    from .stage3_g37_publisher import (
+        STAGE3_G37_FINALIZATION_ARTIFACT_KIND,
+        STAGE3_G37_GATE_ARTIFACT_KIND,
+        STAGE3_G37_PUBLICATION_ARTIFACT_KIND,
+        STAGE3_G37_RECOMMENDATION_ARTIFACT_KIND,
+        STAGE3_G37_TASK_ID,
+        Stage3G37Publication,
+    )
+    from .stage3_gate import Stage3GateEvaluation
+
+    evidence, evidence_ref = _formal_execution_evidence(request, root)
+    try:
+        table = FrozenSourceTable.from_mapping(inputs.payload("cost_accuracy_table"))
+        candidate_wire = dict(inputs.payload("quadrature_decision"))
+        candidate = QuadratureRecommendation.from_mapping(candidate_wire)
+        refs_by_kind = {
+            item.artifact_kind: item.commit_ref for item in inputs.artifacts
+        }
+        cost_table_ref = refs_by_kind["cost_accuracy_table"]
+        candidate_ref = refs_by_kind["quadrature_decision"]
+
+        g37_ref = request.environment.evidence_refs.get("gate_stage3_g3_7")
+        recommendation_ref = request.environment.evidence_refs.get(
+            "stage3_g37_recommendation"
+        )
+        finalization_ref = request.environment.evidence_refs.get(
+            "stage3_g37_finalization"
+        )
+        publication_ref = request.environment.evidence_refs.get(
+            "stage3_g37_publication"
+        )
+        if any(
+            not isinstance(ref, str) or not ref
+            for ref in (
+                g37_ref,
+                recommendation_ref,
+                finalization_ref,
+                publication_ref,
+            )
+        ):
+            raise ValueError(
+                "独立 G3-7 Gate/recommendation/finalization/publication refs 缺失"
+            )
+        assert isinstance(g37_ref, str)
+        assert isinstance(recommendation_ref, str)
+        assert isinstance(finalization_ref, str)
+        assert isinstance(publication_ref, str)
+
+        def committed(
+            reference: str,
+            *,
+            field: str,
+            kinds: set[str],
+            task_id: str | None = None,
+        ) -> LoadedTaskArtifact:
+            if not isinstance(reference, str) or not reference:
+                raise ValueError(f"{field} commit ref 缺失")
+            artifact = load_committed_task_artifact(
+                root, reference, require_formal=True
+            )
+            if artifact.identity.artifact_kind not in kinds:
+                raise ValueError(f"{field} artifact kind 无效")
+            if task_id is not None and artifact.identity.task_id != task_id:
+                raise ValueError(f"{field} task identity 无效")
+            return artifact
+
+        g37_artifact = committed(
+            g37_ref,
+            field="gate_stage3_g3_7",
+            kinds={STAGE3_G37_GATE_ARTIFACT_KIND},
+            task_id=STAGE3_G37_TASK_ID,
+        )
+        recommendation_artifact = committed(
+            recommendation_ref,
+            field="stage3_g37_recommendation",
+            kinds={STAGE3_G37_RECOMMENDATION_ARTIFACT_KIND},
+            task_id=STAGE3_G37_TASK_ID,
+        )
+        finalization_artifact = committed(
+            finalization_ref,
+            field="stage3_g37_finalization",
+            kinds={STAGE3_G37_FINALIZATION_ARTIFACT_KIND},
+            task_id=STAGE3_G37_TASK_ID,
+        )
+        publication_artifact = committed(
+            publication_ref,
+            field="stage3_g37_publication",
+            kinds={STAGE3_G37_PUBLICATION_ARTIFACT_KIND},
+            task_id=STAGE3_G37_TASK_ID,
+        )
+        g37 = GateRecord.from_mapping(dict(g37_artifact.payload))
+        publication = Stage3G37Publication.from_mapping(
+            dict(publication_artifact.payload)
+        )
+        if (
+            g37.gate_id != "stage3.G3-7"
+            or g37.status is not GateStatus.PASS
+            or g37.effective_status() is not GateStatus.PASS
+            or publication.status != "PASS"
+            or not publication.formal_eligible
+            or publication.g3_7_ref != g37_ref
+            or publication.g3_7_hash != g37.artifact_hash
+            or publication.recommendation_ref != recommendation_ref
+            or publication.finalization_ref != finalization_ref
+            or publication.cost_accuracy_table_ref != cost_table_ref
+            or publication.cost_accuracy_table_hash != table.content_hash
+            or publication.quadrature_decision_ref != candidate_ref
+            or publication.quadrature_decision_hash != candidate.artifact_hash
+        ):
+            raise ValueError("独立 G3-7 publication 与直接前驱或输出 commit 不一致")
+        g37_config_hashes = {
+            item.identity.config_hash
+            for item in (
+                g37_artifact,
+                recommendation_artifact,
+                finalization_artifact,
+                publication_artifact,
+            )
+        }
+        if g37_config_hashes != {publication.publication_config_hash}:
+            raise ValueError("独立 G3-7 输出不是同一 publication identity")
+
+        base_execution_artifact = committed(
+            publication.execution_evidence_ref,
+            field="stage3_g37_execution_evidence",
+            kinds={"formal_execution_evidence", "execution_evidence"},
+        )
+        base_execution = FormalExecutionEvidence.from_mapping(
+            base_execution_artifact.payload
+        )
+        if (
+            base_execution.artifact_hash != publication.execution_evidence_hash
+            or not _stage3_execution_is_append_only_extension(base_execution, evidence)
+        ):
+            raise ValueError("S3.10 execution 不是 G3-7 基础证据的严格 append-only 扩展")
+        current_gates = {gate.gate_id: gate for gate in evidence.prerequisite_gates}
+        if (
+            current_gates.get("stage3.G3-7") is None
+            or current_gates["stage3.G3-7"].artifact_hash != g37.artifact_hash
+        ):
+            raise ValueError("当前 execution evidence 未绑定同一真实 G3-7")
+
+        frozen_ref = publication.frozen_source_table_ref
+        plan_ref = publication.formal_plan_ref
+        evaluation_ref = publication.evaluation_ref
+        provenance_ref = publication.provenance_ref
+        g36_ref = publication.g3_6_ref
+        frozen_artifact = committed(
+            frozen_ref,
+            field="frozen_source_table",
+            kinds={"frozen_source_table"},
+        )
+        frozen = FrozenSourceTable.from_mapping(
+            frozen_artifact.payload
+        )
+        plan_artifact = committed(
+            plan_ref,
+            field="formal_plan",
+            kinds={"formal_plan", "stage3_formal_plan"},
+        )
+        plan = plan_artifact.payload
+        evaluation_artifact = committed(
+            evaluation_ref,
+            field="stage3_g36_evaluation",
+            kinds={"gate_evaluation"},
+        )
+        evaluation = Stage3GateEvaluation.from_mapping(
+            dict(evaluation_artifact.payload)
+        )
+        provenance_artifact = committed(
+            provenance_ref,
+            field="stage3_formal_provenance",
+            kinds={"provenance", "provenance_record"},
+        )
+        provenance = ProvenanceRecord.from_mapping(
+            dict(provenance_artifact.payload)
+        )
+        g36_artifact = committed(
+            g36_ref,
+            field="gate_stage3_g3_6",
+            kinds={"gate_record"},
+        )
+        g36 = GateRecord.from_mapping(dict(g36_artifact.payload))
+        if (
+            publication.frozen_source_table_hash != frozen.content_hash
+            or publication.formal_plan_hash != plan.get("artifact_hash")
+            or publication.evaluation_hash != evaluation.artifact_hash
+            or publication.provenance_hash != provenance.artifact_hash
+            or publication.g3_6_hash != g36.artifact_hash
+        ):
+            raise ValueError("G3-7 publication 的上游内容哈希漂移")
+        finalization = Stage3Finalizer().reload_live(
+            finalization_artifact.payload,
+            frozen_table=frozen,
+            formal_plan=plan,
+            execution=base_execution,
+            prerequisite_gates=base_execution.prerequisite_gates,
+            gate_evaluation=evaluation,
+            provenance=provenance,
+            existing_g3_6_gate=g36,
+            existing_g3_6_ref=g36_ref,
+        ).require_pass()
+        if (
+            finalization.artifact_hash != publication.finalization_hash
+            or finalization.g3_7_gate is None
+            or finalization.g3_7_gate.artifact_hash != g37.artifact_hash
+        ):
+            raise ValueError("G3-7 finalization live reload 与 publication 不一致")
+        recommendation = finalization.recommendation
+        if recommendation is None:
+            raise ValueError("qualified recommendation 缺失")
+        if (
+            recommendation.artifact_hash != publication.recommendation_hash
+            or dict(recommendation_artifact.payload) != recommendation.to_dict()
+            or publication.recommendation != recommendation.to_dict()
+            or publication.finalization != finalization.to_dict()
+            or publication.candidate_recommendation != candidate.to_dict()
+        ):
+            raise ValueError("G3-7 qualified outputs 与 publication receipt 不一致")
+    except (KeyError, OSError, TypeError, ValueError, FormalRunRejected) as error:
+        raise _blocked(
+            BlockerCode.CONTRACT_UNFROZEN,
+            "stage3_formal_reporting_inputs",
+            f"Stage 3 正式报告输入不可重放：{error}",
+            retryable=False,
+            evidence_refs=inputs.references,
+        ) from error
+
+    rows = [dict(thaw_json_value(row)) for row in table.rows]
+    errors = np.asarray(
+        [float(row["normalized_l1_error"]) for row in rows], dtype=np.float64
+    )
+    nodes = np.asarray(
+        [float(row["unique_nodes"]) for row in rows], dtype=np.float64
+    )
+    builder = AnalysisReportBuilder(
+        report_id=f"stage3-formal-{table.content_hash[:16]}"
+    )
+    builder.add_source(table)
+    builder.add_metric(
+        "mean_normalized_l1_error",
+        analysis_bias(errors, np.zeros_like(errors)),
+        source=table,
+        derivation_id="stage3.formal.mean-normalized-l1-error.v1",
+        input_columns=("normalized_l1_error",),
+    )
+    builder.add_metric(
+        "nodes_error_pearson",
+        analysis_pearson(nodes, errors),
+        source=table,
+        derivation_id="stage3.formal.nodes-error-pearson.v1",
+        input_columns=("unique_nodes", "normalized_l1_error"),
+    )
+    report = builder.build(
+        metadata={
+            "scope": "formal",
+            "formal_eligible": True,
+            "stage3_finalization_hash": finalization.artifact_hash,
+            "recommendation_hash": recommendation.artifact_hash,
+            "g3_7_gate_hash": g37.artifact_hash,
+            "g3_7_publication_hash": publication.artifact_hash,
+            "default_rule": recommendation.default_rule,
+            "fallback_rule": recommendation.fallback_rule,
+            "required_unit_count": len(recommendation.required_unit_ids),
+            "observation_count": len(rows),
+        }
+    )
+    chart_specs = (
+        ChartSpec.from_table(
+            table,
+            chart_id=f"stage3-cost-error-{table.content_hash[:12]}",
+            chart_type="scatter",
+            x_column="unique_nodes",
+            y_columns=("normalized_l1_error",),
+            sort_columns=("unique_nodes", "rule_name", "unit_id"),
+        ),
+        ChartSpec.from_table(
+            table,
+            chart_id=f"stage3-cost-completeness-{table.content_hash[:12]}",
+            chart_type="scatter",
+            x_column="unique_nodes",
+            y_columns=("completeness_absolute_residual",),
+            sort_columns=("unique_nodes", "rule_name", "unit_id"),
+        ),
+        ChartSpec.from_table(
+            table,
+            chart_id=f"stage3-wall-error-{table.content_hash[:12]}",
+            chart_type="scatter",
+            x_column="wall_seconds",
+            y_columns=("normalized_l1_error",),
+            sort_columns=("wall_seconds", "rule_name", "unit_id"),
+        ),
+    )
+    charts = tuple(ChartArtifact.from_spec(spec) for spec in chart_specs)
+    source_refs = tuple(
+        dict.fromkeys(
+            (
+                *inputs.references,
+                evidence_ref,
+                str(frozen_ref),
+                str(plan_ref),
+                str(evaluation_ref),
+                str(provenance_ref),
+                str(g36_ref),
+                g37_ref,
+                recommendation_ref,
+                finalization_ref,
+                publication_ref,
+                publication.execution_evidence_ref,
+                *finalization.source_artifact_refs,
+            )
+        )
+    )
+    return (
+        {
+            "analysis_report": report.to_dict(),
+            "chart_artifacts": {
+                "schema_version": "stage3-task-chart-artifacts-v1",
+                "scope": "formal",
+                "formal_eligible": True,
+                "source_table_hash": table.content_hash,
+                "artifacts": [chart.to_dict() for chart in charts],
+                "manual_numeric_edits_allowed": False,
+            },
+            "handoff_manifest": {
+                "schema_version": "stage3-task-handoff-manifest-v1",
+                "scope": "formal",
+                "formal_eligible": True,
+                "stage3_finalization": finalization.to_dict(),
+                "stage3_g37_publication_ref": publication_ref,
+                "stage3_g37_publication_hash": publication.artifact_hash,
+                "stage3_g37_gate_ref": g37_ref,
+                "stage3_g37_gate_hash": g37.artifact_hash,
+                "stage3_g37_recommendation_ref": recommendation_ref,
+                "stage3_g37_recommendation_hash": recommendation.artifact_hash,
+                "stage3_g37_finalization_ref": finalization_ref,
+                "stage3_g37_finalization_hash": finalization.artifact_hash,
+                "execution_evidence_ref": evidence_ref,
+                "execution_evidence_hash": evidence.artifact_hash,
+                "source_table_hash": table.content_hash,
+                "default_rule": recommendation.default_rule,
+                "fallback_rule": recommendation.fallback_rule,
+                "passing_rules": list(recommendation.passing_rules),
+                "cost_semantics": "measured_callback_cost_and_unique_nodes_v1",
+                "report_hash": report.report_hash,
+                "formal_stage_complete": False,
+                "completion_boundary": "PENDING_G3_8_DELIVERY_ACCEPTANCE",
+            },
+            "gate_summary": {
+                "schema_version": "stage3-task-gate-summary-v1",
+                "scope": "formal",
+                "stage3.G3-6": "PASS",
+                "stage3.G3-7": "PASS",
+                "stage3.G3-8": "NOT_RUN",
+                "stage3.G3-7_ref": g37_ref,
+                "stage3.G3-7_hash": g37.artifact_hash,
+                "formal_exit_gate": "NOT_RUN",
+                "local_validation_status": "PASS",
+            },
+        },
+        source_refs,
+    )
+
+
 @dataclass(slots=True)
 class _Stage23Runner(TaskRunner):
     """同一 RunnerKind 下按 canonical task_id 分派的薄适配器。"""
@@ -7923,9 +11960,24 @@ class _Stage23Runner(TaskRunner):
         if request.config.run_intent == "formal":
             _formal_execution_evidence(request, self.workspace_root)
         _predecessor_context(request, self.workspace_root, store)
-        completed = _completed_result(request, store)
-        if completed is not None:
-            return completed
+        # The final derived Stage 3 tasks bind live external Gate/provenance
+        # authorities that are not part of their config hash.  Re-run their
+        # pure semantic loaders even when all output commits already exist;
+        # idempotent publication will accept an identical result and reject a
+        # stale result whose current evidence refs drifted.
+        semantic_revalidation = (
+            request.config.run_intent == "formal"
+            and request.task.task_id
+            in {
+                "stage3.08_error_analysis_and_stability",
+                "stage3.09_cost_and_method_selection",
+                "stage3.10_reports_visualizations_and_handoff",
+            }
+        )
+        if not semantic_revalidation:
+            completed = _completed_result(request, store)
+            if completed is not None:
+                return completed
         _authorize_partial_resume(
             request,
             self.workspace_root,

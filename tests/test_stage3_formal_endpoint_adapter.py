@@ -202,7 +202,8 @@ def test_formal_handler_loads_training_endpoint_and_executes_tiny_path(
         ),
         {
             "orchestration": {
-                "input_result_refs": [endpoint_ref, probe_ref]
+                "input_result_refs": [endpoint_ref, probe_ref],
+                "active_probe_id": "formal-probe-0",
             },
             "optimizer_runtime": {
                 "betas": None,
@@ -266,6 +267,15 @@ def test_formal_handler_loads_training_endpoint_and_executes_tiny_path(
     assert len(context.node_cache) == len(resumed.node_cache) == 3
     assert first.unique_gradient_evaluations == 2
     assert second.unique_gradient_evaluations == third.unique_gradient_evaluations == 3
+    second_cost = context.cost_for(simpson)
+    third_cost = resumed.cost_for(simpson)
+    assert second_cost.gradient_evaluations == 1
+    assert second_cost.loss_evaluations == 5  # 3 nodes + 2 endpoint losses
+    assert second_cost.forward_evaluations == second_cost.backward_evaluations == 6
+    assert third_cost.gradient_evaluations == 0  # persistent node cache restores all gradients
+    assert third_cost.loss_evaluations == 5
+    assert third_cost.forward_evaluations == third_cost.backward_evaluations == 5
+    assert second_cost.wall_seconds > 0
     for name in second.signed:
         torch.testing.assert_close(second.signed[name], third.signed[name])
     cache_evidence = resumed.cache_evidence((trapezoid, simpson))
@@ -275,6 +285,93 @@ def test_formal_handler_loads_training_endpoint_and_executes_tiny_path(
     assert all(torch.isfinite(value).all() for value in third.signed.values())
     commit_value = load_canonical_json(tmp_path / endpoint_ref)
     assert commit_value["formal_eligible"] is True
+
+    # A three-probe formal panel must not silently make the first probe the
+    # only executable unit.  Removing the explicit binding is a structured
+    # contract blocker, even though the endpoint and panel themselves are
+    # otherwise valid.
+    unbound_config = _Config(
+        config.base_config,
+        {
+            "orchestration": {"input_result_refs": [endpoint_ref, probe_ref]},
+            "optimizer_runtime": config.sections["optimizer_runtime"],
+        },
+    )
+    unbound_request = SimpleNamespace(
+        config=unbound_config,
+        task=DEFAULT_TASK_CATALOG.get("stage3.03_endpoint_and_probe_pipeline"),
+    )
+    with pytest.raises(TaskBlockedError, match="active_probe_id"):
+        stage23._formal_path_context(unbound_request, tmp_path, store)
+
+
+def test_formal_path_unit_selector_uses_hash_bound_route_spec(tmp_path: Path) -> None:
+    selector = {
+        "schema_version": "stage3-path-unit-selector-v1",
+        "scope": "pilot",
+        "unit_index_hash": "a" * 64,
+        "active_unit_id": "path-unit-real-001",
+    }
+    selector["artifact_hash"] = canonical_json_hash(selector)
+    write_canonical_json(tmp_path / "selector.json", selector)
+    request = SimpleNamespace(
+        config=_Config(
+            _BaseConfig({"path_integration": {}}),
+            {"orchestration": {"route_spec_ref": "selector.json"}},
+        ),
+        task=SimpleNamespace(task_id="stage3.05_reference_integral_and_precision"),
+    )
+    assert stage23._formal_stage3_probe_selector(request, tmp_path) == (
+        None,
+        "path-unit-real-001",
+        "a" * 64,
+        None,
+    )
+
+
+def test_formal_path_unit_selector_rejects_hash_drift(tmp_path: Path) -> None:
+    selector = {
+        "schema_version": "stage3-path-unit-selector-v1",
+        "scope": "formal",
+        "unit_index_hash": "a" * 64,
+        "active_unit_id": "path-unit-real-001",
+        "artifact_hash": "b" * 64,
+    }
+    write_canonical_json(tmp_path / "selector-drift.json", selector)
+    request = SimpleNamespace(
+        config=_Config(
+            _BaseConfig({"path_integration": {}}),
+            {"orchestration": {"route_spec_ref": "selector-drift.json"}},
+        ),
+        task=SimpleNamespace(task_id="stage3.07_formal_experiment_matrix"),
+    )
+    with pytest.raises(TaskBlockedError, match="selector hash"):
+        stage23._formal_stage3_probe_selector(request, tmp_path)
+
+
+def test_formal_probe_selector_binds_pre_index_endpoint_and_plan(tmp_path: Path) -> None:
+    selector = {
+        "schema_version": "stage3-probe-selector-v1",
+        "scope": "formal",
+        "endpoint_digest": "a" * 64,
+        "probe_plan_hash": "b" * 64,
+        "active_probe_id": "formal-probe-01",
+    }
+    selector["artifact_hash"] = canonical_json_hash(selector)
+    write_canonical_json(tmp_path / "probe-selector.json", selector)
+    request = SimpleNamespace(
+        config=_Config(
+            _BaseConfig({"path_integration": {}}),
+            {"orchestration": {"route_spec_ref": "probe-selector.json"}},
+        ),
+        task=SimpleNamespace(task_id="stage3.03_endpoint_and_probe_pipeline"),
+    )
+    assert stage23._formal_stage3_probe_selector(request, tmp_path) == (
+        "formal-probe-01",
+        None,
+        None,
+        ("a" * 64, "b" * 64),
+    )
 
 
 def test_ddp_wrapper_names_are_normalized_without_rejecting_wrapper_root() -> None:
@@ -298,3 +395,137 @@ def test_missing_formal_endpoint_is_a_structured_blocker(tmp_path: Path) -> None
         stage23._load_formal_endpoint_and_probe_plan(request, tmp_path, evidence)
 
     assert caught.value.blockers[0].requirement == "training_endpoint_commit"
+
+
+def test_formal_reference_levels_are_explicit_and_refined() -> None:
+    ladder = {
+        "families": {
+            "gauss_legendre": [2, 4, 8],
+            "composite_simpson": [2, 4, 8],
+        },
+        "frozen": True,
+    }
+    config = _Config(
+        _BaseConfig({"path_integration": {"reference_ladder": ladder}}),
+        {},
+    )
+    request = SimpleNamespace(config=config)
+    context = SimpleNamespace(execution=_formal_evidence("inputs/ladder.json"))
+
+    levels = stage23._stage3_reference_levels(request, Path("."), context)
+
+    assert [level.unique_nodes for level in levels] == [2, 4, 8, 3, 5, 9]
+    assert [level.family for level in levels] == [
+        "gauss_legendre",
+        "gauss_legendre",
+        "gauss_legendre",
+        "composite_simpson",
+        "composite_simpson",
+        "composite_simpson",
+    ]
+
+
+def test_formal_reference_levels_without_frozen_ladder_are_blocked() -> None:
+    config = _Config(_BaseConfig({"path_integration": {}}), {})
+    request = SimpleNamespace(config=config)
+    context = SimpleNamespace(execution=_formal_evidence("inputs/ladder.json"))
+
+    with pytest.raises(TaskBlockedError, match="reference_ladder"):
+        stage23._stage3_reference_levels(request, Path("."), context)
+
+
+def test_formal_reference_ladder_identity_requires_recomputable_hash() -> None:
+    body = {
+        "families": {
+            "gauss_legendre": [2, 4, 8],
+            "composite_simpson": [2, 4, 8],
+        },
+        "frozen": True,
+    }
+    ladder = dict(body)
+    ladder["artifact_hash"] = canonical_json_hash(body)
+    config = _Config(
+        _BaseConfig({"path_integration": {"reference_ladder": ladder}}),
+        {},
+    )
+    request = SimpleNamespace(config=config)
+
+    document, ladder_hash, gauss, simpson = stage23._stage3_reference_ladder_document(
+        request,
+        Path("."),
+        require_artifact_hash=True,
+    )
+
+    assert document == ladder
+    assert ladder_hash == ladder["artifact_hash"]
+    assert gauss == (2, 4, 8)
+    assert simpson == (2, 4, 8)
+
+
+def test_formal_reference_ladder_identity_rejects_unhashed_frozen_document() -> None:
+    ladder = {
+        "families": {
+            "gauss_legendre": [2, 4, 8],
+            "composite_simpson": [2, 4, 8],
+        },
+        "frozen": True,
+    }
+    config = _Config(
+        _BaseConfig({"path_integration": {"reference_ladder": ladder}}),
+        {},
+    )
+    request = SimpleNamespace(config=config)
+
+    with pytest.raises(TaskBlockedError, match="artifact_hash"):
+        stage23._stage3_reference_ladder_document(
+            request,
+            Path("."),
+            require_artifact_hash=True,
+        )
+
+
+def test_formal_reference_binding_is_immutable_and_requires_two_rounds() -> None:
+    binding = stage23.FormalReferenceBinding(
+        formal_plan_ref="plans/stage3.json",
+        formal_plan_hash=_hash("plan"),
+        thresholds_hash=_hash("thresholds"),
+        reference_tolerance=1e-5,
+        reference_ladder_hash=_hash("ladder"),
+        reference_ladder_levels={
+            "gauss_legendre": [2, 4, 8],
+            "composite_simpson": [2, 4, 8],
+        },
+        reference_ladder_nodes={
+            "gauss_legendre": [2, 4, 8],
+            "composite_simpson": [3, 5, 9],
+        },
+    )
+
+    restored = stage23.FormalReferenceBinding.from_mapping(binding.to_dict())
+    assert restored == binding
+    assert binding.artifact_fields()["reference_binding_hash"] == binding.binding_hash
+
+    with pytest.raises(ValueError, match="required_consecutive"):
+        stage23.FormalReferenceBinding(
+            formal_plan_ref=binding.formal_plan_ref,
+            formal_plan_hash=binding.formal_plan_hash,
+            thresholds_hash=binding.thresholds_hash,
+            reference_tolerance=binding.reference_tolerance,
+            reference_ladder_hash=binding.reference_ladder_hash,
+            reference_ladder_levels=binding.reference_ladder_levels,
+            reference_ladder_nodes=binding.reference_ladder_nodes,
+            required_consecutive=1,
+            primary_family=binding.primary_family,
+        )
+
+    with pytest.raises(ValueError, match="primary_family"):
+        stage23.FormalReferenceBinding(
+            formal_plan_ref=binding.formal_plan_ref,
+            formal_plan_hash=binding.formal_plan_hash,
+            thresholds_hash=binding.thresholds_hash,
+            reference_tolerance=binding.reference_tolerance,
+            reference_ladder_hash=binding.reference_ladder_hash,
+            reference_ladder_levels=binding.reference_ladder_levels,
+            reference_ladder_nodes=binding.reference_ladder_nodes,
+            primary_family="trapezoid",
+        )

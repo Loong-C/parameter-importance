@@ -1,0 +1,50 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://parameter-importance.invalid/schemas/shared/stage3-formal-reference-binding-v1.json",
+  "title": "Stage 3 formal reference binding",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "formal_plan_ref",
+    "formal_plan_hash",
+    "thresholds_hash",
+    "reference_tolerance",
+    "reference_ladder_hash",
+    "reference_ladder_levels",
+    "reference_ladder_nodes",
+    "required_consecutive",
+    "primary_family",
+    "artifact_hash"
+  ],
+  "properties": {
+    "schema_version": {"const": "stage3-formal-reference-binding-v1"},
+    "formal_plan_ref": {"type": "string", "minLength": 1},
+    "formal_plan_hash": {"$ref": "#/$defs/hash"},
+    "thresholds_hash": {"$ref": "#/$defs/hash"},
+    "reference_tolerance": {"type": "number", "exclusiveMinimum": 0},
+    "reference_ladder_hash": {"$ref": "#/$defs/hash"},
+    "reference_ladder_levels": {"$ref": "#/$defs/families"},
+    "reference_ladder_nodes": {"$ref": "#/$defs/families"},
+    "required_consecutive": {"const": 2},
+    "primary_family": {"type": "string", "minLength": 1},
+    "artifact_hash": {"$ref": "#/$defs/hash"}
+  },
+  "$defs": {
+    "hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "families": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["gauss_legendre", "composite_simpson"],
+      "properties": {
+        "gauss_legendre": {"$ref": "#/$defs/levels"},
+        "composite_simpson": {"$ref": "#/$defs/levels"}
+      }
+    },
+    "levels": {
+      "type": "array",
+      "minItems": 2,
+      "items": {"type": "integer", "minimum": 1}
+    }
+  }
+}
