@@ -201,6 +201,59 @@ def test_stage3_probe_selector_reads_nested_endpoint_digest(
     assert load_canonical_json(output)["artifact_hash"] == emitted["artifact_hash"]
 
 
+def test_stage3_probe_selector_accepts_real_pilot_endpoint_commit(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    endpoint_digest = hashlib.sha256(b"pilot-endpoint").hexdigest()
+    endpoint_body = {
+        "schema_version": "endpoint-commit-v1",
+        "endpoint_id": "pilot-endpoint-1",
+        "optimizer_step": 1,
+        "endpoint_digest": endpoint_digest,
+        "object_ref": "objects/pilot-endpoint-1.json",
+        "object_sha256": hashlib.sha256(b"object").hexdigest(),
+        "scope": "pilot",
+        "formal_eligible": False,
+        "qualification_evidence_hash": None,
+    }
+    endpoint = endpoint_body | {"artifact_hash": canonical_json_hash(endpoint_body)}
+    endpoint_path = tmp_path / "endpoint-commit.json"
+    write_canonical_json(endpoint_path, endpoint)
+    plan_body = {
+        "schema_version": "stage3-probe-plan-v1",
+        "panel_id": "pilot-panel",
+        "endpoint_digest": endpoint_digest,
+        "entries": [{
+            "role": "pilot",
+            "probe_id": "pilot-probe-0",
+            "sample_ids": ["sample-0"],
+            "content_hash": hashlib.sha256(b"sample-0").hexdigest(),
+            "loss_contract_hash": hashlib.sha256(b"loss").hexdigest(),
+            "effective_weight_unit": "effective_target_tokens",
+            "metadata": {},
+        }],
+        "minimum_formal_probes": 1,
+        "execution_evidence_hash": "a" * 64,
+        "scope": "pilot",
+        "formal_eligible": False,
+    }
+    plan = plan_body | {"artifact_hash": canonical_json_hash(plan_body)}
+    plan_path = tmp_path / "pilot-probe-plan.json"
+    output = tmp_path / "pilot-selector.json"
+    write_canonical_json(plan_path, plan)
+    assert main([
+        "artifact", "stage3-probe-selector-build",
+        "--endpoint-commit", str(endpoint_path),
+        "--probe-plan", str(plan_path),
+        "--active-probe-id", "pilot-probe-0",
+        "--output", str(output),
+    ]) == 0
+    emitted = json.loads(capsys.readouterr().out)
+    assert emitted["scope"] == "pilot"
+    assert emitted["endpoint_digest"] == endpoint_digest
+
+
 class _PassingContractRunner:
     def __init__(self) -> None:
         from param_importance_nlp.contracts import RunnerKind

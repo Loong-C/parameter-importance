@@ -15,6 +15,7 @@ from ops.stage3.export_stage3_probe_source import (
     ProbeSourceExportError,
     SOURCE_SCHEMA,
     _allocate,
+    _loss_contract,
     _rank_candidates,
     _select_replay_indices,
     _validate_execution_evidence,
@@ -97,6 +98,30 @@ def test_hash_ranking_is_reproducible_and_without_replacement() -> None:
     assert first == second
     assert len(first) == len(set(first)) == 32
     assert 11 not in first and 12 not in first
+
+
+def test_loss_contract_normalizes_the_qualified_pile_storage_mapping() -> None:
+    mapping = {
+        "attention_mask_policy": "all_one_for_fixed_full_record",
+        "effective_target_tokens": 2048,
+        "input_sequence_length": 2048,
+        "input_slice": [0, 2048],
+        "label_sequence_length": 2048,
+        "label_slice": [1, 2049],
+        "labels_alignment": "pre_shifted_next_token",
+        "loss_adapter_id": "pre-shifted-next-token-cross-entropy-v1",
+        "source_tokens_per_record": 2049,
+    }
+    context = SimpleNamespace(
+        asset=SimpleNamespace(
+            manifest={"metadata": {"storage": {"causal_lm_mapping": mapping}}}
+        )
+    )
+    contract = _loss_contract(context=context)
+    assert contract["asset_contract"] == mapping
+    assert contract["target_sequence_length"] == 2048
+    assert contract["target_slice"] == [1, 2049]
+    assert contract["target_tokens_per_record"] == 2048
 
 
 def test_replay_reserve_exports_only_fixed_hash_selected_subset() -> None:

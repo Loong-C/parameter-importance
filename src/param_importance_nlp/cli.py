@@ -2121,7 +2121,7 @@ def _artifact_stage3_path_unit_selector_build(arguments: argparse.Namespace) -> 
 
 
 def _artifact_stage3_probe_selector_build(arguments: argparse.Namespace) -> int:
-    """Publish a canonical formal probe selector for pre-index S3.03/S3.04."""
+    """Publish a canonical pilot/formal selector for pre-index S3.03/S3.04."""
 
     from .contracts import canonical_json_hash
     from .runtime import publish_canonical_immutable
@@ -2129,11 +2129,22 @@ def _artifact_stage3_probe_selector_build(arguments: argparse.Namespace) -> int:
     endpoint = _load_mapping(arguments.endpoint_commit)
     plan = _load_mapping(arguments.probe_plan)
     record = endpoint.get("record")
-    endpoint_digest = record.get("endpoint_digest") if isinstance(record, Mapping) else None
+    endpoint_schema = endpoint.get("schema_version")
+    endpoint_digest = (
+        endpoint.get("endpoint_digest")
+        if endpoint_schema == "endpoint-commit-v1"
+        else record.get("endpoint_digest")
+        if isinstance(record, Mapping)
+        else None
+    )
+    scope = endpoint.get("scope")
+    expected_eligible = scope == "formal"
     if (
-        endpoint.get("schema_version") != "stage3-endpoint-capture-v1"
-        or endpoint.get("scope") != "formal"
-        or endpoint.get("formal_eligible") is not True
+        endpoint_schema not in {"endpoint-commit-v1", "stage3-endpoint-capture-v1"}
+        or scope not in {"pilot", "formal"}
+        or endpoint.get("formal_eligible") is not expected_eligible
+        or not isinstance(endpoint_digest, str)
+        or re.fullmatch(r"[0-9a-f]{64}", endpoint_digest) is None
         or endpoint.get("artifact_hash")
         != canonical_json_hash(
             {key: value for key, value in endpoint.items() if key != "artifact_hash"}
@@ -2142,8 +2153,8 @@ def _artifact_stage3_probe_selector_build(arguments: argparse.Namespace) -> int:
         raise ValueError("STAGE3_PROBE_SELECTOR_ENDPOINT_INVALID")
     if (
         plan.get("schema_version") != "stage3-probe-plan-v1"
-        or plan.get("scope") != "formal"
-        or plan.get("formal_eligible") is not True
+        or plan.get("scope") != scope
+        or plan.get("formal_eligible") is not expected_eligible
         or plan.get("endpoint_digest") != endpoint_digest
         or plan.get("artifact_hash")
         != canonical_json_hash(
@@ -2157,7 +2168,7 @@ def _artifact_stage3_probe_selector_build(arguments: argparse.Namespace) -> int:
             item
             for item in entries
             if isinstance(item, Mapping)
-            and item.get("role") == "formal"
+            and item.get("role") == scope
             and item.get("probe_id") == arguments.active_probe_id
         ]
         if isinstance(entries, list)
@@ -2167,7 +2178,7 @@ def _artifact_stage3_probe_selector_build(arguments: argparse.Namespace) -> int:
         raise ValueError("STAGE3_PROBE_SELECTOR_PROBE_NOT_UNIQUE")
     payload: dict[str, Any] = {
         "schema_version": "stage3-probe-selector-v1",
-        "scope": "formal",
+        "scope": scope,
         "endpoint_digest": endpoint_digest,
         "probe_plan_hash": plan["artifact_hash"],
         "active_probe_id": arguments.active_probe_id,

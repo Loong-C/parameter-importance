@@ -691,19 +691,26 @@ def _loss_contract(*, context: _PileContext) -> dict[str, Any]:
     except OSError as error:
         raise _fail("LOSS_IMPLEMENTATION_UNAVAILABLE") from error
     pile_metadata = context.asset.manifest.get("metadata")
-    pile_contract = pile_metadata.get("causal_lm_contract") if isinstance(pile_metadata, Mapping) else None
+    pile_storage = (
+        pile_metadata.get("storage") if isinstance(pile_metadata, Mapping) else None
+    )
+    pile_contract = (
+        pile_storage.get("causal_lm_mapping")
+        if isinstance(pile_storage, Mapping)
+        else None
+    )
     if not isinstance(pile_contract, Mapping):
         raise _fail("CAUSAL_LM_ASSET_CONTRACT_MISSING")
     required = {
         "attention_mask_policy": "all_one_for_fixed_full_record",
-        "effective_target_tokens_per_record": 2048,
+        "effective_target_tokens": 2048,
         "input_sequence_length": 2048,
         "input_slice": [0, 2048],
+        "label_sequence_length": 2048,
+        "label_slice": [1, 2049],
         "labels_alignment": "pre_shifted_next_token",
         "loss_adapter_id": "pre-shifted-next-token-cross-entropy-v1",
         "source_tokens_per_record": 2049,
-        "target_sequence_length": 2048,
-        "target_slice": [1, 2049],
     }
     for key, expected in required.items():
         if pile_contract.get(key) != expected:
