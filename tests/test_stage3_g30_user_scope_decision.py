@@ -15,9 +15,14 @@ from param_importance_nlp.experiments.stage3_scope_authority import (
     publish_stage3_scope_authority,
 )
 from param_importance_nlp.experiments.stage23_task_runners import (
+    _predecessor_context,
     _stage3_scope_authority,
 )
-from param_importance_nlp.runtime.task_artifacts import load_committed_task_artifact
+from param_importance_nlp.contracts.task_catalog import DEFAULT_TASK_CATALOG
+from param_importance_nlp.runtime.task_artifacts import (
+    TaskArtifactStore,
+    load_committed_task_artifact,
+)
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -102,3 +107,26 @@ def test_g30_scope_authority_is_consumable_by_formal_stage3_evidence(
     assert decision["artifact_hash"] == load_canonical_json(DECISION)["artifact_hash"]
     assert observed_gate.artifact_hash == gate.artifact_hash
     assert (observed_decision_ref, observed_gate_ref) == (decision_ref, gate_ref)
+
+
+def test_formal_stage3_entry_does_not_restore_the_retired_stage2_predecessor(
+    tmp_path: Path,
+) -> None:
+    request = SimpleNamespace(
+        config=SimpleNamespace(
+            run_intent="formal",
+            section=lambda name: {"input_result_refs": []}
+            if name == "orchestration"
+            else None,
+        ),
+        task=DEFAULT_TASK_CATALOG.get("stage3.01_prerequisites_and_scope"),
+    )
+
+    context = _predecessor_context(
+        request,
+        tmp_path,
+        TaskArtifactStore(tmp_path, "artifacts/stage3-entry"),
+    )
+
+    assert context.predecessor_task_ids == ()
+    assert context.artifacts == ()

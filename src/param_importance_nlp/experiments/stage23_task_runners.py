@@ -1123,6 +1123,17 @@ def _predecessor_context(
         expected_tasks = ()
     elif (
         request.config.run_intent == "formal"
+        and request.task.task_id == "stage3.01_prerequisites_and_scope"
+        and not raw_refs
+    ):
+        # The formal Stage 3 entry is authorized by the explicit, hash-bound
+        # user scope decision and G3-0 pair.  Its catalog predecessor set is
+        # intentionally empty, so the historical Stage 2 delivery contract
+        # must not be reintroduced by this shared loader before the dedicated
+        # Stage 3 handler can validate that authority.
+        expected_tasks = ()
+    elif (
+        request.config.run_intent == "formal"
         and request.task.task_id == "stage2.02_stage1_handoff_and_fixed_state_contract"
     ):
         # The reviewed G2.1 config carries the complete Stage 1 handoff (S1.10
