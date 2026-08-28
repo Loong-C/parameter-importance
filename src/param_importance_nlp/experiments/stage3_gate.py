@@ -24,7 +24,11 @@ from ..contracts.provenance import ProvenanceRecord, ProvenanceStatus
 from ..contracts.stage23 import FormalExecutionEvidence
 from ..contracts.stage3_scope import validate_stage3_scope_authority
 from ..contracts.status import GateRecord, GateStatus
-from .stage3_protocol import DEFAULT_THRESHOLDS, REQUIRED_FORMAL_GATE_IDS
+from .stage3_protocol import (
+    DEFAULT_CANDIDATE_RULES,
+    DEFAULT_THRESHOLDS,
+    REQUIRED_FORMAL_GATE_IDS,
+)
 
 
 STAGE3_GATE_EVALUATION_SCHEMA = "stage3-gate-evaluation-v1"
@@ -348,6 +352,10 @@ def _formal_plan(
             raise FormalRunRejected(
                 "STAGE3_FROZEN_FORMAL_PLAN_UNIT_COVERAGE_INVALID:"
                 f"expected={expected_unit_count},actual={len(raw_units)}"
+            )
+        if tuple(raw_rules) != DEFAULT_CANDIDATE_RULES:
+            raise FormalRunRejected(
+                "STAGE3_FROZEN_FORMAL_PLAN_CANDIDATE_COVERAGE_INVALID"
             )
     elif len(raw_units) in {12, 99}:
         raise FormalRunRejected("STAGE3_FROZEN_FORMAL_PLAN_INDEX_REQUIRED_FOR_PRODUCTION_UNITS")

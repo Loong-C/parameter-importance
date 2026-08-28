@@ -627,8 +627,8 @@ class PathAnalysisRunner:
             ("loss_contract_hash", loss_contract_hash),
         ):
             _validate_sha256(field_name, digest)
-        if scope not in {"local_fixture", "formal"}:
-            raise ValueError("scope 只能是 local_fixture 或 formal")
+        if scope not in {"local_fixture", "pilot", "formal"}:
+            raise ValueError("scope 只能是 local_fixture、pilot 或 formal")
         if formal_eligible and scope != "formal":
             raise ValueError("只有 formal scope 可以声明 formal_eligible")
         for name, value in (

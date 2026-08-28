@@ -33,6 +33,14 @@ PROBE_PLAN_SCHEMAS = frozenset({"stage3-probe-plan-v1", "stage3-probe-panel-v1"}
 PILOT_SCOPE = "pilot"
 FORMAL_SCOPE = "formal"
 STAGES = ("early", "middle", "late")
+# These are the frozen formal training seeds from the Stage 3 preregistration.
+# They are part of the production-index contract, not examples.  In
+# particular, accepting the old 0/1 placeholders would make a formally
+# published 14M/31M matrix point at the wrong training trajectories.
+FORMAL_MODEL_SEEDS: Mapping[str, frozenset[int]] = {
+    "14M": frozenset({4301, 4302}),
+    "31M": frozenset({5301}),
+}
 _HASH_RE = re.compile(r"^[0-9a-f]{64}$")
 _ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,159}$")
 _FORBIDDEN_RE = re.compile(r"(?:fixture|synthetic)", re.IGNORECASE)
@@ -700,10 +708,12 @@ class ProductionUnitIndex:
                 raise _fail("FORMAL_MODEL_ENDPOINT_COVERAGE_INVALID")
             expected = {
                 ("14M", seed, stage): 4
-                for seed in (0, 1)
+                for seed in FORMAL_MODEL_SEEDS["14M"]
                 for stage in STAGES
             } | {
-                ("31M", 0, stage): 3 for stage in STAGES
+                ("31M", seed, stage): 3
+                for seed in FORMAL_MODEL_SEEDS["31M"]
+                for stage in STAGES
             }
             if {
                 key: len(value) for key, value in by_model_seed_stage.items()
@@ -912,11 +922,15 @@ def _validate_endpoint_coverage(endpoints: Sequence[EndpointCommitIdentity], *, 
         return
     if len(endpoints) != 33 or {item.model for item in endpoints} != {"14M", "31M"}:
         raise _fail("FORMAL_ENDPOINT_COVERAGE_INVALID")
-    for model, seeds, per_stage in (("14M", 2, 4), ("31M", 1, 3)):
+    for model, expected_seeds, per_stage in (
+        ("14M", FORMAL_MODEL_SEEDS["14M"], 4),
+        ("31M", FORMAL_MODEL_SEEDS["31M"], 3),
+    ):
         selected_model = [item for item in endpoints if item.model == model]
-        if len({item.seed for item in selected_model}) != seeds:
+        observed_seeds = {item.seed for item in selected_model}
+        if observed_seeds != set(expected_seeds):
             raise _fail("FORMAL_SEED_COVERAGE_INVALID", model)
-        for seed in {item.seed for item in selected_model}:
+        for seed in expected_seeds:
             for stage in STAGES:
                 count = sum(item.seed == seed and item.stage == stage for item in selected_model)
                 if count != per_stage:
@@ -1040,6 +1054,7 @@ build_unit_index = build_production_unit_index
 __all__ = [
     "ENDPOINT_COMMIT_SCHEMA",
     "ENDPOINT_OBJECT_SCHEMA",
+    "FORMAL_MODEL_SEEDS",
     "FORMAL_SCOPE",
     "PILOT_SCOPE",
     "PROBE_PLAN_SCHEMAS",

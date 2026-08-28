@@ -10,13 +10,26 @@ from param_importance_nlp.contracts.jsonio import canonical_json_hash
 from param_importance_nlp.contracts.status import GateRecord, GateStatus
 from param_importance_nlp.contracts.errors import FormalRunRejected
 from param_importance_nlp.contracts.stage23 import FormalExecutionEvidence
+from param_importance_nlp.analysis import (
+    AnalysisReportBuilder,
+    ChartArtifact,
+    ChartSpec,
+    FrozenSourceTable,
+    MetricResult,
+)
 from param_importance_nlp.experiments.stage3_g37_publisher import Stage3G37Publisher
 from param_importance_nlp.experiments.stage3_g38_publisher import (
     REQUIRED_STAGE3_G38_GATE_IDS,
     Stage3G38DeliveryManifest,
     Stage3G38Publisher,
+    publish_stage3_delivery_manifest,
+)
+from param_importance_nlp.experiments.stage3_raw_storage import (
+    persist_raw_unit_shard,
+    publish_raw_aggregate,
 )
 from param_importance_nlp.runtime.task_artifacts import TaskArtifactStore, load_committed_task_artifact
+import torch
 
 
 CONFIG = "a" * 64
@@ -127,18 +140,92 @@ def _inputs(root: Path) -> dict[str, object]:
         source_refs=tuple(gates.values()),
     )
 
-    report_payload = {
-        "schema_version": "analysis-report-v1",
-        "report_id": "stage3-formal-report",
-        "metadata": {"scope": "formal", "formal_eligible": True},
-        "report_hash": "1" * 64,
-    }
+    raw_ledger = root / "inputs" / "raw"
+    persist_raw_unit_shard(
+        root=root,
+        ledger_root=raw_ledger,
+        unit_id="unit-1",
+        required_unit_ids=("unit-1",),
+        execution_evidence_hash=current_execution.artifact_hash,
+        reference_binding_hash="c" * 64,
+        path_identity_hash="d" * 64,
+        reference_artifact_hash="e" * 64,
+        reference_signed={"weight": torch.tensor([1.0, 2.0], dtype=torch.float64)},
+        candidate_states={
+            "trapezoid": {
+                "signed": {"weight": torch.tensor([1.1, 1.9], dtype=torch.float64)},
+                "positive": {"weight": torch.tensor([1.1, 1.9], dtype=torch.float64)},
+                "negative_mass": {"weight": torch.zeros(2, dtype=torch.float64)},
+                "absolute": {"weight": torch.tensor([1.1, 1.9], dtype=torch.float64)},
+            }
+        },
+        rule_summaries={"trapezoid": {"rule": {"nodes": [0.0, 0.5, 1.0]}, "node_alphas": [0.0, 0.5, 1.0], "node_losses": [3.0, 2.0, 1.0], "path_identity_hash": "d" * 64, "evaluation_cost": {"gradient_evaluations": 3}}},
+    )
+    raw_aggregate, raw_aggregate_ref = publish_raw_aggregate(
+        root=root,
+        ledger_root=raw_ledger,
+        required_unit_ids=("unit-1",),
+        execution_evidence_hash=current_execution.artifact_hash,
+        reference_binding_hash="c" * 64,
+        candidate_rule_names=("trapezoid",),
+    )
+
+    source = FrozenSourceTable.from_rows(
+        name="stage3-formal-cost",
+        schema_version="stage3-formal-cost-v1",
+        rows=({"unique_nodes": 1.0, "normalized_l1_error": 0.1}, {"unique_nodes": 2.0, "normalized_l1_error": 0.05}),
+    )
+    report_builder = AnalysisReportBuilder(report_id="stage3-formal-report")
+    report_builder.add_source(source)
+    report_builder.add_metric(
+        "mean_error",
+        MetricResult(True, 0.075),
+        source=source,
+        derivation_id="test.mean-error.v1",
+        input_columns=("normalized_l1_error",),
+    )
+    report_payload = report_builder.build(
+        metadata={"scope": "formal", "formal_eligible": True, "stage3_07_raw_aggregate_ref": raw_aggregate_ref, "stage3_07_raw_aggregate_hash": raw_aggregate["artifact_hash"]}
+    ).to_dict()
+    spec = ChartSpec.from_table(
+        source,
+        chart_id="overview",
+        chart_type="line",
+        x_column="unique_nodes",
+        y_columns=("normalized_l1_error",),
+        sort_columns=("unique_nodes",),
+    )
+    png_bytes, svg_bytes = b"real-png", b"real-svg"
+    png_record = _put_file(root, "delivery/chart.png", png_bytes)
+    svg_record = _put_file(root, "delivery/chart.svg", svg_bytes)
     chart_payload = {
         "schema_version": "stage3-task-chart-artifacts-v1",
         "scope": "formal",
         "formal_eligible": True,
-        "source_table_hash": "2" * 64,
-        "artifacts": [],
+        "source_table_hash": source.content_hash,
+        "artifacts": [
+            ChartArtifact.from_rendered_bytes(
+                spec,
+                png_bytes,
+                renderer_id="fixture-renderer:v1",
+                output_format="png",
+                render_options={},
+            ).to_dict(),
+            ChartArtifact.from_rendered_bytes(
+                spec,
+                svg_bytes,
+                renderer_id="fixture-renderer:v1",
+                output_format="svg",
+                render_options={},
+            ).to_dict(),
+        ],
+        "rendered_figures": [{
+            "id": "overview",
+            "source_table": source.name,
+            "source_hash": source.content_hash,
+            "png": png_record,
+            "svg": svg_record,
+        }],
         "manual_numeric_edits_allowed": False,
     }
     handoff_payload = {
@@ -156,12 +243,14 @@ def _inputs(root: Path) -> dict[str, object]:
         "stage3_g37_finalization_hash": g37.finalization_hash,
         "execution_evidence_ref": execution_commit.commit_ref,
         "execution_evidence_hash": current_execution.artifact_hash,
-        "source_table_hash": "2" * 64,
+        "source_table_hash": source.content_hash,
         "default_rule": "midpoint",
         "fallback_rule": "trapezoid",
         "passing_rules": ["midpoint", "trapezoid"],
         "cost_semantics": "measured_callback_cost_and_unique_nodes_v1",
-        "report_hash": "1" * 64,
+        "report_hash": report_payload["report_hash"],
+        "stage3_07_raw_aggregate_ref": raw_aggregate_ref,
+        "stage3_07_raw_aggregate_hash": raw_aggregate["artifact_hash"],
         "formal_stage_complete": False,
         "completion_boundary": "PENDING_G3_8_DELIVERY_ACCEPTANCE",
     }
@@ -195,13 +284,12 @@ def _inputs(root: Path) -> dict[str, object]:
         stage310[kind] = published.commit_ref
 
     manifest = _manifest(root)
-    manifest_commit = TaskArtifactStore(root, "inputs/manifest").publish(
-        task_id="stage3.10_delivery_manifest_authority",
-        artifact_kind="delivery_manifest",
+    manifest_commit = publish_stage3_delivery_manifest(
+        workspace_root=root,
+        output_dir="inputs/manifest",
         config_hash=STAGE310_CONFIG,
-        run_intent="formal",
-        formal_eligible=True,
-        payload=manifest,
+        manifest=manifest,
+        stage3_10_refs=stage310,
         source_refs=tuple(stage310.values()),
     )
     return {
@@ -233,6 +321,43 @@ def test_g38_requires_all_formal_inputs_and_hashes_files(tmp_path: Path) -> None
     receipt = load_committed_task_artifact(tmp_path, "outputs/g38/commits/g38_publication.json", require_formal=True)
     assert receipt.payload == result.to_dict()
     assert Stage3G38DeliveryManifest.from_mapping(dict(load_committed_task_artifact(tmp_path, inputs["delivery_manifest_ref"], require_formal=True).payload)).artifact_hash
+
+
+def test_g38_rejects_empty_or_spec_only_chart_bundle(tmp_path: Path) -> None:
+    inputs = _inputs(tmp_path)
+    report = load_committed_task_artifact(
+        tmp_path,
+        inputs["stage3_10_refs"]["analysis_report"],  # type: ignore[index]
+        require_formal=True,
+    ).payload
+    source_hash = report["source_artifacts"][0]["content_hash"]  # type: ignore[index]
+    bad = TaskArtifactStore(tmp_path, "inputs/stage310-bad").publish(
+        task_id="stage3.10_reports_visualizations_and_handoff",
+        artifact_kind="chart_artifacts",
+        config_hash=STAGE310_CONFIG,
+        run_intent="formal",
+        formal_eligible=True,
+        payload={
+            "schema_version": "stage3-task-chart-artifacts-v1",
+            "scope": "formal",
+            "formal_eligible": True,
+            "source_table_hash": source_hash,
+            "artifacts": [],
+            "rendered_figures": [],
+            "manual_numeric_edits_allowed": False,
+        },
+        source_refs=(inputs["execution_evidence_ref"], inputs["g3_7_publication_ref"]),  # type: ignore[arg-type]
+    )
+    refs = dict(inputs["stage3_10_refs"])  # type: ignore[arg-type]
+    refs["chart_artifacts"] = bad.commit_ref
+    with pytest.raises(FormalRunRejected, match="CHARTS_REQUIRE_PNG_AND_SVG"):
+        Stage3G38Publisher().publish(
+            workspace_root=tmp_path,
+            output_dir="outputs/empty-charts",
+            config_hash=CONFIG,
+            checked_at="2026-08-28T01:00:00Z",
+            **(inputs | {"stage3_10_refs": refs}),
+        )
 
 
 def test_g38_rejects_missing_gate_and_tampered_file(tmp_path: Path) -> None:

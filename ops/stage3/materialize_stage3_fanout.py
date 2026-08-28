@@ -257,12 +257,13 @@ def materialize(
     base = _base_v1(base_value)
     identity = base.get("identity")
     runtime = base.get("runtime")
+    data = base.get("data")
     sampling = base.get("sampling")
     importance = base.get("importance")
     path_integration = base.get("path_integration")
     if not all(
         isinstance(item, dict)
-        for item in (identity, runtime, sampling, importance, path_integration)
+        for item in (identity, runtime, data, sampling, importance, path_integration)
     ):
         raise _fail("MATERIALIZATION_BASE_SECTIONS_INVALID")
     identity.update(
@@ -283,6 +284,14 @@ def materialize(
             "cache_root": str(source["cache_root"]),
             "output_root": str(PurePosixPath(str(source["artifact_output_dir"])).parent),
             "temp_root": str(PurePosixPath(str(source["cache_root"])) / "tmp"),
+        }
+    )
+    assert isinstance(data, dict)
+    data.update(
+        {
+            "split": "probe",
+            "sampler": "frozen-probe-panel",
+            "sampling_design": "disjoint_frozen_probe_panel",
         }
     )
     sampling.update({"reference_batch_size": 32})

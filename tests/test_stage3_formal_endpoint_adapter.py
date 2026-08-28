@@ -16,6 +16,7 @@ from types import SimpleNamespace
 import torch
 import pytest
 
+from ops.stage3 import run_stage3_formal as formal
 from param_importance_nlp.contracts import (
     FormalExecutionEvidence,
     GateRecord,
@@ -25,6 +26,7 @@ from param_importance_nlp.contracts import (
     write_canonical_json,
 )
 from param_importance_nlp.contracts.task_catalog import DEFAULT_TASK_CATALOG
+from param_importance_nlp.contracts.stage23 import validate_stage23_artifact
 from param_importance_nlp.experiments import TrainingEndpointObserver
 from param_importance_nlp.experiments import stage23_task_runners as stage23
 from param_importance_nlp.providers import (
@@ -303,6 +305,186 @@ def test_formal_handler_loads_training_endpoint_and_executes_tiny_path(
     )
     with pytest.raises(TaskBlockedError, match="active_probe_id"):
         stage23._formal_path_context(unbound_request, tmp_path, store)
+
+
+def test_pilot_endpoint_and_two_probe_selector_stays_pilot_through_g32(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """The real endpoint handler must keep pilot scope and satisfy G3-2's pilot contract."""
+
+    probe_ref = "inputs/pilot-probe-plan.json"
+    evidence = _formal_evidence(probe_ref)
+    fixture = build_tiny_training_fixture(
+        task_type="sequence_classification", seed=211, steps=4
+    )
+    optimizer = torch.optim.SGD(fixture.model.module.parameters(), lr=0.05, momentum=0.9)
+    engine = TrainingEngine(
+        spec=TrainingRunSpec(
+            "pilot-shaped-tiny",
+            "formal",
+            max_steps=1,
+            max_attempts=1,
+            importance_enabled=True,
+            estimator_decision_hash=_hash("decision-pilot"),
+            estimator_gate_status="PASS",
+            weights_exogenous=True,
+            common_mean_assumption=True,
+        ),
+        model=fixture.model,
+        optimizer=optimizer,
+        cursor=fixture.dataset.cursor(seed=211),
+    )
+    observer = TrainingEndpointObserver(
+        source_run_id="pilot-shaped-tiny",
+        parameter_registry_hash=engine.registry.coordinate_registry_hash,
+        selected_steps={1},
+        output_root=tmp_path / "training" / "pilot-endpoints",
+        workspace_root=tmp_path,
+        scope="pilot",
+        formal_eligible=False,
+    )
+    observer.bind_engine(engine)
+    engine.register_observer(observer)
+    assert engine.run().status == "COMPLETE"
+    endpoint = observer.bundles[0]
+
+    samples = {
+        batch.batch_id: batch
+        for step in fixture.dataset.steps
+        for batch in step
+    }
+    resolver = InMemoryFrozenSampleResolver(
+        samples,
+        resolver_id="pilot-shaped-tiny-probes",
+        loss_unit="sample",
+        statistical_unit="sample",
+        weight_unit="sample",
+        sampling_design="fixed_panel",
+        weights_exogenous=True,
+        common_mean_assumption=True,
+    )
+    provider = TorchFixedStateGradientProvider(
+        fixture.model,
+        resolver,
+        fixed_state_id="pilot-shaped-tiny-post",
+        output_dtype=torch.float64,
+    )
+    provider_context = stage23._ProviderContext(
+        provider=provider,
+        sample_ids=resolver.sample_ids,
+        evidence=evidence,
+        provider_kind="tiny_formal_shaped_test",
+        asset_manifest_hashes=evidence.asset_manifest_hashes,
+    )
+    monkeypatch.setattr(stage23, "_formal_provider", lambda _request, _root: provider_context)
+
+    loss_hash = canonical_json_hash(
+        {
+            "task_type": "sequence_classification",
+            "reduction": "mean",
+            "weighting": "sample",
+        }
+    )
+    probe_body = {
+        "schema_version": "stage3-probe-plan-v1",
+        "panel_id": "pilot-shaped-tiny-panel",
+        "endpoint_digest": endpoint.endpoint_digest,
+        "entries": [
+            {
+                "role": "pilot",
+                "probe_id": f"pilot-probe-{index}",
+                "sample_ids": [resolver.sample_ids[-2 + index]],
+                "content_hash": _hash(f"pilot-probe-content-{index}"),
+                "loss_contract_hash": loss_hash,
+                "effective_weight_unit": "sample",
+                "metadata": {"source": "tiny-pilot-shaped"},
+            }
+            for index in range(2)
+        ],
+        "minimum_formal_probes": 2,
+        "execution_evidence_hash": evidence.artifact_hash,
+        "scope": "pilot",
+        "formal_eligible": False,
+    }
+    probe_body["artifact_hash"] = canonical_json_hash(probe_body)
+    write_canonical_json(tmp_path / probe_ref, probe_body)
+    selector = {
+        "schema_version": "stage3-probe-selector-v1",
+        "scope": "pilot",
+        "endpoint_digest": endpoint.endpoint_digest,
+        "probe_plan_hash": probe_body["artifact_hash"],
+        "active_probe_id": "pilot-probe-0",
+    }
+    selector["artifact_hash"] = canonical_json_hash(selector)
+    selector_ref = "inputs/pilot-selector.json"
+    write_canonical_json(tmp_path / selector_ref, selector)
+
+    endpoint_ref = Path(endpoint.commit_ref).as_posix()
+    config = _Config(
+        _BaseConfig(
+            {
+                "optimizer": {
+                    "type": "sgd",
+                    "learning_rate": 0.05,
+                    "momentum": 0.9,
+                    "weight_decay": 0.0,
+                    "foreach": False,
+                    "fused": False,
+                    "parameter_groups": [],
+                },
+                "precision": {"path_accumulation_dtype": "float64"},
+            }
+        ),
+        {
+            "orchestration": {
+                "input_result_refs": [endpoint_ref, probe_ref],
+                "route_spec_ref": selector_ref,
+                "active_probe_id": "pilot-probe-0",
+            },
+            "optimizer_runtime": {
+                "betas": None,
+                "eps": None,
+                "amsgrad": False,
+                "dampening": 0.0,
+                "nesterov": False,
+                "maximize": False,
+                "capturable": False,
+                "differentiable": False,
+            },
+        },
+    )
+    request = SimpleNamespace(
+        config=config,
+        task=DEFAULT_TASK_CATALOG.get("stage3.03_endpoint_and_probe_pipeline"),
+    )
+    predecessor = SimpleNamespace(
+        references=(endpoint_ref, probe_ref),
+        payload=lambda kind: (
+            {"undefined_policy": "defined_false_with_reason_no_epsilon"}
+            if kind == "metric_contract"
+            else None
+        ),
+    )
+    monkeypatch.setattr(stage23, "_predecessor_context", lambda *_args: predecessor)
+    store = TaskArtifactStore(tmp_path, "runs/stage3-pilot-shaped")
+
+    payloads, refs = stage23._run_stage3_endpoint(request, tmp_path, store)
+
+    assert refs == (endpoint_ref, probe_ref)
+    assert payloads["probe_manifest"]["scope"] == "pilot"
+    assert payloads["probe_manifest"]["formal_eligible"] is False
+    assert len(payloads["probe_manifest"]["entries"]) == 2
+    assert {entry["role"] for entry in payloads["probe_manifest"]["entries"]} == {"pilot"}
+    assert payloads["state_restoration_report"]["scope"] == "pilot"
+    assert payloads["state_restoration_report"]["formal_eligible"] is False
+    validate_stage23_artifact(payloads["probe_manifest"])
+    measured, threshold = formal._validate_local_gate_outputs(
+        "stage3.03_endpoint_and_probe_pipeline",
+        {kind: SimpleNamespace(payload=value) for kind, value in payloads.items()},
+    )
+    assert measured == {"probe_count": 2, "replay_verified": True}
+    assert threshold == {"minimum_independent_pilot_probes": 2, "full_update_endpoint": True}
 
 
 def test_formal_path_unit_selector_uses_hash_bound_route_spec(tmp_path: Path) -> None:

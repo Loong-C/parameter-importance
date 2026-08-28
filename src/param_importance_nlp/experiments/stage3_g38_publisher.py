@@ -483,6 +483,117 @@ def _verify_manifest_files(workspace_root: Path, manifest: Stage3G38DeliveryMani
             raise FormalRunRejected(f"STAGE3_G38_DELIVERY_FILE_SHA256_MISMATCH:{ref}")
 
 
+def _verify_reporting_bundle(
+    workspace_root: Path,
+    report_payload: Mapping[str, object],
+    charts_payload: Mapping[str, object],
+) -> None:
+    """Reload and validate S3.10's semantic report/figure bundle.
+
+    G3-8 remains a consumer: it does not generate figures or repair reports.
+    It does, however, re-run the strict hash-bound parsers and verify that each
+    declared chart has both rendered formats bound to the corresponding files.
+    """
+
+    from ..analysis import AnalysisReport, ChartArtifact
+
+    try:
+        report = AnalysisReport.from_mapping(report_payload)
+    except (TypeError, ValueError) as error:
+        raise FormalRunRejected("STAGE3_G38_ANALYSIS_REPORT_INVALID") from error
+    if report.metadata.get("scope") != "formal" or report.metadata.get("formal_eligible") is not True:
+        raise FormalRunRejected("STAGE3_G38_ANALYSIS_REPORT_NOT_FORMAL")
+    source_hashes = {source.content_hash for source in report.source_artifacts}
+    source_table_hash = charts_payload.get("source_table_hash")
+    if not isinstance(source_table_hash, str) or source_table_hash not in source_hashes:
+        raise FormalRunRejected("STAGE3_G38_CHART_SOURCE_NOT_IN_REPORT")
+    raw_artifacts = charts_payload.get("artifacts")
+    figures = charts_payload.get("rendered_figures")
+    if (
+        not isinstance(raw_artifacts, list)
+        or not raw_artifacts
+        or not isinstance(figures, list)
+        or not figures
+    ):
+        raise FormalRunRejected("STAGE3_G38_CHARTS_REQUIRE_PNG_AND_SVG")
+    parsed: dict[tuple[str, str], ChartArtifact] = {}
+    for value in raw_artifacts:
+        if not isinstance(value, Mapping):
+            raise FormalRunRejected("STAGE3_G38_CHART_ARTIFACT_INVALID")
+        try:
+            artifact = ChartArtifact.from_mapping(value)
+        except (TypeError, ValueError) as error:
+            raise FormalRunRejected("STAGE3_G38_CHART_ARTIFACT_INVALID") from error
+        if artifact.output_format not in {"png", "svg"}:
+            raise FormalRunRejected("STAGE3_G38_RENDERED_CHART_REQUIRED")
+        if artifact.spec.source_hash not in source_hashes:
+            raise FormalRunRejected("STAGE3_G38_CHART_SOURCE_HASH_DRIFT")
+        key = (artifact.spec.chart_id, artifact.output_format)
+        if key in parsed:
+            raise FormalRunRejected("STAGE3_G38_DUPLICATE_RENDERED_CHART")
+        parsed[key] = artifact
+
+    figure_ids: set[str] = set()
+    for index, value in enumerate(figures):
+        if not isinstance(value, Mapping):
+            raise FormalRunRejected(f"STAGE3_G38_RENDERED_FIGURE_INVALID:{index}")
+        chart_id = value.get("id")
+        source_hash = value.get("source_hash")
+        if not isinstance(chart_id, str) or not chart_id or source_hash not in source_hashes:
+            raise FormalRunRejected(f"STAGE3_G38_RENDERED_FIGURE_IDENTITY_INVALID:{index}")
+        if chart_id in figure_ids:
+            raise FormalRunRejected(f"STAGE3_G38_DUPLICATE_RENDERED_FIGURE:{chart_id}")
+        figure_ids.add(chart_id)
+        for output_format in ("png", "svg"):
+            record = value.get(output_format)
+            if not isinstance(record, Mapping):
+                raise FormalRunRejected(f"STAGE3_G38_RENDERED_FIGURE_FORMAT_MISSING:{chart_id}:{output_format}")
+            artifact = parsed.get((chart_id, output_format))
+            if artifact is None or artifact.content_sha256 != record.get("sha256"):
+                raise FormalRunRejected(f"STAGE3_G38_RENDERED_FIGURE_ARTIFACT_MISMATCH:{chart_id}:{output_format}")
+            _verify_file_record(workspace_root, record, field=f"charts.{chart_id}.{output_format}")
+    chart_ids = {chart_id for chart_id, _ in parsed}
+    if figure_ids != chart_ids or any(
+        (chart_id, "png") not in parsed or (chart_id, "svg") not in parsed
+        for chart_id in chart_ids
+    ):
+        raise FormalRunRejected("STAGE3_G38_CHART_FORMAT_PAIR_INCOMPLETE")
+
+
+def _verify_file_record(
+    workspace_root: Path,
+    record: Mapping[str, object],
+    *,
+    field: str,
+) -> None:
+    """Verify one small-file record using the same workspace boundary as G3-8."""
+
+    ref = _safe_ref(record.get("path"), field=f"{field}.path", reject_future=False)
+    size = record.get("size")
+    digest = record.get("sha256")
+    if isinstance(size, bool) or not isinstance(size, int) or size < 0 or not _HASH_RE.fullmatch(str(digest)):
+        raise FormalRunRejected(f"STAGE3_G38_FILE_RECORD_INVALID:{field}")
+    root = workspace_root.resolve()
+    candidate = root.joinpath(*PurePosixPath(ref).parts)
+    try:
+        current = root
+        for part in PurePosixPath(ref).parts:
+            current = current / part
+            if current.is_symlink():
+                raise FormalRunRejected(f"STAGE3_G38_FILE_SYMLINK:{ref}")
+        resolved = candidate.resolve(strict=True)
+        resolved.relative_to(root)
+    except FormalRunRejected:
+        raise
+    except (OSError, ValueError) as error:
+        raise FormalRunRejected(f"STAGE3_G38_FILE_NOT_IN_WORKSPACE:{ref}") from error
+    if not resolved.is_file():
+        raise FormalRunRejected(f"STAGE3_G38_FILE_NOT_REGULAR:{ref}")
+    payload = resolved.read_bytes()
+    if len(payload) != size or hashlib.sha256(payload).hexdigest() != digest:
+        raise FormalRunRejected(f"STAGE3_G38_FILE_HASH_OR_SIZE_MISMATCH:{ref}")
+
+
 def _status_from_payload(payload: Mapping[str, object]) -> str | None:
     status = payload.get("status")
     if isinstance(status, str):
@@ -1010,6 +1121,33 @@ class Stage3G38Publisher:
         handoff = stage_loaded["handoff_manifest"].payload
         summary = stage_loaded["gate_summary"].payload
         charts = stage_loaded["chart_artifacts"].payload
+        _verify_reporting_bundle(
+            root,
+            stage_loaded["analysis_report"].payload,
+            charts,
+        )
+        raw_aggregate_ref = handoff.get("stage3_07_raw_aggregate_ref")
+        raw_aggregate_hash = handoff.get("stage3_07_raw_aggregate_hash")
+        if not isinstance(raw_aggregate_ref, str) or not isinstance(raw_aggregate_hash, str):
+            raise FormalRunRejected("STAGE3_G38_RAW_AGGREGATE_BINDING_MISSING")
+        try:
+            from .stage3_raw_storage import load_raw_aggregate
+
+            load_raw_aggregate(
+                root=root,
+                aggregate_ref=raw_aggregate_ref,
+                aggregate_hash=raw_aggregate_hash,
+                require_complete=True,
+            )
+        except (OSError, TypeError, ValueError) as error:
+            raise FormalRunRejected("STAGE3_G38_RAW_AGGREGATE_INVALID") from error
+        report_metadata = stage_loaded["analysis_report"].payload.get("metadata")
+        if (
+            not isinstance(report_metadata, Mapping)
+            or report_metadata.get("stage3_07_raw_aggregate_ref") != raw_aggregate_ref
+            or report_metadata.get("stage3_07_raw_aggregate_hash") != raw_aggregate_hash
+        ):
+            raise FormalRunRejected("STAGE3_G38_RAW_AGGREGATE_REPORT_BINDING_INVALID")
         if (
             handoff.get("scope") != "formal"
             or handoff.get("formal_eligible") is not True
@@ -1252,6 +1390,49 @@ def publish_stage3_g38(**kwargs: object) -> Stage3G38Publication:
     return Stage3G38Publisher().publish(**kwargs)  # type: ignore[arg-type]
 
 
+def publish_stage3_delivery_manifest(
+    *,
+    workspace_root: str | Path,
+    output_dir: str,
+    config_hash: str,
+    manifest: Mapping[str, object],
+    stage3_10_refs: Mapping[str, str],
+    source_refs: Sequence[str] = (),
+) -> object:
+    """Publish the independent S3.10 delivery-manifest authority.
+
+    The producer only accepts a completed, hash-bound file inventory.  It does
+    not create missing report files and requires all four S3.10 commits to be
+    present in the immutable source reference set, leaving G3-8 to consume this
+    authority independently.
+    """
+
+    if not isinstance(stage3_10_refs, Mapping):
+        raise FormalRunRejected("STAGE3_G38_STAGE310_REFS_REQUIRED")
+    normalized_refs = {
+        str(key): _safe_ref(value, field=f"stage3_10_refs.{key}")
+        for key, value in stage3_10_refs.items()
+    }
+    if set(normalized_refs) != set(REQUIRED_STAGE3_G38_STAGE310_KINDS):
+        raise FormalRunRejected("STAGE3_G38_REQUIRES_EXACT_CANONICAL_STAGE3_10_COMMITS")
+    refs = tuple(_safe_ref(ref, field="source_refs") for ref in source_refs)
+    if not set(normalized_refs.values()).issubset(set(refs)):
+        raise FormalRunRejected("STAGE3_G38_MANIFEST_MISSING_STAGE310_SOURCES")
+    root = Path(workspace_root).resolve()
+    parsed = Stage3G38DeliveryManifest.from_mapping(manifest)
+    _verify_manifest_files(root, parsed)
+    published = TaskArtifactStore(root, output_dir).publish(
+        task_id=STAGE3_G38_MANIFEST_TASK_ID,
+        artifact_kind=STAGE3_G38_MANIFEST_ARTIFACT_KIND,
+        config_hash=config_hash,
+        run_intent="formal",
+        payload=parsed.to_dict(),
+        formal_eligible=True,
+        source_refs=tuple(dict.fromkeys((*refs, *normalized_refs.values()))),
+    )
+    return published
+
+
 __all__ = [
     "REQUIRED_STAGE3_G38_DELIVERY_ROLES",
     "REQUIRED_STAGE3_G38_GATE_IDS",
@@ -1268,5 +1449,6 @@ __all__ = [
     "Stage3G38DeliveryManifest",
     "Stage3G38Publication",
     "Stage3G38Publisher",
+    "publish_stage3_delivery_manifest",
     "publish_stage3_g38",
 ]

@@ -80,6 +80,12 @@ from .stage3_production_plan import (
     load_production_unit_index,
 )
 from .stage3_protocol import DEFAULT_CANDIDATE_RULES
+from .stage3_raw_storage import (
+    VECTOR_DERIVATION_HASH,
+    VECTOR_DERIVATION_SCHEMA,
+    persist_raw_unit_shard,
+    publish_raw_aggregate,
+)
 from ..analysis import (
     AnalysisReportBuilder,
     ChartArtifact,
@@ -266,6 +272,19 @@ _STAGE3_MATRIX_PLAN_TASKS = frozenset(
         "stage3.08_error_analysis_and_stability",
         "stage3.09_cost_and_method_selection",
         "stage3.10_reports_visualizations_and_handoff",
+    }
+)
+# Stage 3 fan-out configs carry one immutable S2.4 parameter-registry commit
+# per endpoint.  It is an auxiliary input (not a catalog predecessor), because
+# the endpoint×probe DAG is still the scientific dependency.  Keep the allow
+# list narrow so an arbitrary Stage 2 commit cannot bypass predecessor checks.
+_STAGE3_PARAMETER_REGISTRY_CONSUMERS = frozenset(
+    {
+        _STAGE3_ENDPOINT_TASK,
+        "stage3.04_quadrature_engine_and_unit_tests",
+        _STAGE3_REFERENCE_TASK,
+        _STAGE3_PILOT_TASK,
+        *_STAGE3_MATRIX_PLAN_TASKS,
     }
 )
 
@@ -1154,6 +1173,7 @@ def _predecessor_context(
 
     grouped: dict[str, dict[str, _BoundInputArtifact]] = {}
     auxiliaries: list[str] = []
+    parameter_registry_refs: list[str] = []
     for reference in raw_refs:
         try:
             value = load_canonical_json(
@@ -1167,6 +1187,19 @@ def _predecessor_context(
                     raise ValueError("STAGE23_INPUT_RUN_INTENT_MISMATCH")
                 if item.formal_eligible != (request.config.run_intent == "formal"):
                     raise ValueError("STAGE23_INPUT_FORMAL_ELIGIBILITY_MISMATCH")
+                # A Stage 3 fan-out unit may carry its model-specific S2.4
+                # registry as an auxiliary task commit.  This is not a DAG
+                # predecessor; the path loader selects it by its immutable
+                # identity below.  Keep this exception limited to exactly
+                # this artifact kind and the Stage 3 path consumers.
+                if (
+                    request.config.run_intent == "formal"
+                    and request.task.task_id in _STAGE3_PARAMETER_REGISTRY_CONSUMERS
+                    and item.artifact_kind == "parameter_registry"
+                ):
+                    parameter_registry_refs.append(reference)
+                    auxiliaries.append(reference)
+                    continue
                 if item.task_id not in expected_tasks:
                     raise ValueError(
                         f"STAGE23_UNEXPECTED_PREDECESSOR_TASK:{item.task_id}"
@@ -1196,6 +1229,15 @@ def _predecessor_context(
                 retryable=False,
                 evidence_refs=(reference,),
             ) from error
+
+    if len(parameter_registry_refs) > 1:
+        raise _blocked(
+            BlockerCode.CONTRACT_UNFROZEN,
+            "stage3_parameter_registry",
+            "每个 Stage 3 unit 至多允许一个 parameter_registry commit",
+            retryable=False,
+            evidence_refs=tuple(parameter_registry_refs),
+        )
 
     ordered: list[_BoundInputArtifact] = []
     for predecessor_id in expected_tasks:
@@ -1567,6 +1609,206 @@ def _load_formal_parameter_registry(
         raise ValueError("FORMAL_PARAMETER_REGISTRY_MANIFEST_INVALID") from error
     if registry.coordinate_registry_hash != declared_registry_hash:
         raise ValueError("FORMAL_PARAMETER_REGISTRY_COORDINATE_HASH_MISMATCH")
+    return registry
+
+
+def _stage3_parameter_registry_reference(
+    request: TaskExecutionRequest,
+    root: Path,
+) -> str:
+    """Resolve the one model-specific registry allowed for a Stage 3 path.
+
+    Fan-out tasks share one runtime environment, while the formal matrix mixes
+    14M and 31M units.  The unit's ``input_result_refs`` therefore take
+    precedence over the environment's historical default registry.  Only an
+    actual, formal ``parameter_registry`` task commit is considered; malformed
+    candidate commits are errors and never silently fall back to the shared
+    environment.  If no candidate is declared, the environment reference is
+    still required and is checked by the identity validator below.
+    """
+
+    if request.task.task_id not in _STAGE3_PARAMETER_REGISTRY_CONSUMERS:
+        raise ValueError("STAGE3_PARAMETER_REGISTRY_TASK_UNSUPPORTED")
+    orchestration = request.config.section("orchestration")
+    if not isinstance(orchestration, Mapping):
+        raise ValueError("STAGE3_PARAMETER_REGISTRY_ORCHESTRATION_INVALID")
+    raw_refs = orchestration.get("input_result_refs", ())
+    if not isinstance(raw_refs, (list, tuple)):
+        raise ValueError("STAGE3_PARAMETER_REGISTRY_INPUT_REFS_INVALID")
+    candidates: list[str] = []
+    for raw_ref in raw_refs:
+        if not isinstance(raw_ref, str) or not raw_ref:
+            raise ValueError("STAGE3_PARAMETER_REGISTRY_INPUT_REF_INVALID")
+        try:
+            value = load_canonical_json(
+                _workspace_path(root, raw_ref, field="orchestration.input_result_refs")
+            )
+        except (FileNotFoundError, OSError, TypeError, ValueError):
+            # The predecessor loader owns the complete input-ref contract and
+            # will report this missing endpoint/probe input.  It is not a
+            # registry candidate, so keep discovery narrowly scoped here.
+            continue
+        if not isinstance(value, Mapping) or value.get("schema_version") != (
+            "task-output-commit-v1"
+        ):
+            continue
+        if value.get("artifact_kind") != "parameter_registry":
+            continue
+        try:
+            loaded = load_committed_task_artifact(
+                root, raw_ref, require_formal=True
+            )
+        except (FileNotFoundError, OSError, TypeError, ValueError) as error:
+            raise ValueError("STAGE3_PARAMETER_REGISTRY_COMMIT_INVALID") from error
+        if loaded.identity.artifact_kind != "parameter_registry":
+            raise ValueError("STAGE3_PARAMETER_REGISTRY_COMMIT_KIND_INVALID")
+        candidates.append(raw_ref)
+    unique = tuple(dict.fromkeys(candidates))
+    if len(unique) > 1:
+        raise ValueError("STAGE3_PARAMETER_REGISTRY_INPUT_AMBIGUOUS")
+    if unique:
+        return unique[0]
+    environment = getattr(request, "environment", None)
+    evidence_refs = getattr(environment, "evidence_refs", {})
+    if not isinstance(evidence_refs, Mapping):
+        raise ValueError("FORMAL_PARAMETER_REGISTRY_REF_REQUIRED")
+    declared = evidence_refs.get("stage2_parameter_registry")
+    if declared is not None and (
+        not isinstance(declared, str) or not declared
+    ):
+        raise ValueError("FORMAL_PARAMETER_REGISTRY_REF_INVALID")
+    # Endpoint trajectory environments historically exposed Stage 2 outputs as
+    # numbered evidence refs rather than under the dedicated key.  Discover a
+    # registry only through a valid immutable task commit, and require the
+    # environment to expose exactly one such commit before using it.
+    environment_candidates: list[str] = []
+    for raw_ref in evidence_refs.values():
+        if not isinstance(raw_ref, str) or not raw_ref:
+            continue
+        try:
+            value = load_canonical_json(
+                _workspace_path(root, raw_ref, field="environment.evidence_refs")
+            )
+        except (FileNotFoundError, OSError, TypeError, ValueError):
+            continue
+        if not isinstance(value, Mapping) or value.get("schema_version") != (
+            "task-output-commit-v1"
+        ) or value.get("artifact_kind") != "parameter_registry":
+            continue
+        try:
+            loaded = load_committed_task_artifact(
+                root, raw_ref, require_formal=True
+            )
+        except (FileNotFoundError, OSError, TypeError, ValueError) as error:
+            raise ValueError("STAGE3_PARAMETER_REGISTRY_ENVIRONMENT_COMMIT_INVALID") from error
+        if loaded.identity.artifact_kind != "parameter_registry":
+            raise ValueError("STAGE3_PARAMETER_REGISTRY_ENVIRONMENT_KIND_INVALID")
+        environment_candidates.append(raw_ref)
+    unique_environment = tuple(dict.fromkeys(environment_candidates))
+    if len(unique_environment) > 1:
+        raise ValueError("STAGE3_PARAMETER_REGISTRY_ENVIRONMENT_AMBIGUOUS")
+    if unique_environment:
+        if isinstance(declared, str) and declared and declared != unique_environment[0]:
+            raise ValueError("STAGE3_PARAMETER_REGISTRY_ENVIRONMENT_CONFLICT")
+        return unique_environment[0]
+    if isinstance(declared, str) and declared:
+        return declared
+    raise ValueError("FORMAL_PARAMETER_REGISTRY_REF_REQUIRED")
+
+
+def _stage3_registry_expected_identity(
+    request: TaskExecutionRequest,
+    *,
+    checkpoint_identity: Mapping[str, JSONValue] | None = None,
+) -> tuple[str, str, str]:
+    """Derive model/checkpoint/initialization identity from current config."""
+
+    base_model = request.config.base_config.section("model")
+    base_identity = request.config.base_config.section("identity")
+    if not isinstance(base_model, Mapping) or not isinstance(base_identity, Mapping):
+        raise ValueError("STAGE3_PARAMETER_REGISTRY_CONFIG_IDENTITY_INVALID")
+    configured_model = base_model.get("architecture")
+    if not isinstance(configured_model, str) or not configured_model:
+        raise ValueError("STAGE3_PARAMETER_REGISTRY_MODEL_ID_REQUIRED")
+    selected_model = (
+        checkpoint_identity.get("model_id")
+        if isinstance(checkpoint_identity, Mapping)
+        else None
+    )
+    if selected_model is not None and selected_model != configured_model:
+        raise ValueError("STAGE3_PARAMETER_REGISTRY_MODEL_CONFIG_MISMATCH")
+    expected_model = str(selected_model or configured_model)
+
+    configured_checkpoint = base_identity.get("input_checkpoint_id")
+    if not isinstance(configured_checkpoint, str) or not configured_checkpoint:
+        configured_checkpoint = base_model.get("initialization_id")
+    selected_checkpoint = (
+        checkpoint_identity.get("checkpoint_id")
+        if isinstance(checkpoint_identity, Mapping)
+        else None
+    )
+    if selected_checkpoint is not None and not isinstance(selected_checkpoint, str):
+        raise ValueError("STAGE3_PARAMETER_REGISTRY_CHECKPOINT_ID_INVALID")
+    if (
+        isinstance(selected_checkpoint, str)
+        and isinstance(configured_checkpoint, str)
+        and selected_checkpoint != configured_checkpoint
+    ):
+        raise ValueError("STAGE3_PARAMETER_REGISTRY_CHECKPOINT_CONFIG_MISMATCH")
+    if not isinstance(configured_checkpoint, str) or not configured_checkpoint:
+        raise ValueError("STAGE3_PARAMETER_REGISTRY_CHECKPOINT_ID_REQUIRED")
+    expected_checkpoint = str(selected_checkpoint or configured_checkpoint)
+
+    initialization = base_model.get("initialization_id")
+    if not isinstance(initialization, str) or not initialization:
+        raise ValueError("STAGE3_PARAMETER_REGISTRY_INITIALIZATION_ID_REQUIRED")
+    return expected_model, expected_checkpoint, initialization
+
+
+def _load_stage3_parameter_registry(
+    request: TaskExecutionRequest,
+    root: Path,
+    model: torch.nn.Module,
+    *,
+    checkpoint_identity: Mapping[str, JSONValue] | None = None,
+) -> ParameterRegistry:
+    """Load and identity-check the exact registry for one Stage 3 unit."""
+
+    reference = _stage3_parameter_registry_reference(request, root)
+    loaded = load_committed_task_artifact(root, reference, require_formal=True)
+    payload = loaded.payload
+    if payload.get("schema_version") != "stage2-parameter-registry-artifact-v1":
+        raise ValueError("STAGE3_PARAMETER_REGISTRY_SCHEMA_INVALID")
+    if payload.get("status") != "READY" or payload.get("scope") != FORMAL_SCOPE:
+        raise ValueError("STAGE3_PARAMETER_REGISTRY_SCOPE_INVALID")
+    expected_model, expected_checkpoint, expected_initialization = (
+        _stage3_registry_expected_identity(
+            request, checkpoint_identity=checkpoint_identity
+        )
+    )
+    actual_model = payload.get("model_id")
+    actual_checkpoint = payload.get("checkpoint_id")
+    if not isinstance(actual_model, str) or not actual_model:
+        raise ValueError("STAGE3_PARAMETER_REGISTRY_MODEL_ID_MISSING")
+    if not isinstance(actual_checkpoint, str) or not actual_checkpoint:
+        raise ValueError("STAGE3_PARAMETER_REGISTRY_CHECKPOINT_ID_MISSING")
+    if actual_model != expected_model:
+        raise ValueError("STAGE3_PARAMETER_REGISTRY_MODEL_ID_MISMATCH")
+    if actual_checkpoint != expected_checkpoint:
+        raise ValueError("STAGE3_PARAMETER_REGISTRY_CHECKPOINT_ID_MISMATCH")
+    # S2.4 publishes checkpoint_id as the initialization identity.  Newer
+    # producers may repeat it explicitly; either representation must agree
+    # with the current Stage 3 model initialization, never merely with the
+    # parameter-name shape.
+    actual_initialization = payload.get("initialization_id", actual_checkpoint)
+    if not isinstance(actual_initialization, str) or not actual_initialization:
+        raise ValueError("STAGE3_PARAMETER_REGISTRY_INITIALIZATION_ID_INVALID")
+    if actual_initialization != expected_initialization:
+        raise ValueError("STAGE3_PARAMETER_REGISTRY_INITIALIZATION_ID_MISMATCH")
+    registry = _load_formal_parameter_registry(root, reference, model)
+    declared_hash = payload.get("registry_hash")
+    if declared_hash != registry.coordinate_registry_hash:
+        raise ValueError("STAGE3_PARAMETER_REGISTRY_COORDINATE_HASH_MISMATCH")
     return registry
 
 
@@ -2112,14 +2354,26 @@ def _formal_provider(request: TaskExecutionRequest, root: Path) -> _ProviderCont
         # property to derive from the current model.  The per-cell auxiliary
         # TaskArtifact binds the selected S2.3 source manifest and its raw
         # bytes; reload both before binding current Parameter objects.
-        registry_ref = request.environment.evidence_refs.get(
-            "stage2_parameter_registry"
-        )
-        if not isinstance(registry_ref, str) or not registry_ref:
-            raise ValueError("FORMAL_PARAMETER_REGISTRY_REF_REQUIRED")
-        registry = _load_formal_parameter_registry(
-            root, registry_ref, model.module
-        )
+        if request.task.stage == 3:
+            registry = _load_stage3_parameter_registry(
+                request,
+                root,
+                model.module,
+                checkpoint_identity=(
+                    selected_checkpoint.to_payload()
+                    if selected_checkpoint is not None
+                    else None
+                ),
+            )
+        else:
+            registry_ref = request.environment.evidence_refs.get(
+                "stage2_parameter_registry"
+            )
+            if not isinstance(registry_ref, str) or not registry_ref:
+                raise ValueError("FORMAL_PARAMETER_REGISTRY_REF_REQUIRED")
+            registry = _load_formal_parameter_registry(
+                root, registry_ref, model.module
+            )
         if (
             selected_checkpoint is not None
             and registry.coordinate_registry_hash
@@ -6725,6 +6979,63 @@ def _endpoint_record_from_wire(value: object):
     return record
 
 
+def _declared_probe_selector_scope(
+    request: TaskExecutionRequest,
+    root: Path,
+) -> str | None:
+    """Best-effort scope discovery for the shared S3.03/S3.04 asset loader.
+
+    The authoritative parser remains :func:`_formal_stage3_probe_selector`,
+    which reports malformed selectors as structured blockers.  This helper is
+    deliberately conservative: it only returns a scope after loading the
+    complete probe-selector shape and recomputing its immutable hash.  A
+    malformed/missing selector returns ``None`` so the normal formal fallback
+    can run and the authoritative parser can emit the useful blocker later.
+    """
+
+    try:
+        orchestration = request.config.section("orchestration")
+    except (AttributeError, KeyError, TypeError):
+        return None
+    if not isinstance(orchestration, Mapping):
+        return None
+    route_ref = orchestration.get("route_spec_ref")
+    if not isinstance(route_ref, str) or not route_ref:
+        return None
+    try:
+        selector = load_canonical_json(
+            _workspace_path(root, route_ref, field="orchestration.route_spec_ref")
+        )
+    except (FileNotFoundError, OSError, TypeError, ValueError):
+        return None
+    if not isinstance(selector, Mapping):
+        return None
+    if selector.get("schema_version") != "stage3-probe-selector-v1":
+        return None
+    expected = {
+        "schema_version",
+        "scope",
+        "endpoint_digest",
+        "probe_plan_hash",
+        "active_probe_id",
+        "artifact_hash",
+    }
+    if set(selector) != expected:
+        return None
+    scope = selector.get("scope")
+    if scope not in {PILOT_SCOPE, FORMAL_SCOPE}:
+        return None
+    if selector.get("artifact_hash") != canonical_json_hash(
+        {key: item for key, item in selector.items() if key != "artifact_hash"}
+    ):
+        return None
+    for field in ("endpoint_digest", "probe_plan_hash", "artifact_hash"):
+        value = selector.get(field)
+        if not isinstance(value, str) or re.fullmatch(r"[0-9a-f]{64}", value) is None:
+            return None
+    return str(scope)
+
+
 def _load_formal_endpoint_and_probe_plan(
     request: TaskExecutionRequest,
     root: Path,
@@ -6740,6 +7051,13 @@ def _load_formal_endpoint_and_probe_plan(
     orchestration = request.config.section("orchestration")
     assert isinstance(orchestration, dict)
     expected_scope = _stage3_production_index_scope(request)
+    # S3.03/S3.04 are the shared endpoint/probe producer and therefore do not
+    # have a production-index scope of their own.  Their real pilot execution
+    # still uses ``run_intent=formal`` (the provider/evidence is formal-shaped),
+    # so derive the asset scope from the hash-bound probe selector when one is
+    # declared.  Otherwise retain the historical formal default.
+    if expected_scope is None:
+        expected_scope = _declared_probe_selector_scope(request, root)
     # Stage 3.05/3.06 are formal *executions* of the frozen pilot index.  The
     # endpoint/probe assets they consume remain pilot-scoped and ineligible;
     # only Stage 3.07 and its downstream consumers use formal assets.  Do not
@@ -7058,10 +7376,13 @@ def _formal_stage3_probe_selector(
                             "active_probe_id",
                             "artifact_hash",
                         }
-                        if set(selector) != expected or expected_scope is not None:
+                        if set(selector) != expected:
                             raise ValueError("probe selector task/字段不匹配")
-                        if selector.get("scope") != FORMAL_SCOPE:
-                            raise ValueError("probe selector scope 必须为 formal")
+                        selector_scope = selector.get("scope")
+                        if selector_scope not in {PILOT_SCOPE, FORMAL_SCOPE}:
+                            raise ValueError("probe selector scope 必须为 pilot 或 formal")
+                        if expected_scope is not None and selector_scope != expected_scope:
+                            raise ValueError("selector scope 与 task production scope 不一致")
                         probe_id = selector.get("active_probe_id")
                         if not isinstance(probe_id, str) or not probe_id:
                             raise ValueError("selector active_probe_id 无效")
@@ -7133,6 +7454,8 @@ def _formal_path_context(
     provider_context = _formal_provider(request, root)
     evidence = provider_context.evidence.require_for_stage(3)
     expected_scope = _stage3_production_index_scope(request)
+    if expected_scope is None:
+        expected_scope = _declared_probe_selector_scope(request, root)
     if request.config.run_intent == "formal" and expected_scope is None:
         expected_scope = FORMAL_SCOPE
     endpoint, probe_plan, probe_ref, bundle_refs = _load_formal_endpoint_and_probe_plan(
@@ -7179,17 +7502,15 @@ def _formal_path_context(
 
     try:
         if provider_context.provider_kind == "offline_hf_torch_fixed_state":
-            registry_ref = request.environment.evidence_refs.get(
-                "stage2_parameter_registry"
-            )
-            if not isinstance(registry_ref, str) or not registry_ref:
-                raise ValueError("FORMAL_PARAMETER_REGISTRY_REF_REQUIRED")
             # Reload the exact upstream S2.3 coordinate registry, including
             # its frozen layer/module tags.  Re-inferring a fresh registry
             # here would allow grouping labels to drift while parameter names
             # still match.
-            registry = _load_formal_parameter_registry(
-                root, registry_ref, provider.model_adapter.module
+            registry = _load_stage3_parameter_registry(
+                request,
+                root,
+                provider.model_adapter.module,
+                checkpoint_identity=provider_context.checkpoint_identity,
             )
         else:
             # In-memory formal-shaped adapter tests have no external S2.3
@@ -7314,22 +7635,18 @@ def _formal_path_context(
                     ),
                 )
             )
-        # ``ProbePanel`` models local_fixture/formal qualification, while the
-        # production plan has a third, pilot-only scope.  Keep the raw pilot
-        # roles and ineligible qualification rather than relabeling them as
-        # formal probes; the enclosing FormalExecutionEvidence still gates the
-        # actual provider and G3-1 environment.
-        panel_execution = (
-            evidence
-            if expected_scope == FORMAL_SCOPE
-            else FormalExecutionEvidence("local_fixture")
-        )
+        # The provider evidence remains the formal-shaped execution authority
+        # for both scopes.  ``scope`` controls the artifact qualification only;
+        # pilot must remain a first-class, ineligible pilot artifact rather
+        # than being relabeled as local_fixture.
+        panel_execution = evidence
         panel = ProbePanel.build(
             panel_id=str(probe_plan["panel_id"]),
             endpoint=record,
             entries=entries,
             execution=panel_execution,
             minimum_formal_probes=int(probe_plan["minimum_formal_probes"]),
+            scope=expected_scope,
         )
         if expected_scope == FORMAL_SCOPE:
             qualification_gate = next(
@@ -7603,6 +7920,10 @@ def _path_result_payload(
 ) -> dict[str, JSONValue]:
     payload: dict[str, JSONValue] = {
         "rule": result.rule.to_dict(),
+        "node_alphas": [float(value) for value in result.rule.nodes.detach().cpu().to(torch.float64).tolist()],
+        "node_losses": [
+            None if value is None else float(value) for value in result.node_losses
+        ],
         "path_identity_hash": result.path_identity_hash,
         "signed": {
             name: result.signed[name].detach().cpu().to(torch.float64).tolist()
@@ -7647,6 +7968,114 @@ def _path_result_payload(
     return payload
 
 
+def _stage3_raw_ledger_root(
+    store: TaskArtifactStore,
+    *,
+    execution_evidence_hash: str,
+    reference_binding_hash: str,
+) -> Path:
+    """Private on-disk namespace for formal S3.07 raw vector shards."""
+
+    if re.fullmatch(r"[0-9a-f]{64}", execution_evidence_hash) is None or re.fullmatch(
+        r"[0-9a-f]{64}", reference_binding_hash
+    ) is None:
+        raise ValueError("STAGE3_RAW_LEDGER_BINDING_HASH_INVALID")
+    return (
+        store.root
+        / "tensor-bundles"
+        / "stage3-formal-raw"
+        / execution_evidence_hash
+        / reference_binding_hash
+    ).resolve()
+
+
+def _persist_stage3_raw_matrix_unit(
+    *,
+    store: TaskArtifactStore,
+    root: Path,
+    context: _PathContext,
+    required_units: Sequence[str],
+    candidate_names: Sequence[str],
+    results: Mapping[str, PathIntegralResult],
+    reference_contribution: Mapping[str, object],
+    reference_artifact_hash: str,
+    reference_binding_hash: str,
+    production_index: ProductionUnitIndex,
+    execution_evidence_hash: str,
+) -> tuple[Mapping[str, JSONValue], str, Mapping[str, JSONValue], str]:
+    """Persist all candidate vectors for one real formal path unit.
+
+    The JSON half deliberately contains summaries only.  Signed/positive/
+    negative/absolute tensors are kept in the content-addressed bundle so the
+    final S3.07 task commit remains small while S3.10 can still replay every
+    coordinate from every unit.
+    """
+
+    candidate_states: dict[str, Mapping[str, Mapping[str, object]]] = {}
+    summaries: dict[str, Mapping[str, object]] = {}
+    for name in sorted(candidate_names):
+        result = results.get(name)
+        if result is None:
+            raise ValueError(f"STAGE3_RAW_CANDIDATE_RESULT_MISSING:{name}")
+        payload = _path_result_payload(
+            result, cost=context.cost_for(_quadrature_rule_from_name(name))
+        )
+        candidate_states[name] = {
+            key: {
+                parameter: value.detach().cpu().to(torch.float64)
+                if isinstance(value, torch.Tensor)
+                else np.asarray(value, dtype=np.float64)
+                for parameter, value in getattr(result, key).items()
+            }
+            for key in ("signed", "positive", "negative_mass", "absolute")
+        }
+        summaries[name] = {
+            key: payload[key]
+            for key in (
+                "rule",
+                "node_alphas",
+                "node_losses",
+                "path_identity_hash",
+                "endpoint_loss_pre",
+                "endpoint_loss_post",
+                "loss_drop",
+                "completeness_absolute_residual",
+                "completeness_relative_residual",
+                "completeness_l1_scaled_residual",
+                "unique_gradient_evaluations",
+                "evaluation_cost",
+            )
+            if key in payload
+        }
+    ledger_root = _stage3_raw_ledger_root(
+        store,
+        execution_evidence_hash=execution_evidence_hash,
+        reference_binding_hash=reference_binding_hash,
+    )
+    shard, shard_ref = persist_raw_unit_shard(
+        root=root,
+        ledger_root=ledger_root,
+        unit_id=context.unit_id,
+        required_unit_ids=required_units,
+        execution_evidence_hash=execution_evidence_hash,
+        reference_binding_hash=reference_binding_hash,
+        path_identity_hash=context.path.identity_hash,
+        reference_artifact_hash=reference_artifact_hash,
+        reference_signed=reference_contribution,
+        candidate_states=candidate_states,
+        rule_summaries=summaries,
+    )
+    aggregate, aggregate_ref = publish_raw_aggregate(
+        root=root,
+        ledger_root=ledger_root,
+        required_unit_ids=required_units,
+        execution_evidence_hash=execution_evidence_hash,
+        reference_binding_hash=reference_binding_hash,
+        candidate_rule_names=candidate_names,
+    )
+    return shard, shard_ref, aggregate, aggregate_ref
+
+
 def _run_stage3_endpoint(
     request: TaskExecutionRequest,
     root: Path,
@@ -7680,12 +8109,12 @@ def _run_stage3_endpoint(
             "replay_verified": True,
             "parameter_post_is_attempt_commit": False,
             "failure_restore_boundary": "pre_state",
-            "scope": request.config.run_intent,
-            "formal_eligible": (
-                request.config.run_intent == "formal"
-                and context.execution.formal_eligible
-                and context.panel.qualification.formal_eligible
-            ),
+            # ``run_intent=formal`` is the provider/evidence mode for real
+            # training, while the captured endpoint itself may be pilot scope.
+            # Preserve that distinction in the task artifact instead of
+            # silently relabeling pilot as formal (or local_fixture).
+            "scope": context.panel.scope,
+            "formal_eligible": context.panel.qualification.formal_eligible,
             "execution_evidence_hash": context.execution.artifact_hash,
         },
         "gate_record": _gate_candidate(request),
@@ -9203,6 +9632,8 @@ def _formal_stage3_pilot_plan(
             or len(set(candidates)) != len(candidates)
         ):
             raise ValueError("candidate_rules 必须为非空无重复字符串数组")
+        if tuple(candidates) != DEFAULT_CANDIDATE_RULES:
+            raise ValueError("candidate_rules 必须完整覆盖冻结的 13 条候选规则并保持顺序")
         if (
             not isinstance(units, list)
             or not units
@@ -10613,6 +11044,28 @@ def _run_stage3_formal_matrix_shard(
         production_index=production_index,
         production_unit=production_unit,
     )
+    # Persist this unit's complete candidate/reference vectors before checking
+    # fan-out coverage.  Early shards are expected to see an incomplete
+    # observation aggregate and must nevertheless leave durable raw tensors
+    # for the eventual final-unit aggregate.
+    node_cache_evidence = context.cache_evidence(
+        tuple(_quadrature_rule_from_name(name) for name in candidate_names)
+    )
+    raw_shard, raw_shard_ref, raw_aggregate, raw_aggregate_ref = (
+        _persist_stage3_raw_matrix_unit(
+            store=store,
+            root=root,
+            context=context,
+            required_units=required_units,
+            candidate_names=candidate_names,
+            results=results,
+            reference_contribution=reference_contribution,
+            reference_artifact_hash=reference_artifact_hash,
+            reference_binding_hash=str(reference_binding["reference_binding_hash"]),
+            production_index=production_index,
+            execution_evidence_hash=context.execution.artifact_hash,
+        )
+    )
     observations, complete_units, missing_units = _load_stage3_observation_aggregate(
         request,
         root,
@@ -10640,33 +11093,15 @@ def _run_stage3_formal_matrix_shard(
                 )
             ),
         )
-    node_cache_evidence = context.cache_evidence(
-        tuple(_quadrature_rule_from_name(name) for name in candidate_names)
-    )
     independent_reference = {
         "rule": {"name": "stage3.05_cross_family_refinement"},
         "path_identity_hash": context.path.identity_hash,
-        "signed": {
-            name: (
-                value.detach().cpu().to(torch.float64).tolist()
-                if isinstance(value, torch.Tensor)
-                else np.asarray(value, dtype=np.float64).tolist()
-            )
-            for name, value in reference_contribution.items()
-        },
-        "positive": {},
-        "negative_mass": {},
-        "absolute": {},
-        "endpoint_loss_pre": None,
-        "endpoint_loss_post": None,
-        "loss_drop": None,
-        "completeness_absolute_residual": None,
-        "completeness_relative_residual": None,
-        "completeness_l1_scaled_residual": None,
-        "node_losses": [],
-        "unique_gradient_evaluations": None,
         "reference_artifact_hash": reference_artifact_hash,
         "reference_normalized_l1_error": float(reference_error),
+        "raw_shard_ref": raw_shard_ref,
+        "raw_shard_hash": raw_shard["artifact_hash"],
+        "raw_bundle_ref": raw_shard["bundle_ref"],
+        "raw_bundle_manifest_hash": raw_shard["bundle_manifest_hash"],
     }
     return (
         {
@@ -10692,13 +11127,21 @@ def _run_stage3_formal_matrix_shard(
                     "observed_unit_count": len(complete_units),
                     "required_unit_count": len(required_units),
                 },
-                "candidate_results": {
-                    name: _path_result_payload(
-                        result,
-                        cost=context.cost_for(_quadrature_rule_from_name(name)),
-                    )
-                    for name, result in sorted(results.items())
-                },
+                # Raw vectors are not embedded in this 99-unit task commit.
+                # S3.10 follows this complete aggregate and then each bundle.
+                "candidate_results": {},
+                "raw_storage_schema": "stage3-formal-raw-shard-v1",
+                "raw_vector_derivation_schema": VECTOR_DERIVATION_SCHEMA,
+                "raw_vector_derivation_contract_hash": VECTOR_DERIVATION_HASH,
+                "raw_shard_ref": raw_shard_ref,
+                "raw_shard_hash": raw_shard["artifact_hash"],
+                "raw_bundle_ref": raw_shard["bundle_ref"],
+                "raw_bundle_manifest_hash": raw_shard["bundle_manifest_hash"],
+                "raw_aggregate_ref": raw_aggregate_ref,
+                "raw_aggregate_hash": raw_aggregate["artifact_hash"],
+                "raw_aggregate_schema": "stage3-formal-raw-aggregate-v1",
+                "raw_aggregate_complete_unit_ids": raw_aggregate["complete_unit_ids"],
+                "raw_aggregate_missing_unit_ids": raw_aggregate["missing_unit_ids"],
                 "cost_semantics": "callback_cost_separate_from_unique_nodes_v1",
                 "node_gradient_cache": node_cache_evidence,
                 "independent_reference": independent_reference,
@@ -11484,7 +11927,7 @@ def _run_stage3_reporting(
 
     inputs = _predecessor_context(request, root, store)
     if request.config.run_intent == "formal":
-        return _run_stage3_formal_reporting(request, root, inputs)
+        return _run_stage3_formal_reporting(request, root, inputs, store)
     try:
         table = FrozenSourceTable.from_mapping(inputs.payload("cost_accuracy_table"))
         from .stage3 import QuadratureDecision
@@ -11568,6 +12011,7 @@ def _run_stage3_formal_reporting(
     request: TaskExecutionRequest,
     root: Path,
     inputs: _PredecessorContext,
+    store: TaskArtifactStore,
 ) -> tuple[Mapping[str, Mapping[str, JSONValue]], tuple[str, ...]]:
     """Live-reload G3-7 and publish reporting-safe formal handoff artifacts."""
 
@@ -11593,6 +12037,15 @@ def _run_stage3_formal_reporting(
         }
         cost_table_ref = refs_by_kind["cost_accuracy_table"]
         candidate_ref = refs_by_kind["quadrature_decision"]
+        raw_ref = (
+            request.environment.evidence_refs.get("stage3_formal_path_results")
+            or request.environment.evidence_refs.get("stage3_07_formal_path_results")
+            or request.environment.evidence_refs.get("formal_path_results")
+        )
+        if not isinstance(raw_ref, str) or not raw_ref:
+            raise ValueError(
+                "S3.10 必须显式绑定 stage3.07 formal_path_results commit"
+            )
 
         g37_ref = request.environment.evidence_refs.get("gate_stage3_g3_7")
         recommendation_ref = request.environment.evidence_refs.get(
@@ -11638,6 +12091,14 @@ def _run_stage3_formal_reporting(
             if task_id is not None and artifact.identity.task_id != task_id:
                 raise ValueError(f"{field} task identity 无效")
             return artifact
+
+        raw_artifact = committed(
+            raw_ref,
+            field="stage3_07_formal_path_results",
+            kinds={"formal_path_results"},
+            task_id="stage3.07_formal_experiment_matrix",
+        )
+        raw_formal_results = raw_artifact.payload
 
         g37_artifact = committed(
             g37_ref,
@@ -11801,6 +12262,21 @@ def _run_stage3_formal_reporting(
             evidence_refs=inputs.references,
         ) from error
 
+    try:
+        from .stage3_reporting import build_raw_reporting_tables, write_reporting_bundle
+
+        vector_table, curve_table = build_raw_reporting_tables(
+            raw_formal_results, workspace_root=root
+        )
+    except (TypeError, ValueError, OSError) as error:
+        raise _blocked(
+            BlockerCode.CONTRACT_UNFROZEN,
+            "stage3_formal_raw_reporting_lineage",
+            f"S3.10 raw formal path results 不可用于报告重建：{error}",
+            retryable=False,
+            evidence_refs=tuple(dict.fromkeys((*inputs.references, raw_ref))),
+        ) from error
+
     rows = [dict(thaw_json_value(row)) for row in table.rows]
     errors = np.asarray(
         [float(row["normalized_l1_error"]) for row in rows], dtype=np.float64
@@ -11812,6 +12288,8 @@ def _run_stage3_formal_reporting(
         report_id=f"stage3-formal-{table.content_hash[:16]}"
     )
     builder.add_source(table)
+    builder.add_source(vector_table)
+    builder.add_source(curve_table)
     builder.add_metric(
         "mean_normalized_l1_error",
         analysis_bias(errors, np.zeros_like(errors)),
@@ -11826,6 +12304,31 @@ def _run_stage3_formal_reporting(
         derivation_id="stage3.formal.nodes-error-pearson.v1",
         input_columns=("unique_nodes", "normalized_l1_error"),
     )
+    signed_column = (
+        "signed_mean"
+        if vector_table.schema_version == "stage3-formal-parameter-summary-table-v1"
+        else "signed"
+    )
+    signed = np.asarray(
+        [float(row[signed_column]) for row in vector_table.rows], dtype=np.float64
+    )
+    builder.add_metric(
+        "raw_signed_vector_mean",
+        analysis_bias(signed, np.zeros_like(signed)),
+        source=vector_table,
+        derivation_id="stage3.formal.raw-signed-vector-mean.v1",
+        input_columns=(signed_column,),
+    )
+    losses = np.asarray(
+        [float(row["loss"]) for row in curve_table.rows], dtype=np.float64
+    )
+    builder.add_metric(
+        "raw_path_loss_mean",
+        analysis_bias(losses, np.zeros_like(losses)),
+        source=curve_table,
+        derivation_id="stage3.formal.raw-path-loss-mean.v1",
+        input_columns=("loss",),
+    )
     report = builder.build(
         metadata={
             "scope": "formal",
@@ -11838,6 +12341,15 @@ def _run_stage3_formal_reporting(
             "fallback_rule": recommendation.fallback_rule,
             "required_unit_count": len(recommendation.required_unit_ids),
             "observation_count": len(rows),
+            "stage3_07_raw_commit_ref": raw_ref,
+            "stage3_07_raw_artifact_hash": raw_artifact.identity.artifact_hash,
+            "stage3_07_raw_payload_hash": canonical_json_hash(raw_formal_results),
+            "stage3_07_raw_aggregate_ref": raw_formal_results.get("raw_aggregate_ref"),
+            "stage3_07_raw_aggregate_hash": raw_formal_results.get("raw_aggregate_hash"),
+            "raw_vector_derivation_schema": raw_formal_results.get("raw_vector_derivation_schema"),
+            "raw_vector_derivation_contract_hash": raw_formal_results.get("raw_vector_derivation_contract_hash"),
+            "raw_vector_table_hash": vector_table.content_hash,
+            "raw_path_curve_table_hash": curve_table.content_hash,
         }
     )
     chart_specs = (
@@ -11865,8 +12377,49 @@ def _run_stage3_formal_reporting(
             y_columns=("normalized_l1_error",),
             sort_columns=("wall_seconds", "rule_name", "unit_id"),
         ),
+        ChartSpec.from_table(
+            vector_table,
+            chart_id=f"stage3-raw-vector-{vector_table.content_hash[:12]}",
+            chart_type="scatter",
+            x_column=(
+                "parameter_index"
+                if vector_table.schema_version == "stage3-formal-parameter-summary-table-v1"
+                else "coordinate_index"
+            ),
+            y_columns=(signed_column,),
+            sort_columns=("unit_id", "rule_name", "parameter"),
+        ),
+        ChartSpec.from_table(
+            curve_table,
+            chart_id=f"stage3-path-loss-{curve_table.content_hash[:12]}",
+            chart_type="line",
+            x_column="alpha",
+            y_columns=("loss",),
+            sort_columns=("unit_id", "rule_name", "alpha"),
+        ),
     )
-    charts = tuple(ChartArtifact.from_spec(spec) for spec in chart_specs)
+    try:
+        bundle = write_reporting_bundle(
+            workspace_root=root,
+            output_root=store.root,
+            tables=(table, vector_table, curve_table),
+            raw_formal_results=raw_formal_results,
+            report=report,
+            chart_specs=chart_specs,
+        )
+    except (TypeError, ValueError, OSError, DependencyUnavailable) as error:
+        raise _blocked(
+            BlockerCode.ASSET_UNAVAILABLE,
+            "stage3_formal_reporting_files",
+            f"S3.10 PNG/SVG/CSV/JSON bundle 生成失败：{error}",
+            retryable=False,
+            evidence_refs=tuple(dict.fromkeys((*inputs.references, raw_ref))),
+        ) from error
+    charts = tuple(
+        ChartArtifact.from_mapping(value)
+        for value in bundle["artifacts"]
+        if isinstance(value, Mapping)
+    )
     source_refs = tuple(
         dict.fromkeys(
             (
@@ -11883,6 +12436,8 @@ def _run_stage3_formal_reporting(
                 publication_ref,
                 publication.execution_evidence_ref,
                 *finalization.source_artifact_refs,
+                raw_ref,
+                *raw_artifact.source_refs,
             )
         )
     )
@@ -11895,6 +12450,13 @@ def _run_stage3_formal_reporting(
                 "formal_eligible": True,
                 "source_table_hash": table.content_hash,
                 "artifacts": [chart.to_dict() for chart in charts],
+                "rendered_figures": bundle["figures"],
+                "reporting_files": {
+                    "tables": bundle["tables"],
+                    "raw_formal_path_results": bundle["raw_formal_path_results"],
+                    "analysis_report": bundle["analysis_report"],
+                    "report_markdown": bundle["report_markdown"],
+                },
                 "manual_numeric_edits_allowed": False,
             },
             "handoff_manifest": {
@@ -11913,6 +12475,16 @@ def _run_stage3_formal_reporting(
                 "execution_evidence_ref": evidence_ref,
                 "execution_evidence_hash": evidence.artifact_hash,
                 "source_table_hash": table.content_hash,
+                "stage3_07_raw_commit_ref": raw_ref,
+                "stage3_07_raw_artifact_hash": raw_artifact.identity.artifact_hash,
+                "stage3_07_raw_payload_hash": canonical_json_hash(raw_formal_results),
+                "stage3_07_raw_aggregate_ref": raw_formal_results.get("raw_aggregate_ref"),
+                "stage3_07_raw_aggregate_hash": raw_formal_results.get("raw_aggregate_hash"),
+                "raw_vector_derivation_schema": raw_formal_results.get("raw_vector_derivation_schema"),
+                "raw_vector_derivation_contract_hash": raw_formal_results.get("raw_vector_derivation_contract_hash"),
+                "raw_vector_table_hash": vector_table.content_hash,
+                "raw_path_curve_table_hash": curve_table.content_hash,
+                "reporting_files": bundle,
                 "default_rule": recommendation.default_rule,
                 "fallback_rule": recommendation.fallback_rule,
                 "passing_rules": list(recommendation.passing_rules),

@@ -6,6 +6,7 @@ from pathlib import Path
 import hashlib
 import subprocess
 import sys
+from types import SimpleNamespace
 
 import torch
 
@@ -36,6 +37,7 @@ from param_importance_nlp.experiments.stage23_task_runners import (
     _formal_stage1_report_artifact_hash,
     _formal_stage2_asset_manifest,
     _load_formal_parameter_registry,
+    _load_stage3_parameter_registry,
     _predecessor_context,
     _reference_tokenizer_identity,
     _run_stage2_contract,
@@ -236,6 +238,124 @@ def test_formal_parameter_registry_reloads_authoritative_coordinate_manifest_and
     write_canonical_json(tmp_path / source_ref, {"registry": registry.to_manifest(), "tampered": True})
     with pytest.raises(ValueError, match="SOURCE_HASH_INVALID"):
         _load_formal_parameter_registry(tmp_path, published.commit_ref, model)
+
+
+@pytest.mark.parametrize(
+    ("model_id", "checkpoint_id"),
+    (("pythia-14m", "stage3-14m-endpoint"), ("pythia-31m", "stage3-31m-endpoint")),
+)
+def test_stage3_path_selects_model_specific_registry_from_unit_inputs(
+    tmp_path: Path, model_id: str, checkpoint_id: str
+) -> None:
+    """A shared fan-out environment must not force the 14M registry onto 31M."""
+
+    model = torch.nn.Linear(2, 1)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+    registry = ParameterRegistry.from_model(model, optimizer)
+    source_ref = f"source/{model_id}-registry.json"
+    write_canonical_json(tmp_path / source_ref, {"registry": registry.to_manifest()})
+    source_sha256 = hashlib.sha256((tmp_path / source_ref).read_bytes()).hexdigest()
+    store = TaskArtifactStore(tmp_path, f"runs/{model_id}")
+    published = store.publish(
+        task_id="stage2.04_reference_target",
+        artifact_kind="parameter_registry",
+        config_hash="a" * 64,
+        run_intent="formal",
+        formal_eligible=True,
+        payload={
+            "schema_version": "stage2-parameter-registry-artifact-v1",
+            "status": "READY",
+            "scope": "formal",
+            "model_id": model_id,
+            "checkpoint_id": checkpoint_id,
+            "initialization_id": checkpoint_id,
+            "training_stage": "early",
+            "registry_hash": registry.coordinate_registry_hash,
+            "source_s203_manifest_ref": source_ref,
+            "source_s203_manifest_sha256": source_sha256,
+        },
+    )
+    base = _base_for("stage3.05_reference_integral_and_precision")
+    base["model"].update(
+        {"architecture": model_id, "initialization_id": checkpoint_id}
+    )
+    base["identity"].update(
+        {
+            "run_intent": "formal",
+            "formal_eligible": True,
+            "input_checkpoint_id": checkpoint_id,
+        }
+    )
+    config = SimpleNamespace(
+        base_config=SimpleNamespace(section=lambda name: base[name]),
+        section=lambda name: {
+            "orchestration": {"input_result_refs": [published.commit_ref]}
+        }[name],
+    )
+    request = SimpleNamespace(
+        config=config,
+        task=DEFAULT_TASK_CATALOG.get("stage3.05_reference_integral_and_precision"),
+        environment=TaskRuntimeEnvironment(
+            evidence_refs={"stage2_parameter_registry": "wrong/environment.json"}
+        ),
+    )
+    loaded = _load_stage3_parameter_registry(request, tmp_path, model)
+    assert loaded.coordinate_registry_hash == registry.coordinate_registry_hash
+
+
+def test_stage3_path_rejects_wrong_model_registry_even_when_environment_matches_other_model(
+    tmp_path: Path,
+) -> None:
+    model = torch.nn.Linear(2, 1)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+    registry = ParameterRegistry.from_model(model, optimizer)
+    source_ref = "source/registry.json"
+    write_canonical_json(tmp_path / source_ref, {"registry": registry.to_manifest()})
+    source_sha256 = hashlib.sha256((tmp_path / source_ref).read_bytes()).hexdigest()
+    store = TaskArtifactStore(tmp_path, "runs/registry")
+    published = store.publish(
+        task_id="stage2.04_reference_target",
+        artifact_kind="parameter_registry",
+        config_hash="a" * 64,
+        run_intent="formal",
+        formal_eligible=True,
+        payload={
+            "schema_version": "stage2-parameter-registry-artifact-v1",
+            "status": "READY",
+            "scope": "formal",
+            "model_id": "pythia-14m",
+            "checkpoint_id": "stage3-14m-endpoint",
+            "initialization_id": "stage3-14m-endpoint",
+            "training_stage": "early",
+            "registry_hash": registry.coordinate_registry_hash,
+            "source_s203_manifest_ref": source_ref,
+            "source_s203_manifest_sha256": source_sha256,
+        },
+    )
+    base = _base_for("stage3.05_reference_integral_and_precision")
+    base["model"].update(
+        {"architecture": "pythia-31m", "initialization_id": "stage3-31m-endpoint"}
+    )
+    base["identity"].update(
+        {
+            "run_intent": "formal",
+            "formal_eligible": True,
+            "input_checkpoint_id": "stage3-31m-endpoint",
+        }
+    )
+    config = SimpleNamespace(
+        base_config=SimpleNamespace(section=lambda name: base[name]),
+        section=lambda name: {"orchestration": {"input_result_refs": []}}[name],
+    )
+    request = SimpleNamespace(
+        config=config,
+        task=DEFAULT_TASK_CATALOG.get("stage3.05_reference_integral_and_precision"),
+        environment=TaskRuntimeEnvironment(
+            evidence_refs={"stage2_parameter_registry": published.commit_ref}
+        ),
+    )
+    with pytest.raises(ValueError, match="MODEL_ID_MISMATCH"):
+        _load_stage3_parameter_registry(request, tmp_path, model)
 
 
 def _formal_stage2_01_request(

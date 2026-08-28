@@ -481,6 +481,7 @@ def _validate_known_artifact(value: dict[str, Any]) -> tuple[str, str | None]:
         return "stage3_probe_plan", artifact_digest
     if schema == "stage3-formal-pilot-plan-v1":
         from .experiments import QuadratureThresholds
+        from .experiments.stage3_protocol import DEFAULT_CANDIDATE_RULES
 
         expected = {
             "schema_version", "plan_id", "scope", "candidate_rules",
@@ -550,6 +551,10 @@ def _validate_known_artifact(value: dict[str, Any]) -> tuple[str, str | None]:
                 raise ValueError(
                     "STAGE3_FORMAL_PILOT_PLAN_UNIT_COVERAGE_INVALID:"
                     f"expected={expected_unit_count},actual={len(units)}"
+                )
+            if tuple(candidates) != DEFAULT_CANDIDATE_RULES:
+                raise ValueError(
+                    "STAGE3_FORMAL_PILOT_PLAN_CANDIDATE_COVERAGE_INVALID"
                 )
         elif isinstance(units, list) and len(units) in {12, 99}:
             raise ValueError(
@@ -1942,6 +1947,7 @@ def _artifact_quadrature_pilot_plan_build(arguments: argparse.Namespace) -> int:
 
     from .contracts import canonical_json_hash
     from .experiments import QuadratureThresholds
+    from .experiments.stage3_protocol import DEFAULT_CANDIDATE_RULES
     from .runtime import publish_canonical_immutable
 
     evidence = _formal_evidence_for_builder(
@@ -2029,6 +2035,10 @@ def _artifact_quadrature_pilot_plan_build(arguments: argparse.Namespace) -> int:
         if list(units) != indexed_units or dict(unit_strata) != indexed_strata:
             raise ValueError(
                 "STAGE3_FORMAL_PILOT_PLAN_SOURCE_INDEX_DERIVATION_MISMATCH"
+            )
+        if tuple(candidate_rules) != DEFAULT_CANDIDATE_RULES:
+            raise ValueError(
+                "STAGE3_FORMAL_PILOT_PLAN_SOURCE_CANDIDATE_COVERAGE_INVALID"
             )
     elif len(units) in {12, 99} or any(key in spec for key in plan_fields):
         raise ValueError(

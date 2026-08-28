@@ -390,18 +390,25 @@ class ProbePanel:
         entries: Sequence[ProbePanelEntry],
         execution: FormalExecutionEvidence | None = None,
         minimum_formal_probes: int = 3,
+        scope: str | None = None,
     ) -> "ProbePanel":
         execution = execution or FormalExecutionEvidence("local_fixture")
         if execution.run_intent == "formal":
             execution.require_for_stage(3)
         for entry in entries:
             entry.probe.assert_independent_from(endpoint)
+        qualification_scope = scope or execution.run_intent
+        if qualification_scope not in {"local_fixture", "pilot", "formal"}:
+            raise ValueError("ProbePanel.scope 不受支持")
+        expected_role = "formal" if qualification_scope == "formal" else "pilot"
+        if scope is not None and any(entry.role != expected_role for entry in entries):
+            raise ValueError("ProbePanel entries role 与 scope 不一致")
         return cls(
             panel_id=panel_id,
             endpoint_digest=endpoint.digest,
             entries=tuple(entries),
             execution_evidence_hash=execution.artifact_hash,
-            qualification=ArtifactQualification.candidate(execution.run_intent),
+            qualification=ArtifactQualification.candidate(qualification_scope),
             minimum_formal_probes=minimum_formal_probes,
         )
 

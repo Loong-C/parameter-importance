@@ -29,6 +29,7 @@ from typing import Any
 
 from ..contracts.jsonio import canonical_json_hash
 from ..contracts.stage23 import FormalExecutionEvidence
+from .stage3_production_plan import FORMAL_MODEL_SEEDS
 
 
 STAGE3_PROTOCOL_SCHEMA = "stage3-protocol-v1"
@@ -773,16 +774,22 @@ def _validate_pilot_coverage(endpoints: Sequence[EndpointSpec]) -> None:
 
 
 def _validate_formal_coverage(endpoints: Sequence[EndpointSpec]) -> None:
+    if any(
+        _contains_forbidden_formal_label(value)
+        for endpoint in endpoints
+        for value in (endpoint.model_size, endpoint.stage, endpoint.endpoint_id, *endpoint.probe_ids)
+    ):
+        raise ValueError("formal matrix 禁止 fixture/synthetic 标识")
     allowed = {"14M", "31M"}
     if {item.model_size for item in endpoints} != allowed:
         raise ValueError("formal 必须同时覆盖 14M 与 31M")
-    for model, expected_seed_count, endpoints_per_stage in (
-        ("14M", 2, 4),
-        ("31M", 1, 3),
+    for model, expected_seeds, endpoints_per_stage in (
+        ("14M", FORMAL_MODEL_SEEDS["14M"], 4),
+        ("31M", FORMAL_MODEL_SEEDS["31M"], 3),
     ):
         model_endpoints = [item for item in endpoints if item.model_size == model]
-        if len({item.seed for item in model_endpoints}) != expected_seed_count:
-            raise ValueError(f"formal {model} seed 覆盖不符合预注册矩阵")
+        if any(len(item.probe_ids) < 3 for item in model_endpoints):
+            raise ValueError("formal 每个 endpoint 至少需要三个 probe")
         for seed in {item.seed for item in model_endpoints}:
             for stage in STAGES:
                 selected = [
@@ -795,8 +802,8 @@ def _validate_formal_coverage(endpoints: Sequence[EndpointSpec]) -> None:
                         f"formal {model}/seed{seed}/{stage} 必须精确包含 "
                         f"{endpoints_per_stage} 个 endpoint"
                     )
-                if any(len(item.probe_ids) < 3 for item in selected):
-                    raise ValueError("formal 每个 endpoint 至少需要三个 probe")
+        if {item.seed for item in model_endpoints} != set(expected_seeds):
+            raise ValueError(f"formal {model} seed 覆盖不符合预注册矩阵")
     # 24 endpoints from 14M plus 9 from 31M, three probes each, is the
     # machine-checkable minimum/denominator for G3-5.
     if len(endpoints) != 33 or len({unit for item in endpoints for unit in item.unit_ids}) != 99:
@@ -1018,11 +1025,11 @@ def _default_pilot_endpoints() -> tuple[EndpointSpec, ...]:
     result: list[EndpointSpec] = []
     for stage in STAGES:
         for index in range(1, 3):
-            endpoint_id = f"pilot-14M-seed0-{stage}-endpoint{index}"
+            endpoint_id = f"pilot-14M-seed4301-{stage}-endpoint{index}"
             result.append(
                 EndpointSpec(
                     model_size="14M",
-                    seed=0,
+                    seed=4301,
                     stage=stage,
                     endpoint_id=endpoint_id,
                     probe_ids=(f"{endpoint_id}-probe1", f"{endpoint_id}-probe2"),
@@ -1033,7 +1040,10 @@ def _default_pilot_endpoints() -> tuple[EndpointSpec, ...]:
 
 def _default_formal_endpoints() -> tuple[EndpointSpec, ...]:
     result: list[EndpointSpec] = []
-    for model, seeds, endpoints_per_stage in (("14M", (0, 1), 4), ("31M", (0,), 3)):
+    for model, seeds, endpoints_per_stage in (
+        ("14M", tuple(sorted(FORMAL_MODEL_SEEDS["14M"])), 4),
+        ("31M", tuple(sorted(FORMAL_MODEL_SEEDS["31M"])), 3),
+    ):
         for seed in seeds:
             for stage in STAGES:
                 for index in range(1, endpoints_per_stage + 1):

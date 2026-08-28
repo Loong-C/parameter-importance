@@ -16,6 +16,7 @@ from param_importance_nlp.experiments.stage3_production_plan import (
     load_production_unit_index,
     write_production_unit_index,
 )
+from param_importance_nlp.experiments.stage3_protocol import DEFAULT_CANDIDATE_RULES
 
 
 def _h(label: str) -> str:
@@ -156,7 +157,7 @@ def _build_sources(tmp_path: Path, *, formal: bool) -> tuple[Path, Path, int]:
     probe_dir = endpoint_root / "probes"
     specs: list[tuple[str, int, str, int]] = []
     if formal:
-        for model, seeds, count in (("14M", (0, 1), 4), ("31M", (0,), 3)):
+        for model, seeds, count in (("14M", (4301, 4302), 4), ("31M", (5301,), 3)):
             for seed in seeds:
                 for stage in ("early", "middle", "late"):
                     for ordinal in range(1, count + 1):
@@ -193,6 +194,40 @@ def test_build_formal_index_is_exactly_99_and_has_two_models(tmp_path: Path) -> 
     assert index.formal_eligible is True
     assert {unit.model for unit in index.units} == {"14M", "31M"}
     assert all(unit.scope == "formal" for unit in index.units)
+
+
+def test_build_formal_index_rejects_placeholder_seed_matrix(tmp_path: Path) -> None:
+    endpoint_dir = tmp_path / "bad-formal" / "endpoints"
+    probe_dir = tmp_path / "bad-formal" / "probes"
+    specs: list[tuple[str, int, str, int]] = []
+    for model, seeds, count in (("14M", (0, 1), 4), ("31M", (0,), 3)):
+        for seed in seeds:
+            for stage in ("early", "middle", "late"):
+                for ordinal in range(1, count + 1):
+                    specs.append((model, seed, stage, ordinal))
+    for index, (model, seed, stage, ordinal) in enumerate(specs):
+        _commit, digest = _write_endpoint(
+            tmp_path / "bad-formal",
+            model=model,
+            seed=seed,
+            stage=stage,
+            ordinal=ordinal,
+            formal=True,
+        )
+        _write_probe(
+            tmp_path / "bad-formal",
+            endpoint_digest=digest,
+            index=index,
+            role="formal",
+            formal=True,
+        )
+    with pytest.raises(ValueError, match="FORMAL_SEED_COVERAGE_INVALID"):
+        build_production_unit_index(
+            endpoint_dir,
+            probe_dir,
+            scope="formal",
+            workspace_root=tmp_path,
+        )
 
 
 def test_formal_index_roundtrip_derives_strata_and_rejects_id_drift(tmp_path: Path) -> None:
@@ -234,7 +269,7 @@ def test_plan_identity_is_scope_separated_and_exactly_bound_to_index(tmp_path: P
         "schema_version": "stage3-formal-pilot-plan-v1",
         "plan_id": "pilot-plan-bound",
         "scope": "formal",
-        "candidate_rules": ["midpoint", "trapezoid", "simpson"],
+        "candidate_rules": list(DEFAULT_CANDIDATE_RULES),
         "required_unit_ids": [unit.path_unit_id for unit in index.units],
         "unit_strata": index.unit_strata(),
         "plan_kind": "pilot",
@@ -300,7 +335,7 @@ def test_plan_identity_is_scope_separated_and_exactly_bound_to_index(tmp_path: P
     write_canonical_json(evidence_path, evidence.to_dict())
     source = {
         "plan_id": "pilot-plan-builder-bound",
-        "candidate_rules": ["midpoint", "trapezoid", "simpson"],
+        "candidate_rules": list(DEFAULT_CANDIDATE_RULES),
         "required_unit_ids": [unit.path_unit_id for unit in index.units],
         "unit_strata": index.unit_strata(),
         "plan_kind": "pilot",
@@ -309,6 +344,25 @@ def test_plan_identity_is_scope_separated_and_exactly_bound_to_index(tmp_path: P
         "production_unit_index_hash": index.artifact_hash,
         "thresholds": body["thresholds"],
     }
+    incomplete_source_path = tmp_path / "pilot-plan-source-incomplete.json"
+    incomplete_output_path = tmp_path / "pilot-plan-incomplete.json"
+    write_canonical_json(
+        incomplete_source_path,
+        {**source, "candidate_rules": ["midpoint", "trapezoid", "simpson"]},
+    )
+    assert main(
+        [
+            "artifact",
+            "quadrature-pilot-plan-build",
+            "--spec",
+            str(incomplete_source_path),
+            "--formal-execution-evidence",
+            str(evidence_path),
+            "--output",
+            str(incomplete_output_path),
+        ]
+    ) != 0
+    assert not incomplete_output_path.exists()
     write_canonical_json(source_path, source)
     assert main(
         [
@@ -325,7 +379,7 @@ def test_plan_identity_is_scope_separated_and_exactly_bound_to_index(tmp_path: P
     built = load_canonical_json(output_path)
     assert built["plan_kind"] == "pilot"
     assert built["production_unit_index_scope"] == "pilot"
-    assert built["candidate_rules"] == ["midpoint", "trapezoid", "simpson"]
+    assert built["candidate_rules"] == list(DEFAULT_CANDIDATE_RULES)
     assert len(built["required_unit_ids"]) == 12
 
     formal_endpoint_dir, formal_probe_dir, _ = _build_sources(tmp_path, formal=True)
@@ -341,7 +395,7 @@ def test_plan_identity_is_scope_separated_and_exactly_bound_to_index(tmp_path: P
     formal_output_path = tmp_path / "matrix-plan.json"
     formal_source = {
         "plan_id": "matrix-plan-builder-bound",
-        "candidate_rules": ["midpoint", "trapezoid", "simpson"],
+        "candidate_rules": list(DEFAULT_CANDIDATE_RULES),
         "required_unit_ids": [unit.path_unit_id for unit in formal_index.units],
         "unit_strata": formal_index.unit_strata(),
         "plan_kind": "matrix",
@@ -366,7 +420,7 @@ def test_plan_identity_is_scope_separated_and_exactly_bound_to_index(tmp_path: P
     built_formal = load_canonical_json(formal_output_path)
     assert built_formal["plan_kind"] == "matrix"
     assert built_formal["production_unit_index_scope"] == "formal"
-    assert built_formal["candidate_rules"] == ["midpoint", "trapezoid", "simpson"]
+    assert built_formal["candidate_rules"] == list(DEFAULT_CANDIDATE_RULES)
     assert len(built_formal["required_unit_ids"]) == 99
 
 

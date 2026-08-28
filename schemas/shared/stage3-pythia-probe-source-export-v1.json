@@ -1,0 +1,49 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://parameter-importance.invalid/schemas/shared/stage3-pythia-probe-source-export-v1.json",
+  "title": "Stage 3 real Pythia probe source exporter input",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "scope",
+    "g3_resolution_ref",
+    "trajectory_receipt_ref",
+    "allocation_seed",
+    "partition",
+    "output_dir",
+    "artifact_hash"
+  ],
+  "properties": {
+    "schema_version": {"const": "stage3-pythia-probe-source-export-v1"},
+    "scope": {"enum": ["pilot", "formal"]},
+    "g3_resolution_ref": {"type": "string", "minLength": 1},
+    "trajectory_receipt_ref": {"type": "string", "minLength": 1},
+    "allocation_seed": {"type": "integer", "minimum": 0},
+    "partition": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["probe", "pilot", "formal", "replay"],
+      "properties": {
+        "probe": {"$ref": "#/$defs/interval"},
+        "pilot": {"$ref": "#/$defs/interval"},
+        "formal": {"$ref": "#/$defs/interval"},
+        "replay": {"$ref": "#/$defs/interval"}
+      }
+    },
+    "output_dir": {"type": "string", "minLength": 1},
+    "artifact_hash": {"$ref": "#/$defs/hash"}
+  },
+  "$defs": {
+    "hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "interval": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["start", "stop"],
+      "properties": {
+        "start": {"type": "integer", "minimum": 0},
+        "stop": {"type": "integer", "exclusiveMinimum": 0}
+      }
+    }
+  }
+}

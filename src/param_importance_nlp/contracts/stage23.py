@@ -254,8 +254,9 @@ class FormalExecutionEvidence:
 class ArtifactQualification:
     """输出 artifact 的 scope 与本阶段 Gate 绑定。
 
-    未资格化产物可以是 ``formal`` scope 的候选证据，但 ``formal_eligible`` 必须为
-    ``False``；只有携带本阶段可接受 Gate 的摘要时才能为真。
+    未资格化产物可以是 ``pilot`` 或 ``formal`` scope 的候选证据，但
+    ``formal_eligible`` 必须为 ``False``；只有 formal 产物携带本阶段可接受 Gate
+    的摘要时才能为真。
     """
 
     scope: str
@@ -263,7 +264,7 @@ class ArtifactQualification:
     qualification_gate_hash: str | None = None
 
     def __post_init__(self) -> None:
-        if self.scope not in {"local_fixture", "formal"}:
+        if self.scope not in {"local_fixture", "pilot", "formal"}:
             raise ValueError("ArtifactQualification.scope 不受支持")
         if type(self.formal_eligible) is not bool:
             raise TypeError("formal_eligible 必须是显式 bool")
@@ -271,8 +272,8 @@ class ArtifactQualification:
             _require_sha256(
                 self.qualification_gate_hash, field_name="qualification_gate_hash"
             )
-        if self.scope == "local_fixture" and self.formal_eligible:
-            raise FormalRunRejected("LOCAL_FIXTURE_CANNOT_BE_FORMAL_ELIGIBLE")
+        if self.scope in {"local_fixture", "pilot"} and self.formal_eligible:
+            raise FormalRunRejected("NON_FORMAL_SCOPE_CANNOT_BE_FORMAL_ELIGIBLE")
         if self.formal_eligible and self.qualification_gate_hash is None:
             raise FormalRunRejected("FORMAL_QUALIFICATION_GATE_HASH_REQUIRED")
         if not self.formal_eligible and self.qualification_gate_hash is not None:
@@ -1498,7 +1499,15 @@ def validate_stage23_artifact(value: Mapping[str, object]) -> object:
         "stage3-g36-publication-v1",
     }:
         scope = value["scope"]
-        if scope not in {"local_fixture", "formal"}:
+        pilot_scoped_artifacts = {
+            "stage3-endpoint-capture-v1",
+            "stage3-probe-panel-v1",
+            "stage3-probe-plan-v1",
+        }
+        allowed_scopes = {"local_fixture", "formal"}
+        if schema in pilot_scoped_artifacts:
+            allowed_scopes.add("pilot")
+        if scope not in allowed_scopes:
             raise ValueError("artifact scope 不受支持")
         if type(value["formal_eligible"]) is not bool:
             raise TypeError("formal_eligible 必须是显式 bool")

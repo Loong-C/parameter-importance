@@ -451,7 +451,7 @@ def _reject_volatile_renderer_options(value: object, *, path: str = "$") -> None
 class ChartArtifact:
     """canonical spec 或其渲染字节的路径无关身份。
 
-    ``output_format='spec'`` 时不含渲染字节 hash；PNG artifact 则同时绑定 spec、
+    ``output_format='spec'`` 时不含渲染字节 hash；PNG/SVG artifact 则同时绑定 spec、
     renderer ID、稳定选项和实际文件 SHA-256。调用方可把同一 artifact 写到不同
     目录，路径不会改变 ``artifact_hash``。
     """
@@ -471,7 +471,7 @@ class ChartArtifact:
             raise TypeError("CHART_ARTIFACT_SPEC_REQUIRED")
         if not isinstance(self.renderer_id, str) or not self.renderer_id:
             raise ValueError("CHART_RENDERER_ID_INVALID")
-        if self.output_format not in {"spec", "png"}:
+        if self.output_format not in {"spec", "png", "svg"}:
             raise ValueError("CHART_OUTPUT_FORMAT_UNSUPPORTED")
         if self.output_format == "spec":
             if self.content_sha256 is not None or self.renderer_id != "canonical-spec-only":
@@ -603,8 +603,9 @@ def render_matplotlib_chart(
     output_path: str | Path,
     *,
     dpi: int = 120,
+    output_format: str = "png",
 ) -> ChartArtifact:
-    """用延迟导入的 Matplotlib/Agg 渲染确定性 PNG。
+    """用延迟导入的 Matplotlib/Agg 渲染确定性 PNG 或 SVG。
 
     ``output_path`` 只决定字节发布位置，从不写入返回 artifact。renderer 固定
     figure 尺寸、DPI、字体和 PNG metadata，并通过内存缓冲区保存，避免文件名
@@ -614,6 +615,8 @@ def render_matplotlib_chart(
 
     if isinstance(dpi, bool) or not isinstance(dpi, int) or dpi <= 0:
         raise ValueError("CHART_RENDER_DPI_INVALID")
+    if output_format not in {"png", "svg"}:
+        raise ValueError("CHART_RENDER_FORMAT_INVALID")
     rows = spec.materialize(table)
     if not rows:
         raise ValueError("CHART_RENDER_NO_ROWS_AFTER_FILTER")
@@ -668,9 +671,13 @@ def render_matplotlib_chart(
         buffer = io.BytesIO()
         figure.savefig(
             buffer,
-            format="png",
+            format=output_format,
             dpi=dpi,
-            metadata={"Software": "param-importance-nlp"},
+            metadata=(
+                {"Software": "param-importance-nlp"}
+                if output_format == "png"
+                else {}
+            ),
         )
         plt.close(figure)
     payload = buffer.getvalue()
@@ -679,6 +686,6 @@ def render_matplotlib_chart(
         spec,
         payload,
         renderer_id=f"matplotlib:{matplotlib.__version__}:Agg",
-        output_format="png",
+        output_format=output_format,
         render_options=options,
     )

@@ -1,4 +1,9 @@
-"""Materialize one non-fan-out Stage 3 task as a strict formal v2 config."""
+"""Materialize one non-fan-out Stage 3 task as a strict v2 config.
+
+The endpoint/probe selector is scope-bound.  Pilot is a real, non-formal-eligible
+Stage 3 path, not a fixture, so S3.03/S3.04 must accept either explicit ``pilot``
+or ``formal`` selectors and must reject every other scope.
+"""
 
 from __future__ import annotations
 
@@ -111,7 +116,7 @@ def materialize(
         )
         if (
             selector.get("schema_version") != "stage3-probe-selector-v1"
-            or selector.get("scope") != "formal"
+            or selector.get("scope") not in {"pilot", "formal"}
             or selector.get("artifact_hash")
             != _canonical_hash(
                 {key: item for key, item in selector.items() if key != "artifact_hash"}
@@ -147,12 +152,13 @@ def materialize(
     base = _base_v1(base_value)
     identity = base.get("identity")
     runtime = base.get("runtime")
+    data = base.get("data")
     sampling = base.get("sampling")
     importance = base.get("importance")
     path_integration = base.get("path_integration")
     if not all(
         isinstance(item, dict)
-        for item in (identity, runtime, sampling, importance, path_integration)
+        for item in (identity, runtime, data, sampling, importance, path_integration)
     ):
         raise _fail("TASK_MATERIALIZATION_BASE_SECTIONS_INVALID")
     identity.update(
@@ -175,6 +181,15 @@ def materialize(
             "temp_root": str(PurePosixPath(str(source["cache_root"])) / "tmp"),
         }
     )
+    if task_id in selector_tasks:
+        assert isinstance(data, dict)
+        data.update(
+            {
+                "split": "probe",
+                "sampler": "frozen-probe-panel",
+                "sampling_design": "disjoint_frozen_probe_panel",
+            }
+        )
     sampling.update({"reference_batch_size": 32})
     importance.update(
         {
@@ -186,7 +201,11 @@ def materialize(
     path_integration.update(
         {
             "enabled": True,
-            "probe_count": 3,
+            # S3.03/S3.04 share the endpoint/probe materializer across the
+            # real pilot (two probes) and formal (three probes) scopes.  Keep
+            # the resolved config truthful so the runner cannot silently
+            # discard a pilot contract by retaining the formal count.
+            "probe_count": 2 if task_id in selector_tasks and selector.get("scope") == "pilot" else 3,
             "default_rule": "simpson",
             "fallback_rule": "gauss_legendre_8",
         }
@@ -200,6 +219,20 @@ def materialize(
     orchestration["input_result_refs"] = list(refs)
     orchestration["route_spec_ref"] = route_spec_ref
     overrides["orchestration"] = orchestration
+    overrides["providers"] = {
+        "kind": "offline_hf",
+        "model_manifest_ref": None,
+        "model_root_ref": None,
+        "data_manifest_ref": None,
+        "data_root_ref": None,
+        "tokenizer_manifest_ref": None,
+        "tokenizer_root_ref": None,
+        "task_type": "causal_lm",
+        "task_name": "pile",
+        "num_labels": None,
+        "local_files_only": True,
+        "trust_remote_code": False,
+    }
     _merge_section(overrides, "recovery", {"resume_ref": None})
     _merge_section(
         overrides,

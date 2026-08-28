@@ -732,25 +732,38 @@ def _validate_local_gate_outputs(
             ):
                 raise _fail("G32_PROBE_PANEL_INVALID")
             sample_ids.extend(entry["sample_ids"])
+        panel_scope = panel.get("scope")
+        if panel_scope not in {"pilot", "formal"}:
+            raise _fail("G32_PROBE_PANEL_SCOPE_INVALID")
+        expected_probe_role = "formal" if panel_scope == "formal" else "pilot"
+        expected_probe_count = 3 if panel_scope == "formal" else 2
         if (
             path_spec.get("schema_version") != "path-spec-v1"
             or path_spec.get("accumulation_dtype") != "float64"
             or panel.get("schema_version") != "stage3-probe-panel-v1"
-            or panel.get("scope") != "formal"
-            or len(entries) < 3
-            or sum(entry.get("role") == "formal" for entry in entries) < 3
+            or panel.get("formal_eligible") is not (panel_scope == "formal")
+            or len(entries) != expected_probe_count
+            or sum(entry.get("role") == expected_probe_role for entry in entries)
+            != expected_probe_count
             or len(sample_ids) != len(set(sample_ids))
             or restoration.get("replay_verified") is not True
             or restoration.get("parameter_post_is_attempt_commit") is not False
             or restoration.get("failure_restore_boundary") != "pre_state"
-            or restoration.get("scope") != "formal"
+            or restoration.get("scope") != panel_scope
             or restoration.get("execution_evidence_hash")
             != panel.get("execution_evidence_hash")
         ):
             raise _fail("G32_ENDPOINT_PROBE_REPLAY_INVALID")
         return (
             {"probe_count": len(entries), "replay_verified": True},
-            {"minimum_independent_formal_probes": 3, "full_update_endpoint": True},
+            {
+                (
+                    "minimum_independent_formal_probes"
+                    if panel_scope == "formal"
+                    else "minimum_independent_pilot_probes"
+                ): expected_probe_count,
+                "full_update_endpoint": True,
+            },
         )
 
     if task_id == "stage3.04_quadrature_engine_and_unit_tests":
