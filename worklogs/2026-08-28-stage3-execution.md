@@ -37,3 +37,11 @@
 - Formal matrix 不能自签资格：必须绑定仍有效的 `FormalExecutionEvidence`，并显式包含 G3-0 至 G3-5 全部 PASS Gate；缺任一 Gate 均拒绝构造。
 - 独立 diff 复核发现并推动修复：probe 嵌套字段漏验、伪 SHA、loss contract 漂移、协议阈值过宽、formal matrix 自签，以及新指标尚未接生产分析。修复后 Stage 3 statistics 已调用新指标核心。
 - 最终相关回归：`96 passed in 73.39s`；probe 专项 `4 passed`；protocol 专项 `8 passed`；G3-0 artifact 专项 `1 passed`；JSON Schema draft 2020-12 自检与 `git diff --check` 通过。
+
+## 2026-08-28 11:59–12:01 CST — 部分交付与同步边界
+
+- 原子功能提交：`d5d4080972e879fdd2b10269d78dd754a1df629f`（`feat(stage3): harden formal protocol and audit prerequisites`）。
+- 分支 `exp/stage3-path-formal-20260828` 已推送到 `origin`，本地 HEAD、remote-tracking ref 与 `ls-remote` 均为同一提交。
+- 提交和推送后 Stage 3 工作树 clean；服务器主 repo 仍为 clean detached `44f934dd62d1b86fcb951230c81f3bfa647791aa`，既有 Stage 2 direct-all 工作树仍为 clean `7cd29ed6a2acb958095f96ad1514d8609b74c535`。
+- 根工作树的三个用户 presentation dirty 文件保持原状且未进入 Stage 3 提交。
+- 未创建服务器 Stage 3 worktree、未同步代码到服务器、未启动 GPU 作业；这是 G3-0 fail-closed 的预期结果。
