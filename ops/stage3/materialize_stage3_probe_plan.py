@@ -64,6 +64,7 @@ from param_importance_nlp.experiments.stage3_production_plan import (
     _load_endpoint,
 )
 from param_importance_nlp.experiments.stage3_trajectory import Stage3TrajectoryReceipt
+from param_importance_nlp.runtime.task_artifacts import load_committed_task_artifact
 
 
 MATERIALIZATION_SCHEMA = "stage3-probe-plan-materialization-source-v1"
@@ -110,6 +111,17 @@ def _within(path: Path, root: Path) -> bool:
     except ValueError:
         return False
     return True
+
+
+def _root_and_ref(path: Path, roots: Sequence[Path]) -> tuple[Path, str]:
+    matches = [root.resolve() for root in roots if _within(path, root)]
+    if not matches:
+        raise _fail("REFERENCE_ROOT_MISSING", path)
+    # DATA_ROOT is listed first and is the stable authority even when an
+    # execution worktree lives beneath it.  Choosing that outer root keeps
+    # commit refs identical to the refs recorded by the trajectory receipt.
+    root = matches[0]
+    return root, path.resolve().relative_to(root).as_posix()
 
 
 def _resolve_ref(value: object, *, roots: Sequence[Path], field: str, require_file: bool = True) -> Path:
@@ -336,9 +348,18 @@ def materialize_probe_plans(
         raise _fail("FORMAL_EXECUTION_REF_DRIFT")
     evidence_path = _resolve_ref(evidence_ref, roots=roots, field="formal_execution_ref")
     try:
-        evidence = FormalExecutionEvidence.from_mapping(_load_mapping(evidence_path, "formal_execution"))
+        evidence_value = _load_mapping(evidence_path, "formal_execution")
+        if evidence_value.get("schema_version") == "task-output-commit-v1":
+            evidence_root, commit_ref = _root_and_ref(evidence_path, roots)
+            loaded = load_committed_task_artifact(
+                evidence_root, commit_ref, require_formal=True
+            )
+            if loaded.identity.artifact_kind != "formal_execution_evidence":
+                raise ValueError("FORMAL_EXECUTION_COMMIT_KIND_INVALID")
+            evidence_value = loaded.payload
+        evidence = FormalExecutionEvidence.from_mapping(evidence_value)
         evidence.require_for_stage(3)
-    except (TypeError, ValueError) as error:
+    except (FileNotFoundError, OSError, TypeError, ValueError) as error:
         raise _fail("FORMAL_EXECUTION_EVIDENCE_INVALID") from error
     if evidence.run_intent != "formal":
         raise _fail("FORMAL_EXECUTION_EVIDENCE_NOT_FORMAL")

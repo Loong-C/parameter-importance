@@ -58,6 +58,7 @@ from param_importance_nlp.g3_runtime_assets import (
 )
 from param_importance_nlp.providers.pythia_mmap import PythiaMMapFrozenSampleResolver
 from param_importance_nlp.runtime import publish_canonical_immutable
+from param_importance_nlp.runtime.task_artifacts import load_committed_task_artifact
 from param_importance_nlp.experiments.stage3_production_plan import FORMAL_MODEL_SEEDS
 
 from ops.stage3.materialize_stage3_probe_plan import materialize_probe_plans
@@ -524,9 +525,20 @@ def _validate_execution_evidence(
     assert receipt.formal_execution_ref is not None
     path = _resolve_ref(receipt.formal_execution_ref, roots=(data, workspace), field="formal_execution_ref")
     try:
-        evidence = FormalExecutionEvidence.from_mapping(_load_object(path, "formal_execution"))
+        raw = _load_object(path, "formal_execution")
+        if raw.get("schema_version") == "task-output-commit-v1":
+            evidence_root = _source_root(path, workspace=workspace, data=data)
+            loaded = load_committed_task_artifact(
+                evidence_root,
+                _logical_ref(path, evidence_root),
+                require_formal=True,
+            )
+            if loaded.identity.artifact_kind != "formal_execution_evidence":
+                raise ValueError("FORMAL_EXECUTION_COMMIT_KIND_INVALID")
+            raw = loaded.payload
+        evidence = FormalExecutionEvidence.from_mapping(raw)
         evidence.require_for_stage(3)
-    except (TypeError, ValueError) as error:
+    except (FileNotFoundError, OSError, TypeError, ValueError) as error:
         raise _fail("FORMAL_EXECUTION_EVIDENCE_INVALID") from error
     if evidence.run_intent != "formal":
         raise _fail("FORMAL_EXECUTION_EVIDENCE_NOT_FORMAL")

@@ -17,9 +17,12 @@ from ops.stage3.export_stage3_probe_source import (
     _allocate,
     _rank_candidates,
     _select_replay_indices,
+    _validate_execution_evidence,
     _validate_partition,
     _validate_source,
 )
+from param_importance_nlp.contracts import FormalExecutionEvidence, GateRecord, GateStatus
+from param_importance_nlp.runtime.task_artifacts import TaskArtifactStore
 
 
 def _h(value: str) -> str:
@@ -49,6 +52,43 @@ def test_source_requires_hash_bound_explicit_partition_and_seed() -> None:
     assert value["allocation_seed"] == 20260829
     with pytest.raises(ProbeSourceExportError, match="SOURCE_FIELDS_MISMATCH"):
         _validate_source({key: item for key, item in _source().items() if key != "artifact_hash"})
+
+
+def test_execution_evidence_accepts_the_real_task_commit_envelope(tmp_path: Path) -> None:
+    gates = (
+        GateRecord(
+            "stage3.G3-0", 3, GateStatus.PASS, "2026-08-29T00:00:00Z",
+            evidence_refs=("evidence/g30.json",),
+        ),
+        GateRecord(
+            "stage3.G3-1", 3, GateStatus.PASS, "2026-08-29T00:00:00Z",
+            evidence_refs=("evidence/g31.json",),
+        ),
+    )
+    evidence = FormalExecutionEvidence(
+        "formal",
+        contract_freeze_hash=_h("contract"),
+        asset_manifest_hashes=(_h("asset"),),
+        prerequisite_gates=gates,
+    )
+    published = TaskArtifactStore(tmp_path, "evidence/formal-execution").publish(
+        task_id="stage3.01_prerequisites_and_scope",
+        artifact_kind="formal_execution_evidence",
+        config_hash=_h("config"),
+        run_intent="formal",
+        payload=evidence.to_dict(),
+        formal_eligible=True,
+    )
+    receipt = SimpleNamespace(
+        formal_execution_ref=published.commit_ref,
+        g30_gate_hash=gates[0].artifact_hash,
+        g31_gate_hash=gates[1].artifact_hash,
+        formal_eligible=False,
+    )
+    loaded = _validate_execution_evidence(
+        receipt, workspace=tmp_path, data=tmp_path
+    )
+    assert loaded.artifact_hash == evidence.artifact_hash
 
 
 def test_hash_ranking_is_reproducible_and_without_replacement() -> None:

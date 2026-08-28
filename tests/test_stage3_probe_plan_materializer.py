@@ -9,6 +9,7 @@ from param_importance_nlp.contracts import FormalExecutionEvidence, GateRecord, 
 from param_importance_nlp.contracts.jsonio import canonical_json_hash, load_canonical_json, write_canonical_json
 from param_importance_nlp.experiments.stage3_trajectory import STAGE3_ENDPOINT_TASK_ID, Stage3TrajectoryReceipt
 from param_importance_nlp.experiments.stage3_production_plan import build_production_unit_index
+from param_importance_nlp.runtime.task_artifacts import TaskArtifactStore
 from ops.stage3.materialize_stage3_probe_plan import (
     ALLOCATION_SCHEMA,
     CONTENT_SOURCE_SCHEMA,
@@ -36,9 +37,15 @@ def _evidence(root: Path) -> tuple[str, FormalExecutionEvidence]:
         "formal", contract_freeze_hash=_hash("contract"),
         asset_manifest_hashes=(_hash("asset"),), prerequisite_gates=tuple(gates),
     )
-    ref = "inputs/formal-execution.json"
-    write_canonical_json(root / ref, evidence.to_dict())
-    return ref, evidence
+    published = TaskArtifactStore(root, "inputs/formal-execution-artifact").publish(
+        task_id="stage3.01_prerequisites_and_scope",
+        artifact_kind="formal_execution_evidence",
+        config_hash=_hash("config"),
+        run_intent="formal",
+        payload=evidence.to_dict(),
+        formal_eligible=True,
+    )
+    return published.commit_ref, evidence
 
 
 def _source(
