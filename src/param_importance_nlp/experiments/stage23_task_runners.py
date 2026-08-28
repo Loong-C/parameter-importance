@@ -8661,7 +8661,46 @@ def _stage3_reference_refinement(
         primary_family="gauss_legendre",
         execution=context.execution,
     )
-    return result, tuple(level.rule for level in levels)
+    return result, _completed_stage3_reference_rules(
+        result,
+        tuple(level.rule for level in levels),
+    )
+
+
+def _completed_stage3_reference_rules(
+    result: object,
+    rules: Sequence[object],
+) -> tuple[object, ...]:
+    """Return exactly the rules whose immutable refinement levels completed.
+
+    Reference refinement deliberately stops once two consecutive rounds meet
+    the frozen tolerance.  Cache evidence must therefore bind the evaluated
+    prefix, not unevaluated higher ladder levels whose node keys cannot have an
+    authoritative cache commit.
+    """
+
+    completed_levels = getattr(result, "completed_levels", None)
+    if not isinstance(completed_levels, tuple) or not completed_levels:
+        raise RuntimeError("STAGE3_REFERENCE_COMPLETED_LEVELS_MISSING")
+    completed_hashes: set[str] = set()
+    for row in completed_levels:
+        if not isinstance(row, Mapping):
+            raise TypeError("STAGE3_REFERENCE_COMPLETED_LEVEL_INVALID")
+        rule_hash = row.get("rule_hash")
+        if not isinstance(rule_hash, str) or _SHA256_RE.fullmatch(rule_hash) is None:
+            raise ValueError("STAGE3_REFERENCE_COMPLETED_RULE_HASH_INVALID")
+        completed_hashes.add(rule_hash)
+
+    selected: list[object] = []
+    selected_hashes: set[str] = set()
+    for rule in rules:
+        rule_hash = getattr(rule, "artifact_hash", None)
+        if rule_hash in completed_hashes and rule_hash not in selected_hashes:
+            selected.append(rule)
+            selected_hashes.add(rule_hash)
+    if selected_hashes != completed_hashes:
+        raise RuntimeError("STAGE3_REFERENCE_COMPLETED_RULE_NOT_IN_LADDER")
+    return tuple(selected)
 
 
 def _stage3_reference_ledger_root(

@@ -83,6 +83,37 @@ def _formal_evidence(probe_ref: str) -> FormalExecutionEvidence:
     )
 
 
+def test_reference_cache_evidence_uses_only_completed_refinement_prefix() -> None:
+    rules = tuple(
+        SimpleNamespace(artifact_hash=_hash(f"rule-{index}")) for index in range(8)
+    )
+    result = SimpleNamespace(
+        completed_levels=tuple(
+            {"family": "family", "level": index, "rule_hash": rules[index].artifact_hash}
+            for index in range(6)
+        )
+    )
+
+    selected = stage23._completed_stage3_reference_rules(result, rules)
+
+    assert selected == rules[:6]
+    assert {rule.artifact_hash for rule in selected} == {
+        row["rule_hash"] for row in result.completed_levels
+    }
+
+
+def test_reference_cache_evidence_rejects_completed_rule_outside_ladder() -> None:
+    rules = (SimpleNamespace(artifact_hash=_hash("rule-0")),)
+    result = SimpleNamespace(
+        completed_levels=(
+            {"family": "family", "level": 0, "rule_hash": _hash("missing-rule")},
+        )
+    )
+
+    with pytest.raises(RuntimeError, match="COMPLETED_RULE_NOT_IN_LADDER"):
+        stage23._completed_stage3_reference_rules(result, rules)
+
+
 def test_formal_handler_loads_training_endpoint_and_executes_tiny_path(
     tmp_path: Path,
     monkeypatch,
