@@ -212,6 +212,16 @@ from .stage3_formal import (
     ReferenceRuleLevel,
     SafeTensorTreeCodec,
 )
+from .stage3_metrics import (
+    MetricResult as Stage3MetricResult,
+    active_set_spearman as stage3_active_set_spearman,
+    cosine as stage3_cosine,
+    normalized_l1 as stage3_normalized_l1,
+    normalized_l2 as stage3_normalized_l2,
+    normalized_linf as stage3_normalized_linf,
+    sign_consistency as stage3_sign_consistency,
+    top_q_metrics as stage3_top_q_metrics,
+)
 
 
 _STAGE2_REFERENCE_TASK = "stage2.04_reference_target"
@@ -5721,7 +5731,7 @@ def _run_stage3_contract(
     path_math: dict[str, JSONValue] = {
         "schema_version": "stage3-task-path-math-contract-v1",
         "path": "theta(alpha)=theta_pre+alpha*(theta_post-theta_pre)",
-        "signed_contribution": "delta_theta*integral_0^1 gradient(theta(alpha)) d_alpha",
+        "signed_contribution": "-delta_theta*integral_0^1 gradient(theta(alpha)) d_alpha",
         "identities": [
             "signed=positive-negative_mass",
             "absolute=positive+negative_mass",
@@ -5735,13 +5745,32 @@ def _run_stage3_contract(
         "schema_version": "stage3-task-metric-contract-v1",
         "metrics": [
             "normalized_l1_error",
+            "normalized_l2_error",
+            "normalized_linf_error",
+            "cosine_similarity",
+            "active_spearman",
+            "sign_consistency",
             "completeness_absolute_residual",
             "completeness_relative_residual",
             "completeness_l1_scaled_residual",
             "pearson",
             "spearman",
             "top_k_overlap",
+            "top_q_overlap",
+            "top_q_jaccard",
+            "layer_total_variation",
+            "module_total_variation",
+            "real_gradient_evaluation_cost",
+            "model_strata",
+            "stage_strata",
+            "update_strata",
+            "probe_strata",
         ],
+        "top_q": {
+            "proportions": [0.001, 0.01, 0.05],
+            "metrics": ["overlap", "jaccard"],
+        },
+        "strata": ["model", "stage", "update", "probe"],
         "undefined_policy": "defined_false_with_reason_no_epsilon",
         "reference_policy": scope["reference_policy"],
         "registered_rules": rule_manifest,  # type: ignore[dict-item]
@@ -7522,6 +7551,15 @@ def _path_wire_vector(
     return np.concatenate(arrays), tuple(coordinate_ids)
 
 
+def _stage3_metric_payload(result: Stage3MetricResult) -> dict[str, JSONValue]:
+    return {
+        "defined": result.defined,
+        "value": result.value,
+        "reason": result.reason,
+        "details": dict(result.details),  # type: ignore[dict-item]
+    }
+
+
 def _run_stage3_statistics(
     request: TaskExecutionRequest,
     root: Path,
@@ -7551,11 +7589,16 @@ def _run_stage3_statistics(
             candidate, observed_ids = _path_wire_vector(raw)
             if observed_ids != coordinate_ids:
                 raise ValueError("STAGE3_CANDIDATE_COORDINATE_ID_DRIFT")
-            denominator = float(np.abs(reference).sum())
-            normalized_l1 = (
-                None
-                if denominator == 0
-                else float(np.abs(candidate - reference).sum() / denominator)
+            normalized_l1 = stage3_normalized_l1(candidate, reference)
+            normalized_l2 = stage3_normalized_l2(candidate, reference)
+            normalized_linf = stage3_normalized_linf(candidate, reference)
+            cosine = stage3_cosine(candidate, reference)
+            active_spearman = stage3_active_set_spearman(candidate, reference)
+            sign_consistency = stage3_sign_consistency(candidate, reference)
+            top_q = stage3_top_q_metrics(
+                candidate,
+                reference,
+                coordinate_ids=coordinate_ids,
             )
             rule = raw.get("rule")
             if not isinstance(rule, Mapping):
@@ -7573,7 +7616,22 @@ def _run_stage3_statistics(
                     "rule_name": rule_name,
                     "rule_hash": rule.get("artifact_hash"),
                     "unique_nodes": raw.get("unique_gradient_evaluations"),
-                    "normalized_l1_error": normalized_l1,
+                    "normalized_l1_error": normalized_l1.value,
+                    "normalized_l1": _stage3_metric_payload(normalized_l1),
+                    "normalized_l2": _stage3_metric_payload(normalized_l2),
+                    "normalized_linf": _stage3_metric_payload(normalized_linf),
+                    "cosine": _stage3_metric_payload(cosine),
+                    "active_spearman": _stage3_metric_payload(active_spearman),
+                    "sign_consistency": _stage3_metric_payload(sign_consistency),
+                    "top_q": {
+                        f"{q:g}": {
+                            "q": values["q"],
+                            "k": values["k"],
+                            "overlap": _stage3_metric_payload(values["overlap"]),  # type: ignore[arg-type]
+                            "jaccard": _stage3_metric_payload(values["jaccard"]),  # type: ignore[arg-type]
+                        }
+                        for q, values in top_q.items()
+                    },
                     "mae": analysis_mae(candidate, reference).value,
                     "mse": analysis_mse(candidate, reference).value,
                     "pearson_defined": pearson.defined,
@@ -7726,7 +7784,7 @@ def _run_stage3_analysis(
         fallback_rule=recommendation.fallback_rule,
     )
     ordered_rows = sorted(
-        (dict(row) for row in source.rows),
+        (dict(thaw_json_value(row)) for row in source.rows),
         key=lambda row: (int(row["unique_nodes"]), str(row["rule_name"])),
     )
     cost_table = FrozenSourceTable.from_rows(

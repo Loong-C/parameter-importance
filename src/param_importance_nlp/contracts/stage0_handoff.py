@@ -16,7 +16,6 @@ import hashlib
 from pathlib import Path, PurePosixPath
 
 from .jsonio import canonical_json_hash, load_canonical_json
-from ..runtime.task_artifacts import load_committed_task_artifact
 
 
 STAGE0_HANDOFF_SCHEMA = "stage0-handoff-manifest-v1"
@@ -286,6 +285,13 @@ def validate_stage0_handoff(
                 f"STAGE0_HANDOFF_ROLE_{role.upper()}_SOURCE_HASH_MISMATCH"
             )
         try:
+            # Keep the runtime import lazy.  ``core.estimators`` imports the
+            # lightweight contracts package while ``runtime.training`` in
+            # turn imports the estimators; importing the runtime package at
+            # module import time therefore makes a clean-process Stage 3
+            # import depend on test collection order.
+            from ..runtime.task_artifacts import load_committed_task_artifact
+
             loaded = load_committed_task_artifact(
                 source_root, ref, require_formal=True
             )

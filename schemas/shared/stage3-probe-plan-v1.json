@@ -42,5 +42,28 @@
     "scope": {"enum": ["local_fixture", "formal"]},
     "formal_eligible": {"type": "boolean"},
     "artifact_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
-  }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {"formal_eligible": {"const": true}},
+        "required": ["formal_eligible"]
+      },
+      "then": {
+        "properties": {
+          "scope": {"const": "formal"},
+          "minimum_formal_probes": {"minimum": 3},
+          "entries": {
+            "minItems": 3,
+            "contains": {
+              "type": "object",
+              "properties": {"role": {"const": "formal"}},
+              "required": ["role"]
+            },
+            "minContains": 3
+          }
+        }
+      }
+    }
+  ]
 }

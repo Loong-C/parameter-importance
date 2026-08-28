@@ -20,8 +20,33 @@
   "allOf": [
     {
       "if": {"properties": {"formal_eligible": {"const": true}}, "required": ["formal_eligible"]},
-      "then": {"properties": {"scope": {"const": "formal"}, "qualification_gate_hash": {"$ref": "#/$defs/hash"}}},
+      "then": {
+        "properties": {
+          "scope": {"const": "formal"},
+          "qualification_gate_hash": {"$ref": "#/$defs/hash"}
+        }
+      },
       "else": {"properties": {"qualification_gate_hash": {"type": "null"}}}
+    },
+    {
+      "if": {
+        "properties": {"scope": {"const": "formal"}},
+        "required": ["scope"]
+      },
+      "then": {
+        "properties": {
+          "minimum_formal_probes": {"minimum": 3},
+          "entries": {
+            "minItems": 3,
+            "contains": {
+              "type": "object",
+              "properties": {"role": {"const": "formal"}},
+              "required": ["role"]
+            },
+            "minContains": 3
+          }
+        }
+      }
     }
   ],
   "$defs": {

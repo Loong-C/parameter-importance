@@ -992,27 +992,60 @@ def validate_stage23_artifact(value: Mapping[str, object]) -> object:
         probe_ids: list[str] = []
         seen_samples: set[object] = set()
         loss_hashes: set[str] = set()
+        formal_count = 0
         for entry in entries:
-            if not isinstance(entry, Mapping):
-                raise TypeError("probe panel entry 必须是 object")
+            entry_fields = {
+                "role",
+                "probe_id",
+                "sample_ids",
+                "content_hash",
+                "loss_contract_hash",
+                "effective_weight_unit",
+                "metadata",
+                "probe_digest",
+            }
+            if not isinstance(entry, Mapping) or set(entry) != entry_fields:
+                raise TypeError("probe panel entry 字段集合不匹配")
+            role = entry.get("role")
             probe_id = entry.get("probe_id")
             samples = entry.get("sample_ids")
             loss_hash = entry.get("loss_contract_hash")
+            if role not in {"pilot", "formal", "replay"}:
+                raise ValueError("probe panel role 无效")
             if not isinstance(probe_id, str) or not probe_id:
                 raise TypeError("probe_id 必须是非空字符串")
-            if not isinstance(samples, list) or not samples:
-                raise TypeError("sample_ids 必须是非空数组")
+            if not isinstance(samples, list) or not samples or any(
+                isinstance(item, bool) or not isinstance(item, (str, int))
+                for item in samples
+            ):
+                raise TypeError("sample_ids 必须是非空字符串/整数数组")
+            if len(samples) != len(set(samples)):
+                raise ValueError("单个 probe 内 sample_ids 不能重复")
             overlap = seen_samples.intersection(samples)
             if overlap:
                 raise ValueError("probe panel 统计单元发生重叠")
             seen_samples.update(samples)
             probe_ids.append(probe_id)
-            if not isinstance(loss_hash, str):
-                raise TypeError("loss_contract_hash 必须是字符串")
-            _require_sha256(loss_hash, field_name="loss_contract_hash")
+            for hash_field in ("content_hash", "loss_contract_hash", "probe_digest"):
+                digest = entry[hash_field]
+                if not isinstance(digest, str):
+                    raise TypeError(f"{hash_field} 必须是字符串")
+                _require_sha256(digest, field_name=hash_field)
+            if (
+                not isinstance(entry["effective_weight_unit"], str)
+                or not entry["effective_weight_unit"]
+                or not isinstance(entry["metadata"], Mapping)
+            ):
+                raise ValueError("probe panel weight unit/metadata 无效")
             loss_hashes.add(loss_hash)
+            formal_count += int(role == "formal")
         if len(set(probe_ids)) != len(probe_ids) or len(loss_hashes) != 1:
             raise ValueError("probe IDs 必须唯一且共享唯一 loss contract")
+        minimum = value["minimum_formal_probes"]
+        if isinstance(minimum, bool) or not isinstance(minimum, int) or minimum <= 0:
+            raise ValueError("minimum_formal_probes 必须是正整数")
+        if value["scope"] == "formal" and (minimum < 3 or formal_count < minimum):
+            raise FormalRunRejected("FORMAL_PROBE_PANEL_REQUIRES_AT_LEAST_THREE_PROBES")
 
     if schema == "stage3-reference-refinement-v1":
         if type(value["converged"]) is not bool:

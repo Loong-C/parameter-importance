@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import copy
+import os
 from pathlib import Path
 import hashlib
+import subprocess
+import sys
 
 import torch
 
@@ -649,6 +652,70 @@ def test_stage3_endpoint_runner_publishes_distinct_post_and_commit_boundaries(
     assert record["parameter_post_state"]["artifact_id"] != record[  # type: ignore[index]
         "attempt_commit_state"
     ]["artifact_id"]
+
+
+def test_stage3_contract_freezes_signed_math_and_metric_surface(completed_chain) -> None:
+    root, _runtime_value, _configs, results = completed_chain
+    result = results["stage3.02_math_and_metric_contract"]
+
+    assert result.status is TaskRunStatus.PASS
+    path_math = _payload(root, result.artifact_refs["path_math_contract"])
+    metric_contract = _payload(root, result.artifact_refs["metric_contract"])
+
+    assert "-delta_theta" in path_math["signed_contribution"]
+    metrics = set(metric_contract["metrics"])
+    assert {
+        "normalized_l1_error",
+        "normalized_l2_error",
+        "normalized_linf_error",
+        "cosine_similarity",
+        "active_spearman",
+        "sign_consistency",
+        "top_q_overlap",
+        "top_q_jaccard",
+        "layer_total_variation",
+        "module_total_variation",
+        "real_gradient_evaluation_cost",
+        "model_strata",
+        "stage_strata",
+        "update_strata",
+        "probe_strata",
+    } <= metrics
+    assert metric_contract["top_q"] == {
+        "proportions": [0.001, 0.01, 0.05],
+        "metrics": ["overlap", "jaccard"],
+    }
+    assert metric_contract["strata"] == ["model", "stage", "update", "probe"]
+
+
+def test_core_import_is_clean_in_a_fresh_python_process() -> None:
+    environment = os.environ.copy()
+    source_root = str(ROOT / "src")
+    existing_pythonpath = environment.get("PYTHONPATH")
+    environment["PYTHONPATH"] = (
+        source_root
+        if not existing_pythonpath
+        else os.pathsep.join((source_root, existing_pythonpath))
+    )
+    environment["PYTHONDONTWRITEBYTECODE"] = "1"
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import sys; "
+                "import param_importance_nlp.core as core; "
+                "assert core.PathSpec is not None; "
+                "assert 'param_importance_nlp.runtime' not in sys.modules"
+            ),
+        ],
+        cwd=ROOT,
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr or completed.stdout
 
 
 def test_stage3_reference_runner_executes_two_family_refinement_and_resumes(

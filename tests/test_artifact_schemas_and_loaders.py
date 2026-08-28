@@ -22,6 +22,7 @@ from param_importance_nlp.contracts import (
     validate_path_integral_result_artifact,
     validate_path_spec_artifact,
     validate_reference_result_artifact,
+    validate_stage23_artifact,
 )
 from param_importance_nlp.core import PruningPlan, trapezoid_rule
 from param_importance_nlp.experiments import (
@@ -40,6 +41,88 @@ from param_importance_nlp.experiments import (
 def _bind(payload: dict[str, object]) -> dict[str, object]:
     payload["artifact_hash"] = canonical_json_hash(payload)
     return payload
+
+
+def _probe_entry(index: int, *, role: str = "formal") -> dict[str, object]:
+    return {
+        "role": role,
+        "probe_id": f"probe-{index}",
+        "sample_ids": [f"sample-{index}"],
+        "content_hash": f"{index + 1:064x}",
+        "loss_contract_hash": "a" * 64,
+        "effective_weight_unit": "effective_token",
+        "metadata": {},
+    }
+
+
+def test_formal_stage3_probe_artifacts_require_three_independent_probes() -> None:
+    insufficient_plan = _bind(
+        {
+            "schema_version": "stage3-probe-plan-v1",
+            "panel_id": "formal-panel",
+            "endpoint_digest": "b" * 64,
+            "entries": [_probe_entry(0)],
+            "minimum_formal_probes": 1,
+            "execution_evidence_hash": "c" * 64,
+            "scope": "formal",
+            "formal_eligible": True,
+        }
+    )
+    with pytest.raises(ValueError, match="FORMAL_PROBE_COUNT_LT_THREE"):
+        _validate_known_artifact(insufficient_plan)
+
+    invalid_hash_plan = copy.deepcopy(insufficient_plan)
+    invalid_hash_plan["entries"][0]["content_hash"] = "z" * 64  # type: ignore[index]
+    invalid_hash_plan["artifact_hash"] = canonical_json_hash(
+        {key: value for key, value in invalid_hash_plan.items() if key != "artifact_hash"}
+    )
+    with pytest.raises(ValueError, match="ENTRY_HASH_INVALID"):
+        _validate_known_artifact(invalid_hash_plan)
+
+    mixed_loss_plan = copy.deepcopy(insufficient_plan)
+    mixed_loss_plan["entries"] = [_probe_entry(index) for index in range(3)]
+    mixed_loss_plan["entries"][2]["loss_contract_hash"] = "e" * 64  # type: ignore[index]
+    mixed_loss_plan["minimum_formal_probes"] = 3
+    mixed_loss_plan["artifact_hash"] = canonical_json_hash(
+        {key: value for key, value in mixed_loss_plan.items() if key != "artifact_hash"}
+    )
+    with pytest.raises(ValueError, match="LOSS_CONTRACT_DRIFT"):
+        _validate_known_artifact(mixed_loss_plan)
+
+    qualified_panel = _bind(
+        {
+            "schema_version": "stage3-probe-panel-v1",
+            "panel_id": "formal-panel",
+            "endpoint_digest": "b" * 64,
+            "entries": [
+                {**_probe_entry(index), "probe_digest": f"{index + 10:064x}"}
+                for index in range(3)
+            ],
+            "minimum_formal_probes": 3,
+            "execution_evidence_hash": "c" * 64,
+            "scope": "formal",
+            "formal_eligible": True,
+            "qualification_gate_hash": "d" * 64,
+        }
+    )
+    assert validate_stage23_artifact(qualified_panel).artifact_hash == qualified_panel["artifact_hash"]
+
+    insufficient_panel = copy.deepcopy(qualified_panel)
+    insufficient_panel["entries"] = insufficient_panel["entries"][:2]  # type: ignore[index]
+    insufficient_panel["minimum_formal_probes"] = 2
+    insufficient_panel["artifact_hash"] = canonical_json_hash(
+        {key: value for key, value in insufficient_panel.items() if key != "artifact_hash"}
+    )
+    with pytest.raises(ValueError, match="AT_LEAST_THREE"):
+        validate_stage23_artifact(insufficient_panel)
+
+    missing_probe_digest = copy.deepcopy(qualified_panel)
+    del missing_probe_digest["entries"][0]["probe_digest"]  # type: ignore[index]
+    missing_probe_digest["artifact_hash"] = canonical_json_hash(
+        {key: value for key, value in missing_probe_digest.items() if key != "artifact_hash"}
+    )
+    with pytest.raises(TypeError, match="字段集合"):
+        validate_stage23_artifact(missing_probe_digest)
 
 
 def test_all_public_artifact_schemas_are_strict_json_objects() -> None:

@@ -388,6 +388,65 @@ def _validate_known_artifact(value: dict[str, Any]) -> tuple[str, str | None]:
             raise ValueError("STAGE3_PROBE_PLAN_SCOPE_MISMATCH")
         if not isinstance(value["entries"], list) or not value["entries"]:
             raise ValueError("STAGE3_PROBE_PLAN_ENTRIES_EMPTY")
+        minimum = value["minimum_formal_probes"]
+        if isinstance(minimum, bool) or not isinstance(minimum, int) or minimum <= 0:
+            raise ValueError("STAGE3_PROBE_PLAN_MINIMUM_INVALID")
+        probe_ids: set[str] = set()
+        sample_ids: set[str | int] = set()
+        loss_contract_hashes: set[str] = set()
+        formal_count = 0
+        entry_fields = {
+            "role",
+            "probe_id",
+            "sample_ids",
+            "content_hash",
+            "loss_contract_hash",
+            "effective_weight_unit",
+            "metadata",
+        }
+        for index, raw_entry in enumerate(value["entries"]):
+            if not isinstance(raw_entry, Mapping) or set(raw_entry) != entry_fields:
+                raise ValueError(f"STAGE3_PROBE_PLAN_ENTRY_FIELDS_MISMATCH:{index}")
+            role = raw_entry["role"]
+            probe_id = raw_entry["probe_id"]
+            samples = raw_entry["sample_ids"]
+            if role not in {"pilot", "formal", "replay"}:
+                raise ValueError(f"STAGE3_PROBE_PLAN_ENTRY_ROLE_INVALID:{index}")
+            if not isinstance(probe_id, str) or not probe_id or probe_id in probe_ids:
+                raise ValueError(f"STAGE3_PROBE_PLAN_PROBE_ID_INVALID:{index}")
+            if not isinstance(samples, list) or not samples or any(
+                isinstance(item, bool) or not isinstance(item, (str, int))
+                for item in samples
+            ):
+                raise ValueError(f"STAGE3_PROBE_PLAN_SAMPLE_IDS_INVALID:{index}")
+            if len(samples) != len(set(samples)):
+                raise ValueError(f"STAGE3_PROBE_PLAN_SAMPLE_IDS_INVALID:{index}")
+            overlap = sample_ids.intersection(samples)
+            if overlap:
+                raise ValueError(f"STAGE3_PROBE_PLAN_SAMPLE_OVERLAP:{index}")
+            for hash_field in ("content_hash", "loss_contract_hash"):
+                digest = raw_entry[hash_field]
+                if (
+                    not isinstance(digest, str)
+                    or re.fullmatch(r"[0-9a-f]{64}", digest) is None
+                ):
+                    raise ValueError(
+                        f"STAGE3_PROBE_PLAN_ENTRY_HASH_INVALID:{index}:{hash_field}"
+                    )
+            if (
+                not isinstance(raw_entry["effective_weight_unit"], str)
+                or not raw_entry["effective_weight_unit"]
+                or not isinstance(raw_entry["metadata"], Mapping)
+            ):
+                raise ValueError(f"STAGE3_PROBE_PLAN_ENTRY_METADATA_INVALID:{index}")
+            probe_ids.add(probe_id)
+            sample_ids.update(samples)
+            loss_contract_hashes.add(raw_entry["loss_contract_hash"])
+            formal_count += int(role == "formal")
+        if len(loss_contract_hashes) != 1:
+            raise ValueError("STAGE3_PROBE_PLAN_LOSS_CONTRACT_DRIFT")
+        if scope == "formal" and (minimum < 3 or formal_count < minimum):
+            raise ValueError("STAGE3_PROBE_PLAN_FORMAL_PROBE_COUNT_LT_THREE")
         return "stage3_probe_plan", digest
     if schema == "stage3-formal-pilot-plan-v1":
         from .experiments import QuadratureThresholds

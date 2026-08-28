@@ -88,7 +88,7 @@ def test_formal_handler_loads_training_endpoint_and_executes_tiny_path(
     probe_ref = "inputs/probe-plan.json"
     evidence = _formal_evidence(probe_ref)
     fixture = build_tiny_training_fixture(
-        task_type="sequence_classification", seed=131, steps=2
+        task_type="sequence_classification", seed=131, steps=4
     )
     optimizer = torch.optim.SGD(fixture.model.module.parameters(), lr=0.05, momentum=0.9)
     engine = TrainingEngine(
@@ -166,15 +166,16 @@ def test_formal_handler_loads_training_endpoint_and_executes_tiny_path(
         "entries": [
             {
                 "role": "formal",
-                "probe_id": "formal-probe-0",
-                "sample_ids": [resolver.sample_ids[-1]],
-                "content_hash": _hash("formal-probe-content"),
+                "probe_id": f"formal-probe-{index}",
+                "sample_ids": [resolver.sample_ids[-3 + index]],
+                "content_hash": _hash(f"formal-probe-content-{index}"),
                 "loss_contract_hash": loss_hash,
                 "effective_weight_unit": "sample",
                 "metadata": {"source": "tiny-formal-shaped"},
             }
+            for index in range(3)
         ],
-        "minimum_formal_probes": 1,
+        "minimum_formal_probes": 3,
         "execution_evidence_hash": evidence.artifact_hash,
         "scope": "formal",
         "formal_eligible": True,
