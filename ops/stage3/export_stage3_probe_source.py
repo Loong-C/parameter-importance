@@ -206,17 +206,25 @@ def _validate_source(value: Mapping[str, Any]) -> Mapping[str, Any]:
         "schema_version",
         "scope",
         "g3_resolution_ref",
-        "trajectory_receipt_ref",
         "allocation_seed",
         "partition",
         "output_dir",
         "artifact_hash",
     }
+    scope = value.get("scope")
+    if scope == PILOT_SCOPE:
+        expected.add("trajectory_receipt_ref")
+    elif scope == FORMAL_SCOPE:
+        # Formal coverage spans three independent training trajectories.  Do
+        # not accept the old singular field here: silently treating one
+        # receipt as the whole matrix would make the 24+9 endpoint identity
+        # boundary unverifiable.
+        expected.add("trajectory_receipt_refs")
     if set(value) != expected or value.get("schema_version") != SOURCE_SCHEMA:
         raise _fail("SOURCE_FIELDS_MISMATCH")
     _check_artifact_hash(value, "source")
     _no_forbidden(value)
-    if value.get("scope") not in SCOPES:
+    if scope not in SCOPES:
         raise _fail("SCOPE_INVALID")
     if (
         isinstance(value.get("allocation_seed"), bool)
@@ -224,9 +232,21 @@ def _validate_source(value: Mapping[str, Any]) -> Mapping[str, Any]:
         or value["allocation_seed"] < 0
     ):
         raise _fail("ALLOCATION_SEED_INVALID")
-    for field in ("g3_resolution_ref", "trajectory_receipt_ref", "output_dir"):
+    for field in ("g3_resolution_ref", "output_dir"):
         if not isinstance(value.get(field), str) or not value[field]:
             raise _fail("REFERENCE_INVALID", field)
+    if scope == PILOT_SCOPE:
+        if not isinstance(value.get("trajectory_receipt_ref"), str) or not value["trajectory_receipt_ref"]:
+            raise _fail("REFERENCE_INVALID", "trajectory_receipt_ref")
+    else:
+        refs = value.get("trajectory_receipt_refs")
+        if (
+            not isinstance(refs, list)
+            or len(refs) != 3
+            or any(not isinstance(item, str) or not item for item in refs)
+            or len(refs) != len(set(refs))
+        ):
+            raise _fail("TRAJECTORY_RECEIPT_REFS_INVALID")
     partition = value.get("partition")
     if not isinstance(partition, Mapping) or set(partition) != {"probe", *PARTITION_NAMES}:
         raise _fail("PARTITION_FIELDS_MISMATCH")
@@ -466,52 +486,143 @@ def _load_pile_context(
     )
 
 
+def _trajectory_receipt_refs(
+    source_value: Mapping[str, Any],
+    *,
+    scope: str,
+) -> tuple[str, ...]:
+    """Return the receipt refs for one probe-source export.
+
+    Pilot retains its historical singular reference.  Formal exports require
+    exactly one receipt for each preregistered model/seed trajectory so the
+    14M/31M endpoint matrix cannot be represented by an unverified hand-made
+    aggregate receipt.
+    """
+
+    if scope == PILOT_SCOPE:
+        return (str(source_value["trajectory_receipt_ref"]),)
+    refs = source_value.get("trajectory_receipt_refs")
+    if (
+        not isinstance(refs, list)
+        or len(refs) != 3
+        or any(not isinstance(item, str) or not item for item in refs)
+        or len(refs) != len(set(refs))
+    ):
+        raise _fail("TRAJECTORY_RECEIPT_REFS_INVALID")
+    return tuple(refs)
+
+
 def _load_receipt_and_endpoints(
     *,
     source_value: Mapping[str, Any],
     workspace: Path,
     data: Path,
-) -> tuple[Stage3TrajectoryReceipt, tuple[Any, ...], dict[str, int]]:
-    receipt_path = _resolve_ref(
-        source_value["trajectory_receipt_ref"], roots=(data, workspace), field="trajectory_receipt_ref"
-    )
-    try:
-        receipt = Stage3TrajectoryReceipt.from_mapping(_load_object(receipt_path, "trajectory_receipt"))
-    except (TypeError, ValueError) as error:
-        raise _fail("TRAJECTORY_RECEIPT_INVALID") from error
+) -> tuple[Stage3TrajectoryReceipt | tuple[Stage3TrajectoryReceipt, ...], tuple[Any, ...], dict[str, int]]:
     scope = str(source_value["scope"])
-    if receipt.purpose_scope != scope or receipt.formal_eligible is not (scope == FORMAL_SCOPE):
-        raise _fail("TRAJECTORY_SCOPE_MISMATCH")
-    if not receipt.formal_execution_ref:
-        raise _fail("TRAJECTORY_FORMAL_EXECUTION_REF_MISSING")
-    if len(set(receipt.endpoint_commit_refs)) != len(receipt.endpoint_commit_refs):
-        raise _fail("TRAJECTORY_ENDPOINT_REF_DUPLICATE")
-    if len(set(receipt.endpoint_digests)) != len(receipt.endpoint_digests):
-        raise _fail("TRAJECTORY_ENDPOINT_DIGEST_DUPLICATE")
-    endpoint_identities: list[Any] = []
-    endpoint_steps: dict[str, int] = {}
-    update_ids: set[object] = set()
-    for index, reference in enumerate(receipt.endpoint_commit_refs):
-        commit_path = _resolve_ref(reference, roots=(data, workspace), field=f"endpoint_commit_ref[{index}]")
-        endpoint_root = _source_root(commit_path, workspace=workspace, data=data)
+    receipt_refs = _trajectory_receipt_refs(source_value, scope=scope)
+    receipts: list[Stage3TrajectoryReceipt] = []
+    receipt_hashes: set[str] = set()
+    execution_refs: set[str] = set()
+    execution_evidences: list[FormalExecutionEvidence] = []
+    gate_hashes: dict[str, set[str]] = {"g30": set(), "g31": set()}
+    for receipt_index, receipt_ref in enumerate(receipt_refs):
+        receipt_path = _resolve_ref(
+            receipt_ref,
+            roots=(data, workspace),
+            field=f"trajectory_receipt_refs[{receipt_index}]",
+        )
         try:
-            identity = _load_endpoint(
-                _Source(reference, commit_path), scope=scope, workspace_root=endpoint_root
+            receipt = Stage3TrajectoryReceipt.from_mapping(
+                _load_object(receipt_path, "trajectory_receipt")
             )
         except (TypeError, ValueError) as error:
-            raise _fail("ENDPOINT_COMMIT_INVALID", reference) from error
-        if identity.endpoint_digest != receipt.endpoint_digests[index]:
-            raise _fail("TRAJECTORY_ENDPOINT_DIGEST_MISMATCH", reference)
-        if identity.ref != reference:
-            raise _fail("ENDPOINT_REFERENCE_DRIFT", reference)
-        step = receipt.selected_steps[index]
-        endpoint_steps[reference] = step
-        if update_ids.intersection(identity.update_sample_ids):
-            raise _fail("ENDPOINT_UPDATE_SAMPLE_DUPLICATE", identity.endpoint_id)
-        update_ids.update(identity.update_sample_ids)
-        endpoint_identities.append(identity)
+            raise _fail("TRAJECTORY_RECEIPT_INVALID", receipt_ref) from error
+        if receipt.purpose_scope != scope or receipt.formal_eligible is not (scope == FORMAL_SCOPE):
+            raise _fail("TRAJECTORY_SCOPE_MISMATCH", receipt_ref)
+        if not receipt.formal_execution_ref:
+            raise _fail("TRAJECTORY_FORMAL_EXECUTION_REF_MISSING", receipt_ref)
+        if receipt.artifact_hash in receipt_hashes:
+            raise _fail("TRAJECTORY_RECEIPT_DUPLICATE", receipt_ref)
+        receipt_hashes.add(receipt.artifact_hash)
+        # Every independently materialized trajectory must pass the same
+        # canonical formal-execution/G3 authority reload.  Checking only the
+        # reference string would let a malformed or stale receipt participate
+        # in a seemingly complete 33-endpoint matrix.
+        execution_evidences.append(
+            _validate_execution_evidence(receipt, workspace=workspace, data=data)
+        )
+        execution_refs.add(receipt.formal_execution_ref)
+        if receipt.g30_gate_hash is not None:
+            gate_hashes["g30"].add(receipt.g30_gate_hash)
+        if receipt.g31_gate_hash is not None:
+            gate_hashes["g31"].add(receipt.g31_gate_hash)
+        receipts.append(receipt)
+
+    if scope == FORMAL_SCOPE and len(receipts) != 3:
+        # Defensive check for callers bypassing _validate_source().
+        raise _fail("TRAJECTORY_RECEIPT_COUNT_INVALID")
+    if len(execution_refs) != 1 or len({item.artifact_hash for item in execution_evidences}) != 1:
+        raise _fail("TRAJECTORY_EXECUTION_MIXED")
+    if scope == FORMAL_SCOPE and (
+        gate_hashes["g30"] != {receipts[0].g30_gate_hash}
+        or gate_hashes["g31"] != {receipts[0].g31_gate_hash}
+    ):
+        raise _fail("TRAJECTORY_GATE_MIXED")
+
+    endpoint_identities: list[Any] = []
+    endpoint_steps: dict[str, int] = {}
+    endpoint_refs: set[str] = set()
+    endpoint_digests: set[str] = set()
+    endpoint_ids: set[str] = set()
+    update_ids: set[object] = set()
+    receipt_model_seeds: list[tuple[str, int]] = []
+    for receipt in receipts:
+        receipt_endpoint_pairs: set[tuple[str, int]] = set()
+        for index, reference in enumerate(receipt.endpoint_commit_refs):
+            if reference in endpoint_refs:
+                raise _fail("TRAJECTORY_ENDPOINT_REF_DUPLICATE", reference)
+            endpoint_refs.add(reference)
+            commit_path = _resolve_ref(
+                reference,
+                roots=(data, workspace),
+                field=f"endpoint_commit_ref[{len(endpoint_identities)}]",
+            )
+            endpoint_root = _source_root(commit_path, workspace=workspace, data=data)
+            try:
+                identity = _load_endpoint(
+                    _Source(reference, commit_path), scope=scope, workspace_root=endpoint_root
+                )
+            except (TypeError, ValueError) as error:
+                raise _fail("ENDPOINT_COMMIT_INVALID", reference) from error
+            if identity.endpoint_digest != receipt.endpoint_digests[index]:
+                raise _fail("TRAJECTORY_ENDPOINT_DIGEST_MISMATCH", reference)
+            if identity.endpoint_digest in endpoint_digests:
+                raise _fail("TRAJECTORY_ENDPOINT_DIGEST_DUPLICATE", reference)
+            endpoint_digests.add(identity.endpoint_digest)
+            if identity.ref != reference:
+                raise _fail("ENDPOINT_REFERENCE_DRIFT", reference)
+            if identity.endpoint_id in endpoint_ids:
+                raise _fail("TRAJECTORY_ENDPOINT_ID_DUPLICATE", identity.endpoint_id)
+            endpoint_ids.add(identity.endpoint_id)
+            step = receipt.selected_steps[index]
+            endpoint_steps[reference] = step
+            receipt_endpoint_pairs.add((identity.model, identity.seed))
+            if update_ids.intersection(identity.update_sample_ids):
+                raise _fail("ENDPOINT_UPDATE_SAMPLE_DUPLICATE", identity.endpoint_id)
+            update_ids.update(identity.update_sample_ids)
+            endpoint_identities.append(identity)
+        if len(receipt_endpoint_pairs) != 1:
+            raise _fail("TRAJECTORY_RECEIPT_MODEL_SEED_MIXED", receipt.receipt_id)
+        receipt_model_seeds.extend(receipt_endpoint_pairs)
+
+    if scope == FORMAL_SCOPE and set(receipt_model_seeds) != {
+        ("14M", 4301), ("14M", 4302), ("31M", 5301)
+    }:
+        raise _fail("TRAJECTORY_RECEIPT_MODEL_SEED_COVERAGE_INVALID")
     _validate_endpoint_matrix(endpoint_identities, endpoint_steps, scope=scope)
-    return receipt, tuple(endpoint_identities), endpoint_steps
+    loaded_receipts: Stage3TrajectoryReceipt | tuple[Stage3TrajectoryReceipt, ...]
+    loaded_receipts = receipts[0] if scope == PILOT_SCOPE else tuple(receipts)
+    return loaded_receipts, tuple(endpoint_identities), endpoint_steps
 
 
 def _validate_execution_evidence(
@@ -548,7 +659,10 @@ def _validate_execution_evidence(
             gate = gates.get(gate_id)
             if gate is None or gate.artifact_hash != receipt_hash:
                 raise _fail("TRAJECTORY_GATE_HASH_MISMATCH", gate_id)
-    if receipt.formal_eligible and any(gates.get(gate_id) is None for gate_id in ("stage3.G3-0", "stage3.G3-1")):
+    required_formal_gates = ("stage3.G3-0", "stage3.G3-1", "stage3.G3-5")
+    if receipt.formal_eligible and any(
+        gates.get(gate_id) is None for gate_id in required_formal_gates
+    ):
         raise _fail("FORMAL_TRAJECTORY_GATE_COVERAGE_MISMATCH")
     return evidence
 
@@ -852,10 +966,21 @@ def export_stage3_probe_source(
     )
     try:
         intervals = _validate_partition(source_value, dataset=context.dataset, scope=scope)
-        receipt, endpoints, endpoint_steps = _load_receipt_and_endpoints(
+        receipt_value, endpoints, endpoint_steps = _load_receipt_and_endpoints(
             source_value=source_value, workspace=workspace, data=data
         )
-        evidence = _validate_execution_evidence(receipt, workspace=workspace, data=data)
+        receipts = (
+            (receipt_value,)
+            if isinstance(receipt_value, Stage3TrajectoryReceipt)
+            else tuple(receipt_value)
+        )
+        receipt_refs = _trajectory_receipt_refs(source_value, scope=scope)
+        # _load_receipt_and_endpoints has already reloaded every evidence
+        # object.  Retain the historical single evidence value for the report
+        # and perform one final reload for the primary materializer input.
+        evidence = _validate_execution_evidence(
+            receipts[0], workspace=workspace, data=data
+        )
         expected = PILOT_ENDPOINTS if scope == PILOT_SCOPE else FORMAL_ENDPOINTS
         if len(endpoints) != expected:
             raise _fail("ENDPOINT_COUNT_INVALID", scope)
@@ -930,25 +1055,74 @@ def export_stage3_probe_source(
         }
         content_source = content_body | {"artifact_hash": canonical_json_hash(content_body)}
         content_source_path = output / "content-source.json"
-        materialization_body: dict[str, Any] = {
-            "schema_version": MATERIALIZATION_SCHEMA,
-            "scope": scope,
-            "trajectory_receipt_ref": str(source_value["trajectory_receipt_ref"]),
-            "probe_allocation_ref": _logical_ref(allocation_path, output_root),
-            "content_source_ref": _logical_ref(content_source_path, output_root),
-            "formal_execution_ref": str(receipt.formal_execution_ref),
-            "output_dir": _logical_ref(output / "plans", output_root),
-        }
-        materialization = materialization_body | {"artifact_hash": canonical_json_hash(materialization_body)}
-        materialization_path = output / "materialization-source.json"
+        # The existing plan materializer intentionally accepts one trajectory
+        # receipt.  For a formal matrix, preserve that contract by creating
+        # one real allocation/materialization source per receipt; the global
+        # allocation remains an audit artifact and is never presented as a
+        # fabricated aggregate receipt.
+        materialization_items: list[tuple[Path, Mapping[str, Any]]] = []
+        allocation_items: list[tuple[Path, Mapping[str, Any]]] = []
+        if scope == FORMAL_SCOPE:
+            allocations_by_endpoint = {
+                str(item["endpoint_commit_ref"]): item for item in allocations
+            }
+            for receipt_index, (receipt, receipt_ref) in enumerate(zip(receipts, receipt_refs, strict=True)):
+                try:
+                    receipt_allocations = [
+                        allocations_by_endpoint[endpoint_ref]
+                        for endpoint_ref in receipt.endpoint_commit_refs
+                    ]
+                except KeyError as error:
+                    raise _fail("ALLOCATION_ENDPOINT_COVERAGE_MISMATCH", error.args[0]) from error
+                per_allocation_body: dict[str, Any] = {
+                    "schema_version": ALLOCATION_SCHEMA,
+                    "scope": scope,
+                    "allocations": receipt_allocations,
+                }
+                per_allocation = per_allocation_body | {
+                    "artifact_hash": canonical_json_hash(per_allocation_body)
+                }
+                per_allocation_path = output / f"allocation-{receipt_index:03d}.json"
+                allocation_items.append((per_allocation_path, per_allocation))
+                materialization_body: dict[str, Any] = {
+                    "schema_version": MATERIALIZATION_SCHEMA,
+                    "scope": scope,
+                    "trajectory_receipt_ref": receipt_ref,
+                    "probe_allocation_ref": _logical_ref(per_allocation_path, output_root),
+                    "content_source_ref": _logical_ref(content_source_path, output_root),
+                    "formal_execution_ref": str(receipt.formal_execution_ref),
+                    "output_dir": _logical_ref(output / "plans", output_root),
+                }
+                materialization = materialization_body | {
+                    "artifact_hash": canonical_json_hash(materialization_body)
+                }
+                materialization_items.append(
+                    (output / f"materialization-source-{receipt_index:03d}.json", materialization)
+                )
+        else:
+            materialization_body = {
+                "schema_version": MATERIALIZATION_SCHEMA,
+                "scope": scope,
+                "trajectory_receipt_ref": receipt_refs[0],
+                "probe_allocation_ref": _logical_ref(allocation_path, output_root),
+                "content_source_ref": _logical_ref(content_source_path, output_root),
+                "formal_execution_ref": str(receipts[0].formal_execution_ref),
+                "output_dir": _logical_ref(output / "plans", output_root),
+            }
+            materialization = materialization_body | {
+                "artifact_hash": canonical_json_hash(materialization_body)
+            }
+            materialization_path = output / "materialization-source.json"
+            materialization_items.append((materialization_path, materialization))
 
-        json_payloads = {
+        json_payloads: dict[Path, Mapping[str, Any]] = {
             loss_path: loss_contract,
             resolver_path: resolver_state,
             allocation_path: allocation,
             content_source_path: content_source,
-            materialization_path: materialization,
         }
+        json_payloads.update(dict(allocation_items))
+        json_payloads.update(dict(materialization_items))
         for target, payload in binary_payloads.items():
             _preflight_target(target, payload)
         for target, value in json_payloads.items():
@@ -958,9 +1132,13 @@ def export_stage3_probe_source(
         for target, value in json_payloads.items():
             publish_canonical_immutable(target, value)
 
-        plan_paths = materialize_probe_plans(
-            materialization_path, workspace_root=workspace, data_root=data
-        )
+        plan_paths: list[Path] = []
+        for materialization_path, _ in materialization_items:
+            plan_paths.extend(
+                materialize_probe_plans(
+                    materialization_path, workspace_root=workspace, data_root=data
+                )
+            )
         plan_refs = [_logical_ref(path, output_root) for path in plan_paths]
         report_body: dict[str, Any] = {
             "schema_version": REPORT_SCHEMA,
@@ -968,9 +1146,7 @@ def export_stage3_probe_source(
             "allocation_seed": int(source_value["allocation_seed"]),
             "g3_resolution_ref": str(source_value["g3_resolution_ref"]),
             "g3_resolution_artifact_hash": context.runtime.resolution_artifact_hash,
-            "trajectory_receipt_ref": str(source_value["trajectory_receipt_ref"]),
-            "trajectory_receipt_hash": receipt.artifact_hash,
-            "formal_execution_ref": str(receipt.formal_execution_ref),
+            "formal_execution_ref": str(receipts[0].formal_execution_ref),
             "formal_execution_hash": evidence.artifact_hash,
             "resolver_state_ref": _logical_ref(resolver_path, output_root),
             "resolver_state_hash": resolver_state["artifact_hash"],
@@ -980,8 +1156,6 @@ def export_stage3_probe_source(
             "allocation_hash": allocation["artifact_hash"],
             "content_source_ref": _logical_ref(content_source_path, output_root),
             "content_source_hash": content_source["artifact_hash"],
-            "materialization_source_ref": _logical_ref(materialization_path, output_root),
-            "materialization_source_hash": materialization["artifact_hash"],
             "probe_plan_refs": plan_refs,
             "endpoint_count": len(endpoints),
             "probe_count": PILOT_PROBES if scope == PILOT_SCOPE else FORMAL_PROBES,
@@ -989,6 +1163,29 @@ def export_stage3_probe_source(
             "content_record_count": len(binary_payloads),
             "partition": {name: list(intervals[name]) for name in ("probe", *PARTITION_NAMES)},
         }
+        if scope == PILOT_SCOPE:
+            materialization_path, materialization = materialization_items[0]
+            report_body.update(
+                {
+                    "trajectory_receipt_ref": receipt_refs[0],
+                    "trajectory_receipt_hash": receipts[0].artifact_hash,
+                    "materialization_source_ref": _logical_ref(materialization_path, output_root),
+                    "materialization_source_hash": materialization["artifact_hash"],
+                }
+            )
+        else:
+            report_body.update(
+                {
+                    "trajectory_receipt_refs": list(receipt_refs),
+                    "trajectory_receipt_hashes": [item.artifact_hash for item in receipts],
+                    "materialization_source_refs": [
+                        _logical_ref(path, output_root) for path, _ in materialization_items
+                    ],
+                    "materialization_source_hashes": [
+                        item["artifact_hash"] for _, item in materialization_items
+                    ],
+                }
+            )
         report = report_body | {"artifact_hash": canonical_json_hash(report_body)}
         report_path = output / "export-report.json"
         _preflight_target(report_path, canonical_json_bytes(report))

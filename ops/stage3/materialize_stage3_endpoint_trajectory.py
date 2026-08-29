@@ -6,7 +6,7 @@ JSON sources and publishes four immutable JSON objects:
 * a ``training-endpoint-capture-plan-v1``;
 * a strict ``ResolvedConfigV2`` for ``stage3.03``;
 * a hash-bound ``TaskRuntimeEnvironment`` derived from the published G3-0/G3-1
-  environments; and
+  environments (and, for formal scope, the post-G3-5 environment); and
 * a materialization receipt describing the command that may later run the real
   trajectory producer.
 
@@ -393,6 +393,30 @@ def _validate_environments(
         raise _error("ENDPOINT_MATERIALIZATION_FORMAL_EXECUTION_INVALID") from error
     if not any(gate.gate_id == "stage3.G3-1" and gate.status is GateStatus.PASS for gate in execution.prerequisite_gates):
         raise _error("ENDPOINT_MATERIALIZATION_FORMAL_EXECUTION_G31_MISSING")
+    if source.get("scope") == "formal":
+        if "stage3.G3-5" not in g31.passed_gate_ids:
+            raise _error("ENDPOINT_MATERIALIZATION_G35_ENVIRONMENT_GATE_MISSING")
+        g35_gate_ref = _environment_ref(g31, "gate_stage3_g3_5")
+        if not isinstance(g35_gate_ref, str) or not g35_gate_ref:
+            raise _error("ENDPOINT_MATERIALIZATION_G35_ENVIRONMENT_EVIDENCE_MISSING")
+        g35_gate = _gate_from_ref(
+            g35_gate_ref,
+            expected_gate_id="stage3.G3-5",
+            workspace_root=workspace_root,
+            data_root=data_root,
+        )
+        execution_g35 = next(
+            (gate for gate in execution.prerequisite_gates if gate.gate_id == "stage3.G3-5"),
+            None,
+        )
+        if (
+            execution_g35 is None
+            or execution_g35.status is not GateStatus.PASS
+            or execution_g35.effective_status() is not GateStatus.PASS
+        ):
+            raise _error("ENDPOINT_MATERIALIZATION_FORMAL_EXECUTION_G35_MISSING")
+        if execution_g35.artifact_hash != g35_gate.artifact_hash:
+            raise _error("ENDPOINT_MATERIALIZATION_FORMAL_EXECUTION_G35_HASH_MISMATCH")
     if g31.environment_hash == g30.environment_hash:
         raise _error("ENDPOINT_MATERIALIZATION_G30_G31_ENVIRONMENT_NOT_DISTINCT")
     return (

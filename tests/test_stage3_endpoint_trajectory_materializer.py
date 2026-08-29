@@ -135,11 +135,21 @@ def _authority(root: Path) -> tuple[str, str, str, str]:
         evidence_refs=("authority/g30-decision.json",),
     )
     _write(root, "authority/g31-gate.json", g31.to_dict())
+    g35 = GateRecord(
+        gate_id="stage3.G3-5",
+        stage=3,
+        status=GateStatus.PASS,
+        checked_at="2026-08-29T00:00:00Z",
+        measured={"contract": "frozen"},
+        threshold={"required": True},
+        evidence_refs=("authority/g35-gate.json",),
+    )
+    _write(root, "authority/g35-gate.json", g35.to_dict())
     evidence = FormalExecutionEvidence(
         run_intent="formal",
         contract_freeze_hash=_h("stage3-contract"),
         asset_manifest_hashes=(_h("asset-model"), _h("asset-data")),
-        prerequisite_gates=(g30_bound, g31),
+        prerequisite_gates=(g30_bound, g31, g35),
         metadata={"scope": "formal", "source": "published"},
     )
     _write(root, "authority/formal-execution.json", evidence.to_dict())
@@ -163,12 +173,13 @@ def _authority(root: Path) -> tuple[str, str, str, str]:
     g31_env = TaskRuntimeEnvironment(
         capabilities=g30_env.capabilities,
         frozen_contract_stages=frozenset({0, 1, 3}),
-        passed_gate_ids=frozenset({"stage3.G3-0", "stage3.G3-1"}),
+        passed_gate_ids=frozenset({"stage3.G3-0", "stage3.G3-1", "stage3.G3-5"}),
         estimator_decision_ref="authority/stage2-estimator.json",
         evidence_refs={
             "stage3_scope_decision": "authority/g30-decision.json",
             "stage3_g30_gate": "authority/g30-gate.json",
             "gate_stage3_g3_1": "authority/g31-gate.json",
+            "gate_stage3_g3_5": "authority/g35-gate.json",
             "formal_execution": "authority/formal-execution.json",
         },
     )
@@ -257,8 +268,87 @@ def test_materializer_builds_31m_formal_and_binds_g31(tmp_path: Path) -> None:
     config = ResolvedConfigV2.from_mapping(load_canonical_json(tmp_path / value["config_ref"]))
     assert config.base_config.section("model")["asset_id"] == "pythia-31m-step0"
     environment = TaskRuntimeEnvironment.from_mapping(load_canonical_json(tmp_path / value["environment_ref"]))
-    assert {"stage3.G3-0", "stage3.G3-1"}.issubset(environment.passed_gate_ids)
+    assert {"stage3.G3-0", "stage3.G3-1", "stage3.G3-5"}.issubset(environment.passed_gate_ids)
     assert environment.evidence_refs["stage3_endpoint_capture_plan"] == value["capture_plan_ref"]
+
+
+def test_materializer_rejects_formal_environment_before_g35(tmp_path: Path) -> None:
+    source = _source(tmp_path, scope="formal")
+    original = TaskRuntimeEnvironment.from_mapping(
+        load_canonical_json(tmp_path / "authority/g31-environment.json")
+    )
+    evidence_refs = dict(original.evidence_refs)
+    evidence_refs.pop("gate_stage3_g3_5")
+    before_g35 = TaskRuntimeEnvironment(
+        capabilities=original.capabilities,
+        frozen_contract_stages=original.frozen_contract_stages,
+        passed_gate_ids=original.passed_gate_ids - {"stage3.G3-5"},
+        estimator_decision_ref=original.estimator_decision_ref,
+        evidence_refs=evidence_refs,
+    )
+    ref = "authority/g31-environment-before-g35.json"
+    _write(tmp_path, ref, before_g35.to_dict())
+    source["g31_environment_ref"] = ref
+    with pytest.raises(Exception, match="G35_ENVIRONMENT_GATE_MISSING"):
+        materializer.materialize(source, workspace_root=tmp_path, data_root=tmp_path)
+    assert not (tmp_path / source["capture_plan_ref"]).exists()
+
+
+def test_materializer_rejects_formal_execution_without_g35(tmp_path: Path) -> None:
+    source = _source(tmp_path, scope="formal")
+    original_evidence = FormalExecutionEvidence.from_mapping(
+        load_canonical_json(tmp_path / "authority/formal-execution.json")
+    )
+    without_g35 = FormalExecutionEvidence(
+        run_intent=original_evidence.run_intent,
+        contract_freeze_hash=original_evidence.contract_freeze_hash,
+        asset_manifest_hashes=original_evidence.asset_manifest_hashes,
+        prerequisite_gates=tuple(
+            gate for gate in original_evidence.prerequisite_gates if gate.gate_id != "stage3.G3-5"
+        ),
+        metadata=original_evidence.metadata,
+    )
+    execution_ref = "authority/formal-execution-before-g35.json"
+    _write(tmp_path, execution_ref, without_g35.to_dict())
+    original_environment = TaskRuntimeEnvironment.from_mapping(
+        load_canonical_json(tmp_path / "authority/g31-environment.json")
+    )
+    evidence_refs = dict(original_environment.evidence_refs)
+    evidence_refs["formal_execution"] = execution_ref
+    environment = TaskRuntimeEnvironment(
+        capabilities=original_environment.capabilities,
+        frozen_contract_stages=original_environment.frozen_contract_stages,
+        passed_gate_ids=original_environment.passed_gate_ids,
+        estimator_decision_ref=original_environment.estimator_decision_ref,
+        evidence_refs=evidence_refs,
+    )
+    environment_ref = "authority/g31-environment-without-g35-evidence.json"
+    _write(tmp_path, environment_ref, environment.to_dict())
+    source["g31_environment_ref"] = environment_ref
+    with pytest.raises(Exception, match="FORMAL_EXECUTION_G35_MISSING"):
+        materializer.materialize(source, workspace_root=tmp_path, data_root=tmp_path)
+    assert not (tmp_path / source["capture_plan_ref"]).exists()
+
+
+def test_materializer_pilot_remains_compatible_without_g35_environment(tmp_path: Path) -> None:
+    source = _source(tmp_path, scope="pilot")
+    original = TaskRuntimeEnvironment.from_mapping(
+        load_canonical_json(tmp_path / "authority/g31-environment.json")
+    )
+    evidence_refs = dict(original.evidence_refs)
+    evidence_refs.pop("gate_stage3_g3_5")
+    pilot_environment = TaskRuntimeEnvironment(
+        capabilities=original.capabilities,
+        frozen_contract_stages=original.frozen_contract_stages,
+        passed_gate_ids=original.passed_gate_ids - {"stage3.G3-5"},
+        estimator_decision_ref=original.estimator_decision_ref,
+        evidence_refs=evidence_refs,
+    )
+    ref = "authority/g31-environment-pilot-without-g35.json"
+    _write(tmp_path, ref, pilot_environment.to_dict())
+    source["g31_environment_ref"] = ref
+    value = materializer.materialize(source, workspace_root=tmp_path, data_root=tmp_path)
+    assert value["scope"] == "pilot"
 
 
 def test_scope_mixing_is_rejected_before_any_output_is_written(tmp_path: Path) -> None:
