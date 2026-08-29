@@ -463,7 +463,7 @@ class FanoutRunner:
         if requirements != sorted(step["expected_blocker_requirements"]):
             raise _fail("FANOUT_BLOCKER_BOUNDARY_INVALID", step["step_id"])
         if value["status"] == "BLOCKED" and any(
-            item.get("code") != "ASSET_UNAVAILABLE"
+            item.get("code") != "asset_unavailable"
             or item.get("retryable") is not True
             for item in blockers
         ):

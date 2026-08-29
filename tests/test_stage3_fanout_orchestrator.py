@@ -11,7 +11,18 @@ from ops.stage3 import run_stage3_formal as formal
 from ops.stage3 import materialize_stage3_fanout as materializer
 from ops.stage3 import materialize_stage3_task as task_materializer
 from ops.stage3.materialize_stage3_fanout import _schedule
-from param_importance_nlp.contracts import ResolvedConfigV2, load_canonical_json
+from param_importance_nlp.contracts import (
+    RecoveryMode,
+    ResolvedConfigV2,
+    RunnerKind,
+    load_canonical_json,
+)
+from param_importance_nlp.runtime import (
+    BlockerCode,
+    TaskBlocker,
+    TaskRunResult,
+    TaskRunStatus,
+)
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -202,6 +213,53 @@ def test_fanout_executes_expected_block_boundary_then_formal_pass(
     status = formal._load_json(tmp_path / "status.json")
     assert [item["unit_id"] for item in status["units"]] == ["u-1", "u-2"]
     assert all(item["status"] == "PASS" for item in status["units"])
+
+
+def test_fanout_accepts_serialized_retryable_asset_unavailable_blocker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _write(tmp_path / "unit-index.json", {})
+    _environment(tmp_path / "environment.json")
+    manifest = _pilot_manifest(tmp_path)
+    monkeypatch.setattr(
+        fanout, "load_unit_index", lambda *_args, **_kwargs: ("d" * 64, _units())
+    )
+    runner = fanout.FanoutRunner(
+        manifest,
+        workspace_root=tmp_path,
+        data_root=tmp_path,
+        environment=tmp_path / "environment.json",
+    )
+    step = runner.steps[0]
+    result = TaskRunResult(
+        task_id="stage3.05_reference_integral_and_precision",
+        stage=3,
+        runner_kind=RunnerKind.REFERENCE,
+        run_intent="formal",
+        status=TaskRunStatus.BLOCKED,
+        config_hash=str(step["config_hash"]),
+        formal_eligible=False,
+        artifact_refs={},
+        checkpoint_ref=None,
+        blockers=(
+            TaskBlocker(
+                BlockerCode.ASSET_UNAVAILABLE,
+                "stage3.05_reference_coverage",
+                "formal reference coverage 1/12",
+                True,
+                ("evidence/unit-1.json",),
+            ),
+        ),
+        error_code=None,
+        message="formal reference coverage 1/12",
+        recovery_mode=RecoveryMode.RESUME_SHARDS,
+    )
+    path = tmp_path / "blocked-result.json"
+    _write(path, result.to_dict())
+
+    parsed = runner._verify_result(step, path)
+
+    assert parsed["blockers"][0]["code"] == "asset_unavailable"
 
 
 def test_fanout_recovers_completed_process_from_immutable_result(
