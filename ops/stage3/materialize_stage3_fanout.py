@@ -143,39 +143,20 @@ def _schedule(task_id: str, unit_ids: Sequence[str]) -> list[dict[str, Any]]:
             }
             for index, unit_id in enumerate(unit_ids)
         ]
-    # S3.07 first closes all references.  The last reference invocation also
-    # produces its observation, so the second wave contains the other n-1 units.
-    steps: list[dict[str, Any]] = []
-    for index, unit_id in enumerate(unit_ids):
-        last = index == len(unit_ids) - 1
-        steps.append(
-            {
-                "unit_id": unit_id,
-                "completes_phases": (
-                    ["reference", "observation"] if last else ["reference"]
-                ),
-                "expected_status": "BLOCKED",
-                "expected_blocker_requirements": [
-                    "stage3.07_matrix_coverage"
-                    if last
-                    else "stage3.07_reference_coverage"
-                ],
-            }
-        )
-    remaining = list(unit_ids[:-1])
-    for index, unit_id in enumerate(remaining):
-        last = index == len(remaining) - 1
-        steps.append(
-            {
-                "unit_id": unit_id,
-                "completes_phases": ["observation"],
-                "expected_status": "PASS" if last else "BLOCKED",
-                "expected_blocker_requirements": (
-                    [] if last else ["stage3.07_matrix_coverage"]
-                ),
-            }
-        )
-    return steps
+    # S3.07 streams each unit's reference and observation together.  The
+    # matrix aggregate remains intentionally blocked until the final unit, so
+    # every prefix has the same single, retryable coverage boundary.
+    return [
+        {
+            "unit_id": unit_id,
+            "completes_phases": ["reference", "observation"],
+            "expected_status": "PASS" if index == len(unit_ids) - 1 else "BLOCKED",
+            "expected_blocker_requirements": (
+                [] if index == len(unit_ids) - 1 else ["stage3.07_matrix_coverage"]
+            ),
+        }
+        for index, unit_id in enumerate(unit_ids)
+    ]
 
 
 def materialize(

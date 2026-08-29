@@ -19,6 +19,7 @@ from ops.stage3.run_stage3_formal import (
     STAGE3_ORCHESTRATOR_SCHEMA,
     Stage3Orchestrator,
     Stage3OrchestratorError,
+    TASK_ENVIRONMENT_EVIDENCE_REQUIREMENTS,
     _canonical_hash,
     _fail,
     _load_json,
@@ -34,6 +35,61 @@ FANOUT_TASKS = {
     "stage3.06_pilot_and_threshold_freeze",
     "stage3.07_formal_experiment_matrix",
 }
+FORMAL_MATRIX_TASK_ID = "stage3.07_formal_experiment_matrix"
+FORMAL_MATRIX_ENVIRONMENT_EVIDENCE_KEYS = frozenset(
+    TASK_ENVIRONMENT_EVIDENCE_REQUIREMENTS[FORMAL_MATRIX_TASK_ID]
+)
+
+
+def _phase_task_environment_evidence(
+    value: object,
+    *,
+    scope: str,
+) -> dict[str, dict[str, str]]:
+    """Validate task-specific evidence passed into each dynamic environment.
+
+    Fan-out receipts describe unit work, but the formal matrix also consumes
+    phase-level authorities which are deliberately not repeated in every unit
+    input.  Keep those authorities in the phase source and copy them into the
+    task spec so :class:`Stage3Orchestrator` can bind them into the immutable
+    per-task environment.  Formal S3.07 must name both the matrix plan and the
+    live G3-5 Gate; an optional matrix-plan execution evidence ref is accepted
+    for plans whose source refs do not already prove that ancestry.
+    """
+
+    if value is None:
+        value = {}
+    if not isinstance(value, Mapping):
+        raise _fail("PHASE_TASK_ENVIRONMENT_EVIDENCE_INVALID")
+    result: dict[str, dict[str, str]] = {}
+    for task_id, raw_refs in value.items():
+        if (
+            not isinstance(task_id, str)
+            or task_id not in FANOUT_TASKS
+            or not isinstance(raw_refs, Mapping)
+        ):
+            raise _fail("PHASE_TASK_ENVIRONMENT_EVIDENCE_INVALID", task_id)
+        refs: dict[str, str] = {}
+        for key, ref in raw_refs.items():
+            if (
+                not isinstance(key, str)
+                or not key
+                or not isinstance(ref, str)
+                or not ref
+            ):
+                raise _fail("PHASE_TASK_ENVIRONMENT_EVIDENCE_INVALID", task_id)
+            refs[key] = ref
+        result[str(task_id)] = refs
+    if scope == "formal":
+        matrix_refs = result.get(FORMAL_MATRIX_TASK_ID)
+        if matrix_refs is None or not FORMAL_MATRIX_ENVIRONMENT_EVIDENCE_KEYS.issubset(
+            matrix_refs
+        ):
+            raise _fail(
+                "PHASE_FORMAL_MATRIX_ENVIRONMENT_EVIDENCE_MISSING",
+                ",".join(sorted(FORMAL_MATRIX_ENVIRONMENT_EVIDENCE_KEYS)),
+            )
+    return result
 
 
 def _verified_receipt(
@@ -64,6 +120,7 @@ def _fanout_spec(
     scope: str,
     run_config_hash: str,
     data_root: Path,
+    environment_evidence_refs: Mapping[str, str] | None = None,
 ) -> Mapping[str, Any]:
     if receipt.get("scope") != scope:
         raise _fail("PHASE_FANOUT_SCOPE_MISMATCH", task_id)
@@ -94,7 +151,7 @@ def _fanout_spec(
         "config_ref": str(receipt["final_config_ref"]),
         "config_hash": str(receipt["final_config_hash"]),
         "environment_ref": None,
-        "evidence_refs": {},
+        "evidence_refs": dict(environment_evidence_refs or {}),
         "command": [
             "{python}",
             "-m",
@@ -165,11 +222,19 @@ def materialize(
         "asset_manifest_hashes",
         "task_receipt_refs",
     }
-    if set(source) != expected or source.get("schema_version") != SOURCE_SCHEMA:
+    allowed = expected | {"task_environment_evidence_refs"}
+    if (
+        not expected.issubset(source)
+        or not set(source).issubset(allowed)
+        or source.get("schema_version") != SOURCE_SCHEMA
+    ):
         raise _fail("PHASE_MATERIALIZATION_SOURCE_FIELDS_INVALID")
     scope = source.get("scope")
     if scope not in {"pilot", "formal"}:
         raise _fail("PHASE_MATERIALIZATION_SCOPE_INVALID")
+    task_environment_evidence = _phase_task_environment_evidence(
+        source.get("task_environment_evidence_refs"), scope=str(scope)
+    )
     order = PILOT_TASK_ORDER if scope == "pilot" else FORMAL_TASK_ORDER
     run_config_hash = _hash(source.get("config_hash"), "config_hash")
     _hash(source.get("initial_execution_config_hash"), "initial_execution_config_hash")
@@ -212,6 +277,7 @@ def materialize(
                 scope=str(scope),
                 run_config_hash=run_config_hash,
                 data_root=data_root,
+                environment_evidence_refs=task_environment_evidence.get(task_id),
             )
         else:
             task = _direct_spec(receipt, task_id=task_id)

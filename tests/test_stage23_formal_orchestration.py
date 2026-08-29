@@ -6,6 +6,7 @@ formal PASS。测试目的在于证明恢复/身份/数学语义，而不是冒�
 
 from __future__ import annotations
 
+import hashlib
 from pathlib import Path
 
 import numpy as np
@@ -19,7 +20,7 @@ from param_importance_nlp.contracts import (
     validate_stage23_artifact,
 )
 from param_importance_nlp.contracts.errors import FormalRunRejected
-from param_importance_nlp.contracts.jsonio import load_canonical_json
+from param_importance_nlp.contracts.jsonio import load_canonical_json, write_canonical_json
 from param_importance_nlp.contracts.stage23 import FormalExecutionEvidence
 from param_importance_nlp.core.quadrature import (
     composite_simpson_rule,
@@ -46,6 +47,7 @@ from param_importance_nlp.experiments.stage3 import (
     NodeCacheKey,
     ProbeSpec,
 )
+from param_importance_nlp.experiments.stage3_raw_storage import RAW_SHARD_SCHEMA
 from param_importance_nlp.experiments.stage3_formal import (
     EndpointCaptureCoordinator,
     EndpointCaptureRequest,
@@ -595,6 +597,183 @@ def test_persistent_node_cache_survives_process_restart_and_is_immutable(
     restored_map["x"].fill_(17.0)
     assert PersistentNodeGradientCache(root).get(tensor_map_key)["x"].item() == 3.0
     assert resumed.reconcile()["orphan_objects"] == []
+
+
+def _retention_fixture(tmp_path: Path) -> tuple[PersistentNodeGradientCache, Path, Path, str]:
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    cache_root = tmp_path / "retention-cache"
+    receipt_root = tmp_path / "retention-receipts"
+    raw_shard = tmp_path / "downstream.raw"
+    raw_body: dict[str, object] = {
+        "schema_version": RAW_SHARD_SCHEMA,
+        "unit_id": "retention-unit",
+        "candidate_rule_names": ["fixture-rule"],
+    }
+    raw_body["artifact_hash"] = canonical_json_hash(raw_body)
+    write_canonical_json(raw_shard, raw_body)
+    raw_hash = str(raw_body["artifact_hash"])
+    cache = PersistentNodeGradientCache(cache_root)
+    key = NodeCacheKey("retention-unit", 0.5, "float64", _hash("a"), _hash("b"))
+    assert cache.publish_many({key: {"gradient": np.array([1.0, 2.0])}}) == 1
+    return cache, receipt_root, raw_shard, str(raw_body["artifact_hash"])
+
+
+def test_persistent_node_cache_seal_and_evict_is_receipted_and_reinstantiable(
+    tmp_path: Path,
+) -> None:
+    cache, receipt_root, raw_shard, raw_hash = _retention_fixture(tmp_path)
+    tombstone = cache.seal_and_evict(
+        scope="formal",
+        unit_id="retention-unit",
+        plan_hash=_hash("c"),
+        run_config_hash=_hash("d"),
+        downstream_raw_shard_ref=raw_shard,
+        downstream_raw_shard_hash=raw_hash,
+        receipt_root=receipt_root,
+    )
+    assert tombstone["state"] == "EVICTED"
+    assert list((tmp_path / "retention-cache").rglob("*.json")) == []
+    assert PersistentNodeGradientCache(cache.root).keys() == ()
+    verified = PersistentNodeGradientCache.verify_receipt(
+        receipt_root, receipt_root / str(tombstone["tombstone_ref"])
+    )
+    assert verified["state"] == "EVICTED"
+    assert verified["key_digests"]
+    assert verified["commit_artifact_hashes"]
+    assert verified["object_manifest_hashes"]
+    assert verified["downstream_raw_shard_hash"] == raw_hash
+    assert verified["downstream_raw_shard_file_sha256"] == hashlib.sha256(
+        raw_shard.read_bytes()
+    ).hexdigest()
+
+    tombstone_path = receipt_root / str(tombstone["tombstone_ref"])
+    forged = dict(load_canonical_json(tombstone_path))
+    forged["key_digests"] = []
+    forged["tombstone_hash"] = canonical_json_hash(
+        {key: value for key, value in forged.items() if key != "tombstone_hash"}
+    )
+    write_canonical_json(tombstone_path, forged)
+    with pytest.raises(ValueError, match="NODE_CACHE_EVICTED_BINDING_MISMATCH"):
+        PersistentNodeGradientCache.verify_receipt(tombstone_path)
+
+
+def test_persistent_node_cache_seal_only_can_finalize_after_restart(
+    tmp_path: Path,
+) -> None:
+    cache, receipt_root, raw_shard, raw_hash = _retention_fixture(tmp_path)
+    sealed = cache.seal(
+        scope="formal",
+        unit_id="retention-unit",
+        plan_hash=_hash("c"),
+        run_config_hash=_hash("d"),
+        downstream_raw_shard_ref=raw_shard,
+        downstream_raw_shard_hash=raw_hash,
+        receipt_root=receipt_root,
+    )
+    resumed = PersistentNodeGradientCache(cache.root, receipt_root=receipt_root)
+    tombstone = resumed.finalize_eviction(str(sealed["receipt_ref"]))
+    assert tombstone["state"] == "EVICTED"
+    assert PersistentNodeGradientCache.verify_receipt(
+        receipt_root / str(tombstone["tombstone_ref"])
+    )["state"] == "EVICTED"
+
+
+def test_persistent_node_cache_retention_never_deletes_writer_lock_or_partial_drift(
+    tmp_path: Path,
+) -> None:
+    cache, receipt_root, raw_shard, raw_hash = _retention_fixture(tmp_path)
+    sealed = cache.seal(
+        scope="formal",
+        unit_id="retention-unit",
+        plan_hash=_hash("c"),
+        run_config_hash=_hash("d"),
+        downstream_raw_shard_ref=raw_shard,
+        downstream_raw_shard_hash=raw_hash,
+        receipt_root=receipt_root,
+    )
+    lock_path = cache.root / "writer.lock"
+    lock_path.write_bytes(b"active writer")
+    with pytest.raises(ValueError, match="WRITER_LOCK"):
+        cache.finalize_eviction(str(sealed["receipt_ref"]), receipt_root=receipt_root)
+    assert lock_path.exists()
+
+
+def test_persistent_node_cache_retention_finalizes_partial_delete(
+    tmp_path: Path,
+) -> None:
+    cache, receipt_root, raw_shard, raw_hash = _retention_fixture(tmp_path)
+    sealed = cache.seal(
+        scope="formal",
+        unit_id="retention-unit",
+        plan_hash=_hash("c"),
+        run_config_hash=_hash("d"),
+        downstream_raw_shard_ref=raw_shard,
+        downstream_raw_shard_hash=raw_hash,
+        receipt_root=receipt_root,
+    )
+    one_object = next((cache.root / "objects").rglob("*.bin"))
+    one_object.unlink()
+    tombstone = cache.finalize_eviction(
+        str(sealed["receipt_ref"]), receipt_root=receipt_root
+    )
+    assert tombstone["state"] == "EVICTED"
+
+
+def test_persistent_node_cache_retention_rejects_hash_path_and_unknown_drift(
+    tmp_path: Path,
+) -> None:
+    cache, receipt_root, raw_shard, raw_hash = _retention_fixture(tmp_path)
+    object_file = next((cache.root / "objects").rglob("*.bin"))
+    object_file.write_bytes(object_file.read_bytes() + b"drift")
+    with pytest.raises(ValueError, match="OBJECT.*HASH|HASH.*MISMATCH|SIZE_MISMATCH"):
+        cache.seal(
+            scope="formal",
+            unit_id="retention-unit",
+            plan_hash=_hash("c"),
+            run_config_hash=_hash("d"),
+            downstream_raw_shard_ref=raw_shard,
+            downstream_raw_shard_hash=raw_hash,
+            receipt_root=receipt_root,
+        )
+
+    cache, receipt_root, raw_shard, raw_hash = _retention_fixture(tmp_path / "unknown")
+    (cache.root / "objects" / "unknown.bin").write_bytes(b"do not delete")
+    with pytest.raises(ValueError, match="UNKNOWN_OBJECT"):
+        cache.seal(
+            scope="formal",
+            unit_id="retention-unit",
+            plan_hash=_hash("c"),
+            run_config_hash=_hash("d"),
+            downstream_raw_shard_ref=raw_shard,
+            downstream_raw_shard_hash=raw_hash,
+            receipt_root=receipt_root,
+        )
+
+
+def test_persistent_node_cache_retention_rejects_wrong_downstream_or_receipt_root(
+    tmp_path: Path,
+) -> None:
+    cache, receipt_root, raw_shard, raw_hash = _retention_fixture(tmp_path)
+    with pytest.raises(ValueError, match="DOWNSTREAM_RAW_SHARD_HASH_MISMATCH"):
+        cache.seal(
+            scope="formal",
+            unit_id="retention-unit",
+            plan_hash=_hash("c"),
+            run_config_hash=_hash("d"),
+            downstream_raw_shard_ref=raw_shard,
+            downstream_raw_shard_hash=_hash("e"),
+            receipt_root=receipt_root,
+        )
+    with pytest.raises(ValueError, match="OUTSIDE_CACHE_ROOT"):
+        cache.seal(
+            scope="formal",
+            unit_id="retention-unit",
+            plan_hash=_hash("c"),
+            run_config_hash=_hash("d"),
+            downstream_raw_shard_ref=raw_shard,
+            downstream_raw_shard_hash=raw_hash,
+            receipt_root=cache.root / "receipts-inside-cache",
+        )
 
 
 def test_reference_refinement_recovers_levels_and_cross_confirms_families(

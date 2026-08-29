@@ -9,7 +9,7 @@ cannot silently turn into a report.
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 import hashlib
 from pathlib import Path, PurePosixPath
 import math
@@ -467,19 +467,30 @@ def publish_raw_aggregate(
     return body, _relative_ref(root, path)
 
 
-def load_raw_aggregate(
+def _load_raw_aggregate_index(
     *, root: Path, aggregate_ref: object, aggregate_hash: object, require_complete: bool = True
-) -> tuple[Mapping[str, object], dict[str, tuple[Mapping[str, object], Mapping[str, object], TensorBundle]]]:
-    """Strictly reload an aggregate and every referenced shard/bundle."""
+) -> tuple[Mapping[str, object], Mapping[str, object]]:
+    """Validate only the small aggregate index and return its unit entries.
+
+    The index is intentionally separated from shard loading.  Formal reporting and
+    G3-8 use the streaming iterator below so at most one unit's tensors are live.
+    """
 
     path = _relative_path(root, aggregate_ref, field="aggregate")
     raw = load_canonical_json(path)
     if not isinstance(raw, Mapping) or raw.get("schema_version") != RAW_AGGREGATE_SCHEMA:
         raise ValueError("STAGE3_RAW_AGGREGATE_SCHEMA_INVALID")
     supplied = _hash(raw.get("artifact_hash"), "aggregate_artifact")
-    if supplied != aggregate_hash or canonical_json_hash({key: item for key, item in raw.items() if key != "artifact_hash"}) != supplied:
+    if supplied != aggregate_hash or canonical_json_hash(
+        {key: item for key, item in raw.items() if key != "artifact_hash"}
+    ) != supplied:
         raise ValueError("STAGE3_RAW_AGGREGATE_HASH_MISMATCH")
-    required = {"schema_version", "execution_evidence_hash", "reference_binding_hash", "required_unit_ids", "candidate_rule_names", "vector_derivation_schema", "vector_derivation_contract_hash", "complete_unit_ids", "missing_unit_ids", "unit_shards", "artifact_hash"}
+    required = {
+        "schema_version", "execution_evidence_hash", "reference_binding_hash",
+        "required_unit_ids", "candidate_rule_names", "vector_derivation_schema",
+        "vector_derivation_contract_hash", "complete_unit_ids", "missing_unit_ids",
+        "unit_shards", "artifact_hash",
+    }
     if set(raw) != required:
         raise ValueError("STAGE3_RAW_AGGREGATE_FIELDS_MISMATCH")
     required_units = raw.get("required_unit_ids")
@@ -487,21 +498,78 @@ def load_raw_aggregate(
     complete = raw.get("complete_unit_ids")
     missing = raw.get("missing_unit_ids")
     entries = raw.get("unit_shards")
-    if not isinstance(required_units, list) or not isinstance(names, list) or not isinstance(complete, list) or not isinstance(missing, list) or not isinstance(entries, Mapping):
+    if (
+        not isinstance(required_units, list)
+        or not isinstance(names, list)
+        or not isinstance(complete, list)
+        or not isinstance(missing, list)
+        or not isinstance(entries, Mapping)
+    ):
         raise ValueError("STAGE3_RAW_AGGREGATE_INDEX_INVALID")
+    if (
+        any(not isinstance(item, str) or not item for item in required_units)
+        or any(not isinstance(item, str) or not item for item in complete)
+        or any(not isinstance(item, str) or not item for item in missing)
+        or len(set(required_units)) != len(required_units)
+        or len(set(complete)) != len(complete)
+        or len(set(missing)) != len(missing)
+        or set(complete).intersection(missing)
+    ):
+        raise ValueError("STAGE3_RAW_AGGREGATE_UNIT_SET_INVALID")
     if (
         raw.get("vector_derivation_schema") != VECTOR_DERIVATION_SCHEMA
         or raw.get("vector_derivation_contract_hash") != VECTOR_DERIVATION_HASH
     ):
         raise ValueError("STAGE3_RAW_AGGREGATE_DERIVATION_CONTRACT_MISMATCH")
-    if sorted(names) != names or len(set(names)) != len(names) or complete + missing != required_units or set(entries) != set(complete):
+    if (
+        sorted(names) != names
+        or len(set(names)) != len(names)
+        or complete + missing != required_units
+        or set(entries) != set(complete)
+    ):
         raise ValueError("STAGE3_RAW_AGGREGATE_COVERAGE_INVALID")
     if require_complete and (missing or complete != required_units):
         raise ValueError("STAGE3_RAW_AGGREGATE_INCOMPLETE")
     _hash(raw.get("execution_evidence_hash"), "aggregate_execution")
     _hash(raw.get("reference_binding_hash"), "aggregate_binding")
-    loaded: dict[str, tuple[Mapping[str, object], Mapping[str, object], TensorBundle]] = {}
-    for unit_id in complete:
+    return raw, entries
+
+
+def load_raw_aggregate_metadata(
+    *, root: Path, aggregate_ref: object, aggregate_hash: object, require_complete: bool = True
+) -> Mapping[str, object]:
+    """Return verified aggregate metadata without opening any TensorBundle."""
+
+    raw, _entries = _load_raw_aggregate_index(
+        root=root,
+        aggregate_ref=aggregate_ref,
+        aggregate_hash=aggregate_hash,
+        require_complete=require_complete,
+    )
+    return raw
+
+
+def iter_raw_aggregate_units(
+    *, root: Path, aggregate_ref: object, aggregate_hash: object, require_complete: bool = True
+) -> Iterator[tuple[str, Mapping[str, object], Mapping[str, object], TensorBundle]]:
+    """Yield one fully verified raw unit at a time.
+
+    Aggregate completeness/index identity is checked before the first yield.  Each
+    shard and its TensorBundle are then verified against that index and yielded once;
+    callers must consume/derive their small result before advancing the iterator.
+    The generator retains no collection of loaded unit states.
+    """
+
+    raw, entries = _load_raw_aggregate_index(
+        root=root,
+        aggregate_ref=aggregate_ref,
+        aggregate_hash=aggregate_hash,
+        require_complete=require_complete,
+    )
+    required_units = raw["required_unit_ids"]
+    names = raw["candidate_rule_names"]
+    assert isinstance(required_units, list) and isinstance(names, list)
+    for unit_id in required_units:
         entry = entries.get(unit_id)
         if not isinstance(entry, Mapping):
             raise ValueError("STAGE3_RAW_AGGREGATE_ENTRY_INVALID")
@@ -513,17 +581,54 @@ def load_raw_aggregate(
             "execution_evidence_hash": raw["execution_evidence_hash"],
             "reference_binding_hash": raw["reference_binding_hash"],
         }
-        shard, state, bundle = _load_shard(root=root, shard_ref=shard_ref, expected=expected)
-        for field in ("shard_hash", "bundle_ref", "bundle_manifest_hash", "path_identity_hash", "reference_artifact_hash", "reference_identity_hash"):
+        shard, state, bundle = _load_shard(
+            root=root, shard_ref=shard_ref, expected=expected
+        )
+        for field in (
+            "shard_hash", "bundle_ref", "bundle_manifest_hash", "path_identity_hash",
+            "reference_artifact_hash", "reference_identity_hash",
+        ):
             if entry.get(field) != shard.get(field.replace("shard_hash", "artifact_hash")):
                 raise ValueError(f"STAGE3_RAW_AGGREGATE_ENTRY_HASH_MISMATCH:{unit_id}:{field}")
-        loaded[unit_id] = (shard, state, bundle)
+        try:
+            yield str(unit_id), shard, state, bundle
+        finally:
+            # Do not keep the previous unit's tensors alive while the caller asks
+            # for the next one, including when iteration is closed early.
+            del shard, state, bundle
+
+
+def load_raw_aggregate(
+    *, root: Path, aggregate_ref: object, aggregate_hash: object, require_complete: bool = True
+) -> tuple[Mapping[str, object], dict[str, tuple[Mapping[str, object], Mapping[str, object], TensorBundle]]]:
+    """Strictly reload an aggregate and every referenced shard/bundle.
+
+    Kept as a compatibility API for small callers.  Formal 99-unit paths must use
+    :func:`iter_raw_aggregate_units` or :func:`load_raw_aggregate_metadata` instead.
+    """
+
+    raw = load_raw_aggregate_metadata(
+        root=root,
+        aggregate_ref=aggregate_ref,
+        aggregate_hash=aggregate_hash,
+        require_complete=require_complete,
+    )
+    loaded = {
+        unit_id: (shard, state, bundle)
+        for unit_id, shard, state, bundle in iter_raw_aggregate_units(
+            root=root,
+            aggregate_ref=aggregate_ref,
+            aggregate_hash=aggregate_hash,
+            require_complete=require_complete,
+        )
+    }
     return raw, loaded
 
 
 __all__ = [
     "RAW_AGGREGATE_SCHEMA", "RAW_SHARD_SCHEMA", "VECTOR_DERIVATION_SCHEMA",
     "VECTOR_DERIVATION_CONTRACT", "VECTOR_DERIVATION_HASH",
-    "derive_candidate_views", "load_raw_aggregate", "persist_raw_unit_shard",
+    "derive_candidate_views", "iter_raw_aggregate_units", "load_raw_aggregate",
+    "load_raw_aggregate_metadata", "persist_raw_unit_shard",
     "publish_raw_aggregate",
 ]

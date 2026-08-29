@@ -22,6 +22,11 @@ from param_importance_nlp.experiments.stage3_formal import (
     QuadratureThresholds,
 )
 from param_importance_nlp.experiments.stage3_gate import Stage3GateEvaluator
+from param_importance_nlp.experiments.stage3_gate import (
+    STAGE3_STREAMING_AGGREGATE_SCHEMA,
+    _validate_streaming_coverage,
+)
+from param_importance_nlp.experiments.stage3_protocol import DEFAULT_CANDIDATE_RULES
 from param_importance_nlp.contracts.errors import FormalRunRejected
 
 
@@ -260,6 +265,126 @@ def _row(
     if not complete:
         row.pop("normalized_l2_error")
     return row
+
+
+def _streaming_aggregate() -> dict[str, object]:
+    """Build a structurally complete aggregate for pure validator tests."""
+
+    units = [f"unit-{index:03d}" for index in range(99)]
+    receipts = {
+        unit: {
+            "receipt_ref": f"evidence/s307/receipts/{index}.json",
+            "receipt_hash": "a" * 64,
+            "eviction_receipt_ref": f"evidence/s307/evictions/{index}.json",
+            "eviction_receipt_hash": "b" * 64,
+            "reference_artifact_hash": "c" * 64,
+            "observation_artifact_hash": "d" * 64,
+            "raw_shard_hash": "e" * 64,
+            "lifecycle_state": "EVICTED",
+        }
+        for index, unit in enumerate(units)
+    }
+    aggregate: dict[str, object] = {
+        "schema_version": STAGE3_STREAMING_AGGREGATE_SCHEMA,
+        "execution_evidence_hash": "f" * 64,
+        "reference_binding_hash": "0" * 64,
+        "formal_plan_ref": "artifacts/plan/commits/formal_plan.json",
+        "formal_plan_hash": "1" * 64,
+        "production_unit_index_ref": "plans/stage3/production-unit-index.json",
+        "production_unit_index_hash": "2" * 64,
+        "required_unit_ids": units,
+        "candidate_rule_names": list(DEFAULT_CANDIDATE_RULES),
+        "reference_aggregate_ref": "evidence/s307/reference-aggregate.json",
+        "reference_aggregate_hash": "3" * 64,
+        "raw_aggregate_ref": "evidence/s307/raw-aggregate.json",
+        "raw_aggregate_hash": "4" * 64,
+        "reference_complete_unit_ids": units.copy(),
+        "raw_complete_unit_ids": units.copy(),
+        "observation_complete_unit_ids": units.copy(),
+        "receipt_complete_unit_ids": units.copy(),
+        "sealed_unit_ids": units.copy(),
+        "evicted_unit_ids": units.copy(),
+        "committed_unit_ids": units.copy(),
+        "missing_unit_ids": [],
+        "unit_receipts": receipts,
+    }
+    aggregate["artifact_hash"] = canonical_json_hash(aggregate)
+    return aggregate
+
+
+def test_streaming_coverage_requires_exact_final_matrix_snapshot() -> None:
+    aggregate = _streaming_aggregate()
+    units = tuple(aggregate["required_unit_ids"])  # type: ignore[arg-type]
+    rules = tuple(DEFAULT_CANDIDATE_RULES)
+    assert _validate_streaming_coverage(
+        aggregate,
+        required_unit_ids=units,
+        required_rule_names=rules,
+        execution_evidence_hash=aggregate["execution_evidence_hash"],  # type: ignore[arg-type]
+        formal_plan_ref=aggregate["formal_plan_ref"],  # type: ignore[arg-type]
+        formal_plan_hash=aggregate["formal_plan_hash"],  # type: ignore[arg-type]
+        production_unit_index_ref=aggregate["production_unit_index_ref"],  # type: ignore[arg-type]
+        production_unit_index_hash=aggregate["production_unit_index_hash"],  # type: ignore[arg-type]
+    ) == aggregate
+
+    partial = dict(aggregate)
+    partial["evicted_unit_ids"] = list(units[:-1])
+    partial["artifact_hash"] = canonical_json_hash(
+        {key: item for key, item in partial.items() if key != "artifact_hash"}
+    )
+    with pytest.raises(ValueError, match="evicted_unit_ids"):
+        _validate_streaming_coverage(
+            partial,
+            required_unit_ids=units,
+            required_rule_names=rules,
+        )
+
+    forged_hash = dict(aggregate)
+    forged_hash["artifact_hash"] = "0" * 64
+    with pytest.raises(ValueError, match="HASH_MISMATCH"):
+        _validate_streaming_coverage(
+            forged_hash,
+            required_unit_ids=units,
+            required_rule_names=rules,
+        )
+
+    wrong_unit = dict(aggregate)
+    wrong_unit["required_unit_ids"] = ["forged-unit", *units[1:]]
+    wrong_unit["artifact_hash"] = canonical_json_hash(
+        {key: item for key, item in wrong_unit.items() if key != "artifact_hash"}
+    )
+    with pytest.raises(ValueError, match="required_unit_ids"):
+        _validate_streaming_coverage(
+            wrong_unit,
+            required_unit_ids=units,
+            required_rule_names=rules,
+        )
+
+    missing_receipt = dict(aggregate)
+    missing_receipts = dict(aggregate["unit_receipts"])  # type: ignore[arg-type]
+    missing_receipts.pop(units[-1])
+    missing_receipt["unit_receipts"] = missing_receipts
+    missing_receipt["artifact_hash"] = canonical_json_hash(
+        {key: item for key, item in missing_receipt.items() if key != "artifact_hash"}
+    )
+    with pytest.raises(ValueError, match="UNIT_RECEIPTS"):
+        _validate_streaming_coverage(
+            missing_receipt,
+            required_unit_ids=units,
+            required_rule_names=rules,
+        )
+
+    raw_incomplete = dict(aggregate)
+    raw_incomplete["raw_complete_unit_ids"] = list(units[:-1])
+    raw_incomplete["artifact_hash"] = canonical_json_hash(
+        {key: item for key, item in raw_incomplete.items() if key != "artifact_hash"}
+    )
+    with pytest.raises(ValueError, match="raw_complete_unit_ids"):
+        _validate_streaming_coverage(
+            raw_incomplete,
+            required_unit_ids=units,
+            required_rule_names=rules,
+        )
 
 
 def test_stage3_evaluator_requires_all_metrics_and_real_gates() -> None:

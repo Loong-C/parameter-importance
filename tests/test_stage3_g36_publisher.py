@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 
+import param_importance_nlp.experiments.stage3_g36_publisher as g36_publisher
 from param_importance_nlp.analysis.report import FrozenSourceTable
 from param_importance_nlp.contracts import (
     FormalExecutionEvidence,
@@ -18,11 +19,18 @@ from param_importance_nlp.contracts import (
     validate_stage23_artifact,
 )
 from param_importance_nlp.contracts.errors import FormalRunRejected
+from param_importance_nlp.contracts.jsonio import write_canonical_json
 from param_importance_nlp.contracts.stage3_scope import validate_stage3_scope_decision
 from param_importance_nlp.experiments.stage3_g36_publisher import (
     Stage3G36Publication,
     Stage3G36Publisher,
 )
+from param_importance_nlp.experiments.stage3_raw_storage import (
+    RAW_AGGREGATE_SCHEMA,
+    VECTOR_DERIVATION_HASH,
+    VECTOR_DERIVATION_SCHEMA,
+)
+from param_importance_nlp.experiments.stage3_protocol import DEFAULT_CANDIDATE_RULES
 from param_importance_nlp.runtime.task_artifacts import (
     TaskArtifactStore,
     load_committed_task_artifact,
@@ -195,7 +203,12 @@ def _provenance(refs: tuple[str, ...]) -> ProvenanceRecord:
     )
 
 
-def _publish_inputs(root: Path, *, self_bind_provenance: bool = False) -> dict[str, str]:
+def _publish_inputs(
+    root: Path,
+    *,
+    self_bind_provenance: bool = False,
+    matrix_plan: bool = False,
+) -> dict[str, str]:
     def store(name: str) -> TaskArtifactStore:
         return TaskArtifactStore(root, f"artifacts/{name}")
 
@@ -265,6 +278,15 @@ def _publish_inputs(root: Path, *, self_bind_provenance: bool = False) -> dict[s
         "execution_evidence_hash": execution.artifact_hash,
         "formal_eligible": True,
     }
+    if matrix_plan:
+        plan.update(
+            {
+                "plan_kind": "matrix",
+                "production_unit_index_scope": "formal",
+                "production_unit_index_ref": "plans/stage3/production-unit-index.json",
+                "production_unit_index_hash": "2" * 64,
+            }
+        )
     plan["artifact_hash"] = canonical_json_hash(plan)
     plan_commit = store("plan").publish(
         task_id="stage3.07_formal_experiment_matrix",
@@ -375,3 +397,89 @@ def test_stage3_g36_publisher_rejects_provenance_self_binding(tmp_path: Path) ->
             config_hash=CONFIG_HASH,
             **refs,
         )
+
+
+def test_stage3_g36_publisher_requires_streaming_coverage_for_matrix_plan(tmp_path: Path) -> None:
+    refs = _publish_inputs(tmp_path, matrix_plan=True)
+    with pytest.raises(FormalRunRejected, match="STREAMING_COVERAGE_REQUIRED"):
+        Stage3G36Publisher().publish(
+            workspace_root=tmp_path,
+            output_dir="artifacts/publisher",
+            config_hash=CONFIG_HASH,
+            **refs,
+        )
+
+
+def test_raw_streaming_verifier_returns_metadata_without_retaining_tensor_states(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """G3-6 must not accumulate the matrix's TensorBundle states in memory."""
+
+    units = tuple(f"unit-{index:03d}" for index in range(99))
+    rules = tuple(DEFAULT_CANDIDATE_RULES)
+    execution_hash = "a" * 64
+    binding_hash = "b" * 64
+    entries: dict[str, dict[str, str]] = {}
+    for index, unit_id in enumerate(units):
+        entries[unit_id] = {
+            "shard_ref": f"raw/shards/{unit_id}.json",
+            "shard_hash": f"{index + 1:064x}",
+            "bundle_ref": f"raw/bundles/{unit_id}.bundle",
+            "bundle_manifest_hash": f"{index + 101:064x}",
+            "path_identity_hash": f"{index + 201:064x}",
+            "reference_artifact_hash": f"{index + 301:064x}",
+            "reference_identity_hash": f"{index + 401:064x}",
+        }
+    aggregate: dict[str, object] = {
+        "schema_version": RAW_AGGREGATE_SCHEMA,
+        "execution_evidence_hash": execution_hash,
+        "reference_binding_hash": binding_hash,
+        "required_unit_ids": list(units),
+        "candidate_rule_names": sorted(rules),
+        "vector_derivation_schema": VECTOR_DERIVATION_SCHEMA,
+        "vector_derivation_contract_hash": VECTOR_DERIVATION_HASH,
+        "complete_unit_ids": list(units),
+        "missing_unit_ids": [],
+        "unit_shards": entries,
+    }
+    aggregate["artifact_hash"] = canonical_json_hash(aggregate)
+    aggregate_path = tmp_path / "raw" / "aggregate.json"
+    aggregate_path.parent.mkdir(parents=True)
+    write_canonical_json(aggregate_path, aggregate)
+
+    calls = 0
+
+    def fake_load_shard(*, root: Path, shard_ref: object, expected: object):
+        nonlocal calls
+        calls += 1
+        assert root == tmp_path
+        assert isinstance(expected, dict)
+        unit_id = str(expected["unit_id"])
+        entry = entries[unit_id]
+        # These stand in for the large state/bundle objects.  The verifier
+        # must release them per iteration and return only aggregate metadata.
+        shard = {
+            "artifact_hash": entry["shard_hash"],
+            "bundle_ref": entry["bundle_ref"],
+            "bundle_manifest_hash": entry["bundle_manifest_hash"],
+            "path_identity_hash": entry["path_identity_hash"],
+            "reference_artifact_hash": entry["reference_artifact_hash"],
+            "reference_identity_hash": entry["reference_identity_hash"],
+        }
+        return shard, {"large": bytearray(1024)}, object()
+
+    monkeypatch.setattr(g36_publisher, "_load_raw_shard", fake_load_shard)
+    raw, metadata = g36_publisher._load_raw_aggregate_for_streaming(
+        tmp_path,
+        "raw/aggregate.json",
+        declared_hash=aggregate["artifact_hash"],
+        expected_units=units,
+        expected_rules=rules,
+        expected_execution_hash=execution_hash,
+        expected_binding_hash=binding_hash,
+    )
+
+    assert calls == len(units)
+    assert raw is not None
+    assert metadata == entries
+    assert all(set(value) == set(entries[units[0]]) for value in metadata.values())

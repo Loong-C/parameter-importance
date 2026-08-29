@@ -5,6 +5,7 @@ from pathlib import Path
 import pytest
 
 from param_importance_nlp.analysis import AnalysisReportBuilder, ChartSpec, MetricResult
+from param_importance_nlp.contracts.jsonio import canonical_json_hash, write_canonical_json
 from param_importance_nlp.experiments.stage3_reporting import (
     build_raw_reporting_tables,
     write_reporting_bundle,
@@ -15,6 +16,7 @@ from param_importance_nlp.experiments.stage3_raw_storage import (
     persist_raw_unit_shard,
     publish_raw_aggregate,
 )
+from param_importance_nlp.experiments import stage3_raw_storage
 import torch
 
 
@@ -100,7 +102,9 @@ def test_reporting_bundle_writes_hash_bound_json_csv_png_and_svg(tmp_path: Path)
         assert Path(tmp_path / figure["svg"]["path"]).is_file()  # type: ignore[index]
 
 
-def test_formal_raw_aggregate_keeps_all_units_and_rejects_bundle_tamper(tmp_path: Path) -> None:
+def test_formal_raw_aggregate_keeps_all_units_and_rejects_bundle_tamper(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     required = ("unit-1", "unit-2")
     execution_hash = "1" * 64
     binding_hash = "2" * 64
@@ -159,6 +163,10 @@ def test_formal_raw_aggregate_keeps_all_units_and_rejects_bundle_tamper(tmp_path
         "raw_aggregate_ref": aggregate_ref,
         "raw_aggregate_hash": aggregate["artifact_hash"],
     }
+    def fail_full_loader(**_kwargs: object) -> object:
+        raise AssertionError("reporting must use bounded raw aggregate iteration")
+
+    monkeypatch.setattr(stage3_raw_storage, "load_raw_aggregate", fail_full_loader)
     vectors, curves = build_raw_reporting_tables(raw, workspace_root=tmp_path)
     assert len(vectors.rows) == 2
     assert {row["unit_id"] for row in vectors.rows} == set(required)
@@ -197,3 +205,108 @@ def test_formal_raw_aggregate_keeps_all_units_and_rejects_bundle_tamper(tmp_path
     tensor_path.write_bytes(tensor_path.read_bytes() + b"tamper")
     with pytest.raises(ValueError, match="TENSOR_(?:SIZE|HASH)_MISMATCH"):
         build_raw_reporting_tables(raw, workspace_root=tmp_path)
+
+
+def test_raw_aggregate_metadata_and_iterator_are_bounded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Metadata validation must not call the legacy all-units loader."""
+
+    from param_importance_nlp.experiments.stage3_raw_storage import (
+        RAW_AGGREGATE_SCHEMA,
+        VECTOR_DERIVATION_HASH,
+        VECTOR_DERIVATION_SCHEMA,
+        iter_raw_aggregate_units,
+        load_raw_aggregate_metadata,
+    )
+
+    units = ["unit-a", "unit-b", "unit-c"]
+    execution_hash = "1" * 64
+    binding_hash = "2" * 64
+    entries = {
+        unit_id: {
+            "shard_ref": f"raw/{unit_id}.json",
+            "shard_hash": f"{index + 1:064x}",
+            "bundle_ref": f"raw/{unit_id}.bundle",
+            "bundle_manifest_hash": f"{index + 101:064x}",
+            "path_identity_hash": f"{index + 201:064x}",
+            "reference_artifact_hash": f"{index + 301:064x}",
+            "reference_identity_hash": f"{index + 401:064x}",
+        }
+        for index, unit_id in enumerate(units)
+    }
+    aggregate: dict[str, object] = {
+        "schema_version": RAW_AGGREGATE_SCHEMA,
+        "execution_evidence_hash": execution_hash,
+        "reference_binding_hash": binding_hash,
+        "required_unit_ids": units,
+        "candidate_rule_names": ["trapezoid"],
+        "vector_derivation_schema": VECTOR_DERIVATION_SCHEMA,
+        "vector_derivation_contract_hash": VECTOR_DERIVATION_HASH,
+        "complete_unit_ids": units,
+        "missing_unit_ids": [],
+        "unit_shards": entries,
+    }
+    aggregate["artifact_hash"] = canonical_json_hash(aggregate)
+    aggregate_path = tmp_path / "raw" / "aggregate.json"
+    write_canonical_json(aggregate_path, aggregate)
+
+    def fail_full_loader(**_kwargs: object) -> object:
+        raise AssertionError("bounded API must not call load_raw_aggregate")
+
+    monkeypatch.setattr(stage3_raw_storage, "load_raw_aggregate", fail_full_loader)
+    metadata = load_raw_aggregate_metadata(
+        root=tmp_path,
+        aggregate_ref="raw/aggregate.json",
+        aggregate_hash=aggregate["artifact_hash"],
+    )
+    assert metadata["required_unit_ids"] == units
+
+    duplicate = dict(aggregate)
+    duplicate["required_unit_ids"] = ["unit-a", "unit-a", "unit-b"]
+    duplicate["complete_unit_ids"] = ["unit-a", "unit-a", "unit-b"]
+    duplicate["unit_shards"] = {
+        "unit-a": entries["unit-a"],
+        "unit-b": entries["unit-b"],
+    }
+    duplicate["artifact_hash"] = canonical_json_hash(
+        {key: value for key, value in duplicate.items() if key != "artifact_hash"}
+    )
+    duplicate_path = tmp_path / "raw" / "aggregate-duplicate.json"
+    write_canonical_json(duplicate_path, duplicate)
+    with pytest.raises(ValueError, match="AGGREGATE_UNIT_SET_INVALID"):
+        load_raw_aggregate_metadata(
+            root=tmp_path,
+            aggregate_ref="raw/aggregate-duplicate.json",
+            aggregate_hash=duplicate["artifact_hash"],
+        )
+
+    calls: list[str] = []
+
+    def fake_load_shard(*, root: Path, shard_ref: object, expected: object):
+        assert root == tmp_path
+        assert isinstance(expected, dict)
+        unit_id = str(expected["unit_id"])
+        calls.append(unit_id)
+        entry = entries[unit_id]
+        shard = {
+            "artifact_hash": entry["shard_hash"],
+            "bundle_ref": entry["bundle_ref"],
+            "bundle_manifest_hash": entry["bundle_manifest_hash"],
+            "path_identity_hash": entry["path_identity_hash"],
+            "reference_artifact_hash": entry["reference_artifact_hash"],
+            "reference_identity_hash": entry["reference_identity_hash"],
+        }
+        return shard, {"unit_id": unit_id}, object()
+
+    monkeypatch.setattr(stage3_raw_storage, "_load_shard", fake_load_shard)
+    yielded = [
+        unit_id
+        for unit_id, _shard, _state, _bundle in iter_raw_aggregate_units(
+            root=tmp_path,
+            aggregate_ref="raw/aggregate.json",
+            aggregate_hash=aggregate["artifact_hash"],
+        )
+    ]
+    assert yielded == units
+    assert calls == units

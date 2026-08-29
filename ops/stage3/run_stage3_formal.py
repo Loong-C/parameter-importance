@@ -95,6 +95,19 @@ EXTERNAL_GATE_BY_TASK = {
     "stage3.08_error_analysis_and_stability": "stage3.G3-6",
     "stage3.09_cost_and_method_selection": "stage3.G3-7",
 }
+TASK_ENVIRONMENT_EVIDENCE_REQUIREMENTS = {
+    # The formal matrix plan and the independent G3-5 Gate are phase-level
+    # authorities.  They must be carried by the task environment rather than
+    # smuggled into per-unit predecessor refs.  The plan execution evidence
+    # ref is intentionally optional: the plan's committed source refs may
+    # already prove the required execution ancestry.
+    "stage3.07_formal_experiment_matrix": frozenset(
+        {
+            "formal_stage3_matrix_plan",
+            "gate_stage3_g3_5",
+        }
+    ),
+}
 EXPECTED_OUTPUTS = {
     "stage3.01_prerequisites_and_scope": (
         "prerequisite_report", "scope_freeze", "gate_record"
@@ -245,6 +258,27 @@ def _forbidden_ref(value: object, field: str) -> None:
     lowered = value.casefold()
     if "fixture" in lowered or "synthetic" in lowered:
         raise _fail("FORMAL_FIXTURE_OR_SYNTHETIC_REF", field)
+
+
+def _validate_task_environment_evidence(
+    task_id: str,
+    evidence_refs: Mapping[str, str],
+) -> None:
+    """Require phase authorities before a formal task can be launched."""
+
+    required = TASK_ENVIRONMENT_EVIDENCE_REQUIREMENTS.get(task_id)
+    if required is None:
+        return
+    missing = sorted(key for key in required if key not in evidence_refs)
+    if missing:
+        raise _fail(
+            "TASK_ENVIRONMENT_EVIDENCE_MISSING",
+            f"{task_id}:{','.join(missing)}",
+        )
+    for key in required:
+        value = evidence_refs.get(key)
+        if not isinstance(value, str) or not value:
+            raise _fail("TASK_ENVIRONMENT_EVIDENCE_INVALID", f"{task_id}:{key}")
 
 
 def _walk(value: object):
@@ -625,6 +659,10 @@ class TaskSpec:
             for key, item in evidence_refs.items()
         ):
             raise _fail("TASK_SPEC_EVIDENCE_REFS_INVALID", task_id)
+        _validate_task_environment_evidence(
+            str(task_id),
+            {str(key): str(item) for key, item in evidence_refs.items()},
+        )
         return cls(
             task_id=task_id,
             config_ref=str(value["config_ref"]),
@@ -1199,6 +1237,7 @@ class Stage3Orchestrator:
         for key, value in task_evidence_refs.items():
             _forbidden_ref(value, f"{task_id}.evidence_refs.{key}")
             evidence_refs[key] = value
+        _validate_task_environment_evidence(task_id, evidence_refs)
         env_payload = {
             "schema_version": "task-runtime-environment-v1",
             "capabilities": list(base.get("capabilities", [])),
@@ -1373,6 +1412,8 @@ __all__ = [
     "Stage3OrchestratorError",
     "UnitLedger",
     "UnitRecord",
+    "TASK_ENVIRONMENT_EVIDENCE_REQUIREMENTS",
+    "_validate_task_environment_evidence",
     "launch_detached",
     "load_unit_index",
     "validate_stage2_identity",

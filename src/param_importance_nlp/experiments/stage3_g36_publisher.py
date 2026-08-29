@@ -18,13 +18,14 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from pathlib import PurePosixPath
 import math
 import re
 
 from ..analysis.report import FrozenSourceTable
 from ..contracts.errors import FormalRunRejected
 from ..contracts.immutable import thaw_json_value
-from ..contracts.jsonio import JSONValue, canonical_json_hash
+from ..contracts.jsonio import JSONValue, canonical_json_hash, load_canonical_json
 from ..contracts.provenance import ProvenanceRecord, ProvenanceStatus
 from ..contracts.stage23 import FormalExecutionEvidence
 from ..contracts.stage3_scope import (
@@ -37,7 +38,19 @@ from ..runtime.task_artifacts import (
     TaskArtifactStore,
     load_committed_task_artifact,
 )
-from .stage3_gate import Stage3GateEvaluation, Stage3GateEvaluator
+from .stage3_formal import PersistentNodeGradientCache
+from .stage3_raw_storage import (
+    RAW_AGGREGATE_SCHEMA,
+    VECTOR_DERIVATION_HASH,
+    VECTOR_DERIVATION_SCHEMA,
+    _load_shard as _load_raw_shard,
+)
+from .stage3_gate import (
+    Stage3GateEvaluation,
+    Stage3GateEvaluator,
+    _streaming_coverage_metrics,
+    _validate_streaming_coverage,
+)
 
 
 STAGE3_G36_PUBLICATION_SCHEMA = "stage3-g36-publication-v1"
@@ -52,6 +65,87 @@ _PLAN_KINDS = frozenset({"formal_plan", "stage3_formal_plan"})
 _PROVENANCE_KINDS = frozenset({"provenance_record", "provenance"})
 _EXECUTION_KINDS = frozenset({"formal_execution_evidence", "execution_evidence"})
 _SCOPE_KINDS = frozenset({"scope_authority", "stage3_scope_authority"})
+_REFERENCE_AGGREGATE_FIELDS = frozenset(
+    {
+        "schema_version",
+        "reference_scope",
+        "execution_evidence_hash",
+        "reference_binding_hash",
+        "required_unit_ids",
+        "complete_unit_ids",
+        "missing_unit_ids",
+        "unit_references",
+        "artifact_hash",
+    }
+)
+_REFERENCE_SHARD_FIELDS = frozenset(
+    {
+        "schema_version",
+        "unit_id",
+        "path_identity_hash",
+        "execution_evidence_hash",
+        "reference_binding_hash",
+        "reference_artifact_hash",
+        "reference",
+        "contribution_bundle_ref",
+        "contribution_bundle_manifest_hash",
+        "required_unit_ids",
+        "scientific_identity_hash",
+        "artifact_hash",
+    }
+)
+_STREAMING_RECEIPT_FIELDS = frozenset(
+    {
+        "schema_version",
+        "unit_id",
+        "required_unit_ids",
+        "candidate_rule_names",
+        "execution_evidence_hash",
+        "formal_plan_ref",
+        "formal_plan_hash",
+        "production_unit_index_ref",
+        "production_unit_index_hash",
+        "reference_binding_hash",
+        "path_identity_hash",
+        "reference_artifact_hash",
+        "reference_shard_ref",
+        "reference_shard_hash",
+        "reference_aggregate_ref",
+        "reference_aggregate_hash",
+        "observation_ledger_ref",
+        "observation_artifact_hash",
+        "raw_shard_ref",
+        "raw_shard_hash",
+        "raw_bundle_ref",
+        "raw_bundle_manifest_hash",
+        "raw_aggregate_ref",
+        "raw_aggregate_hash",
+        "node_cache_evidence_hash",
+        "node_cache_seal_ref",
+        "node_cache_seal_hash",
+        "local_commit_state",
+        "artifact_hash",
+    }
+)
+_STREAMING_EVICTION_FIELDS = frozenset(
+    {
+        "schema_version",
+        "unit_id",
+        "unit_receipt_ref",
+        "unit_receipt_hash",
+        "seal_ref",
+        "seal_hash",
+        "cache_root_ref",
+        "eviction_ref",
+        "eviction_hash",
+        "execution_evidence_hash",
+        "reference_binding_hash",
+        "external_request_id",
+        "idempotency_key",
+        "state",
+        "artifact_hash",
+    }
+)
 
 
 def _hash(value: object, *, field: str) -> str:
@@ -111,6 +205,501 @@ def _mapping(value: object, *, field: str) -> Mapping[str, object]:
     if not isinstance(value, Mapping):
         raise TypeError(f"{field} 必须是 object")
     return value
+
+
+def _load_workspace_json(root: Path, reference: object, *, field: str) -> Mapping[str, object]:
+    """Load one canonical JSON object using the same workspace safety fence."""
+
+    ref = _ref(reference, field=field)
+    logical = PurePosixPath(ref)
+    if (
+        Path(ref).is_absolute()
+        or logical.is_absolute()
+        or any(part in {"", ".", ".."} for part in logical.parts)
+        or "\\" in ref
+    ):
+        raise FormalRunRejected(f"STAGE3_G36_{field.upper()}_REF_ESCAPE")
+    if root.is_symlink():
+        raise FormalRunRejected(f"STAGE3_G36_{field.upper()}_SYMLINK")
+    current = root
+    for part in logical.parts:
+        current = current / part
+        if current.is_symlink():
+            raise FormalRunRejected(f"STAGE3_G36_{field.upper()}_SYMLINK")
+    try:
+        payload = load_canonical_json(root.joinpath(*logical.parts))
+    except (OSError, TypeError, ValueError) as error:
+        raise FormalRunRejected(f"STAGE3_G36_{field.upper()}_LOAD_FAILED") from error
+    return _mapping(payload, field=field)
+
+
+def _checked_body_hash(value: Mapping[str, object], *, field: str) -> str:
+    supplied = value.get("artifact_hash")
+    _hash(supplied, field=f"{field}.artifact_hash")
+    if canonical_json_hash(
+        {key: item for key, item in value.items() if key != "artifact_hash"}
+    ) != supplied:
+        raise FormalRunRejected(f"STAGE3_G36_{field.upper()}_HASH_MISMATCH")
+    return str(supplied)
+
+
+def _load_reference_aggregate(
+    root: Path,
+    reference: str,
+    *,
+    declared_hash: object,
+    expected_units: tuple[str, ...],
+    expected_execution_hash: str,
+    expected_binding_hash: str,
+) -> tuple[Mapping[str, object], Mapping[str, Mapping[str, object]]]:
+    """Reload the complete reference aggregate and its 99 immutable shards."""
+
+    aggregate = _load_workspace_json(root, reference, field="reference_aggregate")
+    if set(aggregate) != _REFERENCE_AGGREGATE_FIELDS:
+        raise FormalRunRejected("STAGE3_G36_REFERENCE_AGGREGATE_FIELDS_INVALID")
+    aggregate_hash = _checked_body_hash(aggregate, field="reference_aggregate")
+    _hash(declared_hash, field="streaming_reference_aggregate_hash")
+    if aggregate_hash != declared_hash:
+        raise FormalRunRejected("STAGE3_G36_REFERENCE_AGGREGATE_HASH_MISMATCH")
+    if (
+        aggregate.get("schema_version") != "stage3-reference-aggregate-v1"
+        or aggregate.get("reference_scope") != "matrix"
+        or aggregate.get("execution_evidence_hash") != expected_execution_hash
+        or aggregate.get("reference_binding_hash") != expected_binding_hash
+    ):
+        raise FormalRunRejected("STAGE3_G36_REFERENCE_AGGREGATE_BINDING_INVALID")
+    if aggregate.get("required_unit_ids") != list(expected_units):
+        raise FormalRunRejected("STAGE3_G36_REFERENCE_AGGREGATE_REQUIRED_UNITS_INVALID")
+    if aggregate.get("complete_unit_ids") != list(expected_units) or aggregate.get("missing_unit_ids") != []:
+        raise FormalRunRejected("STAGE3_G36_REFERENCE_AGGREGATE_INCOMPLETE")
+    entries = aggregate.get("unit_references")
+    if not isinstance(entries, Mapping) or set(entries) != set(expected_units):
+        raise FormalRunRejected("STAGE3_G36_REFERENCE_AGGREGATE_ENTRIES_INVALID")
+
+    loaded_entries: dict[str, Mapping[str, object]] = {}
+    for unit_id in expected_units:
+        entry = entries[unit_id]
+        if not isinstance(entry, Mapping):
+            raise FormalRunRejected(f"STAGE3_G36_REFERENCE_ENTRY_INVALID:{unit_id}")
+        expected_entry_fields = {
+            "ledger_ref",
+            "ledger_artifact_hash",
+            "reference_artifact_hash",
+            "path_identity_hash",
+            "contribution_bundle_ref",
+            "contribution_bundle_manifest_hash",
+            "reference_binding_hash",
+        }
+        if set(entry) != expected_entry_fields:
+            raise FormalRunRejected(f"STAGE3_G36_REFERENCE_ENTRY_FIELDS_INVALID:{unit_id}")
+        for field in (
+            "ledger_artifact_hash",
+            "reference_artifact_hash",
+            "path_identity_hash",
+            "contribution_bundle_manifest_hash",
+            "reference_binding_hash",
+        ):
+            _hash(entry[field], field=f"reference_entry[{unit_id}].{field}")
+        if entry["reference_binding_hash"] != expected_binding_hash:
+            raise FormalRunRejected(f"STAGE3_G36_REFERENCE_ENTRY_BINDING_INVALID:{unit_id}")
+        shard = _load_workspace_json(root, entry["ledger_ref"], field="reference_shard")
+        if set(shard) != _REFERENCE_SHARD_FIELDS:
+            raise FormalRunRejected(f"STAGE3_G36_REFERENCE_SHARD_FIELDS_INVALID:{unit_id}")
+        shard_hash = _checked_body_hash(shard, field="reference_shard")
+        _hash(shard["scientific_identity_hash"], field=f"reference_shard[{unit_id}].scientific_identity_hash")
+        reference_payload = shard.get("reference")
+        if not isinstance(reference_payload, Mapping):
+            raise FormalRunRejected(f"STAGE3_G36_REFERENCE_PAYLOAD_INVALID:{unit_id}")
+        reference_hash = canonical_json_hash(reference_payload)
+        if (
+            shard_hash != entry["ledger_artifact_hash"]
+            or shard.get("unit_id") != unit_id
+            or shard.get("required_unit_ids") != list(expected_units)
+            or shard.get("execution_evidence_hash") != expected_execution_hash
+            or shard.get("reference_binding_hash") != expected_binding_hash
+            or shard.get("reference_artifact_hash") != reference_hash
+            or entry["reference_artifact_hash"] != reference_hash
+            or reference_payload.get("execution_evidence_hash") != expected_execution_hash
+            or reference_payload.get("reference_binding_hash") != expected_binding_hash
+            or not isinstance(reference_payload.get("refinement"), Mapping)
+            or reference_payload["refinement"].get("converged") is not True
+        ):
+            raise FormalRunRejected(f"STAGE3_G36_REFERENCE_SHARD_BINDING_INVALID:{unit_id}")
+        if reference_payload.get("path_identity_hash") != entry["path_identity_hash"]:
+            raise FormalRunRejected(f"STAGE3_G36_REFERENCE_PATH_IDENTITY_INVALID:{unit_id}")
+        loaded_entries[unit_id] = {
+            "entry": entry,
+            "shard": shard,
+        }
+    return aggregate, loaded_entries
+
+
+def _load_raw_aggregate_for_streaming(
+    root: Path,
+    reference: str,
+    *,
+    declared_hash: object,
+    expected_units: tuple[str, ...],
+    expected_rules: tuple[str, ...],
+    expected_execution_hash: str,
+    expected_binding_hash: str,
+) -> tuple[Mapping[str, object], Mapping[str, object]]:
+    """Reload a raw aggregate with bounded memory.
+
+    The raw storage loader returns every TensorBundle state in one mapping,
+    which is appropriate for small callers but would retain the complete
+    formal matrix in memory.  G3-6 only needs the aggregate's metadata after
+    validation, so each shard/bundle is loaded, checked, and released before
+    proceeding to the next unit.
+    """
+
+    raw = _load_workspace_json(root, reference, field="raw_aggregate")
+    required_fields = {
+        "schema_version",
+        "execution_evidence_hash",
+        "reference_binding_hash",
+        "required_unit_ids",
+        "candidate_rule_names",
+        "vector_derivation_schema",
+        "vector_derivation_contract_hash",
+        "complete_unit_ids",
+        "missing_unit_ids",
+        "unit_shards",
+        "artifact_hash",
+    }
+    if set(raw) != required_fields or raw.get("schema_version") != RAW_AGGREGATE_SCHEMA:
+        raise FormalRunRejected("STAGE3_G36_RAW_AGGREGATE_FIELDS_INVALID")
+    aggregate_hash = _checked_body_hash(raw, field="raw_aggregate")
+    _hash(declared_hash, field="streaming_raw_aggregate_hash")
+    if aggregate_hash != declared_hash:
+        raise FormalRunRejected("STAGE3_G36_RAW_AGGREGATE_HASH_MISMATCH")
+    entries = raw.get("unit_shards")
+    if not isinstance(entries, Mapping):
+        raise FormalRunRejected("STAGE3_G36_RAW_AGGREGATE_ENTRIES_INVALID")
+    if (
+        raw.get("vector_derivation_schema") != VECTOR_DERIVATION_SCHEMA
+        or raw.get("vector_derivation_contract_hash") != VECTOR_DERIVATION_HASH
+    ):
+        raise FormalRunRejected("STAGE3_G36_RAW_AGGREGATE_DERIVATION_INVALID")
+    if (
+        raw.get("execution_evidence_hash") != expected_execution_hash
+        or raw.get("reference_binding_hash") != expected_binding_hash
+        or raw.get("required_unit_ids") != list(expected_units)
+        or raw.get("candidate_rule_names") != sorted(expected_rules)
+        or raw.get("complete_unit_ids") != list(expected_units)
+        or raw.get("missing_unit_ids") != []
+        or set(entries) != set(expected_units)
+    ):
+        raise FormalRunRejected("STAGE3_G36_RAW_AGGREGATE_BINDING_INVALID")
+    _hash(raw.get("execution_evidence_hash"), field="raw_aggregate.execution_evidence_hash")
+    _hash(raw.get("reference_binding_hash"), field="raw_aggregate.reference_binding_hash")
+    expected_entry_fields = {
+        "shard_ref",
+        "shard_hash",
+        "bundle_ref",
+        "bundle_manifest_hash",
+        "path_identity_hash",
+        "reference_artifact_hash",
+        "reference_identity_hash",
+    }
+    for unit_id in expected_units:
+        entry = entries.get(unit_id)
+        if not isinstance(entry, Mapping) or set(entry) != expected_entry_fields:
+            raise FormalRunRejected(f"STAGE3_G36_RAW_AGGREGATE_ENTRY_INVALID:{unit_id}")
+        for field in (
+            "shard_hash",
+            "bundle_manifest_hash",
+            "path_identity_hash",
+            "reference_artifact_hash",
+            "reference_identity_hash",
+        ):
+            _hash(entry.get(field), field=f"raw_entry[{unit_id}].{field}")
+        expected = {
+            "unit_id": unit_id,
+            "required_unit_ids": list(expected_units),
+            "candidate_rule_names": sorted(expected_rules),
+            "execution_evidence_hash": expected_execution_hash,
+            "reference_binding_hash": expected_binding_hash,
+        }
+        shard = state = bundle = None
+        try:
+            shard, state, bundle = _load_raw_shard(
+                root=root,
+                shard_ref=entry.get("shard_ref"),
+                expected=expected,
+            )
+            for field, shard_field in (
+                ("shard_hash", "artifact_hash"),
+                ("bundle_ref", "bundle_ref"),
+                ("bundle_manifest_hash", "bundle_manifest_hash"),
+                ("path_identity_hash", "path_identity_hash"),
+                ("reference_artifact_hash", "reference_artifact_hash"),
+                ("reference_identity_hash", "reference_identity_hash"),
+            ):
+                if entry.get(field) != shard.get(shard_field):
+                    raise FormalRunRejected(
+                        f"STAGE3_G36_RAW_AGGREGATE_ENTRY_HASH_MISMATCH:{unit_id}:{field}"
+                    )
+        except (OSError, TypeError, ValueError) as error:
+            raise FormalRunRejected(
+                f"STAGE3_G36_RAW_AGGREGATE_SHARD_INVALID:{unit_id}"
+            ) from error
+        finally:
+            # The loader returns the full state and TensorBundle so it can
+            # perform strict candidate/vector validation.  Never retain them
+            # past this unit; the publisher returns only index metadata.
+            del shard, state, bundle
+    return raw, entries
+
+
+def _load_streaming_receipts(
+    root: Path,
+    aggregate: Mapping[str, object],
+    *,
+    reference_aggregate: Mapping[str, object],
+    reference_entries: Mapping[str, Mapping[str, object]],
+    raw_aggregate: Mapping[str, object],
+    raw_entries: Mapping[str, object],
+    expected_units: tuple[str, ...],
+    expected_rules: tuple[str, ...],
+    expected_execution_hash: str,
+    expected_plan_ref: str,
+    expected_plan_hash: str,
+    expected_index_ref: str,
+    expected_index_hash: str,
+    expected_binding_hash: str,
+) -> None:
+    """Reload every unit receipt, seal, eviction receipt, and tombstone."""
+
+    receipts = aggregate.get("unit_receipts")
+    if not isinstance(receipts, Mapping):
+        raise FormalRunRejected("STAGE3_G36_STREAMING_RECEIPTS_INVALID")
+    for unit_id in expected_units:
+        summary = receipts[unit_id]
+        if not isinstance(summary, Mapping):
+            raise FormalRunRejected(f"STAGE3_G36_STREAMING_RECEIPT_SUMMARY_INVALID:{unit_id}")
+        receipt = _load_workspace_json(root, summary.get("receipt_ref"), field="streaming_unit_receipt")
+        if set(receipt) != _STREAMING_RECEIPT_FIELDS or receipt.get("schema_version") != "stage3-formal-streaming-unit-receipt-v1":
+            raise FormalRunRejected(f"STAGE3_G36_STREAMING_RECEIPT_FIELDS_INVALID:{unit_id}")
+        receipt_hash = _checked_body_hash(receipt, field="streaming_unit_receipt")
+        if receipt_hash != summary.get("receipt_hash"):
+            raise FormalRunRejected(f"STAGE3_G36_STREAMING_RECEIPT_HASH_MISMATCH:{unit_id}")
+        expected_identity = {
+            "unit_id": unit_id,
+            "required_unit_ids": list(expected_units),
+            "candidate_rule_names": list(expected_rules),
+            "execution_evidence_hash": expected_execution_hash,
+            "formal_plan_ref": expected_plan_ref,
+            "formal_plan_hash": expected_plan_hash,
+            "production_unit_index_ref": expected_index_ref,
+            "production_unit_index_hash": expected_index_hash,
+            "reference_binding_hash": expected_binding_hash,
+            "local_commit_state": "SEALED",
+        }
+        if any(receipt.get(key) != expected for key, expected in expected_identity.items()):
+            raise FormalRunRejected(f"STAGE3_G36_STREAMING_RECEIPT_IDENTITY_INVALID:{unit_id}")
+        for field in (
+            "execution_evidence_hash", "formal_plan_hash", "production_unit_index_hash",
+            "reference_binding_hash", "path_identity_hash", "reference_artifact_hash",
+            "reference_shard_hash", "reference_aggregate_hash", "observation_artifact_hash",
+            "raw_shard_hash", "raw_bundle_manifest_hash", "raw_aggregate_hash",
+            "node_cache_evidence_hash", "node_cache_seal_hash",
+        ):
+            _hash(receipt[field], field=f"streaming_receipt[{unit_id}].{field}")
+        ref_entry = reference_entries[unit_id]["entry"]
+        raw_entry = raw_entries.get(unit_id)
+        if not isinstance(raw_entry, Mapping):
+            raise FormalRunRejected(f"STAGE3_G36_STREAMING_RAW_ENTRY_INVALID:{unit_id}")
+        if (
+            receipt.get("reference_shard_ref") != ref_entry.get("ledger_ref")
+            or receipt.get("reference_shard_hash") != ref_entry.get("ledger_artifact_hash")
+            or receipt.get("reference_artifact_hash") != ref_entry.get("reference_artifact_hash")
+            or receipt.get("path_identity_hash") != ref_entry.get("path_identity_hash")
+            or receipt.get("reference_aggregate_ref") != aggregate.get("reference_aggregate_ref")
+            or receipt.get("reference_aggregate_hash") != aggregate.get("reference_aggregate_hash")
+            or receipt.get("raw_shard_ref") != raw_entry.get("shard_ref")
+            or receipt.get("raw_shard_hash") != raw_entry.get("shard_hash")
+            or receipt.get("raw_bundle_ref") != raw_entry.get("bundle_ref")
+            or receipt.get("raw_bundle_manifest_hash") != raw_entry.get("bundle_manifest_hash")
+            or receipt.get("reference_artifact_hash") != raw_entry.get("reference_artifact_hash")
+            or receipt.get("raw_aggregate_ref") != aggregate.get("raw_aggregate_ref")
+            or receipt.get("raw_aggregate_hash") != aggregate.get("raw_aggregate_hash")
+            or receipt.get("path_identity_hash") != raw_entry.get("path_identity_hash")
+        ):
+            raise FormalRunRejected(f"STAGE3_G36_STREAMING_RECEIPT_SOURCE_IDENTITY_INVALID:{unit_id}")
+        observation = _load_workspace_json(root, receipt.get("observation_ledger_ref"), field="observation_ledger")
+        if (
+            observation.get("artifact_hash") != receipt.get("observation_artifact_hash")
+            or _checked_body_hash(observation, field="observation_ledger") != receipt.get("observation_artifact_hash")
+            or observation.get("schema_version") != "stage3-quadrature-observation-v1"
+            or observation.get("unit_id") != unit_id
+            or observation.get("execution_evidence_hash") != expected_execution_hash
+            or observation.get("reference_artifact_hash") != receipt.get("reference_artifact_hash")
+            or observation.get("reference_binding_hash") != expected_binding_hash
+            or observation.get("path_identity_hash") != receipt.get("path_identity_hash")
+            or observation.get("candidate_rule_names") != list(expected_rules)
+            or not isinstance(observation.get("observations"), list)
+            or len(observation["observations"]) != len(expected_rules)
+            or any(
+                not isinstance(item, Mapping) or item.get("unit_id") != unit_id
+                for item in observation.get("observations", [])
+            )
+            or {
+                item.get("rule_name")
+                for item in observation.get("observations", [])
+                if isinstance(item, Mapping)
+            }
+            != set(expected_rules)
+        ):
+            raise FormalRunRejected(f"STAGE3_G36_STREAMING_OBSERVATION_INVALID:{unit_id}")
+
+        seal_ref = receipt.get("node_cache_seal_ref")
+        _load_workspace_json(root, seal_ref, field="node_cache_seal")
+        seal_target = root.joinpath(*PurePosixPath(str(seal_ref)).parts)
+        try:
+            verified_seal = PersistentNodeGradientCache.verify_receipt(seal_target)
+        except (OSError, TypeError, ValueError) as error:
+            raise FormalRunRejected(f"STAGE3_G36_STREAMING_SEAL_INVALID:{unit_id}") from error
+        if (
+            verified_seal.get("state") != "SEALED"
+            or verified_seal.get("unit_id") != unit_id
+            or verified_seal.get("plan_hash") != expected_plan_hash
+            or verified_seal.get("downstream_raw_shard_hash") != receipt.get("raw_shard_hash")
+            or verified_seal.get("receipt_hash") != receipt.get("node_cache_seal_hash")
+        ):
+            raise FormalRunRejected(f"STAGE3_G36_STREAMING_SEAL_INVALID:{unit_id}")
+        _hash(verified_seal.get("receipt_hash"), field=f"streaming_seal[{unit_id}].receipt_hash")
+
+        eviction = _load_workspace_json(root, summary.get("eviction_receipt_ref"), field="streaming_eviction_receipt")
+        if set(eviction) != _STREAMING_EVICTION_FIELDS or eviction.get("schema_version") != "stage3-formal-streaming-eviction-receipt-v1":
+            raise FormalRunRejected(f"STAGE3_G36_STREAMING_EVICTION_FIELDS_INVALID:{unit_id}")
+        eviction_hash = _checked_body_hash(eviction, field="streaming_eviction_receipt")
+        if eviction_hash != summary.get("eviction_receipt_hash"):
+            raise FormalRunRejected(f"STAGE3_G36_STREAMING_EVICTION_HASH_MISMATCH:{unit_id}")
+        if (
+            eviction.get("unit_id") != unit_id
+            or eviction.get("unit_receipt_ref") != summary.get("receipt_ref")
+            or eviction.get("unit_receipt_hash") != receipt_hash
+            or eviction.get("seal_ref") != seal_ref
+            or eviction.get("seal_hash") != receipt.get("node_cache_seal_hash")
+            or eviction.get("execution_evidence_hash") != expected_execution_hash
+            or eviction.get("reference_binding_hash") != expected_binding_hash
+            or eviction.get("state") != "EVICTED"
+            or eviction.get("external_request_id") != eviction.get("idempotency_key")
+        ):
+            raise FormalRunRejected(f"STAGE3_G36_STREAMING_EVICTION_IDENTITY_INVALID:{unit_id}")
+        eviction_ref = eviction.get("eviction_ref")
+        tombstone = _load_workspace_json(root, eviction_ref, field="node_cache_tombstone")
+        tombstone_target = root.joinpath(*PurePosixPath(str(eviction_ref)).parts)
+        try:
+            verified_tombstone = PersistentNodeGradientCache.verify_receipt(tombstone_target)
+        except (OSError, TypeError, ValueError) as error:
+            raise FormalRunRejected(f"STAGE3_G36_STREAMING_TOMBSTONE_INVALID:{unit_id}") from error
+        if (
+            verified_tombstone.get("state") != "EVICTED"
+            or verified_tombstone.get("unit_id") != unit_id
+            or verified_tombstone.get("schema_version") != "stage3-node-cache-evicted-v1"
+            or verified_tombstone.get("sealed_receipt_ref") != verified_seal.get("receipt_ref")
+            or verified_tombstone.get("sealed_receipt_hash") != verified_seal.get("receipt_hash")
+            or verified_tombstone.get("downstream_raw_shard_hash") != receipt.get("raw_shard_hash")
+            or verified_tombstone.get("tombstone_hash") != eviction.get("eviction_hash")
+        ):
+            raise FormalRunRejected(f"STAGE3_G36_STREAMING_TOMBSTONE_INVALID:{unit_id}")
+        # Tombstones use ``tombstone_hash`` rather than the ordinary
+        # ``artifact_hash`` envelope.  ``verify_receipt`` has already
+        # validated that canonical tombstone payload and its hash; checking it
+        # as an artifact would reject every genuine EVICTED receipt.
+
+
+def _load_streaming_coverage(
+    root: Path,
+    reference: str,
+    *,
+    expected_units: tuple[str, ...],
+    expected_rules: tuple[str, ...],
+    expected_execution_hash: str,
+    expected_plan_ref: str,
+    expected_plan_hash: str,
+    expected_index_ref: object,
+    expected_index_hash: object,
+    expected_binding_hash: str | None = None,
+    declared_hash: str | None = None,
+) -> tuple[Mapping[str, object], str]:
+    """Load a canonical S3.07 aggregate under the publisher's workspace root."""
+
+    ref = _ref(reference, field="streaming_coverage_ref")
+    candidate = Path(ref)
+    if candidate.is_absolute() or "\\" in ref or ".." in candidate.parts:
+        raise FormalRunRejected("STAGE3_G36_STREAMING_COVERAGE_REF_ESCAPE")
+    if root.is_symlink():
+        raise FormalRunRejected("STAGE3_G36_STREAMING_COVERAGE_SYMLINK")
+    current = root
+    for part in candidate.parts:
+        current = current / part
+        if current.is_symlink():
+            raise FormalRunRejected("STAGE3_G36_STREAMING_COVERAGE_SYMLINK")
+    path = (root / candidate).resolve()
+    try:
+        path.relative_to(root)
+    except ValueError as error:
+        raise FormalRunRejected("STAGE3_G36_STREAMING_COVERAGE_REF_ESCAPE") from error
+    try:
+        payload = load_canonical_json(path)
+        aggregate = _mapping(payload, field="streaming_coverage")
+        _validate_streaming_coverage(
+            aggregate,
+            required_unit_ids=expected_units,
+            required_rule_names=expected_rules,
+            execution_evidence_hash=expected_execution_hash,
+            formal_plan_ref=expected_plan_ref,
+            formal_plan_hash=expected_plan_hash,
+            production_unit_index_ref=expected_index_ref,  # type: ignore[arg-type]
+            production_unit_index_hash=expected_index_hash,  # type: ignore[arg-type]
+            reference_binding_hash=expected_binding_hash,
+        )
+        binding_hash = str(aggregate["reference_binding_hash"])
+        reference_aggregate, reference_entries = _load_reference_aggregate(
+            root,
+            str(aggregate["reference_aggregate_ref"]),
+            declared_hash=aggregate["reference_aggregate_hash"],
+            expected_units=expected_units,
+            expected_execution_hash=expected_execution_hash,
+            expected_binding_hash=binding_hash,
+        )
+        raw_aggregate, raw_entries = _load_raw_aggregate_for_streaming(
+            root,
+            str(aggregate["raw_aggregate_ref"]),
+            declared_hash=aggregate["raw_aggregate_hash"],
+            expected_units=expected_units,
+            expected_rules=expected_rules,
+            expected_execution_hash=expected_execution_hash,
+            expected_binding_hash=binding_hash,
+        )
+        _load_streaming_receipts(
+            root,
+            aggregate,
+            reference_aggregate=reference_aggregate,
+            reference_entries=reference_entries,
+            raw_aggregate=raw_aggregate,
+            raw_entries=raw_entries,
+            expected_units=expected_units,
+            expected_rules=expected_rules,
+            expected_execution_hash=expected_execution_hash,
+            expected_plan_ref=expected_plan_ref,
+            expected_plan_hash=expected_plan_hash,
+            expected_index_ref=str(expected_index_ref),
+            expected_index_hash=str(expected_index_hash),
+            expected_binding_hash=binding_hash,
+        )
+    except (OSError, TypeError, ValueError, FormalRunRejected) as error:
+        raise FormalRunRejected("STAGE3_G36_STREAMING_COVERAGE_INVALID") from error
+    aggregate_hash = aggregate.get("artifact_hash")
+    _hash(aggregate_hash, field="streaming_coverage_hash")
+    if declared_hash is not None:
+        _hash(declared_hash, field="streaming_coverage_hash")
+        if declared_hash != aggregate_hash:
+            raise FormalRunRejected("STAGE3_G36_STREAMING_COVERAGE_HASH_MISMATCH")
+    return aggregate, str(aggregate_hash)
 
 
 def _source_refs_from_rows(table: FrozenSourceTable) -> tuple[str, ...]:
@@ -234,6 +823,7 @@ def _evaluation_sources(
     scope_gate_ref: str,
     execution: FormalExecutionEvidence,
     table: FrozenSourceTable,
+    streaming_coverage_ref: str | None = None,
 ) -> tuple[str, ...]:
     refs: list[str] = [
         frozen_ref,
@@ -242,6 +832,8 @@ def _evaluation_sources(
         decision_ref,
         scope_gate_ref,
     ]
+    if streaming_coverage_ref is not None:
+        refs.append(streaming_coverage_ref)
     for gate in execution.prerequisite_gates:
         refs.extend(gate.evidence_refs)
     refs.extend(_source_refs_from_rows(table))
@@ -258,7 +850,28 @@ def _g36_measured(
     units: tuple[str, ...],
     rules: tuple[str, ...],
     all_rows_finite: bool,
+    streaming_coverage: Mapping[str, object] | None = None,
+    streaming_coverage_ref: str | None = None,
+    streaming_coverage_hash: str | None = None,
 ) -> dict[str, JSONValue]:
+    # Non-matrix/local-compatible plans predate the streaming ledger.  Their
+    # coverage facts remain true by the legacy complete-table contract; matrix
+    # plans always pass a strictly validated aggregate here.
+    if streaming_coverage is None:
+        streaming_metrics: Mapping[str, object] = {
+            "complete_reference_raw_observation_coverage": True,
+            "streaming_receipt_coverage": True,
+            "node_cache_seal_coverage": True,
+            "node_cache_eviction_coverage": True,
+            "streaming_required_unit_count": len(units),
+            "streaming_required_rule_count": len(rules),
+        }
+    else:
+        streaming_metrics = _streaming_coverage_metrics(
+            streaming_coverage,
+            required_unit_ids=units,
+            required_rule_names=rules,
+        )
     return {
         "source_table_hash": table.content_hash,
         "evaluation_hash": evaluation.artifact_hash,
@@ -267,6 +880,18 @@ def _g36_measured(
         "unit_count": len(units),
         "rule_count": len(rules),
         "all_rows_finite": all_rows_finite,
+        "complete_reference_raw_observation_coverage": bool(
+            streaming_metrics["complete_reference_raw_observation_coverage"]
+        ),
+        "streaming_receipt_coverage": bool(streaming_metrics["streaming_receipt_coverage"]),
+        "node_cache_seal_coverage": bool(streaming_metrics["node_cache_seal_coverage"]),
+        "node_cache_eviction_coverage": bool(
+            streaming_metrics["node_cache_eviction_coverage"]
+        ),
+        "streaming_required_unit_count": int(streaming_metrics["streaming_required_unit_count"]),
+        "streaming_required_rule_count": int(streaming_metrics["streaming_required_rule_count"]),
+        "streaming_coverage_ref": streaming_coverage_ref,
+        "streaming_coverage_hash": streaming_coverage_hash,
         "passing_rules": [
             name
             for name, raw in evaluation.rule_evaluations.items()
@@ -488,6 +1113,8 @@ class Stage3G36Publisher:
         execution_evidence_ref: str,
         stage3_scope_decision_ref: str,
         stage3_scope_gate_ref: str,
+        streaming_coverage_ref: str | None = None,
+        streaming_coverage_hash: str | None = None,
         publication_id: str | None = None,
         task_id: str = STAGE3_G36_TASK_ID,
     ) -> Stage3G36Publication:
@@ -560,12 +1187,49 @@ class Stage3G36Publisher:
         except (OSError, TypeError, ValueError, FormalRunRejected) as error:
             raise FormalRunRejected(f"STAGE3_G36_INPUTS_INVALID:{error}") from error
 
+        matrix_plan = plan.get("plan_kind") == "matrix"
+        streaming_coverage: Mapping[str, object] | None = None
+        resolved_streaming_hash: str | None = None
+        if matrix_plan:
+            if streaming_coverage_ref is None:
+                raise FormalRunRejected("STAGE3_G36_STREAMING_COVERAGE_REQUIRED")
+            streaming_coverage, resolved_streaming_hash = _load_streaming_coverage(
+                root,
+                streaming_coverage_ref,
+                expected_units=units,
+                expected_rules=rules,
+                expected_execution_hash=execution.artifact_hash,
+                expected_plan_ref=formal_plan_ref,
+                expected_plan_hash=str(plan["artifact_hash"]),
+                expected_index_ref=plan.get("production_unit_index_ref"),
+                expected_index_hash=plan.get("production_unit_index_hash"),
+                declared_hash=streaming_coverage_hash,
+            )
+        elif streaming_coverage_ref is not None:
+            # Explicit non-matrix input remains supported, but it must still
+            # be a valid aggregate rather than an unbound opaque ref.
+            streaming_coverage, resolved_streaming_hash = _load_streaming_coverage(
+                root,
+                streaming_coverage_ref,
+                expected_units=units,
+                expected_rules=rules,
+                expected_execution_hash=execution.artifact_hash,
+                expected_plan_ref=formal_plan_ref,
+                expected_plan_hash=str(plan["artifact_hash"]),
+                expected_index_ref=plan.get("production_unit_index_ref"),
+                expected_index_hash=plan.get("production_unit_index_hash"),
+                declared_hash=streaming_coverage_hash,
+            )
+        elif streaming_coverage_hash is not None:
+            raise FormalRunRejected("STAGE3_G36_STREAMING_COVERAGE_HASH_WITHOUT_REF")
+
         evaluator_sources = _evaluation_sources(
             frozen_ref=frozen_source_table_ref,
             execution_ref=execution_evidence_ref,
             plan_ref=formal_plan_ref,
             decision_ref=stage3_scope_decision_ref,
             scope_gate_ref=stage3_scope_gate_ref,
+            streaming_coverage_ref=streaming_coverage_ref,
             execution=execution,
             table=table,
         )
@@ -597,6 +1261,7 @@ class Stage3G36Publisher:
             stage3_scope_gate=scope_gate_record,
             stage3_scope_decision_ref=stage3_scope_decision_ref,
             stage3_scope_gate_ref=stage3_scope_gate_ref,
+            streaming_coverage=streaming_coverage,
         )
         all_rows_finite = _finite_observation_table(table)
         gate_status = GateStatus.PASS if evaluation.formal_eligible and all_rows_finite else GateStatus.BLOCKED
@@ -625,6 +1290,9 @@ class Stage3G36Publisher:
             units=units,
             rules=rules,
             all_rows_finite=all_rows_finite,
+            streaming_coverage=streaming_coverage,
+            streaming_coverage_ref=streaming_coverage_ref,
+            streaming_coverage_hash=resolved_streaming_hash,
         )
         gate = GateRecord(
             gate_id="stage3.G3-6",
@@ -636,6 +1304,12 @@ class Stage3G36Publisher:
                 "complete_unit_rule_coverage": True,
                 "all_rows_finite": True,
                 "independent_evaluation_status": "PASS",
+                "complete_reference_raw_observation_coverage": True,
+                "streaming_receipt_coverage": True,
+                "node_cache_seal_coverage": True,
+                "node_cache_eviction_coverage": True,
+                "streaming_required_unit_count": len(units),
+                "streaming_required_rule_count": len(rules),
             },
             evidence_refs=tuple(
                 dict.fromkeys(
@@ -644,6 +1318,7 @@ class Stage3G36Publisher:
                         evaluation_artifact.commit_ref,
                         provenance_ref,
                         formal_plan_ref,
+                        *((streaming_coverage_ref,) if streaming_coverage_ref is not None else ()),
                     )
                 )
             ),

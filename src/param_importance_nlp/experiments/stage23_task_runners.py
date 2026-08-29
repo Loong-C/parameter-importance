@@ -83,8 +83,8 @@ from .stage3_protocol import DEFAULT_CANDIDATE_RULES
 from .stage3_raw_storage import (
     VECTOR_DERIVATION_HASH,
     VECTOR_DERIVATION_SCHEMA,
+    _load_shard as _load_stage3_raw_shard,
     persist_raw_unit_shard,
-    publish_raw_aggregate,
 )
 from ..analysis import (
     AnalysisReportBuilder,
@@ -7989,6 +7989,143 @@ def _stage3_raw_ledger_root(
     ).resolve()
 
 
+def _load_stage3_raw_shard_metadata(
+    *,
+    root: Path,
+    shard_ref: str,
+    expected: Mapping[str, object],
+) -> Mapping[str, JSONValue]:
+    """Strictly validate one raw shard's JSON metadata without loading tensors."""
+
+    path = _workspace_path(root, shard_ref, field="stage3_raw_shard")
+    raw = load_canonical_json(path)
+    if not isinstance(raw, Mapping) or raw.get("schema_version") != "stage3-formal-raw-shard-v1":
+        raise ValueError("STAGE3_RAW_SHARD_SCHEMA_INVALID")
+    required = {
+        "schema_version", "unit_id", "required_unit_ids", "candidate_rule_names",
+        "execution_evidence_hash", "reference_binding_hash", "path_identity_hash",
+        "reference_artifact_hash", "vector_derivation_schema",
+        "vector_derivation_contract_hash", "reference_identity_hash", "bundle_ref",
+        "bundle_manifest_hash", "rule_summaries", "artifact_hash",
+    }
+    if set(raw) != required:
+        raise ValueError("STAGE3_RAW_SHARD_FIELDS_MISMATCH")
+    artifact_hash = raw.get("artifact_hash")
+    if not isinstance(artifact_hash, str) or _SHA256_RE.fullmatch(artifact_hash) is None:
+        raise ValueError("STAGE3_RAW_SHARD_ARTIFACT_HASH_INVALID")
+    if artifact_hash != canonical_json_hash(
+        {key: item for key, item in raw.items() if key != "artifact_hash"}
+    ):
+        raise ValueError("STAGE3_RAW_SHARD_HASH_MISMATCH")
+    for field_name in (
+        "execution_evidence_hash", "reference_binding_hash", "path_identity_hash",
+        "reference_artifact_hash", "bundle_manifest_hash",
+    ):
+        value = raw.get(field_name)
+        if not isinstance(value, str) or _SHA256_RE.fullmatch(value) is None:
+            raise ValueError(f"STAGE3_RAW_SHARD_{field_name.upper()}_INVALID")
+    if (
+        raw.get("vector_derivation_schema") != VECTOR_DERIVATION_SCHEMA
+        or raw.get("vector_derivation_contract_hash") != VECTOR_DERIVATION_HASH
+    ):
+        raise ValueError("STAGE3_RAW_DERIVATION_CONTRACT_MISMATCH")
+    for key, value in expected.items():
+        if raw.get(key) != value:
+            raise ValueError(f"STAGE3_RAW_SHARD_BINDING_MISMATCH:{key}")
+    unit_id = raw.get("unit_id")
+    required_unit_ids = raw.get("required_unit_ids")
+    candidate_rule_names = raw.get("candidate_rule_names")
+    if (
+        not isinstance(unit_id, str)
+        or not isinstance(required_unit_ids, list)
+        or not isinstance(candidate_rule_names, list)
+        or candidate_rule_names != sorted(candidate_rule_names)
+        or len(set(candidate_rule_names)) != len(candidate_rule_names)
+        or any(not isinstance(item, str) for item in required_unit_ids)
+    ):
+        raise ValueError("STAGE3_RAW_SHARD_UNIT_OR_RULE_SET_INVALID")
+    summaries = raw.get("rule_summaries")
+    if not isinstance(summaries, Mapping) or set(summaries) != set(candidate_rule_names):
+        raise ValueError("STAGE3_RAW_SHARD_SUMMARY_SET_INVALID")
+    for rule_name, summary in summaries.items():
+        if not isinstance(rule_name, str) or not isinstance(summary, Mapping):
+            raise ValueError("STAGE3_RAW_SHARD_SUMMARY_INVALID")
+        if summary.get("path_identity_hash") != raw.get("path_identity_hash"):
+            raise ValueError("STAGE3_RAW_SHARD_SUMMARY_IDENTITY_MISMATCH")
+    reference_identity = canonical_json_hash(
+        {
+            "unit_id": raw["unit_id"],
+            "path_identity_hash": raw["path_identity_hash"],
+            "execution_evidence_hash": raw["execution_evidence_hash"],
+            "reference_binding_hash": raw["reference_binding_hash"],
+            "reference_artifact_hash": raw["reference_artifact_hash"],
+        }
+    )
+    if raw.get("reference_identity_hash") != reference_identity:
+        raise ValueError("STAGE3_RAW_SHARD_REFERENCE_IDENTITY_MISMATCH")
+    _workspace_path(root, str(raw["bundle_ref"]), field="stage3_raw_bundle")
+    return dict(raw)
+
+
+def _publish_stage3_raw_aggregate_metadata(
+    *,
+    root: Path,
+    ledger_root: Path,
+    required_unit_ids: Sequence[str],
+    execution_evidence_hash: str,
+    reference_binding_hash: str,
+    candidate_rule_names: Sequence[str],
+) -> tuple[Mapping[str, JSONValue], str]:
+    """Snapshot raw shard metadata while loading tensors only for the active unit."""
+
+    entries: dict[str, JSONValue] = {}
+    complete: list[str] = []
+    missing: list[str] = []
+    for unit_id in required_unit_ids:
+        shard_path = ledger_root / f"{unit_id}.json"
+        if not shard_path.exists():
+            missing.append(unit_id)
+            continue
+        shard_ref = _stage3_relative_ref(root, shard_path, field="raw_shard")
+        shard = _load_stage3_raw_shard_metadata(
+            root=root,
+            shard_ref=shard_ref,
+            expected={
+                "unit_id": unit_id,
+                "required_unit_ids": list(required_unit_ids),
+                "candidate_rule_names": sorted(candidate_rule_names),
+                "execution_evidence_hash": execution_evidence_hash,
+                "reference_binding_hash": reference_binding_hash,
+            },
+        )
+        entries[unit_id] = {
+            "shard_ref": shard_ref,
+            "shard_hash": str(shard["artifact_hash"]),
+            "bundle_ref": str(shard["bundle_ref"]),
+            "bundle_manifest_hash": str(shard["bundle_manifest_hash"]),
+            "path_identity_hash": str(shard["path_identity_hash"]),
+            "reference_artifact_hash": str(shard["reference_artifact_hash"]),
+            "reference_identity_hash": str(shard["reference_identity_hash"]),
+        }
+        complete.append(unit_id)
+    body: dict[str, JSONValue] = {
+        "schema_version": "stage3-formal-raw-aggregate-v1",
+        "execution_evidence_hash": execution_evidence_hash,
+        "reference_binding_hash": reference_binding_hash,
+        "required_unit_ids": list(required_unit_ids),
+        "candidate_rule_names": sorted(candidate_rule_names),
+        "vector_derivation_schema": VECTOR_DERIVATION_SCHEMA,
+        "vector_derivation_contract_hash": VECTOR_DERIVATION_HASH,
+        "complete_unit_ids": complete,
+        "missing_unit_ids": missing,
+        "unit_shards": entries,
+    }
+    body["artifact_hash"] = canonical_json_hash(body)
+    path = ledger_root / f"aggregate-{body['artifact_hash']}.json"
+    _write_stage3_streaming_immutable(path, body)
+    return body, _stage3_relative_ref(root, path, field="raw_aggregate")
+
+
 def _persist_stage3_raw_matrix_unit(
     *,
     store: TaskArtifactStore,
@@ -8065,7 +8202,7 @@ def _persist_stage3_raw_matrix_unit(
         candidate_states=candidate_states,
         rule_summaries=summaries,
     )
-    aggregate, aggregate_ref = publish_raw_aggregate(
+    aggregate, aggregate_ref = _publish_stage3_raw_aggregate_metadata(
         root=root,
         ledger_root=ledger_root,
         required_unit_ids=required_units,
@@ -8735,6 +8872,564 @@ def _stage3_reference_ledger_root(
     ).resolve()
 
 
+def _stage3_streaming_receipt_root(
+    request: TaskExecutionRequest,
+    root: Path,
+    store: TaskArtifactStore,
+    *,
+    execution_evidence_hash: str,
+    reference_binding_hash: str,
+) -> Path:
+    """Return the external, path-safe S3.07 streaming receipt namespace."""
+
+    if _SHA256_RE.fullmatch(execution_evidence_hash) is None:
+        raise ValueError("STAGE3_STREAMING_EXECUTION_HASH_INVALID")
+    if _SHA256_RE.fullmatch(reference_binding_hash) is None:
+        raise ValueError("STAGE3_STREAMING_BINDING_HASH_INVALID")
+    try:
+        runtime = request.config.base_config.section("runtime")
+    except (AttributeError, KeyError, TypeError):
+        runtime = None
+    cache_root = runtime.get("cache_root") if isinstance(runtime, Mapping) else None
+    base = (
+        _workspace_path(root, cache_root, field="runtime.cache_root")
+        if isinstance(cache_root, str)
+        else (store.root / "resume").resolve()
+    )
+    receipt_root = (
+        base
+        / "stage3-streaming-receipts"
+        / execution_evidence_hash
+        / reference_binding_hash
+    ).resolve()
+    try:
+        receipt_root.relative_to(root.resolve())
+    except ValueError as error:
+        raise ValueError("STAGE3_STREAMING_RECEIPT_PATH_ESCAPE") from error
+    return receipt_root
+
+
+def _stage3_relative_ref(root: Path, path: Path, *, field: str) -> str:
+    """Convert an artifact path to a workspace-relative logical reference."""
+
+    target = path.resolve()
+    try:
+        return target.relative_to(root.resolve()).as_posix()
+    except ValueError as error:
+        raise ValueError(f"STAGE3_STREAMING_{field.upper()}_PATH_ESCAPE") from error
+
+
+def _write_stage3_streaming_immutable(
+    path: Path, payload: Mapping[str, JSONValue]
+) -> None:
+    """Publish a receipt/snapshot without replacing a different identity."""
+
+    if path.is_symlink() or (path.exists() and not path.is_file()):
+        raise ValueError("STAGE3_STREAMING_RECEIPT_PATH_INVALID")
+    if path.exists():
+        existing = load_canonical_json(path)
+        if existing != payload:
+            raise ValueError("STAGE3_STREAMING_IMMUTABLE_CONFLICT")
+        return
+    write_canonical_json(path, payload)
+
+
+def _stage3_streaming_artifact_hash(
+    value: Mapping[str, JSONValue], *, field: str
+) -> str:
+    supplied = value.get("artifact_hash")
+    if not isinstance(supplied, str) or _SHA256_RE.fullmatch(supplied) is None:
+        raise ValueError(f"STAGE3_STREAMING_{field.upper()}_HASH_INVALID")
+    if supplied != canonical_json_hash(
+        {key: item for key, item in value.items() if key != "artifact_hash"}
+    ):
+        raise ValueError(f"STAGE3_STREAMING_{field.upper()}_HASH_MISMATCH")
+    return supplied
+
+
+def _stage3_observation_artifact_hash(
+    request: TaskExecutionRequest,
+    root: Path,
+    store: TaskArtifactStore,
+    *,
+    execution_evidence_hash: str,
+    reference_binding_hash: str,
+    unit_id: str,
+) -> str:
+    ledger_root = _stage3_observation_ledger_root(
+        request,
+        root,
+        store,
+        execution_evidence_hash=execution_evidence_hash,
+    )
+    path = ledger_root / f"{unit_id}.json"
+    value = load_canonical_json(path)
+    if not isinstance(value, Mapping):
+        raise ValueError("STAGE3_STREAMING_OBSERVATION_NOT_OBJECT")
+    return _stage3_streaming_artifact_hash(value, field="observation")
+
+
+def _persist_stage3_streaming_unit_receipt(
+    *,
+    root: Path,
+    receipt_root: Path,
+    unit_id: str,
+    required_unit_ids: Sequence[str],
+    candidate_names: Sequence[str],
+    execution_evidence_hash: str,
+    formal_plan_ref: str,
+    formal_plan_hash: str,
+    production_unit_index_ref: str,
+    production_unit_index_hash: str,
+    reference_binding_hash: str,
+    path_identity_hash: str,
+    reference_artifact_hash: str,
+    reference_shard_ref: str,
+    reference_shard_hash: str,
+    reference_aggregate_ref: str,
+    reference_aggregate_hash: str,
+    observation_ledger_ref: str,
+    observation_artifact_hash: str,
+    raw_shard_ref: str,
+    raw_shard_hash: str,
+    raw_bundle_ref: str,
+    raw_bundle_manifest_hash: str,
+    raw_aggregate_ref: str,
+    raw_aggregate_hash: str,
+    node_cache_evidence_hash: str,
+    node_cache_seal_ref: str,
+    node_cache_seal_hash: str,
+) -> tuple[Mapping[str, JSONValue], str]:
+    """Write the immutable fence proving this unit has all durable inputs."""
+
+    hashes = {
+        "execution_evidence_hash": execution_evidence_hash,
+        "formal_plan_hash": formal_plan_hash,
+        "production_unit_index_hash": production_unit_index_hash,
+        "reference_binding_hash": reference_binding_hash,
+        "path_identity_hash": path_identity_hash,
+        "reference_artifact_hash": reference_artifact_hash,
+        "reference_shard_hash": reference_shard_hash,
+        "reference_aggregate_hash": reference_aggregate_hash,
+        "observation_artifact_hash": observation_artifact_hash,
+        "raw_shard_hash": raw_shard_hash,
+        "raw_bundle_manifest_hash": raw_bundle_manifest_hash,
+        "raw_aggregate_hash": raw_aggregate_hash,
+        "node_cache_evidence_hash": node_cache_evidence_hash,
+        "node_cache_seal_hash": node_cache_seal_hash,
+    }
+    if any(
+        not isinstance(value, str) or _SHA256_RE.fullmatch(value) is None
+        for value in hashes.values()
+    ):
+        raise ValueError("STAGE3_STREAMING_UNIT_RECEIPT_HASH_INVALID")
+    if unit_id not in required_unit_ids:
+        raise ValueError("STAGE3_STREAMING_UNIT_NOT_REQUIRED")
+    if tuple(candidate_names) != tuple(DEFAULT_CANDIDATE_RULES):
+        raise ValueError("STAGE3_STREAMING_CANDIDATE_RULE_SET_MISMATCH")
+    body: dict[str, JSONValue] = {
+        "schema_version": "stage3-formal-streaming-unit-receipt-v1",
+        "unit_id": unit_id,
+        "required_unit_ids": list(required_unit_ids),
+        "candidate_rule_names": list(candidate_names),
+        "execution_evidence_hash": execution_evidence_hash,
+        "formal_plan_ref": formal_plan_ref,
+        "formal_plan_hash": formal_plan_hash,
+        "production_unit_index_ref": production_unit_index_ref,
+        "production_unit_index_hash": production_unit_index_hash,
+        "reference_binding_hash": reference_binding_hash,
+        "path_identity_hash": path_identity_hash,
+        "reference_artifact_hash": reference_artifact_hash,
+        "reference_shard_ref": reference_shard_ref,
+        "reference_shard_hash": reference_shard_hash,
+        "reference_aggregate_ref": reference_aggregate_ref,
+        "reference_aggregate_hash": reference_aggregate_hash,
+        "observation_ledger_ref": observation_ledger_ref,
+        "observation_artifact_hash": observation_artifact_hash,
+        "raw_shard_ref": raw_shard_ref,
+        "raw_shard_hash": raw_shard_hash,
+        "raw_bundle_ref": raw_bundle_ref,
+        "raw_bundle_manifest_hash": raw_bundle_manifest_hash,
+        "raw_aggregate_ref": raw_aggregate_ref,
+        "raw_aggregate_hash": raw_aggregate_hash,
+        "node_cache_evidence_hash": node_cache_evidence_hash,
+        "node_cache_seal_ref": node_cache_seal_ref,
+        "node_cache_seal_hash": node_cache_seal_hash,
+        "local_commit_state": "SEALED",
+    }
+    body["artifact_hash"] = canonical_json_hash(body)
+    path = receipt_root / "units" / f"{unit_id}.json"
+    _write_stage3_streaming_immutable(path, body)
+    return body, _stage3_relative_ref(root, path, field="unit_receipt")
+
+
+def _load_stage3_streaming_unit_receipt(
+    *,
+    root: Path,
+    receipt_root: Path,
+    unit_id: str,
+    required_unit_ids: Sequence[str],
+    candidate_names: Sequence[str],
+    execution_evidence_hash: str,
+    formal_plan_ref: str,
+    formal_plan_hash: str,
+    production_unit_index_ref: str,
+    production_unit_index_hash: str,
+    reference_binding_hash: str,
+    path_identity_hash: str,
+) -> tuple[Mapping[str, JSONValue], str] | None:
+    """Load one streaming fence and fail closed on any identity drift."""
+
+    path = receipt_root / "units" / f"{unit_id}.json"
+    if path.is_symlink():
+        raise ValueError("STAGE3_STREAMING_UNIT_RECEIPT_SYMLINK")
+    if not path.exists():
+        return None
+    value = load_canonical_json(path)
+    if not isinstance(value, Mapping):
+        raise ValueError("STAGE3_STREAMING_UNIT_RECEIPT_NOT_OBJECT")
+    expected_fields = {
+        "schema_version", "unit_id", "required_unit_ids", "candidate_rule_names",
+        "execution_evidence_hash", "formal_plan_ref", "formal_plan_hash",
+        "production_unit_index_ref", "production_unit_index_hash",
+        "reference_binding_hash", "path_identity_hash", "reference_artifact_hash",
+        "reference_shard_ref", "reference_shard_hash", "reference_aggregate_ref",
+        "reference_aggregate_hash", "observation_ledger_ref", "observation_artifact_hash",
+        "raw_shard_ref", "raw_shard_hash", "raw_bundle_ref", "raw_bundle_manifest_hash",
+        "raw_aggregate_ref", "raw_aggregate_hash", "node_cache_evidence_hash",
+        "node_cache_seal_ref", "node_cache_seal_hash", "local_commit_state",
+        "artifact_hash",
+    }
+    if set(value) != expected_fields or value.get("schema_version") != "stage3-formal-streaming-unit-receipt-v1":
+        raise ValueError("STAGE3_STREAMING_UNIT_RECEIPT_FIELDS_INVALID")
+    if _stage3_streaming_artifact_hash(value, field="unit_receipt") != value.get("artifact_hash"):
+        raise ValueError("STAGE3_STREAMING_UNIT_RECEIPT_HASH_INVALID")
+    expected = {
+        "unit_id": unit_id,
+        "required_unit_ids": list(required_unit_ids),
+        "candidate_rule_names": list(candidate_names),
+        "execution_evidence_hash": execution_evidence_hash,
+        "formal_plan_ref": formal_plan_ref,
+        "formal_plan_hash": formal_plan_hash,
+        "production_unit_index_ref": production_unit_index_ref,
+        "production_unit_index_hash": production_unit_index_hash,
+        "reference_binding_hash": reference_binding_hash,
+        "path_identity_hash": path_identity_hash,
+        "local_commit_state": "SEALED",
+    }
+    if any(value.get(key) != expected_value for key, expected_value in expected.items()):
+        raise ValueError("STAGE3_STREAMING_UNIT_RECEIPT_IDENTITY_MISMATCH")
+    for field_name in (
+        "execution_evidence_hash", "formal_plan_hash", "production_unit_index_hash",
+        "reference_binding_hash", "path_identity_hash", "reference_artifact_hash",
+        "reference_shard_hash", "reference_aggregate_hash", "observation_artifact_hash",
+        "raw_shard_hash", "raw_bundle_manifest_hash", "raw_aggregate_hash",
+        "node_cache_evidence_hash", "node_cache_seal_hash",
+    ):
+        field_value = value.get(field_name)
+        if not isinstance(field_value, str) or _SHA256_RE.fullmatch(field_value) is None:
+            raise ValueError(f"STAGE3_STREAMING_UNIT_RECEIPT_{field_name.upper()}_INVALID")
+    for field_name in (
+        "reference_shard_ref", "reference_aggregate_ref", "observation_ledger_ref",
+        "raw_shard_ref", "raw_bundle_ref", "raw_aggregate_ref", "node_cache_seal_ref",
+    ):
+        field_value = value.get(field_name)
+        if not isinstance(field_value, str):
+            raise ValueError(f"STAGE3_STREAMING_UNIT_RECEIPT_{field_name.upper()}_INVALID")
+        _workspace_path(root, field_value, field=f"streaming.{field_name}")
+    for ref_field, hash_field, schema in (
+        ("reference_shard_ref", "reference_shard_hash", "stage3-reference-shard-v1"),
+        ("reference_aggregate_ref", "reference_aggregate_hash", "stage3-reference-aggregate-v1"),
+        ("observation_ledger_ref", "observation_artifact_hash", "stage3-quadrature-observation-v1"),
+        ("raw_shard_ref", "raw_shard_hash", "stage3-formal-raw-shard-v1"),
+        ("raw_aggregate_ref", "raw_aggregate_hash", "stage3-formal-raw-aggregate-v1"),
+    ):
+        target = _workspace_path(
+            root, str(value[ref_field]), field=f"streaming.{ref_field}"
+        )
+        loaded_value = load_canonical_json(target)
+        if not isinstance(loaded_value, Mapping) or loaded_value.get("schema_version") != schema:
+            raise ValueError(f"STAGE3_STREAMING_UNIT_RECEIPT_{ref_field.upper()}_SCHEMA_INVALID")
+        if loaded_value.get("artifact_hash") != value[hash_field]:
+            raise ValueError(f"STAGE3_STREAMING_UNIT_RECEIPT_{ref_field.upper()}_HASH_MISMATCH")
+        if loaded_value.get("artifact_hash") != canonical_json_hash(
+            {key: item for key, item in loaded_value.items() if key != "artifact_hash"}
+        ):
+            raise ValueError(f"STAGE3_STREAMING_UNIT_RECEIPT_{ref_field.upper()}_HASH_INVALID")
+    return value, _stage3_relative_ref(root, path, field="unit_receipt")
+
+
+def _persist_stage3_streaming_eviction_receipt(
+    *,
+    root: Path,
+    receipt_root: Path,
+    unit_id: str,
+    unit_receipt_ref: str,
+    unit_receipt_hash: str,
+    seal_ref: str,
+    seal_hash: str,
+    cache_root_ref: str,
+    eviction_ref: str,
+    eviction_hash: str,
+    execution_evidence_hash: str,
+    reference_binding_hash: str,
+) -> tuple[Mapping[str, JSONValue], str]:
+    for field_name, field_value in (
+        ("unit_receipt_hash", unit_receipt_hash),
+        ("seal_hash", seal_hash),
+        ("eviction_hash", eviction_hash),
+        ("execution_evidence_hash", execution_evidence_hash),
+        ("reference_binding_hash", reference_binding_hash),
+    ):
+        if not isinstance(field_value, str) or _SHA256_RE.fullmatch(field_value) is None:
+            raise ValueError(f"STAGE3_STREAMING_EVICTION_{field_name.upper()}_INVALID")
+    request_key = f"stage3.07:{execution_evidence_hash}:{reference_binding_hash}:{unit_id}"
+    body: dict[str, JSONValue] = {
+        "schema_version": "stage3-formal-streaming-eviction-receipt-v1",
+        "unit_id": unit_id,
+        "unit_receipt_ref": unit_receipt_ref,
+        "unit_receipt_hash": unit_receipt_hash,
+        "seal_ref": seal_ref,
+        "seal_hash": seal_hash,
+        "cache_root_ref": cache_root_ref,
+        "eviction_ref": eviction_ref,
+        "eviction_hash": eviction_hash,
+        "execution_evidence_hash": execution_evidence_hash,
+        "reference_binding_hash": reference_binding_hash,
+        "external_request_id": request_key,
+        "idempotency_key": request_key,
+        "state": "EVICTED",
+    }
+    body["artifact_hash"] = canonical_json_hash(body)
+    path = receipt_root / "evictions" / f"{unit_id}.json"
+    _write_stage3_streaming_immutable(path, body)
+    return body, _stage3_relative_ref(root, path, field="eviction_receipt")
+
+
+def _publish_stage3_streaming_aggregate(
+    *,
+    root: Path,
+    receipt_root: Path,
+    required_unit_ids: Sequence[str],
+    candidate_names: Sequence[str],
+    execution_evidence_hash: str,
+    reference_binding_hash: str,
+    formal_plan_ref: str,
+    formal_plan_hash: str,
+    production_unit_index_ref: str,
+    production_unit_index_hash: str,
+    reference_aggregate_ref: str,
+    reference_aggregate: Mapping[str, JSONValue],
+    raw_aggregate_ref: str,
+    raw_aggregate: Mapping[str, JSONValue],
+    observation_complete_unit_ids: Sequence[str],
+) -> tuple[Mapping[str, JSONValue], str]:
+    """Publish an append-only exact intersection of all streaming lifecycles."""
+
+    if tuple(candidate_names) != tuple(DEFAULT_CANDIDATE_RULES):
+        raise ValueError("STAGE3_STREAMING_CANDIDATE_RULE_SET_MISMATCH")
+    if reference_aggregate.get("schema_version") != "stage3-reference-aggregate-v1":
+        raise ValueError("STAGE3_STREAMING_REFERENCE_AGGREGATE_SCHEMA_INVALID")
+    if raw_aggregate.get("schema_version") != "stage3-formal-raw-aggregate-v1":
+        raise ValueError("STAGE3_STREAMING_RAW_AGGREGATE_SCHEMA_INVALID")
+    _stage3_streaming_artifact_hash(reference_aggregate, field="reference_aggregate")
+    _stage3_streaming_artifact_hash(raw_aggregate, field="raw_aggregate")
+    for aggregate_name, aggregate in (
+        ("reference", reference_aggregate),
+        ("raw", raw_aggregate),
+    ):
+        if (
+            aggregate.get("execution_evidence_hash") != execution_evidence_hash
+            or aggregate.get("reference_binding_hash") != reference_binding_hash
+        ):
+            raise ValueError(f"STAGE3_STREAMING_{aggregate_name.upper()}_AGGREGATE_IDENTITY_MISMATCH")
+    reference_complete = reference_aggregate.get("complete_unit_ids")
+    raw_complete = raw_aggregate.get("complete_unit_ids")
+    if not isinstance(reference_complete, list) or not isinstance(raw_complete, list):
+        raise ValueError("STAGE3_STREAMING_AGGREGATE_SOURCE_COVERAGE_INVALID")
+    if reference_aggregate.get("required_unit_ids") != list(required_unit_ids):
+        raise ValueError("STAGE3_STREAMING_REFERENCE_REQUIRED_SET_MISMATCH")
+    if raw_aggregate.get("required_unit_ids") != list(required_unit_ids):
+        raise ValueError("STAGE3_STREAMING_RAW_REQUIRED_SET_MISMATCH")
+    if raw_aggregate.get("candidate_rule_names") != sorted(candidate_names):
+        raise ValueError("STAGE3_STREAMING_RAW_CANDIDATE_SET_MISMATCH")
+    observation_complete = list(observation_complete_unit_ids)
+    required_set = set(required_unit_ids)
+    if (
+        len(set(reference_complete)) != len(reference_complete)
+        or len(set(raw_complete)) != len(raw_complete)
+        or len(set(observation_complete)) != len(observation_complete)
+        or not set(reference_complete).issubset(required_set)
+        or not set(raw_complete).issubset(required_set)
+        or not set(observation_complete).issubset(required_set)
+    ):
+        raise ValueError("STAGE3_STREAMING_SOURCE_COVERAGE_UNKNOWN_OR_DUPLICATE")
+    for source_name, source_values in (
+        ("reference", reference_complete),
+        ("raw", raw_complete),
+        ("observation", observation_complete),
+    ):
+        expected_order = [
+            unit_id for unit_id in required_unit_ids if unit_id in set(source_values)
+        ]
+        if list(source_values) != expected_order:
+            raise ValueError(f"STAGE3_STREAMING_{source_name.upper()}_COVERAGE_ORDER_INVALID")
+
+    receipt_complete: list[str] = []
+    sealed: list[str] = []
+    evicted: list[str] = []
+    unit_receipts: dict[str, JSONValue] = {}
+    for unit_id in required_unit_ids:
+        path = receipt_root / "units" / f"{unit_id}.json"
+        if path.is_symlink():
+            raise ValueError("STAGE3_STREAMING_UNIT_RECEIPT_SYMLINK")
+        if not path.exists():
+            continue
+        value = load_canonical_json(path)
+        if not isinstance(value, Mapping):
+            raise ValueError("STAGE3_STREAMING_UNIT_RECEIPT_NOT_OBJECT")
+        path_identity = value.get("path_identity_hash")
+        if not isinstance(path_identity, str) or _SHA256_RE.fullmatch(path_identity) is None:
+            raise ValueError("STAGE3_STREAMING_PATH_IDENTITY_INVALID")
+        loaded = _load_stage3_streaming_unit_receipt(
+            root=root,
+            receipt_root=receipt_root,
+            unit_id=unit_id,
+            required_unit_ids=required_unit_ids,
+            candidate_names=candidate_names,
+            execution_evidence_hash=execution_evidence_hash,
+            formal_plan_ref=formal_plan_ref,
+            formal_plan_hash=formal_plan_hash,
+            production_unit_index_ref=production_unit_index_ref,
+            production_unit_index_hash=production_unit_index_hash,
+            reference_binding_hash=reference_binding_hash,
+            path_identity_hash=path_identity,
+        )
+        if loaded is None:
+            continue
+        value, receipt_ref = loaded
+        reference_entries = reference_aggregate.get("unit_references")
+        raw_entries = raw_aggregate.get("unit_shards")
+        reference_entry = (
+            reference_entries.get(unit_id)
+            if isinstance(reference_entries, Mapping)
+            else None
+        )
+        raw_entry = raw_entries.get(unit_id) if isinstance(raw_entries, Mapping) else None
+        if not isinstance(reference_entry, Mapping) or not isinstance(raw_entry, Mapping):
+            raise ValueError("STAGE3_STREAMING_RECEIPT_SOURCE_ENTRY_MISSING")
+        if (
+            reference_entry.get("reference_artifact_hash") != value.get("reference_artifact_hash")
+            or reference_entry.get("path_identity_hash") != value.get("path_identity_hash")
+            or raw_entry.get("shard_hash") != value.get("raw_shard_hash")
+            or raw_entry.get("bundle_ref") != value.get("raw_bundle_ref")
+            or raw_entry.get("bundle_manifest_hash") != value.get("raw_bundle_manifest_hash")
+            or raw_entry.get("path_identity_hash") != value.get("path_identity_hash")
+        ):
+            raise ValueError("STAGE3_STREAMING_RECEIPT_SOURCE_IDENTITY_MISMATCH")
+        seal_ref = str(value["node_cache_seal_ref"])
+        seal_path = _workspace_path(root, seal_ref, field="streaming.node_cache_seal_ref")
+        seal_root = seal_path.parent
+        seal = PersistentNodeGradientCache.verify_receipt(seal_root, seal_path.name)
+        if seal.get("state") != "SEALED" or seal.get("receipt_hash") != value.get("node_cache_seal_hash"):
+            raise ValueError("STAGE3_STREAMING_SEAL_RECEIPT_MISMATCH")
+        if seal.get("unit_id") != unit_id or seal.get("downstream_raw_shard_hash") != value.get("raw_shard_hash"):
+            raise ValueError("STAGE3_STREAMING_SEAL_IDENTITY_MISMATCH")
+        sealed.append(unit_id)
+        eviction_path = receipt_root / "evictions" / f"{unit_id}.json"
+        eviction_loaded = None
+        if eviction_path.is_symlink():
+            raise ValueError("STAGE3_STREAMING_EVICTION_SYMLINK")
+        if eviction_path.exists():
+            eviction_loaded = load_canonical_json(eviction_path)
+            if not isinstance(eviction_loaded, Mapping):
+                raise ValueError("STAGE3_STREAMING_EVICTION_NOT_OBJECT")
+            eviction_expected = {
+                "schema_version": "stage3-formal-streaming-eviction-receipt-v1",
+                "unit_id": unit_id,
+                "unit_receipt_ref": receipt_ref,
+                "unit_receipt_hash": value.get("artifact_hash"),
+                "seal_ref": seal_ref,
+                "seal_hash": value.get("node_cache_seal_hash"),
+                "execution_evidence_hash": execution_evidence_hash,
+                "reference_binding_hash": reference_binding_hash,
+                "state": "EVICTED",
+            }
+            if any(eviction_loaded.get(k) != v for k, v in eviction_expected.items()):
+                raise ValueError("STAGE3_STREAMING_EVICTION_IDENTITY_MISMATCH")
+            _stage3_streaming_artifact_hash(eviction_loaded, field="eviction")
+            eviction_ref = eviction_loaded.get("eviction_ref")
+            eviction_hash = eviction_loaded.get("eviction_hash")
+            if not isinstance(eviction_ref, str) or not isinstance(eviction_hash, str):
+                raise ValueError("STAGE3_STREAMING_EVICTION_REFERENCE_INVALID")
+            eviction_target = _workspace_path(root, eviction_ref, field="streaming.eviction_ref")
+            tombstone = PersistentNodeGradientCache.verify_receipt(
+                eviction_target.parent, eviction_target.name
+            )
+            if tombstone.get("state") != "EVICTED" or tombstone.get("tombstone_hash") != eviction_hash:
+                raise ValueError("STAGE3_STREAMING_EVICTION_RECEIPT_MISMATCH")
+            evicted.append(unit_id)
+        receipt_complete.append(unit_id)
+        unit_receipts[unit_id] = {
+            "receipt_ref": receipt_ref,
+            "receipt_hash": value["artifact_hash"],
+            "eviction_receipt_ref": (
+                _stage3_relative_ref(root, eviction_path, field="eviction_receipt")
+                if eviction_loaded is not None
+                else None
+            ),
+            "eviction_receipt_hash": (
+                eviction_loaded.get("artifact_hash")
+                if isinstance(eviction_loaded, Mapping)
+                else None
+            ),
+            "reference_artifact_hash": value["reference_artifact_hash"],
+            "observation_artifact_hash": value["observation_artifact_hash"],
+            "raw_shard_hash": value["raw_shard_hash"],
+            "lifecycle_state": "EVICTED" if eviction_loaded is not None else "SEALED",
+        }
+
+    committed = [
+        unit_id
+        for unit_id in required_unit_ids
+        if unit_id in set(reference_complete)
+        and unit_id in set(raw_complete)
+        and unit_id in set(observation_complete)
+        and unit_id in set(receipt_complete)
+        and unit_id in set(sealed)
+        and unit_id in set(evicted)
+    ]
+    missing = [unit_id for unit_id in required_unit_ids if unit_id not in set(committed)]
+    body: dict[str, JSONValue] = {
+        "schema_version": "stage3-formal-streaming-aggregate-v1",
+        "execution_evidence_hash": execution_evidence_hash,
+        "reference_binding_hash": reference_binding_hash,
+        "formal_plan_ref": formal_plan_ref,
+        "formal_plan_hash": formal_plan_hash,
+        "production_unit_index_ref": production_unit_index_ref,
+        "production_unit_index_hash": production_unit_index_hash,
+        "required_unit_ids": list(required_unit_ids),
+        "candidate_rule_names": list(candidate_names),
+        "reference_aggregate_ref": reference_aggregate_ref,
+        "reference_aggregate_hash": reference_aggregate["artifact_hash"],
+        "raw_aggregate_ref": raw_aggregate_ref,
+        "raw_aggregate_hash": raw_aggregate["artifact_hash"],
+        "reference_complete_unit_ids": list(reference_complete),
+        "raw_complete_unit_ids": list(raw_complete),
+        "observation_complete_unit_ids": observation_complete,
+        "receipt_complete_unit_ids": receipt_complete,
+        "sealed_unit_ids": sealed,
+        "evicted_unit_ids": evicted,
+        "committed_unit_ids": committed,
+        "missing_unit_ids": missing,
+        "unit_receipts": unit_receipts,
+    }
+    body["artifact_hash"] = canonical_json_hash(body)
+    path = receipt_root / f"aggregate-{body['artifact_hash']}.json"
+    _write_stage3_streaming_immutable(path, body)
+    return body, _stage3_relative_ref(root, path, field="streaming_aggregate")
+
+
 def _reference_scientific_identity(value: Mapping[str, object]) -> str:
     """Hash reference identity while excluding machine timing diagnostics."""
 
@@ -9032,6 +9727,43 @@ def _publish_stage3_reference_aggregate(
         if path.is_relative_to(root.resolve())
         else str(path),
     )
+
+
+def _load_stage3_reference_shard(
+    request: TaskExecutionRequest,
+    root: Path,
+    store: TaskArtifactStore,
+    *,
+    unit_id: str,
+    required_unit_ids: Sequence[str],
+    execution_evidence_hash: str,
+    reference_binding_hash: str,
+    reference_scope: str = "matrix",
+) -> tuple[Mapping[str, JSONValue], Mapping[str, JSONValue], str] | None:
+    """Load one immutable reference shard without rerunning refinement."""
+
+    references, entries, complete, _missing = _load_stage3_reference_aggregate(
+        request,
+        root,
+        store,
+        required_unit_ids=required_unit_ids,
+        execution_evidence_hash=execution_evidence_hash,
+        reference_binding_hash=reference_binding_hash,
+        reference_scope=reference_scope,
+    )
+    if unit_id not in complete:
+        return None
+    reference = references[unit_id]
+    entry = entries[unit_id]
+    reference_path = _workspace_path(
+        root, str(entry["ledger_ref"]), field="stage3_reference_shard"
+    )
+    value = load_canonical_json(reference_path)
+    if not isinstance(value, Mapping):
+        raise ValueError("STAGE3_REFERENCE_SHARD_NOT_OBJECT")
+    if value.get("reference_artifact_hash") != canonical_json_hash(reference):
+        raise ValueError("STAGE3_REFERENCE_SHARD_REFERENCE_HASH_MISMATCH")
+    return reference, entry, str(entry["ledger_ref"])
 
 
 def _select_stage3_reference(
@@ -10912,6 +11644,334 @@ def _run_stage3_matrix(
     return payloads, inputs.references
 
 
+def _resume_stage3_formal_matrix_from_receipt(
+    request: TaskExecutionRequest,
+    root: Path,
+    store: TaskArtifactStore,
+    *,
+    inputs: _PredecessorContext,
+    context: _PathContext,
+    thresholds: QuadratureThresholds,
+    candidate_names: Sequence[str],
+    required_units: Sequence[str],
+    unit_strata: Mapping[str, Mapping[str, str]],
+    plan_ref: str,
+    production_index: ProductionUnitIndex,
+    production_index_ref: str,
+    reference_binding: Mapping[str, JSONValue],
+    receipt_root: Path,
+    receipt: Mapping[str, JSONValue],
+) -> tuple[Mapping[str, Mapping[str, JSONValue]], tuple[str, ...]]:
+    """Recover a durable unit after raw/receipt publication without candidates."""
+
+    execution_hash = context.execution.artifact_hash
+    binding_hash = str(reference_binding["reference_binding_hash"])
+    reference_aggregate, reference_aggregate_ref = _publish_stage3_reference_aggregate(
+        request,
+        root,
+        store,
+        required_unit_ids=required_units,
+        execution_evidence_hash=execution_hash,
+        reference_binding_hash=binding_hash,
+        reference_scope="matrix",
+    )
+    raw_ledger_root = _stage3_raw_ledger_root(
+        store,
+        execution_evidence_hash=execution_hash,
+        reference_binding_hash=binding_hash,
+    )
+    raw_aggregate, raw_aggregate_ref = _publish_stage3_raw_aggregate_metadata(
+        root=root,
+        ledger_root=raw_ledger_root,
+        required_unit_ids=required_units,
+        execution_evidence_hash=execution_hash,
+        reference_binding_hash=binding_hash,
+        candidate_rule_names=candidate_names,
+    )
+    current_raw_shard, current_raw_state, current_raw_bundle = _load_stage3_raw_shard(
+        root=root,
+        shard_ref=str(receipt["raw_shard_ref"]),
+        expected={
+            "unit_id": context.unit_id,
+            "required_unit_ids": list(required_units),
+            "candidate_rule_names": sorted(candidate_names),
+            "execution_evidence_hash": execution_hash,
+            "reference_binding_hash": binding_hash,
+        },
+    )
+    raw_loaded = {
+        context.unit_id: (current_raw_shard, current_raw_state, current_raw_bundle)
+    }
+    raw_entries = raw_aggregate.get("unit_shards")
+    if (
+        not isinstance(raw_entries, Mapping)
+        or not isinstance(raw_entries.get(context.unit_id), Mapping)
+        or raw_entries[context.unit_id].get("shard_hash")
+        != current_raw_shard.get("artifact_hash")
+    ):
+        raise ValueError("STAGE3_STREAMING_ACTIVE_RAW_AGGREGATE_MISMATCH")
+    if context.unit_id not in raw_loaded:
+        raise _blocked(
+            BlockerCode.CONTRACT_UNFROZEN,
+            "stage3_streaming_ledger",
+            "已有 streaming receipt 但当前 unit raw shard 不存在",
+            retryable=False,
+            evidence_refs=(str(receipt["raw_shard_ref"]),),
+        )
+    observations, complete_units, missing_units = _load_stage3_observation_aggregate(
+        request,
+        root,
+        store,
+        required_unit_ids=required_units,
+        candidate_rule_names=candidate_names,
+        execution_evidence_hash=execution_hash,
+        production_index=production_index,
+        expected_reference_binding_hash=binding_hash,
+    )
+    seal_ref = str(receipt["node_cache_seal_ref"])
+    seal_path = _workspace_path(root, seal_ref, field="streaming.node_cache_seal_ref")
+    seal = PersistentNodeGradientCache.verify_receipt(seal_path.parent, seal_path.name)
+    if (
+        seal.get("state") != "SEALED"
+        or seal.get("receipt_hash") != receipt.get("node_cache_seal_hash")
+        or seal.get("unit_id") != context.unit_id
+        or seal.get("downstream_raw_shard_hash") != receipt.get("raw_shard_hash")
+    ):
+        raise _blocked(
+            BlockerCode.CONTRACT_UNFROZEN,
+            "stage3.07_node_cache_lifecycle",
+            "已有 streaming receipt 的 cache seal identity 不一致",
+            retryable=False,
+            evidence_refs=(seal_ref,),
+        )
+    eviction_path = receipt_root / "evictions" / f"{context.unit_id}.json"
+    if eviction_path.is_symlink():
+        raise ValueError("STAGE3_STREAMING_EVICTION_SYMLINK")
+    if eviction_path.exists():
+        eviction = load_canonical_json(eviction_path)
+        if not isinstance(eviction, Mapping):
+            raise ValueError("STAGE3_STREAMING_EVICTION_NOT_OBJECT")
+        if eviction.get("state") != "EVICTED":
+            raise ValueError("STAGE3_STREAMING_EVICTION_STATE_INVALID")
+        tombstone_ref = str(eviction["eviction_ref"])
+        tombstone_path = _workspace_path(root, tombstone_ref, field="streaming.eviction_ref")
+        tombstone = PersistentNodeGradientCache.verify_receipt(
+            tombstone_path.parent, tombstone_path.name
+        )
+        if tombstone.get("tombstone_hash") != eviction.get("eviction_hash"):
+            raise ValueError("STAGE3_STREAMING_EVICTION_HASH_MISMATCH")
+        eviction_receipt_ref = _stage3_relative_ref(
+            root, eviction_path, field="eviction_receipt"
+        )
+        eviction_receipt_hash = str(eviction["artifact_hash"])
+    else:
+        tombstone = context.node_cache.evict(
+            seal_path.name,
+            receipt_root=receipt_root,
+        )
+        tombstone_ref = _stage3_relative_ref(
+            root, receipt_root / str(tombstone["tombstone_ref"]), field="node_cache_eviction"
+        )
+        eviction, eviction_receipt_ref = _persist_stage3_streaming_eviction_receipt(
+            root=root,
+            receipt_root=receipt_root,
+            unit_id=context.unit_id,
+            unit_receipt_ref=_stage3_relative_ref(
+                root, receipt_root / "units" / f"{context.unit_id}.json", field="unit_receipt"
+            ),
+            unit_receipt_hash=str(receipt["artifact_hash"]),
+            seal_ref=seal_ref,
+            seal_hash=str(receipt["node_cache_seal_hash"]),
+            cache_root_ref=context.node_cache_root_ref,
+            eviction_ref=tombstone_ref,
+            eviction_hash=str(tombstone["tombstone_hash"]),
+            execution_evidence_hash=execution_hash,
+            reference_binding_hash=binding_hash,
+        )
+        eviction_receipt_hash = str(eviction["artifact_hash"])
+    streaming_aggregate, streaming_aggregate_ref = _publish_stage3_streaming_aggregate(
+        root=root,
+        receipt_root=receipt_root,
+        required_unit_ids=required_units,
+        candidate_names=candidate_names,
+        execution_evidence_hash=execution_hash,
+        reference_binding_hash=binding_hash,
+        formal_plan_ref=plan_ref,
+        formal_plan_hash=str(reference_binding["formal_plan_hash"]),
+        production_unit_index_ref=production_index_ref,
+        production_unit_index_hash=production_index.artifact_hash,
+        reference_aggregate_ref=reference_aggregate_ref,
+        reference_aggregate=reference_aggregate,
+        raw_aggregate_ref=raw_aggregate_ref,
+        raw_aggregate=raw_aggregate,
+        observation_complete_unit_ids=complete_units,
+    )
+    reference_path = _workspace_path(
+        root, str(receipt["reference_shard_ref"]), field="streaming.reference_shard_ref"
+    )
+    reference_shard = load_canonical_json(reference_path)
+    if not isinstance(reference_shard, Mapping):
+        raise ValueError("STAGE3_STREAMING_REFERENCE_SHARD_NOT_OBJECT")
+    reference = reference_shard.get("reference")
+    if not isinstance(reference, Mapping):
+        raise ValueError("STAGE3_STREAMING_REFERENCE_NOT_OBJECT")
+    if canonical_json_hash(reference) != receipt.get("reference_artifact_hash"):
+        raise ValueError("STAGE3_STREAMING_REFERENCE_HASH_MISMATCH")
+    refinement = reference.get("refinement")
+    if not isinstance(refinement, Mapping):
+        raise ValueError("STAGE3_STREAMING_REFERENCE_REFINEMENT_INVALID")
+    reference_error = refinement.get("conservative_error")
+    if reference_error is None:
+        raise ValueError("STAGE3_STREAMING_REFERENCE_ERROR_MISSING")
+    raw_shard, _raw_state, _raw_bundle = raw_loaded[context.unit_id]
+    independent_reference = {
+        "rule": {"name": "stage3.05_cross_family_refinement"},
+        "path_identity_hash": context.path.identity_hash,
+        "reference_artifact_hash": receipt["reference_artifact_hash"],
+        "reference_normalized_l1_error": float(reference_error),
+        "raw_shard_ref": receipt["raw_shard_ref"],
+        "raw_shard_hash": raw_shard["artifact_hash"],
+        "raw_bundle_ref": raw_shard["bundle_ref"],
+        "raw_bundle_manifest_hash": raw_shard["bundle_manifest_hash"],
+    }
+    active_observations = tuple(
+        item for item in observations if item.unit_id == context.unit_id
+    )
+    if {item.rule_name for item in active_observations} != set(candidate_names):
+        raise ValueError("STAGE3_STREAMING_ACTIVE_OBSERVATION_SET_INVALID")
+    node_evidence = {
+        "schema_version": "stage3-path-node-cache-evidence-v1",
+        "path_unit_id": context.unit_id,
+        "cache_root_ref": context.node_cache_root_ref,
+        "evidence_hash": receipt["node_cache_evidence_hash"],
+    }
+    formal_results: dict[str, JSONValue] = {
+        "schema_version": "stage3-task-path-results-v1",
+        "scope": "formal",
+        "formal_eligible": False,
+        "formal_gate_status": "PENDING_G3_6_AND_G3_7",
+        "selected_rule": None,
+        "quadrature_recommendation": None,
+        "active_unit_id": context.unit_id,
+        "execution_evidence_hash": execution_hash,
+        "observations": [_observation_payload(item) for item in observations],
+        "observation_ledger_ref": receipt["observation_ledger_ref"],
+        "reference_ledger_ref": receipt["reference_shard_ref"],
+        "reference_aggregate_ref": reference_aggregate_ref,
+        "reference_aggregate_hash": reference_aggregate["artifact_hash"],
+        "streaming_receipt_ref": _stage3_relative_ref(
+            root, receipt_root / "units" / f"{context.unit_id}.json", field="unit_receipt"
+        ),
+        "streaming_receipt_hash": receipt["artifact_hash"],
+        "streaming_aggregate_ref": streaming_aggregate_ref,
+        "streaming_aggregate_hash": streaming_aggregate["artifact_hash"],
+        "streaming_coverage": {
+            key: streaming_aggregate[key]
+            for key in (
+                "required_unit_ids", "candidate_rule_names",
+                "reference_complete_unit_ids", "raw_complete_unit_ids",
+                "observation_complete_unit_ids", "receipt_complete_unit_ids",
+                "sealed_unit_ids", "evicted_unit_ids", "committed_unit_ids",
+                "missing_unit_ids",
+            )
+        },
+        "observation_progress": {
+            "complete_unit_ids": list(complete_units),
+            "missing_unit_ids": list(missing_units),
+            "observed_unit_count": len(complete_units),
+            "required_unit_count": len(required_units),
+        },
+        "candidate_results": {},
+        "raw_storage_schema": "stage3-formal-raw-shard-v1",
+        "raw_vector_derivation_schema": VECTOR_DERIVATION_SCHEMA,
+        "raw_vector_derivation_contract_hash": VECTOR_DERIVATION_HASH,
+        "raw_shard_ref": receipt["raw_shard_ref"],
+        "raw_shard_hash": raw_shard["artifact_hash"],
+        "raw_bundle_ref": raw_shard["bundle_ref"],
+        "raw_bundle_manifest_hash": raw_shard["bundle_manifest_hash"],
+        "raw_aggregate_ref": raw_aggregate_ref,
+        "raw_aggregate_hash": raw_aggregate["artifact_hash"],
+        "raw_aggregate_schema": "stage3-formal-raw-aggregate-v1",
+        "raw_aggregate_complete_unit_ids": raw_aggregate["complete_unit_ids"],
+        "raw_aggregate_missing_unit_ids": raw_aggregate["missing_unit_ids"],
+        "cost_semantics": "callback_cost_separate_from_unique_nodes_v1",
+        "node_gradient_cache": node_evidence,
+        "node_cache_lifecycle": {
+            "state": "EVICTED",
+            "seal_ref": seal_ref,
+            "seal_hash": receipt["node_cache_seal_hash"],
+            "eviction_receipt_ref": eviction_receipt_ref,
+            "eviction_receipt_hash": eviction_receipt_hash,
+            "eviction_ref": tombstone_ref,
+            "eviction_hash": tombstone["tombstone_hash"],
+        },
+        "independent_reference": independent_reference,
+        "thresholds_hash": thresholds.artifact_hash,
+        "formal_plan_ref": plan_ref,
+        "formal_plan_hash": reference_binding["formal_plan_hash"],
+        "reference_artifact_hash": receipt["reference_artifact_hash"],
+        "reference_binding_hash": binding_hash,
+        "reference_ladder_hash": reference_binding["reference_ladder_hash"],
+        "reference_ladder_levels": reference_binding["reference_ladder_levels"],
+        "reference_ladder_nodes": reference_binding["reference_ladder_nodes"],
+        "reference_tolerance": reference_binding["reference_tolerance"],
+        "required_consecutive": reference_binding["required_consecutive"],
+        "primary_family": reference_binding["primary_family"],
+        "production_unit_index_ref": production_index_ref,
+        "production_unit_index_hash": production_index.artifact_hash,
+        "upstream_binding_hash": inputs.binding_hash,
+    }
+    completeness = {
+        item.rule_name: {
+            "absolute": item.completeness_absolute_residual,
+            "relative": item.completeness_relative_residual,
+            "l1_scaled": item.completeness_l1_scaled_residual,
+        }
+        for item in active_observations
+    }
+    formal_report: dict[str, JSONValue] = {
+        "schema_version": "stage3-task-completeness-report-v1",
+        "path_identity_hash": context.path.identity_hash,
+        "active_unit_id": context.unit_id,
+        "selected_rule": None,
+        "candidate_residuals": completeness,
+        "defined": all(item["absolute"] is not None for item in completeness.values()),
+        "node_gradient_cache_evidence_hash": receipt["node_cache_evidence_hash"],
+    }
+    streaming_committed = streaming_aggregate["committed_unit_ids"]
+    if streaming_aggregate["missing_unit_ids"] or streaming_committed != list(required_units):
+        raise _blocked(
+            BlockerCode.ASSET_UNAVAILABLE,
+            "stage3.07_matrix_coverage",
+            (
+                "formal Stage3.07 matrix fan-out 尚未覆盖全部 path units "
+                f"({len(streaming_committed)}/{len(required_units)})"
+            ),
+            evidence_refs=tuple(
+                dict.fromkeys(
+                    (*inputs.references, plan_ref, reference_aggregate_ref,
+                     str(receipt["observation_ledger_ref"]), str(receipt["raw_shard_ref"]),
+                     str(receipt["raw_aggregate_ref"]),
+                     _stage3_relative_ref(root, receipt_root / "units" / f"{context.unit_id}.json", field="unit_receipt"),
+                     eviction_receipt_ref, streaming_aggregate_ref)
+                )
+            ),
+        )
+    return {
+        "formal_path_results": formal_results,
+        "completeness_report": formal_report,
+        "gate_record": _gate_candidate(request),
+    }, tuple(
+        dict.fromkeys(
+            (*inputs.references, plan_ref, reference_aggregate_ref,
+             str(receipt["observation_ledger_ref"]), str(receipt["raw_shard_ref"]),
+             str(receipt["raw_aggregate_ref"]),
+             _stage3_relative_ref(root, receipt_root / "units" / f"{context.unit_id}.json", field="unit_receipt"),
+             eviction_receipt_ref, streaming_aggregate_ref)
+        )
+    )
+
+
 def _run_stage3_formal_matrix_shard(
     request: TaskExecutionRequest,
     root: Path,
@@ -10988,6 +12048,235 @@ def _run_stage3_formal_matrix_shard(
     reference_binding = _stage3_formal_reference_binding(
         request, root, context, plan_kind="matrix"
     )
+    receipt_root = _stage3_streaming_receipt_root(
+        request,
+        root,
+        store,
+        execution_evidence_hash=context.execution.artifact_hash,
+        reference_binding_hash=str(reference_binding["reference_binding_hash"]),
+    )
+    existing_streaming_receipt = _load_stage3_streaming_unit_receipt(
+        root=root,
+        receipt_root=receipt_root,
+        unit_id=context.unit_id,
+        required_unit_ids=required_units,
+        candidate_names=candidate_names,
+        execution_evidence_hash=context.execution.artifact_hash,
+        formal_plan_ref=plan_ref,
+        formal_plan_hash=str(reference_binding["formal_plan_hash"]),
+        production_unit_index_ref=production_index_ref,
+        production_unit_index_hash=production_index.artifact_hash,
+        reference_binding_hash=str(reference_binding["reference_binding_hash"]),
+        path_identity_hash=context.path.identity_hash,
+    )
+    if existing_streaming_receipt is not None:
+        return _resume_stage3_formal_matrix_from_receipt(
+            request,
+            root,
+            store,
+            inputs=inputs,
+            context=context,
+            thresholds=thresholds,
+            candidate_names=candidate_names,
+            required_units=required_units,
+            unit_strata=unit_strata,
+            plan_ref=plan_ref,
+            production_index=production_index,
+            production_index_ref=production_index_ref,
+            reference_binding=reference_binding,
+            receipt_root=receipt_root,
+            receipt=existing_streaming_receipt[0],
+        )
+    # A process may die after the three scientific shards are durable but
+    # before the unit receipt is written.  Treat that state as a recovery
+    # fence: validate the existing objects, seal the already-populated cache,
+    # and never invoke the 13 candidates again.
+    reference_shard_path = (
+        _stage3_reference_ledger_root(
+            request,
+            root,
+            store,
+            execution_evidence_hash=context.execution.artifact_hash,
+            reference_scope="matrix",
+        )
+        / f"{context.unit_id}.json"
+    )
+    observation_path = (
+        _stage3_observation_ledger_root(
+            request,
+            root,
+            store,
+            execution_evidence_hash=context.execution.artifact_hash,
+        )
+        / f"{context.unit_id}.json"
+    )
+    raw_shard_path = (
+        _stage3_raw_ledger_root(
+            store,
+            execution_evidence_hash=context.execution.artifact_hash,
+            reference_binding_hash=str(reference_binding["reference_binding_hash"]),
+        )
+        / f"{context.unit_id}.json"
+    )
+    durable_shards = (reference_shard_path, observation_path, raw_shard_path)
+    if raw_shard_path.exists() and not all(path.exists() for path in durable_shards):
+        raise _blocked(
+            BlockerCode.CONTRACT_UNFROZEN,
+            "stage3_streaming_ledger",
+            "raw shard 已存在但 reference/observation durable coverage 不完整",
+            retryable=False,
+            evidence_refs=tuple(
+                _stage3_relative_ref(root, path, field="streaming_shard")
+                for path in durable_shards
+                if path.exists()
+            ),
+        )
+    if all(path.exists() for path in durable_shards):
+        stored_reference = _load_stage3_reference_shard(
+            request,
+            root,
+            store,
+            unit_id=context.unit_id,
+            required_unit_ids=required_units,
+            execution_evidence_hash=context.execution.artifact_hash,
+            reference_binding_hash=str(reference_binding["reference_binding_hash"]),
+            reference_scope="matrix",
+        )
+        if stored_reference is None:
+            raise ValueError("STAGE3_STREAMING_REFERENCE_RECOVERY_MISSING")
+        stored_reference_payload, stored_reference_entry, stored_reference_ref = stored_reference
+        stored_reference_aggregate, stored_reference_aggregate_ref = _publish_stage3_reference_aggregate(
+            request,
+            root,
+            store,
+            required_unit_ids=required_units,
+            execution_evidence_hash=context.execution.artifact_hash,
+            reference_binding_hash=str(reference_binding["reference_binding_hash"]),
+            reference_scope="matrix",
+        )
+        stored_raw_aggregate, stored_raw_aggregate_ref = _publish_stage3_raw_aggregate_metadata(
+            root=root,
+            ledger_root=raw_shard_path.parent,
+            required_unit_ids=required_units,
+            execution_evidence_hash=context.execution.artifact_hash,
+            reference_binding_hash=str(reference_binding["reference_binding_hash"]),
+            candidate_rule_names=candidate_names,
+        )
+        stored_raw_shard, stored_raw_state, stored_raw_bundle = _load_stage3_raw_shard(
+            root=root,
+            shard_ref=_stage3_relative_ref(root, raw_shard_path, field="raw_shard"),
+            expected={
+                "unit_id": context.unit_id,
+                "required_unit_ids": list(required_units),
+                "candidate_rule_names": sorted(candidate_names),
+                "execution_evidence_hash": context.execution.artifact_hash,
+                "reference_binding_hash": str(reference_binding["reference_binding_hash"]),
+            },
+        )
+        stored_raw_loaded = {
+            context.unit_id: (stored_raw_shard, stored_raw_state, stored_raw_bundle)
+        }
+        stored_raw_entries = stored_raw_aggregate.get("unit_shards")
+        if (
+            not isinstance(stored_raw_entries, Mapping)
+            or not isinstance(stored_raw_entries.get(context.unit_id), Mapping)
+            or stored_raw_entries[context.unit_id].get("shard_hash")
+            != stored_raw_shard.get("artifact_hash")
+        ):
+            raise ValueError("STAGE3_STREAMING_ACTIVE_RAW_AGGREGATE_MISMATCH")
+        stored_refinement = stored_reference_payload.get("refinement")
+        if not isinstance(stored_refinement, Mapping):
+            raise ValueError("STAGE3_STREAMING_REFERENCE_REFINEMENT_INVALID")
+        stored_levels = stored_refinement.get("completed_levels")
+        if not isinstance(stored_levels, list):
+            raise ValueError("STAGE3_STREAMING_REFERENCE_LEVELS_INVALID")
+        completed_hashes = {
+            str(item["rule_hash"])
+            for item in stored_levels
+            if isinstance(item, Mapping) and isinstance(item.get("rule_hash"), str)
+        }
+        reference_rules = tuple(
+            rule
+            for rule in _stage3_reference_levels(request, root, context)
+            if getattr(rule.rule, "artifact_hash", None) in completed_hashes
+        )
+        if {getattr(rule.rule, "artifact_hash", None) for rule in reference_rules} != completed_hashes:
+            raise ValueError("STAGE3_STREAMING_REFERENCE_LEVEL_IDENTITY_MISMATCH")
+        recovered_cache_evidence = context.cache_evidence(
+            tuple(reference_rules)
+            + tuple(_quadrature_rule_from_name(name) for name in candidate_names)
+        )
+        recovered_raw_shard = stored_raw_loaded[context.unit_id][0]
+        recovered_observation_hash = _stage3_observation_artifact_hash(
+            request,
+            root,
+            store,
+            execution_evidence_hash=context.execution.artifact_hash,
+            reference_binding_hash=str(reference_binding["reference_binding_hash"]),
+            unit_id=context.unit_id,
+        )
+        recovered_seal = context.node_cache.seal(
+            scope="stage3.07.matrix",
+            unit_id=context.unit_id,
+            plan_hash=str(reference_binding["formal_plan_hash"]),
+            run_config_hash=request.config.config_hash,
+            downstream_raw_shard_ref=raw_shard_path.resolve(),
+            downstream_raw_shard_hash=str(recovered_raw_shard["artifact_hash"]),
+            receipt_root=receipt_root,
+        )
+        recovered_seal_path = receipt_root / str(recovered_seal["receipt_ref"])
+        recovered_receipt, _recovered_receipt_ref = _persist_stage3_streaming_unit_receipt(
+            root=root,
+            receipt_root=receipt_root,
+            unit_id=context.unit_id,
+            required_unit_ids=required_units,
+            candidate_names=candidate_names,
+            execution_evidence_hash=context.execution.artifact_hash,
+            formal_plan_ref=plan_ref,
+            formal_plan_hash=str(reference_binding["formal_plan_hash"]),
+            production_unit_index_ref=production_index_ref,
+            production_unit_index_hash=production_index.artifact_hash,
+            reference_binding_hash=str(reference_binding["reference_binding_hash"]),
+            path_identity_hash=context.path.identity_hash,
+            reference_artifact_hash=canonical_json_hash(stored_reference_payload),
+            reference_shard_ref=stored_reference_ref,
+            reference_shard_hash=str(stored_reference_entry["ledger_artifact_hash"]),
+            reference_aggregate_ref=stored_reference_aggregate_ref,
+            reference_aggregate_hash=str(stored_reference_aggregate["artifact_hash"]),
+            observation_ledger_ref=_stage3_relative_ref(root, observation_path, field="observation_ledger"),
+            observation_artifact_hash=recovered_observation_hash,
+            raw_shard_ref=_stage3_relative_ref(root, raw_shard_path, field="raw_shard"),
+            raw_shard_hash=str(recovered_raw_shard["artifact_hash"]),
+            raw_bundle_ref=str(recovered_raw_shard["bundle_ref"]),
+            raw_bundle_manifest_hash=str(recovered_raw_shard["bundle_manifest_hash"]),
+            raw_aggregate_ref=stored_raw_aggregate_ref,
+            raw_aggregate_hash=str(stored_raw_aggregate["artifact_hash"]),
+            node_cache_evidence_hash=str(recovered_cache_evidence["evidence_hash"]),
+            node_cache_seal_ref=_stage3_relative_ref(root, recovered_seal_path, field="node_cache_seal"),
+            node_cache_seal_hash=str(recovered_seal["receipt_hash"]),
+        )
+        # The resume helper validates and loads the active raw bundle once more.
+        # Drop every caller-held TensorBundle/state reference first so a crash
+        # between raw persistence and the unit receipt never doubles the peak
+        # memory for this unit (and never retains prior units).
+        del stored_raw_loaded, stored_raw_state, stored_raw_bundle, stored_raw_shard
+        return _resume_stage3_formal_matrix_from_receipt(
+            request,
+            root,
+            store,
+            inputs=inputs,
+            context=context,
+            thresholds=thresholds,
+            candidate_names=candidate_names,
+            required_units=required_units,
+            unit_strata=unit_strata,
+            plan_ref=plan_ref,
+            production_index=production_index,
+            production_index_ref=production_index_ref,
+            reference_binding=reference_binding,
+            receipt_root=receipt_root,
+            receipt=recovered_receipt,
+        )
     reference_result, reference_rules = _stage3_reference_refinement(
         request, root, store, context, plan_kind="matrix"
     )
@@ -11047,44 +12336,9 @@ def _run_stage3_formal_matrix_shard(
         reference_binding_hash=str(reference_binding["reference_binding_hash"]),
         reference_scope="matrix",
     )
-    _reference_rows, _reference_entries, reference_complete, reference_missing = (
-        _load_stage3_reference_aggregate(
-            request,
-            root,
-            store,
-            required_unit_ids=required_units,
-            execution_evidence_hash=context.execution.artifact_hash,
-            reference_binding_hash=str(reference_binding["reference_binding_hash"]),
-            reference_scope="matrix",
-        )
-    )
-    reference_aggregate, reference_aggregate_ref = _publish_stage3_reference_aggregate(
-        request,
-        root,
-        store,
-        required_unit_ids=required_units,
-        execution_evidence_hash=context.execution.artifact_hash,
-        reference_binding_hash=str(reference_binding["reference_binding_hash"]),
-        reference_scope="matrix",
-    )
-    if reference_missing or tuple(reference_complete) != tuple(required_units):
-        raise _blocked(
-            BlockerCode.ASSET_UNAVAILABLE,
-            "stage3.07_reference_coverage",
-            (
-                "formal Stage3.07 matrix reference fan-out 尚未覆盖全部 path units "
-                f"({len(reference_complete)}/{len(required_units)})"
-            ),
-            evidence_refs=tuple(
-                dict.fromkeys(
-                    (*inputs.references, reference_ledger_ref, reference_aggregate_ref)
-                )
-            ),
-        )
-    reference_aggregate_hash = str(reference_aggregate["artifact_hash"])
-    # The shard's immutable reference hash intentionally excludes this
-    # aggregate convenience binding.  The aggregate itself is content
-    # addressed and is included in the top-level matrix result below.
+    # The reference shard is the only cross-unit artifact required before this
+    # unit's candidates.  A global reference barrier would serialize the fanout
+    # and, more importantly, would produce reference-only partial steps.
     reference = dict(matrix_reference)
     refinement = reference.get("refinement")
     if (
@@ -11141,9 +12395,6 @@ def _run_stage3_formal_matrix_shard(
     # fan-out coverage.  Early shards are expected to see an incomplete
     # observation aggregate and must nevertheless leave durable raw tensors
     # for the eventual final-unit aggregate.
-    node_cache_evidence = context.cache_evidence(
-        tuple(_quadrature_rule_from_name(name) for name in candidate_names)
-    )
     raw_shard, raw_shard_ref, raw_aggregate, raw_aggregate_ref = (
         _persist_stage3_raw_matrix_unit(
             store=store,
@@ -11159,6 +12410,19 @@ def _run_stage3_formal_matrix_shard(
             execution_evidence_hash=context.execution.artifact_hash,
         )
     )
+    # Coverage snapshots and cache lifecycle evidence are deliberately after
+    # raw persistence.  Thus a BLOCKED invocation still leaves a complete,
+    # independently reloadable unit behind it.
+    reference_aggregate, reference_aggregate_ref = _publish_stage3_reference_aggregate(
+        request,
+        root,
+        store,
+        required_unit_ids=required_units,
+        execution_evidence_hash=context.execution.artifact_hash,
+        reference_binding_hash=str(reference_binding["reference_binding_hash"]),
+        reference_scope="matrix",
+    )
+    reference_aggregate_hash = str(reference_aggregate["artifact_hash"])
     observations, complete_units, missing_units = _load_stage3_observation_aggregate(
         request,
         root,
@@ -11169,19 +12433,125 @@ def _run_stage3_formal_matrix_shard(
         production_index=production_index,
         expected_reference_binding_hash=str(reference_binding["reference_binding_hash"]),
     )
-    if missing_units or tuple(complete_units) != tuple(required_units):
+    all_rules = tuple(reference_rules) + tuple(
+        _quadrature_rule_from_name(name) for name in candidate_names
+    )
+    node_cache_evidence = context.cache_evidence(all_rules)
+    observation_artifact_hash = _stage3_observation_artifact_hash(
+        request,
+        root,
+        store,
+        execution_evidence_hash=context.execution.artifact_hash,
+        reference_binding_hash=str(reference_binding["reference_binding_hash"]),
+        unit_id=context.unit_id,
+    )
+    seal = context.node_cache.seal(
+        scope="stage3.07.matrix",
+        unit_id=context.unit_id,
+        plan_hash=str(reference_binding["formal_plan_hash"]),
+        run_config_hash=request.config.config_hash,
+        downstream_raw_shard_ref=(root / raw_shard_ref).resolve(),
+        downstream_raw_shard_hash=str(raw_shard["artifact_hash"]),
+        receipt_root=receipt_root,
+    )
+    seal_name = str(seal["receipt_ref"])
+    seal_path = receipt_root / seal_name
+    seal_ref = _stage3_relative_ref(root, seal_path, field="node_cache_seal")
+    seal_hash = str(seal["receipt_hash"])
+    unit_receipt, unit_receipt_ref = _persist_stage3_streaming_unit_receipt(
+        root=root,
+        receipt_root=receipt_root,
+        unit_id=context.unit_id,
+        required_unit_ids=required_units,
+        candidate_names=candidate_names,
+        execution_evidence_hash=context.execution.artifact_hash,
+        formal_plan_ref=plan_ref,
+        formal_plan_hash=str(reference_binding["formal_plan_hash"]),
+        production_unit_index_ref=production_index_ref,
+        production_unit_index_hash=production_index.artifact_hash,
+        reference_binding_hash=str(reference_binding["reference_binding_hash"]),
+        path_identity_hash=context.path.identity_hash,
+        reference_artifact_hash=reference_artifact_hash,
+        reference_shard_ref=reference_ledger_ref,
+        reference_shard_hash=str(_reference_shard["artifact_hash"]),
+        reference_aggregate_ref=reference_aggregate_ref,
+        reference_aggregate_hash=reference_aggregate_hash,
+        observation_ledger_ref=ledger_ref,
+        observation_artifact_hash=observation_artifact_hash,
+        raw_shard_ref=raw_shard_ref,
+        raw_shard_hash=str(raw_shard["artifact_hash"]),
+        raw_bundle_ref=str(raw_shard["bundle_ref"]),
+        raw_bundle_manifest_hash=str(raw_shard["bundle_manifest_hash"]),
+        raw_aggregate_ref=raw_aggregate_ref,
+        raw_aggregate_hash=str(raw_aggregate["artifact_hash"]),
+        node_cache_evidence_hash=str(node_cache_evidence["evidence_hash"]),
+        node_cache_seal_ref=seal_ref,
+        node_cache_seal_hash=seal_hash,
+    )
+    tombstone = context.node_cache.evict(
+        seal_name,
+        receipt_root=receipt_root,
+    )
+    tombstone_name = str(tombstone["tombstone_ref"])
+    tombstone_ref = _stage3_relative_ref(
+        root, receipt_root / tombstone_name, field="node_cache_eviction"
+    )
+    eviction_receipt, eviction_receipt_ref = _persist_stage3_streaming_eviction_receipt(
+        root=root,
+        receipt_root=receipt_root,
+        unit_id=context.unit_id,
+        unit_receipt_ref=unit_receipt_ref,
+        unit_receipt_hash=str(unit_receipt["artifact_hash"]),
+        seal_ref=seal_ref,
+        seal_hash=seal_hash,
+        cache_root_ref=context.node_cache_root_ref,
+        eviction_ref=tombstone_ref,
+        eviction_hash=str(tombstone["tombstone_hash"]),
+        execution_evidence_hash=context.execution.artifact_hash,
+        reference_binding_hash=str(reference_binding["reference_binding_hash"]),
+    )
+    streaming_aggregate, streaming_aggregate_ref = _publish_stage3_streaming_aggregate(
+        root=root,
+        receipt_root=receipt_root,
+        required_unit_ids=required_units,
+        candidate_names=candidate_names,
+        execution_evidence_hash=context.execution.artifact_hash,
+        reference_binding_hash=str(reference_binding["reference_binding_hash"]),
+        formal_plan_ref=plan_ref,
+        formal_plan_hash=str(reference_binding["formal_plan_hash"]),
+        production_unit_index_ref=production_index_ref,
+        production_unit_index_hash=production_index.artifact_hash,
+        reference_aggregate_ref=reference_aggregate_ref,
+        reference_aggregate=reference_aggregate,
+        raw_aggregate_ref=raw_aggregate_ref,
+        raw_aggregate=raw_aggregate,
+        observation_complete_unit_ids=complete_units,
+    )
+    streaming_committed = streaming_aggregate.get("committed_unit_ids")
+    if (
+        streaming_aggregate.get("missing_unit_ids")
+        or streaming_committed != list(required_units)
+    ):
         raise _blocked(
             BlockerCode.ASSET_UNAVAILABLE,
             "stage3.07_matrix_coverage",
             (
                 "formal Stage3.07 matrix fan-out 尚未覆盖全部 path units "
-                f"({len(complete_units)}/{len(required_units)})"
+                f"({len(streaming_committed) if isinstance(streaming_committed, list) else 0}/{len(required_units)})"
             ),
             evidence_refs=tuple(
                 dict.fromkeys(
                     (
                         *inputs.references,
+                        plan_ref,
+                        reference_ledger_ref,
+                        reference_aggregate_ref,
                         ledger_ref,
+                        raw_shard_ref,
+                        raw_aggregate_ref,
+                        unit_receipt_ref,
+                        eviction_receipt_ref,
+                        streaming_aggregate_ref,
                     )
                 )
             ),
@@ -11214,6 +12584,25 @@ def _run_stage3_formal_matrix_shard(
                 "reference_ledger_ref": reference_ledger_ref,
                 "reference_aggregate_ref": reference_aggregate_ref,
                 "reference_aggregate_hash": reference_aggregate_hash,
+                "streaming_receipt_ref": unit_receipt_ref,
+                "streaming_receipt_hash": unit_receipt["artifact_hash"],
+                "streaming_aggregate_ref": streaming_aggregate_ref,
+                "streaming_aggregate_hash": streaming_aggregate["artifact_hash"],
+                "streaming_coverage": {
+                    key: streaming_aggregate[key]
+                    for key in (
+                        "required_unit_ids",
+                        "candidate_rule_names",
+                        "reference_complete_unit_ids",
+                        "raw_complete_unit_ids",
+                        "observation_complete_unit_ids",
+                        "receipt_complete_unit_ids",
+                        "sealed_unit_ids",
+                        "evicted_unit_ids",
+                        "committed_unit_ids",
+                        "missing_unit_ids",
+                    )
+                },
                 "observation_progress": {
                     "complete_unit_ids": list(complete_units),
                     "missing_unit_ids": list(missing_units),
@@ -11237,6 +12626,15 @@ def _run_stage3_formal_matrix_shard(
                 "raw_aggregate_missing_unit_ids": raw_aggregate["missing_unit_ids"],
                 "cost_semantics": "callback_cost_separate_from_unique_nodes_v1",
                 "node_gradient_cache": node_cache_evidence,
+                "node_cache_lifecycle": {
+                    "state": "EVICTED",
+                    "seal_ref": seal_ref,
+                    "seal_hash": seal_hash,
+                    "eviction_receipt_ref": eviction_receipt_ref,
+                    "eviction_receipt_hash": eviction_receipt["artifact_hash"],
+                    "eviction_ref": tombstone_ref,
+                    "eviction_hash": tombstone["tombstone_hash"],
+                },
                 "independent_reference": independent_reference,
                 "thresholds_hash": thresholds.artifact_hash,
                 "formal_plan_ref": plan_ref,
@@ -11286,7 +12684,18 @@ def _run_stage3_formal_matrix_shard(
         },
         tuple(
             dict.fromkeys(
-                (*inputs.references, plan_ref, reference_aggregate_ref)
+                (
+                    *inputs.references,
+                    plan_ref,
+                    reference_ledger_ref,
+                    reference_aggregate_ref,
+                    ledger_ref,
+                    raw_shard_ref,
+                    raw_aggregate_ref,
+                    unit_receipt_ref,
+                    eviction_receipt_ref,
+                    streaming_aggregate_ref,
+                )
             )
         ),
     )

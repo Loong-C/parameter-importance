@@ -159,6 +159,45 @@ def test_task_spec_cannot_declare_candidate_gate_output() -> None:
         )
 
 
+def test_formal_matrix_task_spec_requires_phase_authorities() -> None:
+    def spec(evidence_refs: dict[str, str]) -> dict[str, object]:
+        return {
+            "task_id": "stage3.07_formal_experiment_matrix",
+            "config_ref": "configs/stage3-matrix.json",
+            "config_hash": "a" * 64,
+            "environment_ref": None,
+            "evidence_refs": evidence_refs,
+            "command": ["{python}", "worker.py"],
+            "output_refs": {
+                kind: f"outputs/{kind}.json"
+                for kind in orchestrator.EXPECTED_OUTPUTS[
+                    "stage3.07_formal_experiment_matrix"
+                ]
+            },
+            "output_dir": "outputs/stage3.07",
+            "result_ref": "results/stage3.07.json",
+            "unit_status_ref": "status/stage3.07.json",
+            "external_gate_ref": None,
+        }
+
+    with pytest.raises(
+        orchestrator.Stage3OrchestratorError,
+        match="TASK_ENVIRONMENT_EVIDENCE_MISSING:stage3.07_formal_experiment_matrix:.*formal_stage3_matrix_plan",
+    ):
+        orchestrator.TaskSpec.from_mapping(spec({}))
+
+    parsed = orchestrator.TaskSpec.from_mapping(
+        spec(
+            {
+                "formal_stage3_matrix_plan": "plans/matrix.json",
+                "gate_stage3_g3_5": "gates/g3-5.json",
+                "stage3_matrix_plan_execution": "evidence/matrix-execution.json",
+            }
+        )
+    )
+    assert parsed.evidence_refs["formal_stage3_matrix_plan"] == "plans/matrix.json"
+
+
 def test_gate_authority_publishes_independent_formal_gate_and_evidence(tmp_path: Path) -> None:
     from param_importance_nlp.contracts.stage23 import FormalExecutionEvidence
     from param_importance_nlp.contracts.status import GateRecord, GateStatus

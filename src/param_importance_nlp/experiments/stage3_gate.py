@@ -41,6 +41,50 @@ REQUIRED_STAGE3_STRATA: tuple[str, ...] = (
 )
 REQUIRED_STAGE3_TOP_Q: tuple[float, ...] = (0.001, 0.01, 0.05)
 
+# S3.07's streaming ledger is an additional, immutable coverage fence for the
+# formal matrix.  It is deliberately validated here as a plain mapping so the
+# evaluator cannot be made to pass by supplying only a 99x13 observation table.
+STAGE3_STREAMING_AGGREGATE_SCHEMA = "stage3-formal-streaming-aggregate-v1"
+_STREAMING_AGGREGATE_FIELDS = frozenset(
+    {
+        "schema_version",
+        "execution_evidence_hash",
+        "reference_binding_hash",
+        "formal_plan_ref",
+        "formal_plan_hash",
+        "production_unit_index_ref",
+        "production_unit_index_hash",
+        "required_unit_ids",
+        "candidate_rule_names",
+        "reference_aggregate_ref",
+        "reference_aggregate_hash",
+        "raw_aggregate_ref",
+        "raw_aggregate_hash",
+        "reference_complete_unit_ids",
+        "raw_complete_unit_ids",
+        "observation_complete_unit_ids",
+        "receipt_complete_unit_ids",
+        "sealed_unit_ids",
+        "evicted_unit_ids",
+        "committed_unit_ids",
+        "missing_unit_ids",
+        "unit_receipts",
+        "artifact_hash",
+    }
+)
+_STREAMING_UNIT_RECEIPT_FIELDS = frozenset(
+    {
+        "receipt_ref",
+        "receipt_hash",
+        "eviction_receipt_ref",
+        "eviction_receipt_hash",
+        "reference_artifact_hash",
+        "observation_artifact_hash",
+        "raw_shard_hash",
+        "lifecycle_state",
+    }
+)
+
 # S3.2 defines principle bounds only for the keys in DEFAULT_THRESHOLDS.  The
 # absolute and loss-drop-relative completeness tolerances must still be frozen
 # before formal execution, but their numerical scale is calibrated by S3.6;
@@ -378,6 +422,231 @@ def _formal_plan(
     }
     thresholds = _thresholds(value["thresholds"])  # type: ignore[arg-type]
     return artifact_hash, tuple(raw_rules), tuple(raw_units), unit_strata, thresholds
+
+
+def _streaming_ref(value: object, *, field: str) -> str:
+    """Validate an immutable streaming-ledger reference.
+
+    The aggregate is loaded by the publisher before it reaches this module,
+    but the evaluator also accepts direct callers.  Keep the same formal
+    anti-fixture and no-query rules at this boundary so a local test object
+    cannot be relabeled as production evidence.
+    """
+
+    if (
+        not isinstance(value, str)
+        or not value
+        or "?" in value
+        or "\\" in value
+        or "//" in value
+        or _forbidden_formal_label(value)
+    ):
+        raise ValueError(f"{field} 必须是稳定 formal ref")
+    return value
+
+
+def _streaming_ids(
+    value: object,
+    *,
+    field: str,
+    expected: tuple[str, ...],
+) -> tuple[str, ...]:
+    if not isinstance(value, list):
+        raise ValueError(f"{field} 必须是 ordered array")
+    if any(not isinstance(item, str) or not item for item in value):
+        raise ValueError(f"{field} 含无效 unit id")
+    if len(set(value)) != len(value):
+        raise ValueError(f"{field} 含 duplicate unit id")
+    actual = tuple(value)
+    if actual != expected:
+        raise ValueError(f"{field} 与冻结 required_unit_ids 不一致")
+    return actual
+
+
+def _validate_streaming_coverage(
+    value: Mapping[str, object] | object,
+    *,
+    required_unit_ids: Sequence[str],
+    required_rule_names: Sequence[str],
+    execution_evidence_hash: str | None = None,
+    formal_plan_ref: str | None = None,
+    formal_plan_hash: str | None = None,
+    production_unit_index_ref: str | None = None,
+    production_unit_index_hash: str | None = None,
+    reference_binding_hash: str | None = None,
+) -> Mapping[str, object]:
+    """Fail closed on the final S3.07 streaming coverage snapshot.
+
+    The aggregate is intentionally an exact-shape, content-addressed mapping.
+    Every one of the reference/raw/observation/receipt/commit/seal/eviction
+    sets must equal the frozen production index.  In particular, this does not
+    accept a partial snapshot merely because all observation rows are present.
+    Receipt payloads themselves are immutable upstream artifacts; at this
+    boundary we verify their refs, hashes, lifecycle state, and one-to-one
+    identity with the frozen unit map.
+    """
+
+    if not isinstance(value, Mapping):
+        raise TypeError("STAGE3_STREAMING_COVERAGE_REQUIRED_OBJECT")
+    if set(value) != _STREAMING_AGGREGATE_FIELDS:
+        raise ValueError("STAGE3_STREAMING_AGGREGATE_FIELDS_MISMATCH")
+    if value.get("schema_version") != STAGE3_STREAMING_AGGREGATE_SCHEMA:
+        raise ValueError("STAGE3_STREAMING_AGGREGATE_SCHEMA_INVALID")
+
+    units = tuple(required_unit_ids)
+    rules = tuple(required_rule_names)
+    if (
+        len(units) != 99
+        or len(set(units)) != len(units)
+        or any(not isinstance(item, str) or not item for item in units)
+    ):
+        raise ValueError("STAGE3_STREAMING_REQUIRED_UNIT_COUNT_INVALID")
+    if (
+        len(rules) != 13
+        or len(set(rules)) != len(rules)
+        or tuple(rules) != DEFAULT_CANDIDATE_RULES
+    ):
+        raise ValueError("STAGE3_STREAMING_REQUIRED_RULE_COUNT_INVALID")
+
+    aggregate_hash = value.get("artifact_hash")
+    _sha256(aggregate_hash, field="streaming_aggregate.artifact_hash")
+    if canonical_json_hash(
+        {key: item for key, item in value.items() if key != "artifact_hash"}
+    ) != aggregate_hash:
+        raise ValueError("STAGE3_STREAMING_AGGREGATE_HASH_MISMATCH")
+
+    for field in (
+        "execution_evidence_hash",
+        "reference_binding_hash",
+        "formal_plan_hash",
+        "production_unit_index_hash",
+        "reference_aggregate_hash",
+        "raw_aggregate_hash",
+    ):
+        _sha256(value.get(field), field=f"streaming_aggregate.{field}")
+    for field in (
+        "formal_plan_ref",
+        "production_unit_index_ref",
+        "reference_aggregate_ref",
+        "raw_aggregate_ref",
+    ):
+        _streaming_ref(value.get(field), field=f"streaming_aggregate.{field}")
+    for expected, actual, field in (
+        (execution_evidence_hash, value["execution_evidence_hash"], "execution_evidence_hash"),
+        (formal_plan_ref, value["formal_plan_ref"], "formal_plan_ref"),
+        (formal_plan_hash, value["formal_plan_hash"], "formal_plan_hash"),
+        (production_unit_index_ref, value["production_unit_index_ref"], "production_unit_index_ref"),
+        (production_unit_index_hash, value["production_unit_index_hash"], "production_unit_index_hash"),
+        (reference_binding_hash, value["reference_binding_hash"], "reference_binding_hash"),
+    ):
+        if expected is not None and actual != expected:
+            raise ValueError(f"STAGE3_STREAMING_{field.upper()}_MISMATCH")
+
+    _streaming_ids(
+        value["required_unit_ids"], field="streaming_aggregate.required_unit_ids", expected=units
+    )
+    raw_rules = value["candidate_rule_names"]
+    if (
+        not isinstance(raw_rules, list)
+        or any(not isinstance(item, str) or not item for item in raw_rules)
+        or tuple(raw_rules) != rules
+        or len(set(raw_rules)) != len(rules)
+    ):
+        raise ValueError("STAGE3_STREAMING_CANDIDATE_RULES_MISMATCH")
+
+    for field in (
+        "reference_complete_unit_ids",
+        "raw_complete_unit_ids",
+        "observation_complete_unit_ids",
+        "receipt_complete_unit_ids",
+        "sealed_unit_ids",
+        "evicted_unit_ids",
+        "committed_unit_ids",
+    ):
+        _streaming_ids(value[field], field=f"streaming_aggregate.{field}", expected=units)
+    _streaming_ids(value["missing_unit_ids"], field="streaming_aggregate.missing_unit_ids", expected=())
+
+    receipts = value["unit_receipts"]
+    if not isinstance(receipts, Mapping) or set(receipts) != set(units):
+        raise ValueError("STAGE3_STREAMING_UNIT_RECEIPTS_COVERAGE_INVALID")
+    receipt_refs: set[str] = set()
+    eviction_refs: set[str] = set()
+    for unit_id in units:
+        receipt = receipts[unit_id]
+        if not isinstance(receipt, Mapping) or set(receipt) != _STREAMING_UNIT_RECEIPT_FIELDS:
+            raise ValueError(f"STAGE3_STREAMING_UNIT_RECEIPT_FIELDS_INVALID:{unit_id}")
+        receipt_ref = _streaming_ref(receipt["receipt_ref"], field=f"unit_receipts[{unit_id}].receipt_ref")
+        eviction_ref = _streaming_ref(
+            receipt["eviction_receipt_ref"], field=f"unit_receipts[{unit_id}].eviction_receipt_ref"
+        )
+        if receipt_ref in receipt_refs or eviction_ref in eviction_refs:
+            raise ValueError("STAGE3_STREAMING_RECEIPT_REFS_DUPLICATE")
+        receipt_refs.add(receipt_ref)
+        eviction_refs.add(eviction_ref)
+        for field in (
+            "receipt_hash",
+            "eviction_receipt_hash",
+            "reference_artifact_hash",
+            "observation_artifact_hash",
+            "raw_shard_hash",
+        ):
+            _sha256(receipt[field], field=f"unit_receipts[{unit_id}].{field}")
+        if receipt["lifecycle_state"] != "EVICTED":
+            raise ValueError(f"STAGE3_STREAMING_UNIT_NOT_EVICTED:{unit_id}")
+
+    # The commit set is not trusted as a producer-supplied boolean: it must
+    # exactly equal the intersection of all scientific and lifecycle ledgers.
+    coverage_sets = [
+        set(value[field])
+        for field in (
+            "reference_complete_unit_ids",
+            "raw_complete_unit_ids",
+            "observation_complete_unit_ids",
+            "receipt_complete_unit_ids",
+            "sealed_unit_ids",
+            "evicted_unit_ids",
+        )
+    ]
+    committed = set(value["committed_unit_ids"])
+    if committed != set.intersection(*coverage_sets) or committed != set(units):
+        raise ValueError("STAGE3_STREAMING_COMMITTED_INTERSECTION_INVALID")
+    return value
+
+
+def _streaming_coverage_metrics(
+    value: Mapping[str, object],
+    *,
+    required_unit_ids: Sequence[str],
+    required_rule_names: Sequence[str],
+) -> dict[str, object]:
+    """Derive measured/threshold facts only after the strict validator passed."""
+
+    units = tuple(required_unit_ids)
+    rules = tuple(required_rule_names)
+    complete = all(
+        tuple(value[field]) == units
+        for field in (
+            "reference_complete_unit_ids",
+            "raw_complete_unit_ids",
+            "observation_complete_unit_ids",
+            "receipt_complete_unit_ids",
+            "committed_unit_ids",
+        )
+    )
+    receipts = value.get("unit_receipts")
+    lifecycle = receipts.values() if isinstance(receipts, Mapping) else ()
+    return {
+        "complete_reference_raw_observation_coverage": complete,
+        "streaming_receipt_coverage": tuple(value["receipt_complete_unit_ids"]) == units,
+        "node_cache_seal_coverage": tuple(value["sealed_unit_ids"]) == units,
+        "node_cache_eviction_coverage": tuple(value["evicted_unit_ids"]) == units
+        and all(
+            isinstance(item, Mapping) and item.get("lifecycle_state") == "EVICTED"
+            for item in lifecycle
+        ),
+        "streaming_required_unit_count": len(units),
+        "streaming_required_rule_count": len(rules),
+    }
 
 
 def _gates(
@@ -781,6 +1050,7 @@ class Stage3GateEvaluator:
         stage3_scope_gate: GateRecord | Mapping[str, object] | None = None,
         stage3_scope_decision_ref: str | None = None,
         stage3_scope_gate_ref: str | None = None,
+        streaming_coverage: Mapping[str, object] | None = None,
     ) -> Stage3GateEvaluation:
         reasons: list[str] = []
         gate_records: tuple[GateRecord, ...] = ()
@@ -789,6 +1059,7 @@ class Stage3GateEvaluator:
         scope_decision_hash_value: str | None = None
         scope_gate_ref_value: str | None = None
         scope_gate_hash_value: str | None = None
+        matrix_plan = False
         try:
             if not isinstance(execution, FormalExecutionEvidence):
                 raise FormalRunRejected("STAGE3_EXECUTION_EVIDENCE_REQUIRED")
@@ -837,6 +1108,10 @@ class Stage3GateEvaluator:
                 planned_unit_strata,
                 declared_thresholds,
             ) = _formal_plan(formal_plan, execution)
+            matrix_plan = (
+                isinstance(formal_plan, Mapping)
+                and formal_plan.get("plan_kind") == "matrix"
+            )
             if tuple(required_rule_names) not in ((), rules):
                 raise ValueError("STAGE3_REQUIRED_RULES_DISAGREE_WITH_FROZEN_PLAN")
             if tuple(required_unit_ids) not in ((), units):
@@ -846,6 +1121,24 @@ class Stage3GateEvaluator:
         except (FormalRunRejected, TypeError, ValueError) as error:
             declared_thresholds = {}
             reasons.append(str(error))
+        if matrix_plan:
+            try:
+                if not isinstance(formal_plan, Mapping):  # defensive; _formal_plan checked this
+                    raise ValueError("STAGE3_STREAMING_FORMAL_PLAN_REQUIRED")
+                _validate_streaming_coverage(
+                    streaming_coverage,
+                    required_unit_ids=units,
+                    required_rule_names=rules,
+                    execution_evidence_hash=execution.artifact_hash
+                    if isinstance(execution, FormalExecutionEvidence)
+                    else None,
+                    formal_plan_ref=formal_plan_ref,
+                    formal_plan_hash=formal_plan_hash,
+                    production_unit_index_ref=formal_plan.get("production_unit_index_ref"),
+                    production_unit_index_hash=formal_plan.get("production_unit_index_hash"),
+                )
+            except (FormalRunRejected, TypeError, ValueError) as error:
+                reasons.append(str(error))
         thresholds_hash = canonical_json_hash(declared_thresholds)
         try:
             provenance_record = _provenance(provenance)
@@ -1145,8 +1438,10 @@ __all__ = [
     "REQUIRED_STAGE3_STRATA",
     "REQUIRED_STAGE3_TOP_Q",
     "STAGE3_GATE_EVALUATION_SCHEMA",
+    "STAGE3_STREAMING_AGGREGATE_SCHEMA",
     "Stage3GateEvaluation",
     "Stage3GateEvaluator",
+    "_validate_streaming_coverage",
     "evaluate_stage3_gate",
     "evaluate_stage3_gates",
 ]

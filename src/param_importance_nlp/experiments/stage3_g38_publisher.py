@@ -1131,14 +1131,17 @@ class Stage3G38Publisher:
         if not isinstance(raw_aggregate_ref, str) or not isinstance(raw_aggregate_hash, str):
             raise FormalRunRejected("STAGE3_G38_RAW_AGGREGATE_BINDING_MISSING")
         try:
-            from .stage3_raw_storage import load_raw_aggregate
+            from .stage3_raw_storage import iter_raw_aggregate_units
 
-            load_raw_aggregate(
+            for _unit_id, _shard, _state, _bundle in iter_raw_aggregate_units(
                 root=root,
                 aggregate_ref=raw_aggregate_ref,
                 aggregate_hash=raw_aggregate_hash,
                 require_complete=True,
-            )
+            ):
+                # The iterator validates and releases one TensorBundle per unit;
+                # G3-8 only needs the aggregate's fail-closed validity here.
+                del _unit_id, _shard, _state, _bundle
         except (OSError, TypeError, ValueError) as error:
             raise FormalRunRejected("STAGE3_G38_RAW_AGGREGATE_INVALID") from error
         report_metadata = stage_loaded["analysis_report"].payload.get("metadata")

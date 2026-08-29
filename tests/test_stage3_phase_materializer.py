@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from ops.stage3 import materialize_stage3_phase as phase
 from ops.stage3 import run_stage3_formal as formal
 
@@ -87,6 +89,43 @@ def _fanout_receipt(
             },
         }
     )
+
+
+def test_formal_phase_requires_matrix_plan_and_g35_environment_refs() -> None:
+    with pytest.raises(
+        formal.Stage3OrchestratorError,
+        match="PHASE_FORMAL_MATRIX_ENVIRONMENT_EVIDENCE_MISSING",
+    ):
+        phase._phase_task_environment_evidence({}, scope="formal")
+
+    refs = {
+        "stage3.07_formal_experiment_matrix": {
+            "formal_stage3_matrix_plan": "plans/stage3-matrix.json",
+            "gate_stage3_g3_5": "gates/stage3-g3-5.json",
+            "stage3_matrix_plan_execution": "evidence/matrix-execution.json",
+        }
+    }
+    assert phase._phase_task_environment_evidence(refs, scope="formal") == refs
+
+
+def test_fanout_spec_carries_task_environment_evidence(tmp_path: Path) -> None:
+    run_hash = "c" * 64
+    receipt = _fanout_receipt(
+        tmp_path, "stage3.07_formal_experiment_matrix", 7, run_hash
+    )
+    refs = {
+        "formal_stage3_matrix_plan": "plans/stage3-matrix.json",
+        "gate_stage3_g3_5": "gates/stage3-g3-5.json",
+    }
+    spec = phase._fanout_spec(
+        receipt,
+        task_id="stage3.07_formal_experiment_matrix",
+        scope="pilot",
+        run_config_hash=run_hash,
+        data_root=tmp_path,
+        environment_evidence_refs=refs,
+    )
+    assert spec["evidence_refs"] == refs
 
 
 def test_phase_materializer_assembles_exact_pilot_dag(

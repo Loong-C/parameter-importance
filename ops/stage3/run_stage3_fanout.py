@@ -47,7 +47,6 @@ PARTIAL_REQUIREMENTS = {
     },
     "stage3.06_pilot_and_threshold_freeze": {"stage3.06_pilot_coverage"},
     "stage3.07_formal_experiment_matrix": {
-        "stage3.07_reference_coverage",
         "stage3.07_matrix_coverage",
     },
 }
@@ -103,6 +102,14 @@ class FanoutRunner:
             raise _fail("FANOUT_UNIT_INDEX_HASH_DRIFT")
         self.units = units
         self.unit_ids = tuple(item.unit_id for item in units)
+        self.steps = tuple(dict(item) for item in self.manifest["steps"])
+        # Diagnose an invalid immutable schedule before consulting its launch
+        # evidence, while remaining entirely read-only at this boundary.
+        self._validate_schedule()
+        # Freeze the environment-bound capacity launch specification before
+        # resolving or creating any fan-out state paths.  Every unrecovered
+        # S3.07 step still re-measures the referenced inputs/filesystems below.
+        self.streaming_capacity_spec = self._load_streaming_capacity_spec()
         self.state_dir = _resolve_ref(
             self.manifest["state_dir"], roots=(self.data_root,), field="state_dir"
         )
@@ -111,8 +118,6 @@ class FanoutRunner:
         )
         self.state_path = self.state_dir / "fanout-state.json"
         self.state_dir.mkdir(parents=True, exist_ok=True)
-        self.steps = tuple(dict(item) for item in self.manifest["steps"])
-        self._validate_schedule()
         self.state = self._load_or_initialize_state()
 
     def _validate_manifest(self) -> None:
@@ -158,6 +163,30 @@ class FanoutRunner:
             {key: value for key, value in environment.items() if key != "environment_hash"}
         ):
             raise _fail("FANOUT_ENVIRONMENT_HASH_INVALID")
+        # Retain the verified, immutable environment for per-launch checks.
+        # The S3.07 capacity spec is deliberately resolved from this payload;
+        # it is never synthesized from mutable runner/config state.
+        self.environment_payload = environment
+
+    def _load_streaming_capacity_spec(self) -> Mapping[str, object] | None:
+        if self.task_id != "stage3.07_formal_experiment_matrix":
+            return None
+        evidence_refs = self.environment_payload.get("evidence_refs")
+        if not isinstance(evidence_refs, Mapping):
+            raise _fail("FANOUT_CAPACITY_PREFLIGHT_REF_MISSING", "environment")
+        spec_ref = evidence_refs.get("stage3_streaming_capacity_preflight")
+        if not isinstance(spec_ref, str) or not spec_ref:
+            raise _fail("FANOUT_CAPACITY_PREFLIGHT_REF_MISSING", "environment")
+        try:
+            from param_importance_nlp.experiments.stage3_streaming_capacity import (
+                load_streaming_launch_spec,
+            )
+
+            return dict(load_streaming_launch_spec(self.data_root, spec_ref))
+        except Stage3OrchestratorError:
+            raise
+        except Exception as error:
+            raise _fail("FANOUT_CAPACITY_PREFLIGHT_INVALID", "environment") from error
 
     def _validate_schedule(self) -> None:
         expected_fields = {
@@ -176,6 +205,12 @@ class FanoutRunner:
         }
         coverage: dict[str, set[str]] = {unit_id: set() for unit_id in self.unit_ids}
         step_ids: set[str] = set()
+        is_s307 = self.task_id.startswith("stage3.07")
+        if is_s307 and len(self.steps) != len(self.unit_ids):
+            raise _fail(
+                "FANOUT_S307_STEP_COUNT_INVALID",
+                f"{len(self.steps)} != {len(self.unit_ids)}",
+            )
         for index, step in enumerate(self.steps):
             _strict_fields(step, expected_fields, "FANOUT_STEP_FIELDS_INVALID")
             step_id = _string(step.get("step_id"), f"steps[{index}].step_id")
@@ -193,6 +228,8 @@ class FanoutRunner:
                 or len(phases) != len(set(phases))
             ):
                 raise _fail("FANOUT_STEP_PHASES_INVALID", step_id)
+            if is_s307 and phases != ["reference", "observation"]:
+                raise _fail("FANOUT_S307_STREAMING_PHASES_INVALID", step_id)
             overlap = coverage[str(unit_id)].intersection(phases)
             if overlap:
                 raise _fail("FANOUT_PHASE_COVERAGE_DUPLICATE", f"{unit_id}:{sorted(overlap)}")
@@ -320,16 +357,15 @@ class FanoutRunner:
                 or requirements[0] not in PARTIAL_REQUIREMENTS[self.task_id]
             ):
                 raise _fail("FANOUT_PARTIAL_BOUNDARY_NOT_AUTHORIZED", step_id)
-            if self.task_id.startswith("stage3.07"):
-                requirement = requirements[0] if requirements else None
-                if requirement == "stage3.07_reference_coverage" and phases != [
-                    "reference"
-                ]:
-                    raise _fail("FANOUT_REFERENCE_PHASE_BOUNDARY_INVALID", step_id)
-                if requirement == "stage3.07_matrix_coverage" and "observation" not in phases:
-                    raise _fail("FANOUT_OBSERVATION_PHASE_BOUNDARY_INVALID", step_id)
-                if status == "PASS" and "observation" not in phases:
-                    raise _fail("FANOUT_FINAL_OBSERVATION_MISSING", step_id)
+            if is_s307:
+                expected_status = "PASS" if index == len(self.steps) - 1 else "BLOCKED"
+                expected_requirements = (
+                    []
+                    if expected_status == "PASS"
+                    else ["stage3.07_matrix_coverage"]
+                )
+                if status != expected_status or requirements != expected_requirements:
+                    raise _fail("FANOUT_S307_STREAMING_BOUNDARY_INVALID", step_id)
         if self.task_id.startswith("stage3.05"):
             expected_phases = {"reference"}
         elif self.task_id.startswith("stage3.06"):
@@ -439,6 +475,70 @@ class FanoutRunner:
         )
         return resume_root.is_dir() and any(path.is_file() for path in resume_root.rglob("*"))
 
+    def _preflight_streaming_capacity(self, step: Mapping[str, Any]) -> None:
+        """Fail closed immediately before every unrecovered S3.07 launch."""
+
+        if self.task_id != "stage3.07_formal_experiment_matrix":
+            return
+        try:
+            from ops.stage3.preflight_stage3_streaming_capacity import run_preflight
+
+            spec = self.streaming_capacity_spec
+            if not isinstance(spec, Mapping):
+                raise _fail("FANOUT_CAPACITY_PREFLIGHT_INVALID", step["step_id"])
+            root = self.data_root
+
+            def path_for(field: str) -> Path:
+                return _resolve_ref(
+                    spec[field], roots=(root,), field=f"capacity.{field}"
+                )
+
+            resume = spec["resume_manifest_ref"]
+            arguments = argparse.Namespace(
+                workspace_root=root,
+                formal_plan=path_for("formal_plan_ref"),
+                production_index=path_for("production_index_ref"),
+                parameter_counts=path_for("parameter_counts_ref"),
+                metadata=path_for("metadata_ref"),
+                output_filesystem=path_for("output_filesystem_ref"),
+                cache_filesystem=path_for("cache_filesystem_ref"),
+                resume_manifest=None if resume is None else path_for("resume_manifest_ref"),
+                output=None,
+            )
+            report = run_preflight(arguments)
+            expected_bindings = {
+                "formal_plan_ref": spec["formal_plan_ref"],
+                "formal_plan_hash": spec["formal_plan_hash"],
+                "production_index_ref": spec["production_index_ref"],
+                "production_index_hash": spec["production_index_hash"],
+                "parameter_counts_ref": spec["parameter_counts_ref"],
+                "metadata_ref": spec["metadata_ref"],
+                "filesystem_refs": {
+                    "output": spec["output_filesystem_ref"],
+                    "cache": spec["cache_filesystem_ref"],
+                },
+            }
+            if any(report.get(key) != value for key, value in expected_bindings.items()):
+                raise _fail("FANOUT_CAPACITY_PREFLIGHT_SPEC_DRIFT", step["step_id"])
+            if (
+                report.get("parameter_counts_hash") != spec["parameter_counts_hash"]
+                or report.get("metadata_hash") != spec["metadata_hash"]
+                or report.get("resume_ref") != spec["resume_manifest_ref"]
+                or report.get("resume_hash") != spec["resume_manifest_hash"]
+                or report.get("estimate", {}).get("candidate_rule_names")
+                != spec["candidate_rule_names"]
+            ):
+                raise _fail("FANOUT_CAPACITY_PREFLIGHT_SPEC_DRIFT", step["step_id"])
+            if report.get("status") != "PASS":
+                raise _fail(
+                    "FANOUT_CAPACITY_PREFLIGHT_BLOCKED",
+                    f"{step['step_id']}:{report.get('reasons', [])}",
+                )
+        except Stage3OrchestratorError:
+            raise
+        except Exception as error:
+            raise _fail("FANOUT_CAPACITY_PREFLIGHT_INVALID", step["step_id"]) from error
+
     def _verify_result(self, step: Mapping[str, Any], path: Path) -> Mapping[str, Any]:
         try:
             from param_importance_nlp.runtime import TaskRunResult
@@ -540,6 +640,10 @@ class FanoutRunner:
                 )
                 recovered = result.is_file()
                 if not recovered:
+                    # This is intentionally before result directory creation
+                    # and before executor: BLOCKED preflight cannot advance a
+                    # cursor, create workload, or consume a GPU attempt.
+                    self._preflight_streaming_capacity(step)
                     result.parent.mkdir(parents=True, exist_ok=True)
                     effective_step = step
                     if self._needs_retry_config(step):

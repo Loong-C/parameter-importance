@@ -27,7 +27,11 @@ from ..analysis import (
 )
 from ..atomic import atomic_write_bytes
 from ..contracts.jsonio import JSONValue, canonical_json_bytes, write_canonical_json
-from .stage3_raw_storage import derive_candidate_views, load_raw_aggregate
+from .stage3_raw_storage import (
+    derive_candidate_views,
+    iter_raw_aggregate_units,
+    load_raw_aggregate_metadata,
+)
 
 
 _SAFE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
@@ -171,7 +175,7 @@ def _aggregate_reporting_tables(
     aggregate_hash = raw.get("raw_aggregate_hash")
     if not isinstance(aggregate_ref, str) or not isinstance(aggregate_hash, str):
         raise ValueError("STAGE3_REPORTING_RAW_AGGREGATE_BINDING_MISSING")
-    aggregate, loaded = load_raw_aggregate(
+    aggregate = load_raw_aggregate_metadata(
         root=workspace_root,
         aggregate_ref=aggregate_ref,
         aggregate_hash=aggregate_hash,
@@ -179,8 +183,12 @@ def _aggregate_reporting_tables(
     )
     vector_rows: list[dict[str, JSONValue]] = []
     curve_rows: list[dict[str, JSONValue]] = []
-    for unit_id in aggregate["required_unit_ids"]:  # type: ignore[index]
-        shard, state, _bundle = loaded[unit_id]
+    for unit_id, shard, state, _bundle in iter_raw_aggregate_units(
+        root=workspace_root,
+        aggregate_ref=aggregate_ref,
+        aggregate_hash=aggregate_hash,
+        require_complete=True,
+    ):
         shard_entry = aggregate["unit_shards"][unit_id]  # type: ignore[index]
         reference = state["reference"]
         reference_signed = reference["signed"]  # type: ignore[index]
@@ -357,7 +365,7 @@ def write_reporting_bundle(
     write_canonical_json(raw_path, dict(raw_formal_results))
     raw_shard_manifest_record: Mapping[str, object] | None = None
     if raw_formal_results.get("raw_aggregate_ref") is not None:
-        aggregate, _loaded = load_raw_aggregate(
+        aggregate = load_raw_aggregate_metadata(
             root=workspace_root.resolve(),
             aggregate_ref=raw_formal_results.get("raw_aggregate_ref"),
             aggregate_hash=raw_formal_results.get("raw_aggregate_hash"),

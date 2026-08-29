@@ -365,24 +365,60 @@ def test_stage306_requires_exact_observation_coverage(
     )
 
 
-def test_materialized_s307_schedule_is_99_references_then_99_observations() -> None:
+def test_materialized_s307_schedule_is_99_per_unit_streaming_steps() -> None:
     units = tuple(f"formal-unit-{index:03d}" for index in range(99))
     steps = _schedule("stage3.07_formal_experiment_matrix", units)
-    assert len(steps) == 197
-    reference_coverage = [
-        step["unit_id"] for step in steps if "reference" in step["completes_phases"]
-    ]
-    observation_coverage = [
-        step["unit_id"]
-        for step in steps
-        if "observation" in step["completes_phases"]
-    ]
-    assert reference_coverage == list(units)
-    assert sorted(observation_coverage) == sorted(units)
-    assert steps[98]["expected_blocker_requirements"] == [
-        "stage3.07_matrix_coverage"
-    ]
+    assert len(steps) == 99
+    assert [step["unit_id"] for step in steps] == list(units)
+    assert all(
+        step["completes_phases"] == ["reference", "observation"] for step in steps
+    )
+    assert all(
+        step["expected_status"] == "BLOCKED"
+        and step["expected_blocker_requirements"] == ["stage3.07_matrix_coverage"]
+        for step in steps[:-1]
+    )
     assert steps[-1]["expected_status"] == "PASS"
+    assert steps[-1]["expected_blocker_requirements"] == []
+
+
+@pytest.mark.parametrize(
+    ("legacy_shape", "expected_error"),
+    (
+        ("reference-only", "FANOUT_S307_STREAMING_PHASES_INVALID"),
+        ("197-step", "FANOUT_S307_STEP_COUNT_INVALID"),
+    ),
+)
+def test_fanout_rejects_legacy_s307_reference_wave_manifests(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    legacy_shape: str,
+    expected_error: str,
+) -> None:
+    _write(tmp_path / "unit-index.json", {})
+    _environment(tmp_path / "environment.json")
+    manifest = _pilot_manifest(
+        tmp_path,
+        task_id="stage3.07_formal_experiment_matrix",
+        phase="reference",
+        blocker="stage3.07_reference_coverage",
+    )
+    manifest["scope"] = "formal"
+    if legacy_shape == "197-step":
+        manifest["steps"] = list(manifest["steps"]) * 98 + [manifest["steps"][0]]
+    manifest["manifest_hash"] = formal._canonical_hash(
+        {key: value for key, value in manifest.items() if key != "manifest_hash"}
+    )
+    monkeypatch.setattr(
+        fanout, "load_unit_index", lambda *_args, **_kwargs: ("d" * 64, _units())
+    )
+    with pytest.raises(formal.Stage3OrchestratorError, match=expected_error):
+        fanout.FanoutRunner(
+            manifest,
+            workspace_root=tmp_path,
+            data_root=tmp_path,
+            environment=tmp_path / "environment.json",
+        )
 
 
 def test_materializer_emits_real_v2_selectors_and_exact_pilot_schedule(
