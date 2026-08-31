@@ -108,6 +108,30 @@ def test_verified_sha256_accepts_a_safe_explicit_leaf(
     assert len(_certificates(cache_root)) == 1
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX path-shape validation")
+def test_cache_root_allows_deep_formal_linux_path_but_rejects_broad_home_roots(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        Path,
+        "home",
+        classmethod(lambda _cls: Path("/home/sophgo13")),
+    )
+    formal = Path(
+        "/home/sophgo13/cjl/storage/pile/formal-cache/.file-verification"
+    )
+    assert pythia_mmap._verification_cache_root(formal) == formal
+
+    for unsafe in (
+        Path("/home"),
+        Path("/home/user"),
+        Path("/home/user/.file-verification"),
+        Path("/etc/.file-verification"),
+    ):
+        with pytest.raises(ValueError, match="file verification cache_root"):
+            pythia_mmap._verification_cache_root(unsafe)
+
+
 def test_verified_sha256_disabled_by_default_still_hashes(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

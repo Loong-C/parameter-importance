@@ -183,12 +183,10 @@ def _verification_cache_root(cache_root: str | Path | None) -> Path | None:
                 "/etc",
                 "/lib",
                 "/lib64",
-                "/home",
                 "/media",
                 "/mnt",
                 "/opt",
                 "/proc",
-                "/root",
                 "/run",
                 "/sbin",
                 "/srv",
@@ -205,6 +203,16 @@ def _verification_cache_root(cache_root: str | Path | None) -> Path | None:
             )
     if candidate == home or candidate.parent == home:
         raise ValueError("file verification cache_root cannot be home or its direct child")
+    if os.name != "nt":
+        posix_home_root = Path("/home")
+        if candidate == posix_home_root:
+            raise ValueError("file verification cache_root cannot be the /home root")
+        if candidate.is_relative_to(posix_home_root):
+            relative_parts = candidate.relative_to(posix_home_root).parts
+            if len(relative_parts) <= 2:
+                raise ValueError(
+                    "file verification cache_root cannot be a broad /home user root"
+                )
     if os.name == "nt" and (
         candidate == home.parent or candidate.parent == home.parent
     ):
