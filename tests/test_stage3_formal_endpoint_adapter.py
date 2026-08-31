@@ -19,6 +19,7 @@ import pytest
 from ops.stage3 import run_stage3_formal as formal
 from param_importance_nlp.contracts import (
     FormalExecutionEvidence,
+    FormalRunRejected,
     GateRecord,
     GateStatus,
     canonical_json_hash,
@@ -83,6 +84,116 @@ def _formal_evidence(probe_ref: str) -> FormalExecutionEvidence:
     )
 
 
+def _formal_evidence_with_g31_authorities(
+    root: Path, probe_ref: str
+) -> FormalExecutionEvidence:
+    """Build a current FEE whose G3-1 members are real formal commits."""
+
+    full_evidence = _formal_evidence(probe_ref)
+    prior = FormalExecutionEvidence(
+        "formal",
+        contract_freeze_hash=full_evidence.contract_freeze_hash,
+        asset_manifest_hashes=full_evidence.asset_manifest_hashes,
+        prerequisite_gates=(full_evidence.prerequisite_gates[0],),
+    )
+    store = TaskArtifactStore(root, "authority/g31-fixture")
+    config_hash = _hash("g31-config")
+    path = store.publish(
+        task_id="stage3.02_math_and_metric_contract",
+        artifact_kind="path_math_contract",
+        config_hash=config_hash,
+        run_intent="formal",
+        formal_eligible=True,
+        payload={
+            "schema_version": "stage3-task-path-math-contract-v1",
+            "signed_contribution": "-delta_theta*integral_0^1 gradient(theta(alpha)) d_alpha",
+        },
+    )
+    metric = store.publish(
+        task_id="stage3.02_math_and_metric_contract",
+        artifact_kind="metric_contract",
+        config_hash=config_hash,
+        run_intent="formal",
+        formal_eligible=True,
+        payload={
+            "schema_version": "stage3-task-metric-contract-v1",
+            "undefined_policy": "defined_false_with_reason_no_epsilon",
+        },
+    )
+    predecessor = store.publish(
+        task_id="stage3.formal_control_plane",
+        artifact_kind="formal_execution_evidence",
+        config_hash=config_hash,
+        run_intent="formal",
+        formal_eligible=True,
+        payload=prior.to_dict(),
+    )
+    g31 = GateRecord(
+        gate_id="stage3.G3-1",
+        stage=3,
+        status=GateStatus.PASS,
+        checked_at="2026-07-22T00:00:00+00:00",
+        measured={"math_contract_hash": path.artifact_hash},
+        evidence_refs=(predecessor.commit_ref, path.commit_ref, metric.commit_ref),
+    )
+    return FormalExecutionEvidence(
+        "formal",
+        contract_freeze_hash=prior.contract_freeze_hash,
+        asset_manifest_hashes=prior.asset_manifest_hashes,
+        prerequisite_gates=(prior.prerequisite_gates[0], g31),
+    )
+
+
+def test_g31_probe_qualification_uses_gate_bound_predecessor_authority(
+    tmp_path: Path,
+) -> None:
+    evidence = _formal_evidence_with_g31_authorities(tmp_path, "inputs/probe.json")
+    gate = next(item for item in evidence.prerequisite_gates if item.gate_id == "stage3.G3-1")
+
+    assert stage23._formal_g31_authority_ref(SimpleNamespace(), tmp_path, gate) == gate.evidence_refs[0]
+
+
+def test_g31_probe_qualification_rejects_missing_or_ambiguous_authority(
+    tmp_path: Path,
+) -> None:
+    evidence = _formal_evidence_with_g31_authorities(tmp_path, "inputs/probe.json")
+    gate = next(item for item in evidence.prerequisite_gates if item.gate_id == "stage3.G3-1")
+    path_ref, metric_ref = gate.evidence_refs[1:]
+
+    missing_authority = GateRecord(
+        gate_id=gate.gate_id,
+        stage=gate.stage,
+        status=gate.status,
+        checked_at=gate.checked_at,
+        measured=gate.measured,
+        threshold=gate.threshold,
+        evidence_refs=(path_ref, metric_ref),
+    )
+    with pytest.raises(FormalRunRejected, match="FORMAL_G31_AUTHORITY"):
+        stage23._formal_g31_authority_ref(SimpleNamespace(), tmp_path, missing_authority)
+
+    store = TaskArtifactStore(tmp_path, "authority/g31-duplicate")
+    duplicate = store.publish(
+        task_id="stage3.formal_control_plane",
+        artifact_kind="formal_execution_evidence",
+        config_hash=_hash("g31-config"),
+        run_intent="formal",
+        formal_eligible=True,
+        payload=_formal_evidence("inputs/probe.json").to_dict(),
+    )
+    ambiguous = GateRecord(
+        gate_id=gate.gate_id,
+        stage=gate.stage,
+        status=gate.status,
+        checked_at=gate.checked_at,
+        measured=gate.measured,
+        threshold=gate.threshold,
+        evidence_refs=(*gate.evidence_refs, duplicate.commit_ref),
+    )
+    with pytest.raises(FormalRunRejected, match="FORMAL_G31_AUTHORITY"):
+        stage23._formal_g31_authority_ref(SimpleNamespace(), tmp_path, ambiguous)
+
+
 def test_reference_cache_evidence_uses_only_completed_refinement_prefix() -> None:
     rules = tuple(
         SimpleNamespace(artifact_hash=_hash(f"rule-{index}")) for index in range(8)
@@ -119,7 +230,7 @@ def test_formal_handler_loads_training_endpoint_and_executes_tiny_path(
     monkeypatch,
 ) -> None:
     probe_ref = "inputs/probe-plan.json"
-    evidence = _formal_evidence(probe_ref)
+    evidence = _formal_evidence_with_g31_authorities(tmp_path, probe_ref)
     fixture = build_tiny_training_fixture(
         task_type="sequence_classification", seed=131, steps=4
     )

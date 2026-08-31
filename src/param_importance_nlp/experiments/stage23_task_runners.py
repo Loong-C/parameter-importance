@@ -262,6 +262,7 @@ _FORMAL_SELECTED_CHECKPOINT_TASKS = frozenset(
 )
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _STAGE3_ENDPOINT_TASK = "stage3.03_endpoint_and_probe_pipeline"
+_STAGE3_FORMAL_CONTROL_TASK_ID = "stage3.formal_control_plane"
 _STAGE3_REFERENCE_TASK = "stage3.05_reference_integral_and_precision"
 _STAGE3_PILOT_TASK = "stage3.06_pilot_and_threshold_freeze"
 _STAGE3_MATRIX_TASK = "stage3.07_formal_experiment_matrix"
@@ -7444,6 +7445,114 @@ def _stage3_production_index_scope(request: TaskExecutionRequest) -> str | None:
     return None
 
 
+def _formal_g31_authority_ref(
+    request: TaskExecutionRequest,
+    root: Path,
+    gate: GateRecord,
+) -> str:
+    """Return the unique predecessor FEE commit bound by a PASS G3-1 Gate.
+
+    The G3-1 Gate is the independent authority for the S3.02 path and metric
+    contracts.  Its evidence list is therefore the only discovery surface for
+    this qualification: config/environment declarations and probe-plan refs
+    are deliberately not authorities.  The returned reference is passed to
+    ``ProbePanel.qualify`` solely to satisfy Gate membership; the panel still
+    binds the *current* execution evidence through its own hash checks.
+    """
+
+    del request  # authority discovery is intentionally gate-membership only
+    if gate.gate_id != "stage3.G3-1":
+        raise FormalRunRejected("FORMAL_G31_AUTHORITY_GATE_ID_MISMATCH")
+
+    authority_refs: list[str] = []
+    authority_invalid = False
+    contract_refs: dict[str, list[str]] = {
+        "path_math_contract": [],
+        "metric_contract": [],
+    }
+    contract_hashes: dict[str, list[str]] = {
+        "path_math_contract": [],
+        "metric_contract": [],
+    }
+    contract_invalid = False
+
+    for reference in gate.evidence_refs:
+        try:
+            loaded = load_committed_task_artifact(
+                root, reference, require_formal=True
+            )
+        except (FileNotFoundError, OSError, TypeError, ValueError):
+            # A Gate may retain non-commit source refs from the producer's
+            # lineage.  They are ignored unless their commit envelope declares
+            # one of the exact authority identities, in which case malformed
+            # authority data must not be hidden by another valid candidate.
+            try:
+                raw = load_canonical_json(
+                    _workspace_path(root, reference, field="stage3.G3-1.evidence_refs")
+                )
+            except (FileNotFoundError, OSError, TypeError, ValueError):
+                continue
+            if isinstance(raw, Mapping) and raw.get("schema_version") == "task-output-commit-v1":
+                task_id = raw.get("task_id")
+                artifact_kind = raw.get("artifact_kind")
+                if task_id == _STAGE3_FORMAL_CONTROL_TASK_ID and artifact_kind == "formal_execution_evidence":
+                    authority_invalid = True
+                elif task_id == "stage3.02_math_and_metric_contract" and artifact_kind in contract_refs:
+                    contract_invalid = True
+            continue
+
+        identity = loaded.identity
+        if (
+            identity.task_id == _STAGE3_FORMAL_CONTROL_TASK_ID
+            and identity.artifact_kind == "formal_execution_evidence"
+        ):
+            try:
+                predecessor = FormalExecutionEvidence.from_mapping(dict(loaded.payload))
+                predecessor.require_for_stage(3)
+                # G3-1 must bind the evidence revision immediately before this
+                # Gate; accepting a revision which already contains G3-1 would
+                # permit a current/descendant FEE to masquerade as predecessor.
+                if any(item.gate_id == "stage3.G3-1" for item in predecessor.prerequisite_gates):
+                    raise FormalRunRejected("FORMAL_G31_PREDECESSOR_ALREADY_CONTAINS_GATE")
+            except (TypeError, ValueError, FormalRunRejected):
+                authority_invalid = True
+            else:
+                authority_refs.append(identity.commit_ref)
+            continue
+
+        if identity.task_id != "stage3.02_math_and_metric_contract":
+            continue
+        expected_schema = {
+            "path_math_contract": "stage3-task-path-math-contract-v1",
+            "metric_contract": "stage3-task-metric-contract-v1",
+        }.get(identity.artifact_kind)
+        if expected_schema is None:
+            continue
+        if loaded.payload.get("schema_version") != expected_schema:
+            contract_invalid = True
+        else:
+            contract_refs[identity.artifact_kind].append(identity.commit_ref)
+            contract_hashes[identity.artifact_kind].append(identity.artifact_hash)
+
+    # G3-1 exact PASS requires the predecessor formal execution evidence and
+    # both S3.02 contract members.  Source refs (for example preregistration
+    # documents) do not count as contract membership.
+    if authority_invalid or len(set(authority_refs)) != 1:
+        raise FormalRunRejected("FORMAL_G31_AUTHORITY_REFERENCE_AMBIGUOUS")
+    if contract_invalid or any(len(set(refs)) != 1 for refs in contract_refs.values()):
+        raise FormalRunRejected(
+            "FORMAL_GATE_DOES_NOT_BIND_ARTIFACT:stage3.G3-1:<stage3.02-contract>"
+        )
+
+    math_ref = contract_refs["path_math_contract"][0]
+    measured = gate.measured
+    if not isinstance(measured, Mapping) or measured.get("math_contract_hash") != (
+        contract_hashes["path_math_contract"][0]
+    ):
+        raise FormalRunRejected("FORMAL_G31_MATH_CONTRACT_HASH_MISMATCH")
+    return authority_refs[0]
+
+
 def _formal_path_context(
     request: TaskExecutionRequest,
     root: Path,
@@ -7652,10 +7761,13 @@ def _formal_path_context(
             qualification_gate = next(
                 gate for gate in evidence.prerequisite_gates if gate.gate_id == "stage3.G3-1"
             )
+            qualification_ref = _formal_g31_authority_ref(
+                request, root, qualification_gate
+            )
             panel = panel.qualify(
                 execution=evidence,
                 gate=qualification_gate,
-                artifact_ref=probe_ref,
+                artifact_ref=qualification_ref,
             )
     except (StopIteration, TypeError, ValueError, FormalRunRejected) as error:
         raise _blocked(
