@@ -31,6 +31,8 @@ from ops.stage3.run_stage3_formal import (
 
 
 SOURCE_SCHEMA = "stage3-fanout-materialization-source-v1"
+MODEL_CONFIG_MAP_SCHEMA = "stage3-model-config-map-v1"
+MODEL_OVERRIDES_MAP_SCHEMA = "stage3-model-overrides-map-v1"
 FORBIDDEN_RE = re.compile(r"(?:^|[^a-z])(fixture|synthetic)(?:[^a-z]|$)", re.I)
 SUPPORTED = {
     "stage3.05_reference_integral_and_precision": "pilot",
@@ -94,6 +96,145 @@ def _base_v1(value: Mapping[str, Any]) -> dict[str, Any]:
     if not isinstance(identity, Mapping) or identity.get("schema_version") != "resolved-config-v1":
         raise _fail("MATERIALIZATION_BASE_CONFIG_SCHEMA_INVALID")
     return deepcopy(dict(value))
+
+
+def _model_key(value: object) -> str | None:
+    """Normalize a model identity to the production-index key.
+
+    Production units deliberately use the compact ``14M``/``31M`` labels,
+    while resolved configs use names such as ``pythia-14m-deduped``.  Matching
+    the terminal model-size token keeps the binding strict without requiring
+    the control-plane map to rewrite scientific model names.
+    """
+
+    if not isinstance(value, str):
+        return None
+    match = re.search(r"(?:^|[-_])((?:14|31)m)(?:$|[-_])", value, re.I)
+    return None if match is None else match.group(1).upper()
+
+
+def _validate_model_base(
+    value: Mapping[str, Any],
+    *,
+    model: str,
+    field: str,
+) -> dict[str, Any]:
+    """Validate one map entry and return its v1 scientific base.
+
+    Map entries are required to be complete, hash-checked resolved-config-v2
+    objects.  The fanout compiler then derives the Stage 3 task envelope from
+    the embedded v1 base exactly as it does for the legacy single-file input.
+    """
+
+    try:
+        from param_importance_nlp.contracts import ResolvedConfigV2
+
+        resolved = ResolvedConfigV2.from_mapping(value)
+    except Exception as error:
+        raise _fail("MATERIALIZATION_MODEL_CONFIG_INVALID", field) from error
+    if resolved.run_intent != "formal" or resolved.formal_eligible is not True:
+        raise _fail("MATERIALIZATION_MODEL_CONFIG_NOT_FORMAL", field)
+    base = _base_v1(value)
+    identity = base.get("identity")
+    model_section = base.get("model")
+    if not isinstance(identity, Mapping) or not isinstance(model_section, Mapping):
+        raise _fail("MATERIALIZATION_MODEL_CONFIG_IDENTITY_MISSING", field)
+    if identity.get("formal_eligible") is not True or identity.get("run_intent") != "formal":
+        raise _fail("MATERIALIZATION_MODEL_CONFIG_NOT_FORMAL", field)
+    identities = (
+        model_section.get("architecture"),
+        model_section.get("asset_id"),
+        model_section.get("initialization_id"),
+        identity.get("input_checkpoint_id"),
+    )
+    if not any(_model_key(item) == model for item in identities):
+        raise _fail("MATERIALIZATION_MODEL_IDENTITY_MISMATCH", f"{field}:{model}")
+    return base
+
+
+def _load_model_config_map(
+    value: Mapping[str, Any],
+    *,
+    roots: Sequence[Path],
+    units: Sequence[Any],
+    scope: str,
+) -> dict[str, dict[str, Any]] | None:
+    """Load a strict model→resolved-config-v2 map, or ``None`` for legacy.
+
+    The map is intentionally keyed by the *actual* model labels observed in
+    the immutable production index.  This prevents a formal 14M/31M index
+    from silently selecting a single-model base.
+    """
+
+    if value.get("schema_version") != MODEL_CONFIG_MAP_SCHEMA:
+        return None
+    expected = {"schema_version", "scope", "entries", "artifact_hash"}
+    if set(value) != expected or value.get("scope") != scope:
+        raise _fail("MATERIALIZATION_MODEL_CONFIG_MAP_FIELDS_INVALID")
+    declared = _hash(value.get("artifact_hash"), "base_config_map.artifact_hash")
+    body = {key: item for key, item in value.items() if key != "artifact_hash"}
+    if declared != _canonical_hash(body):
+        raise _fail("MATERIALIZATION_MODEL_CONFIG_MAP_HASH_INVALID")
+    models = {str(unit.model) for unit in units}
+    if scope == "formal" and models != {"14M", "31M"}:
+        raise _fail("MATERIALIZATION_FORMAL_MODEL_COVERAGE_INVALID", sorted(models))
+    entries = value.get("entries")
+    if not isinstance(entries, Mapping) or set(entries) != models:
+        raise _fail("MATERIALIZATION_MODEL_CONFIG_MAP_KEYS_INVALID")
+    loaded: dict[str, dict[str, Any]] = {}
+    for model in sorted(models):
+        entry = entries.get(model)
+        if not isinstance(entry, Mapping) or set(entry) != {"ref", "config_hash"}:
+            raise _fail("MATERIALIZATION_MODEL_CONFIG_MAP_ENTRY_INVALID", model)
+        ref = entry.get("ref")
+        config_hash = _hash(entry.get("config_hash"), f"base_config_map.{model}.config_hash")
+        path = _resolve_ref(ref, roots=roots, field=f"base_config_map.{model}.ref")
+        loaded_value = _load_json(path)
+        if loaded_value.get("schema_version") != "resolved-config-v2":
+            raise _fail("MATERIALIZATION_MODEL_CONFIG_SCHEMA_INVALID", model)
+        if loaded_value.get("config_hash") != config_hash:
+            raise _fail("MATERIALIZATION_MODEL_CONFIG_HASH_MISMATCH", model)
+        loaded[model] = _validate_model_base(
+            loaded_value, model=model, field=f"base_config_map.{model}"
+        )
+    return loaded
+
+
+def _load_model_overrides_map(
+    value: Mapping[str, Any],
+    *,
+    units: Sequence[Any],
+    scope: str,
+) -> dict[str, dict[str, Any]] | None:
+    """Load optional strict model-specific execution override maps."""
+
+    if value.get("schema_version") != MODEL_OVERRIDES_MAP_SCHEMA:
+        return None
+    expected = {"schema_version", "scope", "entries", "artifact_hash"}
+    if set(value) != expected or value.get("scope") != scope:
+        raise _fail("MATERIALIZATION_MODEL_OVERRIDES_MAP_FIELDS_INVALID")
+    declared = _hash(value.get("artifact_hash"), "config_overrides_map.artifact_hash")
+    body = {key: item for key, item in value.items() if key != "artifact_hash"}
+    if declared != _canonical_hash(body):
+        raise _fail("MATERIALIZATION_MODEL_OVERRIDES_MAP_HASH_INVALID")
+    models = {str(unit.model) for unit in units}
+    entries = value.get("entries")
+    if not isinstance(entries, Mapping) or set(entries) != models:
+        raise _fail("MATERIALIZATION_MODEL_OVERRIDES_MAP_KEYS_INVALID")
+    loaded: dict[str, dict[str, Any]] = {}
+    for model in sorted(models):
+        entry = entries.get(model)
+        if not isinstance(entry, Mapping):
+            raise _fail("MATERIALIZATION_MODEL_OVERRIDES_MAP_ENTRY_INVALID", model)
+        # Direct per-model mappings are canonical.  Accepting a single
+        # ``overrides`` wrapper keeps hand-authored control docs readable while
+        # still rejecting every other wrapper shape.
+        if set(entry) == {"overrides"}:
+            entry = entry.get("overrides")
+        if not isinstance(entry, Mapping):
+            raise _fail("MATERIALIZATION_MODEL_OVERRIDES_MAP_ENTRY_INVALID", model)
+        loaded[model] = deepcopy(dict(entry))
+    return loaded
 
 
 def _merge_section(overrides: dict[str, Any], name: str, values: Mapping[str, Any]) -> None:
@@ -235,66 +376,91 @@ def materialize(
     )
     _no_forbidden(base_value, "base_config")
     _no_forbidden(override_value, "config_overrides")
-    base = _base_v1(base_value)
-    identity = base.get("identity")
-    runtime = base.get("runtime")
-    data = base.get("data")
-    sampling = base.get("sampling")
-    importance = base.get("importance")
-    path_integration = base.get("path_integration")
-    if not all(
-        isinstance(item, dict)
-        for item in (identity, runtime, data, sampling, importance, path_integration)
-    ):
-        raise _fail("MATERIALIZATION_BASE_SECTIONS_INVALID")
-    identity.update(
-        {
-            "stage": 3,
-            "task": task_id,
-            "route": "path_integration",
-            "run_intent": "formal",
-            "formal_eligible": True,
-            "input_run_id": EXPECTED_STAGE2_RUN_ID,
-        }
-    )
-    runtime.update(
-        {
-            "device": "cuda",
-            "allow_dirty_worktree": False,
-            "offline": True,
-            "cache_root": str(source["cache_root"]),
-            "output_root": str(PurePosixPath(str(source["artifact_output_dir"])).parent),
-            "temp_root": str(PurePosixPath(str(source["cache_root"])) / "tmp"),
-        }
-    )
-    assert isinstance(data, dict)
-    data.update(
-        {
-            "split": "probe",
-            "sampler": "frozen-probe-panel",
-            "sampling_design": "disjoint_frozen_probe_panel",
-        }
-    )
-    sampling.update({"reference_batch_size": 32})
-    importance.update(
-        {
-            "estimator_name": "u",
-            "clip_mode": "none",
-            "require_decision_for_formal": True,
-        }
-    )
-    path_integration.update(
-        {
-            "enabled": True,
-            "probe_count": 2 if scope == "pilot" else 3,
-            "default_rule": "simpson",
-            "fallback_rule": "gauss_legendre_8",
-        }
-    )
     index_path = _resolve_ref(source["unit_index_ref"], roots=roots, field="unit_index_ref")
     loaded_hash, units = load_unit_index(index_path, scope=str(scope))
     if loaded_hash != index_hash:
         raise _fail("MATERIALIZATION_UNIT_INDEX_HASH_DRIFT")
+    model_bases = _load_model_config_map(
+        base_value, roots=roots, units=units, scope=str(scope)
+    )
+    model_overrides = _load_model_overrides_map(
+        override_value, units=units, scope=str(scope)
+    )
+    if model_bases is None:
+        base = _base_v1(base_value)
+        bases_by_model: Mapping[str, dict[str, Any]] | None = None
+    else:
+        bases_by_model = model_bases
+        base = None
+
+    def prepare_base(raw_base: dict[str, Any]) -> dict[str, Any]:
+        """Apply only task-wide Stage 3 execution identity to one model base."""
+
+        prepared = deepcopy(raw_base)
+        identity = prepared.get("identity")
+        runtime = prepared.get("runtime")
+        data = prepared.get("data")
+        sampling = prepared.get("sampling")
+        importance = prepared.get("importance")
+        path_integration = prepared.get("path_integration")
+        if not all(
+            isinstance(item, dict)
+            for item in (identity, runtime, data, sampling, importance, path_integration)
+        ):
+            raise _fail("MATERIALIZATION_BASE_SECTIONS_INVALID")
+        identity.update(
+            {
+                "stage": 3,
+                "task": task_id,
+                "route": "path_integration",
+                "run_intent": "formal",
+                "formal_eligible": True,
+                "input_run_id": EXPECTED_STAGE2_RUN_ID,
+            }
+        )
+        runtime.update(
+            {
+                "device": "cuda",
+                "allow_dirty_worktree": False,
+                "offline": True,
+                "cache_root": str(source["cache_root"]),
+                "output_root": str(PurePosixPath(str(source["artifact_output_dir"])).parent),
+                "temp_root": str(PurePosixPath(str(source["cache_root"])) / "tmp"),
+            }
+        )
+        data.update(
+            {
+                "split": "probe",
+                "sampler": "frozen-probe-panel",
+                "sampling_design": "disjoint_frozen_probe_panel",
+            }
+        )
+        sampling.update({"reference_batch_size": 32})
+        importance.update(
+            {
+                "estimator_name": "u",
+                "clip_mode": "none",
+                "require_decision_for_formal": True,
+            }
+        )
+        path_integration.update(
+            {
+                "enabled": True,
+                "probe_count": 2 if scope == "pilot" else 3,
+                "default_rule": "simpson",
+                "fallback_rule": "gauss_legendre_8",
+            }
+        )
+        return prepared
+
+    if bases_by_model is None:
+        assert base is not None
+        base = prepare_base(base)
+    else:
+        bases_by_model = {
+            model: prepare_base(model_base)
+            for model, model_base in bases_by_model.items()
+        }
     unit_ids = tuple(item.unit_id for item in units)
     endpoint_digests = {item.endpoint_hash for item in units}
     if set(refs_by_endpoint) != endpoint_digests:
@@ -318,7 +484,13 @@ def materialize(
         selector_path = selector_dir / f"{unit_id}.json"
         _write_immutable(selector_path, selector)
         selector_ref = selector_path.relative_to(data_root).as_posix()
-        overrides = deepcopy(dict(override_value))
+        model = str(unit_by_id[unit_id].model)
+        if model_overrides is None:
+            overrides = deepcopy(dict(override_value))
+        else:
+            if model not in model_overrides:
+                raise _fail("MATERIALIZATION_MODEL_OVERRIDES_MAP_KEYS_INVALID", model)
+            overrides = deepcopy(model_overrides[model])
         orchestration = overrides.get("orchestration")
         if orchestration is None:
             orchestration = {}
@@ -342,8 +514,13 @@ def materialize(
             "artifacts",
             {"output_dir": str(source["artifact_output_dir"]), "publish_partial": False},
         )
+        selected_base = (
+            base if bases_by_model is None else bases_by_model.get(model)
+        )
+        if selected_base is None:
+            raise _fail("MATERIALIZATION_MODEL_CONFIG_MAP_KEYS_INVALID", model)
         resolved = ResolvedConfigV2.resolve(
-            base,
+            selected_base,
             task_id=str(task_id),
             overrides=overrides,
         )
@@ -363,7 +540,7 @@ def materialize(
                 {"resume_ref": str(source["artifact_output_dir"])},
             )
             retry_resolved = ResolvedConfigV2.resolve(
-                base,
+                selected_base,
                 task_id=str(task_id),
                 overrides=retry_overrides,
             )
@@ -482,4 +659,10 @@ if __name__ == "__main__":
     raise SystemExit(main())
 
 
-__all__ = ["SOURCE_SCHEMA", "materialize", "main"]
+__all__ = [
+    "MODEL_CONFIG_MAP_SCHEMA",
+    "MODEL_OVERRIDES_MAP_SCHEMA",
+    "SOURCE_SCHEMA",
+    "materialize",
+    "main",
+]
