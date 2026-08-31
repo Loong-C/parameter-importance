@@ -19,6 +19,7 @@ from pathlib import Path
 import re
 import stat
 import struct
+import tempfile
 from typing import Any, Sequence
 
 import numpy as np
@@ -33,7 +34,7 @@ MMAP_INDEX_VERSION = 1
 MMAP_INDEX_HEADER_BYTES = 34
 PYTHIA_TOKENS_PER_RECORD = 2049
 FILE_VERIFICATION_CACHE_ENV = "PARAM_IMPORTANCE_FILE_VERIFICATION_CACHE"
-FILE_VERIFICATION_SCHEMA_VERSION = "param-importance-file-verification-v1"
+FILE_VERIFICATION_SCHEMA_VERSION = "param-importance-file-verification-v2"
 
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _SHARD_NAME_RE = re.compile(
@@ -52,6 +53,13 @@ _DTYPE_BY_CODE: dict[int, np.dtype[Any]] = {
 _FILE_VERIFICATION_CERT_FIELDS = frozenset(
     {
         "schema_version",
+        "logical_path",
+        "logical_is_symlink",
+        "logical_st_dev",
+        "logical_st_ino",
+        "logical_st_size",
+        "logical_st_mtime_ns",
+        "logical_st_ctime_ns",
         "resolved_path",
         "st_dev",
         "st_ino",
@@ -91,6 +99,7 @@ def sha256_file(path: str | Path, *, chunk_size: int = 16 * 1024 * 1024) -> str:
 def _verification_cache_root(cache_root: str | Path | None) -> Path | None:
     """Resolve the explicitly opted-in certificate cache root."""
 
+    from_environment = cache_root is None
     if cache_root is None:
         configured = os.environ.get(FILE_VERIFICATION_CACHE_ENV)
         if not configured:
@@ -98,14 +107,123 @@ def _verification_cache_root(cache_root: str | Path | None) -> Path | None:
         cache_root = configured
     try:
         raw = os.fspath(cache_root)
-    except TypeError:
-        return None
-    if not raw:
-        return None
+    except TypeError as error:
+        raise ValueError("file verification cache_root must be a path") from error
+    if not isinstance(raw, str) or not raw or raw.strip() != raw or not raw.strip():
+        raise ValueError("file verification cache_root must be a non-blank path")
     try:
-        return Path(raw).expanduser().resolve()
-    except (OSError, RuntimeError, TypeError, ValueError):
-        return None
+        candidate_input = Path(raw)
+    except (TypeError, ValueError) as error:
+        raise ValueError("file verification cache_root must be a valid path") from error
+    if not candidate_input.is_absolute():
+        raise ValueError("file verification cache_root must be absolute")
+    try:
+        lexical = candidate_input.expanduser().absolute()
+    except (OSError, RuntimeError, TypeError, ValueError) as error:
+        raise ValueError("file verification cache_root cannot be resolved") from error
+    if lexical.is_symlink():
+        raise ValueError("file verification cache_root must not be a symlink")
+    try:
+        candidate = lexical.resolve()
+    except (OSError, RuntimeError, TypeError, ValueError) as error:
+        raise ValueError("file verification cache_root cannot be resolved") from error
+
+    if from_environment and candidate.name != ".file-verification":
+        raise ValueError(
+            "environment file verification cache_root must be a dedicated "
+            ".file-verification leaf"
+        )
+    if candidate == Path(candidate.anchor):
+        raise ValueError("file verification cache_root cannot be a filesystem root")
+
+    try:
+        cwd = Path.cwd().resolve()
+        home = Path.home().resolve()
+    except (OSError, RuntimeError) as error:
+        raise ValueError("file verification cache_root anchors cannot be resolved") from error
+
+    def _contains(parent: Path, child: Path) -> bool:
+        return child == parent or child.is_relative_to(parent)
+
+    # A verification cache must never be placed in the current checkout (or in
+    # one of its parents/children).  This also catches ``.`` and the worktree
+    # root without relying on a particular repository layout.
+    repository_roots = [
+        parent
+        for parent in (cwd, *cwd.parents)
+        if (parent / ".git").exists()
+    ]
+    for anchor in (cwd, *repository_roots):
+        if _contains(anchor, candidate) or _contains(candidate, anchor):
+            raise ValueError(
+                "file verification cache_root cannot overlap cwd or worktree"
+            )
+
+    # Keep broad user/system locations out of the dedicated cache namespace.
+    # Temporary directories are allowed only below a per-run/user-created leaf,
+    # never directly as the cache root itself.
+    protected: list[Path] = []
+    if os.name == "nt":
+        system_root = os.environ.get("SystemRoot", r"C:\Windows")
+        protected.extend(
+            Path(value).resolve()
+            for value in (
+                system_root,
+                os.environ.get("ProgramFiles", r"C:\Program Files"),
+                os.environ.get("ProgramData", r"C:\ProgramData"),
+            )
+        )
+    else:
+        protected.extend(
+            Path(value)
+            for value in (
+                "/bin",
+                "/boot",
+                "/dev",
+                "/etc",
+                "/lib",
+                "/lib64",
+                "/home",
+                "/media",
+                "/mnt",
+                "/opt",
+                "/proc",
+                "/root",
+                "/run",
+                "/sbin",
+                "/srv",
+                "/sys",
+                "/usr",
+                "/var",
+            )
+        )
+    temporary_root = Path(tempfile.gettempdir()).resolve()
+    for protected_root in protected:
+        if _contains(protected_root, candidate):
+            raise ValueError(
+                f"file verification cache_root cannot be under system directory {protected_root}"
+            )
+    if candidate == home or candidate.parent == home:
+        raise ValueError("file verification cache_root cannot be home or its direct child")
+    if os.name == "nt" and (
+        candidate == home.parent or candidate.parent == home.parent
+    ):
+        raise ValueError("file verification cache_root cannot be the broad Users directory")
+    if candidate == temporary_root or candidate.parent == temporary_root:
+        raise ValueError("file verification cache_root cannot be a broad temp directory")
+
+    # Validate the existing/creatable parent without creating anything.  The
+    # actual leaf is created only after a successful file hash.
+    if candidate.exists():
+        if not candidate.is_dir():
+            raise ValueError("file verification cache_root must be a directory")
+    else:
+        existing_parent = candidate.parent
+        while not existing_parent.exists() and existing_parent != existing_parent.parent:
+            existing_parent = existing_parent.parent
+        if not existing_parent.is_dir():
+            raise ValueError("file verification cache_root parent is not a directory")
+    return candidate
 
 
 def _regular_file_stat(path: Path) -> dict[str, int] | None:
@@ -126,13 +244,53 @@ def _regular_file_stat(path: Path) -> dict[str, int] | None:
     }
 
 
+def _logical_file_stat(path: Path) -> dict[str, int | bool] | None:
+    """Return the original logical path's lstat identity."""
+
+    try:
+        observed = path.lstat()
+    except OSError:
+        return None
+    if not (stat.S_ISREG(observed.st_mode) or stat.S_ISLNK(observed.st_mode)):
+        return None
+    return {
+        "is_symlink": stat.S_ISLNK(observed.st_mode),
+        "st_dev": int(observed.st_dev),
+        "st_ino": int(observed.st_ino),
+        "st_size": int(observed.st_size),
+        "st_mtime_ns": int(observed.st_mtime_ns),
+        "st_ctime_ns": int(observed.st_ctime_ns),
+    }
+
+
+def _verification_snapshot(
+    logical_path: Path,
+) -> tuple[Path, dict[str, int | bool], dict[str, int]] | None:
+    """Capture logical-link and resolved-target identity for one verification."""
+
+    logical_stat = _logical_file_stat(logical_path)
+    if logical_stat is None:
+        return None
+    try:
+        resolved_path = logical_path.resolve()
+    except (OSError, RuntimeError):
+        return None
+    target_stat = _regular_file_stat(resolved_path)
+    if target_stat is None:
+        return None
+    return resolved_path, logical_stat, target_stat
+
+
 def _verification_certificate_path(
-    cache_root: Path, resolved_path: Path, expected_sha256: str
+    cache_root: Path,
+    logical_path: Path,
+    resolved_path: Path,
+    expected_sha256: str,
 ) -> Path:
-    """Return a path keyed by both the resolved file path and expected digest."""
+    """Return a path keyed by logical/target paths and expected digest."""
 
     key = hashlib.sha256(
-        f"{resolved_path}\x00{expected_sha256}".encode("utf-8")
+        f"{logical_path}\x00{resolved_path}\x00{expected_sha256}".encode("utf-8")
     ).hexdigest()
     return cache_root / key[:2] / f"{key}.json"
 
@@ -150,9 +308,11 @@ def _valid_verified_at(value: object) -> bool:
 def _certificate_hit(
     certificate_path: Path,
     *,
+    logical_path: Path,
+    logical_stat: Mapping[str, int | bool],
     resolved_path: Path,
     expected_sha256: str,
-    file_stat: Mapping[str, int],
+    target_stat: Mapping[str, int],
 ) -> bool:
     """Validate a certificate completely; malformed data is always a miss."""
 
@@ -166,12 +326,25 @@ def _certificate_hit(
             return False
         if certificate.get("schema_version") != FILE_VERIFICATION_SCHEMA_VERSION:
             return False
+        if certificate.get("logical_path") != str(logical_path):
+            return False
+        if type(certificate.get("logical_is_symlink")) is not bool:
+            return False
+        if certificate["logical_is_symlink"] != logical_stat["is_symlink"]:
+            return False
+        for field in ("st_dev", "st_ino", "st_size", "st_mtime_ns", "st_ctime_ns"):
+            logical_field = f"logical_{field}"
+            if (
+                type(certificate.get(logical_field)) is not int
+                or certificate[logical_field] != logical_stat[field]
+            ):
+                return False
         if certificate.get("resolved_path") != str(resolved_path):
             return False
         if certificate.get("expected_sha256") != expected_sha256:
             return False
         for field in ("st_dev", "st_ino", "st_size", "st_mtime_ns", "st_ctime_ns"):
-            if type(certificate.get(field)) is not int or certificate[field] != file_stat[field]:
+            if type(certificate.get(field)) is not int or certificate[field] != target_stat[field]:
                 return False
         actual_sha256 = certificate.get("actual_sha256")
         if (
@@ -204,15 +377,24 @@ def _certificate_hit(
 def _write_verification_certificate(
     certificate_path: Path,
     *,
+    logical_path: Path,
+    logical_stat: Mapping[str, int | bool],
     resolved_path: Path,
     expected_sha256: str,
     actual_sha256: str,
-    file_stat: Mapping[str, int],
+    target_stat: Mapping[str, int],
 ) -> None:
     certificate: dict[str, object] = {
         "schema_version": FILE_VERIFICATION_SCHEMA_VERSION,
+        "logical_path": str(logical_path),
+        "logical_is_symlink": logical_stat["is_symlink"],
+        "logical_st_dev": logical_stat["st_dev"],
+        "logical_st_ino": logical_stat["st_ino"],
+        "logical_st_size": logical_stat["st_size"],
+        "logical_st_mtime_ns": logical_stat["st_mtime_ns"],
+        "logical_st_ctime_ns": logical_stat["st_ctime_ns"],
         "resolved_path": str(resolved_path),
-        **dict(file_stat),
+        **dict(target_stat),
         "expected_sha256": expected_sha256,
         "actual_sha256": actual_sha256,
         "verified_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
@@ -247,44 +429,54 @@ def verified_sha256(
         return sha256_file(path)
 
     try:
-        resolved_path = Path(path).expanduser().resolve()
-    except (OSError, RuntimeError, TypeError, ValueError):
-        _LOGGER.debug("file verification cache path resolution skipped for %s", path)
-        return sha256_file(path)
-    certificate_path = _verification_certificate_path(root, resolved_path, expected_sha256)
-    initial_stat = _regular_file_stat(resolved_path)
-    if initial_stat is not None and _certificate_hit(
+        logical_path = Path(path).expanduser().absolute()
+    except (OSError, RuntimeError, TypeError, ValueError) as error:
+        raise ValueError("file verification logical path cannot be resolved") from error
+    initial = _verification_snapshot(logical_path)
+    if initial is None:
+        raise ValueError("file verification target must be a regular file")
+    resolved_path, logical_stat, target_stat = initial
+    certificate_path = _verification_certificate_path(
+        root,
+        logical_path,
+        resolved_path,
+        expected_sha256,
+    )
+    if _certificate_hit(
         certificate_path,
+        logical_path=logical_path,
+        logical_stat=logical_stat,
         resolved_path=resolved_path,
         expected_sha256=expected_sha256,
-        file_stat=initial_stat,
+        target_stat=target_stat,
     ):
         # A second stat closes the read/validation window before accepting a hit.
-        if _regular_file_stat(resolved_path) == initial_stat:
+        if _verification_snapshot(logical_path) == initial:
             _LOGGER.debug("file verification cache hit: %s", resolved_path)
             return expected_sha256
 
     _LOGGER.debug("file verification cache miss: %s", resolved_path)
     actual_sha256 = sha256_file(resolved_path)
-    final_stat = _regular_file_stat(resolved_path)
-    if initial_stat is not None and final_stat != initial_stat:
+    final = _verification_snapshot(logical_path)
+    if final != initial and final is not None:
         # Do not certify a file that changed while it was being hashed.  One retry
         # gives a concurrently published file a chance to settle without changing
         # the existing mismatch behavior for callers.
-        actual_sha256 = sha256_file(resolved_path)
-        final_stat = _regular_file_stat(resolved_path)
+        actual_sha256 = sha256_file(final[0])
+        final = _verification_snapshot(logical_path)
     if (
         actual_sha256 == expected_sha256
-        and initial_stat is not None
-        and final_stat is not None
-        and final_stat == initial_stat
+        and final is not None
+        and final == initial
     ):
         _write_verification_certificate(
             certificate_path,
-            resolved_path=resolved_path,
+            logical_path=logical_path,
+            logical_stat=logical_stat,
+            resolved_path=final[0],
             expected_sha256=expected_sha256,
             actual_sha256=actual_sha256,
-            file_stat=final_stat,
+            target_stat=final[2],
         )
     return actual_sha256
 

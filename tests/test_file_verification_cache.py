@@ -54,11 +54,57 @@ def test_verified_sha256_uses_explicit_environment_opt_in(
 ) -> None:
     source = tmp_path / "artifact.bin"
     source.write_bytes(b"environment opt-in")
-    cache_root = tmp_path / "cache"
+    cache_root = tmp_path / "formal-cache" / ".file-verification"
     expected = _sha256(source)
     monkeypatch.setenv(pythia_mmap.FILE_VERIFICATION_CACHE_ENV, str(cache_root))
 
     assert pythia_mmap.verified_sha256(source, expected) == expected
+    assert len(_certificates(cache_root)) == 1
+
+
+def test_verified_sha256_rejects_unsafe_cache_roots_without_creating_them(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "artifact.bin"
+    source.write_bytes(b"cache root safety")
+    expected = _sha256(source)
+    system_root = (
+        Path(os.environ.get("SystemRoot", r"C:\Windows")) / ".file-verification"
+        if os.name == "nt"
+        else Path("/etc/.file-verification")
+    )
+    unsafe_roots = (
+        "",
+        " ",
+        ".",
+        str(Path.cwd()),
+        str(Path.cwd() / ".file-verification"),
+        str(Path.cwd().anchor),
+        str(Path.home()),
+        str(Path.home() / ".file-verification"),
+        str(Path.home().parent / ".file-verification"),
+        str(system_root),
+        "relative-cache",
+    )
+    for unsafe in unsafe_roots:
+        with pytest.raises(ValueError, match="file verification cache_root"):
+            pythia_mmap.verified_sha256(source, expected, unsafe)
+
+    env_root = tmp_path / "relative-cache" / ".file-verification"
+    monkeypatch.setenv(pythia_mmap.FILE_VERIFICATION_CACHE_ENV, "relative-cache")
+    with pytest.raises(ValueError, match="cache_root must be absolute"):
+        pythia_mmap.verified_sha256(source, expected)
+    assert not env_root.exists()
+
+
+def test_verified_sha256_accepts_a_safe_explicit_leaf(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "artifact.bin"
+    source.write_bytes(b"safe cache root")
+    cache_root = tmp_path / "external-formal-cache" / ".file-verification"
+
+    assert pythia_mmap.verified_sha256(source, _sha256(source), cache_root) == _sha256(source)
     assert len(_certificates(cache_root)) == 1
 
 
@@ -81,13 +127,84 @@ def test_verified_sha256_disabled_by_default_still_hashes(
     assert calls == 1
 
 
+def _create_symlink(link: Path, target: Path) -> None:
+    try:
+        os.symlink(target, link)
+    except (OSError, NotImplementedError) as error:
+        pytest.skip(f"symlink creation is unavailable: {error}")
+
+
+def test_verified_sha256_binds_logical_symlink_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = tmp_path / "target.bin"
+    target.write_bytes(b"symlink target")
+    logical = tmp_path / "logical.bin"
+    _create_symlink(logical, target)
+    cache_root = tmp_path / "external-formal-cache" / ".file-verification"
+    expected = _sha256(target)
+    assert pythia_mmap.verified_sha256(logical, expected, cache_root) == expected
+
+    def fail_if_hashed(_path: str | Path, **_kwargs: object) -> str:
+        raise AssertionError("unchanged symlink should hit its certificate")
+
+    monkeypatch.setattr(pythia_mmap, "sha256_file", fail_if_hashed)
+    assert pythia_mmap.verified_sha256(logical, expected, cache_root) == expected
+
+    replacement = tmp_path / "replacement-link.bin"
+    _create_symlink(replacement, target)
+    logical.unlink()
+    os.replace(replacement, logical)
+    calls = 0
+    original_hash = pythia_mmap.sha256_file
+
+    def count_hashes(path: str | Path, **kwargs: object) -> str:
+        nonlocal calls
+        calls += 1
+        return original_hash(path, **kwargs)
+
+    monkeypatch.setattr(pythia_mmap, "sha256_file", count_hashes)
+    assert pythia_mmap.verified_sha256(logical, expected, cache_root) == expected
+    assert calls == 1
+
+
+def test_verified_sha256_rehashes_when_symlink_target_changes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    first_target = tmp_path / "first.bin"
+    second_target = tmp_path / "second.bin"
+    first_target.write_bytes(b"first target")
+    second_target.write_bytes(b"second target")
+    logical = tmp_path / "logical.bin"
+    _create_symlink(logical, first_target)
+    cache_root = tmp_path / "external-formal-cache" / ".file-verification"
+    expected = _sha256(first_target)
+    assert pythia_mmap.verified_sha256(logical, expected, cache_root) == expected
+
+    replacement = tmp_path / "replacement-link.bin"
+    _create_symlink(replacement, second_target)
+    logical.unlink()
+    os.replace(replacement, logical)
+    calls = 0
+    original_hash = pythia_mmap.sha256_file
+
+    def count_hashes(path: str | Path, **kwargs: object) -> str:
+        nonlocal calls
+        calls += 1
+        return original_hash(path, **kwargs)
+
+    monkeypatch.setattr(pythia_mmap, "sha256_file", count_hashes)
+    assert pythia_mmap.verified_sha256(logical, expected, cache_root) == _sha256(second_target)
+    assert calls == 1
+
+
 @pytest.mark.parametrize("mutation", ("mtime", "size", "content", "inode"))
 def test_verified_sha256_stat_or_content_change_is_a_miss(
     tmp_path: Path, mutation: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     source = tmp_path / "artifact.bin"
     source.write_bytes(b"original")
-    cache_root = tmp_path / "cache"
+    cache_root = tmp_path / "formal-cache" / ".file-verification"
     expected = _sha256(source)
     assert pythia_mmap.verified_sha256(source, expected, cache_root) == expected
 
