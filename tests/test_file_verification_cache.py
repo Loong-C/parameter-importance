@@ -135,6 +135,23 @@ def test_cache_root_allows_deep_formal_linux_path_but_rejects_broad_home_roots(
             pythia_mmap._verification_cache_root(unsafe)
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX protected-root validation")
+def test_cache_root_rejects_inaccessible_protected_root_before_filesystem_access(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    touched = 0
+
+    def fail_if_inspected(_path: Path) -> bool:
+        nonlocal touched
+        touched += 1
+        raise PermissionError("protected root is not searchable")
+
+    monkeypatch.setattr(Path, "is_symlink", fail_if_inspected)
+    with pytest.raises(ValueError, match="file verification cache_root"):
+        pythia_mmap._verification_cache_root(Path("/root/.file-verification"))
+    assert touched == 0
+
+
 def test_verified_sha256_disabled_by_default_still_hashes(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

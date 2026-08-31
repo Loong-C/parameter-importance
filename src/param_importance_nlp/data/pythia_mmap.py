@@ -121,52 +121,26 @@ def _verification_cache_root(cache_root: str | Path | None) -> Path | None:
         lexical = candidate_input.expanduser().absolute()
     except (OSError, RuntimeError, TypeError, ValueError) as error:
         raise ValueError("file verification cache_root cannot be resolved") from error
-    if lexical.is_symlink():
-        raise ValueError("file verification cache_root must not be a symlink")
-    try:
-        candidate = lexical.resolve()
-    except (OSError, RuntimeError, TypeError, ValueError) as error:
-        raise ValueError("file verification cache_root cannot be resolved") from error
-
-    if from_environment and candidate.name != ".file-verification":
-        raise ValueError(
-            "environment file verification cache_root must be a dedicated "
-            ".file-verification leaf"
-        )
-    if candidate == Path(candidate.anchor):
-        raise ValueError("file verification cache_root cannot be a filesystem root")
-
-    try:
-        cwd = Path.cwd().resolve()
-        home = Path.home().resolve()
-    except (OSError, RuntimeError) as error:
-        raise ValueError("file verification cache_root anchors cannot be resolved") from error
 
     def _contains(parent: Path, child: Path) -> bool:
         return child == parent or child.is_relative_to(parent)
 
-    # A verification cache must never be placed in the current checkout (or in
-    # one of its parents/children).  This also catches ``.`` and the worktree
-    # root without relying on a particular repository layout.
-    repository_roots = [
-        parent
-        for parent in (cwd, *cwd.parents)
-        if (parent / ".git").exists()
-    ]
-    for anchor in (cwd, *repository_roots):
-        if _contains(anchor, candidate) or _contains(candidate, anchor):
-            raise ValueError(
-                "file verification cache_root cannot overlap cwd or worktree"
-            )
+    # Perform pure lexical safety checks before touching the filesystem.  In
+    # particular, a protected path such as /root may be non-searchable by the
+    # caller, so is_symlink()/resolve() must not run before it is rejected.
+    if lexical == Path(lexical.anchor):
+        raise ValueError("file verification cache_root cannot be a filesystem root")
+    if from_environment and lexical.name != ".file-verification":
+        raise ValueError(
+            "environment file verification cache_root must be a dedicated "
+            ".file-verification leaf"
+        )
 
-    # Keep broad user/system locations out of the dedicated cache namespace.
-    # Temporary directories are allowed only below a per-run/user-created leaf,
-    # never directly as the cache root itself.
     protected: list[Path] = []
     if os.name == "nt":
         system_root = os.environ.get("SystemRoot", r"C:\Windows")
         protected.extend(
-            Path(value).resolve()
+            Path(value)
             for value in (
                 system_root,
                 os.environ.get("ProgramFiles", r"C:\Program Files"),
@@ -196,41 +170,124 @@ def _verification_cache_root(cache_root: str | Path | None) -> Path | None:
                 "/var",
             )
         )
-    temporary_root = Path(tempfile.gettempdir()).resolve()
     for protected_root in protected:
-        if _contains(protected_root, candidate):
+        if _contains(protected_root, lexical):
             raise ValueError(
                 f"file verification cache_root cannot be under system directory {protected_root}"
             )
-    if candidate == home or candidate.parent == home:
+
+    try:
+        home = Path.home().absolute()
+    except (OSError, RuntimeError, TypeError, ValueError) as error:
+        raise ValueError("file verification cache_root home cannot be resolved") from error
+    if lexical == home or lexical.parent == home:
         raise ValueError("file verification cache_root cannot be home or its direct child")
     if os.name != "nt":
         posix_home_root = Path("/home")
-        if candidate == posix_home_root:
+        if lexical == posix_home_root:
             raise ValueError("file verification cache_root cannot be the /home root")
-        if candidate.is_relative_to(posix_home_root):
-            relative_parts = candidate.relative_to(posix_home_root).parts
+        if lexical.is_relative_to(posix_home_root):
+            relative_parts = lexical.relative_to(posix_home_root).parts
             if len(relative_parts) <= 2:
                 raise ValueError(
                     "file verification cache_root cannot be a broad /home user root"
                 )
     if os.name == "nt" and (
-        candidate == home.parent or candidate.parent == home.parent
+        lexical == home.parent or lexical.parent == home.parent
     ):
         raise ValueError("file verification cache_root cannot be the broad Users directory")
-    if candidate == temporary_root or candidate.parent == temporary_root:
+    try:
+        temporary_root = Path(tempfile.gettempdir()).absolute()
+    except (OSError, RuntimeError, TypeError, ValueError) as error:
+        raise ValueError("file verification cache_root temp anchor cannot be resolved") from error
+    if lexical == temporary_root or lexical.parent == temporary_root:
         raise ValueError("file verification cache_root cannot be a broad temp directory")
+
+    try:
+        if lexical.is_symlink():
+            raise ValueError("file verification cache_root must not be a symlink")
+    except ValueError:
+        raise
+    except OSError as error:
+        raise ValueError("file verification cache_root cannot inspect symlink state") from error
+    try:
+        candidate = lexical.resolve()
+    except (OSError, RuntimeError, TypeError, ValueError) as error:
+        raise ValueError("file verification cache_root cannot be resolved") from error
+    for protected_root in protected:
+        if _contains(protected_root, candidate):
+            raise ValueError(
+                f"file verification cache_root cannot be under system directory {protected_root}"
+            )
+    try:
+        canonical_home = home.resolve()
+    except (OSError, RuntimeError, TypeError, ValueError) as error:
+        raise ValueError("file verification cache_root home cannot be resolved") from error
+    if candidate == canonical_home or candidate.parent == canonical_home:
+        raise ValueError("file verification cache_root cannot be home or its direct child")
+    if os.name != "nt" and candidate.is_relative_to(Path("/home")):
+        relative_parts = candidate.relative_to(Path("/home")).parts
+        if len(relative_parts) <= 2:
+            raise ValueError(
+                "file verification cache_root cannot be a broad /home user root"
+            )
+    if os.name == "nt" and (
+        candidate == canonical_home.parent or candidate.parent == canonical_home.parent
+    ):
+        raise ValueError("file verification cache_root cannot be the broad Users directory")
+    try:
+        canonical_temporary_root = temporary_root.resolve()
+    except (OSError, RuntimeError, TypeError, ValueError) as error:
+        raise ValueError("file verification cache_root temp anchor cannot be resolved") from error
+    if candidate == canonical_temporary_root or candidate.parent == canonical_temporary_root:
+        raise ValueError("file verification cache_root cannot be a broad temp directory")
+
+    # A verification cache must never be placed in the current checkout (or in
+    # one of its parents/children).  This also catches ``.`` and the worktree
+    # root without relying on a particular repository layout.
+    try:
+        cwd = Path.cwd().resolve()
+    except (OSError, RuntimeError, TypeError, ValueError) as error:
+        raise ValueError("file verification cache_root cwd cannot be resolved") from error
+    try:
+        repository_roots = [
+            parent
+            for parent in (cwd, *cwd.parents)
+            if (parent / ".git").exists()
+        ]
+    except OSError as error:
+        raise ValueError("file verification cache_root worktree cannot be inspected") from error
+    for anchor in (cwd, *repository_roots):
+        if _contains(anchor, candidate) or _contains(candidate, anchor):
+            raise ValueError(
+                "file verification cache_root cannot overlap cwd or worktree"
+            )
 
     # Validate the existing/creatable parent without creating anything.  The
     # actual leaf is created only after a successful file hash.
-    if candidate.exists():
-        if not candidate.is_dir():
+    try:
+        candidate_exists = candidate.exists()
+    except OSError as error:
+        raise ValueError("file verification cache_root cannot inspect directory") from error
+    if candidate_exists:
+        try:
+            candidate_is_dir = candidate.is_dir()
+        except OSError as error:
+            raise ValueError("file verification cache_root cannot inspect directory") from error
+        if not candidate_is_dir:
             raise ValueError("file verification cache_root must be a directory")
     else:
         existing_parent = candidate.parent
-        while not existing_parent.exists() and existing_parent != existing_parent.parent:
-            existing_parent = existing_parent.parent
-        if not existing_parent.is_dir():
+        try:
+            while (
+                not existing_parent.exists()
+                and existing_parent != existing_parent.parent
+            ):
+                existing_parent = existing_parent.parent
+            parent_is_dir = existing_parent.is_dir()
+        except OSError as error:
+            raise ValueError("file verification cache_root parent cannot be inspected") from error
+        if not parent_is_dir:
             raise ValueError("file verification cache_root parent is not a directory")
     return candidate
 
