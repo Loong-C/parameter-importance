@@ -144,6 +144,7 @@ def test_verified_sha256_binds_logical_symlink_identity(
     cache_root = tmp_path / "external-formal-cache" / ".file-verification"
     expected = _sha256(target)
     assert pythia_mmap.verified_sha256(logical, expected, cache_root) == expected
+    real_hash = pythia_mmap.sha256_file
 
     def fail_if_hashed(_path: str | Path, **_kwargs: object) -> str:
         raise AssertionError("unchanged symlink should hit its certificate")
@@ -156,16 +157,18 @@ def test_verified_sha256_binds_logical_symlink_identity(
     logical.unlink()
     os.replace(replacement, logical)
     calls = 0
-    original_hash = pythia_mmap.sha256_file
 
     def count_hashes(path: str | Path, **kwargs: object) -> str:
         nonlocal calls
         calls += 1
-        return original_hash(path, **kwargs)
+        return real_hash(path, **kwargs)
 
     monkeypatch.setattr(pythia_mmap, "sha256_file", count_hashes)
     assert pythia_mmap.verified_sha256(logical, expected, cache_root) == expected
     assert calls == 1
+
+    monkeypatch.setattr(pythia_mmap, "sha256_file", fail_if_hashed)
+    assert pythia_mmap.verified_sha256(logical, expected, cache_root) == expected
 
 
 def test_verified_sha256_rehashes_when_symlink_target_changes(

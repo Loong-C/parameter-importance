@@ -14,6 +14,8 @@ from enum import Enum
 import hashlib
 import random
 import re
+from pathlib import Path
+import stat
 import struct
 import threading
 from typing import Final, Hashable
@@ -37,6 +39,44 @@ _FROZEN_RESOLVER_IDENTITY_VERSION: Final = "pythia-mmap-frozen-resolver-v1"
 _FROZEN_RESOLVER_METADATA_VERSION: Final = (
     "pythia-mmap-frozen-sample-metadata-v1"
 )
+
+
+def _file_identity(
+    logical_path: Path,
+    resolved_path: Path,
+    *,
+    error_code: str,
+) -> tuple[object, ...]:
+    """Capture immutable logical-link and resolved-target filesystem identity."""
+
+    try:
+        logical = logical_path.lstat()
+        current_resolved_path = logical_path.resolve()
+        target = resolved_path.stat()
+    except OSError as error:
+        raise RuntimeError(error_code) from error
+    if current_resolved_path != resolved_path:
+        raise RuntimeError(error_code)
+    logical_is_symlink = stat.S_ISLNK(logical.st_mode)
+    if not (logical_is_symlink or stat.S_ISREG(logical.st_mode)):
+        raise RuntimeError(error_code)
+    if not stat.S_ISREG(target.st_mode):
+        raise RuntimeError(error_code)
+    return (
+        str(logical_path),
+        logical_is_symlink,
+        int(logical.st_dev),
+        int(logical.st_ino),
+        int(logical.st_size),
+        int(logical.st_mtime_ns),
+        int(logical.st_ctime_ns),
+        str(resolved_path),
+        int(target.st_dev),
+        int(target.st_ino),
+        int(target.st_size),
+        int(target.st_mtime_ns),
+        int(target.st_ctime_ns),
+    )
 
 
 class PythiaMMapProviderError(ValueError):
@@ -280,24 +320,23 @@ class PythiaMMapDatasetAdapter:
         if self._closed:
             raise RuntimeError("PYTHIA_MMAP_ADAPTER_CLOSED")
 
-    def _file_stats(self) -> tuple[tuple[int, int, int, int, int], ...]:
+    def _file_stats(self) -> tuple[tuple[object, ...], ...]:
         paths = (
-            self._dataset.index.path,
-            *(item.path.resolve() for item in self._dataset.reader.shards),
+            (self._dataset.index.logical_path, self._dataset.index.path),
+            *zip(
+                self._dataset.reader.logical_paths,
+                self._dataset.reader.resolved_paths,
+                strict=True,
+            ),
         )
-        values: list[tuple[int, int, int, int, int]] = []
-        for path in paths:
-            observed = path.stat()
-            values.append(
-                (
-                    observed.st_size,
-                    observed.st_mtime_ns,
-                    observed.st_ctime_ns,
-                    observed.st_dev,
-                    observed.st_ino,
-                )
+        return tuple(
+            _file_identity(
+                logical_path,
+                resolved_path,
+                error_code="PYTHIA_MMAP_ADAPTER_FILE_STAT_CHANGED",
             )
-        return tuple(values)
+            for logical_path, resolved_path in paths
+        )
 
     def _assert_files_unchanged(self) -> None:
         if self._file_stats() != self._initial_file_stats:
@@ -504,21 +543,23 @@ class PythiaMMapFrozenSampleResolver:
     def _sample_id(self, global_index: int) -> str:
         return f"{self._sample_prefix}{global_index:012d}"
 
-    def _file_stats(self) -> list[dict[str, object]]:
-        values: list[dict[str, object]] = []
+    def _file_stats(self) -> tuple[tuple[object, ...], ...]:
         paths = (
-            self._dataset.index.path,
-            *(item.path.resolve() for item in self._dataset.reader.shards),
+            (self._dataset.index.logical_path, self._dataset.index.path),
+            *zip(
+                self._dataset.reader.logical_paths,
+                self._dataset.reader.resolved_paths,
+                strict=True,
+            ),
         )
-        for path in paths:
-            stat = path.stat()
-            values.append(
-                {
-                    "size_bytes": stat.st_size,
-                    "mtime_ns": stat.st_mtime_ns,
-                }
+        return tuple(
+            _file_identity(
+                logical_path,
+                resolved_path,
+                error_code="PYTHIA_MMAP_FROZEN_RESOLVER_FILE_STAT_CHANGED",
             )
-        return values
+            for logical_path, resolved_path in paths
+        )
 
     @property
     def resolver_id(self) -> str:

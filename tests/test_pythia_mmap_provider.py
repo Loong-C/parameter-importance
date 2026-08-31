@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from pathlib import Path
 import struct
 
@@ -381,7 +382,34 @@ def test_training_cursor_rejects_idx_or_shard_stat_drift(
     shard_path = tmp_path / "document-00000-of-00000.bin"
     payload = bytearray(shard_path.read_bytes())
     payload[0] ^= 1
+    before = shard_path.stat()
     shard_path.write_bytes(payload)
+    after = shard_path.stat()
+    if (
+        after.st_size == before.st_size
+        and after.st_mtime_ns == before.st_mtime_ns
+        and after.st_ctime_ns == before.st_ctime_ns
+        and after.st_dev == before.st_dev
+        and after.st_ino == before.st_ino
+    ):
+        os.utime(
+            shard_path,
+            ns=(before.st_atime_ns, before.st_mtime_ns + 1_000_000),
+        )
+        after = shard_path.stat()
+    assert (
+        after.st_size,
+        after.st_mtime_ns,
+        after.st_ctime_ns,
+        after.st_dev,
+        after.st_ino,
+    ) != (
+        before.st_size,
+        before.st_mtime_ns,
+        before.st_ctime_ns,
+        before.st_dev,
+        before.st_ino,
+    )
 
     with pytest.raises(RuntimeError, match="PYTHIA_MMAP_ADAPTER_FILE_STAT_CHANGED"):
         if operation == "next":

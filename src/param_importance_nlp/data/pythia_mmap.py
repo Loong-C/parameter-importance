@@ -529,7 +529,8 @@ class OrderedShardReader:
                 "Pythia shard descriptors must be ordered and contiguous from ordinal zero"
             )
 
-        resolved_paths = tuple(item.path.resolve() for item in descriptors)
+        logical_paths = tuple(item.path.expanduser().absolute() for item in descriptors)
+        resolved_paths = tuple(path.resolve() for path in logical_paths)
         if len(set(resolved_paths)) != len(resolved_paths):
             raise PythiaDataError("duplicate Pythia shard path")
 
@@ -574,6 +575,7 @@ class OrderedShardReader:
             ends.append(cursor)
 
         self._shards = descriptors
+        self._logical_paths = logical_paths
         self._paths = resolved_paths
         self._starts = tuple(starts)
         self._ends = tuple(ends)
@@ -582,6 +584,18 @@ class OrderedShardReader:
     @property
     def shards(self) -> tuple[PythiaShardDescriptor, ...]:
         return self._shards
+
+    @property
+    def logical_paths(self) -> tuple[Path, ...]:
+        """Return the original absolute shard paths, without resolving links."""
+
+        return self._logical_paths
+
+    @property
+    def resolved_paths(self) -> tuple[Path, ...]:
+        """Return the resolved target paths captured during reader construction."""
+
+        return self._paths
 
     @property
     def total_size(self) -> int:
@@ -635,7 +649,8 @@ class MMapIndex:
         expected_sha256: str | None = None,
         cache_root: str | Path | None = None,
     ) -> None:
-        self.path = Path(path).expanduser().resolve()
+        self.logical_path = Path(path).expanduser().absolute()
+        self.path = self.logical_path.resolve()
         if self.path.name.casefold().endswith(".part"):
             raise PythiaDataError(f"temporary Pythia index is forbidden: {self.path}")
         if not self.path.is_file():
