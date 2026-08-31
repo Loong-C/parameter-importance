@@ -10,6 +10,7 @@ from .pythia_mmap import (
     PythiaNextTokenBatch,
     PythiaShardDescriptor,
     sha256_file,
+    verified_sha256,
 )
 
 __all__ = [
@@ -22,4 +23,5 @@ __all__ = [
     "PythiaNextTokenBatch",
     "PythiaShardDescriptor",
     "sha256_file",
+    "verified_sha256",
 ]

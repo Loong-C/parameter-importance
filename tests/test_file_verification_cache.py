@@ -1,0 +1,244 @@
+"""Fail-closed cross-process file verification certificate tests."""
+
+from __future__ import annotations
+
+from concurrent.futures import ThreadPoolExecutor
+import hashlib
+import json
+import os
+from pathlib import Path
+import struct
+
+import numpy as np
+import pytest
+
+import param_importance_nlp.data.pythia_mmap as pythia_mmap
+
+
+def _sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _certificates(cache_root: Path) -> list[Path]:
+    return sorted(cache_root.rglob("*.json"))
+
+
+def test_verified_sha256_writes_certificate_and_second_call_hits(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "artifact.bin"
+    source.write_bytes(b"verified artifact")
+    cache_root = tmp_path / "formal-cache" / ".file-verification"
+    expected = _sha256(source)
+
+    assert pythia_mmap.verified_sha256(source, expected, cache_root) == expected
+    certificates = _certificates(cache_root)
+    assert len(certificates) == 1
+    certificate = json.loads(certificates[0].read_text(encoding="utf-8"))
+    assert certificate["resolved_path"] == str(source.resolve())
+    assert certificate["expected_sha256"] == expected
+    assert certificate["actual_sha256"] == expected
+    assert certificate["artifact_hash"] == pythia_mmap.canonical_json_hash(
+        {key: value for key, value in certificate.items() if key != "artifact_hash"}
+    )
+
+    def fail_if_hashed(_path: str | Path, **_kwargs: object) -> str:
+        raise AssertionError("certificate hit unexpectedly hashed the file")
+
+    monkeypatch.setattr(pythia_mmap, "sha256_file", fail_if_hashed)
+    assert pythia_mmap.verified_sha256(source, expected, cache_root) == expected
+
+
+def test_verified_sha256_uses_explicit_environment_opt_in(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "artifact.bin"
+    source.write_bytes(b"environment opt-in")
+    cache_root = tmp_path / "cache"
+    expected = _sha256(source)
+    monkeypatch.setenv(pythia_mmap.FILE_VERIFICATION_CACHE_ENV, str(cache_root))
+
+    assert pythia_mmap.verified_sha256(source, expected) == expected
+    assert len(_certificates(cache_root)) == 1
+
+
+def test_verified_sha256_disabled_by_default_still_hashes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "artifact.bin"
+    source.write_bytes(b"disabled")
+    monkeypatch.delenv(pythia_mmap.FILE_VERIFICATION_CACHE_ENV, raising=False)
+    calls = 0
+    original = pythia_mmap.sha256_file
+
+    def count_hashes(path: str | Path, **kwargs: object) -> str:
+        nonlocal calls
+        calls += 1
+        return original(path, **kwargs)
+
+    monkeypatch.setattr(pythia_mmap, "sha256_file", count_hashes)
+    assert pythia_mmap.verified_sha256(source, _sha256(source)) == _sha256(source)
+    assert calls == 1
+
+
+@pytest.mark.parametrize("mutation", ("mtime", "size", "content", "inode"))
+def test_verified_sha256_stat_or_content_change_is_a_miss(
+    tmp_path: Path, mutation: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "artifact.bin"
+    source.write_bytes(b"original")
+    cache_root = tmp_path / "cache"
+    expected = _sha256(source)
+    assert pythia_mmap.verified_sha256(source, expected, cache_root) == expected
+
+    if mutation == "mtime":
+        original_stat = source.stat()
+        os.utime(source, ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns + 1_000_000))
+        expected_after = expected
+    elif mutation == "size":
+        source.write_bytes(b"replacement with a different size")
+        expected_after = _sha256(source)
+    elif mutation == "content":
+        source.write_bytes(b"changed")
+        expected_after = expected
+    else:
+        replacement = tmp_path / "replacement.bin"
+        replacement.write_bytes(b"original")
+        os.replace(replacement, source)
+        expected_after = expected
+
+    calls = 0
+    original_hash = pythia_mmap.sha256_file
+
+    def count_hashes(path: str | Path, **kwargs: object) -> str:
+        nonlocal calls
+        calls += 1
+        return original_hash(path, **kwargs)
+
+    monkeypatch.setattr(pythia_mmap, "sha256_file", count_hashes)
+    actual = pythia_mmap.verified_sha256(source, expected_after, cache_root)
+    assert calls >= 1
+    assert actual == _sha256(source)
+
+
+def test_verified_sha256_corrupt_or_tampered_certificate_is_a_miss(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "artifact.bin"
+    source.write_bytes(b"certificate")
+    cache_root = tmp_path / "cache"
+    expected = _sha256(source)
+    pythia_mmap.verified_sha256(source, expected, cache_root)
+    certificate_path = _certificates(cache_root)[0]
+    certificate_path.write_text("{\"schema_version\": \"tampered\"}\n", encoding="utf-8")
+
+    calls = 0
+    original_hash = pythia_mmap.sha256_file
+
+    def count_hashes(path: str | Path, **kwargs: object) -> str:
+        nonlocal calls
+        calls += 1
+        return original_hash(path, **kwargs)
+
+    monkeypatch.setattr(pythia_mmap, "sha256_file", count_hashes)
+    assert pythia_mmap.verified_sha256(source, expected, cache_root) == expected
+    assert calls == 1
+
+
+def test_verified_sha256_expected_change_uses_a_distinct_certificate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "artifact.bin"
+    source.write_bytes(b"expected binding")
+    cache_root = tmp_path / "cache"
+    expected = _sha256(source)
+    pythia_mmap.verified_sha256(source, expected, cache_root)
+
+    calls = 0
+    original_hash = pythia_mmap.sha256_file
+
+    def count_hashes(path: str | Path, **kwargs: object) -> str:
+        nonlocal calls
+        calls += 1
+        return original_hash(path, **kwargs)
+
+    monkeypatch.setattr(pythia_mmap, "sha256_file", count_hashes)
+    wrong_expected = "0" * 64
+    assert pythia_mmap.verified_sha256(source, wrong_expected, cache_root) == expected
+    assert calls == 1
+
+
+def test_verified_sha256_mismatch_does_not_write_certificate(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "artifact.bin"
+    source.write_bytes(b"mismatch")
+    cache_root = tmp_path / "cache"
+    wrong_expected = "0" * 64
+
+    assert pythia_mmap.verified_sha256(source, wrong_expected, cache_root) != wrong_expected
+    assert not cache_root.exists()
+
+
+def test_verified_sha256_concurrent_writers_publish_valid_atomic_certificate(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "artifact.bin"
+    source.write_bytes(b"concurrent")
+    cache_root = tmp_path / "cache"
+    expected = _sha256(source)
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        results = list(
+            executor.map(
+                lambda _index: pythia_mmap.verified_sha256(source, expected, cache_root),
+                range(16),
+            )
+        )
+    assert results == [expected] * 16
+    certificates = _certificates(cache_root)
+    assert len(certificates) == 1
+    assert json.loads(certificates[0].read_text(encoding="utf-8"))["actual_sha256"] == expected
+
+
+def test_mmap_index_and_ordered_reader_share_certificate_cache(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    index_path = tmp_path / "document.idx"
+    index_path.write_bytes(
+        pythia_mmap.MMAP_INDEX_MAGIC
+        + struct.pack("<Q", 1)
+        + struct.pack("<B", 8)
+        + struct.pack("<QQ", 1, 1)
+        + np.asarray([1], dtype="<i4").tobytes()
+        + np.asarray([0], dtype="<i8").tobytes()
+        + np.asarray([1], dtype="<i8").tobytes()
+    )
+    shard_path = tmp_path / "document-00000-of-00000.bin"
+    shard_path.write_bytes(b"\x01\x00")
+    descriptor = pythia_mmap.PythiaShardDescriptor(
+        0, shard_path, shard_path.stat().st_size, _sha256(shard_path)
+    )
+    cache_root = tmp_path / "cache"
+    index_expected = _sha256(index_path)
+    original_hash = pythia_mmap.sha256_file
+    calls = 0
+
+    def count_hashes(path: str | Path, **kwargs: object) -> str:
+        nonlocal calls
+        calls += 1
+        return original_hash(path, **kwargs)
+
+    monkeypatch.setattr(pythia_mmap, "sha256_file", count_hashes)
+    with pythia_mmap.MMapIndex(index_path, expected_sha256=index_expected, cache_root=cache_root):
+        reader = pythia_mmap.OrderedShardReader((descriptor,), cache_root=cache_root)
+        assert reader.read_exact(0, 2) == b"\x01\x00"
+    assert calls == 2
+
+    def fail_if_hashed(_path: str | Path, **_kwargs: object) -> str:
+        raise AssertionError("integration certificate hit unexpectedly hashed a file")
+
+    monkeypatch.setattr(pythia_mmap, "sha256_file", fail_if_hashed)
+    with pythia_mmap.MMapIndex(index_path, expected_sha256=index_expected, cache_root=cache_root):
+        reader = pythia_mmap.OrderedShardReader((descriptor,), cache_root=cache_root)
+        assert reader.read_exact(0, 2) == b"\x01\x00"
