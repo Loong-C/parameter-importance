@@ -14,9 +14,12 @@ from param_importance_nlp.contracts.task_catalog import DEFAULT_TASK_CATALOG
 from param_importance_nlp.experiments.stage3_scope_authority import (
     publish_stage3_scope_authority,
 )
+from param_importance_nlp.experiments.task_runners import _decision_hash
 from param_importance_nlp.runtime import TaskArtifactStore
+from param_importance_nlp.runtime.task_artifacts import load_committed_task_artifact
 from param_importance_nlp.runtime.task_runtime import (
     BlockerCode,
+    TaskExecutionRequest,
     TaskRuntime,
     TaskRuntimeEnvironment,
 )
@@ -99,6 +102,27 @@ def test_stage3_preflight_accepts_only_hash_bound_user_scope_authority(
     assert DEFAULT_TASK_CATALOG.get(
         "stage3.01_prerequisites_and_scope"
     ).predecessor_task_ids == ()
+
+
+def test_stage3_training_decision_hash_uses_the_same_scope_authority_as_preflight(
+    tmp_path: Path,
+) -> None:
+    decision_ref, gate_ref = _published_authority(tmp_path)
+    environment = _environment(decision_ref, gate_ref)
+    config = _formal_stage3_config()
+    task = DEFAULT_TASK_CATALOG.get("stage3.01_prerequisites_and_scope")
+    request = TaskExecutionRequest(
+        config=config,
+        task=task,
+        environment=environment,
+    )
+    expected = load_committed_task_artifact(
+        tmp_path,
+        decision_ref,
+        require_formal=True,
+    ).identity.artifact_hash
+
+    assert _decision_hash(request, tmp_path) == (expected, "PASS")
 
 
 def test_stage3_scope_authority_rejects_semantic_drift_inside_valid_envelopes(

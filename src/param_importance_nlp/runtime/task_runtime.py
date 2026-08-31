@@ -944,6 +944,27 @@ class TaskRuntime:
             return False, refs
         return True, refs
 
+    def stage3_scope_estimator_authority_hash(
+        self,
+        environment: TaskRuntimeEnvironment,
+    ) -> str | None:
+        """Return the verified formal envelope hash for Stage 3 scope authority.
+
+        This exposes exactly the same narrow U-32/G3-0 exception used by
+        formal preflight so downstream training setup cannot reject an
+        authority that preflight already accepted.  It remains unavailable to
+        Stage 2 and Stage 4+ call sites by construction: callers must opt in
+        only for a catalog task whose stage is 3.
+        """
+
+        verified, _ = self._verified_stage3_scope_estimator_authority(environment)
+        if not verified:
+            return None
+        decision_ref = environment.evidence_refs.get("stage3_scope_decision")
+        if decision_ref is None:  # Defensive; verified implies this is present.
+            return None
+        return self._load_environment_evidence(decision_ref).identity.artifact_hash
+
     def register(self, runner: TaskRunner) -> None:
         kind = getattr(runner, "runner_kind", None)
         if not isinstance(kind, RunnerKind):

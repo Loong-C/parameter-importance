@@ -806,6 +806,12 @@ def _decision_hash(request: TaskExecutionRequest, root: Path) -> tuple[str | Non
         return None, None
     reference = request.environment.estimator_decision_ref
     if reference is None:
+        if request.task.stage == 3:
+            scope_authority_hash = TaskRuntime(
+                workspace_root=root
+            ).stage3_scope_estimator_authority_hash(request.environment)
+            if scope_authority_hash is not None:
+                return scope_authority_hash, "PASS"
         raise RuntimeError("FORMAL_ESTIMATOR_DECISION_PREFLIGHT_BYPASSED")
     value = load_canonical_json(_resolve_workspace_path(root, reference, field="decision_ref"))
     if not isinstance(value, dict):
