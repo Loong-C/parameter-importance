@@ -550,6 +550,24 @@ def materialize(
         field="base_config_ref",
     )
     _no_forbidden(base_value, "base_config")
+    stage3_predecessor_refs: list[str] = []
+    if base_value.get("schema_version") == "resolved-config-v2":
+        base_orchestration = base_value.get("orchestration")
+        raw_predecessors = (
+            base_orchestration.get("input_result_refs")
+            if isinstance(base_orchestration, Mapping)
+            else None
+        )
+        if (
+            not isinstance(raw_predecessors, list)
+            or not raw_predecessors
+            or any(not isinstance(item, str) or not item for item in raw_predecessors)
+            or len(raw_predecessors) != len(set(raw_predecessors))
+        ):
+            raise _error("ENDPOINT_MATERIALIZATION_STAGE3_PREDECESSOR_REFS_INVALID")
+        stage3_predecessor_refs = list(raw_predecessors)
+    elif scope == "formal":
+        raise _error("ENDPOINT_MATERIALIZATION_FORMAL_STAGE3_PREDECESSOR_REFS_REQUIRED")
     base = _base_v1(base_value)
     if not _model_is_bound(base, str(source["model"])):
         raise _error("ENDPOINT_MATERIALIZATION_MODEL_BASE_CONFIG_MISMATCH")
@@ -627,8 +645,10 @@ def materialize(
     capture_plan["artifact_hash"] = canonical_json_hash(capture_plan)
     _write_immutable(output_paths["capture_plan_ref"], capture_plan, "capture_plan_ref")
 
-    # Keep S3.03's catalog input list empty; its own trajectory loader reads
-    # these exact refs from the environment's auxiliary evidence map.
+    # The trajectory loader consumes its capture plan from the environment,
+    # while the generic task preflight still requires the exact committed
+    # S3.02 predecessor outputs declared by the task catalog.  Preserve those
+    # refs from the trusted resolved base instead of silently clearing them.
     overrides: dict[str, Any] = {
         "training": {"max_steps": int(source["max_steps"])},
         "providers": {
@@ -645,7 +665,10 @@ def materialize(
             "local_files_only": True,
             "trust_remote_code": False,
         },
-        "orchestration": {"route_spec_ref": None, "input_result_refs": []},
+        "orchestration": {
+            "route_spec_ref": None,
+            "input_result_refs": stage3_predecessor_refs,
+        },
         "recovery": {"resume_ref": None},
         "artifacts": {"output_dir": logical_inputs["artifact_output_dir"], "publish_partial": False},
     }

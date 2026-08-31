@@ -97,10 +97,38 @@ def _base(root: Path, *, model: str) -> str:
             "default_rule": "simpson",
             "fallback_rule": "gauss_legendre_8",
             "node_budget": 16,
+            "probe_count": 3,
             "thresholds_ref": "plans/stage3-thresholds.json",
         }
     )
-    _write(root, "base.json", value)
+    predecessor_refs = [
+        "stage3/s302/commits/path_math_contract.json",
+        "stage3/s302/commits/metric_contract.json",
+        "stage3/s302/commits/gate_record.json",
+    ]
+    resolved = ResolvedConfigV2.resolve(
+        value,
+        task_id=materializer.TASK_ID,
+        overrides={
+            "training": {"max_steps": 6},
+            "providers": {
+                "kind": "offline_hf",
+                "model_manifest_ref": None,
+                "model_root_ref": None,
+                "data_manifest_ref": None,
+                "data_root_ref": None,
+                "tokenizer_manifest_ref": None,
+                "tokenizer_root_ref": None,
+                "task_type": "causal_lm",
+                "task_name": "pile",
+                "num_labels": None,
+                "local_files_only": True,
+                "trust_remote_code": False,
+            },
+            "orchestration": {"input_result_refs": predecessor_refs},
+        },
+    )
+    _write(root, "base.json", resolved.to_dict())
     return "base.json"
 
 
@@ -253,7 +281,11 @@ def test_materializer_builds_real_14m_pilot_without_execution(tmp_path: Path) ->
     assert data["sampling_design"] == "without_replacement_frozen_epoch"
     assert data["sampler"] == "without_replacement"
     assert config.section("training")["max_steps"] == 6
-    assert config.section("orchestration")["input_result_refs"] == []
+    assert config.section("orchestration")["input_result_refs"] == [
+        "stage3/s302/commits/path_math_contract.json",
+        "stage3/s302/commits/metric_contract.json",
+        "stage3/s302/commits/gate_record.json",
+    ]
     assert not (tmp_path / value["trajectory_receipt_ref"]).exists()
 
 
