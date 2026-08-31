@@ -262,7 +262,8 @@ _FORMAL_SELECTED_CHECKPOINT_TASKS = frozenset(
 )
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _STAGE3_ENDPOINT_TASK = "stage3.03_endpoint_and_probe_pipeline"
-_STAGE3_FORMAL_CONTROL_TASK_ID = "stage3.formal_control_plane"
+_STAGE3_FORMAL_EXECUTION_AUTHORITY_TASK_ID = "stage3.formal_execution_authority"
+_STAGE3_S302_CONTRACT_TASK_ID = "stage3.02_math_and_metric_contract"
 _STAGE3_REFERENCE_TASK = "stage3.05_reference_integral_and_precision"
 _STAGE3_PILOT_TASK = "stage3.06_pilot_and_threshold_freeze"
 _STAGE3_MATRIX_TASK = "stage3.07_formal_experiment_matrix"
@@ -7464,22 +7465,49 @@ def _formal_g31_authority_ref(
     if gate.gate_id != "stage3.G3-1":
         raise FormalRunRejected("FORMAL_G31_AUTHORITY_GATE_ID_MISMATCH")
 
-    authority_refs: list[str] = []
+    # Keep the commit envelope as the identity source.  In particular, the
+    # FEE member is published by ``stage3.formal_execution_authority``; the
+    # G3-1 producer/control-plane task is not the identity of that member.
+    # Artifact hashes also collapse aliases which point at the same immutable
+    # object through distinct commit paths.
+    authority_refs: dict[str, str] = {}
     authority_invalid = False
-    contract_refs: dict[str, list[str]] = {
-        "path_math_contract": [],
-        "metric_contract": [],
-    }
-    contract_hashes: dict[str, list[str]] = {
-        "path_math_contract": [],
-        "metric_contract": [],
+    contract_refs: dict[str, dict[str, str]] = {
+        "path_math_contract": {},
+        "metric_contract": {},
     }
     contract_invalid = False
+    seen_refs: set[str] = set()
+
+    def _mark_raw_identity(raw: object) -> None:
+        """Flag malformed commits whose envelope names a G3-1 member."""
+
+        nonlocal authority_invalid, contract_invalid
+        if not isinstance(raw, Mapping) or raw.get("schema_version") != "task-output-commit-v1":
+            return
+        task_id = raw.get("task_id")
+        artifact_kind = raw.get("artifact_kind")
+        if artifact_kind == "formal_execution_evidence":
+            authority_invalid = True
+        elif artifact_kind in contract_refs:
+            contract_invalid = True
 
     for reference in gate.evidence_refs:
         try:
+            normalized_reference = _logical_path(
+                reference, field="stage3.G3-1.evidence_refs"
+            ).as_posix()
+        except (TypeError, ValueError):
+            # GateRecord normally rejects this earlier; retain fail-closed
+            # behavior if a caller supplies a test/dynamic GateRecord object.
+            authority_invalid = True
+            continue
+        if normalized_reference in seen_refs:
+            continue
+        seen_refs.add(normalized_reference)
+        try:
             loaded = load_committed_task_artifact(
-                root, reference, require_formal=True
+                root, normalized_reference, require_formal=True
             )
         except (FileNotFoundError, OSError, TypeError, ValueError):
             # A Gate may retain non-commit source refs from the producer's
@@ -7488,24 +7516,26 @@ def _formal_g31_authority_ref(
             # authority data must not be hidden by another valid candidate.
             try:
                 raw = load_canonical_json(
-                    _workspace_path(root, reference, field="stage3.G3-1.evidence_refs")
+                    _workspace_path(
+                        root,
+                        normalized_reference,
+                        field="stage3.G3-1.evidence_refs",
+                    )
                 )
             except (FileNotFoundError, OSError, TypeError, ValueError):
                 continue
-            if isinstance(raw, Mapping) and raw.get("schema_version") == "task-output-commit-v1":
-                task_id = raw.get("task_id")
-                artifact_kind = raw.get("artifact_kind")
-                if task_id == _STAGE3_FORMAL_CONTROL_TASK_ID and artifact_kind == "formal_execution_evidence":
-                    authority_invalid = True
-                elif task_id == "stage3.02_math_and_metric_contract" and artifact_kind in contract_refs:
-                    contract_invalid = True
+            _mark_raw_identity(raw)
             continue
 
+        # ``LoadedTaskArtifact.identity`` is copied from the validated commit
+        # envelope and cross-checked against its object envelope by the loader.
+        # Do not infer identity from the nested payload (or from the outer G3-1
+        # control-plane task).
         identity = loaded.identity
-        if (
-            identity.task_id == _STAGE3_FORMAL_CONTROL_TASK_ID
-            and identity.artifact_kind == "formal_execution_evidence"
-        ):
+        if identity.artifact_kind == "formal_execution_evidence":
+            if identity.task_id != _STAGE3_FORMAL_EXECUTION_AUTHORITY_TASK_ID:
+                authority_invalid = True
+                continue
             try:
                 predecessor = FormalExecutionEvidence.from_mapping(dict(loaded.payload))
                 predecessor.require_for_stage(3)
@@ -7517,40 +7547,40 @@ def _formal_g31_authority_ref(
             except (TypeError, ValueError, FormalRunRejected):
                 authority_invalid = True
             else:
-                authority_refs.append(identity.commit_ref)
+                authority_refs.setdefault(identity.artifact_hash, identity.commit_ref)
             continue
 
-        if identity.task_id != "stage3.02_math_and_metric_contract":
+        if identity.artifact_kind not in contract_refs:
+            continue
+        if identity.task_id != _STAGE3_S302_CONTRACT_TASK_ID:
+            contract_invalid = True
             continue
         expected_schema = {
             "path_math_contract": "stage3-task-path-math-contract-v1",
             "metric_contract": "stage3-task-metric-contract-v1",
         }.get(identity.artifact_kind)
-        if expected_schema is None:
-            continue
         if loaded.payload.get("schema_version") != expected_schema:
             contract_invalid = True
         else:
-            contract_refs[identity.artifact_kind].append(identity.commit_ref)
-            contract_hashes[identity.artifact_kind].append(identity.artifact_hash)
+            contract_refs[identity.artifact_kind].setdefault(
+                identity.artifact_hash, identity.commit_ref
+            )
 
     # G3-1 exact PASS requires the predecessor formal execution evidence and
     # both S3.02 contract members.  Source refs (for example preregistration
     # documents) do not count as contract membership.
-    if authority_invalid or len(set(authority_refs)) != 1:
+    if authority_invalid or len(authority_refs) != 1:
         raise FormalRunRejected("FORMAL_G31_AUTHORITY_REFERENCE_AMBIGUOUS")
-    if contract_invalid or any(len(set(refs)) != 1 for refs in contract_refs.values()):
+    if contract_invalid or any(len(refs) != 1 for refs in contract_refs.values()):
         raise FormalRunRejected(
             "FORMAL_GATE_DOES_NOT_BIND_ARTIFACT:stage3.G3-1:<stage3.02-contract>"
         )
 
-    math_ref = contract_refs["path_math_contract"][0]
+    math_hash = next(iter(contract_refs["path_math_contract"]))
     measured = gate.measured
-    if not isinstance(measured, Mapping) or measured.get("math_contract_hash") != (
-        contract_hashes["path_math_contract"][0]
-    ):
+    if not isinstance(measured, Mapping) or measured.get("math_contract_hash") != math_hash:
         raise FormalRunRejected("FORMAL_G31_MATH_CONTRACT_HASH_MISMATCH")
-    return authority_refs[0]
+    return next(iter(authority_refs.values()))
 
 
 def _formal_path_context(

@@ -121,7 +121,9 @@ def _formal_evidence_with_g31_authorities(
         },
     )
     predecessor = store.publish(
-        task_id="stage3.formal_control_plane",
+        # The outer G3-1 control plane is not the identity of this member;
+        # real FEE commits are published by the execution authority task.
+        task_id="stage3.formal_execution_authority",
         artifact_kind="formal_execution_evidence",
         config_hash=config_hash,
         run_intent="formal",
@@ -174,9 +176,9 @@ def test_g31_probe_qualification_rejects_missing_or_ambiguous_authority(
 
     store = TaskArtifactStore(tmp_path, "authority/g31-duplicate")
     duplicate = store.publish(
-        task_id="stage3.formal_control_plane",
+        task_id="stage3.formal_execution_authority",
         artifact_kind="formal_execution_evidence",
-        config_hash=_hash("g31-config"),
+        config_hash=_hash("g31-duplicate-config"),
         run_intent="formal",
         formal_eligible=True,
         payload=_formal_evidence("inputs/probe.json").to_dict(),
@@ -192,6 +194,55 @@ def test_g31_probe_qualification_rejects_missing_or_ambiguous_authority(
     )
     with pytest.raises(FormalRunRejected, match="FORMAL_G31_AUTHORITY"):
         stage23._formal_g31_authority_ref(SimpleNamespace(), tmp_path, ambiguous)
+
+
+def test_g31_probe_qualification_deduplicates_normalized_commit_alias(
+    tmp_path: Path,
+) -> None:
+    evidence = _formal_evidence_with_g31_authorities(tmp_path, "inputs/probe.json")
+    gate = next(item for item in evidence.prerequisite_gates if item.gate_id == "stage3.G3-1")
+    authority_ref, path_ref, metric_ref = gate.evidence_refs
+    alias = authority_ref.replace("/commits/", "//commits/")
+    aliased_gate = GateRecord(
+        gate_id=gate.gate_id,
+        stage=gate.stage,
+        status=gate.status,
+        checked_at=gate.checked_at,
+        measured=gate.measured,
+        threshold=gate.threshold,
+        evidence_refs=(authority_ref, alias, path_ref, metric_ref),
+    )
+
+    assert stage23._formal_g31_authority_ref(SimpleNamespace(), tmp_path, aliased_gate) == authority_ref
+
+
+def test_g31_probe_qualification_rejects_wrong_fee_member_task_identity(
+    tmp_path: Path,
+) -> None:
+    evidence = _formal_evidence_with_g31_authorities(tmp_path, "inputs/probe.json")
+    gate = next(item for item in evidence.prerequisite_gates if item.gate_id == "stage3.G3-1")
+    _authority_ref, path_ref, metric_ref = gate.evidence_refs
+    store = TaskArtifactStore(tmp_path, "authority/g31-wrong-identity")
+    wrong = store.publish(
+        task_id="stage3.formal_control_plane",
+        artifact_kind="formal_execution_evidence",
+        config_hash=_hash("g31-wrong-identity-config"),
+        run_intent="formal",
+        formal_eligible=True,
+        payload=_formal_evidence("inputs/probe.json").to_dict(),
+    )
+    wrong_identity_gate = GateRecord(
+        gate_id=gate.gate_id,
+        stage=gate.stage,
+        status=gate.status,
+        checked_at=gate.checked_at,
+        measured=gate.measured,
+        threshold=gate.threshold,
+        evidence_refs=(wrong.commit_ref, path_ref, metric_ref),
+    )
+
+    with pytest.raises(FormalRunRejected, match="FORMAL_G31_AUTHORITY"):
+        stage23._formal_g31_authority_ref(SimpleNamespace(), tmp_path, wrong_identity_gate)
 
 
 def test_reference_cache_evidence_uses_only_completed_refinement_prefix() -> None:
