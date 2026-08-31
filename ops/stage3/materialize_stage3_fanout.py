@@ -113,10 +113,17 @@ def _model_key(value: object) -> str | None:
     return None if match is None else match.group(1).upper()
 
 
+def _seed(value: object, field: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise _fail("MATERIALIZATION_SEED_INVALID", field)
+    return value
+
+
 def _validate_model_base(
     value: Mapping[str, Any],
     *,
     model: str,
+    seed: int,
     field: str,
 ) -> dict[str, Any]:
     """Validate one map entry and return its v1 scientific base.
@@ -141,13 +148,35 @@ def _validate_model_base(
         raise _fail("MATERIALIZATION_MODEL_CONFIG_IDENTITY_MISSING", field)
     if identity.get("formal_eligible") is not True or identity.get("run_intent") != "formal":
         raise _fail("MATERIALIZATION_MODEL_CONFIG_NOT_FORMAL", field)
+    if identity.get("master_seed") != seed:
+        raise _fail("MATERIALIZATION_MODEL_SEED_MISMATCH", f"{field}:{seed}")
+    # input_run_id is the frozen Stage 2 authority shared by all three
+    # trajectories.  A seed-specific base must not silently point at a
+    # different upstream run; prepare_base preserves this identity below.
+    if identity.get("input_run_id") != EXPECTED_STAGE2_RUN_ID:
+        raise _fail("MATERIALIZATION_MODEL_INPUT_RUN_MISMATCH", field)
     identities = (
-        model_section.get("architecture"),
-        model_section.get("asset_id"),
-        model_section.get("initialization_id"),
-        identity.get("input_checkpoint_id"),
+        ("architecture", model_section.get("architecture")),
+        ("asset_id", model_section.get("asset_id")),
+        ("initialization_id", model_section.get("initialization_id")),
+        ("input_checkpoint_id", identity.get("input_checkpoint_id")),
     )
-    if not any(_model_key(item) == model for item in identities):
+    recognized = False
+    for identity_field, item in identities:
+        normalized = _model_key(item)
+        if normalized is None:
+            # input_checkpoint_id is optional and the other fields may use a
+            # registry name without an explicit size token.  The v1 contract
+            # handles their type/non-empty requirements; only identifiable
+            # model tokens are bound here.
+            continue
+        recognized = True
+        if normalized != model:
+            raise _fail(
+                "MATERIALIZATION_MODEL_IDENTITY_MISMATCH",
+                f"{field}:{identity_field}:{model}",
+            )
+    if not recognized:
         raise _fail("MATERIALIZATION_MODEL_IDENTITY_MISMATCH", f"{field}:{model}")
     return base
 
@@ -158,12 +187,12 @@ def _load_model_config_map(
     roots: Sequence[Path],
     units: Sequence[Any],
     scope: str,
-) -> dict[str, dict[str, Any]] | None:
-    """Load a strict model→resolved-config-v2 map, or ``None`` for legacy.
+) -> dict[tuple[str, int], dict[str, Any]] | None:
+    """Load a strict ``(model, seed)``→resolved-config-v2 map.
 
-    The map is intentionally keyed by the *actual* model labels observed in
-    the immutable production index.  This prevents a formal 14M/31M index
-    from silently selecting a single-model base.
+    A model-only map is not sufficient for formal work: 14M has two frozen
+    trajectories.  The list form is canonical; a mapping is accepted only
+    when each key is the explicit ``MODEL:SEED`` identity.
     """
 
     if value.get("schema_version") != MODEL_CONFIG_MAP_SCHEMA:
@@ -175,27 +204,42 @@ def _load_model_config_map(
     body = {key: item for key, item in value.items() if key != "artifact_hash"}
     if declared != _canonical_hash(body):
         raise _fail("MATERIALIZATION_MODEL_CONFIG_MAP_HASH_INVALID")
-    models = {str(unit.model) for unit in units}
-    if scope == "formal" and models != {"14M", "31M"}:
-        raise _fail("MATERIALIZATION_FORMAL_MODEL_COVERAGE_INVALID", sorted(models))
+    pairs = {(str(unit.model), _seed(unit.seed, "unit.seed")) for unit in units}
+    if scope == "formal" and pairs != {
+        ("14M", 4301),
+        ("14M", 4302),
+        ("31M", 5301),
+    }:
+        raise _fail("MATERIALIZATION_FORMAL_MODEL_SEED_COVERAGE_INVALID", sorted(pairs))
     entries = value.get("entries")
-    if not isinstance(entries, Mapping) or set(entries) != models:
-        raise _fail("MATERIALIZATION_MODEL_CONFIG_MAP_KEYS_INVALID")
-    loaded: dict[str, dict[str, Any]] = {}
-    for model in sorted(models):
-        entry = entries.get(model)
-        if not isinstance(entry, Mapping) or set(entry) != {"ref", "config_hash"}:
-            raise _fail("MATERIALIZATION_MODEL_CONFIG_MAP_ENTRY_INVALID", model)
+    rows = _identity_entry_rows(
+        entries,
+        expected=pairs,
+        field="base_config_map",
+        list_fields={"model", "seed", "ref", "config_hash"},
+        mapping_fields={"ref", "config_hash"},
+        error_code="MATERIALIZATION_MODEL_CONFIG_MAP",
+    )
+    loaded: dict[tuple[str, int], dict[str, Any]] = {}
+    for (model, seed), entry in rows.items():
         ref = entry.get("ref")
-        config_hash = _hash(entry.get("config_hash"), f"base_config_map.{model}.config_hash")
-        path = _resolve_ref(ref, roots=roots, field=f"base_config_map.{model}.ref")
+        identity_ref = f"{model}:{seed}"
+        config_hash = _hash(
+            entry.get("config_hash"), f"base_config_map.{identity_ref}.config_hash"
+        )
+        path = _resolve_ref(
+            ref, roots=roots, field=f"base_config_map.{identity_ref}.ref"
+        )
         loaded_value = _load_json(path)
         if loaded_value.get("schema_version") != "resolved-config-v2":
-            raise _fail("MATERIALIZATION_MODEL_CONFIG_SCHEMA_INVALID", model)
+            raise _fail("MATERIALIZATION_MODEL_CONFIG_SCHEMA_INVALID", identity_ref)
         if loaded_value.get("config_hash") != config_hash:
-            raise _fail("MATERIALIZATION_MODEL_CONFIG_HASH_MISMATCH", model)
-        loaded[model] = _validate_model_base(
-            loaded_value, model=model, field=f"base_config_map.{model}"
+            raise _fail("MATERIALIZATION_MODEL_CONFIG_HASH_MISMATCH", identity_ref)
+        loaded[(model, seed)] = _validate_model_base(
+            loaded_value,
+            model=model,
+            seed=seed,
+            field=f"base_config_map.{identity_ref}",
         )
     return loaded
 
@@ -205,8 +249,8 @@ def _load_model_overrides_map(
     *,
     units: Sequence[Any],
     scope: str,
-) -> dict[str, dict[str, Any]] | None:
-    """Load optional strict model-specific execution override maps."""
+) -> dict[tuple[str, int], dict[str, Any]] | None:
+    """Load optional strict ``(model, seed)``-specific override maps."""
 
     if value.get("schema_version") != MODEL_OVERRIDES_MAP_SCHEMA:
         return None
@@ -217,24 +261,77 @@ def _load_model_overrides_map(
     body = {key: item for key, item in value.items() if key != "artifact_hash"}
     if declared != _canonical_hash(body):
         raise _fail("MATERIALIZATION_MODEL_OVERRIDES_MAP_HASH_INVALID")
-    models = {str(unit.model) for unit in units}
+    pairs = {(str(unit.model), _seed(unit.seed, "unit.seed")) for unit in units}
     entries = value.get("entries")
-    if not isinstance(entries, Mapping) or set(entries) != models:
-        raise _fail("MATERIALIZATION_MODEL_OVERRIDES_MAP_KEYS_INVALID")
-    loaded: dict[str, dict[str, Any]] = {}
-    for model in sorted(models):
-        entry = entries.get(model)
-        if not isinstance(entry, Mapping):
-            raise _fail("MATERIALIZATION_MODEL_OVERRIDES_MAP_ENTRY_INVALID", model)
-        # Direct per-model mappings are canonical.  Accepting a single
-        # ``overrides`` wrapper keeps hand-authored control docs readable while
-        # still rejecting every other wrapper shape.
-        if set(entry) == {"overrides"}:
-            entry = entry.get("overrides")
-        if not isinstance(entry, Mapping):
-            raise _fail("MATERIALIZATION_MODEL_OVERRIDES_MAP_ENTRY_INVALID", model)
-        loaded[model] = deepcopy(dict(entry))
+    rows = _identity_entry_rows(
+        entries,
+        expected=pairs,
+        field="config_overrides_map",
+        list_fields={"model", "seed", "overrides"},
+        mapping_fields={"overrides"},
+        error_code="MATERIALIZATION_MODEL_OVERRIDES_MAP",
+    )
+    loaded: dict[tuple[str, int], dict[str, Any]] = {}
+    for identity, entry in rows.items():
+        model, seed = identity
+        override = entry.get("overrides")
+        if not isinstance(override, Mapping):
+            raise _fail(
+                "MATERIALIZATION_MODEL_OVERRIDES_MAP_ENTRY_INVALID",
+                f"{model}:{seed}",
+            )
+        loaded[identity] = deepcopy(dict(override))
     return loaded
+
+
+def _identity_entry_rows(
+    entries: object,
+    *,
+    expected: set[tuple[str, int]],
+    field: str,
+    list_fields: set[str],
+    mapping_fields: set[str],
+    error_code: str,
+) -> dict[tuple[str, int], Mapping[str, Any]]:
+    """Normalize canonical list or explicit ``MODEL:SEED`` map entries."""
+
+    rows: dict[tuple[str, int], Mapping[str, Any]] = {}
+    if isinstance(entries, list):
+        for index, raw in enumerate(entries):
+            if not isinstance(raw, Mapping) or set(raw) != list_fields:
+                raise _fail(f"{error_code}_ENTRY_INVALID", index)
+            model = raw.get("model")
+            seed = _seed(raw.get("seed"), f"{field}[{index}].seed")
+            if not isinstance(model, str) or not model:
+                raise _fail(f"{error_code}_ENTRY_INVALID", index)
+            identity = (model, seed)
+            if identity in rows:
+                raise _fail(f"{error_code}_KEYS_INVALID", identity)
+            rows[identity] = raw
+    elif isinstance(entries, Mapping):
+        for raw_key, raw in entries.items():
+            if not isinstance(raw_key, str):
+                raise _fail(f"{error_code}_KEYS_INVALID")
+            match = re.fullmatch(r"([^:]+):(\d+)", raw_key)
+            if match is None:
+                raise _fail(f"{error_code}_KEYS_INVALID", raw_key)
+            model, seed_text = match.groups()
+            seed = _seed(int(seed_text), f"{field}.{raw_key}.seed")
+            if not isinstance(raw, Mapping) or set(raw) != mapping_fields:
+                raise _fail(f"{error_code}_ENTRY_INVALID", raw_key)
+            identity = (model, seed)
+            if identity in rows:
+                raise _fail(f"{error_code}_KEYS_INVALID", raw_key)
+            rows[identity] = {
+                "model": model,
+                "seed": seed,
+                **dict(raw),
+            }
+    else:
+        raise _fail(f"{error_code}_KEYS_INVALID")
+    if set(rows) != expected:
+        raise _fail(f"{error_code}_KEYS_INVALID", sorted(set(rows) ^ expected))
+    return rows
 
 
 def _merge_section(overrides: dict[str, Any], name: str, values: Mapping[str, Any]) -> None:
@@ -388,9 +485,11 @@ def materialize(
     )
     if model_bases is None:
         base = _base_v1(base_value)
-        bases_by_model: Mapping[str, dict[str, Any]] | None = None
+        bases_by_identity: Mapping[tuple[str, int], dict[str, Any]] | None = None
     else:
-        bases_by_model = model_bases
+        if model_overrides is None:
+            raise _fail("MATERIALIZATION_MODEL_OVERRIDES_MAP_REQUIRED")
+        bases_by_identity = model_bases
         base = None
 
     def prepare_base(raw_base: dict[str, Any]) -> dict[str, Any]:
@@ -453,13 +552,13 @@ def materialize(
         )
         return prepared
 
-    if bases_by_model is None:
+    if bases_by_identity is None:
         assert base is not None
         base = prepare_base(base)
     else:
-        bases_by_model = {
-            model: prepare_base(model_base)
-            for model, model_base in bases_by_model.items()
+        bases_by_identity = {
+            identity: prepare_base(model_base)
+            for identity, model_base in bases_by_identity.items()
         }
     unit_ids = tuple(item.unit_id for item in units)
     endpoint_digests = {item.endpoint_hash for item in units}
@@ -470,27 +569,33 @@ def materialize(
     config_dir = _resolve_ref(source["config_dir"], roots=(data_root,), field="config_dir")
     selector_dir = _resolve_ref(source["selector_dir"], roots=(data_root,), field="selector_dir")
     result_dir = _resolve_ref(source["result_dir"], roots=(data_root,), field="result_dir")
-    config_dir.mkdir(parents=True, exist_ok=True)
-    selector_dir.mkdir(parents=True, exist_ok=True)
-    result_dir.mkdir(parents=True, exist_ok=True)
     from param_importance_nlp.contracts import ResolvedConfigV2
 
-    manifest_steps: list[dict[str, Any]] = []
+    # Resolve every step, including all per-seed identities and retry configs,
+    # before creating any output directory or writing any selector/config.
+    # This makes a late bad override fail atomically rather than leaving an
+    # apparently complete prefix of immutable artifacts.
+    prepared_steps: list[dict[str, Any]] = []
     first = True
     for index, step in enumerate(schedule):
         unit_id = str(step["unit_id"])
-        refs = refs_by_endpoint[unit_by_id[unit_id].endpoint_hash]
-        selector = _selector_payload(str(scope), index_hash, unit_id)
+        unit = unit_by_id[unit_id]
+        model = str(unit.model)
+        seed = _seed(unit.seed, f"unit.{unit_id}.seed")
+        identity_key = (model, seed)
+        refs = refs_by_endpoint[unit.endpoint_hash]
         selector_path = selector_dir / f"{unit_id}.json"
-        _write_immutable(selector_path, selector)
         selector_ref = selector_path.relative_to(data_root).as_posix()
-        model = str(unit_by_id[unit_id].model)
+        selector = _selector_payload(str(scope), index_hash, unit_id)
         if model_overrides is None:
             overrides = deepcopy(dict(override_value))
         else:
-            if model not in model_overrides:
-                raise _fail("MATERIALIZATION_MODEL_OVERRIDES_MAP_KEYS_INVALID", model)
-            overrides = deepcopy(model_overrides[model])
+            if identity_key not in model_overrides:
+                raise _fail(
+                    "MATERIALIZATION_MODEL_OVERRIDES_MAP_KEYS_INVALID",
+                    f"{model}:{seed}",
+                )
+            overrides = deepcopy(model_overrides[identity_key])
         orchestration = overrides.get("orchestration")
         if orchestration is None:
             orchestration = {}
@@ -515,19 +620,22 @@ def materialize(
             {"output_dir": str(source["artifact_output_dir"]), "publish_partial": False},
         )
         selected_base = (
-            base if bases_by_model is None else bases_by_model.get(model)
+            base
+            if bases_by_identity is None
+            else bases_by_identity.get(identity_key)
         )
         if selected_base is None:
-            raise _fail("MATERIALIZATION_MODEL_CONFIG_MAP_KEYS_INVALID", model)
+            raise _fail(
+                "MATERIALIZATION_MODEL_CONFIG_MAP_KEYS_INVALID",
+                f"{model}:{seed}",
+            )
         resolved = ResolvedConfigV2.resolve(
             selected_base,
             task_id=str(task_id),
             overrides=overrides,
         )
-        config_path = config_dir / f"step-{index:03d}-{unit_id}.json"
-        _write_immutable(config_path, resolved.to_dict())
+        retry_overrides = deepcopy(overrides)
         if first:
-            retry_overrides = deepcopy(overrides)
             _merge_section(
                 retry_overrides,
                 "recovery",
@@ -544,18 +652,57 @@ def materialize(
                 task_id=str(task_id),
                 overrides=retry_overrides,
             )
-            retry_config_path = config_dir / f"step-{index:03d}-{unit_id}.resume.json"
-            _write_immutable(retry_config_path, retry_resolved.to_dict())
         else:
             retry_resolved = resolved
-            retry_config_path = config_path
+        config_path = config_dir / f"step-{index:03d}-{unit_id}.json"
+        retry_config_path = (
+            config_dir / f"step-{index:03d}-{unit_id}.resume.json"
+            if first
+            else config_path
+        )
         result_path = result_dir / f"step-{index:03d}-{unit_id}.json"
+        prepared_steps.append(
+            {
+                "index": index,
+                "step": step,
+                "unit_id": unit_id,
+                "selector": selector,
+                "selector_path": selector_path,
+                "resolved": resolved,
+                "retry_resolved": retry_resolved,
+                "config_path": config_path,
+                "retry_config_path": retry_config_path,
+                "result_path": result_path,
+                "first": first,
+            }
+        )
+        first = False
+
+    config_dir.mkdir(parents=True, exist_ok=True)
+    selector_dir.mkdir(parents=True, exist_ok=True)
+    result_dir.mkdir(parents=True, exist_ok=True)
+    manifest_steps: list[dict[str, Any]] = []
+    for prepared in prepared_steps:
+        index = int(prepared["index"])
+        step = prepared["step"]
+        unit_id = str(prepared["unit_id"])
+        selector = prepared["selector"]
+        selector_path = prepared["selector_path"]
+        resolved = prepared["resolved"]
+        retry_resolved = prepared["retry_resolved"]
+        config_path = prepared["config_path"]
+        retry_config_path = prepared["retry_config_path"]
+        result_path = prepared["result_path"]
+        _write_immutable(selector_path, selector)
+        _write_immutable(config_path, resolved.to_dict())
+        if bool(prepared["first"]):
+            _write_immutable(retry_config_path, retry_resolved.to_dict())
         manifest_steps.append(
             {
                 "step_id": f"step-{index:03d}-{unit_id}",
                 "unit_id": unit_id,
                 "completes_phases": list(step["completes_phases"]),
-                "action": "run" if first else "resume",
+                "action": "run" if bool(prepared["first"]) else "resume",
                 "config_ref": config_path.relative_to(data_root).as_posix(),
                 "config_hash": resolved.config_hash,
                 "retry_config_ref": retry_config_path.relative_to(data_root).as_posix(),
@@ -580,7 +727,6 @@ def materialize(
                 ),
             }
         )
-        first = False
     manifest: dict[str, Any] = {
         "schema_version": FANOUT_SCHEMA,
         "task_id": task_id,
