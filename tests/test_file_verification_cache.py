@@ -127,6 +127,9 @@ def test_cache_root_allows_deep_formal_linux_path_but_rejects_broad_home_roots(
         Path("/home/user"),
         Path("/home/user/.file-verification"),
         Path("/etc/.file-verification"),
+        Path("/root"),
+        Path("/root/.file-verification"),
+        Path("/root/data/formal-cache/.file-verification"),
     ):
         with pytest.raises(ValueError, match="file verification cache_root"):
             pythia_mmap._verification_cache_root(unsafe)

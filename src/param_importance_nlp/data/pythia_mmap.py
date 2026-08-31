@@ -187,6 +187,7 @@ def _verification_cache_root(cache_root: str | Path | None) -> Path | None:
                 "/mnt",
                 "/opt",
                 "/proc",
+                "/root",
                 "/run",
                 "/sbin",
                 "/srv",
