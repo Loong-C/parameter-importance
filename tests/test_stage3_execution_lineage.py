@@ -515,7 +515,7 @@ def test_matrix_unit_reference_nonconvergence_runs_zero_candidates(tmp_path, mon
         checked_at="2026-08-28T00:00:00Z",
         measured={},
         threshold={},
-        evidence_refs=(plan_ref,),
+        evidence_refs=("evidence/stage3/g35/pilot-freeze.json",),
     )
     context = SimpleNamespace(
         unit_id="unit-00",

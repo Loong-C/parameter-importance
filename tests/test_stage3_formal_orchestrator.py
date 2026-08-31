@@ -232,6 +232,7 @@ def test_gate_authority_publishes_independent_formal_gate_and_evidence(tmp_path:
     ).commit_ref
     output_refs: dict[str, str] = {}
     store = TaskArtifactStore(tmp_path, "s302-outputs")
+    preregistration_ref = "plans/stage3/g31-preregistered-contract.json"
     payloads = {
         "path_math_contract": {
             "schema_version": "stage3-task-path-math-contract-v1",
@@ -264,6 +265,7 @@ def test_gate_authority_publishes_independent_formal_gate_and_evidence(tmp_path:
             run_intent="formal",
             payload=payload,
             formal_eligible=True,
+            source_refs=(preregistration_ref,),
         ).commit_ref
 
     gate_ref, evidence_ref, gate = orchestrator.GateAuthorityPublisher(tmp_path).publish(
@@ -279,6 +281,7 @@ def test_gate_authority_publishes_independent_formal_gate_and_evidence(tmp_path:
     assert gate.status is GateStatus.PASS
     loaded_gate = load_committed_task_artifact(tmp_path, gate_ref, require_formal=True)
     assert loaded_gate.payload["schema_version"] == "gate-record-v1"
+    assert preregistration_ref in loaded_gate.payload["evidence_refs"]
     loaded_evidence = load_committed_task_artifact(tmp_path, evidence_ref, require_formal=True)
     parsed = FormalExecutionEvidence.from_mapping(dict(loaded_evidence.payload))
     assert [item.gate_id for item in parsed.prerequisite_gates] == ["stage3.G3-0", "stage3.G3-1"]

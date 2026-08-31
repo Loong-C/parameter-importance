@@ -12032,12 +12032,13 @@ def _run_stage3_formal_matrix_shard(
     if (
         threshold_freeze.get("thresholds_hash") != thresholds.artifact_hash
         or g35 is None
-        or plan_ref not in g35.evidence_refs
+        or g35.status is not GateStatus.PASS
+        or g35.effective_status() is not GateStatus.PASS
     ):
         raise _blocked(
             BlockerCode.CONTRACT_UNFROZEN,
             "stage3_formal_threshold_freeze",
-            "正式矩阵与 G3-5 冻结阈值/计划不一致",
+            "正式矩阵与 G3-5 冻结阈值不一致或 Gate 未通过",
             retryable=False,
             evidence_refs=inputs.references,
         )

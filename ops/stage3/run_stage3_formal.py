@@ -969,6 +969,11 @@ class GateAuthorityPublisher:
                     raise _fail("AUTHORITY_OUTPUT_IDENTITY_DRIFT", kind)
                 loaded[kind] = item
                 refs.append(ref)
+                # A Gate must preserve the producer lineage of the committed
+                # task outputs it independently reloads.  Keeping only the
+                # outer commit refs loses the preregistered pilot plan and
+                # other hash-bound inputs behind those envelopes.
+                refs.extend(item.source_refs)
             except Stage3OrchestratorError as error:
                 reasons.append(str(error))
         semantic_measured: Mapping[str, Any] = {}

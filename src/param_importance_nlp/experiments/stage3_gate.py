@@ -1178,8 +1178,18 @@ class Stage3GateEvaluator:
             (gate for gate in gate_records if gate.gate_id == "stage3.G3-5"),
             None,
         )
-        if g35 is None or formal_plan_ref not in g35.evidence_refs:
-            reasons.append("STAGE3_G3_5_DOES_NOT_BIND_FROZEN_FORMAL_PLAN")
+        # The concrete 99-unit matrix plan is intentionally materialized from
+        # formal endpoint/probe assets after G3-5.  Requiring that future plan
+        # ref inside the earlier Gate creates a circular authority dependency.
+        # The plan remains bound here by source_artifact_refs/provenance, while
+        # the matrix runner independently verifies its post-G3-5 execution
+        # evidence ancestry before any formal observation is accepted.
+        if (
+            g35 is None
+            or g35.status is not GateStatus.PASS
+            or g35.effective_status() is not GateStatus.PASS
+        ):
+            reasons.append("STAGE3_G3_5_NOT_EFFECTIVE_PASS")
 
         normalized_rows: list[dict[str, object]] = []
         try:
