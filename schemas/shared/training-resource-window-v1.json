@@ -1,0 +1,46 @@
+{
+  "$id": "https://parameter-importance.invalid/schemas/shared/training-resource-window-v1.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "artifact_hash": {"pattern": "^[0-9a-f]{64}$", "type": "string"},
+    "communication": {
+      "additionalProperties": false,
+      "properties": {
+        "bytes": {"minimum": 0, "type": ["integer", "null"]},
+        "defined": {"type": "boolean"},
+        "reason": {"minLength": 1, "type": "string"},
+        "requested": {"type": "boolean"}
+      },
+      "required": ["requested", "defined", "bytes", "reason"],
+      "type": "object"
+    },
+    "end_step": {"minimum": 1, "type": "integer"},
+    "profile": {
+      "$ref": "training-resource-profile-v1.json"
+    },
+    "repetition": {"minimum": 0, "type": "integer"},
+    "requested": {
+      "additionalProperties": false,
+      "properties": {
+        "capture_communication": {"type": "boolean"},
+        "capture_memory": {"type": "boolean"},
+        "capture_throughput": {"type": "boolean"},
+        "synchronize_device": {"type": "boolean"}
+      },
+      "required": [
+        "capture_memory", "capture_throughput", "capture_communication",
+        "synchronize_device"
+      ],
+      "type": "object"
+    },
+    "schema_version": {"const": "training-resource-window-v1"},
+    "start_step": {"minimum": 0, "type": "integer"}
+  },
+  "required": [
+    "schema_version", "repetition", "start_step", "end_step", "requested",
+    "profile", "communication", "artifact_hash"
+  ],
+  "title": "Training Resource Window v1",
+  "type": "object"
+}

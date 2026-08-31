@@ -752,7 +752,10 @@ R_t^{\mathrm{rel}}
 \right].
 \]
 
-令 \(\eta_t>0\) 表示第 \(t\) 步学习率。
+令 \(g(k)\) 表示坐标 \(k\) 所属的静态 optimizer 参数组，
+\(\eta_{g(k),t}>0\) 表示第 \(t\) 步该参数组的动态学习率。参数组映射属于
+``optimizer_contract_hash``；随 step 变化的学习率值属于运行时事件，不进入
+``coordinate_registry_hash``。
 
 ### 7.2 理想 population SGD 更新
 
@@ -761,7 +764,7 @@ R_t^{\mathrm{rel}}
 \[
 \Delta\theta_{k,t}^{\mathrm{SGD}}
 =
--\eta_t\mu_{k,t}.
+-\eta_{g(k),t}\mu_{k,t}.
 \]
 
 在左端点局部近似下，第 \(k\) 个参数的损失下降贡献为
@@ -773,7 +776,7 @@ C_{k,t}^{\mathrm{grad}}
 \Delta\theta_{k,t}^{\mathrm{SGD}}
 \mu_{k,t}
 =
-\eta_t\mu_{k,t}^2.
+\eta_{g(k),t}\mu_{k,t}^2.
 \]
 
 这就是正式 Microbatch-level U-statistic 主要估计的目标量。
@@ -822,7 +825,7 @@ s_t
 其中 \(\varepsilon_{\mathrm{clip}}>0\) 用于避免除零。若裁剪后的 SGD 更新为
 
 \[
-\Delta\Theta_t=-\eta_ts_t\mu_t,
+\Delta\theta_{k,t}=-\eta_{g(k),t}s_t\mu_{k,t},
 \]
 
 则局部目标变为
@@ -830,10 +833,15 @@ s_t
 \[
 C_{k,t}^{\mathrm{grad,clip}}
 =
-\eta_ts_t\mu_{k,t}^2.
+\eta_{g(k),t}s_t\mu_{k,t}^2.
 \]
 
 裁剪因子只乘一次，因为一个梯度因子来自更新方向，另一个梯度因子来自损失的局部导数。正式实现应在所有 microbatch 梯度聚合之后计算全局裁剪因子；不得先对每个 microbatch 独立裁剪再代入 U-statistic。
+
+上式中的 \(s_t\) 若由固定总体梯度给出，可视为目标的一部分；真实在线代码使用的
+却是同一随机 batch 平均梯度计算出的 \(\widehat s_t\)。它与 U 核心共享随机性，
+所以 \(\widehat s_t\widehat C^U\) 只能称为 plug-in 在线分数。除非另有独立裁剪
+因子或专门证明，不得把未裁剪 U 的严格无偏性传递给该乘积。
 
 ---
 
@@ -882,7 +890,7 @@ G_i
 \[
 \mathbb E[\bar G^2]
 =
-\mu^2+rac{\sigma^2}{B},
+\mu^2+\frac{\sigma^2}{B},
 \]
 
 所以
@@ -1326,34 +1334,31 @@ S_{2,k,t}
 \[
 \widehat C_{k,t}^{U}
 =
-\eta_t
+\eta_{g(k),t}
 \frac{
 S_{1,k,t}^2-S_{2,k,t}
 }{M(M-1)}.
 \]
 
-向量化形式为
-
-\[
-\widehat C_t^{U}
-=
-\eta_t
-\frac{
-S_{1,t}^{\odot2}-S_{2,t}
-}{M(M-1)}.
-\]
+向量化实现按 registry 中的参数组映射，对每个坐标应用对应的
+\(\eta_{g(k),t}\)；不得用一个全局标量覆盖多参数组学习率。
 
 考虑全局梯度裁剪后，定义
 
 \[
 \widehat C_{k,t}^{U,\mathrm{clip}}
 =
- s_t\widehat C_{k,t}^{U}.
+ \widehat s_t\widehat C_{k,t}^{U}.
 \]
 
-这就是正式训练在线累计的主公式。
+``local_gradient_space_importance_u`` 是固定状态下唯一继承上述 U 核心无偏性声明
+的字段。``local_gradient_space_importance_u_clipped`` 是同批随机裁剪因子产生的
+plug-in 在线分数，必须记录 ``clip_source=same_batch_global_mean`` 和
+``unbiasedness_claim=none``；它不能再被描述为严格无偏主估计量。
 
-需要特别注意：\(\widehat C_{k,t}^{U}\) 在有限样本下可能为负，即使目标 \(\eta_t\mu_{k,t}^2\) 非负。这不是代码错误，而是无偏估计器的随机波动。若在单步层面立即执行 `clamp_min(0)`，就会重新引入正偏差。
+需要特别注意：\(\widehat C_{k,t}^{U}\) 在有限样本下可能为负，即使目标
+\(\eta_{g(k),t}\mu_{k,t}^2\) 非负。这不是代码错误，而是无偏估计器的随机波动。
+若在单步层面立即执行 `clamp_min(0)`，就会重新引入正偏差。
 
 ## 9.7 不等大小 microbatch 的加权 U-statistic
 
@@ -1416,6 +1421,13 @@ w_m
 \]
 
 语言模型若采用全局有效 token 平均，应令 \(b_m\) 等于该 microbatch 的有效目标 token 数；若每条固定长度序列始终含有相同数量的有效目标 token，则可以使用等权公式。
+
+加权 U 的无偏性还要求权重对被估计梯度外生（或至少满足足以推出同一目标均值
+的条件），并要求参与去对角配对的统计单元具有同一目标均值。每个 artifact 必须
+显式记录 ``statistical_unit``、``weight_unit``、``sampling_design``、
+``weights_exogenous`` 和 ``common_mean_assumption``。有效 token 数若由 labels/mask
+预先确定通常可作为外生设计量；若权重由同批 loss、gradient 或事后筛选决定，则
+该结果只能标为 plug-in/描述性统计，不能自动声称无偏。
 
 ## 9.8 U-statistic 的方差
 
@@ -2399,7 +2411,9 @@ p_t^{\mathrm{cos}}
 
 ## 18.1 算法 A：正式训练中的局部 U-statistic
 
-输入包括：当前模型参数 \(\Theta_t\)、学习率 \(\eta_t\)、全局梯度裁剪阈值 \(G_{\max}\)、全局 microbatch 数量 \(M\)，以及每个 microbatch 的未同步平均梯度。
+输入包括：当前模型参数 \(\Theta_t\)、坐标到参数组的静态映射与各组动态学习率
+\(\eta_{g,t}\)、全局梯度裁剪阈值 \(G_{\max}\)、全局 microbatch 数量 \(M\)，
+以及每个 microbatch 的未同步平均梯度。
 
 数学流程如下：
 
@@ -2422,17 +2436,18 @@ p_t^{\mathrm{cos}}
    \]
 
 5. 根据 \(\bar g_t\) 计算全局裁剪因子 \(s_t\)。
-6. 计算单步主分数
+6. 分别计算未裁剪 U 分数与同批 clip plug-in 分数
 
    \[
    \widehat C_t^{U,\mathrm{clip}}
    =
-   \eta_ts_t
+   \eta_{g(k),t}\widehat s_t
    \frac{S_{1,t}^{\odot2}-S_{2,t}}
    {M(M-1)}.
    \]
 
-7. 累计 signed、positive、negative 和 absolute 四类统计。
+7. 累计 signed、positive、negative mass 和 absolute 四类统计，并保存未裁剪与
+   plug-in 两个命名空间，禁止覆盖。
 8. 将裁剪后的平均梯度交给优化器执行 AdamW 更新。
 9. 记录不含权重衰减的数据更新量，并计算 actual-update 诊断量。
 
@@ -2461,13 +2476,14 @@ mean_grad = S1 / M
 set_optimizer_grads(mean_grad)
 clip_factor = compute_global_clip_factor_and_clip(mean_grad)
 
-step_u = learning_rate * clip_factor * (
+step_u = learning_rate_by_parameter_group * (
     S1.square() - S2
 ) / (M * (M - 1))
+step_u_clipped_plugin = clip_factor * step_u
 
 omega_signed += step_u
 omega_positive += step_u.clamp_min(0)
-omega_negative += (-step_u).clamp_min(0)
+omega_negative_mass += (-step_u).clamp_min(0)
 omega_absolute += step_u.abs()
 
 optimizer_step()
@@ -2671,9 +2687,12 @@ g_{1,k}=g_{2,k}=\cdots=g_{M,k}=g_k,
 5. Probe 损失对齐后的逐参数分配不自动获得逐参数无偏性。
 6. Microbatch U-statistic 的一般路径无偏性要求路径固定或与评价统计单元独立；正式主公式只声称对固定状态下的局部梯度平方目标无偏。
 7. AdamW 的真实更新含动量、预条件和权重衰减。局部 U-statistic 是 gradient-space importance，不是完整 AdamW 路径积分。
-8. 全局梯度裁剪因子在局部贡献公式中只乘一次。
+8. 全局梯度裁剪因子在局部贡献公式中只乘一次；若因子来自同一随机 batch，所得
+   clipped 字段是 plug-in 在线分数，不继承未裁剪 U 的严格无偏性。
 9. 单步 U-statistic 可能为负；先截断再累计会引入偏差。
-10. signed、positive、negative 和 absolute 四类累计量回答不同问题，不能只保存其中一种。
+10. signed、positive、negative mass 和 absolute 四类累计量回答不同问题，且固定
+    满足 ``signed = positive - negative_mass``、
+    ``absolute = positive + negative_mass``，不能只保存其中一种。
 11. 归一化只能解决尺度可比性，不能修复错误的估计器或错误的参数排序。
 12. 层总重要性和层平均每参数重要性必须同时报告。
 13. 数值积分总和误差很小，不代表参数级归因一定准确；必须同时比较排名和 top-k 集合。

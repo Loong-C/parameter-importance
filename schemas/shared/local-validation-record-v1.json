@@ -1,0 +1,24 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://parameter-importance.invalid/schemas/shared/local-validation-record-v1.json",
+  "title": "Local-only validation record",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version", "scope", "formal_eligible", "validation_id", "status",
+    "checked_at", "checks", "evidence_refs", "reasons", "host_profile", "artifact_hash"
+  ],
+  "properties": {
+    "schema_version": {"const": "local-validation-record-v1"},
+    "scope": {"const": "local_fixture"},
+    "formal_eligible": {"const": false},
+    "validation_id": {"type": "string", "pattern": "^local\\.[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$"},
+    "status": {"enum": ["PASS", "FAIL", "SKIPPED", "NOT_RUN"]},
+    "checked_at": {"type": "string", "format": "date-time"},
+    "checks": {"type": "object", "minProperties": 1, "additionalProperties": {"type": "boolean"}},
+    "evidence_refs": {"type": "array", "uniqueItems": true, "items": {"type": "string", "minLength": 1}},
+    "reasons": {"type": "array", "items": {"type": "string", "minLength": 1}},
+    "host_profile": {"type": "string", "minLength": 1, "maxLength": 256},
+    "artifact_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+  }
+}

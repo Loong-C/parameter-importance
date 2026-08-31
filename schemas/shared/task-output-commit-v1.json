@@ -1,0 +1,20 @@
+{
+  "$id": "https://parameter-importance.invalid/schemas/shared/task-output-commit-v1.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "artifact_hash": {"pattern": "^[0-9a-f]{64}$", "type": "string"},
+    "artifact_kind": {"pattern": "^[a-z][a-z0-9_]*$", "type": "string"},
+    "config_hash": {"pattern": "^[0-9a-f]{64}$", "type": "string"},
+    "formal_eligible": {"type": "boolean"},
+    "object_ref": {"minLength": 1, "type": "string"},
+    "schema_version": {"const": "task-output-commit-v1"},
+    "task_id": {"pattern": "^stage[0-9]\\.", "type": "string"}
+  },
+  "required": [
+    "schema_version", "task_id", "artifact_kind", "config_hash", "artifact_hash",
+    "object_ref", "formal_eligible"
+  ],
+  "title": "Task Output Commit v1",
+  "type": "object"
+}

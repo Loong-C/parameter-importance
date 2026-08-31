@@ -1,0 +1,24 @@
+{
+  "$id": "https://parameter-importance.invalid/schemas/shared/training-resource-profile-v1.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "completed_steps": {"minimum": 0, "type": "integer"},
+    "effective_units": {"minimum": 0, "type": "integer"},
+    "memory_scope": {"type": ["string", "null"]},
+    "process_cpu_seconds": {"minimum": 0, "type": "number"},
+    "profile_hash": {"pattern": "^[0-9a-f]{64}$", "type": "string"},
+    "python_peak_bytes": {"minimum": 0, "type": ["integer", "null"]},
+    "schema_version": {"const": "training-resource-profile-v1"},
+    "steps_per_second": {"exclusiveMinimum": 0, "type": ["number", "null"]},
+    "units_per_second": {"exclusiveMinimum": 0, "type": ["number", "null"]},
+    "wall_seconds": {"minimum": 0, "type": "number"}
+  },
+  "required": [
+    "schema_version", "wall_seconds", "process_cpu_seconds", "completed_steps",
+    "effective_units", "steps_per_second", "units_per_second", "python_peak_bytes",
+    "memory_scope", "profile_hash"
+  ],
+  "title": "Training Resource Profile v1",
+  "type": "object"
+}

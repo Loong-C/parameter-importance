@@ -1,0 +1,4 @@
+orchestration:
+  matrix_ref: FILL_STAGE8_FROZEN_MATRIX_COMMIT
+  input_result_refs: [FILL_STAGE8_CONFIGURATION_RECOMMENDATION_COMMIT]
+artifacts: {output_dir: runs/formal/stage8/report}

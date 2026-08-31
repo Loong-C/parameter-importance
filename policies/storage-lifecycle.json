@@ -1,0 +1,57 @@
+{
+  "schema_version": "stage0.storage-policy.v1",
+  "data_root_environment": "PARAM_IMPORTANCE_DATA_ROOT",
+  "required_directories": [
+    "datasets",
+    "models",
+    "cache",
+    "checkpoints",
+    "runs",
+    "results",
+    "reports",
+    "manifests",
+    "operations",
+    "wheelhouse",
+    "envs",
+    "source",
+    "tmp"
+  ],
+  "root_disk_minimum_free_bytes": 10737418240,
+  "data_root_launch_margin": "E + max(0.2 * E, 100 GiB)",
+  "git_max_unapproved_bytes": 10485760,
+  "classes": {
+    "replaceable": {
+      "examples": [
+        "fixed-revision upstream model",
+        "fixed-revision upstream dataset",
+        "verified wheelhouse",
+        "cache"
+      ],
+      "minimum_retention": "until no active or planned run references the asset",
+      "cleanup_authority": "manifest-driven maintenance only"
+    },
+    "non_reproducible": {
+      "examples": [
+        "formal checkpoint",
+        "raw experiment result",
+        "manual adjudication",
+        "unique run evidence"
+      ],
+      "minimum_retention": "through dependent analysis, paper evidence freeze, and an approved durability review",
+      "cleanup_authority": "explicit checkpoint/result index and owner approval"
+    },
+    "temporary": {
+      "examples": ["atomic-write temporary", "Git bundle", "per-run scratch"],
+      "minimum_retention": "until the owning transaction is committed or diagnosed",
+      "cleanup_authority": "exact paths recorded by the owning transaction"
+    }
+  },
+  "protections": [
+    "Never clean an active run or an object with a live lock or process",
+    "Never clean .part or lock metadata without checking the owning process and lease",
+    "Resolve every cleanup target and prove it is inside DATA_ROOT",
+    "Delete checkpoints only by immutable checkpoint ID after reference checks",
+    "Retain tombstones for removed checkpoints",
+    "Do not mix Git GC, system log cleanup, or other-project maintenance into this policy"
+  ]
+}

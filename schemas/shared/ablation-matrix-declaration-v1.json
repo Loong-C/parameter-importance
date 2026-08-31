@@ -1,0 +1,64 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://parameter-importance.invalid/schemas/shared/ablation-matrix-declaration-v1.json",
+  "title": "Ablation matrix declaration v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version", "matrix_id", "base_config", "factors", "base_seed",
+    "seed_namespace", "scope", "formal_eligible", "artifact_hash"
+  ],
+  "properties": {
+    "schema_version": {"const": "ablation-matrix-declaration-v1"},
+    "matrix_id": {"type": "string", "minLength": 1},
+    "base_config": {
+      "type": "object",
+      "minProperties": 1,
+      "additionalProperties": {"$ref": "#/$defs/jsonValue"}
+    },
+    "factors": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["name", "config_path", "baseline_value", "alternatives"],
+        "properties": {
+          "name": {"type": "string", "minLength": 1},
+          "config_path": {
+            "type": "array",
+            "minItems": 1,
+            "items": {"type": "string", "minLength": 1}
+          },
+          "baseline_value": {"$ref": "#/$defs/jsonValue"},
+          "alternatives": {
+            "type": "array",
+            "minItems": 1,
+            "items": {"$ref": "#/$defs/jsonValue"}
+          }
+        }
+      }
+    },
+    "base_seed": {"type": "integer", "minimum": 0},
+    "seed_namespace": {"type": "string", "minLength": 1},
+    "scope": {"enum": ["local_fixture", "formal"]},
+    "formal_eligible": {"type": "boolean"},
+    "artifact_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+  },
+  "$defs": {
+    "jsonValue": {
+      "oneOf": [
+        {"type": "null"},
+        {"type": "boolean"},
+        {"type": "integer"},
+        {"type": "number"},
+        {"type": "string"},
+        {"type": "array", "items": {"$ref": "#/$defs/jsonValue"}},
+        {
+          "type": "object",
+          "additionalProperties": {"$ref": "#/$defs/jsonValue"}
+        }
+      ]
+    }
+  }
+}

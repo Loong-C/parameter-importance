@@ -1,0 +1,35 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://parameter-importance.invalid/schemas/shared/task-finalization-record-v1.json",
+  "title": "Immutable task PASS finalization",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version", "result_ref", "result_hash", "task_id", "config_hash",
+    "scope", "formal_eligible", "artifact_refs", "finalization_hash"
+  ],
+  "properties": {
+    "schema_version": {"const": "task-finalization-record-v1"},
+    "result_ref": {"$ref": "#/$defs/logicalRef"},
+    "result_hash": {"$ref": "#/$defs/hash"},
+    "task_id": {"type": "string", "minLength": 1},
+    "config_hash": {"$ref": "#/$defs/hash"},
+    "scope": {"enum": ["local_fixture", "formal"]},
+    "formal_eligible": {"type": "boolean"},
+    "artifact_refs": {
+      "type": "object", "minProperties": 1,
+      "additionalProperties": {"$ref": "#/$defs/logicalRef"}
+    },
+    "finalization_hash": {"$ref": "#/$defs/hash"}
+  },
+  "$defs": {
+    "hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "logicalRef": {"type": "string", "minLength": 1, "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.(?:/|$))(?!.*\\\\).+$"}
+  },
+  "allOf": [
+    {
+      "if": {"properties": {"formal_eligible": {"const": true}}, "required": ["formal_eligible"]},
+      "then": {"properties": {"scope": {"const": "formal"}}}
+    }
+  ]
+}

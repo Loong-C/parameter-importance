@@ -1,0 +1,27 @@
+training: {max_steps: 1000, validation_every_steps: 100, gradient_clip_max_norm: 1.0}
+scheduler: {kind: cosine, warmup_steps: 100, total_steps: 1000}
+providers:
+  kind: offline_hf
+  model_manifest_ref: manifests/model/pythia-160m-classifier.json
+  model_root_ref: assets/model/pythia-160m-classifier
+  data_manifest_ref: manifests/data/glue-mnli-pretokenized.json
+  data_root_ref: assets/data/glue-mnli-pretokenized
+  tokenizer_manifest_ref: manifests/tokenizer/pythia.json
+  tokenizer_root_ref: assets/tokenizer/pythia
+  task_type: sequence_classification
+  task_name: mnli
+  num_labels: 3
+evaluation:
+  enabled: true
+  split: validation_matched
+  every_steps: 100
+  batch_size: 16
+  max_batches: 64
+  metrics: [loss, mnli_matched_accuracy]
+checkpoint_schedule:
+  segments: [{start_step: 0, end_step: null, every_steps: 100}]
+launcher: {kind: torchrun, backend: nccl, world_size: 4, init_method: env, rendezvous_id: stage6-mnli}
+orchestration:
+  route_spec_ref: manifests/routes/stage6-mnli-routes.json
+  quadrature_decision_ref: decisions/stage3-quadrature-recommendation.json
+artifacts: {output_dir: runs/formal/stage6-mnli}

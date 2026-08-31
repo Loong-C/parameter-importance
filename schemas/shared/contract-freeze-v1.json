@@ -1,0 +1,53 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://parameter-importance.invalid/schemas/shared/contract-freeze-v1.json",
+  "title": "Stage contract freeze",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version", "contract_id", "stage", "scope", "state", "formal_eligible",
+    "formula_version", "config_hash", "schema_hashes", "source_hashes",
+    "required_gate_ids", "frozen_at", "reason", "decision_ref", "artifact_hash"
+  ],
+  "properties": {
+    "schema_version": {"const": "contract-freeze-v1"},
+    "contract_id": {"type": "string", "pattern": "^stage[0-9]\\.contract\\.[a-z0-9]+(?:[._-][a-z0-9]+)*$"},
+    "stage": {"type": "integer", "minimum": 0, "maximum": 9},
+    "scope": {"enum": ["local_fixture", "formal"]},
+    "state": {"enum": ["FROZEN", "UNFROZEN", "BLOCKED", "STALE"]},
+    "formal_eligible": {"type": "boolean"},
+    "formula_version": {"type": "string", "minLength": 1, "maxLength": 256},
+    "config_hash": {"$ref": "#/$defs/hash"},
+    "schema_hashes": {"$ref": "#/$defs/hashMap"},
+    "source_hashes": {"$ref": "#/$defs/hashMap"},
+    "required_gate_ids": {
+      "type": "array", "uniqueItems": true,
+      "items": {"type": "string", "pattern": "^stage[0-9]\\.G[0-9]+(?:[.-][A-Za-z0-9]+)*$"}
+    },
+    "frozen_at": {"oneOf": [{"type": "null"}, {"type": "string", "format": "date-time"}]},
+    "reason": {"oneOf": [{"type": "null"}, {"type": "string", "minLength": 1}]},
+    "decision_ref": {"oneOf": [{"type": "null"}, {"type": "string", "minLength": 1}]},
+    "artifact_hash": {"$ref": "#/$defs/hash"}
+  },
+  "allOf": [
+    {
+      "if": {"properties": {"scope": {"const": "formal"}, "state": {"const": "FROZEN"}}, "required": ["scope", "state"]},
+      "then": {
+        "properties": {
+          "formal_eligible": {"const": true},
+          "required_gate_ids": {"minItems": 1},
+          "frozen_at": {"type": "string", "format": "date-time"},
+          "reason": {"type": "null"}
+        }
+      }
+    },
+    {
+      "if": {"properties": {"scope": {"const": "local_fixture"}}, "required": ["scope"]},
+      "then": {"properties": {"formal_eligible": {"const": false}}}
+    }
+  ],
+  "$defs": {
+    "hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "hashMap": {"type": "object", "additionalProperties": {"$ref": "#/$defs/hash"}}
+  }
+}

@@ -1,0 +1,58 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://parameter-importance.invalid/schemas/shared/analysis-report-v1.json",
+  "title": "Stage 9 deterministic analysis report",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "report_id", "source_artifacts", "metrics", "metadata", "report_hash"],
+  "properties": {
+    "schema_version": {"const": "analysis-report-v1"},
+    "report_id": {"type": "string", "minLength": 1},
+    "source_artifacts": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/source"}},
+    "metrics": {"type": "object", "minProperties": 1, "additionalProperties": {"$ref": "#/$defs/metric"}},
+    "metadata": {"type": "object"},
+    "report_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+  },
+  "$defs": {
+    "source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "schema_version", "content_hash", "row_count", "frozen"],
+      "properties": {
+        "name": {"type": "string", "minLength": 1},
+        "schema_version": {"type": "string", "minLength": 1},
+        "content_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "row_count": {"type": "integer", "minimum": 1},
+        "frozen": {"const": true}
+      }
+    },
+    "metric": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["defined", "value", "reason", "metadata"],
+      "properties": {
+        "defined": {"type": "boolean"},
+        "value": {"oneOf": [{"type": "null"}, {"type": "number"}]},
+        "reason": {"oneOf": [{"type": "null"}, {"type": "string", "minLength": 1}]},
+        "metadata": {
+          "type": "object",
+          "required": ["source_binding"],
+          "properties": {
+            "source_binding": {"$ref": "#/$defs/sourceBinding"}
+          }
+        }
+      }
+    },
+    "sourceBinding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["source_name", "source_hash", "derivation_id", "input_columns"],
+      "properties": {
+        "source_name": {"type": "string", "minLength": 1},
+        "source_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "derivation_id": {"type": "string", "minLength": 1},
+        "input_columns": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"type": "string", "minLength": 1}}
+      }
+    }
+  }
+}

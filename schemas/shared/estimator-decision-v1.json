@@ -1,0 +1,45 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://parameter-importance.invalid/schemas/shared/estimator-decision-v1.json",
+  "title": "Stage 2 estimator decision",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version", "decision_id", "selected_estimator", "scope", "status", "state",
+    "batch_size", "microbatch_count", "repetitions", "gate_id", "gate_status",
+    "artifact_ref", "metadata", "artifact_hash"
+  ],
+  "properties": {
+    "schema_version": {"const": "estimator-decision-v1"},
+    "decision_id": {"type": "string", "minLength": 1},
+    "selected_estimator": {"enum": [null, "u", "weighted_u", "double"]},
+    "scope": {"enum": ["local_fixture", "formal"]},
+    "status": {"type": "string", "minLength": 1},
+    "state": {"enum": ["UNFROZEN", "FROZEN", "SELECTED", "PASS", "READY"]},
+    "batch_size": {"oneOf": [{"type": "null"}, {"type": "integer", "minimum": 1}]},
+    "microbatch_count": {"oneOf": [{"type": "null"}, {"type": "integer", "minimum": 2}]},
+    "repetitions": {"oneOf": [{"type": "null"}, {"type": "integer", "minimum": 1}]},
+    "gate_id": {"type": "string", "pattern": "^stage2\\.G[0-9]+(?:[.-][A-Za-z0-9]+)*$"},
+    "gate_status": {"enum": [null, "PASS", "CONDITIONALLY_ACCEPTED", "FAIL", "BLOCKED", "STALE", "NOT_RUN"]},
+    "artifact_ref": {"oneOf": [{"type": "null"}, {"type": "string", "minLength": 1}]},
+    "metadata": {"type": "object"},
+    "artifact_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+  },
+  "allOf": [
+    {
+      "if": {"properties": {"scope": {"const": "formal"}}, "required": ["scope"]},
+      "then": {
+        "properties": {
+          "selected_estimator": {"enum": ["u", "weighted_u", "double"]},
+          "status": {"enum": ["PASS", "SELECTED", "QUALIFIED", "READY"]},
+          "state": {"enum": ["FROZEN", "SELECTED", "PASS", "READY"]},
+          "batch_size": {"type": "integer", "minimum": 1},
+          "microbatch_count": {"type": "integer", "minimum": 2},
+          "repetitions": {"type": "integer", "minimum": 1},
+          "gate_status": {"enum": ["PASS", "CONDITIONALLY_ACCEPTED"]},
+          "artifact_ref": {"type": "string", "minLength": 1}
+        }
+      }
+    }
+  ]
+}

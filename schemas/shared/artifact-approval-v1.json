@@ -1,0 +1,35 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://parameter-importance.invalid/schemas/shared/artifact-approval-v1.json",
+  "title": "Immutable artifact approval",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version", "review_ref", "review_hash", "artifact_kind",
+    "artifact_ref", "artifact_hash", "artifact_scope",
+    "artifact_formal_eligible", "approval_scope", "approver", "approval_hash"
+  ],
+  "properties": {
+    "schema_version": {"const": "artifact-approval-v1"},
+    "review_ref": {"$ref": "#/$defs/logicalRef"},
+    "review_hash": {"$ref": "#/$defs/hash"},
+    "artifact_kind": {"type": "string", "minLength": 1},
+    "artifact_ref": {"$ref": "#/$defs/logicalRef"},
+    "artifact_hash": {"$ref": "#/$defs/hash"},
+    "artifact_scope": {"enum": ["local_fixture", "formal"]},
+    "artifact_formal_eligible": {"type": "boolean"},
+    "approval_scope": {"enum": ["local_validation", "formal"]},
+    "approver": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._@-]{0,127}$"},
+    "approval_hash": {"$ref": "#/$defs/hash"}
+  },
+  "$defs": {
+    "hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "logicalRef": {"type": "string", "minLength": 1, "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.(?:/|$))(?!.*\\\\).+$"}
+  },
+  "allOf": [
+    {
+      "if": {"properties": {"approval_scope": {"const": "formal"}}, "required": ["approval_scope"]},
+      "then": {"properties": {"artifact_scope": {"const": "formal"}, "artifact_formal_eligible": {"const": true}}}
+    }
+  ]
+}

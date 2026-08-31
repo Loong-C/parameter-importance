@@ -1,0 +1,22 @@
+providers:
+  kind: offline_hf
+  model_manifest_ref: manifests/model/pythia-160m.json
+  model_root_ref: assets/model/pythia-160m
+  data_manifest_ref: manifests/data/pile-pretokenized.json
+  data_root_ref: assets/data/pile-pretokenized
+  tokenizer_manifest_ref: manifests/tokenizer/pythia.json
+  tokenizer_root_ref: assets/tokenizer/pythia
+  task_type: causal_lm
+  task_name: pile
+  num_labels: null
+orchestration:
+  matrix_ref: FILL_STAGE8_FROZEN_MATRIX_COMMIT
+  input_result_refs:
+    - FILL_HASH_BOUND_TRAINING_CHECKPOINT_TASK_OUTPUT
+    - manifests/ablation/stage8-cell-evidence.json
+  paired_design:
+    enabled: true
+    design: matched_seeds
+    mapping_ref: manifests/ablation/stage8-cell-evidence.json
+    budget_unit: samples
+artifacts: {output_dir: runs/formal/stage8/execute}

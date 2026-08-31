@@ -1,0 +1,41 @@
+{
+  "$id": "https://parameter-importance.invalid/schemas/shared/ablation-matrix-source-v1.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$defs": {
+    "factor": {
+      "additionalProperties": false,
+      "properties": {
+        "alternatives": {"minItems": 1, "type": "array", "uniqueItems": true},
+        "baseline_value": {},
+        "config_path": {
+          "items": {"minLength": 1, "type": "string"},
+          "minItems": 1,
+          "type": "array"
+        },
+        "name": {"minLength": 1, "type": "string"}
+      },
+      "required": ["name", "config_path", "baseline_value", "alternatives"],
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "properties": {
+    "base_config": {"minProperties": 1, "type": "object"},
+    "base_seed": {"minimum": 0, "type": "integer"},
+    "factors": {
+      "items": {"$ref": "#/$defs/factor"},
+      "minItems": 1,
+      "type": "array"
+    },
+    "matrix_id": {"minLength": 1, "type": "string"},
+    "schema_version": {"const": "ablation-matrix-source-v1"},
+    "scope": {"enum": ["local_fixture", "formal"]},
+    "seed_namespace": {"minLength": 1, "type": "string"}
+  },
+  "required": [
+    "schema_version", "matrix_id", "base_config", "factors", "base_seed",
+    "seed_namespace", "scope"
+  ],
+  "title": "Ablation Matrix Source v1",
+  "type": "object"
+}

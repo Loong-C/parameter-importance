@@ -1,0 +1,36 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://parameter-importance.invalid/schemas/shared/ablation-cell-result-v1.json",
+  "title": "Stage 8 committed ablation cell result",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "result_id", "matrix_id", "matrix_hash", "cell_id", "parent_cell_id", "parent_result_hash", "changed_factor", "changed_path", "config_hash", "seed", "executor_id", "metrics", "baseline_metrics", "metric_directions", "deltas", "directed_effects", "scope", "formal_eligible", "evidence_hash", "metadata", "artifact_hash"],
+  "properties": {
+    "schema_version": {"const": "ablation-cell-result-v1"},
+    "result_id": {"type": "string", "minLength": 1},
+    "matrix_id": {"type": "string", "minLength": 1},
+    "matrix_hash": {"$ref": "#/$defs/hash"},
+    "cell_id": {"type": "string", "minLength": 1},
+    "parent_cell_id": {"oneOf": [{"type": "null"}, {"type": "string", "minLength": 1}]},
+    "parent_result_hash": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/hash"}]},
+    "changed_factor": {"oneOf": [{"type": "null"}, {"type": "string", "minLength": 1}]},
+    "changed_path": {"oneOf": [{"type": "null"}, {"type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1}}]},
+    "config_hash": {"$ref": "#/$defs/hash"},
+    "seed": {"type": "integer", "minimum": 0},
+    "executor_id": {"type": "string", "minLength": 1},
+    "metrics": {"$ref": "#/$defs/metrics"},
+    "baseline_metrics": {"$ref": "#/$defs/metrics"},
+    "metric_directions": {"type": "object", "minProperties": 1, "additionalProperties": {"enum": ["higher_is_better", "lower_is_better"]}},
+    "deltas": {"$ref": "#/$defs/metrics"},
+    "directed_effects": {"$ref": "#/$defs/metrics"},
+    "scope": {"enum": ["local_fixture", "formal"]},
+    "formal_eligible": {"type": "boolean"},
+    "evidence_hash": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/hash"}]},
+    "metadata": {"type": "object"},
+    "artifact_hash": {"$ref": "#/$defs/hash"}
+  },
+  "$defs": {
+    "hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "metrics": {"type": "object", "minProperties": 1, "additionalProperties": {"type": "number"}}
+  }
+}

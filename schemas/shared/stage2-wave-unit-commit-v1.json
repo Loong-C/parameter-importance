@@ -1,0 +1,21 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://parameter-importance.invalid/schemas/shared/stage2-wave-unit-commit-v1.json",
+  "title": "Stage 2 authoritative paired wave unit commit",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "unit_id", "input_hash", "scientific_digest", "object_ref", "object_manifest_hash", "artifact_hash"],
+  "properties": {
+    "schema_version": {"const": "stage2-wave-unit-commit-v1"},
+    "unit_id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,159}$"},
+    "input_hash": {"$ref": "#/$defs/hash"},
+    "scientific_digest": {"$ref": "#/$defs/hash"},
+    "object_ref": {"$ref": "#/$defs/ref"},
+    "object_manifest_hash": {"$ref": "#/$defs/hash"},
+    "artifact_hash": {"$ref": "#/$defs/hash"}
+  },
+  "$defs": {
+    "hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "ref": {"type": "string", "minLength": 1, "pattern": "^(?!/)(?![A-Za-z]:)(?!.*(?:^|/)\\.\\.(?:/|$))[^\\\\]+$"}
+  }
+}

@@ -1,0 +1,35 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://parameter-importance.invalid/schemas/shared/ablation-cell-training-metrics-v1.json",
+  "title": "Stage 8 trained ablation cell metrics",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version", "matrix_hash", "cell_id", "config_hash", "seed",
+    "training_result_hash", "metrics", "metric_directions", "scope", "artifact_hash"
+  ],
+  "properties": {
+    "schema_version": {"const": "ablation-cell-training-metrics-v1"},
+    "matrix_hash": {"$ref": "#/$defs/hash"},
+    "cell_id": {"type": "string", "minLength": 1},
+    "config_hash": {"$ref": "#/$defs/hash"},
+    "seed": {"type": "integer", "minimum": 0},
+    "training_result_hash": {"$ref": "#/$defs/hash"},
+    "metrics": {"$ref": "#/$defs/metrics"},
+    "metric_directions": {
+      "type": "object",
+      "minProperties": 1,
+      "additionalProperties": {"enum": ["higher_is_better", "lower_is_better"]}
+    },
+    "scope": {"enum": ["local_fixture", "formal"]},
+    "artifact_hash": {"$ref": "#/$defs/hash"}
+  },
+  "$defs": {
+    "hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "metrics": {
+      "type": "object",
+      "minProperties": 1,
+      "additionalProperties": {"type": "number"}
+    }
+  }
+}

@@ -1,0 +1,34 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://parameter-importance.invalid/schemas/shared/reference-result-v1.json",
+  "title": "Stage 2 reference result manifest",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version", "reference_id", "bias_reference_hash", "cross_reference_hash",
+    "ranking_reference_hash", "sample_count_a", "sample_count_b", "block_size",
+    "registry_hash", "scope", "formal_eligible", "metadata", "tensor_bundle_ref",
+    "tensor_bundle_manifest_hash", "artifact_hash"
+  ],
+  "properties": {
+    "schema_version": {"const": "reference-result-v1"},
+    "reference_id": {"type": "string", "minLength": 1},
+    "bias_reference_hash": {"$ref": "#/$defs/hash"},
+    "cross_reference_hash": {"$ref": "#/$defs/hash"},
+    "ranking_reference_hash": {"$ref": "#/$defs/hash"},
+    "sample_count_a": {"type": "integer", "minimum": 1},
+    "sample_count_b": {"type": "integer", "minimum": 1},
+    "block_size": {"type": "integer", "minimum": 1},
+    "registry_hash": {"$ref": "#/$defs/hash"},
+    "scope": {"enum": ["local_fixture", "formal"]},
+    "formal_eligible": {"type": "boolean"},
+    "metadata": {"type": "object"},
+    "tensor_bundle_ref": {"$ref": "#/$defs/ref"},
+    "tensor_bundle_manifest_hash": {"$ref": "#/$defs/hash"},
+    "artifact_hash": {"$ref": "#/$defs/hash"}
+  },
+  "$defs": {
+    "hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "ref": {"type": "string", "minLength": 1, "pattern": "^(?!/)(?![A-Za-z]:)(?!.*(?:^|/)\\.\\.(?:/|$))[^\\\\]+$"}
+  }
+}

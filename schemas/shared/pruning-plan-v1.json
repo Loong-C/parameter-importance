@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://parameter-importance.invalid/schemas/shared/pruning-plan-v1.json",
+  "title": "Stage 7 pruning plan",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "ratio", "strategy", "scope", "seed", "score_view", "plan_hash"],
+  "properties": {
+    "schema_version": {"const": "pruning-plan-v1"},
+    "ratio": {"type": "number", "minimum": 0, "maximum": 1},
+    "strategy": {"enum": ["high", "low", "random"]},
+    "scope": {"enum": ["global", "layer_balanced"]},
+    "seed": {"type": "integer"},
+    "score_view": {"enum": ["signed", "positive", "absolute"]},
+    "plan_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+  }
+}

@@ -1,0 +1,4 @@
+orchestration:
+  matrix_ref: FILL_STAGE7_PRUNING_MATRIX_COMMIT
+  input_result_refs: [FILL_STAGE7_PRUNING_SUMMARY_COMMIT]
+artifacts: {output_dir: runs/formal/stage7/report}

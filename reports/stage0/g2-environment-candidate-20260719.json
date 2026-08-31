@@ -1,0 +1,122 @@
+{
+  "schema_version": "stage0.environment-gate-summary.v1",
+  "generated_at": "2026-07-19T17:02:15+08:00",
+  "subtask": "S0.3",
+  "subtask_status": "CPU_AND_OFFLINE_SCOPE_COMPLETE",
+  "gate": {
+    "id": "G2",
+    "status": "BLOCKED",
+    "reason": "G0-G remains blocked pending an administrator-enforced four-GPU PCI/UUID allowlist, per-card CUDA health revalidation, and actual four-GPU NCCL runtime validation.",
+    "training_eligible": false,
+    "published_classification": "CPU_ONLY_CANDIDATE"
+  },
+  "code": {
+    "rebuild_producer_commit": "9335fe6f8f8c090af90628c4dfe9d4760c9219c8",
+    "final_hardening_commit": "5541f660b39d79af135878c22c9efbf70643e49a"
+  },
+  "candidate": {
+    "path": "/home/sophgo13/cjl/storage/parameter-importance/envs/parameter-importance-stage0-1bd963c65f75",
+    "size_bytes": 7135424701,
+    "environment_id": "env-v1-aaf55d32341c60a904b7d80a3c09d69bff7b7ee500e43f42a6432f65438d9d29",
+    "build_id": "env-build-v1-c023ca43cccc9a80634b9dd1c770cb7a62e10206fd96e6b3ea524b409ee601d4",
+    "python": "3.12.3",
+    "torch": "2.12.1+cu126",
+    "torch_cuda_runtime": "12.6",
+    "cudnn_runtime": "9.10.2",
+    "nccl_distribution": "2.29.3",
+    "nccl_runtime": null
+  },
+  "offline_rebuild": {
+    "status": "PASS",
+    "elapsed_seconds": 228.51400493900292,
+    "locked_distribution_count": 89,
+    "wheel_count": 89,
+    "wheel_total_bytes": 3742765243,
+    "wheelhouse_pre_install_verified": true,
+    "wheelhouse_post_install_verified": true,
+    "freeze_matches_lock": true,
+    "freeze_sha256": "dfbd26ab3a2e39853505d2644fd54230bb2468327455cc7752c78f4fb1fa9679",
+    "pip_check": "PASS",
+    "negative_omitted_distribution": "pyyaml",
+    "negative_omitted_version": "6.0.3",
+    "negative_install_exit_code": 1,
+    "negative_test_passed": true,
+    "negative_temporary_cleaned": true,
+    "temporary_root_cleaned": true
+  },
+  "network_audit": {
+    "preventive_namespace": "UNAVAILABLE: unprivileged uid_map denied",
+    "mode": "strace -f -e trace=network plus pip --no-index --require-hashes --only-binary",
+    "external_attempt_counts": {
+      "current_nvcc_version": 0,
+      "existing_freeze_before": 0,
+      "candidate_create": 0,
+      "candidate_install": 0,
+      "candidate_freeze": 0,
+      "candidate_freeze_all": 0,
+      "pip_check": 0,
+      "core_import": 0,
+      "negative_create": 0,
+      "negative_install": 0,
+      "existing_freeze_after": 0
+    },
+    "all_external_attempt_counts_zero": true
+  },
+  "existing_environment": {
+    "path": "/home/sophgo13/cjl/storage/parameter-importance/envs/parameter-importance",
+    "freeze_all_before_sha256": "f7940de670f5f94eae5038b159dfe80ed647080398bd89c162bdd6514ff933f9",
+    "freeze_all_after_sha256": "f7940de670f5f94eae5038b159dfe80ed647080398bd89c162bdd6514ff933f9",
+    "unchanged": true
+  },
+  "linux_tests": [
+    {
+      "environment": "existing",
+      "commit": "8295f0800e5a45d179d0a760f1a39eabd266d3d7",
+      "passed": 122,
+      "failed": 0
+    },
+    {
+      "environment": "candidate",
+      "commit": "9335fe6f8f8c090af90628c4dfe9d4760c9219c8",
+      "passed": 122,
+      "failed": 0
+    },
+    {
+      "environment": "candidate",
+      "commit": "5541f660b39d79af135878c22c9efbf70643e49a",
+      "passed": 123,
+      "failed": 0
+    }
+  ],
+  "server_artifacts": {
+    "raw_rebuild_report": {
+      "path": "/home/sophgo13/cjl/storage/parameter-importance/reports/stage0/parameter-importance-stage0-1bd963c65f75/environment-rebuild.json",
+      "sha256": "7df92d5325109ac3b3963738193398a3fc6e226a90e7bf7262364047321427e9"
+    },
+    "environment_identity": {
+      "path": "/home/sophgo13/cjl/storage/parameter-importance/manifests/environment-identities/env-v1-aaf55d32341c60a904b7d80a3c09d69bff7b7ee500e43f42a6432f65438d9d29.json",
+      "sha256": "a99d2e770ae97202b154192b123e1c2581289ece75ce9c43d9c711e094d22fe6",
+      "mode": "0644",
+      "link_count": 1
+    },
+    "build_observation": {
+      "path": "/home/sophgo13/cjl/storage/parameter-importance/manifests/environment-builds/env-build-v1-c023ca43cccc9a80634b9dd1c770cb7a62e10206fd96e6b3ea524b409ee601d4.json",
+      "sha256": "8a42395dfbd34a7eb5cc78c5e00404737af90bd9914a3d34f3d6ef405bc989fe",
+      "mode": "0644",
+      "link_count": 1
+    },
+    "cpu_candidate_reference": {
+      "path": "/home/sophgo13/cjl/storage/parameter-importance/manifests/environment-cpu-candidate.json",
+      "sha256": "d56d4b6e03693ff9dc876c612c4284fb3f1a56def88cdc1a03160650f0087784"
+    },
+    "immutable_directories_mode": "0755"
+  },
+  "hardware_boundary": {
+    "gpu_gate": "G0-G BLOCKED",
+    "gpu_management_or_compute_device_enumeration_performed_by_rebuild": false,
+    "cuda_visible_devices_for_core_import": "",
+    "actual_nccl_runtime_deferred": true
+  },
+  "secrets_included": false,
+  "internal_server_paths_included_with_user_approval": true
+}

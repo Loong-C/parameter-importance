@@ -1,0 +1,58 @@
+{
+  "schema_version": "stage0.storage-budget.v1",
+  "generated_at": "2026-07-19T10:18:00+08:00",
+  "status": "CANDIDATE",
+  "units": "bytes",
+  "assumptions": {
+    "checkpoint_bytes_per_parameter_before_safety": 14,
+    "checkpoint_safety_factor": 1.25,
+    "resident_fp32_parameter_buffers": 10,
+    "transient_fp32_parameter_buffers": 3,
+    "logs_and_reports_per_run": 10737418240,
+    "stage4_retained_checkpoints": 12,
+    "stage5_retained_checkpoints": 20,
+    "seed_count": 3,
+    "parallel_runs": 1
+  },
+  "budgets": {
+    "stage0_assets_and_environment": {
+      "expected_new_bytes": 620000000000,
+      "safety_margin_bytes": 124000000000,
+      "required_free_bytes": 744000000000
+    },
+    "stage4_160m": {
+      "parameter_count": 160000000,
+      "estimated_checkpoint_bytes": 2800000000,
+      "estimated_parameter_statistics_peak_bytes": 8320000000,
+      "expected_new_bytes": 156052254720,
+      "safety_margin_bytes": 107374182400,
+      "required_free_bytes": 263426437120
+    },
+    "stage5_410m": {
+      "parameter_count": 410000000,
+      "estimated_checkpoint_bytes": 7175000000,
+      "estimated_parameter_statistics_peak_bytes": 21320000000,
+      "expected_new_bytes": 521752254720,
+      "safety_margin_bytes": 107374182400,
+      "required_free_bytes": 629126437120
+    }
+  },
+  "current_snapshot": {
+    "data_root_available_bytes_approx": 3188583720550,
+    "root_disk_available_bytes_approx": 16106127360,
+    "inode_use_percent": 1
+  },
+  "decision": {
+    "stage0_assets_fit_analytical_budget": true,
+    "stage4_160m_fit_analytical_budget": true,
+    "stage5_410m_fit_analytical_budget": true,
+    "root_disk_above_10_gib_guard": true,
+    "requires_recalculation_after_final_configs": true,
+    "requires_g8_real_measurement": true
+  },
+  "limitations": [
+    "This is an analytical launch budget, not a G8 memory or throughput result",
+    "Formal Stage 4 and Stage 5 checkpoint cadence and parameter-state envelopes must be frozen and remeasured",
+    "The remaining active Pile download must not be touched or counted as ready input"
+  ]
+}

@@ -1,0 +1,40 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://parameter-importance.invalid/schemas/shared/pruning-evaluation-result-v1.json",
+  "title": "Stage 7 committed pruning evaluation result",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "result_id", "study_id", "study_hash", "run_id", "model_checkpoint_hash", "coordinate_registry_hash", "evaluator_id", "method", "direction", "pruning_scope", "ratio", "mask_seed", "source_artifact_hash", "score_view", "selected_count", "eligible_count", "metrics", "baseline_metrics", "damage", "metric_directions", "scope", "formal_eligible", "evidence_hash", "metadata", "artifact_hash"],
+  "properties": {
+    "schema_version": {"const": "pruning-evaluation-result-v1"},
+    "result_id": {"type": "string", "minLength": 1},
+    "study_id": {"type": "string", "minLength": 1},
+    "study_hash": {"$ref": "#/$defs/hash"},
+    "run_id": {"type": "string", "minLength": 1},
+    "model_checkpoint_hash": {"$ref": "#/$defs/hash"},
+    "coordinate_registry_hash": {"$ref": "#/$defs/hash"},
+    "evaluator_id": {"type": "string", "minLength": 1},
+    "method": {"type": "string", "minLength": 1},
+    "direction": {"type": "string", "minLength": 1},
+    "pruning_scope": {"type": "string", "minLength": 1},
+    "ratio": {"type": "number", "minimum": 0, "maximum": 1},
+    "mask_seed": {"oneOf": [{"type": "null"}, {"type": "integer"}]},
+    "source_artifact_hash": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/hash"}]},
+    "score_view": {"oneOf": [{"type": "null"}, {"enum": ["signed", "positive", "absolute"]}]},
+    "selected_count": {"type": "integer", "minimum": 0},
+    "eligible_count": {"type": "integer", "minimum": 0},
+    "metrics": {"$ref": "#/$defs/metrics"},
+    "baseline_metrics": {"$ref": "#/$defs/metrics"},
+    "damage": {"$ref": "#/$defs/metrics"},
+    "metric_directions": {"type": "object", "minProperties": 1, "additionalProperties": {"enum": ["higher_is_better", "lower_is_better"]}},
+    "scope": {"enum": ["local_fixture", "formal"]},
+    "formal_eligible": {"type": "boolean"},
+    "evidence_hash": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/hash"}]},
+    "metadata": {"type": "object"},
+    "artifact_hash": {"$ref": "#/$defs/hash"}
+  },
+  "$defs": {
+    "hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "metrics": {"type": "object", "minProperties": 1, "additionalProperties": {"type": "number"}}
+  }
+}

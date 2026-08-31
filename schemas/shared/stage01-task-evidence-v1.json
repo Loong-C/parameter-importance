@@ -1,0 +1,47 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://parameter-importance.invalid/schemas/shared/stage01-task-evidence-v1.json",
+  "title": "Stage 0/1 task-specific execution evidence",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "task_id",
+    "artifact_role",
+    "scope",
+    "local_validation_status",
+    "gate_status",
+    "config_hash",
+    "task_definition_hash",
+    "input_evidence",
+    "core_evidence_hash",
+    "core_evidence",
+    "role_evidence"
+  ],
+  "properties": {
+    "schema_version": {"const": "stage01-task-evidence-v1"},
+    "task_id": {"type": "string", "pattern": "^stage[01]\\."},
+    "artifact_role": {"type": "string", "pattern": "^[a-z][a-z0-9_]*$"},
+    "scope": {"enum": ["local_fixture", "formal"]},
+    "local_validation_status": {"enum": ["PASS", "FAIL", "SKIPPED", "NOT_RUN"]},
+    "gate_status": {"const": "NOT_RUN"},
+    "config_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "task_definition_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "input_evidence": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["ref", "sha256", "kind"],
+        "properties": {
+          "ref": {"type": "string", "minLength": 1},
+          "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+          "kind": {"type": "string", "minLength": 1}
+        }
+      }
+    },
+    "core_evidence_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "core_evidence": {"type": "object"},
+    "role_evidence": {"type": "object"}
+  }
+}

@@ -1,0 +1,60 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://parameter-importance.invalid/schemas/shared/training-endpoint-capture-plan-v1.json",
+  "title": "Training endpoint capture plan v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "plan_id",
+    "selected_steps",
+    "include_checkpoint_steps",
+    "scope",
+    "formal_eligible",
+    "qualification_evidence_hash",
+    "probe_plan_ref",
+    "artifact_hash"
+  ],
+  "properties": {
+    "schema_version": {"const": "training-endpoint-capture-plan-v1"},
+    "plan_id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,159}$"},
+    "selected_steps": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {"type": "integer", "minimum": 1}
+    },
+    "include_checkpoint_steps": {"type": "boolean"},
+    "scope": {"enum": ["local_fixture", "formal"]},
+    "formal_eligible": {"type": "boolean"},
+    "qualification_evidence_hash": {
+      "oneOf": [
+        {"type": "null"},
+        {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+      ]
+    },
+    "probe_plan_ref": {
+      "oneOf": [
+        {"type": "null"},
+        {"type": "string", "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.(?:/|$))(?!.*\\\\).+$"}
+      ]
+    },
+    "artifact_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+  },
+  "allOf": [
+    {
+      "if": {"properties": {"scope": {"const": "formal"}}},
+      "then": {
+        "properties": {
+          "formal_eligible": {"const": true},
+          "qualification_evidence_hash": {"type": "string"}
+        }
+      },
+      "else": {
+        "properties": {
+          "formal_eligible": {"const": false},
+          "qualification_evidence_hash": {"type": "null"}
+        }
+      }
+    }
+  ]
+}

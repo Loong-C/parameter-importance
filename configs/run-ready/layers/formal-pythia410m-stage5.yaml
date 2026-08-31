@@ -1,0 +1,13 @@
+# 叠加在 formal-pythia160m-stage4.yaml 之后，只改变 Stage 5/410M 身份。
+identity:
+  stage: 5
+  task: stage5.formal_pretraining
+runtime:
+  output_root: runs/formal/stage5-pythia410m
+  cache_root: cache/formal/stage5-pythia410m
+  temp_root: runs/formal/stage5-pythia410m/tmp
+model:
+  asset_id: pythia-410m
+  revision: FILL_MODEL_REVISION
+  initialization_id: FILL_BASE_INITIALIZATION_HASH
+  architecture: pythia-410m

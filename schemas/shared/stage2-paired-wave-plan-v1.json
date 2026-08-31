@@ -1,0 +1,43 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://parameter-importance.invalid/schemas/shared/stage2-paired-wave-plan-v1.json",
+  "title": "Stage 2 paired wave immutable root plan",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "wave_id", "reference_hash", "registry_hash", "provider_state_digest", "execution_evidence_hash", "weighting_assumptions", "mappings", "artifact_hash"],
+  "properties": {
+    "schema_version": {"const": "stage2-paired-wave-plan-v1"},
+    "wave_id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,159}$"},
+    "reference_hash": {"$ref": "#/$defs/hash"},
+    "registry_hash": {"$ref": "#/$defs/hash"},
+    "provider_state_digest": {"$ref": "#/$defs/hash"},
+    "execution_evidence_hash": {"$ref": "#/$defs/hash"},
+    "weighting_assumptions": {"$ref": "#/$defs/weighting"},
+    "mappings": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/mapping"}},
+    "artifact_hash": {"$ref": "#/$defs/hash"}
+  },
+  "$defs": {
+    "hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "mapping": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["unit_id", "mapping_hash"],
+      "properties": {
+        "unit_id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,159}$"},
+        "mapping_hash": {"$ref": "#/$defs/hash"}
+      }
+    },
+    "weighting": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["statistical_unit", "weight_unit", "sampling_design", "weights_exogenous", "common_mean_assumption"],
+      "properties": {
+        "statistical_unit": {"type": "string", "minLength": 1},
+        "weight_unit": {"type": "string", "minLength": 1},
+        "sampling_design": {"type": "string", "minLength": 1},
+        "weights_exogenous": {"type": "boolean"},
+        "common_mean_assumption": {"type": "boolean"}
+      }
+    }
+  }
+}

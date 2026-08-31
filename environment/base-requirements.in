@@ -1,0 +1,6 @@
+# Platform-neutral Stage 0 runtime dependencies.
+#
+# This file is an input declaration.  Exact transitive versions belong in a
+# platform-specific lock generated according to environment/LOCKING.md.
+numpy==2.5.1
+pyyaml==6.0.3

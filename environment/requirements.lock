@@ -1,3 +1,11 @@
+# lock-schema: stage0-linux-cp312-x86_64-v1
+# generated-at: 2026-07-13
+# target: CPython 3.12 / cp312 / Linux x86_64
+# platform-tags: manylinux_2_28_x86_64, manylinux_2_17_x86_64, manylinux2014_x86_64
+# resolver: pip 25.0.1 base report plus explicit Linux PyTorch/CUDA metadata completion
+# generator: scripts/lock_from_pip_report.py at repository commits 96ec8bf and fd6b69c
+# base-resolution-report-sha256: 9464bc33d531b15c58492bd5e8510071ff159bc461b076b4a8b2915005f123e3
+# source-indexes: PyPI, PyTorch cu126, NVIDIA PyPI
 --extra-index-url https://download.pytorch.org/whl/cu126
 --extra-index-url https://pypi.nvidia.com
 absl-py==2.5.0

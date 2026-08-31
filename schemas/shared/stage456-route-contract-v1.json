@@ -1,0 +1,24 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://parameter-importance.invalid/schemas/shared/stage456-route-contract-v1.json",
+  "title": "Stage 4 route contract validation payload",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version", "route_spec", "route_source_hash", "checks",
+    "estimator_decision_audit", "quadrature_decision_audit",
+    "local_validation_status", "gate_status", "artifact_role", "data"
+  ],
+  "properties": {
+    "schema_version": {"const": "stage456-route-contract-v1"},
+    "route_spec": {"type": "object"},
+    "route_source_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "checks": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"type": "string"}},
+    "estimator_decision_audit": {"type": "object"},
+    "quadrature_decision_audit": {"type": "object"},
+    "local_validation_status": {"enum": ["PASS", "FAIL", "SKIPPED", "NOT_RUN"]},
+    "gate_status": {"enum": ["PASS", "CONDITIONALLY_ACCEPTED", "FAIL", "BLOCKED", "STALE", "NOT_RUN"]},
+    "artifact_role": {"type": "string", "pattern": "^[a-z][a-z0-9_]*$"},
+    "data": {"type": "object"}
+  }
+}

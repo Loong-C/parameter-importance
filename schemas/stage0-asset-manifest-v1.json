@@ -1,0 +1,327 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://parameter-importance.invalid/schemas/stage0-asset-manifest-v1.json",
+  "title": "Stage 0 immutable asset manifest",
+  "description": "Canonical UTF-8 JSON without a BOM. Python validation additionally enforces canonical identity, history continuity, revision specificity, and temporary-path rejection.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "asset_id",
+    "asset_type",
+    "state",
+    "name",
+    "source",
+    "revision",
+    "files",
+    "state_history",
+    "created_at",
+    "generator_version",
+    "metadata"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "stage0-asset-manifest-v1"
+    },
+    "asset_id": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "asset_type": {
+      "enum": ["model", "tokenizer", "dataset", "source"]
+    },
+    "state": {
+      "enum": ["downloading", "downloaded", "verified", "ready", "invalid"]
+    },
+    "name": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256
+    },
+    "source": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 512,
+      "description": "Stable source identifier only; signed or query URLs are forbidden."
+    },
+    "revision": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 512,
+      "not": {
+        "enum": [
+          "unknown",
+          "latest",
+          "main",
+          "master",
+          "head",
+          "default",
+          "current",
+          "none",
+          "null",
+          "unspecified",
+          "na",
+          "n/a"
+        ]
+      },
+      "description": "Pinned immutable commit, digest, version, or snapshot identifier. Generic values are rejected case-insensitively by Python validation."
+    },
+    "files": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "$ref": "#/$defs/file"
+      }
+    },
+    "state_history": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "$ref": "#/$defs/stateTransition"
+      }
+    },
+    "created_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "generator_version": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256
+    },
+    "metadata": {
+      "type": "object"
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {"asset_type": {"const": "model"}},
+        "required": ["asset_type"]
+      },
+      "then": {
+        "properties": {"metadata": {"$ref": "#/$defs/modelMetadata"}}
+      }
+    },
+    {
+      "if": {
+        "properties": {"asset_type": {"const": "tokenizer"}},
+        "required": ["asset_type"]
+      },
+      "then": {
+        "properties": {"metadata": {"$ref": "#/$defs/tokenizerMetadata"}}
+      }
+    },
+    {
+      "if": {
+        "properties": {"asset_type": {"const": "dataset"}},
+        "required": ["asset_type"]
+      },
+      "then": {
+        "properties": {"metadata": {"$ref": "#/$defs/datasetMetadata"}}
+      }
+    },
+    {
+      "if": {
+        "properties": {"asset_type": {"const": "source"}},
+        "required": ["asset_type"]
+      },
+      "then": {
+        "properties": {"metadata": {"$ref": "#/$defs/sourceMetadata"}}
+      }
+    }
+  ],
+  "$defs": {
+    "file": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "size_bytes", "sha256"],
+      "properties": {
+        "path": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 4096,
+          "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.(?:/|$))(?!.*\\\\).+$",
+          "description": "Normalized relative POSIX final-object path. .part, .lock, tmp and temp components are rejected by Python validation."
+        },
+        "size_bytes": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "role": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        }
+      }
+    },
+    "stateTransition": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "from",
+        "to",
+        "at",
+        "actor",
+        "actor_role",
+        "evidence_ref",
+        "summary"
+      ],
+      "properties": {
+        "from": {
+          "oneOf": [
+            {"type": "null"},
+            {"enum": ["downloading", "downloaded", "verified", "ready", "invalid"]}
+          ]
+        },
+        "to": {
+          "enum": ["downloading", "downloaded", "verified", "ready", "invalid"]
+        },
+        "at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "actor": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "actor_role": {
+          "enum": ["fetcher", "verifier", "gate"]
+        },
+        "evidence_ref": {
+          "oneOf": [
+            {"type": "null"},
+            {"type": "string", "minLength": 1, "maxLength": 4096}
+          ]
+        },
+        "summary": {
+          "type": "string"
+        }
+      },
+      "oneOf": [
+        {
+          "properties": {
+            "from": {"type": "null"},
+            "to": {"const": "downloading"},
+            "actor_role": {"const": "fetcher"}
+          }
+        },
+        {
+          "properties": {
+            "from": {"const": "downloading"},
+            "to": {"const": "downloaded"},
+            "actor_role": {"const": "fetcher"}
+          }
+        },
+        {
+          "properties": {
+            "from": {"const": "downloaded"},
+            "to": {"const": "verified"},
+            "actor_role": {"const": "verifier"}
+          }
+        },
+        {
+          "properties": {
+            "from": {"const": "downloaded"},
+            "to": {"const": "invalid"},
+            "actor_role": {"const": "verifier"}
+          }
+        },
+        {
+          "properties": {
+            "from": {"const": "verified"},
+            "to": {"const": "invalid"},
+            "actor_role": {"const": "verifier"}
+          }
+        },
+        {
+          "properties": {
+            "from": {"const": "verified"},
+            "to": {"const": "ready"},
+            "actor_role": {"const": "gate"}
+          }
+        },
+        {
+          "properties": {
+            "from": {"const": "ready"},
+            "to": {"const": "invalid"},
+            "actor_role": {"const": "gate"}
+          }
+        }
+      ],
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "to": {"enum": ["verified", "ready", "invalid"]}
+            },
+            "required": ["to"]
+          },
+          "then": {
+            "properties": {
+              "evidence_ref": {"type": "string", "minLength": 1}
+            }
+          }
+        }
+      ]
+    },
+    "modelMetadata": {
+      "type": "object",
+      "required": ["architecture", "parameter_count", "dtype", "initialization_id"],
+      "properties": {
+        "architecture": {"type": "string", "minLength": 1, "maxLength": 256},
+        "parameter_count": {"type": "integer", "minimum": 1},
+        "dtype": {"type": "string", "minLength": 1, "maxLength": 128},
+        "initialization_id": {"type": "string", "minLength": 1, "maxLength": 512}
+      }
+    },
+    "tokenizerMetadata": {
+      "type": "object",
+      "required": ["tokenizer_class", "vocab_size", "special_tokens", "normalization"],
+      "properties": {
+        "tokenizer_class": {"type": "string", "minLength": 1, "maxLength": 256},
+        "vocab_size": {"type": "integer", "minimum": 1},
+        "special_tokens": {"type": "object"},
+        "normalization": {"type": "string", "minLength": 1, "maxLength": 256}
+      }
+    },
+    "datasetMetadata": {
+      "type": "object",
+      "required": ["splits", "preprocessing_version"],
+      "properties": {
+        "splits": {
+          "type": "object",
+          "minProperties": 1,
+          "additionalProperties": {"$ref": "#/$defs/datasetSplit"}
+        },
+        "preprocessing_version": {"type": "string", "minLength": 1, "maxLength": 256}
+      }
+    },
+    "datasetSplit": {
+      "type": "object",
+      "required": ["sample_count", "fields"],
+      "properties": {
+        "sample_count": {"type": "integer", "minimum": 0},
+        "fields": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {"type": "string", "minLength": 1, "maxLength": 128}
+        }
+      }
+    },
+    "sourceMetadata": {
+      "type": "object",
+      "required": ["source_kind", "license"],
+      "properties": {
+        "source_kind": {"type": "string", "minLength": 1, "maxLength": 128},
+        "license": {"type": "string", "minLength": 1, "maxLength": 256}
+      }
+    }
+  }
+}

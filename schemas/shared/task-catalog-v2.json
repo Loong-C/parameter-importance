@@ -1,0 +1,18 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://parameter-importance.invalid/schemas/shared/task-catalog-v2.json",
+  "title": "Hash-bound canonical Stage 0-9 task contract catalog",
+  "description": "Each task freezes config schema, artifact dependency DAG, output envelope and payload schemas, replay/completion/failure rules, and isolated local-fixture eligibility.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "tasks", "catalog_hash"],
+  "properties": {
+    "schema_version": {"const": "task-catalog-v2"},
+    "tasks": {
+      "type": "array",
+      "minItems": 1,
+      "items": {"$ref": "task-definition-v2.json"}
+    },
+    "catalog_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+  }
+}

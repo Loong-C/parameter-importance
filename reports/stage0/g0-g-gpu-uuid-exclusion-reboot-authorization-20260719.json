@@ -1,0 +1,50 @@
+{
+  "schema_version": "stage0.gpu-uuid-exclusion-reboot-authorization.v1",
+  "request_id": "g0-g-admin-recovery-20260719",
+  "recorded_at": "2026-07-19T20:31:00+08:00",
+  "project_owner_authorization": {
+    "statement_summary": "All members were consulted and are inactive; the project owner authorized any operation needed to repair the GPU path and requested prompt completion.",
+    "interpreted_scope": [
+      "install a persistent NVIDIA GPU UUID exclusion configuration",
+      "rebuild initramfs",
+      "gracefully terminate the single verified resumable curl transfer immediately before reboot while preserving its .part and .meta files",
+      "perform one controlled node reboot",
+      "verify the exact four-GPU runtime after reboot"
+    ],
+    "password_handling": "The host account owner enters the sudo password directly into a visible remote TTY; the password is not read or recorded by Codex."
+  },
+  "reason_for_reboot_path": {
+    "failed_run": "/var/lib/parameter-importance/stage0/g0-g-path-b/admin-20260719T121157Z.MtJwlbzw",
+    "kernel_event": "NVRM reported a non-zero usage count while removing 0000:50:00.0.",
+    "stuck_operation": "The NVIDIA sysfs unbind callback did not return after its driver symlink disappeared; one SIGINT remained pending and no safe in-band resume was possible.",
+    "prohibited_recovery_actions": [
+      "SIGKILL of the stuck root process",
+      "parallel PCI unbind",
+      "manual rebind of the two faulting GPUs",
+      "live NVIDIA driver reload"
+    ]
+  },
+  "persistent_exclusion": {
+    "module_parameter": "NVreg_ExcludedGpus",
+    "driver_version_at_authorization": "575.57.08",
+    "excluded_uuids": [
+      "GPU-6ff7389b-eaf8-aefd-b2c6-1611be41fa5d",
+      "GPU-dc6cfc60-41dd-7bcf-ed09-b7deb5be342c",
+      "GPU-180ff767-885a-7dc9-c8a9-921d65a01bbd",
+      "GPU-d0ce0b43-7e46-6bca-b078-5aa7043928d7"
+    ],
+    "allowed_uuids": [
+      "GPU-5c672d04-4f83-3cc0-80d0-0108b1b63267",
+      "GPU-e78c55cd-db97-b761-f559-dc6eae3be81d",
+      "GPU-9b2b2a3b-3547-187f-ca29-2c02624e2e4f",
+      "GPU-5a81500d-5e9c-b0d7-5607-fdfdaab65ff4"
+    ]
+  },
+  "known_reboot_impact": {
+    "resumable_download": "/home/sophgo13/cjl/storage/parameter-importance/datasets/pile-deduped-pythia-preshuffled/document-00009-of-00020.bin.part",
+    "status": "The partial file is preserved, but its signed URL cannot be safely recovered; resumption requires a refreshed URL after reboot.",
+    "formal_stage4_or_stage5_artifacts_in_scope": false
+  },
+  "secrets_included": false,
+  "internal_server_information_included_with_project_owner_approval": true
+}

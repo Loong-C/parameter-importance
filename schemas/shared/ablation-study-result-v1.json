@@ -1,0 +1,20 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://parameter-importance.invalid/schemas/shared/ablation-study-result-v1.json",
+  "title": "Stage 8 reduced ablation study result",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "matrix_id", "matrix_hash", "baseline_result_hash", "cell_result_hashes", "rows", "scope", "formal_eligible", "artifact_hash"],
+  "properties": {
+    "schema_version": {"const": "ablation-study-result-v1"},
+    "matrix_id": {"type": "string", "minLength": 1},
+    "matrix_hash": {"$ref": "#/$defs/hash"},
+    "baseline_result_hash": {"$ref": "#/$defs/hash"},
+    "cell_result_hashes": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/hash"}},
+    "rows": {"type": "array", "minItems": 1, "items": {"type": "object"}},
+    "scope": {"enum": ["local_fixture", "formal"]},
+    "formal_eligible": {"type": "boolean"},
+    "artifact_hash": {"$ref": "#/$defs/hash"}
+  },
+  "$defs": {"hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"}}
+}

@@ -1,0 +1,177 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://parameter-importance.invalid/schemas/shared/task-definition-v2.json",
+  "title": "Canonical Stage 0-9 task definition",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version", "task_id", "stage", "title", "plan_ref", "runner_kind",
+    "config_schema_ref", "config_paths", "predecessor_task_ids", "input_artifacts",
+    "artifact_kinds", "output_artifacts", "recovery", "replay_policy",
+    "completion_rules", "failure_rules", "local_fixture", "formal_eligibility"
+  ],
+  "properties": {
+    "schema_version": {"const": "task-definition-v2"},
+    "task_id": {"$ref": "#/$defs/taskId"},
+    "stage": {"type": "integer", "minimum": 0, "maximum": 9},
+    "title": {"type": "string", "minLength": 1},
+    "plan_ref": {"type": "string", "minLength": 1},
+    "runner_kind": {
+      "enum": [
+        "audit", "storage", "environment", "asset", "contract", "training",
+        "distributed_training", "observability", "checkpoint", "capacity",
+        "test_matrix", "delivery", "registry", "oracle", "validation",
+        "estimator", "reference", "estimator_experiment", "pilot", "statistics",
+        "reporting", "path_integration", "route_training", "pruning", "ablation",
+        "analysis"
+      ]
+    },
+    "config_schema_ref": {"$ref": "#/$defs/schemaRef"},
+    "config_paths": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {"type": "string", "pattern": "^[a-z][a-z0-9_]*(?:\\.[a-z][a-z0-9_]*)*$"}
+    },
+    "predecessor_task_ids": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {"$ref": "#/$defs/taskId"}
+    },
+    "input_artifacts": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/inputArtifact"}
+    },
+    "artifact_kinds": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {"$ref": "#/$defs/name"}
+    },
+    "output_artifacts": {
+      "type": "array",
+      "minItems": 1,
+      "items": {"$ref": "#/$defs/outputArtifact"}
+    },
+    "recovery": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["mode", "safe_boundary"],
+      "properties": {
+        "mode": {
+          "enum": [
+            "restart_idempotent", "resume_checkpoint", "resume_shards",
+            "reconcile_state", "rebuild_derived", "manual_external"
+          ]
+        },
+        "safe_boundary": {
+          "enum": [
+            "none", "immutable_publish", "attempt_commit_state", "shard_commit",
+            "checkpoint_commit", "canonical_source"
+          ]
+        }
+      }
+    },
+    "replay_policy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "strategy", "requires_same_config_hash", "requires_same_input_hashes",
+        "existing_output_policy"
+      ],
+      "properties": {
+        "strategy": {
+          "enum": [
+            "restart_from_config", "resume_from_commit", "reconcile_committed_state",
+            "rebuild_from_frozen_sources", "manual_external_review"
+          ]
+        },
+        "requires_same_config_hash": {"const": true},
+        "requires_same_input_hashes": {"type": "boolean"},
+        "existing_output_policy": {"const": "reuse_identical_reject_drift"}
+      }
+    },
+    "completion_rules": {"$ref": "#/$defs/rules"},
+    "failure_rules": {"$ref": "#/$defs/rules"},
+    "local_fixture": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "supported", "artifact_formal_eligible", "may_satisfy_formal_gate",
+        "gate_status_on_success"
+      ],
+      "properties": {
+        "supported": {"type": "boolean"},
+        "artifact_formal_eligible": {"const": false},
+        "may_satisfy_formal_gate": {"const": false},
+        "gate_status_on_success": {"const": "NOT_RUN"}
+      }
+    },
+    "formal_eligibility": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "supported", "required_contract_stages", "required_gate_ids",
+        "required_capabilities", "requires_estimator_decision"
+      ],
+      "properties": {
+        "supported": {"type": "boolean"},
+        "required_contract_stages": {
+          "type": "array", "uniqueItems": true,
+          "items": {"type": "integer", "minimum": 0, "maximum": 9}
+        },
+        "required_gate_ids": {
+          "type": "array", "uniqueItems": true,
+          "items": {"type": "string", "pattern": "^stage[0-9]\\.G[0-9]+(?:[.-][A-Za-z0-9]+)*$"}
+        },
+        "required_capabilities": {
+          "type": "array", "uniqueItems": true,
+          "items": {"$ref": "#/$defs/name"}
+        },
+        "requires_estimator_decision": {"type": "boolean"}
+      }
+    }
+  },
+  "$defs": {
+    "name": {"type": "string", "pattern": "^[a-z][a-z0-9_]*$"},
+    "taskId": {"type": "string", "pattern": "^stage[0-9]\\.[a-z0-9][a-z0-9_.-]*$"},
+    "schemaRef": {
+      "type": "string",
+      "pattern": "^https://parameter-importance\\.invalid/schemas/[a-z0-9_./-]+\\.json$"
+    },
+    "rules": {
+      "type": "array", "minItems": 1, "uniqueItems": true,
+      "items": {"$ref": "#/$defs/name"}
+    },
+    "inputArtifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "input_id", "schema_ref", "required", "producer_task_ids", "artifact_kinds"
+      ],
+      "properties": {
+        "input_id": {"$ref": "#/$defs/name"},
+        "schema_ref": {"$ref": "#/$defs/schemaRef"},
+        "required": {"type": "boolean"},
+        "producer_task_ids": {
+          "type": "array", "minItems": 1, "uniqueItems": true,
+          "items": {"$ref": "#/$defs/taskId"}
+        },
+        "artifact_kinds": {
+          "type": "array", "minItems": 1, "uniqueItems": true,
+          "items": {"$ref": "#/$defs/name"}
+        }
+      }
+    },
+    "outputArtifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["artifact_kind", "schema_ref", "payload_schema_ref"],
+      "properties": {
+        "artifact_kind": {"$ref": "#/$defs/name"},
+        "schema_ref": {"$ref": "#/$defs/schemaRef"},
+        "payload_schema_ref": {"$ref": "#/$defs/schemaRef"}
+      }
+    }
+  }
+}

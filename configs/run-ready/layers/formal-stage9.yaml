@@ -1,0 +1,9 @@
+# 叠加在 formal-pythia160m-stage4.yaml 之后；只消费 hash-bound 上游产物。
+identity:
+  stage: 9
+  task: stage9.ingest
+  route: analysis
+runtime:
+  output_root: runs/formal/stage9
+  cache_root: cache/formal/stage9
+  temp_root: runs/formal/stage9/tmp

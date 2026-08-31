@@ -1,0 +1,19 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://parameter-importance.invalid/schemas/shared/stage456-route-matrix-task-v1.json",
+  "title": "Stage 6 route matrix task payload",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version", "artifact_role", "route_matrix", "data",
+    "local_validation_status", "gate_status"
+  ],
+  "properties": {
+    "schema_version": {"const": "stage456-route-matrix-task-v1"},
+    "artifact_role": {"type": "string", "pattern": "^[a-z][a-z0-9_]*$"},
+    "route_matrix": {"type": "object"},
+    "data": {},
+    "local_validation_status": {"enum": ["PASS", "FAIL", "SKIPPED", "NOT_RUN"]},
+    "gate_status": {"enum": ["PASS", "CONDITIONALLY_ACCEPTED", "FAIL", "BLOCKED", "STALE", "NOT_RUN"]}
+  }
+}

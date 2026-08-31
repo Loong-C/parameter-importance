@@ -1,0 +1,33 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://parameter-importance.invalid/schemas/shared/analysis-composite-figure-artifact-v1.json",
+  "title": "Stage 9 rendered composite figure artifact",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "source_table_hash", "source_content_hash", "producer_source_hash", "spec_hash", "renderer_id", "files", "render_options", "artifact_hash"],
+  "properties": {
+    "schema_version": {"const": "analysis-composite-figure-artifact-v1"},
+    "source_table_hash": {"$ref": "#/$defs/hash"},
+    "source_content_hash": {"$ref": "#/$defs/hash"},
+    "producer_source_hash": {"$ref": "#/$defs/hash"},
+    "spec_hash": {"$ref": "#/$defs/hash"},
+    "renderer_id": {"type": "string", "minLength": 1},
+    "files": {
+      "type": "array",
+      "minItems": 3,
+      "maxItems": 3,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["kind", "content_sha256"],
+        "properties": {
+          "kind": {"enum": ["heatmap", "errorbar", "facet"]},
+          "content_sha256": {"$ref": "#/$defs/hash"}
+        }
+      }
+    },
+    "render_options": {"type": "object"},
+    "artifact_hash": {"$ref": "#/$defs/hash"}
+  },
+  "$defs": {"hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"}}
+}

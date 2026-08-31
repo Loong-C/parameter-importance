@@ -1,0 +1,9 @@
+# 叠加在 formal-pythia160m-stage4.yaml 之后；只改变 Stage 7 身份与落盘域。
+identity:
+  stage: 7
+  task: stage7.matrix
+  route: pruning-study
+runtime:
+  output_root: runs/formal/stage7
+  cache_root: cache/formal/stage7
+  temp_root: runs/formal/stage7/tmp

@@ -1,0 +1,16 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://parameter-importance.invalid/schemas/shared/analysis-table-artifact-v1.json",
+  "title": "Deterministic rendered analysis table",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "spec", "contents", "content_hashes", "artifact_hash"],
+  "properties": {
+    "schema_version": {"const": "analysis-table-artifact-v1"},
+    "spec": {"$ref": "analysis-table-spec-v1.json"},
+    "contents": {"type": "object", "minProperties": 1, "additionalProperties": {"type": "string"}},
+    "content_hashes": {"type": "object", "minProperties": 1, "additionalProperties": {"$ref": "#/$defs/hash"}},
+    "artifact_hash": {"$ref": "#/$defs/hash"}
+  },
+  "$defs": {"hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"}}
+}

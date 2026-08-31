@@ -1,0 +1,256 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://parameter-importance.invalid/schemas/shared/resolved-config-v2.json",
+  "title": "Task-executable resolved configuration v2",
+  "description": "Python validation additionally binds task_id to the catalog, runner/recovery/artifact fields to the task definition, and recomputes semantic/full hashes.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version", "task_id", "base_config", "execution", "training",
+    "scheduler", "data_loader", "providers", "evaluation", "profiling",
+    "checkpoint_schedule", "precision_runtime", "optimizer_runtime", "launcher",
+    "orchestration", "recovery", "artifacts", "config_hash", "full_hash"
+  ],
+  "properties": {
+    "schema_version": {"const": "resolved-config-v2"},
+    "task_id": {"type": "string", "pattern": "^stage[0-9]\\.[a-z0-9][a-z0-9_.-]*$"},
+    "base_config": {"$ref": "resolved-config-v1.json"},
+    "execution": {"$ref": "#/$defs/execution"},
+    "training": {"$ref": "#/$defs/training"},
+    "scheduler": {"$ref": "#/$defs/scheduler"},
+    "data_loader": {"$ref": "#/$defs/dataLoader"},
+    "providers": {"$ref": "#/$defs/providers"},
+    "evaluation": {"$ref": "#/$defs/evaluation"},
+    "profiling": {"$ref": "#/$defs/profiling"},
+    "checkpoint_schedule": {"$ref": "#/$defs/checkpointSchedule"},
+    "precision_runtime": {"$ref": "#/$defs/precisionRuntime"},
+    "optimizer_runtime": {"$ref": "#/$defs/optimizerRuntime"},
+    "launcher": {"$ref": "#/$defs/launcher"},
+    "orchestration": {"$ref": "#/$defs/orchestration"},
+    "recovery": {"$ref": "#/$defs/recovery"},
+    "artifacts": {"$ref": "#/$defs/artifacts"},
+    "config_hash": {"$ref": "#/$defs/digest"},
+    "full_hash": {"$ref": "#/$defs/digest"}
+  },
+  "$defs": {
+    "positiveInt": {"type": "integer", "minimum": 1},
+    "nonNegativeInt": {"type": "integer", "minimum": 0},
+    "optionalPositiveInt": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/positiveInt"}]},
+    "logicalRef": {"type": "string", "minLength": 1, "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.(?:/|$))(?!.*\\\\).+$"},
+    "optionalLogicalRef": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/logicalRef"}]},
+    "digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "runnerKind": {
+      "enum": [
+        "audit", "storage", "environment", "asset", "contract", "training",
+        "distributed_training", "observability", "checkpoint", "capacity",
+        "test_matrix", "delivery", "registry", "oracle", "validation",
+        "estimator", "reference", "estimator_experiment", "pilot", "statistics",
+        "reporting", "path_integration", "route_training", "pruning", "ablation",
+        "analysis"
+      ]
+    },
+    "execution": {
+      "type": "object", "additionalProperties": false,
+      "required": ["runner_kind", "timeout_seconds", "max_attempts", "dry_run", "fail_on_blocked"],
+      "properties": {
+        "runner_kind": {"$ref": "#/$defs/runnerKind"},
+        "timeout_seconds": {"$ref": "#/$defs/positiveInt"},
+        "max_attempts": {"$ref": "#/$defs/positiveInt"},
+        "dry_run": {"type": "boolean"},
+        "fail_on_blocked": {"type": "boolean"}
+      }
+    },
+    "training": {
+      "type": "object", "additionalProperties": false,
+      "required": ["max_steps", "max_epochs", "validation_every_steps", "gradient_clip_max_norm", "deterministic_algorithms"],
+      "properties": {
+        "max_steps": {"$ref": "#/$defs/optionalPositiveInt"},
+        "max_epochs": {"$ref": "#/$defs/optionalPositiveInt"},
+        "validation_every_steps": {"$ref": "#/$defs/optionalPositiveInt"},
+        "gradient_clip_max_norm": {"oneOf": [{"type": "null"}, {"type": "number", "exclusiveMinimum": 0}]},
+        "deterministic_algorithms": {"type": "boolean"}
+      }
+    },
+    "scheduler": {
+      "type": "object", "additionalProperties": false,
+      "required": ["kind", "warmup_steps", "total_steps"],
+      "properties": {
+        "kind": {"enum": ["none", "constant", "linear", "cosine"]},
+        "warmup_steps": {"$ref": "#/$defs/nonNegativeInt"},
+        "total_steps": {"$ref": "#/$defs/optionalPositiveInt"}
+      }
+    },
+    "dataLoader": {
+      "type": "object", "additionalProperties": false,
+      "required": ["num_workers", "prefetch_factor", "persistent_workers", "drop_last", "cursor_policy"],
+      "properties": {
+        "num_workers": {"$ref": "#/$defs/nonNegativeInt"},
+        "prefetch_factor": {"$ref": "#/$defs/optionalPositiveInt"},
+        "persistent_workers": {"type": "boolean"},
+        "drop_last": {"type": "boolean"},
+        "cursor_policy": {"enum": ["attempt_commit_state", "draw_manifest", "checkpoint_commit"]}
+      }
+    },
+    "providers": {
+      "type": "object", "additionalProperties": false,
+      "required": [
+        "kind", "model_manifest_ref", "model_root_ref", "data_manifest_ref",
+        "data_root_ref", "tokenizer_manifest_ref", "tokenizer_root_ref", "task_type",
+        "task_name", "num_labels", "local_files_only", "trust_remote_code"
+      ],
+      "properties": {
+        "kind": {"enum": ["tiny", "offline_hf"]},
+        "model_manifest_ref": {"$ref": "#/$defs/optionalLogicalRef"},
+        "model_root_ref": {"$ref": "#/$defs/optionalLogicalRef"},
+        "data_manifest_ref": {"$ref": "#/$defs/optionalLogicalRef"},
+        "data_root_ref": {"$ref": "#/$defs/optionalLogicalRef"},
+        "tokenizer_manifest_ref": {"$ref": "#/$defs/optionalLogicalRef"},
+        "tokenizer_root_ref": {"$ref": "#/$defs/optionalLogicalRef"},
+        "task_type": {"enum": ["causal_lm", "sequence_classification", "synthetic"]},
+        "task_name": {"enum": ["fixture", "pile", "sst2", "mnli", "rte"]},
+        "num_labels": {"oneOf": [{"type": "null"}, {"type": "integer", "minimum": 2}]},
+        "local_files_only": {"const": true},
+        "trust_remote_code": {"const": false}
+      }
+    },
+    "evaluation": {
+      "type": "object", "additionalProperties": false,
+      "required": ["enabled", "split", "every_steps", "batch_size", "max_batches", "metrics", "save_predictions"],
+      "properties": {
+        "enabled": {"type": "boolean"},
+        "split": {"oneOf": [{"type": "null"}, {"type": "string", "minLength": 1}]},
+        "every_steps": {"$ref": "#/$defs/optionalPositiveInt"},
+        "batch_size": {"$ref": "#/$defs/optionalPositiveInt"},
+        "max_batches": {"$ref": "#/$defs/optionalPositiveInt"},
+        "metrics": {
+          "type": "array", "uniqueItems": true,
+          "items": {"enum": ["loss", "perplexity", "accuracy", "f1", "matthews_correlation", "mnli_matched_accuracy", "mnli_mismatched_accuracy", "damage_auc"]}
+        },
+        "save_predictions": {"type": "boolean"}
+      }
+    },
+    "profiling": {
+      "type": "object", "additionalProperties": false,
+      "required": ["enabled", "warmup_steps", "measure_steps", "repetitions", "capture_memory", "capture_throughput", "capture_communication", "synchronize_device"],
+      "properties": {
+        "enabled": {"type": "boolean"},
+        "warmup_steps": {"$ref": "#/$defs/nonNegativeInt"},
+        "measure_steps": {"$ref": "#/$defs/optionalPositiveInt"},
+        "repetitions": {"$ref": "#/$defs/positiveInt"},
+        "capture_memory": {"type": "boolean"},
+        "capture_throughput": {"type": "boolean"},
+        "capture_communication": {"type": "boolean"},
+        "synchronize_device": {"type": "boolean"}
+      }
+    },
+    "checkpointSegment": {
+      "type": "object", "additionalProperties": false,
+      "required": ["start_step", "end_step", "every_steps"],
+      "properties": {
+        "start_step": {"$ref": "#/$defs/nonNegativeInt"},
+        "end_step": {"$ref": "#/$defs/optionalPositiveInt"},
+        "every_steps": {"$ref": "#/$defs/positiveInt"}
+      }
+    },
+    "checkpointSchedule": {
+      "type": "object", "additionalProperties": false,
+      "required": ["segments", "save_on_phase_end", "save_optimizer", "save_rng", "save_data_state"],
+      "properties": {
+        "segments": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/checkpointSegment"}},
+        "save_on_phase_end": {"type": "boolean"},
+        "save_optimizer": {"type": "boolean"},
+        "save_rng": {"type": "boolean"},
+        "save_data_state": {"type": "boolean"}
+      }
+    },
+    "precisionRuntime": {
+      "type": "object", "additionalProperties": false,
+      "required": ["autocast_enabled", "autocast_dtype", "grad_scaler_enabled", "initial_scale", "growth_factor", "backoff_factor", "growth_interval", "global_found_inf_reduce"],
+      "properties": {
+        "autocast_enabled": {"type": "boolean"},
+        "autocast_dtype": {"enum": ["float32", "bfloat16", "float16"]},
+        "grad_scaler_enabled": {"type": "boolean"},
+        "initial_scale": {"type": "number", "exclusiveMinimum": 0},
+        "growth_factor": {"type": "number", "exclusiveMinimum": 1},
+        "backoff_factor": {"type": "number", "exclusiveMinimum": 0, "exclusiveMaximum": 1},
+        "growth_interval": {"$ref": "#/$defs/positiveInt"},
+        "global_found_inf_reduce": {"type": "boolean"}
+      }
+    },
+    "optimizerRuntime": {
+      "type": "object", "additionalProperties": false,
+      "required": ["betas", "eps", "amsgrad", "dampening", "nesterov", "maximize", "capturable", "differentiable"],
+      "properties": {
+        "betas": {
+          "oneOf": [
+            {"type": "null"},
+            {"type": "array", "minItems": 2, "maxItems": 2, "items": {"type": "number", "minimum": 0, "exclusiveMaximum": 1}}
+          ]
+        },
+        "eps": {"oneOf": [{"type": "null"}, {"type": "number", "exclusiveMinimum": 0}]},
+        "amsgrad": {"type": "boolean"},
+        "dampening": {"type": "number", "minimum": 0},
+        "nesterov": {"type": "boolean"},
+        "maximize": {"type": "boolean"},
+        "capturable": {"type": "boolean"},
+        "differentiable": {"type": "boolean"}
+      }
+    },
+    "launcher": {
+      "type": "object", "additionalProperties": false,
+      "required": ["kind", "backend", "world_size", "init_method", "init_ref", "rendezvous_id", "max_restarts"],
+      "properties": {
+        "kind": {"enum": ["local", "torchrun"]},
+        "backend": {"enum": ["local", "gloo", "nccl"]},
+        "world_size": {"$ref": "#/$defs/positiveInt"},
+        "init_method": {"enum": ["local", "env", "file"]},
+        "init_ref": {"$ref": "#/$defs/optionalLogicalRef"},
+        "rendezvous_id": {"oneOf": [{"type": "null"}, {"type": "string", "minLength": 1}]},
+        "max_restarts": {"$ref": "#/$defs/nonNegativeInt"}
+      }
+    },
+    "pairedDesign": {
+      "type": "object", "additionalProperties": false,
+      "required": ["enabled", "design", "mapping_ref", "budget_unit"],
+      "properties": {
+        "enabled": {"type": "boolean"},
+        "design": {"enum": ["none", "shared_draws", "independent_halves", "matched_seeds"]},
+        "mapping_ref": {"$ref": "#/$defs/optionalLogicalRef"},
+        "budget_unit": {"enum": ["samples", "tokens", "gradient_evaluations", "wall_clock"]}
+      }
+    },
+    "orchestration": {
+      "type": "object", "additionalProperties": false,
+      "required": ["route_spec_ref", "quadrature_decision_ref", "matrix_ref", "paired_design", "input_result_refs"],
+      "properties": {
+        "route_spec_ref": {"$ref": "#/$defs/optionalLogicalRef"},
+        "quadrature_decision_ref": {"$ref": "#/$defs/optionalLogicalRef"},
+        "matrix_ref": {"$ref": "#/$defs/optionalLogicalRef"},
+        "paired_design": {"$ref": "#/$defs/pairedDesign"},
+        "input_result_refs": {"type": "array", "uniqueItems": true, "items": {"$ref": "#/$defs/logicalRef"}}
+      }
+    },
+    "recovery": {
+      "type": "object", "additionalProperties": false,
+      "required": ["mode", "resume_ref", "max_restarts", "safe_boundary"],
+      "properties": {
+        "mode": {"enum": ["restart_idempotent", "resume_checkpoint", "resume_shards", "reconcile_state", "rebuild_derived", "manual_external"]},
+        "resume_ref": {"$ref": "#/$defs/optionalLogicalRef"},
+        "max_restarts": {"$ref": "#/$defs/nonNegativeInt"},
+        "safe_boundary": {"enum": ["none", "immutable_publish", "attempt_commit_state", "shard_commit", "checkpoint_commit", "canonical_source"]}
+      }
+    },
+    "artifacts": {
+      "type": "object", "additionalProperties": false,
+      "required": ["output_dir", "required_kinds", "publish_partial"],
+      "properties": {
+        "output_dir": {"type": "string", "minLength": 1, "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.(?:/|$))(?!.*\\\\).+$"},
+        "required_kinds": {
+          "type": "array", "minItems": 1, "uniqueItems": true,
+          "items": {"type": "string", "pattern": "^[a-z][a-z0-9_]*$"}
+        },
+        "publish_partial": {"type": "boolean"}
+      }
+    }
+  }
+}

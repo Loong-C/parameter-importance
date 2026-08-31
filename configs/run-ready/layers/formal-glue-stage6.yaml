@@ -1,0 +1,37 @@
+# 叠加在 formal-pythia160m-stage4.yaml 后，冻结 Stage 6 路线比较共同语义。
+identity:
+  stage: 6
+  task: stage6.training_route_comparison
+  route: route_comparison
+runtime:
+  output_root: runs/formal/stage6-glue
+  cache_root: cache/formal/stage6-glue
+  temp_root: runs/formal/stage6-glue/tmp
+model:
+  asset_id: pythia-160m-sequence-classification
+  revision: FILL_MODEL_REVISION
+  tokenizer_asset_id: pythia-tokenizer
+  initialization_id: FILL_SHARED_BASE_INITIALIZATION_HASH
+  architecture: pythia-160m-sequence-classification
+data:
+  asset_id: glue-pretokenized
+  revision: FILL_DATA_REVISION
+  split: train
+  sequence_length: 512
+  sampler: distributed-shuffle
+  statistical_unit: sample
+  weight_unit: sample
+  sampling_design: without_replacement_frozen_epoch
+  weights_exogenous: true
+  common_mean_assumption: true
+loss:
+  task_type: sequence_classification
+  reduction: mean
+  ignore_index: -100
+  weighting: sample
+pruning:
+  enabled: false
+  strategy: none
+  scope: global
+  ratios: []
+  random_repetitions: 0

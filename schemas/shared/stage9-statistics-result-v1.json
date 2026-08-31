@@ -1,0 +1,14 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://parameter-importance.invalid/schemas/shared/stage9-statistics-result-v1.json",
+  "title": "Stage 9 grouped and paired Holm statistics result",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "grouped_statistics", "paired_statistics_holm", "source_artifact_hash"],
+  "properties": {
+    "schema_version": {"const": "stage9-statistics-result-v1"},
+    "grouped_statistics": {"type": "object"},
+    "paired_statistics_holm": {"type": "object"},
+    "source_artifact_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+  }
+}

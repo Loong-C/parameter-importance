@@ -1,0 +1,42 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://parameter-importance.invalid/schemas/shared/stage2-estimator-recommendation-v1.json",
+  "title": "Stage 2 estimator recommendation candidate",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "recommendation_id", "status", "selected_estimator", "batch_size", "microbatch_count", "repetitions", "required_cells", "qualified_estimators", "thresholds", "scope", "formal_eligible", "qualification_gate_hash", "execution_evidence_hash", "reasons", "artifact_hash"],
+  "properties": {
+    "schema_version": {"const": "stage2-estimator-recommendation-v1"},
+    "recommendation_id": {"$ref": "#/$defs/id"},
+    "status": {"enum": ["FIXTURE_RECOMMENDATION", "FORMAL_CANDIDATE", "BLOCKED"]},
+    "selected_estimator": {"enum": [null, "u", "weighted_u", "double"]},
+    "batch_size": {"oneOf": [{"type": "null"}, {"type": "integer", "minimum": 1}]},
+    "microbatch_count": {"oneOf": [{"type": "null"}, {"type": "integer", "minimum": 2}]},
+    "repetitions": {"oneOf": [{"type": "null"}, {"type": "integer", "minimum": 1}]},
+    "required_cells": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"$ref": "#/$defs/id"}},
+    "qualified_estimators": {"type": "array", "uniqueItems": true, "items": {"enum": ["u", "weighted_u", "double"]}},
+    "thresholds": {"$ref": "#/$defs/thresholds"},
+    "scope": {"enum": ["local_fixture", "formal"]},
+    "formal_eligible": {"const": false},
+    "qualification_gate_hash": {"type": "null"},
+    "execution_evidence_hash": {"$ref": "#/$defs/hash"},
+    "reasons": {"type": "array", "items": {"type": "string", "minLength": 1}},
+    "artifact_hash": {"$ref": "#/$defs/hash"}
+  },
+  "$defs": {
+    "id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,159}$"},
+    "hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "thresholds": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["bias_margin", "max_corrected_nmse_ratio", "min_spearman", "min_topk_overlap", "max_online_cost_ratio"],
+      "properties": {
+        "bias_margin": {"type": "number", "minimum": 0},
+        "max_corrected_nmse_ratio": {"type": "number", "exclusiveMinimum": 0},
+        "min_spearman": {"type": "number", "minimum": -1, "maximum": 1},
+        "min_topk_overlap": {"type": "number", "minimum": 0, "maximum": 1},
+        "max_online_cost_ratio": {"type": "number", "exclusiveMinimum": 0}
+      }
+    }
+  }
+}

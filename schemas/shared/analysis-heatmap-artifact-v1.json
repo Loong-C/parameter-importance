@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://parameter-importance.invalid/schemas/shared/analysis-heatmap-artifact-v1.json",
+  "title": "Rendered deterministic heatmap artifact",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "spec", "renderer_id", "content_sha256", "render_options", "artifact_hash"],
+  "properties": {
+    "schema_version": {"const": "analysis-heatmap-artifact-v1"},
+    "spec": {"$ref": "analysis-heatmap-spec-v1.json"},
+    "renderer_id": {"type": "string", "minLength": 1},
+    "content_sha256": {"$ref": "#/$defs/hash"},
+    "render_options": {"type": "object"},
+    "artifact_hash": {"$ref": "#/$defs/hash"}
+  },
+  "$defs": {"hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"}}
+}

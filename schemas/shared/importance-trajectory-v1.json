@@ -1,0 +1,27 @@
+{
+  "$id": "https://parameter-importance.invalid/schemas/shared/importance-trajectory-v1.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "artifact_hash": {"pattern": "^[0-9a-f]{64}$", "type": "string"},
+    "estimator_decision_hash": {"anyOf": [{"pattern": "^[0-9a-f]{64}$", "type": "string"}, {"type": "null"}]},
+    "points": {
+      "items": {
+        "additionalProperties": false,
+        "properties": {
+          "checkpoint_id": {"minLength": 1, "type": "string"},
+          "global_step": {"minimum": 1, "type": "integer"},
+          "snapshot": {"type": "object"}
+        },
+        "required": ["global_step", "checkpoint_id", "snapshot"],
+        "type": "object"
+      },
+      "type": "array"
+    },
+    "registry_hash": {"pattern": "^[0-9a-f]{64}$", "type": "string"},
+    "schema_version": {"const": "importance-trajectory-v1"}
+  },
+  "required": ["schema_version", "registry_hash", "estimator_decision_hash", "points", "artifact_hash"],
+  "title": "Importance Trajectory v1",
+  "type": "object"
+}

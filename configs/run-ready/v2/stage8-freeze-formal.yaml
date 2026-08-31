@@ -1,0 +1,4 @@
+orchestration:
+  # 由 artifact build 生成 hash；无需人工计算 artifact_hash。
+  matrix_ref: manifests/ablation/stage8-declaration.json
+artifacts: {output_dir: runs/formal/stage8/freeze}

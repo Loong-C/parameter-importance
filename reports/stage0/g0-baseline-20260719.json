@@ -1,0 +1,112 @@
+{
+  "schema_version": "stage0.gate-report.v1",
+  "generated_at": "2026-07-19T10:12:22+08:00",
+  "gate": "G0",
+  "status": "BLOCKED",
+  "subgates": {
+    "G0-C": {
+      "status": "PASS",
+      "evidence": {
+        "ssh_batch_mode": {
+          "lab_pc": "PASS",
+          "server": "PASS"
+        },
+        "repository_baseline": {
+          "local_base_head": "34966d0819a5229569169bfe436afe9058c0ed24",
+          "github_main_head": "34966d0819a5229569169bfe436afe9058c0ed24",
+          "server_main_head": "34966d0819a5229569169bfe436afe9058c0ed24",
+          "server_worktree": "clean",
+          "execution_branch": "feat/stage0-infrastructure",
+          "local_user_changes_preserved": true
+        },
+        "authorized_roots": {
+          "repository": "/home/sophgo13/cjl/parameter-importance",
+          "data_root": "/home/sophgo13/cjl/storage/parameter-importance",
+          "read_write": true
+        },
+        "agent_documents": {
+          "file_count_each_side": 5,
+          "synchronized_at": "2026-07-19T10:04:00+08:00",
+          "sha256": {
+            "git.md": "183f4ba702d22a3a97a459d4873aed62377d51b666d2515990a2f408ecd856ca",
+            "remote_access.md": "795c677e717827492a30342e5b91a4b5959f0df22c72354f14a506ecb023f7a1",
+            "server.md": "9f2d4370ac64990cd29d33ef13de5c20cca65efb4655e928118ae4f3ca012c68",
+            "sync.md": "1bf84f8379018b918eb1680c49dacb7d6d75d764c306782f5170212ceb190015",
+            "worklogs.md": "4a61b34b02a7070b5d3321b349d13016548615a0f3ce069901d18049072a10da"
+          }
+        }
+      }
+    },
+    "G0-G": {
+      "status": "BLOCKED",
+      "reason": "Project scope is reduced to four GPUs, but path B still requires an administrator-enforced PCI/UUID allowlist and excluded-device disposition",
+      "project_scope_decision": {
+        "recorded_at": "2026-07-19T11:35:31+08:00",
+        "requested_gpu_count": 4,
+        "requested_remediation_path": "B",
+        "status": "PROJECT_OWNER_APPROVED_ADMIN_PENDING",
+        "default_exclusions": [
+          "0000:4f:00.0",
+          "0000:50:00.0"
+        ],
+        "interpretation": "The project may proceed on four administrator-approved healthy GPUs; the two unresolved devices remain excluded defects and are not treated as repaired or ignored."
+      },
+      "evidence": {
+        "driver_version": "575.57.08",
+        "pci_gpu_count": 8,
+        "driver_proc_gpu_count": 8,
+        "nvml_gpu_count": 7,
+        "pytorch_gpu_count": 7,
+        "missing_pci_device": "0000:4f:00.0",
+        "affected_visible_pci_device": "0000:50:00.0",
+        "volatile_uncorrectable_ecc": 24,
+        "aggregate_uncorrectable_ecc": 24,
+        "row_remap_pending": true,
+        "xid": 95,
+        "recovery_action_reported_by_driver": "Reset",
+        "gpu_queries_stopped": true
+      },
+      "required_resolution": [
+        "Administrator issues a stable four-GPU PCI/UUID allowlist and enforces it through the authoritative allocation layer",
+        "Administrator records exclusion and disposition for 0000:4f:00.0 and 0000:50:00.0",
+        "NVML and PyTorch enumerate the approved allowlist with identical mappings; unexplained 8/7 remains unacceptable",
+        "The selected four-GPU set is rechecked before any CUDA or NCCL test"
+      ]
+    }
+  },
+  "system_snapshot": {
+    "hostname": "sophgo13",
+    "os": "Ubuntu 24.04.3 LTS",
+    "kernel": "6.8.0-134-generic",
+    "glibc": "2.39",
+    "logical_cpus": 128,
+    "memory_gib_approx": 1024,
+    "root_filesystem": {
+      "type": "ext4",
+      "size_gib": 98,
+      "available_gib": 15,
+      "inode_use_percent": 6
+    },
+    "project_storage": {
+      "type": "ext4",
+      "size_tib": 3.5,
+      "available_tib": 2.9,
+      "inode_use_percent": 1
+    },
+    "limits": {
+      "nofile_soft": 1024,
+      "nofile_hard": 1048576,
+      "stack_soft_kib": 8192,
+      "stack_hard": "unlimited"
+    },
+    "runtime_versions": {
+      "python": "3.12.3",
+      "pytorch": "2.12.1+cu126",
+      "pytorch_cuda_runtime": "12.6",
+      "system_cuda_toolkit": "12.9",
+      "cudnn": "9.10.2"
+    }
+  },
+  "historical_ready_reused": false,
+  "secrets_included": false
+}

@@ -1,0 +1,47 @@
+{
+  "$id": "https://parameter-importance.invalid/schemas/shared/training-route-source-v1.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$defs": {
+    "phase": {
+      "additionalProperties": false,
+      "properties": {
+        "base_initialization_id": {"minLength": 1, "type": "string"},
+        "checkpoint_frequency_steps": {"minimum": 1, "type": "integer"},
+        "dataset_asset_id": {"minLength": 1, "type": "string"},
+        "importance_enabled": {"type": "boolean"},
+        "input_checkpoint_id": {"type": ["string", "null"]},
+        "metadata": {"type": "object"},
+        "model_asset_id": {"minLength": 1, "type": "string"},
+        "output_checkpoint_id": {"minLength": 1, "type": "string"},
+        "parent_phase_id": {"type": ["string", "null"]},
+        "phase_id": {"minLength": 1, "type": "string"},
+        "phase_type": {
+          "enum": ["pretrain", "direct_supervised", "finetune"]
+        },
+        "task_id": {"type": ["string", "null"]}
+      },
+      "required": [
+        "phase_id", "phase_type", "base_initialization_id", "model_asset_id",
+        "dataset_asset_id", "output_checkpoint_id", "checkpoint_frequency_steps",
+        "parent_phase_id", "input_checkpoint_id", "task_id", "importance_enabled",
+        "metadata"
+      ],
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "properties": {
+    "metadata": {"type": "object"},
+    "phases": {
+      "items": {"$ref": "#/$defs/phase"},
+      "minItems": 1,
+      "type": "array"
+    },
+    "route_id": {"minLength": 1, "type": "string"},
+    "run_intent": {"enum": ["local_fixture", "formal"]},
+    "schema_version": {"const": "training-route-source-v1"}
+  },
+  "required": ["schema_version", "route_id", "run_intent", "phases", "metadata"],
+  "title": "Training Route Source v1",
+  "type": "object"
+}

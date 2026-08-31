@@ -1,0 +1,65 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://parameter-importance.invalid/schemas/shared/stage3-endpoint-capture-v1.json",
+  "title": "Stage 3 replay-verified endpoint capture",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "record", "execution_evidence_hash", "scope", "formal_eligible", "qualification_gate_hash", "artifact_hash"],
+  "properties": {
+    "schema_version": {"const": "stage3-endpoint-capture-v1"},
+    "record": {"$ref": "#/$defs/record"},
+    "execution_evidence_hash": {"$ref": "#/$defs/hash"},
+    "scope": {"enum": ["local_fixture", "formal"]},
+    "formal_eligible": {"type": "boolean"},
+    "qualification_gate_hash": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/hash"}]},
+    "artifact_hash": {"$ref": "#/$defs/hash"}
+  },
+  "allOf": [
+    {
+      "if": {"properties": {"formal_eligible": {"const": true}}, "required": ["formal_eligible"]},
+      "then": {"properties": {"scope": {"const": "formal"}, "qualification_gate_hash": {"$ref": "#/$defs/hash"}}},
+      "else": {"properties": {"qualification_gate_hash": {"type": "null"}}}
+    }
+  ],
+  "$defs": {
+    "hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "state": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["artifact_id", "artifact_hash", "parameter_hash", "buffer_hash", "optimizer_hash", "scheduler_hash", "scaler_hash", "rng_hash", "data_cursor_hash", "model_mode_hash"],
+      "properties": {
+        "artifact_id": {"type": "string", "minLength": 1},
+        "artifact_hash": {"$ref": "#/$defs/hash"},
+        "parameter_hash": {"$ref": "#/$defs/hash"},
+        "buffer_hash": {"$ref": "#/$defs/hash"},
+        "optimizer_hash": {"$ref": "#/$defs/hash"},
+        "scheduler_hash": {"$ref": "#/$defs/hash"},
+        "scaler_hash": {"$ref": "#/$defs/hash"},
+        "rng_hash": {"$ref": "#/$defs/hash"},
+        "data_cursor_hash": {"$ref": "#/$defs/hash"},
+        "model_mode_hash": {"$ref": "#/$defs/hash"}
+      }
+    },
+    "record": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path_state_id", "source_run_id", "optimizer_step", "parameter_registry_hash", "pre_state", "parameter_post_state", "attempt_commit_state", "attempt_commit_parent_hash", "probe_buffer_snapshot_hash", "full_update_delta_hash", "update_sample_ids", "replay_verified", "metadata", "endpoint_digest"],
+      "properties": {
+        "path_state_id": {"type": "string", "minLength": 1},
+        "source_run_id": {"type": "string", "minLength": 1},
+        "optimizer_step": {"type": "integer", "minimum": 0},
+        "parameter_registry_hash": {"$ref": "#/$defs/hash"},
+        "pre_state": {"$ref": "#/$defs/state"},
+        "parameter_post_state": {"$ref": "#/$defs/state"},
+        "attempt_commit_state": {"$ref": "#/$defs/state"},
+        "attempt_commit_parent_hash": {"$ref": "#/$defs/hash"},
+        "probe_buffer_snapshot_hash": {"$ref": "#/$defs/hash"},
+        "full_update_delta_hash": {"$ref": "#/$defs/hash"},
+        "update_sample_ids": {"type": "array", "minItems": 1, "items": {"oneOf": [{"type": "string"}, {"type": "integer"}]}},
+        "replay_verified": {"const": true},
+        "metadata": {"type": "object"},
+        "endpoint_digest": {"$ref": "#/$defs/hash"}
+      }
+    }
+  }
+}

@@ -1,0 +1,307 @@
+{
+  "schema_version": "stage0.gpu-admin-request.v1",
+  "request_id": "g0-g-admin-request-20260719",
+  "generated_at": "2026-07-19T10:52:21+08:00",
+  "request_status": "OPEN",
+  "project_scope_decision": {
+    "recorded_at": "2026-07-19T11:35:31+08:00",
+    "requested_gpu_count": 4,
+    "selected_path": "B",
+    "project_owner_status": "APPROVED",
+    "administrator_status": "PENDING",
+    "default_exclusions_until_individually_cleared": [
+      "0000:4f:00.0",
+      "0000:50:00.0"
+    ],
+    "meaning": "Four healthy GPUs are sufficient for project scope. This does not waive the unexplained 8/7 mapping, admit either affected device, or authorize reset/reload/reboot actions."
+  },
+  "severity": "CRITICAL_BLOCKER",
+  "gate": {
+    "id": "G0-G",
+    "status": "BLOCKED",
+    "reason": "Physical/driver, NVML, and PyTorch enumeration are inconsistent, and a visible device has active ECC, row-remap, and Xid failures."
+  },
+  "scope": {
+    "authorized_actor": "server_or_infrastructure_administrator",
+    "project_agent_role": "preserve evidence and perform post-clearance read-only verification only",
+    "gpu_workloads_suspended": true,
+    "source_evidence": [
+      "reports/stage0/g0-baseline-20260719.json",
+      "reports/stage0/g0-baseline-20260719.md"
+    ]
+  },
+  "observed_state": {
+    "observation_date": "2026-07-19",
+    "gpu_model": "NVIDIA A100-SXM4-80GB",
+    "driver_version": "575.57.08",
+    "enumeration": {
+      "pci_count": 8,
+      "driver_proc_count": 8,
+      "nvml_count": 7,
+      "pytorch_count": 7,
+      "missing_pci_device": "0000:4f:00.0",
+      "consistent": false
+    },
+    "affected_visible_device": {
+      "pci_device": "0000:50:00.0",
+      "current_nvml_index": 0,
+      "volatile_uncorrectable_ecc": 24,
+      "aggregate_uncorrectable_ecc": 24,
+      "row_remap_pending": true,
+      "row_remap_failure": false,
+      "xid_code": 95,
+      "xid_component": "FBHUB",
+      "driver_recovery_action": "Reset",
+      "safe_for_project_use": false
+    },
+    "compute_process_count_at_snapshot": 0,
+    "new_xid_observed_during_read_only_health_query": true,
+    "additional_project_gpu_queries_suspended": true,
+    "pci_sysfs_read_only_diagnostics": {
+      "gpu_management_or_compute_runtime_invoked": false,
+      "state_changing_action_performed": false,
+      "devices": {
+        "0000:4f:00.0": {
+          "sysfs_present": true,
+          "enabled": 1,
+          "driver_binding": "nvidia",
+          "driver_module": "nvidia",
+          "current_link_speed": "16.0 GT/s PCIe",
+          "current_link_width": 16,
+          "max_link_speed": "16.0 GT/s PCIe",
+          "max_link_width": 16,
+          "power_control": "auto",
+          "power_runtime_status": "active",
+          "runtime_suspended_time": 0,
+          "reset_methods_reported": [
+            "flr",
+            "bus"
+          ],
+          "reset_performed": false,
+          "endpoint_aer_totals": {
+            "correctable": 0,
+            "nonfatal": 0,
+            "fatal": 0
+          },
+          "root_port_aer_totals": "not_exposed_at_endpoint_sysfs",
+          "kernel_record": {
+            "rm_init_adapter_failed": true,
+            "error_signature": "0x62:0x40:1941",
+            "device_minor": 0,
+            "repeated": true
+          }
+        },
+        "0000:50:00.0": {
+          "sysfs_present": true,
+          "enabled": 1,
+          "driver_binding": "nvidia",
+          "driver_module": "nvidia",
+          "current_link_speed": "16.0 GT/s PCIe",
+          "current_link_width": 16,
+          "max_link_speed": "16.0 GT/s PCIe",
+          "max_link_width": 16,
+          "power_control": "auto",
+          "power_runtime_status": "active",
+          "runtime_suspended_time": 0,
+          "reset_methods_reported": [
+            "flr",
+            "bus"
+          ],
+          "reset_performed": false,
+          "endpoint_aer_totals": {
+            "correctable": 0,
+            "nonfatal": 0,
+            "fatal": 0
+          },
+          "root_port_aer_totals": "not_exposed_at_endpoint_sysfs",
+          "kernel_record": {
+            "xid_code": 95,
+            "component": "FBHUB",
+            "uncontained": true,
+            "reset_recommended": true
+          }
+        }
+      },
+      "interpretation": [
+        "Both devices have a present, enabled, full-width PCIe Gen4 link and are bound to the NVIDIA driver.",
+        "The missing runtime device fails NVIDIA RM initialization despite the live PCIe link and driver binding.",
+        "Zero endpoint AER totals do not negate GPU-internal ECC, Xid, or RM initialization failures.",
+        "The upstream root-port AER view, BMC telemetry, and vendor hardware diagnostics remain administrator tasks."
+      ]
+    },
+    "historical_ready_valid": false
+  },
+  "impact_control": {
+    "node_gpu_training_blocked": true,
+    "devices_treated_as_unapproved_until_resolution": [
+      "0000:4f:00.0",
+      "0000:50:00.0"
+    ],
+    "administrator_actions": [
+      "Drain affected workloads and establish a maintenance window before state-changing diagnostics or recovery.",
+      "Prevent new allocations of unresolved devices through the scheduler or authoritative allocation process.",
+      "Preserve pre-change PCI mapping, ECC, row-remap, Xid, AER, BMC, and recovery-action evidence.",
+      "Record change owner, ticket/reference, maintenance timestamps, rollback plan, and final device disposition.",
+      "Stop repeated probing if a health query produces another Xid or device disappearance."
+    ],
+    "project_actions": [
+      "Do not run CUDA, NCCL, DDP, memory, performance, or training workloads.",
+      "Do not use numeric GPU indices to mask the enumeration mismatch.",
+      "Wait for explicit administrator clearance before any further device query."
+    ]
+  },
+  "administrator_diagnostic_request": [
+    {
+      "id": "D1",
+      "target": "node_inventory",
+      "required_result": "A preserved pre-change PCI/device-minor/UUID/NVML mapping and relevant kernel, AER, BMC, and platform health evidence."
+    },
+    {
+      "id": "D2",
+      "target": "0000:4f:00.0",
+      "required_result": "A root-cause classification for repeated NVIDIA RmInitAdapter failure 0x62:0x40:1941 despite an enabled full-width PCIe link and driver binding, plus a restore-or-exclude disposition."
+    },
+    {
+      "id": "D3",
+      "target": "0000:50:00.0",
+      "required_result": "A vendor/runbook-backed disposition for uncorrectable ECC, pending row remap, Xid 95, and the driver Reset recommendation."
+    },
+    {
+      "id": "D4",
+      "target": "enumeration_contract",
+      "required_result": "Selection of remediation path A (full 8/8/8) or path B (approved stable isolation with an exact PCI/UUID allowlist)."
+    },
+    {
+      "id": "D5",
+      "target": "upstream_platform_health",
+      "required_result": "An administrator review of upstream root-port AER, BMC/platform telemetry, and vendor hardware diagnostics because endpoint AER counters are zero and root-port totals are not exposed at the endpoint."
+    }
+  ],
+  "remediation_paths": {
+    "A": {
+      "name": "restore_full_eight_gpu_inventory",
+      "required_outcomes": [
+        "PCI, driver, NVML, and PyTorch enumerate the same eight expected devices.",
+        "PCI and UUID mappings are one-to-one with no silent index shift.",
+        "Every expected device has zero volatile uncorrectable ECC, no row-remap pending/failure, and no active recovery action.",
+        "Every device with nonzero aggregate uncorrectable ECC has an explicit administrator disposition before inclusion.",
+        "A recorded observation window has no new ECC, Xid, AER, or device disappearance.",
+        "A healthy four-GPU candidate set is identified by PCI and UUID."
+      ],
+      "minimum_observation": {
+        "duration_minutes": 15,
+        "snapshots": 2,
+        "note": "Use a longer interval when required by the hardware vendor or site runbook."
+      }
+    },
+    "B": {
+      "name": "administrator_approved_stable_isolation",
+      "required_outcomes": [
+        "The expected device count and exact PCI/UUID allowlist are documented.",
+        "Every excluded device has a reason, isolation mechanism, owner, and final disposition.",
+        "The scheduler or authoritative allocation layer enforces the exclusion; process-local numeric indexing is insufficient.",
+        "NVML and PyTorch enumerate exactly the approved allowlist with identical mappings.",
+        "The approved set contains a four-GPU candidate set meeting the same health criteria as path A.",
+        "The approval records scope, effective time, expiry/review conditions, and invalidation triggers."
+      ],
+      "default_exclusions_until_individually_cleared": [
+        "0000:4f:00.0",
+        "0000:50:00.0"
+      ],
+      "unexplained_8_7_is_acceptable": false
+    }
+  },
+  "post_remediation_revalidation": {
+    "must_wait_for_administrator_clearance": true,
+    "identity_and_versions": [
+      "administrator_change_reference",
+      "verification_start_and_end",
+      "os",
+      "kernel",
+      "nvidia_driver",
+      "system_cuda_toolkit",
+      "python",
+      "pytorch",
+      "pytorch_cuda_runtime"
+    ],
+    "enumeration_layers": [
+      "pci",
+      "driver_proc",
+      "nvml",
+      "pytorch"
+    ],
+    "per_device_fields": [
+      "pci_address",
+      "uuid",
+      "model",
+      "memory_total",
+      "ecc_corrected_volatile",
+      "ecc_corrected_aggregate",
+      "ecc_uncorrected_volatile",
+      "ecc_uncorrected_aggregate",
+      "retired_pages_when_supported",
+      "row_remap_correctable",
+      "row_remap_uncorrectable",
+      "row_remap_pending",
+      "row_remap_failure",
+      "recovery_action",
+      "temperature",
+      "memory_used",
+      "utilization",
+      "mig_mode",
+      "compute_process_count"
+    ],
+    "observation_fields": [
+      "xid_delta",
+      "ecc_delta",
+      "aer_delta",
+      "device_disappearance",
+      "query_triggered_errors"
+    ],
+    "candidate_four_gpu_identity": "pci_and_uuid_required",
+    "g0_g_pass_requires": "All selected path outcomes and post-remediation checks pass with no unresolved health or mapping failure.",
+    "downstream_evidence_invalidation": "Kernel, driver, topology, UUID, or hardware changes make affected G2/G5/G6/G8 GPU evidence stale."
+  },
+  "explicit_prohibitions_for_project_agent_and_scripts": [
+    "gpu_reset",
+    "pci_unbind_or_rebind",
+    "driver_reload",
+    "node_reboot",
+    "ecc_counter_clear",
+    "sudo_or_system_configuration_change",
+    "device_permission_change",
+    "mig_or_persistence_mode_change",
+    "power_or_clock_change",
+    "termination_of_unknown_or_other_user_processes",
+    "repeated_query_of_faulting_device_before_clearance",
+    "cuda_tensor_or_dcgm_stress_test",
+    "nccl_or_ddp_test",
+    "memory_or_performance_test",
+    "training",
+    "masking_the_mismatch_with_numeric_gpu_indices",
+    "reuse_of_historical_ready_evidence"
+  ],
+  "administrator_response_required": {
+    "response_status": null,
+    "selected_path": null,
+    "administrator_role_or_team": null,
+    "change_or_ticket_reference": null,
+    "maintenance_started_at": null,
+    "maintenance_completed_at": null,
+    "root_cause_missing_device": null,
+    "disposition_missing_device": null,
+    "root_cause_ecc_xid_device": null,
+    "disposition_ecc_xid_device": null,
+    "expected_device_count": null,
+    "allowed_devices": [],
+    "excluded_devices": [],
+    "isolation_enforcement": null,
+    "approval_effective_at": null,
+    "approval_expires_or_review_at": null,
+    "invalidation_conditions": [],
+    "post_remediation_evidence_references": [],
+    "administrator_conclusion": null
+  },
+  "secrets_included": false,
+  "connection_details_included": false
+}

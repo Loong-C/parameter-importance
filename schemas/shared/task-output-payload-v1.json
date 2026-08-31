@@ -1,0 +1,15 @@
+{
+  "$id": "https://parameter-importance.invalid/schemas/shared/task-output-payload-v1.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": true,
+  "properties": {
+    "schema_version": {
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$",
+      "type": "string"
+    }
+  },
+  "required": ["schema_version"],
+  "title": "Canonical Task Output Payload v1",
+  "type": "object"
+}

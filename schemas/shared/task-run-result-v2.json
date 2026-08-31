@@ -1,0 +1,79 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://parameter-importance.invalid/schemas/shared/task-run-result-v2.json",
+  "title": "Hash-bound task execution result",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version", "task_id", "stage", "runner_kind", "run_intent", "status",
+    "config_hash", "formal_eligible", "artifact_refs", "checkpoint_ref", "blockers",
+    "error_code", "message", "recovery_mode", "metadata", "result_hash"
+  ],
+  "properties": {
+    "schema_version": {"const": "task-run-result-v2"},
+    "task_id": {"type": "string", "pattern": "^stage[0-9]\\.[a-z0-9][a-z0-9_.-]*$"},
+    "stage": {"type": "integer", "minimum": 0, "maximum": 9},
+    "runner_kind": {
+      "enum": [
+        "audit", "storage", "environment", "asset", "contract", "training",
+        "distributed_training", "observability", "checkpoint", "capacity",
+        "test_matrix", "delivery", "registry", "oracle", "validation",
+        "estimator", "reference", "estimator_experiment", "pilot", "statistics",
+        "reporting", "path_integration", "route_training", "pruning", "ablation",
+        "analysis"
+      ]
+    },
+    "run_intent": {"enum": ["local_fixture", "formal"]},
+    "status": {"enum": ["PASS", "FAIL", "BLOCKED", "SKIPPED"]},
+    "config_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "formal_eligible": {"type": "boolean"},
+    "artifact_refs": {
+      "type": "object",
+      "propertyNames": {"pattern": "^[a-z][a-z0-9_]*$"},
+      "additionalProperties": {"$ref": "#/$defs/logicalRef"}
+    },
+    "checkpoint_ref": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/logicalRef"}]},
+    "blockers": {"type": "array", "items": {"$ref": "#/$defs/blocker"}},
+    "error_code": {"oneOf": [{"type": "null"}, {"type": "string", "minLength": 1}]},
+    "message": {"type": "string", "minLength": 1},
+    "recovery_mode": {"enum": ["restart_idempotent", "resume_checkpoint", "resume_shards", "reconcile_state", "rebuild_derived", "manual_external"]},
+    "metadata": {"type": "object"},
+    "result_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+  },
+  "$defs": {
+    "logicalRef": {"type": "string", "minLength": 1, "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.(?:/|$))(?!.*\\\\).+$"},
+    "blocker": {
+      "type": "object", "additionalProperties": false,
+      "required": ["code", "requirement", "message", "retryable", "evidence_refs"],
+      "properties": {
+        "code": {
+          "enum": [
+            "runner_unavailable", "server_unreachable", "dependency_unavailable",
+            "asset_unavailable", "device_unavailable", "gate_not_ready",
+            "contract_unfrozen", "estimator_decision_unavailable",
+            "capability_unavailable", "formal_not_supported", "formal_dry_run",
+            "external_approval_required"
+          ]
+        },
+        "requirement": {"type": "string", "minLength": 1},
+        "message": {"type": "string", "minLength": 1},
+        "retryable": {"type": "boolean"},
+        "evidence_refs": {"type": "array", "uniqueItems": true, "items": {"$ref": "#/$defs/logicalRef"}}
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": {"properties": {"status": {"const": "BLOCKED"}}, "required": ["status"]},
+      "then": {"properties": {"blockers": {"minItems": 1}, "error_code": {"type": "null"}, "formal_eligible": {"const": false}}}
+    },
+    {
+      "if": {"properties": {"status": {"const": "FAIL"}}, "required": ["status"]},
+      "then": {"properties": {"blockers": {"maxItems": 0}, "error_code": {"type": "string", "minLength": 1}, "formal_eligible": {"const": false}}}
+    },
+    {
+      "if": {"properties": {"formal_eligible": {"const": true}}, "required": ["formal_eligible"]},
+      "then": {"properties": {"status": {"const": "PASS"}, "run_intent": {"const": "formal"}}}
+    }
+  ]
+}

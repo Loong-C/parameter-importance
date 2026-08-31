@@ -1,0 +1,45 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://parameter-importance.invalid/schemas/shared/stage3-reference-refinement-v1.json",
+  "title": "Stage 3 cross-family reference refinement result",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "unit_id", "converged", "convergence_defined", "status", "primary_family", "selected_level", "selected_rule_hash", "conservative_error", "within_family_errors", "cross_family_error", "completed_levels", "reference_contribution_hash", "scope", "formal_eligible", "qualification_gate_hash", "execution_evidence_hash", "reasons", "artifact_hash"],
+  "properties": {
+    "schema_version": {"const": "stage3-reference-refinement-v1"},
+    "unit_id": {"$ref": "#/$defs/id"},
+    "converged": {"type": "boolean"},
+    "convergence_defined": {"type": "boolean"},
+    "status": {"enum": ["FIXTURE_CONVERGED", "FORMAL_CANDIDATE", "REFERENCE_UNRESOLVED"]},
+    "primary_family": {"$ref": "#/$defs/id"},
+    "selected_level": {"oneOf": [{"type": "null"}, {"type": "integer", "minimum": 0}]},
+    "selected_rule_hash": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/hash"}]},
+    "conservative_error": {"oneOf": [{"type": "null"}, {"type": "number", "minimum": 0}]},
+    "within_family_errors": {"type": "object", "additionalProperties": {"type": "number", "minimum": 0}},
+    "cross_family_error": {"oneOf": [{"type": "null"}, {"type": "number", "minimum": 0}]},
+    "completed_levels": {"type": "array", "items": {"$ref": "#/$defs/level"}},
+    "reference_contribution_hash": {"$ref": "#/$defs/hash"},
+    "scope": {"enum": ["local_fixture", "formal"]},
+    "formal_eligible": {"const": false},
+    "qualification_gate_hash": {"type": "null"},
+    "execution_evidence_hash": {"$ref": "#/$defs/hash"},
+    "reasons": {"type": "array", "items": {"type": "string", "minLength": 1}},
+    "artifact_hash": {"$ref": "#/$defs/hash"}
+  },
+  "$defs": {
+    "id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,159}$"},
+    "hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "level": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["family", "level", "unique_nodes", "rule_hash", "contribution_hash"],
+      "properties": {
+        "family": {"$ref": "#/$defs/id"},
+        "level": {"type": "integer", "minimum": 0},
+        "unique_nodes": {"type": "integer", "minimum": 1},
+        "rule_hash": {"$ref": "#/$defs/hash"},
+        "contribution_hash": {"$ref": "#/$defs/hash"}
+      }
+    }
+  }
+}

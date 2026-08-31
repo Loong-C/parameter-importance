@@ -1,0 +1,106 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://parameter-importance.invalid/schemas/shared/stage2-formal-experiment-plan-source-v1.json",
+  "title": "Stage 2 formal experiment plan source",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version", "plan_id", "task_id", "wave_id", "cell_id", "stream",
+    "batch_size", "microbatch_counts", "repetitions", "selection_basis",
+    "pilot_thresholds"
+  ],
+  "properties": {
+    "schema_version": {"const": "stage2-formal-experiment-plan-source-v1"},
+    "plan_id": {"$ref": "#/$defs/id"},
+    "task_id": {
+      "enum": [
+        "stage2.05_paired_estimator_runner",
+        "stage2.06_pilot_and_matrix_freeze",
+        "stage2.07_main_sweep"
+      ]
+    },
+    "wave_id": {"$ref": "#/$defs/id"},
+    "cell_id": {"$ref": "#/$defs/id"},
+    "stream": {"enum": ["pilot", "confirmatory"]},
+    "batch_size": {"enum": [32, 64, 128, 256]},
+    "microbatch_counts": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {"enum": [2, 4, 8, 16, 32]}
+    },
+    "repetitions": {"type": "integer", "minimum": 1},
+    "selection_basis": {
+      "enum": [
+        "preregistered_development",
+        "preregistered_pilot",
+        "pilot_frozen_primary"
+      ]
+    },
+    "pilot_thresholds": {
+      "oneOf": [
+        {"type": "null"},
+        {"$ref": "#/$defs/thresholds"}
+      ]
+    }
+  },
+  "$defs": {
+    "id": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,159}$"
+    },
+    "thresholds": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "bias_margin", "max_corrected_nmse_ratio", "min_spearman",
+        "min_topk_overlap", "max_online_cost_ratio"
+      ],
+      "properties": {
+        "bias_margin": {"type": "number", "minimum": 0},
+        "max_corrected_nmse_ratio": {"type": "number", "exclusiveMinimum": 0},
+        "min_spearman": {"type": "number", "minimum": -1, "maximum": 1},
+        "min_topk_overlap": {"type": "number", "minimum": 0, "maximum": 1},
+        "max_online_cost_ratio": {"type": "number", "exclusiveMinimum": 0}
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": {"properties": {"task_id": {"const": "stage2.05_paired_estimator_runner"}}},
+      "then": {
+        "properties": {
+          "stream": {"const": "pilot"},
+          "selection_basis": {"const": "preregistered_development"},
+          "pilot_thresholds": {"type": "null"}
+        }
+      }
+    },
+    {
+      "if": {"properties": {"task_id": {"const": "stage2.06_pilot_and_matrix_freeze"}}},
+      "then": {
+        "properties": {
+          "stream": {"const": "pilot"},
+          "selection_basis": {"const": "preregistered_pilot"},
+          "pilot_thresholds": {"$ref": "#/$defs/thresholds"}
+        }
+      }
+    },
+    {
+      "if": {"properties": {"task_id": {"const": "stage2.07_main_sweep"}}},
+      "then": {
+        "properties": {
+          "stream": {"const": "confirmatory"},
+          "selection_basis": {"const": "pilot_frozen_primary"},
+          "pilot_thresholds": {"type": "null"},
+          "microbatch_counts": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 1,
+            "items": {"enum": [4, 8, 16, 32]}
+          }
+        }
+      }
+    }
+  ]
+}

@@ -1,0 +1,43 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://parameter-importance.invalid/schemas/shared/stage3-node-cache-commit-v1.json",
+  "title": "Stage 3 authoritative persistent node cache batch commit",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "batch_digest", "codec_id", "entries", "object_ref", "object_manifest_hash", "artifact_hash"],
+  "properties": {
+    "schema_version": {"const": "stage3-node-cache-commit-v1"},
+    "batch_digest": {"$ref": "#/$defs/hash"},
+    "codec_id": {"type": "string", "minLength": 1},
+    "entries": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/entry"}},
+    "object_ref": {"$ref": "#/$defs/ref"},
+    "object_manifest_hash": {"$ref": "#/$defs/hash"},
+    "artifact_hash": {"$ref": "#/$defs/hash"}
+  },
+  "$defs": {
+    "hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "ref": {"type": "string", "minLength": 1, "pattern": "^(?!/)(?![A-Za-z]:)(?!.*(?:^|/)\\.\\.(?:/|$))[^\\\\]+$"},
+    "entry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["key", "key_digest", "value_digest"],
+      "properties": {
+        "key": {"$ref": "#/$defs/key"},
+        "key_digest": {"$ref": "#/$defs/hash"},
+        "value_digest": {"$ref": "#/$defs/hash"}
+      }
+    },
+    "key": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path_unit_id", "alpha_hex", "precision", "parameter_registry_hash", "loss_contract_hash"],
+      "properties": {
+        "path_unit_id": {"type": "string", "minLength": 1},
+        "alpha_hex": {"type": "string", "pattern": "^-?0x[0-9a-f]+(?:\\.[0-9a-f]+)?p[+-][0-9]+$"},
+        "precision": {"enum": ["float32", "float64"]},
+        "parameter_registry_hash": {"$ref": "#/$defs/hash"},
+        "loss_contract_hash": {"$ref": "#/$defs/hash"}
+      }
+    }
+  }
+}
