@@ -350,6 +350,11 @@ def _certificate_hit(
         if not stat.S_ISREG(certificate_stat.st_mode):
             return None
         encoded = path.read_bytes()
+        # A concurrent atomic replacement may race the read.  Requiring the
+        # same regular-file identity on both sides makes the optional cache
+        # fail closed instead of validating bytes from an entry that changed.
+        if path.lstat() != certificate_stat:
+            return None
         decoded = json.loads(encoded.decode("utf-8"))
         if not isinstance(decoded, dict) or set(decoded) != _CERTIFICATE_FIELDS:
             return None
