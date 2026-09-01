@@ -12215,35 +12215,17 @@ def _stage3_validate_recovery_receipt(
     if value.get("schema_version") != _STAGE3_RECOVERY_RECEIPT_SCHEMA:
         raise ValueError("STAGE3_RECOVERY_EXPECTED_EVIDENCE_RECEIPT_SCHEMA")
 
-    base_fields = {
+    expected_fields = {
         "schema_version", "unit_id", "formal_plan_hash", "run_config_hash",
         "execution_evidence_hash", "reference_binding_hash", "path_identity_hash",
         "sealed_receipt_ref", "sealed_receipt_hash", "evicted_receipt_ref",
         "evicted_receipt_hash", "raw_shard_ref", "raw_shard_hash",
-        "raw_shard_file_sha256", "artifact_hash",
-    }
-    quarantine_fields = {
-        "quarantine_unit_receipt_ref", "quarantine_unit_receipt_file_sha256",
+        "raw_shard_file_sha256", "quarantine_unit_receipt_ref",
+        "quarantine_unit_receipt_file_sha256",
         "quarantine_unit_receipt_artifact_hash",
-        "quarantine_node_cache_evidence_hash",
+        "quarantine_node_cache_evidence_hash", "artifact_hash",
     }
-    # Accept the concise names used by the recovery operator as an exact
-    # alternative, but never accept a partially populated or extra-field form.
-    concise_fields = {
-        "unit_receipt_ref", "unit_receipt_file_sha256",
-        "unit_receipt_artifact_hash", "node_cache_evidence_hash",
-    }
-    if set(value) == base_fields | quarantine_fields:
-        receipt_ref_key = "quarantine_unit_receipt_ref"
-        receipt_file_key = "quarantine_unit_receipt_file_sha256"
-        receipt_artifact_key = "quarantine_unit_receipt_artifact_hash"
-        evidence_key = "quarantine_node_cache_evidence_hash"
-    elif set(value) == base_fields | concise_fields:
-        receipt_ref_key = "unit_receipt_ref"
-        receipt_file_key = "unit_receipt_file_sha256"
-        receipt_artifact_key = "unit_receipt_artifact_hash"
-        evidence_key = "node_cache_evidence_hash"
-    else:
+    if set(value) != expected_fields:
         raise ValueError("STAGE3_RECOVERY_EXPECTED_EVIDENCE_RECEIPT_FIELDS")
     artifact_hash = _stage3_recovery_hash(
         value.get("artifact_hash"), field="receipt_artifact_hash"
@@ -12268,9 +12250,11 @@ def _stage3_validate_recovery_receipt(
             raise ValueError(f"STAGE3_RECOVERY_{field_name.upper()}_MISMATCH")
 
     quarantine_path, quarantine_file_sha = _stage3_recovery_ref(
-        root, value.get(receipt_ref_key), field="quarantine_unit_receipt"
+        root,
+        value.get("quarantine_unit_receipt_ref"),
+        field="quarantine_unit_receipt",
     )
-    if value.get(receipt_file_key) != quarantine_file_sha:
+    if value.get("quarantine_unit_receipt_file_sha256") != quarantine_file_sha:
         raise ValueError("STAGE3_RECOVERY_QUARANTINE_UNIT_RECEIPT_FILE_HASH_MISMATCH")
     quarantine = load_canonical_json(quarantine_path)
     if not isinstance(quarantine, Mapping):
@@ -12283,14 +12267,15 @@ def _stage3_validate_recovery_receipt(
         {key: item for key, item in quarantine.items() if key != "artifact_hash"}
     ) != quarantine_artifact_hash:
         raise ValueError("STAGE3_RECOVERY_QUARANTINE_UNIT_RECEIPT_HASH_MISMATCH")
-    if value.get(receipt_artifact_key) != quarantine_artifact_hash:
+    if value.get("quarantine_unit_receipt_artifact_hash") != quarantine_artifact_hash:
         raise ValueError("STAGE3_RECOVERY_QUARANTINE_UNIT_RECEIPT_ARTIFACT_MISMATCH")
     expected_evidence_hash = _stage3_recovery_hash(
-        value.get(evidence_key), field="node_cache_evidence_hash"
+        value.get("quarantine_node_cache_evidence_hash"),
+        field="node_cache_evidence_hash",
     )
     if quarantine.get("node_cache_evidence_hash") != expected_evidence_hash:
         raise ValueError("STAGE3_RECOVERY_QUARANTINE_NODE_CACHE_EVIDENCE_MISMATCH")
-    if quarantine.get("unit_id") not in (None, unit_id):
+    if quarantine.get("unit_id") != unit_id:
         raise ValueError("STAGE3_RECOVERY_QUARANTINE_UNIT_ID_MISMATCH")
 
     raw_path, raw_file_sha = _stage3_recovery_ref(
@@ -12301,6 +12286,8 @@ def _stage3_validate_recovery_receipt(
     raw = load_canonical_json(raw_path)
     if not isinstance(raw, Mapping) or raw.get("schema_version") != "stage3-formal-raw-shard-v1":
         raise ValueError("STAGE3_RECOVERY_RAW_SHARD_SCHEMA_INVALID")
+    if raw.get("unit_id") != unit_id:
+        raise ValueError("STAGE3_RECOVERY_RAW_UNIT_ID_MISMATCH")
     raw_hash = _stage3_recovery_hash(raw.get("artifact_hash"), field="raw_shard_hash")
     if canonical_json_hash(
         {key: item for key, item in raw.items() if key != "artifact_hash"}
@@ -12341,82 +12328,6 @@ def _stage3_validate_recovery_receipt(
             raise ValueError(f"STAGE3_RECOVERY_{ref_field.upper()}_IDENTITY_MISMATCH")
     return dict(value)
 
-
-
-
-def _stage3_recovery_expected_evidence_hash(
-    *,
-    root: Path,
-    unit_id: str,
-    formal_plan_hash: str,
-    run_config_hash: str,
-    downstream_raw_shard_ref: str,
-    downstream_raw_shard_hash: str,
-    execution_evidence_hash: str,
-    reference_binding_hash: str,
-    path_identity_hash: str,
-) -> str:
-    """Load the startup recovery fence; never infer an expected hash."""
-    receipt_ref = os.environ.get(_STAGE3_RECOVERY_RECEIPT_ENV)
-    if not isinstance(receipt_ref, str) or not receipt_ref:
-        raise ValueError("STAGE3_RECOVERY_EXPECTED_EVIDENCE_RECEIPT_REQUIRED")
-    receipt_path = _workspace_path(
-        root, receipt_ref, field="recovery.expected_evidence_receipt"
-    )
-    if receipt_path.is_symlink() or not receipt_path.is_file():
-        raise ValueError("STAGE3_RECOVERY_EXPECTED_EVIDENCE_RECEIPT_INVALID")
-    value = load_canonical_json(receipt_path)
-    if not isinstance(value, Mapping):
-        raise ValueError("STAGE3_RECOVERY_EXPECTED_EVIDENCE_RECEIPT_NOT_OBJECT")
-    if value.get("schema_version") != "stage3-cache-recovery-receipt-v1":
-        raise ValueError("STAGE3_RECOVERY_EXPECTED_EVIDENCE_RECEIPT_SCHEMA")
-    artifact_hash = value.get("artifact_hash")
-    if (
-        not isinstance(artifact_hash, str)
-        or _SHA256_RE.fullmatch(artifact_hash) is None
-        or canonical_json_hash(
-            {key: item for key, item in value.items() if key != "artifact_hash"}
-        )
-        != artifact_hash
-    ):
-        raise ValueError("STAGE3_RECOVERY_EXPECTED_EVIDENCE_RECEIPT_HASH")
-    required = {
-        "schema_version",
-        "unit_id",
-        "formal_plan_hash",
-        "run_config_hash",
-        "downstream_raw_shard_ref",
-        "downstream_raw_shard_hash",
-        "execution_evidence_hash",
-        "reference_binding_hash",
-        "path_identity_hash",
-        "expected_node_cache_evidence_hash",
-        "artifact_hash",
-    }
-    if not required.issubset(value):
-        raise ValueError("STAGE3_RECOVERY_EXPECTED_EVIDENCE_RECEIPT_FIELDS")
-    expected = value.get("expected_node_cache_evidence_hash")
-    if not isinstance(expected, str) or _SHA256_RE.fullmatch(expected) is None:
-        raise ValueError("STAGE3_RECOVERY_EXPECTED_EVIDENCE_HASH_INVALID")
-    current = {
-        "unit_id": unit_id,
-        "formal_plan_hash": formal_plan_hash,
-        "run_config_hash": run_config_hash,
-        "downstream_raw_shard_ref": downstream_raw_shard_ref,
-        "downstream_raw_shard_hash": downstream_raw_shard_hash,
-        "execution_evidence_hash": execution_evidence_hash,
-        "reference_binding_hash": reference_binding_hash,
-        "path_identity_hash": path_identity_hash,
-    }
-    for field_name, field_value in current.items():
-        if field_name.endswith("hash") and (
-            not isinstance(field_value, str)
-            or _SHA256_RE.fullmatch(field_value) is None
-        ):
-            raise ValueError(f"STAGE3_RECOVERY_{field_name.upper()}_INVALID")
-        if value.get(field_name) != field_value:
-            raise ValueError(f"STAGE3_RECOVERY_{field_name.upper()}_MISMATCH")
-    return expected
 
 
 

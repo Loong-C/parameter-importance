@@ -52,6 +52,7 @@ from param_importance_nlp.experiments.stage3_formal import (
     EndpointCaptureCoordinator,
     EndpointCaptureRequest,
     PersistentNodeGradientCache,
+    _write_immutable_canonical_json,
     ProbePanel,
     ProbePanelEntry,
     QuadratureObservation,
@@ -616,6 +617,99 @@ def _retention_fixture(tmp_path: Path) -> tuple[PersistentNodeGradientCache, Pat
     key = NodeCacheKey("retention-unit", 0.5, "float64", _hash("a"), _hash("b"))
     assert cache.publish_many({key: {"gradient": np.array([1.0, 2.0])}}) == 1
     return cache, receipt_root, raw_shard, str(raw_body["artifact_hash"])
+
+
+def test_persistent_node_cache_live_evidence_roundtrips_after_seal_and_evict(
+    tmp_path: Path,
+) -> None:
+    cache, receipt_root, raw_shard, raw_hash = _retention_fixture(tmp_path)
+    all_keys = cache.keys()
+    assert all_keys
+    live = cache.commit_evidence(all_keys)
+    sealed = cache.seal(
+        scope="formal",
+        unit_id="retention-unit",
+        plan_hash=_hash("c"),
+        run_config_hash=_hash("d"),
+        downstream_raw_shard_ref=raw_shard,
+        downstream_raw_shard_hash=raw_hash,
+        receipt_root=receipt_root,
+    )
+    evicted = cache.finalize_eviction(
+        str(sealed["receipt_ref"]), receipt_root=receipt_root
+    )
+    fresh = PersistentNodeGradientCache(cache.root)
+    recovered = fresh.commit_evidence_from_sealed(
+        all_keys,
+        receipt_root / str(sealed["receipt_ref"]),
+        receipt_root / str(evicted["tombstone_ref"]),
+    )
+    assert recovered == live
+    assert recovered["authoritative_commits"] == live["authoritative_commits"]
+    assert recovered["reconciliation"] == live["reconciliation"]
+    assert recovered["evidence_hash"] == live["evidence_hash"]
+
+
+def test_persistent_node_cache_mapping_evicted_rejects_hash_and_binding_drift(
+    tmp_path: Path,
+) -> None:
+    cache, receipt_root, raw_shard, raw_hash = _retention_fixture(tmp_path)
+    all_keys = cache.keys()
+    sealed = cache.seal(
+        scope="formal",
+        unit_id="retention-unit",
+        plan_hash=_hash("c"),
+        run_config_hash=_hash("d"),
+        downstream_raw_shard_ref=raw_shard,
+        downstream_raw_shard_hash=raw_hash,
+        receipt_root=receipt_root,
+    )
+    evicted = cache.finalize_eviction(
+        str(sealed["receipt_ref"]), receipt_root=receipt_root
+    )
+    sealed_value = load_canonical_json(receipt_root / str(sealed["receipt_ref"]))
+    evicted_value = load_canonical_json(receipt_root / str(evicted["tombstone_ref"]))
+    assert isinstance(sealed_value, dict)
+    assert isinstance(evicted_value, dict)
+
+    hash_drift = dict(evicted_value)
+    hash_drift["sealed_receipt_hash"] = _hash("f")
+    hash_drift["tombstone_hash"] = canonical_json_hash(
+        {key: value for key, value in hash_drift.items() if key != "tombstone_hash"}
+    )
+    with pytest.raises(ValueError, match="NODE_CACHE_EVICTED_SEAL_HASH_MISMATCH"):
+        PersistentNodeGradientCache(cache.root).commit_evidence_from_sealed(
+            all_keys, sealed_value, hash_drift
+        )
+
+    binding_drift = dict(evicted_value)
+    binding_drift["cache_root_ref"] = (tmp_path / "different-cache").as_posix()
+    binding_drift["tombstone_hash"] = canonical_json_hash(
+        {
+            key: value
+            for key, value in binding_drift.items()
+            if key != "tombstone_hash"
+        }
+    )
+    with pytest.raises(ValueError, match="NODE_CACHE_EVICTED_BINDING_MISMATCH"):
+        PersistentNodeGradientCache(cache.root).commit_evidence_from_sealed(
+            all_keys, sealed_value, binding_drift
+        )
+
+
+def test_persistent_node_cache_receipt_writer_is_idempotent_and_conflict_safe(
+    tmp_path: Path,
+) -> None:
+    receipt = tmp_path / "receipt.json"
+    payload = {"schema_version": "stage3-receipt-test-v1", "value": 1}
+    _write_immutable_canonical_json(receipt, payload)
+    first_bytes = receipt.read_bytes()
+    _write_immutable_canonical_json(receipt, payload)
+    assert receipt.read_bytes() == first_bytes
+    with pytest.raises(ValueError, match="NODE_CACHE_RECEIPT_IMMUTABLE_CONFLICT"):
+        _write_immutable_canonical_json(
+            receipt, {"schema_version": "stage3-receipt-test-v1", "value": 2}
+        )
 
 
 def test_persistent_node_cache_seal_and_evict_is_receipted_and_reinstantiable(
