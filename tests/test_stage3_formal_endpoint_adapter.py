@@ -27,6 +27,7 @@ from param_importance_nlp.contracts import (
     write_canonical_json,
 )
 from param_importance_nlp.contracts.task_catalog import DEFAULT_TASK_CATALOG
+from param_importance_nlp.core.quadrature import QuadratureRule
 from param_importance_nlp.contracts.stage23 import validate_stage23_artifact
 from param_importance_nlp.experiments import TrainingEndpointObserver
 from param_importance_nlp.experiments import stage23_task_runners as stage23
@@ -276,6 +277,174 @@ def test_reference_cache_evidence_rejects_completed_rule_outside_ladder() -> Non
         stage23._completed_stage3_reference_rules(result, rules)
 
 
+def test_resume_shards_unwraps_sealed_reference_levels_before_cache_evidence(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A missing receipt resumes sealed science without rerunning candidates."""
+
+    class _CacheEvidenceStop(Exception):
+        pass
+
+    rule = stage23.gauss_legendre_rule(2)
+    level = stage23.ReferenceRuleLevel("gauss_legendre", 0, rule)
+    captured: list[object] = []
+
+    def cache_evidence(rules):
+        captured.extend(rules)
+        raise _CacheEvidenceStop
+
+    thresholds = SimpleNamespace(artifact_hash=_hash("thresholds"))
+    context = SimpleNamespace(
+        unit_id="unit-0",
+        path=SimpleNamespace(identity_hash=_hash("path")),
+        execution=SimpleNamespace(
+            artifact_hash=_hash("execution"),
+            prerequisite_gates=(
+                GateRecord(
+                    gate_id="stage3.G3-5",
+                    stage=3,
+                    status=GateStatus.PASS,
+                    checked_at="2026-07-22T00:00:00+00:00",
+                    evidence_refs=("gate-evidence",),
+                ),
+            ),
+        ),
+        cache_evidence=cache_evidence,
+    )
+    raw_hash = _hash("raw-shard")
+    reference_root = tmp_path / "reference-ledger"
+    observation_root = tmp_path / "observation-ledger"
+    raw_root = tmp_path / "raw-ledger"
+    for directory in (reference_root, observation_root, raw_root):
+        directory.mkdir()
+        (directory / "unit-0.json").write_text("{}", encoding="utf-8")
+
+    monkeypatch.setattr(
+        stage23,
+        "_predecessor_context",
+        lambda *_args: SimpleNamespace(
+            references=(),
+            payload=lambda kind: (
+                {"thresholds_hash": thresholds.artifact_hash}
+                if kind == "threshold_freeze"
+                else {}
+            ),
+        ),
+    )
+    monkeypatch.setattr(stage23, "_fixture_path_context", lambda *_args: context)
+    monkeypatch.setattr(
+        stage23,
+        "_formal_stage3_matrix_plan",
+        lambda *_args: (
+            thresholds,
+            ("midpoint",),
+            ("unit-0",),
+            {"unit-0": ()},
+            "plan-ref",
+        ),
+    )
+    monkeypatch.setattr(stage23, "_load_formal_document_ref", lambda *_a, **_k: {})
+    monkeypatch.setattr(
+        stage23,
+        "_load_stage3_production_index",
+        lambda *_a, **_k: (
+            SimpleNamespace(artifact_hash=_hash("index"), unit=lambda _id: {}),
+            "index-ref",
+        ),
+    )
+    monkeypatch.setattr(
+        stage23,
+        "_stage3_formal_reference_binding",
+        lambda *_a, **_k: {
+            "reference_binding_hash": _hash("binding"),
+            "formal_plan_hash": _hash("plan"),
+        },
+    )
+    monkeypatch.setattr(
+        stage23,
+        "_stage3_streaming_receipt_root",
+        lambda *_a, **_k: tmp_path / "receipts",
+    )
+    monkeypatch.setattr(
+        stage23,
+        "_load_stage3_streaming_unit_receipt",
+        lambda *_a, **_k: None,
+    )
+    monkeypatch.setattr(
+        stage23, "_stage3_reference_ledger_root", lambda *_a, **_k: reference_root
+    )
+    monkeypatch.setattr(
+        stage23, "_stage3_observation_ledger_root", lambda *_a, **_k: observation_root
+    )
+    monkeypatch.setattr(
+        stage23, "_stage3_raw_ledger_root", lambda *_a, **_k: raw_root
+    )
+    monkeypatch.setattr(
+        stage23,
+        "_load_stage3_reference_shard",
+        lambda *_a, **_k: (
+            {
+                "refinement": {
+                    "completed_levels": [{"rule_hash": rule.artifact_hash}]
+                }
+            },
+            {"artifact_hash": _hash("reference-entry")},
+            "reference-ledger/unit-0.json",
+        ),
+    )
+    monkeypatch.setattr(
+        stage23,
+        "_publish_stage3_reference_aggregate",
+        lambda *_a, **_k: (
+            {"artifact_hash": _hash("reference-aggregate")},
+            "reference-aggregate",
+        ),
+    )
+    monkeypatch.setattr(
+        stage23,
+        "_publish_stage3_raw_aggregate_metadata",
+        lambda *_a, **_k: (
+            {"unit_shards": {"unit-0": {"shard_hash": raw_hash}}},
+            "raw-aggregate",
+        ),
+    )
+    monkeypatch.setattr(
+        stage23,
+        "_load_stage3_raw_shard",
+        lambda *_a, **_k: (
+            {
+                "artifact_hash": raw_hash,
+                "bundle_ref": "raw-bundle",
+                "bundle_manifest_hash": _hash("raw-bundle"),
+            },
+            {},
+            {},
+        ),
+    )
+    monkeypatch.setattr(stage23, "_stage3_reference_levels", lambda *_a: (level,))
+    candidate_called = False
+
+    def fail_if_candidates_run(*_args, **_kwargs):
+        nonlocal candidate_called
+        candidate_called = True
+        raise AssertionError("resume_shards must not rerun candidate science")
+
+    monkeypatch.setattr(stage23, "_quadrature_observations", fail_if_candidates_run)
+    request = SimpleNamespace(
+        config=SimpleNamespace(config_hash=_hash("config")),
+        task=DEFAULT_TASK_CATALOG.get("stage3.07_formal_experiment_matrix"),
+    )
+
+    with pytest.raises(_CacheEvidenceStop):
+        stage23._run_stage3_formal_matrix_shard(
+            request, tmp_path, TaskArtifactStore(tmp_path, "resume-test")
+        )
+
+    assert captured
+    assert all(isinstance(item, QuadratureRule) for item in captured)
+    assert captured[0] is rule
+    assert captured[-1].name == "midpoint"
+    assert candidate_called is False
 def test_formal_handler_loads_training_endpoint_and_executes_tiny_path(
     tmp_path: Path,
     monkeypatch,

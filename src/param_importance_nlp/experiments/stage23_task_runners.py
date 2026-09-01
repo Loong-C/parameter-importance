@@ -12346,7 +12346,7 @@ def _run_stage3_formal_matrix_shard(
         if {getattr(rule.rule, "artifact_hash", None) for rule in reference_rules} != completed_hashes:
             raise ValueError("STAGE3_STREAMING_REFERENCE_LEVEL_IDENTITY_MISMATCH")
         recovered_cache_evidence = context.cache_evidence(
-            tuple(reference_rules)
+            tuple(level.rule for level in reference_rules)
             + tuple(_quadrature_rule_from_name(name) for name in candidate_names)
         )
         recovered_raw_shard = stored_raw_loaded[context.unit_id][0]
