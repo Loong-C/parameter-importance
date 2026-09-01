@@ -1096,6 +1096,32 @@ class PersistentNodeGradientCache:
             ),
         }
 
+    @staticmethod
+    def _commit_evidence_payload(
+        *,
+        codec_id: str,
+        requested_digests: Sequence[str],
+        authoritative_commits: Sequence[Mapping[str, object]],
+        reconciliation: Mapping[str, object],
+    ) -> dict[str, object]:
+        """Build the ordinary evidence body for live and sealed caches."""
+        committed = set(reconciliation.get("committed_key_digests", ()))
+        requested = list(requested_digests)
+        payload: dict[str, object] = {
+            "schema_version": "stage3-node-cache-evidence-v1",
+            "codec_id": codec_id,
+            "publication_protocol": (
+                "immutable_tensor_bundle_then_independent_authoritative_commit"
+            ),
+            "requested_key_digests": requested,
+            "all_requested_keys_committed": not bool(set(requested) - committed),
+            "missing_key_digests": sorted(set(requested) - committed),
+            "authoritative_commits": [dict(item) for item in authoritative_commits],
+            "reconciliation": dict(reconciliation),
+        }
+        payload["evidence_hash"] = canonical_json_hash(payload)
+        return payload
+
     def commit_evidence(
         self,
         keys: Sequence[NodeCacheKey],
@@ -1142,20 +1168,202 @@ class PersistentNodeGradientCache:
                 }
             )
 
-        payload: dict[str, object] = {
-            "schema_version": "stage3-node-cache-evidence-v1",
-            "codec_id": self.codec.codec_id,
-            "publication_protocol": (
-                "immutable_tensor_bundle_then_independent_authoritative_commit"
-            ),
-            "requested_key_digests": requested_digests,
-            "all_requested_keys_committed": not missing,
-            "missing_key_digests": missing,
-            "authoritative_commits": authoritative_commits,
-            "reconciliation": reconciliation,
-        }
-        payload["evidence_hash"] = canonical_json_hash(payload)
-        return payload
+        return self._commit_evidence_payload(
+            codec_id=self.codec.codec_id,
+            requested_digests=requested_digests,
+            authoritative_commits=authoritative_commits,
+            reconciliation=reconciliation,
+        )
+
+    @staticmethod
+    def _load_recovery_receipt(
+        value: Mapping[str, object] | str | Path,
+    ) -> tuple[dict[str, object], Path | None]:
+        if isinstance(value, Mapping):
+            return dict(value), None
+        path = Path(value).resolve(strict=False)
+        loaded = load_canonical_json(path)
+        if not isinstance(loaded, Mapping):
+            raise ValueError("NODE_CACHE_RECEIPT_NOT_OBJECT")
+        return dict(loaded), path
+
+    def commit_evidence_from_sealed(
+        self,
+        keys: Sequence[NodeCacheKey],
+        sealed_receipt: Mapping[str, object] | str | Path,
+        evicted_receipt: Mapping[str, object] | str | Path,
+    ) -> dict[str, object]:
+        """Rebuild ordinary commit evidence from a verified EVICTED fence."""
+        requested: dict[str, NodeCacheKey] = {}
+        for key in keys:
+            if not isinstance(key, NodeCacheKey):
+                raise TypeError("PersistentNodeGradientCache 只接受 NodeCacheKey")
+            requested[key.digest] = key
+        requested_digests = sorted(requested)
+        sealed_value, sealed_path = self._load_recovery_receipt(sealed_receipt)
+        evicted_value, evicted_path = self._load_recovery_receipt(evicted_receipt)
+        sealed = self._validate_sealed_payload(sealed_value)
+        if sealed_path is not None and sealed_path.name != str(sealed["receipt_ref"]):
+            raise ValueError("NODE_CACHE_RECEIPT_REF_MISMATCH")
+        evicted = self._validate_evicted_payload(
+            evicted_value if evicted_path is None else evicted_path,
+            sealed,
+        )
+        if sealed.get("cache_root_ref") != self.root.as_posix() or evicted.get("cache_root_ref") != self.root.as_posix():
+            raise ValueError("NODE_CACHE_CACHE_ROOT_BINDING_MISMATCH")
+        self._reload_index()
+        self._cache_state_matches_seal(sealed, allow_missing=True)
+        if self._cache_state_has_files(sealed) or self._index:
+            raise ValueError("NODE_CACHE_EVICTED_CACHE_NOT_EMPTY")
+
+        key_records = sealed.get("key_records")
+        commits = sealed.get("commits")
+        objects = sealed.get("objects")
+        manifest = sealed.get("eviction_manifest")
+        if not all(isinstance(item, list) for item in (key_records, commits, objects, manifest)):
+            raise ValueError("NODE_CACHE_RECEIPT_COMPONENTS_INVALID")
+        assert isinstance(key_records, list)
+        assert isinstance(commits, list)
+        assert isinstance(objects, list)
+        assert isinstance(manifest, list)
+        manifest_by_path: dict[str, Mapping[str, object]] = {}
+        for item in manifest:
+            if not isinstance(item, Mapping):
+                raise ValueError("NODE_CACHE_EVICTION_FILE_INVALID")
+            path = item.get("path")
+            if not isinstance(path, str) or path in manifest_by_path:
+                raise ValueError("NODE_CACHE_EVICTION_PATH_DUPLICATE")
+            manifest_by_path[path] = item
+
+        records: dict[str, dict[str, object]] = {}
+        for item in key_records:
+            if not isinstance(item, Mapping):
+                raise ValueError("NODE_CACHE_KEY_RECORD_INVALID")
+            key_payload = item.get("key")
+            if not isinstance(key_payload, Mapping):
+                raise ValueError("NODE_CACHE_KEY_RECORD_KEY_INVALID")
+            key = _key_from_payload(key_payload)
+            kd = _require_sha256(str(item.get("key_digest")), field_name="key_digest")
+            vd = _require_sha256(str(item.get("value_digest")), field_name="value_digest")
+            if key.digest != kd:
+                raise ValueError("NODE_CACHE_KEY_DIGEST_MISMATCH")
+            record = {"key": _key_payload(key), "key_digest": kd, "value_digest": vd}
+            if kd in records and records[kd] != record:
+                raise ValueError("NODE_CACHE_IMMUTABLE_KEY_CONFLICT")
+            records[kd] = record
+        if key_records != [records[d] for d in sorted(records)]:
+            raise ValueError("NODE_CACHE_KEY_RECORD_ORDER_MISMATCH")
+
+        commit_items: list[dict[str, object]] = []
+        commit_hashes: list[str] = []
+        entries_by_key: dict[str, dict[str, object]] = {}
+        object_by_ref: dict[str, str] = {}
+        for item in commits:
+            if not isinstance(item, Mapping) or not isinstance(item.get("commit"), Mapping):
+                raise ValueError("NODE_CACHE_RECEIPT_COMMIT_INVALID")
+            path = item.get("path")
+            commit = dict(item["commit"])
+            if not isinstance(path, str) or Path(path).is_absolute() or ".." in Path(path).parts:
+                raise ValueError("NODE_CACHE_RECEIPT_COMMIT_PATH_ESCAPE")
+            if set(commit) != {"schema_version", "batch_digest", "codec_id", "entries", "object_ref", "object_manifest_hash", "artifact_hash"}:
+                raise ValueError("NODE_CACHE_COMMIT_FIELDS_MISMATCH")
+            if commit.get("schema_version") != "stage3-node-cache-commit-v1" or commit.get("codec_id") != self.codec.codec_id:
+                raise ValueError("NODE_CACHE_CODEC_ID_MISMATCH")
+            batch = _require_sha256(str(commit.get("batch_digest")), field_name="commit.batch_digest")
+            if path != f"commits/{batch}.json" or commit.get("object_ref") != f"objects/{batch}":
+                raise ValueError("NODE_CACHE_COMMIT_PATH_MISMATCH")
+            object_hash = _require_sha256(str(commit.get("object_manifest_hash")), field_name="commit.object_manifest_hash")
+            artifact = _require_sha256(str(commit.get("artifact_hash")), field_name="commit.artifact_hash")
+            if canonical_json_hash({k: v for k, v in commit.items() if k != "artifact_hash"}) != artifact:
+                raise ValueError("NODE_CACHE_COMMIT_HASH_MISMATCH")
+            entries = commit.get("entries")
+            if not isinstance(entries, list) or entries != sorted(entries, key=lambda v: str(v.get("key_digest")) if isinstance(v, Mapping) else ""):
+                raise ValueError("NODE_CACHE_ENTRIES_INVALID")
+            batch_entries: list[dict[str, str]] = []
+            for entry in entries:
+                if not isinstance(entry, Mapping) or set(entry) != {"key", "key_digest", "value_digest"}:
+                    raise ValueError("NODE_CACHE_ENTRY_INVALID")
+                key_payload = entry.get("key")
+                if not isinstance(key_payload, Mapping):
+                    raise ValueError("NODE_CACHE_ENTRY_KEY_INVALID")
+                key = _key_from_payload(key_payload)
+                kd = _require_sha256(str(entry.get("key_digest")), field_name="entry.key_digest")
+                vd = _require_sha256(str(entry.get("value_digest")), field_name="entry.value_digest")
+                if key.digest != kd:
+                    raise ValueError("NODE_CACHE_KEY_DIGEST_MISMATCH")
+                record = {"key": _key_payload(key), "key_digest": kd, "value_digest": vd}
+                if kd in entries_by_key and entries_by_key[kd] != record:
+                    raise ValueError("NODE_CACHE_IMMUTABLE_KEY_CONFLICT")
+                entries_by_key[kd] = record
+                batch_entries.append({"key_digest": kd, "value_digest": vd})
+            if canonical_json_hash({"codec_id": self.codec.codec_id, "entries": batch_entries}) != batch:
+                raise ValueError("NODE_CACHE_BATCH_DIGEST_MISMATCH")
+            m = manifest_by_path.get(path)
+            if not isinstance(m, Mapping) or m.get("kind") != "commit" or m.get("sha256") != item.get("sha256") or m.get("byte_count") != item.get("byte_count"):
+                raise ValueError("NODE_CACHE_RECEIPT_COMMIT_BYTE_BINDING_MISMATCH")
+            if batch in object_by_ref:
+                raise ValueError("NODE_CACHE_RECEIPT_OBJECT_REF_DUPLICATE")
+            object_by_ref[batch] = object_hash
+            commit_items.append({"path": path, "commit": commit, "byte_count": item.get("byte_count"), "sha256": item.get("sha256")})
+            commit_hashes.append(artifact)
+        if commits != sorted(commit_items, key=lambda v: str(v["path"])):
+            raise ValueError("NODE_CACHE_RECEIPT_COMMIT_ORDER_MISMATCH")
+        if sorted(commit_hashes) != sealed.get("commit_artifact_hashes") or entries_by_key != records:
+            raise ValueError("NODE_CACHE_RECEIPT_KEY_RECORD_SET_MISMATCH")
+
+        object_items: list[dict[str, object]] = []
+        object_hashes: list[str] = []
+        object_files: set[str] = set()
+        for item in objects:
+            if not isinstance(item, Mapping) or not isinstance(item.get("object_ref"), str):
+                raise ValueError("NODE_CACHE_RECEIPT_OBJECT_INVALID")
+            ref = str(item["object_ref"])
+            batch = Path(ref).name
+            if ref != f"objects/{batch}" or batch not in object_by_ref or object_by_ref[batch] != item.get("object_manifest_hash"):
+                raise ValueError("NODE_CACHE_RECEIPT_OBJECT_REF_MISMATCH")
+            nested = item.get("files")
+            if not isinstance(nested, list) or nested != sorted(nested, key=lambda v: str(v.get("path")) if isinstance(v, Mapping) else ""):
+                raise ValueError("NODE_CACHE_RECEIPT_OBJECT_FILES_INVALID")
+            nested_paths: set[str] = set()
+            nested_bytes = 0
+            for file_item in nested:
+                if not isinstance(file_item, Mapping):
+                    raise ValueError("NODE_CACHE_RECEIPT_OBJECT_FILE_INVALID")
+                file_path = file_item.get("path")
+                if not isinstance(file_path, str) or not file_path.startswith(f"{ref}/") or file_path in nested_paths:
+                    raise ValueError("NODE_CACHE_RECEIPT_OBJECT_FILE_BINDING_MISMATCH")
+                m = manifest_by_path.get(file_path)
+                if not isinstance(m, Mapping) or m.get("kind") != "object" or dict(m) != dict(file_item):
+                    raise ValueError("NODE_CACHE_RECEIPT_OBJECT_FILE_BINDING_MISMATCH")
+                nested_paths.add(file_path)
+                object_files.add(file_path)
+                nested_bytes += int(file_item.get("byte_count", -1))
+            if nested_bytes != item.get("byte_count"):
+                raise ValueError("NODE_CACHE_RECEIPT_OBJECT_BYTE_COUNT_MISMATCH")
+            object_items.append({"object_ref": ref, "object_manifest_hash": item.get("object_manifest_hash"), "files": [dict(v) for v in nested], "byte_count": item.get("byte_count")})
+            object_hashes.append(str(item.get("object_manifest_hash")))
+        if objects != sorted(object_items, key=lambda v: str(v["object_ref"])):
+            raise ValueError("NODE_CACHE_RECEIPT_OBJECT_ORDER_MISMATCH")
+        if sorted(object_hashes) != sealed.get("object_manifest_hashes"):
+            raise ValueError("NODE_CACHE_RECEIPT_OBJECT_HASH_SET_MISMATCH")
+        expected_object_files = {str(v.get("path")) for v in manifest if isinstance(v, Mapping) and v.get("kind") == "object"}
+        expected_paths = {str(v.get("path")) for v in commits if isinstance(v, Mapping)} | object_files
+        if object_files != expected_object_files or set(manifest_by_path) != expected_paths:
+            raise ValueError("NODE_CACHE_RECEIPT_PATH_SET_MISMATCH")
+
+        authoritative: list[dict[str, object]] = []
+        for item in commit_items:
+            commit = item["commit"]
+            assert isinstance(commit, Mapping)
+            matched = sorted({str(v["key_digest"]) for v in commit["entries"] if isinstance(v, Mapping)}.intersection(requested_digests))
+            if matched:
+                authoritative.append({"commit_ref": item["path"], "commit_artifact_hash": commit["artifact_hash"], "object_ref": commit["object_ref"], "object_manifest_hash": commit["object_manifest_hash"], "key_digests": matched})
+        return self._commit_evidence_payload(
+            codec_id=self.codec.codec_id,
+            requested_digests=requested_digests,
+            authoritative_commits=authoritative,
+            reconciliation={"committed_key_digests": sorted(records), "orphan_objects": []},
+        )
 
     def _verify_downstream_raw_shard(
         self,
@@ -1728,11 +1936,25 @@ class PersistentNodeGradientCache:
 
     @staticmethod
     def _validate_evicted_payload(
-        path: Path, sealed: Mapping[str, object]
+        value_or_path: Mapping[str, object] | str | Path,
+        sealed: Mapping[str, object],
     ) -> dict[str, object]:
-        value = load_canonical_json(path)
-        if not isinstance(value, Mapping):
-            raise ValueError("NODE_CACHE_EVICTED_NOT_OBJECT")
+        """Validate an EVICTED tombstone and its SEALED binding.
+
+        A recovery caller may already have loaded an immutable tombstone from a
+        streaming receipt. Validate that mapping directly instead of resolving
+        its reference relative to the process cwd. Path callers retain the
+        on-disk validator and also bind the filename to the payload.
+        """
+        path: Path | None = None
+        if isinstance(value_or_path, Mapping):
+            value = value_or_path
+        else:
+            path = Path(value_or_path)
+            loaded = load_canonical_json(path)
+            if not isinstance(loaded, Mapping):
+                raise ValueError("NODE_CACHE_EVICTED_NOT_OBJECT")
+            value = loaded
         if value.get("schema_version") != "stage3-node-cache-evicted-v1":
             raise ValueError("NODE_CACHE_EVICTED_SCHEMA_MISMATCH")
         if value.get("state") != "EVICTED":
@@ -1765,7 +1987,10 @@ class PersistentNodeGradientCache:
             raise ValueError("NODE_CACHE_EVICTED_RECEIPT_BINDING_MISMATCH")
         if value.get("sealed_receipt_hash") != sealed.get("receipt_hash"):
             raise ValueError("NODE_CACHE_EVICTED_SEAL_HASH_MISMATCH")
-        if value.get("tombstone_ref") != path.name:
+        expected_tombstone_ref = f"{sealed['receipt_id']}.EVICTED.json"
+        if value.get("tombstone_ref") != expected_tombstone_ref:
+            raise ValueError("NODE_CACHE_EVICTED_TOMBSTONE_REF_MISMATCH")
+        if path is not None and path.name != value.get("tombstone_ref"):
             raise ValueError("NODE_CACHE_EVICTED_TOMBSTONE_REF_MISMATCH")
         if value.get("sealed_receipt_ref") != sealed.get("receipt_ref"):
             raise ValueError("NODE_CACHE_EVICTED_SEALED_REF_MISMATCH")

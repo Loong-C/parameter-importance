@@ -6596,7 +6596,13 @@ class _PathContext:
         rule_key = str(getattr(rule, "artifact_hash", getattr(rule, "name", "unknown-rule")))
         return self._cost_by_rule.get(rule_key, _PathEvaluationCost())
 
-    def cache_evidence(self, rules: Sequence[object]) -> dict[str, JSONValue]:
+    def cache_evidence(
+        self,
+        rules: Sequence[object],
+        *,
+        sealed_receipt: Mapping[str, object] | str | Path | None = None,
+        evicted_receipt: Mapping[str, object] | str | Path | None = None,
+    ) -> dict[str, JSONValue]:
         """生成与规则集合绑定、fresh/resume 一致的节点缓存证据。
 
         这里故意不输出本次 cache hit/miss 数，因为中断发生在哪个规则之后会改变
@@ -6635,9 +6641,18 @@ class _PathContext:
                 keys_by_digest[key.digest] = key
                 key_rule_counts[key.digest] = key_rule_counts.get(key.digest, 0) + 1
 
-        commit_evidence = self.node_cache.commit_evidence(
-            tuple(keys_by_digest[digest] for digest in sorted(keys_by_digest))
+        if (sealed_receipt is None) != (evicted_receipt is None):
+            raise ValueError("STAGE3_CACHE_EVIDENCE_LIFECYCLE_PAIR_REQUIRED")
+        requested_keys = tuple(
+            keys_by_digest[digest] for digest in sorted(keys_by_digest)
         )
+        if sealed_receipt is None:
+            commit_evidence = self.node_cache.commit_evidence(requested_keys)
+        else:
+            assert evicted_receipt is not None
+            commit_evidence = self.node_cache.commit_evidence_from_sealed(
+                requested_keys, sealed_receipt, evicted_receipt
+            )
         if commit_evidence["all_requested_keys_committed"] is not True:
             raise RuntimeError("STAGE3_NODE_CACHE_COMMIT_INCOMPLETE")
         shared = sorted(
@@ -12114,7 +12129,76 @@ def _resume_stage3_formal_matrix_from_receipt(
     )
 
 
+
+def _stage3_verified_node_cache_lifecycle(
+    *,
+    receipt_root: Path,
+    unit_id: str,
+    cache_root_ref: str,
+    raw_shard_hash: str,
+) -> tuple[dict[str, object], dict[str, object]]:
+    """Locate exactly one verified SEALED/EVICTED pair for the active unit.
+
+    Receipt filenames and payload identities are both checked through the
+    PersistentNodeGradientCache receipt API. A missing, duplicate, or drifting
+    lifecycle is a hard recovery failure; no cache evidence is synthesized.
+    """
+    if receipt_root.is_symlink() or not receipt_root.is_dir():
+        raise ValueError("STAGE3_NODE_CACHE_LIFECYCLE_ROOT_INVALID")
+    sealed_candidates: list[tuple[dict[str, object], dict[str, object]]] = []
+    seen_sealed: set[str] = set()
+    for sealed_path in sorted(receipt_root.glob("*.SEALED.json")):
+        if sealed_path.is_symlink():
+            raise ValueError("STAGE3_NODE_CACHE_LIFECYCLE_SYMLINK")
+        raw = load_canonical_json(sealed_path)
+        if not isinstance(raw, Mapping):
+            continue
+        if raw.get("unit_id") != unit_id:
+            continue
+        sealed = PersistentNodeGradientCache.verify_receipt(
+            receipt_root, sealed_path.name
+        )
+        if (
+            sealed.get("unit_id") != unit_id
+            or sealed.get("cache_root_ref") != cache_root_ref
+            or sealed.get("scope") != "stage3.07.matrix"
+            or sealed.get("downstream_raw_shard_hash") != raw_shard_hash
+        ):
+            raise ValueError("STAGE3_NODE_CACHE_LIFECYCLE_IDENTITY_MISMATCH")
+        evicted_name = sealed_path.name.removesuffix(".SEALED.json") + ".EVICTED.json"
+        evicted_path = receipt_root / evicted_name
+        if evicted_path.is_symlink() or not evicted_path.is_file():
+            raise ValueError("STAGE3_NODE_CACHE_LIFECYCLE_PAIR_MISSING")
+        tombstone = PersistentNodeGradientCache.verify_receipt(
+            receipt_root, evicted_path.name
+        )
+        if (
+            tombstone.get("state") != "EVICTED"
+            or tombstone.get("unit_id") != unit_id
+            or tombstone.get("cache_root_ref") != cache_root_ref
+            or tombstone.get("downstream_raw_shard_hash") != raw_shard_hash
+            or tombstone.get("receipt_id") != sealed.get("receipt_id")
+        ):
+            raise ValueError("STAGE3_NODE_CACHE_LIFECYCLE_IDENTITY_MISMATCH")
+        if sealed_path.name in seen_sealed:
+            raise ValueError("STAGE3_NODE_CACHE_LIFECYCLE_DUPLICATE")
+        seen_sealed.add(sealed_path.name)
+        sealed_candidates.append((sealed, tombstone))
+    for evicted_path in sorted(receipt_root.glob("*.EVICTED.json")):
+        if evicted_path.is_symlink():
+            raise ValueError("STAGE3_NODE_CACHE_LIFECYCLE_SYMLINK")
+        raw = load_canonical_json(evicted_path)
+        if not isinstance(raw, Mapping) or raw.get("unit_id") != unit_id:
+            continue
+        sealed_name = evicted_path.name.removesuffix(".EVICTED.json") + ".SEALED.json"
+        if not (receipt_root / sealed_name).is_file():
+            raise ValueError("STAGE3_NODE_CACHE_LIFECYCLE_PAIR_MISSING")
+    if len(sealed_candidates) != 1:
+        raise ValueError("STAGE3_NODE_CACHE_LIFECYCLE_UNIQUE_REQUIRED")
+    return sealed_candidates[0]
+
 def _run_stage3_formal_matrix_shard(
+
     request: TaskExecutionRequest,
     root: Path,
     store: TaskArtifactStore,
@@ -12345,10 +12429,28 @@ def _run_stage3_formal_matrix_shard(
         )
         if {getattr(rule.rule, "artifact_hash", None) for rule in reference_rules} != completed_hashes:
             raise ValueError("STAGE3_STREAMING_REFERENCE_LEVEL_IDENTITY_MISMATCH")
-        recovered_cache_evidence = context.cache_evidence(
-            tuple(level.rule for level in reference_rules)
-            + tuple(_quadrature_rule_from_name(name) for name in candidate_names)
+        all_rules = tuple(level.rule for level in reference_rules) + tuple(
+            _quadrature_rule_from_name(name) for name in candidate_names
         )
+        node_cache = getattr(context, "node_cache", None)
+        if node_cache is None:
+            # Narrow fixture adapters may omit retention state; production
+            # contexts always take the verified lifecycle path below.
+            recovered_cache_evidence = context.cache_evidence(all_rules)
+        else:
+            if len(all_rules) != 19:
+                raise ValueError("STAGE3_STREAMING_CACHE_RULE_COUNT_MISMATCH")
+            sealed_receipt, evicted_receipt = _stage3_verified_node_cache_lifecycle(
+                receipt_root=receipt_root,
+                unit_id=context.unit_id,
+                cache_root_ref=node_cache.root.as_posix(),
+                raw_shard_hash=str(stored_raw_shard["artifact_hash"]),
+            )
+            recovered_cache_evidence = context.cache_evidence(
+                all_rules,
+                sealed_receipt=sealed_receipt,
+                evicted_receipt=evicted_receipt,
+            )
         recovered_raw_shard = stored_raw_loaded[context.unit_id][0]
         recovered_observation_hash = _stage3_observation_artifact_hash(
             request,
