@@ -79,6 +79,29 @@ def _file_identity(
     )
 
 
+def _dataset_file_paths(
+    dataset: PythiaIndexedDataset,
+) -> tuple[tuple[Path, Path], ...]:
+    """Derive logical/resolved identities without requiring cache-only fields.
+
+    The qualified mmap reader intentionally remains unchanged.  Its public
+    state exposes the resolved index path and shard descriptors; provider
+    cursor identity can reconstruct the descriptor logical paths locally while
+    treating the index path as already resolved.  This keeps post-G3 cursor
+    drift checks compatible with the f32 qualified reader and with the later
+    Stage 3 provider fixes.
+    """
+
+    shard_paths = tuple(
+        (
+            descriptor.path.expanduser().absolute(),
+            descriptor.path.expanduser().resolve(),
+        )
+        for descriptor in dataset.reader.shards
+    )
+    return ((dataset.index.path, dataset.index.path), *shard_paths)
+
+
 class PythiaMMapProviderError(ValueError):
     """Raised when an mmap provider identity or cursor boundary is invalid."""
 
@@ -321,14 +344,7 @@ class PythiaMMapDatasetAdapter:
             raise RuntimeError("PYTHIA_MMAP_ADAPTER_CLOSED")
 
     def _file_stats(self) -> tuple[tuple[object, ...], ...]:
-        paths = (
-            (self._dataset.index.logical_path, self._dataset.index.path),
-            *zip(
-                self._dataset.reader.logical_paths,
-                self._dataset.reader.resolved_paths,
-                strict=True,
-            ),
-        )
+        paths = _dataset_file_paths(self._dataset)
         return tuple(
             _file_identity(
                 logical_path,
@@ -544,14 +560,7 @@ class PythiaMMapFrozenSampleResolver:
         return f"{self._sample_prefix}{global_index:012d}"
 
     def _file_stats(self) -> tuple[tuple[object, ...], ...]:
-        paths = (
-            (self._dataset.index.logical_path, self._dataset.index.path),
-            *zip(
-                self._dataset.reader.logical_paths,
-                self._dataset.reader.resolved_paths,
-                strict=True,
-            ),
-        )
+        paths = _dataset_file_paths(self._dataset)
         return tuple(
             _file_identity(
                 logical_path,
