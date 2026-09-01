@@ -12727,7 +12727,7 @@ def _run_stage3_formal_matrix_shard(
         )
     if all(path.exists() for path in durable_shards):
         recovery_fence: dict[str, object] | None = None
-        if context.execution.run_intent == "formal":
+        if getattr(context.execution, "run_intent", None) == "formal":
             recovery_fence = _stage3_validate_recovery_receipt(
                 root=root,
                 unit_id=context.unit_id,
@@ -12859,17 +12859,32 @@ def _run_stage3_formal_matrix_shard(
                         recovery_fence.get("node_cache_evidence_hash"),
                     )
                 )
-                sealed_key_digests = sealed_receipt.get("key_digests")
-                requested_key_digests = tuple(
-                    str(item)
-                    for item in (
-                        sealed_key_digests
-                        if isinstance(sealed_key_digests, list)
+                requested_key_digests = {
+                    context.node_key(float(alpha)).digest
+                    for rule in all_rules
+                    for alpha in (
+                        getattr(rule, "nodes", None)
+                        .detach()
+                        .cpu()
+                        .to(torch.float64)
+                        .tolist()
+                        if isinstance(getattr(rule, "nodes", None), torch.Tensor)
                         else ()
                     )
-                )
-                if len(requested_key_digests) != 127 or len(set(requested_key_digests)) != 127:
-                    raise ValueError("STAGE3_STREAMING_CACHE_KEY_COUNT_MISMATCH")
+                }
+                sealed_key_digests = sealed_receipt.get("key_digests")
+                if not isinstance(sealed_key_digests, list) or any(
+                    not isinstance(item, str) or _SHA256_RE.fullmatch(item) is None
+                    for item in sealed_key_digests
+                ):
+                    raise ValueError("STAGE3_STREAMING_CACHE_KEY_SET_INVALID")
+                verified_key_digests = set(sealed_key_digests)
+                if (
+                    len(requested_key_digests) != 127
+                    or len(verified_key_digests) != 127
+                    or requested_key_digests != verified_key_digests
+                ):
+                    raise ValueError("STAGE3_STREAMING_CACHE_KEY_SET_MISMATCH")
             else:
                 expected_evidence_hash = None
             recovered_cache_evidence = context.cache_evidence(
