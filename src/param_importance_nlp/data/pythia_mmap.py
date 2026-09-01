@@ -9,32 +9,21 @@ explicitly; this module never scans or globs a dataset directory.
 from __future__ import annotations
 
 from bisect import bisect_right
-from collections.abc import Mapping
 from dataclasses import dataclass
-from datetime import datetime, timezone
 import hashlib
-import logging
-import os
 from pathlib import Path
 import re
-import stat
 import struct
-import tempfile
 from typing import Any, Sequence
 
 import numpy as np
 import torch
-
-from ..atomic import atomic_write_bytes
-from ..contracts.jsonio import canonical_json_bytes, canonical_json_hash, loads_strict_json
 
 
 MMAP_INDEX_MAGIC = b"MMIDIDX\x00\x00"
 MMAP_INDEX_VERSION = 1
 MMAP_INDEX_HEADER_BYTES = 34
 PYTHIA_TOKENS_PER_RECORD = 2049
-FILE_VERIFICATION_CACHE_ENV = "PARAM_IMPORTANCE_FILE_VERIFICATION_CACHE"
-FILE_VERIFICATION_SCHEMA_VERSION = "param-importance-file-verification-v2"
 
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _SHARD_NAME_RE = re.compile(
@@ -50,29 +39,6 @@ _DTYPE_BY_CODE: dict[int, np.dtype[Any]] = {
     7: np.dtype(np.float64),
     8: np.dtype(np.uint16),
 }
-_FILE_VERIFICATION_CERT_FIELDS = frozenset(
-    {
-        "schema_version",
-        "logical_path",
-        "logical_is_symlink",
-        "logical_st_dev",
-        "logical_st_ino",
-        "logical_st_size",
-        "logical_st_mtime_ns",
-        "logical_st_ctime_ns",
-        "resolved_path",
-        "st_dev",
-        "st_ino",
-        "st_size",
-        "st_mtime_ns",
-        "st_ctime_ns",
-        "expected_sha256",
-        "actual_sha256",
-        "verified_at",
-        "artifact_hash",
-    }
-)
-_LOGGER = logging.getLogger(__name__)
 
 
 class PythiaDataError(ValueError):
@@ -94,457 +60,6 @@ def sha256_file(path: str | Path, *, chunk_size: int = 16 * 1024 * 1024) -> str:
         for chunk in iter(lambda: handle.read(chunk_size), b""):
             digest.update(chunk)
     return digest.hexdigest()
-
-
-def _verification_cache_root(cache_root: str | Path | None) -> Path | None:
-    """Resolve the explicitly opted-in certificate cache root."""
-
-    from_environment = cache_root is None
-    if cache_root is None:
-        configured = os.environ.get(FILE_VERIFICATION_CACHE_ENV)
-        if not configured:
-            return None
-        cache_root = configured
-    try:
-        raw = os.fspath(cache_root)
-    except TypeError as error:
-        raise ValueError("file verification cache_root must be a path") from error
-    if not isinstance(raw, str) or not raw or raw.strip() != raw or not raw.strip():
-        raise ValueError("file verification cache_root must be a non-blank path")
-    try:
-        candidate_input = Path(raw)
-    except (TypeError, ValueError) as error:
-        raise ValueError("file verification cache_root must be a valid path") from error
-    if not candidate_input.is_absolute():
-        raise ValueError("file verification cache_root must be absolute")
-    try:
-        lexical = candidate_input.expanduser().absolute()
-    except (OSError, RuntimeError, TypeError, ValueError) as error:
-        raise ValueError("file verification cache_root cannot be resolved") from error
-
-    def _contains(parent: Path, child: Path) -> bool:
-        return child == parent or child.is_relative_to(parent)
-
-    # Perform pure lexical safety checks before touching the filesystem.  In
-    # particular, a protected path such as /root may be non-searchable by the
-    # caller, so is_symlink()/resolve() must not run before it is rejected.
-    if lexical == Path(lexical.anchor):
-        raise ValueError("file verification cache_root cannot be a filesystem root")
-    if from_environment and lexical.name != ".file-verification":
-        raise ValueError(
-            "environment file verification cache_root must be a dedicated "
-            ".file-verification leaf"
-        )
-
-    protected: list[Path] = []
-    if os.name == "nt":
-        system_root = os.environ.get("SystemRoot", r"C:\Windows")
-        protected.extend(
-            Path(value)
-            for value in (
-                system_root,
-                os.environ.get("ProgramFiles", r"C:\Program Files"),
-                os.environ.get("ProgramData", r"C:\ProgramData"),
-            )
-        )
-    else:
-        protected.extend(
-            Path(value)
-            for value in (
-                "/bin",
-                "/boot",
-                "/dev",
-                "/etc",
-                "/lib",
-                "/lib64",
-                "/media",
-                "/mnt",
-                "/opt",
-                "/proc",
-                "/root",
-                "/run",
-                "/sbin",
-                "/srv",
-                "/sys",
-                "/usr",
-                "/var",
-            )
-        )
-    for protected_root in protected:
-        if _contains(protected_root, lexical):
-            raise ValueError(
-                f"file verification cache_root cannot be under system directory {protected_root}"
-            )
-
-    try:
-        home = Path.home().absolute()
-    except (OSError, RuntimeError, TypeError, ValueError) as error:
-        raise ValueError("file verification cache_root home cannot be resolved") from error
-    if lexical == home or lexical.parent == home:
-        raise ValueError("file verification cache_root cannot be home or its direct child")
-    if os.name != "nt":
-        posix_home_root = Path("/home")
-        if lexical == posix_home_root:
-            raise ValueError("file verification cache_root cannot be the /home root")
-        if lexical.is_relative_to(posix_home_root):
-            relative_parts = lexical.relative_to(posix_home_root).parts
-            if len(relative_parts) <= 2:
-                raise ValueError(
-                    "file verification cache_root cannot be a broad /home user root"
-                )
-    if os.name == "nt" and (
-        lexical == home.parent or lexical.parent == home.parent
-    ):
-        raise ValueError("file verification cache_root cannot be the broad Users directory")
-    try:
-        temporary_root = Path(tempfile.gettempdir()).absolute()
-    except (OSError, RuntimeError, TypeError, ValueError) as error:
-        raise ValueError("file verification cache_root temp anchor cannot be resolved") from error
-    if lexical == temporary_root or lexical.parent == temporary_root:
-        raise ValueError("file verification cache_root cannot be a broad temp directory")
-
-    try:
-        if lexical.is_symlink():
-            raise ValueError("file verification cache_root must not be a symlink")
-    except ValueError:
-        raise
-    except OSError as error:
-        raise ValueError("file verification cache_root cannot inspect symlink state") from error
-    try:
-        candidate = lexical.resolve()
-    except (OSError, RuntimeError, TypeError, ValueError) as error:
-        raise ValueError("file verification cache_root cannot be resolved") from error
-    for protected_root in protected:
-        if _contains(protected_root, candidate):
-            raise ValueError(
-                f"file verification cache_root cannot be under system directory {protected_root}"
-            )
-    try:
-        canonical_home = home.resolve()
-    except (OSError, RuntimeError, TypeError, ValueError) as error:
-        raise ValueError("file verification cache_root home cannot be resolved") from error
-    if candidate == canonical_home or candidate.parent == canonical_home:
-        raise ValueError("file verification cache_root cannot be home or its direct child")
-    if os.name != "nt" and candidate.is_relative_to(Path("/home")):
-        relative_parts = candidate.relative_to(Path("/home")).parts
-        if len(relative_parts) <= 2:
-            raise ValueError(
-                "file verification cache_root cannot be a broad /home user root"
-            )
-    if os.name == "nt" and (
-        candidate == canonical_home.parent or candidate.parent == canonical_home.parent
-    ):
-        raise ValueError("file verification cache_root cannot be the broad Users directory")
-    try:
-        canonical_temporary_root = temporary_root.resolve()
-    except (OSError, RuntimeError, TypeError, ValueError) as error:
-        raise ValueError("file verification cache_root temp anchor cannot be resolved") from error
-    if candidate == canonical_temporary_root or candidate.parent == canonical_temporary_root:
-        raise ValueError("file verification cache_root cannot be a broad temp directory")
-
-    # A verification cache must never be placed in the current checkout (or in
-    # one of its parents/children).  This also catches ``.`` and the worktree
-    # root without relying on a particular repository layout.
-    try:
-        cwd = Path.cwd().resolve()
-    except (OSError, RuntimeError, TypeError, ValueError) as error:
-        raise ValueError("file verification cache_root cwd cannot be resolved") from error
-    try:
-        repository_roots = [
-            parent
-            for parent in (cwd, *cwd.parents)
-            if (parent / ".git").exists()
-        ]
-    except OSError as error:
-        raise ValueError("file verification cache_root worktree cannot be inspected") from error
-    for anchor in (cwd, *repository_roots):
-        if _contains(anchor, candidate) or _contains(candidate, anchor):
-            raise ValueError(
-                "file verification cache_root cannot overlap cwd or worktree"
-            )
-
-    # Validate the existing/creatable parent without creating anything.  The
-    # actual leaf is created only after a successful file hash.
-    try:
-        candidate_exists = candidate.exists()
-    except OSError as error:
-        raise ValueError("file verification cache_root cannot inspect directory") from error
-    if candidate_exists:
-        try:
-            candidate_is_dir = candidate.is_dir()
-        except OSError as error:
-            raise ValueError("file verification cache_root cannot inspect directory") from error
-        if not candidate_is_dir:
-            raise ValueError("file verification cache_root must be a directory")
-    else:
-        existing_parent = candidate.parent
-        try:
-            while (
-                not existing_parent.exists()
-                and existing_parent != existing_parent.parent
-            ):
-                existing_parent = existing_parent.parent
-            parent_is_dir = existing_parent.is_dir()
-        except OSError as error:
-            raise ValueError("file verification cache_root parent cannot be inspected") from error
-        if not parent_is_dir:
-            raise ValueError("file verification cache_root parent is not a directory")
-    return candidate
-
-
-def _regular_file_stat(path: Path) -> dict[str, int] | None:
-    """Return the stat identity used by a certificate, or ``None`` if unsafe."""
-
-    try:
-        observed = path.stat()
-    except OSError:
-        return None
-    if not stat.S_ISREG(observed.st_mode):
-        return None
-    return {
-        "st_dev": int(observed.st_dev),
-        "st_ino": int(observed.st_ino),
-        "st_size": int(observed.st_size),
-        "st_mtime_ns": int(observed.st_mtime_ns),
-        "st_ctime_ns": int(observed.st_ctime_ns),
-    }
-
-
-def _logical_file_stat(path: Path) -> dict[str, int | bool] | None:
-    """Return the original logical path's lstat identity."""
-
-    try:
-        observed = path.lstat()
-    except OSError:
-        return None
-    if not (stat.S_ISREG(observed.st_mode) or stat.S_ISLNK(observed.st_mode)):
-        return None
-    return {
-        "is_symlink": stat.S_ISLNK(observed.st_mode),
-        "st_dev": int(observed.st_dev),
-        "st_ino": int(observed.st_ino),
-        "st_size": int(observed.st_size),
-        "st_mtime_ns": int(observed.st_mtime_ns),
-        "st_ctime_ns": int(observed.st_ctime_ns),
-    }
-
-
-def _verification_snapshot(
-    logical_path: Path,
-) -> tuple[Path, dict[str, int | bool], dict[str, int]] | None:
-    """Capture logical-link and resolved-target identity for one verification."""
-
-    logical_stat = _logical_file_stat(logical_path)
-    if logical_stat is None:
-        return None
-    try:
-        resolved_path = logical_path.resolve()
-    except (OSError, RuntimeError):
-        return None
-    target_stat = _regular_file_stat(resolved_path)
-    if target_stat is None:
-        return None
-    return resolved_path, logical_stat, target_stat
-
-
-def _verification_certificate_path(
-    cache_root: Path,
-    logical_path: Path,
-    resolved_path: Path,
-    expected_sha256: str,
-) -> Path:
-    """Return a path keyed by logical/target paths and expected digest."""
-
-    key = hashlib.sha256(
-        f"{logical_path}\x00{resolved_path}\x00{expected_sha256}".encode("utf-8")
-    ).hexdigest()
-    return cache_root / key[:2] / f"{key}.json"
-
-
-def _valid_verified_at(value: object) -> bool:
-    if not isinstance(value, str) or not value or value != value.strip():
-        return False
-    try:
-        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
-    except ValueError:
-        return False
-    return parsed.tzinfo is not None
-
-
-def _certificate_hit(
-    certificate_path: Path,
-    *,
-    logical_path: Path,
-    logical_stat: Mapping[str, int | bool],
-    resolved_path: Path,
-    expected_sha256: str,
-    target_stat: Mapping[str, int],
-) -> bool:
-    """Validate a certificate completely; malformed data is always a miss."""
-
-    try:
-        encoded = certificate_path.read_bytes()
-        decoded = loads_strict_json(encoded)
-        if not isinstance(decoded, Mapping) or set(decoded) != _FILE_VERIFICATION_CERT_FIELDS:
-            return False
-        certificate = dict(decoded)
-        if encoded != canonical_json_bytes(certificate):
-            return False
-        if certificate.get("schema_version") != FILE_VERIFICATION_SCHEMA_VERSION:
-            return False
-        if certificate.get("logical_path") != str(logical_path):
-            return False
-        if type(certificate.get("logical_is_symlink")) is not bool:
-            return False
-        if certificate["logical_is_symlink"] != logical_stat["is_symlink"]:
-            return False
-        for field in ("st_dev", "st_ino", "st_size", "st_mtime_ns", "st_ctime_ns"):
-            logical_field = f"logical_{field}"
-            if (
-                type(certificate.get(logical_field)) is not int
-                or certificate[logical_field] != logical_stat[field]
-            ):
-                return False
-        if certificate.get("resolved_path") != str(resolved_path):
-            return False
-        if certificate.get("expected_sha256") != expected_sha256:
-            return False
-        for field in ("st_dev", "st_ino", "st_size", "st_mtime_ns", "st_ctime_ns"):
-            if type(certificate.get(field)) is not int or certificate[field] != target_stat[field]:
-                return False
-        actual_sha256 = certificate.get("actual_sha256")
-        if (
-            not isinstance(actual_sha256, str)
-            or _SHA256_RE.fullmatch(actual_sha256) is None
-            or actual_sha256 != expected_sha256
-        ):
-            return False
-        if not _valid_verified_at(certificate.get("verified_at")):
-            return False
-        artifact_hash = certificate.get("artifact_hash")
-        if (
-            not isinstance(artifact_hash, str)
-            or _SHA256_RE.fullmatch(artifact_hash) is None
-            or artifact_hash
-            != canonical_json_hash(
-                {
-                    field: value
-                    for field, value in certificate.items()
-                    if field != "artifact_hash"
-                }
-            )
-        ):
-            return False
-    except Exception:
-        return False
-    return True
-
-
-def _write_verification_certificate(
-    certificate_path: Path,
-    *,
-    logical_path: Path,
-    logical_stat: Mapping[str, int | bool],
-    resolved_path: Path,
-    expected_sha256: str,
-    actual_sha256: str,
-    target_stat: Mapping[str, int],
-) -> None:
-    certificate: dict[str, object] = {
-        "schema_version": FILE_VERIFICATION_SCHEMA_VERSION,
-        "logical_path": str(logical_path),
-        "logical_is_symlink": logical_stat["is_symlink"],
-        "logical_st_dev": logical_stat["st_dev"],
-        "logical_st_ino": logical_stat["st_ino"],
-        "logical_st_size": logical_stat["st_size"],
-        "logical_st_mtime_ns": logical_stat["st_mtime_ns"],
-        "logical_st_ctime_ns": logical_stat["st_ctime_ns"],
-        "resolved_path": str(resolved_path),
-        **dict(target_stat),
-        "expected_sha256": expected_sha256,
-        "actual_sha256": actual_sha256,
-        "verified_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
-    }
-    certificate["artifact_hash"] = canonical_json_hash(certificate)
-    try:
-        atomic_write_bytes(certificate_path, canonical_json_bytes(certificate), mode=0o644)
-    except OSError as error:
-        # Verification remains authoritative if an optional cache is unwritable.
-        _LOGGER.debug("file verification certificate write skipped: %s", error)
-
-
-def verified_sha256(
-    path: str | Path,
-    expected_sha256: str,
-    cache_root: str | Path | None = None,
-) -> str:
-    """Return a file SHA-256, using an opt-in fail-closed stat certificate cache.
-
-    A cache hit is accepted only when the certificate is canonical, complete, bound
-    to the resolved path and expected digest, and all recorded filesystem identity
-    fields still match.  A miss always falls back to hashing the file.  The actual
-    digest is returned even when it differs from ``expected_sha256`` so existing
-    callers retain their established, diagnostic mismatch errors.
-    """
-
-    if not isinstance(expected_sha256, str) or _SHA256_RE.fullmatch(expected_sha256) is None:
-        raise ValueError("expected_sha256 must be 64 lowercase hexadecimal characters")
-    root = _verification_cache_root(cache_root)
-    if root is None:
-        _LOGGER.debug("file verification cache disabled for %s", path)
-        return sha256_file(path)
-
-    try:
-        logical_path = Path(path).expanduser().absolute()
-    except (OSError, RuntimeError, TypeError, ValueError) as error:
-        raise ValueError("file verification logical path cannot be resolved") from error
-    initial = _verification_snapshot(logical_path)
-    if initial is None:
-        raise ValueError("file verification target must be a regular file")
-    resolved_path, logical_stat, target_stat = initial
-    certificate_path = _verification_certificate_path(
-        root,
-        logical_path,
-        resolved_path,
-        expected_sha256,
-    )
-    if _certificate_hit(
-        certificate_path,
-        logical_path=logical_path,
-        logical_stat=logical_stat,
-        resolved_path=resolved_path,
-        expected_sha256=expected_sha256,
-        target_stat=target_stat,
-    ):
-        # A second stat closes the read/validation window before accepting a hit.
-        if _verification_snapshot(logical_path) == initial:
-            _LOGGER.debug("file verification cache hit: %s", resolved_path)
-            return expected_sha256
-
-    _LOGGER.debug("file verification cache miss: %s", resolved_path)
-    actual_sha256 = sha256_file(resolved_path)
-    final = _verification_snapshot(logical_path)
-    if final != initial and final is not None:
-        # Do not certify a file that changed while it was being hashed.  One retry
-        # gives a concurrently published file a chance to settle without changing
-        # the existing mismatch behavior for callers.
-        actual_sha256 = sha256_file(final[0])
-        final = _verification_snapshot(logical_path)
-    if (
-        actual_sha256 == expected_sha256
-        and final is not None
-        and final == initial
-    ):
-        _write_verification_certificate(
-            certificate_path,
-            logical_path=logical_path,
-            logical_stat=logical_stat,
-            resolved_path=final[0],
-            expected_sha256=expected_sha256,
-            actual_sha256=actual_sha256,
-            target_stat=final[2],
-        )
-    return actual_sha256
 
 
 @dataclass(frozen=True, slots=True)
@@ -575,12 +90,7 @@ class PythiaShardDescriptor:
 class OrderedShardReader:
     """Read a verified ordered shard inventory as one continuous byte stream."""
 
-    def __init__(
-        self,
-        shards: Sequence[PythiaShardDescriptor],
-        *,
-        cache_root: str | Path | None = None,
-    ) -> None:
+    def __init__(self, shards: Sequence[PythiaShardDescriptor]) -> None:
         descriptors = tuple(shards)
         if not descriptors:
             raise PythiaDataError("at least one Pythia shard descriptor is required")
@@ -595,8 +105,7 @@ class OrderedShardReader:
                 "Pythia shard descriptors must be ordered and contiguous from ordinal zero"
             )
 
-        logical_paths = tuple(item.path.expanduser().absolute() for item in descriptors)
-        resolved_paths = tuple(path.resolve() for path in logical_paths)
+        resolved_paths = tuple(item.path.resolve() for item in descriptors)
         if len(set(resolved_paths)) != len(resolved_paths):
             raise PythiaDataError("duplicate Pythia shard path")
 
@@ -626,11 +135,7 @@ class OrderedShardReader:
                     f"Pythia shard size mismatch for {resolved}: "
                     f"{actual_size} != {item.size_bytes}"
                 )
-            actual_sha256 = verified_sha256(
-                resolved,
-                item.sha256,
-                cache_root=cache_root,
-            )
+            actual_sha256 = sha256_file(resolved)
             if actual_sha256 != item.sha256:
                 raise PythiaDataError(
                     f"Pythia shard SHA-256 mismatch for {resolved}: "
@@ -641,7 +146,6 @@ class OrderedShardReader:
             ends.append(cursor)
 
         self._shards = descriptors
-        self._logical_paths = logical_paths
         self._paths = resolved_paths
         self._starts = tuple(starts)
         self._ends = tuple(ends)
@@ -650,18 +154,6 @@ class OrderedShardReader:
     @property
     def shards(self) -> tuple[PythiaShardDescriptor, ...]:
         return self._shards
-
-    @property
-    def logical_paths(self) -> tuple[Path, ...]:
-        """Return the original absolute shard paths, without resolving links."""
-
-        return self._logical_paths
-
-    @property
-    def resolved_paths(self) -> tuple[Path, ...]:
-        """Return the resolved target paths captured during reader construction."""
-
-        return self._paths
 
     @property
     def total_size(self) -> int:
@@ -713,10 +205,8 @@ class MMapIndex:
         path: str | Path,
         *,
         expected_sha256: str | None = None,
-        cache_root: str | Path | None = None,
     ) -> None:
-        self.logical_path = Path(path).expanduser().absolute()
-        self.path = self.logical_path.resolve()
+        self.path = Path(path).expanduser().resolve()
         if self.path.name.casefold().endswith(".part"):
             raise PythiaDataError(f"temporary Pythia index is forbidden: {self.path}")
         if not self.path.is_file():
@@ -728,11 +218,7 @@ class MMapIndex:
                 raise PythiaDataError(
                     "expected index sha256 must be 64 lowercase hexadecimal characters"
                 )
-            actual_sha256 = verified_sha256(
-                self.path,
-                expected_sha256,
-                cache_root=cache_root,
-            )
+            actual_sha256 = sha256_file(self.path)
             if actual_sha256 != expected_sha256:
                 raise PythiaDataError(
                     f"Pythia index SHA-256 mismatch: {actual_sha256} != {expected_sha256}"
@@ -862,7 +348,6 @@ class PythiaIndexedDataset:
         record_stop: int | None = None,
         tokens_per_record: int = PYTHIA_TOKENS_PER_RECORD,
         expected_idx_sha256: str | None = None,
-        cache_root: str | Path | None = None,
     ) -> None:
         record_start = _require_nonnegative_integer(record_start, field="record_start")
         if record_stop is not None:
@@ -873,13 +358,9 @@ class PythiaIndexedDataset:
         if tokens_per_record < 2:
             raise PythiaDataError("tokens_per_record must be at least two")
 
-        self.index = MMapIndex(
-            idx_path,
-            expected_sha256=expected_idx_sha256,
-            cache_root=cache_root,
-        )
+        self.index = MMapIndex(idx_path, expected_sha256=expected_idx_sha256)
         try:
-            self.reader = OrderedShardReader(shards, cache_root=cache_root)
+            self.reader = OrderedShardReader(shards)
             if self.index.dtype_code != 8 or self.index.dtype != np.dtype(np.uint16):
                 raise PythiaDataError(
                     "Pythia token records require MMIDIDX dtype code 8 (uint16)"
