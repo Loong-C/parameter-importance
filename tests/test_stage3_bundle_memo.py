@@ -280,3 +280,40 @@ def test_finalize_and_seal_and_evict_clear_memo_and_reject_stale_get(
     assert not combined._memo and combined._memo_enabled is False
     with pytest.raises((KeyError, FileNotFoundError, ValueError)):
         combined.get(combined_keys[0])
+
+
+
+def test_seal_and_evict_seal_failure_clears_memo_without_persisted_changes(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "seal-failure"
+    root.mkdir()
+    cache, receipt_root, keys, _sealed = _fixture(root, codec=_CountingCodec())
+    cache.get(keys[0])
+    assert cache.memoization_bytes > 0 and cache._memo
+
+    def snapshot(path: Path) -> dict[str, bytes]:
+        return {
+            item.relative_to(path).as_posix(): item.read_bytes()
+            for item in path.rglob("*")
+            if item.is_file()
+        }
+
+    cache_before = snapshot(cache.root)
+    receipts_before = snapshot(receipt_root)
+    with pytest.raises(
+        ValueError, match="NODE_CACHE_DOWNSTREAM_RAW_SHARD_HASH_MISMATCH"
+    ):
+        cache.seal_and_evict(
+            scope="formal",
+            unit_id="memo-unit",
+            plan_hash=_hash("plan"),
+            run_config_hash=_hash("config"),
+            downstream_raw_shard_ref=root / "raw-shard.json",
+            downstream_raw_shard_hash=_hash("intentionally-wrong"),
+            receipt_root=receipt_root,
+        )
+    assert cache.memoization_bytes == 0
+    assert not cache._memo and cache._memo_enabled is False
+    assert snapshot(cache.root) == cache_before
+    assert snapshot(receipt_root) == receipts_before

@@ -2802,18 +2802,24 @@ class PersistentNodeGradientCache:
     ) -> dict[str, object]:
         """Execute both retention phases, returning the immutable EVICTED tombstone."""
 
-        sealed = self.seal(
-            scope=scope,
-            unit_id=unit_id,
-            plan_hash=plan_hash,
-            run_config_hash=run_config_hash,
-            downstream_raw_shard_ref=downstream_raw_shard_ref,
-            downstream_raw_shard_hash=downstream_raw_shard_hash,
-            receipt_root=receipt_root,
-        )
-        return self.finalize_eviction(
-            str(sealed["receipt_ref"]), receipt_root=receipt_root
-        )
+        try:
+            sealed = self.seal(
+                scope=scope,
+                unit_id=unit_id,
+                plan_hash=plan_hash,
+                run_config_hash=run_config_hash,
+                downstream_raw_shard_ref=downstream_raw_shard_ref,
+                downstream_raw_shard_hash=downstream_raw_shard_hash,
+                receipt_root=receipt_root,
+            )
+            return self.finalize_eviction(
+                str(sealed["receipt_ref"]), receipt_root=receipt_root
+            )
+        finally:
+            # The combined lifecycle must invalidate memo even when seal-phase
+            # validation fails before finalize_eviction can establish the boundary.
+            with self._lock:
+                self._disable_memoization_unlocked()
 
     @staticmethod
     def verify_receipt(
