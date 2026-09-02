@@ -26,6 +26,7 @@ from dataclasses import dataclass
 import hashlib
 import random
 import re
+import threading
 from types import MappingProxyType
 
 import numpy as np
@@ -635,6 +636,8 @@ class TorchFixedStateGradientProvider:
         self._enable_formal_batched = enable_formal_batched
         self._formal_batch_chunk_size = formal_batch_chunk_size
         self._digest_baseline: _DigestBaseline | None = None
+        self._parameter_state_lock = threading.Lock()
+        self._parameter_state_guard = threading.local()
 
     @property
     def registry_hash(self) -> str:
@@ -712,15 +715,27 @@ class TorchFixedStateGradientProvider:
         buffers: Mapping[str, torch.Tensor] | None = None,
         model_modes: Mapping[str, bool] | None = None,
     ) -> GradientBatch:
-        """在临时路径节点状态计算梯度，并无条件恢复 provider 原状态。
+        """在临时路径状态计算梯度，并串行保护 module 安装与恢复。"""
+        if getattr(self._parameter_state_guard, "active", False):
+            raise RuntimeError("PATH_PARAMETER_STATE_REENTRANT")
+        self._parameter_state_lock.acquire()
+        self._parameter_state_guard.active = True
+        try:
+            return self._gradient_at_parameter_state_locked(
+                parameters, draws, buffers=buffers, model_modes=model_modes
+            )
+        finally:
+            self._parameter_state_guard.active = False
+            self._parameter_state_lock.release()
 
-        ``parameters`` 必须完整覆盖 provider 的 canonical 坐标；``buffers`` 若给出，
-        必须完整覆盖模型 buffer。该方法先保存 provider 原状态，再安装路径节点，
-        调用常规 :meth:`gradient`（它自身仍执行一次固定状态防污染检查），最后恢复
-        原状态并核对摘要。因此一次节点求值既不会推进数据 resolver，也不会让路径
-        插值残留在后续 Stage 2/3 任务中。
-        """
-
+    def _gradient_at_parameter_state_locked(
+        self,
+        parameters: Mapping[str, torch.Tensor],
+        draws: Sequence[object],
+        *,
+        buffers: Mapping[str, torch.Tensor] | None = None,
+        model_modes: Mapping[str, bool] | None = None,
+    ) -> GradientBatch:
         if set(parameters) != set(self.parameter_names):
             raise ValueError("PATH_PARAMETER_STATE_NAMES_MISMATCH")
         module_parameters = dict(

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
+import threading
 from types import SimpleNamespace
 
 import pytest
@@ -316,3 +318,120 @@ def test_gradient_at_parameter_state_first_digest_failure_does_not_cache(
             [SimpleNamespace(sample_id="a")],
         )
     assert provider._digest_baseline is None
+
+
+def test_gradient_at_parameter_state_serializes_concurrent_nodes() -> None:
+    module = _ScaleLM()
+    provider = TorchFixedStateGradientProvider(
+        TorchModelAdapter(module, task_type="causal_lm"),
+        _resolver(),
+        fixed_state_id="path-concurrent-guard",
+        output_dtype=torch.float64,
+    )
+    provider.state_digest()
+    paths = {
+        "a": ({"weight": torch.tensor(0.5, dtype=torch.float64)}, "a"),
+        "b": ({"weight": torch.tensor(1.0, dtype=torch.float64)}, "b"),
+    }
+    expected = {
+        name: provider.gradient_at_parameter_state(
+            parameters, [SimpleNamespace(sample_id=sample_id)]
+        )
+        for name, (parameters, sample_id) in paths.items()
+    }
+    start = threading.Barrier(2)
+    results: dict[str, object] = {}
+    errors: list[BaseException] = []
+
+    def run(name: str) -> None:
+        parameters, sample_id = paths[name]
+        try:
+            start.wait(timeout=5.0)
+            results[name] = provider.gradient_at_parameter_state(
+                parameters, [SimpleNamespace(sample_id=sample_id)]
+            )
+        except BaseException as exc:  # pragma: no cover - assertion below reports it
+            errors.append(exc)
+
+    threads = [threading.Thread(target=run, args=(name,)) for name in paths]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=10.0)
+    assert all(not thread.is_alive() for thread in threads)
+    assert errors == []
+    assert set(results) == set(paths)
+    for name, observed in results.items():
+        reference = expected[name]
+        assert observed.sample_ids == reference.sample_ids  # type: ignore[union-attr]
+        torch.testing.assert_close(
+            observed.gradients["weight"],  # type: ignore[union-attr]
+            reference.gradients["weight"],  # type: ignore[union-attr]
+            rtol=0.0,
+            atol=0.0,
+        )
+    assert module.weight.item() == pytest.approx(0.25)
+
+
+def test_gradient_at_parameter_state_same_thread_reentry_fails_fast(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _ScaleLM()
+    provider = TorchFixedStateGradientProvider(
+        TorchModelAdapter(module, task_type="causal_lm"),
+        _resolver(),
+        fixed_state_id="path-reentry-guard",
+    )
+    provider.state_digest()
+    parameters = {"weight": torch.tensor(0.5, dtype=torch.float64)}
+    original_gradient = provider.gradient
+    reentry_errors: list[str] = []
+
+    def reenter(draws: Sequence[object]):
+        try:
+            provider.gradient_at_parameter_state(parameters, draws)
+        except RuntimeError as exc:
+            reentry_errors.append(str(exc))
+        return original_gradient(draws)
+
+    monkeypatch.setattr(provider, "gradient", reenter)
+    result = provider.gradient_at_parameter_state(
+        parameters, [SimpleNamespace(sample_id="a")]
+    )
+    assert torch.isfinite(result.gradients["weight"]).all()
+    assert reentry_errors == ["PATH_PARAMETER_STATE_REENTRANT"]
+    assert module.weight.item() == pytest.approx(0.25)
+
+
+def test_gradient_at_parameter_state_exception_releases_guard(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _ScaleLM()
+    provider = TorchFixedStateGradientProvider(
+        TorchModelAdapter(module, task_type="causal_lm"),
+        _resolver(),
+        fixed_state_id="path-guard-release",
+    )
+    provider.state_digest()
+    parameters = {"weight": torch.tensor(0.5, dtype=torch.float64)}
+    original_gradient = provider.gradient
+    failed = True
+
+    def fail_once(draws: Sequence[object]):
+        nonlocal failed
+        if failed:
+            failed = False
+            raise RuntimeError("EXPECTED_PATH_FAILURE")
+        return original_gradient(draws)
+
+    monkeypatch.setattr(provider, "gradient", fail_once)
+    with pytest.raises(RuntimeError, match="EXPECTED_PATH_FAILURE"):
+        provider.gradient_at_parameter_state(
+            parameters, [SimpleNamespace(sample_id="a")]
+        )
+    assert module.weight.item() == pytest.approx(0.25)
+    result = provider.gradient_at_parameter_state(
+        parameters, [SimpleNamespace(sample_id="a")]
+    )
+    assert torch.isfinite(result.gradients["weight"]).all()
+    assert module.weight.item() == pytest.approx(0.25)
