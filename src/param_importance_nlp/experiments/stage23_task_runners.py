@@ -10244,6 +10244,77 @@ def _quadrature_rule_from_name(name: str) -> object:
     raise ValueError(f"STAGE3_QUADRATURE_RULE_NAME_UNSUPPORTED:{name}")
 
 
+
+def _stage3_validate_streaming_recovery_rule_identity(
+    *,
+    reference_rules: Sequence[ReferenceRuleLevel],
+    candidate_names: Sequence[str],
+    all_rules: Sequence[object],
+) -> None:
+    """Fail closed on the formal 19-instance/17-artifact rule identity."""
+    def invalid(reason: str) -> None:
+        raise ValueError("STAGE3_STREAMING_CACHE_RULE_IDENTITY_MISMATCH:" + reason)
+    expected = tuple(DEFAULT_CANDIDATE_RULES)
+    if tuple(candidate_names) != expected or len(reference_rules) != 6 or len(all_rules) != 19:
+        invalid("shape")
+    references = tuple(level.rule for level in reference_rules)
+    def identity(rule: object, label: str) -> tuple[str, str, tuple[float, ...], tuple[float, ...]]:
+        try:
+            rule_hash, name = rule.artifact_hash, rule.name
+            nodes, weights = rule.nodes, rule.weights
+            node_values = tuple(float(item) for item in nodes.detach().cpu().tolist())
+            weight_values = tuple(float(item) for item in weights.detach().cpu().tolist())
+            if (
+                _SHA256_RE.fullmatch(rule_hash) is None or not name
+                or nodes.dtype != torch.float64 or nodes.ndim != 1 or not nodes.numel()
+                or weights.dtype != torch.float64 or weights.ndim != 1 or weights.numel() != nodes.numel()
+                or not bool(torch.isfinite(nodes).all()) or bool(((nodes < 0) | (nodes > 1)).any())
+                or not bool(torch.isfinite(weights).all()) or bool((weights < 0).any())
+                or not math.isclose(float(weights.sum().item()), 1.0, rel_tol=0.0, abs_tol=1e-12)
+            ):
+                invalid(f"{label}:fields")
+            payload = rule.to_dict()
+            if (
+                not isinstance(payload, Mapping)
+                or payload.get("artifact_hash") != rule_hash
+                or payload.get("name") != name
+                or tuple(payload.get("nodes", ())) != node_values
+                or tuple(payload.get("weights", ())) != weight_values
+                or canonical_json_hash({k: v for k, v in payload.items() if k != "artifact_hash"}) != rule_hash
+            ):
+                invalid(f"{label}:fingerprint")
+        except (AttributeError, TypeError, ValueError, OverflowError, RuntimeError):
+            invalid(f"{label}:fingerprint")
+        return rule_hash, name, node_values, weight_values
+    reference_ids = tuple(identity(rule, f"reference[{i}]") for i, rule in enumerate(references))
+    candidate_ids = tuple(identity(rule, f"candidate[{name}]") for name, rule in zip(expected, all_rules[6:]))
+    expected_ids = tuple(identity(_quadrature_rule_from_name(name), f"expected[{name}]") for name in expected)
+    if candidate_ids != expected_ids:
+        invalid("candidate")
+    reference_labels = []
+    for i, level in enumerate(reference_rules):
+        family, index = getattr(level, "family", None), getattr(level, "level", None)
+        if family not in {"gauss_legendre", "composite_simpson"} or isinstance(index, bool) or not isinstance(index, int) or index < 0:
+            invalid(f"reference[{i}]:label")
+        reference_labels.append(("reference", family, index))
+    if {(family, index) for _, family, index in reference_labels} != {("gauss_legendre", 0), ("gauss_legendre", 1), ("gauss_legendre", 2), ("composite_simpson", 0), ("composite_simpson", 1), ("composite_simpson", 2)}:
+        invalid("reference_ladder")
+    aliases = (("composite_simpson_16", "composite_simpson", 0), ("gauss_legendre_8", "gauss_legendre", 0))
+    expected_duplicates = set()
+    for candidate_name, family, index in aliases:
+        matches = [i for i, label in enumerate(reference_labels) if label[1:] == (family, index)]
+        if len(matches) != 1 or candidate_ids[expected.index(candidate_name)] != reference_ids[matches[0]]:
+            invalid(f"alias:{candidate_name}")
+        expected_duplicates.add(frozenset((reference_labels[matches[0]], ("candidate", candidate_name))))
+    labels = reference_labels + [("candidate", name) for name in expected]
+    groups = {}
+    for rule_id, label in zip(reference_ids + candidate_ids, labels):
+        groups.setdefault(rule_id[0], []).append(label)
+    duplicate_groups = {frozenset(items) for items in groups.values() if len(items) > 1}
+    if len(groups) != 17 or duplicate_groups != expected_duplicates or any(len(items) != 2 for items in groups.values() if len(items) > 1):
+        invalid("duplicates")
+
+
 def _load_path_reference_vector(
     reference: Mapping[str, object],
     root: Path,
@@ -12734,12 +12805,11 @@ def _run_stage3_formal_matrix_shard(
         else:
             if len(all_rules) != 19:
                 raise ValueError("STAGE3_STREAMING_CACHE_RULE_COUNT_MISMATCH")
-            rule_hashes = tuple(getattr(rule, "artifact_hash", None) for rule in all_rules)
-            if len(set(rule_hashes)) != 19 or any(
-                not isinstance(item, str) or _SHA256_RE.fullmatch(item) is None
-                for item in rule_hashes
-            ):
-                raise ValueError("STAGE3_STREAMING_CACHE_RULE_IDENTITY_MISMATCH")
+            _stage3_validate_streaming_recovery_rule_identity(
+                reference_rules=reference_rules,
+                candidate_names=candidate_names,
+                all_rules=all_rules,
+            )
             sealed_receipt, evicted_receipt = _stage3_verified_node_cache_lifecycle(
                 node_cache=node_cache,
                 receipt_root=receipt_root,
@@ -12804,6 +12874,22 @@ def _run_stage3_formal_matrix_shard(
                 evicted_receipt=evicted_receipt,
                 expected_evidence_hash=expected_evidence_hash,
             )
+            if recovery_fence is not None:
+                rule_requests = recovered_cache_evidence.get("rule_requests")
+                expected_rule_hashes = {
+                    getattr(rule, "artifact_hash") for rule in all_rules
+                }
+                if (
+                    not isinstance(rule_requests, list)
+                    or len(rule_requests) != 17
+                    or {
+                        item.get("rule_hash")
+                        for item in rule_requests
+                        if isinstance(item, Mapping)
+                    }
+                    != expected_rule_hashes
+                ):
+                    raise ValueError("STAGE3_STREAMING_CACHE_RULE_REQUEST_SET_MISMATCH")
         recovered_raw_shard = stored_raw_loaded[context.unit_id][0]
         recovered_observation_hash = _stage3_observation_artifact_hash(
             request,

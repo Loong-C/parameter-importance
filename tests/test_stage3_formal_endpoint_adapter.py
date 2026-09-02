@@ -277,6 +277,68 @@ def test_reference_cache_evidence_rejects_completed_rule_outside_ladder() -> Non
         stage23._completed_stage3_reference_rules(result, rules)
 
 
+
+def _formal_recovery_rule_inputs():
+    levels = tuple(
+        stage23.ReferenceRuleLevel(family, index, builder(points))
+        for family, builder, points_list in (
+            ("gauss_legendre", stage23.gauss_legendre_rule, (8, 16, 32)),
+            ("composite_simpson", stage23.composite_simpson_rule, (16, 32, 64)),
+        )
+        for index, points in enumerate(points_list)
+    )
+    names = tuple(stage23.DEFAULT_CANDIDATE_RULES)
+    rules = tuple(level.rule for level in levels) + tuple(
+        stage23._quadrature_rule_from_name(name) for name in names
+    )
+    return levels, names, rules
+
+
+def test_streaming_recovery_rule_identity_accepts_formal_aliases() -> None:
+    levels, names, rules = _formal_recovery_rule_inputs()
+    stage23._stage3_validate_streaming_recovery_rule_identity(
+        reference_rules=levels, candidate_names=names, all_rules=rules
+    )
+
+
+@pytest.mark.parametrize("mutation", ("duplicate", "hash", "nodes", "dtype", "extra", "missing"))
+def test_streaming_recovery_rule_identity_rejects_mutations(mutation: str) -> None:
+    levels, names, rules = _formal_recovery_rule_inputs()
+
+    class _Override:
+        def __init__(self, base, **overrides):
+            self.base = base
+            self.overrides = overrides
+
+        def __getattr__(self, name):
+            return self.overrides.get(name, getattr(self.base, name))
+
+        def to_dict(self):
+            return self.base.to_dict()
+
+    broken = list(rules)
+    broken_names = names
+    if mutation == "duplicate":
+        broken[6] = _Override(levels[0].rule)
+    elif mutation == "hash":
+        broken[6] = _Override(broken[6], artifact_hash="0" * 64)
+    elif mutation == "nodes":
+        nodes = broken[6].nodes.clone()
+        nodes[0] = 0.123456
+        broken[6] = _Override(broken[6], nodes=nodes)
+    elif mutation == "dtype":
+        broken[6] = _Override(broken[6], nodes=broken[6].nodes.float())
+    elif mutation == "extra":
+        broken_names = names + ("unexpected",)
+    elif mutation == "missing":
+        broken = broken[:-1]
+
+    with pytest.raises(ValueError, match="STAGE3_STREAMING_CACHE_RULE_IDENTITY_MISMATCH"):
+        stage23._stage3_validate_streaming_recovery_rule_identity(
+            reference_rules=levels, candidate_names=broken_names, all_rules=tuple(broken)
+        )
+
+
 def test_resume_shards_unwraps_sealed_reference_levels_before_cache_evidence(
     tmp_path: Path, monkeypatch
 ) -> None:
