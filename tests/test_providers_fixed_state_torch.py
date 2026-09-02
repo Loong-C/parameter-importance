@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+import param_importance_nlp.providers.fixed_state_torch as fixed_state_torch
 from param_importance_nlp.core.registry import ParameterRegistry
 from param_importance_nlp.providers.fixed_state_torch import (
     InMemoryFrozenSampleResolver,
@@ -207,3 +208,111 @@ def test_loss_unit_mismatch_and_external_state_drift_fail_closed() -> None:
         module.weight.add_(1.0)
     with pytest.raises(RuntimeError, match="STATE_CHANGED"):
         provider.assert_unchanged(before)
+
+
+def test_gradient_at_parameter_state_caches_baseline_but_postchecks_every_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _ScaleLM()
+    provider = TorchFixedStateGradientProvider(
+        TorchModelAdapter(module, task_type="causal_lm"),
+        _resolver(),
+        fixed_state_id="path-baseline-cache",
+        output_dtype=torch.float64,
+    )
+    original_state_digest = provider.state_digest
+    digest_calls: list[None] = []
+
+    def counted_state_digest() -> str:
+        digest_calls.append(None)
+        return original_state_digest()
+
+    monkeypatch.setattr(provider, "state_digest", counted_state_digest)
+    path_parameters = {"weight": torch.tensor(0.5, dtype=torch.float64)}
+    first = provider.gradient_at_parameter_state(
+        path_parameters, [SimpleNamespace(sample_id="a")]
+    )
+    second = provider.gradient_at_parameter_state(
+        path_parameters, [SimpleNamespace(sample_id="a")]
+    )
+
+    # The first call establishes the fixed baseline; each call still hashes
+    # the fully restored state exactly once.
+    assert len(digest_calls) == 3
+    assert first.statistical_weight == second.statistical_weight
+    assert first.sample_ids == second.sample_ids
+    assert first.loss == second.loss
+    torch.testing.assert_close(
+        first.gradients["weight"], second.gradients["weight"], rtol=0.0, atol=0.0
+    )
+
+
+def test_gradient_at_parameter_state_external_mutation_cannot_replace_baseline() -> None:
+    module = _ScaleLM()
+    provider = TorchFixedStateGradientProvider(
+        TorchModelAdapter(module, task_type="causal_lm"),
+        _resolver(),
+        fixed_state_id="path-baseline-drift",
+    )
+    path_parameters = {"weight": torch.tensor(0.5, dtype=torch.float64)}
+    provider.gradient_at_parameter_state(
+        path_parameters, [SimpleNamespace(sample_id="a")]
+    )
+    with torch.no_grad():
+        module.weight.add_(1.0)
+
+    with pytest.raises(RuntimeError, match="PATH_PROVIDER_STATE_CHANGED_AFTER_RESTORE"):
+        provider.gradient_at_parameter_state(
+            path_parameters, [SimpleNamespace(sample_id="a")]
+        )
+    assert module.weight.item() == pytest.approx(1.25)
+
+
+def test_gradient_at_parameter_state_restore_failure_does_not_publish_first_cache(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _ScaleLM()
+    provider = TorchFixedStateGradientProvider(
+        TorchModelAdapter(module, task_type="causal_lm"),
+        _resolver(),
+        fixed_state_id="path-baseline-restore-failure",
+    )
+
+    def fail_restore(*_args: object, **_kwargs: object) -> None:
+        raise RuntimeError("RESTORE_FAILURE")
+
+    monkeypatch.setattr(fixed_state_torch, "_restore_snapshot", fail_restore)
+    with pytest.raises(RuntimeError, match="RESTORE_FAILURE"):
+        provider.gradient_at_parameter_state(
+            {"weight": torch.tensor(0.5, dtype=torch.float64)},
+            [SimpleNamespace(sample_id="a")],
+        )
+    assert provider._digest_baseline is None
+
+
+def test_gradient_at_parameter_state_first_digest_failure_does_not_cache(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _ScaleLM()
+    provider = TorchFixedStateGradientProvider(
+        TorchModelAdapter(module, task_type="causal_lm"),
+        _resolver(),
+        fixed_state_id="path-baseline-initial-failure",
+    )
+    original_state_digest = provider.state_digest
+    failed = False
+
+    def fail_once() -> str:
+        nonlocal failed
+        if not failed:
+            failed = True
+            raise RuntimeError("BASELINE_DIGEST_FAILURE")
+        return original_state_digest()
+
+    monkeypatch.setattr(provider, "state_digest", fail_once)
+    with pytest.raises(RuntimeError, match="BASELINE_DIGEST_FAILURE"):
+        provider.gradient_at_parameter_state(
+            {"weight": torch.tensor(0.5, dtype=torch.float64)},
+            [SimpleNamespace(sample_id="a")],
+        )
+    assert provider._digest_baseline is None

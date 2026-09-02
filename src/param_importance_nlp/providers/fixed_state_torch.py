@@ -748,7 +748,21 @@ class TorchFixedStateGradientProvider:
         ):
             raise ValueError("PATH_MODEL_MODE_STATE_MISMATCH")
 
-        before_digest = self.state_digest()
+        # A path node must be checked against the provider's original fixed
+        # state, rather than whatever state happens to be installed when the
+        # node is entered.  Compute that digest only once per provider; every
+        # later invocation still performs the complete post-restore digest
+        # below, so an external model mutation cannot silently become the new
+        # baseline.
+        baseline_at_entry = self._digest_baseline
+        baseline_created = baseline_at_entry is None
+        if baseline_at_entry is None:
+            before_digest = self.state_digest()
+            baseline_at_entry = self._digest_baseline
+            if baseline_at_entry is None or baseline_at_entry.digest != before_digest:
+                raise RuntimeError("PATH_PROVIDER_BASELINE_UNAVAILABLE")
+        else:
+            before_digest = baseline_at_entry.digest
         snapshot = _take_snapshot(self._model.module)
         result: GradientBatch | None = None
         error: BaseException | None = None
@@ -775,9 +789,37 @@ class TorchFixedStateGradientProvider:
         except BaseException as exc:
             error = exc
         finally:
-            _restore_snapshot(self._model.module, snapshot)
-        if self.state_digest() != before_digest:
+            try:
+                _restore_snapshot(self._model.module, snapshot)
+            except BaseException:
+                # A failed restore leaves no trustworthy fixed-state cache.
+                # Preserve an already-established baseline for the next
+                # fail-closed check, but never retain a newly-created one.
+                self._digest_baseline = (
+                    None if baseline_created else baseline_at_entry
+                )
+                raise
+        try:
+            after_digest = self.state_digest()
+        except BaseException:
+            # state_digest() may have installed a replacement cache before
+            # failing; roll that mutation back to the cache valid on entry.
+            self._digest_baseline = (
+                None if baseline_created else baseline_at_entry
+            )
+            raise
+        if after_digest != before_digest:
+            # Do not let an externally-mutated model become the next fixed
+            # baseline merely because the post-restore check observed it.
+            self._digest_baseline = (
+                None if baseline_created else baseline_at_entry
+            )
             raise RuntimeError("PATH_PROVIDER_STATE_CHANGED_AFTER_RESTORE") from error
+        if error is not None and baseline_created:
+            # A failed first node evaluation is not a successful fixed-state
+            # call; avoid publishing a cache that callers could mistake for a
+            # completed baseline transaction.
+            self._digest_baseline = None
         if error is not None:
             raise error
         assert result is not None
