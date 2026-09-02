@@ -13,13 +13,16 @@
 from __future__ import annotations
 
 import copy
+from collections import OrderedDict
 from dataclasses import dataclass, field, replace
 import hashlib
 import math
 import os
 from pathlib import Path
 import re
+import sys
 import tempfile
+import threading
 from types import MappingProxyType
 from typing import Callable, Hashable, Mapping, Protocol, Sequence
 
@@ -711,10 +714,197 @@ def _write_immutable_canonical_json(path: Path, value: Mapping[str, object]) -> 
     finally:
         if temporary.name:
             temporary.unlink(missing_ok=True)
+_FileIdentity = tuple[int, int, int, int, int]
+
+
+@dataclass(frozen=True, slots=True)
+class _CurrentNodeIndexEntry:
+    """一条从磁盘重新读取的节点索引条目及其文件身份。"""
+
+    key: NodeCacheKey
+    object_ref: str
+    object_manifest_hash: str
+    value_digest: str
+    identity: str
+    source_paths: tuple[Path, ...]
+    source_identities: tuple[tuple[str, _FileIdentity], ...]
+
+
+@dataclass(slots=True)
+class _NodeMemoEntry:
+    """已完整验证的单节点模板；模板永远不直接返回给调用方。"""
+
+    key: NodeCacheKey
+    object_ref: str
+    value_digest: str
+    index_identity: str
+    source_identities: tuple[tuple[str, _FileIdentity], ...]
+    bundle_identities: tuple[tuple[str, _FileIdentity], ...]
+    generation: str
+    template: object
+    size_bytes: int
+
+
+def _path_identity(path: Path, *, expect_directory: bool = False) -> _FileIdentity:
+    """返回足以发现原地写入/替换的本地文件身份；异常时 fail closed。"""
+
+    if path.is_symlink():
+        raise ValueError(f"NODE_CACHE_PATH_SYMLINK:{path}")
+    try:
+        stat = path.stat()
+    except OSError as error:
+        raise ValueError(f"NODE_CACHE_PATH_STAT_FAILED:{path}") from error
+    if expect_directory:
+        if not path.is_dir():
+            raise ValueError(f"NODE_CACHE_DIRECTORY_MISSING:{path}")
+    elif not path.is_file():
+        raise ValueError(f"NODE_CACHE_FILE_MISSING:{path}")
+    return (
+        int(getattr(stat, "st_dev", 0)),
+        int(getattr(stat, "st_ino", 0)),
+        int(stat.st_size),
+        int(stat.st_mtime_ns),
+        int(stat.st_ctime_ns),
+    )
+
+
+def _bundle_file_identities(root: Path) -> tuple[tuple[str, _FileIdentity], ...]:
+    """枚举已发布 bundle 的全部文件并读取身份。
+
+    每次命中检查都会重新枚举，因而新增/删除文件也会使缓存失效；根目录身份
+    另外捕获没有文件内容的目录生命周期变化。这里不读取文件内容，哈希验证仍
+    只由 ``load_tensor_bundle`` 在首次加载或失效后负责。
+    """
+
+    _path_identity(root, expect_directory=True)
+    identities: list[tuple[str, _FileIdentity]] = [
+        ("<root>", _path_identity(root, expect_directory=True))
+    ]
+    try:
+        paths = sorted(root.rglob("*"), key=lambda item: item.relative_to(root).as_posix())
+    except OSError as error:
+        raise ValueError(f"NODE_CACHE_BUNDLE_ENUMERATION_FAILED:{root}") from error
+    for path in paths:
+        relative = path.relative_to(root).as_posix()
+        if path.is_symlink():
+            raise ValueError(f"NODE_CACHE_PATH_SYMLINK:{relative}")
+        if path.is_dir():
+            # Directory mtime catches directory-level lifecycle changes while file
+            # identities below catch content replacement. Include all directories so
+            # a newly-created empty subdirectory cannot be silently ignored.
+            identities.append((relative + "/", _path_identity(path, expect_directory=True)))
+        elif path.is_file():
+            identities.append((relative, _path_identity(path)))
+        else:
+            raise ValueError(f"NODE_CACHE_PATH_UNSUPPORTED:{relative}")
+    return tuple(identities)
+
+
+def _tree_nbytes(value: object, *, _seen: set[int] | None = None) -> int | None:
+    """Recursively estimate template bytes, including Python object overhead.
+
+    Tensor/array storage is counted in addition to sys.getsizeof. Mapping keys,
+    containers and scalar leaves are included so a scalar-heavy tree cannot bypass
+    the bound; unknown values fail closed.
+    """
+
+    seen = _seen if _seen is not None else set()
+    identity = id(value)
+    if identity in seen:
+        return 0
+    seen.add(identity)
+    try:
+        try:
+            total = int(sys.getsizeof(value))
+        except (TypeError, ValueError):
+            return None
+        try:
+            import torch
+        except ImportError:  # pragma: no cover - 极简环境
+            torch = None  # type: ignore[assignment]
+        if torch is not None and isinstance(value, torch.Tensor):
+            return total + int(value.numel()) * int(value.element_size())
+        if isinstance(value, np.ndarray):
+            return total + int(value.nbytes)
+        if isinstance(value, Mapping):
+            for key, child in value.items():
+                key_size = _tree_nbytes(key, _seen=seen)
+                child_size = _tree_nbytes(child, _seen=seen)
+                if key_size is None or child_size is None:
+                    return None
+                total += key_size + child_size
+            return total
+        if isinstance(value, (list, tuple)):
+            for child in value:
+                child_size = _tree_nbytes(child, _seen=seen)
+                if child_size is None:
+                    return None
+                total += child_size
+            return total
+        if value is None or isinstance(value, (bool, int, float, str)):
+            return total
+        return None
+    finally:
+        seen.discard(identity)
+
+
+def _available_memory_bytes() -> int | None:
+    """Best-effort read-only host availability probe for the memo budget."""
+
+    observed: list[int] = []
+    try:
+        page_size = int(os.sysconf("SC_PAGE_SIZE"))
+        available_pages = int(os.sysconf("SC_AVPHYS_PAGES"))
+        if page_size > 0 and available_pages > 0:
+            observed.append(page_size * available_pages)
+    except (AttributeError, OSError, TypeError, ValueError):
+        pass
+    try:
+        import psutil  # type: ignore[import-not-found]
+
+        available = int(psutil.virtual_memory().available)
+        if available > 0:
+            observed.append(available)
+    except (ImportError, AttributeError, OSError, TypeError, ValueError):
+        pass
+    # A container's cgroup limit can be much smaller than host-visible RAM. Read
+    # the limit/usage files when present so a bounded memo cannot reserve a whole
+    # 16 GiB host budget inside a memory-constrained worker.
+    for limit_path, usage_path in (
+        (
+            Path("/sys/fs/cgroup/memory.max"),
+            Path("/sys/fs/cgroup/memory.current"),
+        ),
+        (
+            Path("/sys/fs/cgroup/memory/memory.limit_in_bytes"),
+            Path("/sys/fs/cgroup/memory/memory.usage_in_bytes"),
+        ),
+    ):
+        try:
+            limit_text = limit_path.read_text(encoding="ascii").strip()
+            if limit_text == "max":
+                continue
+            limit = int(limit_text)
+            usage = int(usage_path.read_text(encoding="ascii").strip())
+            if limit > 0 and usage >= 0 and limit > usage:
+                observed.append(limit - usage)
+        except (OSError, UnicodeError, TypeError, ValueError):
+            continue
+    return min(observed) if observed else None
 
 
 class PersistentNodeGradientCache:
-    """批次原子提交、可跨进程恢复且不允许覆盖的安全节点缓存。"""
+    """批次原子提交、可跨进程恢复且不允许覆盖的安全节点缓存。
+
+    ``get`` 的首个访问仍会完整执行 TensorBundle 的 manifest、文件集合、dtype、
+    shape、内容哈希和节点值哈希验证。验证成功的单节点值可以在本进程/本实例
+    内短暂复用；命中前只重新读取相关 commit/index 条目并 stat 该条目引用的
+    全部文件，因此磁盘对象一旦发生原地修改、替换或生命周期变化，旧模板会被
+    丢弃并回到完整验证路径。memo 不写入任何 artifact，也不跨进程共享。
+    """
+
+    _DEFAULT_MAX_MEMO_BYTES = 16 * 1024**3
+    _MEMORY_SAFETY_MARGIN_BYTES = 512 * 1024**2
 
     def __init__(
         self,
@@ -722,7 +912,17 @@ class PersistentNodeGradientCache:
         *,
         codec: NodeValueCodec | None = None,
         receipt_root: str | Path | None = None,
+        memoize: bool = True,
+        max_memo_bytes: int | None = None,
     ) -> None:
+        if type(memoize) is not bool:
+            raise TypeError("memoize 必须是 bool")
+        if max_memo_bytes is not None and (
+            isinstance(max_memo_bytes, bool)
+            or not isinstance(max_memo_bytes, int)
+            or max_memo_bytes < 0
+        ):
+            raise ValueError("max_memo_bytes 必须是非负整数或 null")
         self.root = _resolved_cache_path(root, field_name="cache_root")
         self.objects = self.root / "objects"
         self.commits = self.root / "commits"
@@ -734,14 +934,33 @@ class PersistentNodeGradientCache:
             if receipt_root is not None
             else None
         )
+        self._lock = threading.RLock()
+        self._memoize = memoize
+        self._max_memo_bytes = (
+            self._DEFAULT_MAX_MEMO_BYTES
+            if max_memo_bytes is None
+            else max_memo_bytes
+        )
+        self._memo: OrderedDict[str, _NodeMemoEntry] = OrderedDict()
+        self._memo_bytes = 0
+        self._memo_enabled = False
+        self._memo_generation: str | None = None
+        self._memo_generation_path: Path | None = None
+        self._memo_generation_identity: _FileIdentity | None = None
         self._index: dict[str, tuple[NodeCacheKey, str, str]] = {}
+        self._index_sources: dict[str, tuple[Path, ...]] = {}
+        self._index_identities: dict[str, str] = {}
+        self._index_directory_identity: _FileIdentity | None = None
         self._reload_index()
+        self._try_enable_memoization()
 
     def __len__(self) -> int:
-        return len(self._index)
+        with self._lock:
+            return len(self._index)
 
     def __contains__(self, key: object) -> bool:
-        return isinstance(key, NodeCacheKey) and key.digest in self._index
+        with self._lock:
+            return isinstance(key, NodeCacheKey) and key.digest in self._index
 
     def _validated_commit(self, path: Path) -> tuple[Mapping[str, object], Mapping[str, object]]:
         commit = load_canonical_json(path)
@@ -764,8 +983,121 @@ class PersistentNodeGradientCache:
             raise ValueError("NODE_CACHE_OBJECT_STATE_INVALID")
         return commit, state
 
+    def _commit_header(self, path: Path) -> Mapping[str, object]:
+        """只验证 commit/index 外壳，不重新加载其 bundle。"""
+
+        commit = load_canonical_json(path)
+        if not isinstance(commit, Mapping):
+            raise ValueError("NODE_CACHE_COMMIT_NOT_OBJECT")
+        payload = {name: item for name, item in commit.items() if name != "artifact_hash"}
+        if canonical_json_hash(payload) != commit.get("artifact_hash"):
+            raise ValueError("NODE_CACHE_COMMIT_HASH_MISMATCH")
+        if commit.get("schema_version") != "stage3-node-cache-commit-v1":
+            raise ValueError("NODE_CACHE_COMMIT_SCHEMA_MISMATCH")
+        if commit.get("codec_id") != self.codec.codec_id:
+            raise ValueError("NODE_CACHE_CODEC_ID_MISMATCH")
+        entries = commit.get("entries")
+        if not isinstance(entries, list):
+            raise ValueError("NODE_CACHE_ENTRIES_INVALID")
+        return commit
+
+    def _entry_identity(
+        self,
+        path: Path,
+        commit: Mapping[str, object],
+        entry: Mapping[str, object],
+    ) -> str:
+        try:
+            commit_ref = path.relative_to(self.root).as_posix()
+        except ValueError as error:
+            raise ValueError("NODE_CACHE_COMMIT_PATH_ESCAPE") from error
+        return canonical_json_hash(
+            {
+                "commit_ref": commit_ref,
+                "commit_artifact_hash": commit["artifact_hash"],
+                "entry": dict(entry),
+            }
+        )
+
+    def _current_index_entry(self, key_digest: str) -> _CurrentNodeIndexEntry | None:
+        """重新读取当前 key 的 commit 条目及所有来源文件身份。"""
+
+        source_paths = self._index_sources.get(key_digest)
+        if not source_paths:
+            return None
+        matches: list[tuple[Path, Mapping[str, object], Mapping[str, object]]] = []
+        for path in source_paths:
+            commit = self._commit_header(path)
+            entries = commit["entries"]
+            assert isinstance(entries, list)
+            found = False
+            for raw_entry in entries:
+                if not isinstance(raw_entry, Mapping):
+                    raise ValueError("NODE_CACHE_ENTRY_NOT_OBJECT")
+                if str(raw_entry.get("key_digest")) != key_digest:
+                    continue
+                found = True
+                key_payload = raw_entry.get("key")
+                if not isinstance(key_payload, Mapping):
+                    raise ValueError("NODE_CACHE_KEY_PAYLOAD_INVALID")
+                key = _key_from_payload(key_payload)
+                if key.digest != key_digest:
+                    raise ValueError("NODE_CACHE_KEY_DIGEST_MISMATCH")
+                value_digest = raw_entry.get("value_digest")
+                if not isinstance(value_digest, str):
+                    raise ValueError("NODE_CACHE_VALUE_DIGEST_INVALID")
+                matches.append((path, commit, raw_entry))
+            if not found:
+                raise ValueError("NODE_CACHE_INDEX_ENTRY_MISSING")
+        if not matches:
+            raise ValueError("NODE_CACHE_INDEX_ENTRY_MISSING")
+        _, first_commit, first_entry = matches[0]
+        first_key_payload = first_entry["key"]
+        assert isinstance(first_key_payload, Mapping)
+        key = _key_from_payload(first_key_payload)
+        object_ref = str(first_commit["object_ref"])
+        object_manifest_hash = str(first_commit["object_manifest_hash"])
+        value_digest = str(first_entry["value_digest"])
+        source_identities: list[tuple[str, _FileIdentity]] = []
+        entry_identities: list[str] = []
+        for path, commit, entry in matches:
+            if str(commit["object_ref"]) != object_ref or str(entry["value_digest"]) != value_digest:
+                raise ValueError("NODE_CACHE_IMMUTABLE_KEY_CONFLICT")
+            entry_identities.append(self._entry_identity(path, commit, entry))
+            source_identities.append(
+                (
+                    path.relative_to(self.root).as_posix(),
+                    _path_identity(path),
+                )
+            )
+        return _CurrentNodeIndexEntry(
+            key=key,
+            object_ref=object_ref,
+            object_manifest_hash=object_manifest_hash,
+            value_digest=value_digest,
+            identity=canonical_json_hash(sorted(entry_identities)),
+            source_paths=tuple(path for path, _commit, _entry in matches),
+            source_identities=tuple(sorted(source_identities)),
+        )
+
     def _reload_index(self) -> None:
+        with self._lock:
+            self._reload_index_unlocked()
+
+    def _reload_index_unlocked(self) -> None:
+        # Index/lifecycle changes are an explicit cache boundary. Drop every
+        # template before touching disk so a failed reload can never leave a
+        # previously-authorized value available to a later caller.
+        if self._memo_enabled:
+            # A commit/index lifecycle change means the cache is no longer the
+            # sealed generation that authorized this process-local memo.
+            self._disable_memoization_unlocked()
+        else:
+            self._memo.clear()
+            self._memo_bytes = 0
         index: dict[str, tuple[NodeCacheKey, str, str]] = {}
+        sources: dict[str, list[Path]] = {}
+        identities: dict[str, list[str]] = {}
         for path in sorted(self.commits.glob("*.json")):
             commit, state = self._validated_commit(path)
             entries = commit.get("entries")
@@ -788,21 +1120,331 @@ class PersistentNodeGradientCache:
                 if previous is not None and previous[2] != value_digest:
                     raise ValueError("NODE_CACHE_IMMUTABLE_KEY_CONFLICT")
                 index[key_digest] = current
+                sources.setdefault(key_digest, []).append(path)
+                identities.setdefault(key_digest, []).append(
+                    self._entry_identity(path, commit, entry)
+                )
         self._index = index
+        self._index_sources = {
+            key_digest: tuple(paths)
+            for key_digest, paths in sources.items()
+        }
+        self._index_identities = {
+            key_digest: canonical_json_hash(sorted(entry_ids))
+            for key_digest, entry_ids in identities.items()
+        }
+        self._index_directory_identity = _path_identity(self.commits, expect_directory=True)
+
+    def _index_directory_changed(self) -> bool:
+        expected = self._index_directory_identity
+        if expected is None:
+            return True
+        try:
+            return _path_identity(self.commits, expect_directory=True) != expected
+        except (OSError, ValueError):
+            return True
+
+    def _disable_memoization_unlocked(self) -> None:
+        self._memo.clear()
+        self._memo_bytes = 0
+        self._memo_enabled = False
+        self._memo_generation = None
+        self._memo_generation_path = None
+        self._memo_generation_identity = None
+
+    def _activate_memoization(
+        self, receipt: Mapping[str, object], path: Path, *, validate_cache: bool
+    ) -> None:
+        if sys.platform != "linux":
+            return
+        validated = self._validate_sealed_payload(receipt)
+        if validated.get("cache_root_ref") != self.root.as_posix():
+            raise ValueError("NODE_CACHE_CACHE_ROOT_BINDING_MISMATCH")
+        if validate_cache:
+            self._cache_state_matches_seal(validated, allow_missing=False)
+        identity = _path_identity(path)
+        generation = validated.get("receipt_hash")
+        if not isinstance(generation, str):
+            raise ValueError("NODE_CACHE_SEAL_HASH_MISSING")
+        self._memo_generation = generation
+        self._memo_generation_path = path
+        self._memo_generation_identity = identity
+        self._memo_enabled = True
+
+    def _try_enable_memoization(self) -> None:
+        if (
+            not self._memoize
+            or sys.platform != "linux"
+            or self.receipt_root is None
+            or self.receipt_root.is_symlink()
+            or not self.receipt_root.is_dir()
+        ):
+            return
+        for path in sorted(self.receipt_root.glob("*.SEALED.json")):
+            if path.is_symlink() or not path.is_file():
+                continue
+            try:
+                receipt = load_canonical_json(path)
+                if not isinstance(receipt, Mapping):
+                    continue
+                if receipt.get("cache_root_ref") != self.root.as_posix():
+                    continue
+                self._activate_memoization(receipt, path, validate_cache=True)
+                return
+            except (OSError, TypeError, ValueError):
+                self._disable_memoization_unlocked()
+
+    def _memo_generation_current(self) -> bool:
+        if (
+            not self._memo_enabled
+            or self._memo_generation is None
+            or self._memo_generation_path is None
+            or self._memo_generation_identity is None
+        ):
+            return False
+        path = self._memo_generation_path
+        try:
+            if _path_identity(path) != self._memo_generation_identity:
+                return False
+            receipt = load_canonical_json(path)
+            if not isinstance(receipt, Mapping):
+                return False
+            validated = self._validate_sealed_payload(receipt)
+            return (
+                validated.get("receipt_hash") == self._memo_generation
+                and validated.get("cache_root_ref") == self.root.as_posix()
+            )
+        except (OSError, TypeError, ValueError):
+            return False
+
+    def _memo_matches(
+        self,
+        memo: _NodeMemoEntry,
+        current: _CurrentNodeIndexEntry,
+    ) -> bool:
+        if (
+            memo.key != current.key
+            or memo.object_ref != current.object_ref
+            or memo.value_digest != current.value_digest
+            or memo.generation != self._memo_generation
+            or memo.index_identity != current.identity
+            or memo.source_identities != current.source_identities
+        ):
+            return False
+        # Enumerating and stat'ing every file on each hit is deliberate. It keeps
+        # the memo a performance hint rather than a new authority and catches
+        # same-size in-place writes, atomic replacement, and bundle lifecycle drift.
+        current_bundle = _bundle_file_identities(self.root / current.object_ref)
+        return memo.bundle_identities == current_bundle
+
+    def _can_remember(self, size_bytes: int) -> bool:
+        if (
+            not self._memo_enabled
+            or not self._memoize
+            or size_bytes <= 0
+            or size_bytes > self._max_memo_bytes
+        ):
+            return False
+        available = _available_memory_bytes()
+        if available is not None and (
+            self._memo_bytes + size_bytes
+            > max(0, available - self._MEMORY_SAFETY_MARGIN_BYTES)
+        ):
+            return False
+        return True
+
+    def _remember(
+        self,
+        *,
+        current: _CurrentNodeIndexEntry,
+        template: object,
+        bundle_identities: tuple[tuple[str, _FileIdentity], ...],
+    ) -> None:
+        size_bytes = _tree_nbytes(template)
+        if size_bytes is None or size_bytes <= 0 or not self._memo_enabled:
+            return
+        digest = current.key.digest
+        previous = self._memo.pop(digest, None)
+        if previous is not None:
+            self._memo_bytes = max(0, self._memo_bytes - previous.size_bytes)
+        available = _available_memory_bytes()
+        budget = self._max_memo_bytes
+        if available is not None:
+            budget = min(
+                budget, max(0, available - self._MEMORY_SAFETY_MARGIN_BYTES)
+            )
+        # Evict before the admission check so a newly-small value can reclaim
+        # space from old LRU entries instead of being rejected prematurely.
+        while self._memo and self._memo_bytes + size_bytes > budget:
+            _evicted_digest, evicted = self._memo.popitem(last=False)
+            self._memo_bytes = max(0, self._memo_bytes - evicted.size_bytes)
+        if size_bytes > budget:
+            return
+        self._memo[digest] = _NodeMemoEntry(
+            key=current.key,
+            object_ref=current.object_ref,
+            value_digest=current.value_digest,
+            index_identity=current.identity,
+            source_identities=current.source_identities,
+            bundle_identities=bundle_identities,
+            generation=self._memo_generation or "",
+            template=template,
+            size_bytes=size_bytes,
+        )
+        self._memo_bytes += size_bytes
+
+    def _load_current(self, current: _CurrentNodeIndexEntry) -> object:
+        """完整验证当前 index 指向的 object，并返回本次调用的独立值。"""
+
+        object_path = self.root / current.object_ref
+        # Capture identities around the full load. If a writer/lifecycle actor
+        # mutates the object during verification, fail closed rather than caching
+        # a value whose content and recorded file identity came from different
+        # moments.
+        before = _bundle_file_identities(object_path)
+        state, bundle = load_tensor_bundle(object_path)
+        after = _bundle_file_identities(object_path)
+        if before != after:
+            self._memo.pop(current.key.digest, None)
+            raise ValueError("NODE_CACHE_BUNDLE_CHANGED_DURING_LOAD")
+        if bundle.manifest_sha256 != current.object_manifest_hash:
+            raise ValueError("NODE_CACHE_OBJECT_MANIFEST_HASH_MISMATCH")
+        if not isinstance(state, Mapping) or state.get("codec_id") != self.codec.codec_id:
+            raise ValueError("NODE_CACHE_OBJECT_STATE_INVALID")
+        values = state.get("values")
+        if not isinstance(values, Mapping):
+            raise ValueError("NODE_CACHE_VALUES_INVALID")
+        encoded = values.get(current.key.digest)
+        if encoded is None or _tree_digest(encoded) != current.value_digest:
+            raise ValueError("NODE_CACHE_VALUE_CHANGED_AFTER_INDEX")
+        template = self.codec.decode(encoded)
+        # Do not let the complete decoded object keep occupying the budget while
+        # deciding whether this one node template can be memoized. Safe codecs copy
+        # tensors during decode; deleting these containers therefore cannot mutate
+        # the template or alter the returned value.
+        del state, values, encoded
+        # ``after`` was captured before decoding, so a concurrent lifecycle change
+        # during codec work is checked one more time immediately before publication.
+        final_identities = _bundle_file_identities(object_path)
+        if after != final_identities:
+            self._memo.pop(current.key.digest, None)
+            raise ValueError("NODE_CACHE_BUNDLE_CHANGED_DURING_LOAD")
+        self._remember(
+            current=current,
+            template=template,
+            bundle_identities=final_identities,
+        )
+        return _clone_tree(template)
 
     def get(self, key: NodeCacheKey) -> object:
         if not isinstance(key, NodeCacheKey):
             raise TypeError("PersistentNodeGradientCache 只接受 NodeCacheKey")
-        indexed = self._index.get(key.digest)
-        if indexed is None:
-            raise KeyError(key)
-        _stored_key, object_ref, value_digest = indexed
-        state, _bundle = load_tensor_bundle(self.root / object_ref)
-        assert isinstance(state, Mapping) and isinstance(state["values"], Mapping)
-        encoded = state["values"][key.digest]
-        if _tree_digest(encoded) != value_digest:
-            raise ValueError("NODE_CACHE_VALUE_CHANGED_AFTER_INDEX")
-        return _clone_tree(self.codec.decode(encoded))
+        with self._lock:
+            indexed = self._index.get(key.digest)
+            if indexed is None:
+                raise KeyError(key)
+            if self._memo_enabled and not self._memo_generation_current():
+                self._disable_memoization_unlocked()
+            if self._index_directory_changed():
+                self._reload_index_unlocked()
+                indexed = self._index.get(key.digest)
+                if indexed is None:
+                    raise KeyError(key)
+            current = self._current_index_entry(key.digest)
+            if current is None:
+                self._reload_index_unlocked()
+                if key.digest not in self._index:
+                    raise KeyError(key)
+                current = self._current_index_entry(key.digest)
+                if current is None:  # pragma: no cover - defensive race guard
+                    raise KeyError(key)
+            expected = (current.key, current.object_ref, current.value_digest)
+            if indexed != expected or self._index_identities.get(key.digest) != current.identity:
+                # A changed index is itself a lifecycle boundary. Rebuild the
+                # authoritative in-memory index before deciding whether to load.
+                self._reload_index_unlocked()
+                indexed = self._index.get(key.digest)
+                if indexed is None:
+                    raise KeyError(key)
+                current = self._current_index_entry(key.digest)
+                if current is None:  # pragma: no cover - defensive race guard
+                    raise KeyError(key)
+                if indexed != (current.key, current.object_ref, current.value_digest):
+                    raise ValueError("NODE_CACHE_INDEX_CHANGED_DURING_READ")
+            memo = self._memo.get(key.digest)
+            if memo is not None:
+                try:
+                    valid = self._memo_matches(memo, current)
+                except (OSError, ValueError):
+                    # Re-enter complete bundle verification below. This preserves
+                    # the caller-visible failure reason for a malformed object and
+                    # never falls back to stale in-memory data.
+                    valid = False
+                if valid:
+                    self._memo.move_to_end(key.digest)
+                    try:
+                        return _clone_tree(memo.template)
+                    except Exception:
+                        self._memo.pop(key.digest, None)
+                        self._memo_bytes = max(
+                            0, self._memo_bytes - memo.size_bytes
+                        )
+                        raise
+                self._disable_memoization_unlocked()
+            return self._load_current(current)
+
+    @property
+    def memoization_max_bytes(self) -> int:
+        """当前实例的进程内 memo 上限（不代表已使用量）。"""
+
+        return self._max_memo_bytes
+
+    @property
+    def memoization_bytes(self) -> int:
+        """当前 memo 模板的估计 tensor/array 字节数。"""
+
+        with self._lock:
+            return self._memo_bytes
+
+    def clear_memoization(self) -> None:
+        """清空本实例 memo；磁盘 cache/index 不受影响。"""
+
+        with self._lock:
+            self._memo.clear()
+            self._memo_bytes = 0
+
+    def clear(self) -> None:
+        """生命周期兼容别名：只清空内存 memo，不删除持久 artifact。"""
+
+        self.clear_memoization()
+
+    def evict_memo(self, key: NodeCacheKey | None = None) -> None:
+        """驱逐一个节点或整个实例的进程内 memo。"""
+
+        with self._lock:
+            if key is None:
+                self._memo.clear()
+                self._memo_bytes = 0
+                return
+            if not isinstance(key, NodeCacheKey):
+                raise TypeError("PersistentNodeGradientCache 只接受 NodeCacheKey")
+            memo = self._memo.pop(key.digest, None)
+            if memo is not None:
+                self._memo_bytes = max(0, self._memo_bytes - memo.size_bytes)
+
+    def close(self) -> None:
+        """关闭/离开一个 cache 生命周期时清空内存 memo。
+
+        持久对象仍由现有恢复协议管理；保持 close 后可重新 get，便于调用方在
+        lifecycle transition 后显式释放内存而不改变 artifact 语义。
+        """
+
+        self.clear_memoization()
+
+    def lifecycle_transition(self, *_args: object, **_kwargs: object) -> None:
+        """供生命周期控制器调用的内存边界钩子。"""
+
+        self.clear_memoization()
 
     def publish_many(self, entries: Mapping[NodeCacheKey, object]) -> int:
         if not entries:
@@ -813,7 +1455,8 @@ class PersistentNodeGradientCache:
                 raise TypeError("PersistentNodeGradientCache 只接受 NodeCacheKey")
             encoded = self.codec.encode(value)
             value_digest = _tree_digest(encoded)
-            existing = self._index.get(key.digest)
+            with self._lock:
+                existing = self._index.get(key.digest)
             if existing is not None:
                 if existing[2] != value_digest:
                     raise ValueError("NODE_CACHE_IMMUTABLE_KEY_CONFLICT")
@@ -889,19 +1532,21 @@ class PersistentNodeGradientCache:
         return len(prepared)
 
     def keys(self) -> tuple[NodeCacheKey, ...]:
-        return tuple(self._index[digest][0] for digest in sorted(self._index))
+        with self._lock:
+            return tuple(self._index[digest][0] for digest in sorted(self._index))
 
     def reconcile(self) -> dict[str, object]:
-        self._reload_index()
-        referenced = {
-            str(load_canonical_json(path)["batch_digest"])  # type: ignore[index]
-            for path in self.commits.glob("*.json")
-        }
-        objects = {path.name for path in self.objects.iterdir() if path.is_dir()}
-        return {
-            "committed_key_digests": sorted(self._index),
-            "orphan_objects": sorted(objects - referenced),
-        }
+        with self._lock:
+            self._reload_index_unlocked()
+            referenced = {
+                str(load_canonical_json(path)["batch_digest"])  # type: ignore[index]
+                for path in self.commits.glob("*.json")
+            }
+            objects = {path.name for path in self.objects.iterdir() if path.is_dir()}
+            return {
+                "committed_key_digests": sorted(self._index),
+                "orphan_objects": sorted(objects - referenced),
+            }
 
     def _receipt_root_for(self, receipt_root: str | Path | None) -> Path:
         configured = self.receipt_root if receipt_root is None else receipt_root
@@ -1875,6 +2520,12 @@ class PersistentNodeGradientCache:
                     raise ValueError("NODE_CACHE_EVICTED_CACHE_NOT_EMPTY")
             else:
                 self._cache_state_matches_seal(validated, allow_missing=True)
+            try:
+                self._activate_memoization(
+                    validated, sealed_path, validate_cache=False
+                )
+            except (OSError, TypeError, ValueError):
+                self._disable_memoization_unlocked()
             return dict(validated)
 
         inventory = self._cache_inventory()
@@ -1932,6 +2583,10 @@ class PersistentNodeGradientCache:
         }
         receipt["receipt_hash"] = canonical_json_hash(receipt)
         _write_immutable_canonical_json(sealed_path, receipt)
+        try:
+            self._activate_memoization(receipt, sealed_path, validate_cache=False)
+        except (OSError, TypeError, ValueError):
+            self._disable_memoization_unlocked()
         return receipt
 
     @staticmethod
@@ -2111,13 +2766,18 @@ class PersistentNodeGradientCache:
 
     def evict(
         self,
-        receipt_ref: str | Path | Mapping[str, object] | None = None,
+        receipt_ref: str | Path | Mapping[str, object] | NodeCacheKey | None = None,
         *,
         receipt_root: str | Path | None = None,
         receipt_id: str | None = None,
     ) -> dict[str, object]:
-        """Alias for the recoverable second phase."""
+        """Alias for recovery, or evict one in-process memo entry."""
 
+        if isinstance(receipt_ref, NodeCacheKey):
+            if receipt_root is not None or receipt_id is not None:
+                raise ValueError("NODE_CACHE_MEMO_EVICT_ARGS_INVALID")
+            self.evict_memo(receipt_ref)
+            return {"state": "MEMO_EVICTED", "key_digest": receipt_ref.digest}
         return self.finalize_eviction(
             receipt_ref, receipt_root=receipt_root, receipt_id=receipt_id
         )
