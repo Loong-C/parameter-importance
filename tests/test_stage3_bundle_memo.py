@@ -4,17 +4,19 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import os
+import sys
 from pathlib import Path
 
 import numpy as np
 import pytest
 
 from param_importance_nlp.contracts import canonical_json_hash
-from param_importance_nlp.contracts.jsonio import write_canonical_json
+from param_importance_nlp.contracts.jsonio import load_canonical_json, write_canonical_json
 from param_importance_nlp.experiments.stage3 import NodeCacheKey
 from param_importance_nlp.experiments.stage3_formal import (
     PersistentNodeGradientCache,
     SafeTensorTreeCodec,
+    _clone_tree,
     _tree_nbytes,
 )
 from param_importance_nlp.experiments.stage3_raw_storage import RAW_SHARD_SCHEMA
@@ -204,3 +206,77 @@ def test_127_keys_and_19_17_2_path_alias_shapes_survive_evidence_recovery(
     )
     assert len(live["requested_key_digests"]) == 127
     assert recovered["evidence_hash"] == live["evidence_hash"]
+
+
+
+def test_tree_nbytes_counts_shared_refs_once_and_handles_cycles(tmp_path: Path) -> None:
+    shared = np.zeros(8, dtype=np.float64)
+    one = [shared]
+    twice = [shared, shared]
+    one_size = _tree_nbytes(one)
+    twice_size = _tree_nbytes(twice)
+    assert one_size is not None and twice_size is not None
+    assert twice_size - one_size == sys.getsizeof(twice) - sys.getsizeof(one)
+
+    cycle: list[object] = []
+    cycle.append(cycle)
+    assert _tree_nbytes(cycle) == sys.getsizeof(cycle)
+    scalar_size = _tree_nbytes(7)
+    assert scalar_size == sys.getsizeof(7) and scalar_size > 0
+
+
+def test_tensor_map_clone_preserves_dtype_device_and_isolation() -> None:
+    torch = pytest.importorskip("torch")
+    from param_importance_nlp.core.tensors import TensorMap
+
+    source = TensorMap({"gradient": torch.tensor([1.0], dtype=torch.float32)})
+    cloned = _clone_tree(source)
+    assert isinstance(cloned, TensorMap)
+    assert cloned["gradient"].dtype == source["gradient"].dtype
+    assert cloned["gradient"].device == source["gradient"].device
+    cloned["gradient"][0] = 9.0
+    assert source["gradient"][0].item() == 1.0
+
+
+def test_finalize_and_seal_and_evict_clear_memo_and_reject_stale_get(
+    tmp_path: Path,
+) -> None:
+    finalize_root = tmp_path / "finalize"
+    finalize_root.mkdir()
+    cache, receipt_root, keys, sealed = _fixture(
+        finalize_root, codec=_CountingCodec()
+    )
+    cache.get(keys[0])
+    assert cache.memoization_bytes > 0 and cache._memo
+    tombstone = cache.finalize_eviction(
+        str(sealed["receipt_ref"]), receipt_root=receipt_root
+    )
+    assert tombstone["state"] == "EVICTED"
+    assert cache.memoization_bytes == 0
+    assert not cache._memo and cache._memo_enabled is False
+    with pytest.raises((KeyError, FileNotFoundError, ValueError)):
+        cache.get(keys[0])
+
+    combined_root = tmp_path / "combined"
+    combined_root.mkdir()
+    combined, combined_receipts, combined_keys, _ = _fixture(
+        combined_root, codec=_CountingCodec()
+    )
+    combined.get(combined_keys[0])
+    assert combined.memoization_bytes > 0 and combined._memo
+    raw = load_canonical_json(combined_root / "raw-shard.json")
+    assert isinstance(raw, dict)
+    combined_tombstone = combined.seal_and_evict(
+        scope="formal",
+        unit_id="memo-unit",
+        plan_hash=_hash("plan"),
+        run_config_hash=_hash("config"),
+        downstream_raw_shard_ref=combined_root / "raw-shard.json",
+        downstream_raw_shard_hash=str(raw["artifact_hash"]),
+        receipt_root=combined_receipts,
+    )
+    assert combined_tombstone["state"] == "EVICTED"
+    assert combined.memoization_bytes == 0
+    assert not combined._memo and combined._memo_enabled is False
+    with pytest.raises((KeyError, FileNotFoundError, ValueError)):
+        combined.get(combined_keys[0])

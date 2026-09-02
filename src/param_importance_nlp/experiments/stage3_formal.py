@@ -805,7 +805,8 @@ def _tree_nbytes(value: object, *, _seen: set[int] | None = None) -> int | None:
 
     Tensor/array storage is counted in addition to sys.getsizeof. Mapping keys,
     containers and scalar leaves are included so a scalar-heavy tree cannot bypass
-    the bound; unknown values fail closed.
+    the bound; unknown values fail closed. ``_seen`` is retained for the whole
+    traversal so shared references are counted once and cycles terminate safely.
     """
 
     seen = _seen if _seen is not None else set()
@@ -814,38 +815,35 @@ def _tree_nbytes(value: object, *, _seen: set[int] | None = None) -> int | None:
         return 0
     seen.add(identity)
     try:
-        try:
-            total = int(sys.getsizeof(value))
-        except (TypeError, ValueError):
-            return None
-        try:
-            import torch
-        except ImportError:  # pragma: no cover - 极简环境
-            torch = None  # type: ignore[assignment]
-        if torch is not None and isinstance(value, torch.Tensor):
-            return total + int(value.numel()) * int(value.element_size())
-        if isinstance(value, np.ndarray):
-            return total + int(value.nbytes)
-        if isinstance(value, Mapping):
-            for key, child in value.items():
-                key_size = _tree_nbytes(key, _seen=seen)
-                child_size = _tree_nbytes(child, _seen=seen)
-                if key_size is None or child_size is None:
-                    return None
-                total += key_size + child_size
-            return total
-        if isinstance(value, (list, tuple)):
-            for child in value:
-                child_size = _tree_nbytes(child, _seen=seen)
-                if child_size is None:
-                    return None
-                total += child_size
-            return total
-        if value is None or isinstance(value, (bool, int, float, str)):
-            return total
+        total = int(sys.getsizeof(value))
+    except (TypeError, ValueError):
         return None
-    finally:
-        seen.discard(identity)
+    try:
+        import torch
+    except ImportError:  # pragma: no cover - 极简环境
+        torch = None  # type: ignore[assignment]
+    if torch is not None and isinstance(value, torch.Tensor):
+        return total + int(value.numel()) * int(value.element_size())
+    if isinstance(value, np.ndarray):
+        return total + int(value.nbytes)
+    if isinstance(value, Mapping):
+        for key, child in value.items():
+            key_size = _tree_nbytes(key, _seen=seen)
+            child_size = _tree_nbytes(child, _seen=seen)
+            if key_size is None or child_size is None:
+                return None
+            total += key_size + child_size
+        return total
+    if isinstance(value, (list, tuple)):
+        for child in value:
+            child_size = _tree_nbytes(child, _seen=seen)
+            if child_size is None:
+                return None
+            total += child_size
+        return total
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return total
+    return None
 
 
 def _available_memory_bytes() -> int | None:
@@ -2684,6 +2682,11 @@ class PersistentNodeGradientCache:
     ) -> dict[str, object]:
         """Complete the delete phase for a SEALED receipt after interruption."""
 
+        # Finalization is a persistent lifecycle boundary. Clear before any
+        # validation/deletion so every failure path cannot expose stale templates.
+        with self._lock:
+            self._disable_memoization_unlocked()
+
         receipt_base = self._receipt_root_for(receipt_root)
         if isinstance(receipt_ref, Mapping):
             receipt_ref = receipt_ref.get("receipt_ref")  # type: ignore[assignment]
@@ -2718,10 +2721,14 @@ class PersistentNodeGradientCache:
             self._cache_state_matches_seal(sealed, allow_missing=True)
             if self._cache_state_has_files(sealed):
                 raise ValueError("NODE_CACHE_EVICTED_CACHE_NOT_EMPTY")
+            with self._lock:
+                self._disable_memoization_unlocked()
             return tombstone
 
         self._cache_state_matches_seal(sealed, allow_missing=True)
         self._delete_sealed_files(sealed)
+        with self._lock:
+            self._disable_memoization_unlocked()
         if self._cache_state_has_files(sealed):
             raise ValueError("NODE_CACHE_EVICTION_INCOMPLETE")
         tombstone: dict[str, object] = {
