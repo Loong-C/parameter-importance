@@ -337,7 +337,8 @@ def test_fresh_formal_unit_ephemeral_memo_reuses_thirteen_rule_accesses(
     commit_evidence = cache.commit_evidence([key])
     evidence: dict[str, object] = {
         "schema_version": "stage3-path-node-cache-evidence-v1",
-        "cache_root_ref": cache.root.as_posix(),
+        # Formal path evidence carries a workspace-relative logical ref.
+        "cache_root_ref": cache.root.relative_to(tmp_path).as_posix(),
         "path_unit_id": "fresh-formal-unit",
         "precision": "float64",
         "parameter_registry_hash": registry_hash,
@@ -354,7 +355,21 @@ def test_fresh_formal_unit_ephemeral_memo_reuses_thirteen_rule_accesses(
         "commit_evidence": commit_evidence,
     }
     evidence["evidence_hash"] = canonical_json_hash(evidence)
-    cache.authorize_ephemeral_memoization([key], evidence)
+    wrong_root = dict(evidence)
+    wrong_root["cache_root_ref"] = "other-cache/stage3-node-gradients/fresh-formal-unit"
+    wrong_root["evidence_hash"] = canonical_json_hash(wrong_root)
+    with pytest.raises(
+        ValueError, match="NODE_CACHE_EPHEMERAL_CACHE_ROOT_MISMATCH"
+    ):
+        cache.authorize_ephemeral_memoization(
+            [key], wrong_root, cache_root_base=tmp_path
+        )
+    assert cache.memoization_bytes == 0
+    assert not cache._memo and cache._memo_enabled is False
+
+    cache.authorize_ephemeral_memoization(
+        [key], evidence, cache_root_base=tmp_path
+    )
     assert cache._memo_enabled is True
     assert cache._memo_mode == "ephemeral"
 
@@ -409,7 +424,9 @@ def test_fresh_formal_unit_ephemeral_memo_reuses_thirteen_rule_accesses(
     refreshed["commit_evidence"] = refreshed_commit_evidence
     refreshed.pop("evidence_hash", None)
     refreshed["evidence_hash"] = canonical_json_hash(refreshed)
-    cache.authorize_ephemeral_memoization([key], refreshed)
+    cache.authorize_ephemeral_memoization(
+        [key], refreshed, cache_root_base=tmp_path
+    )
     commit_file = next((cache.root / "commits").glob("*.json"))
     original_commit = commit_file.read_bytes()
     commit_stat = commit_file.stat()

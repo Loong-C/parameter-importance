@@ -12994,7 +12994,9 @@ def _run_stage3_formal_matrix_shard(
     # passed two-phase commit evidence and identity validation.  Only then may
     # this process reuse verified templates while the candidate rules run.
     context.node_cache.authorize_ephemeral_memoization(
-        reference_keys, reference_cache_evidence
+        reference_keys,
+        reference_cache_evidence,
+        cache_root_base=root,
     )
     matrix_reference: dict[str, JSONValue] = {
         "schema_version": "stage3-task-path-integral-reference-v1",

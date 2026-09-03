@@ -661,6 +661,46 @@ def _resolved_cache_path(value: str | Path, *, field_name: str) -> Path:
     return path.resolve(strict=False)
 
 
+def _canonical_cache_root_reference(
+    value: object,
+    *,
+    base: str | Path | None,
+) -> Path:
+    """Resolve a receipt/evidence cache root without weakening workspace binding.
+
+    Runtime evidence stores a workspace-relative logical ref, whereas the cache
+    instance stores a canonical absolute path. Relative refs are accepted only
+    with an explicit trusted workspace base and may not cross it or traverse a
+    symlink. Absolute refs are canonicalized and still compared exactly by the
+    caller.
+    """
+
+    if not isinstance(value, str) or not value or "\\" in value:
+        raise ValueError("NODE_CACHE_CACHE_ROOT_REFERENCE_INVALID")
+    reference = Path(value)
+    if reference.is_absolute():
+        return reference.resolve(strict=False)
+    if base is None:
+        raise ValueError("NODE_CACHE_CACHE_ROOT_REFERENCE_BASE_REQUIRED")
+    base_input = Path(base)
+    if base_input.is_symlink():
+        raise ValueError("NODE_CACHE_CACHE_ROOT_REFERENCE_BASE_SYMLINK")
+    base_path = _resolved_cache_path(base_input, field_name="cache_root_base")
+    if not reference.parts or any(
+        part in {"", ".", ".."} for part in reference.parts
+    ):
+        raise ValueError("NODE_CACHE_CACHE_ROOT_REFERENCE_ESCAPE")
+    current = base_path
+    for part in reference.parts:
+        current = current / part
+        if current.is_symlink():
+            raise ValueError("NODE_CACHE_CACHE_ROOT_REFERENCE_SYMLINK")
+    resolved = current.resolve(strict=False)
+    if not _path_is_within(resolved, base_path):
+        raise ValueError("NODE_CACHE_CACHE_ROOT_REFERENCE_ESCAPE")
+    return resolved
+
+
 def _require_external_receipt_root(cache_root: Path, value: str | Path) -> Path:
     receipt_root = _resolved_cache_path(value, field_name="receipt_root")
     if _path_is_within(receipt_root, cache_root) or _path_is_within(
@@ -1182,6 +1222,8 @@ class PersistentNodeGradientCache:
         self,
         keys: Sequence[NodeCacheKey],
         evidence: Mapping[str, object],
+        *,
+        cache_root_base: str | Path | None = None,
     ) -> None:
         """Explicitly authorize a Linux fresh-unit memo from verified commit evidence.
 
@@ -1200,7 +1242,16 @@ class PersistentNodeGradientCache:
                 raise TypeError("NODE_CACHE_EPHEMERAL_EVIDENCE_INVALID")
             if evidence.get("schema_version") != "stage3-path-node-cache-evidence-v1":
                 raise ValueError("NODE_CACHE_EPHEMERAL_EVIDENCE_SCHEMA_MISMATCH")
-            if evidence.get("cache_root_ref") != self.root.as_posix():
+            try:
+                evidence_root = _canonical_cache_root_reference(
+                    evidence.get("cache_root_ref"),
+                    base=cache_root_base,
+                )
+            except (OSError, TypeError, ValueError) as error:
+                raise ValueError(
+                    "NODE_CACHE_EPHEMERAL_CACHE_ROOT_MISMATCH"
+                ) from error
+            if evidence_root != self.root:
                 raise ValueError("NODE_CACHE_EPHEMERAL_CACHE_ROOT_MISMATCH")
             requested = sorted({
                 key.digest
