@@ -945,6 +945,9 @@ class PersistentNodeGradientCache:
         self._memo_generation: str | None = None
         self._memo_generation_path: Path | None = None
         self._memo_generation_identity: _FileIdentity | None = None
+        self._memo_mode: str | None = None
+        self._memo_allowed_key_digests: frozenset[str] | None = None
+        self._memo_ephemeral_index_snapshot: tuple[tuple[str, _FileIdentity], ...] | None = None
         self._index: dict[str, tuple[NodeCacheKey, str, str]] = {}
         self._index_sources: dict[str, tuple[Path, ...]] = {}
         self._index_identities: dict[str, str] = {}
@@ -1149,6 +1152,9 @@ class PersistentNodeGradientCache:
         self._memo_generation = None
         self._memo_generation_path = None
         self._memo_generation_identity = None
+        self._memo_mode = None
+        self._memo_allowed_key_digests = None
+        self._memo_ephemeral_index_snapshot = None
 
     def _activate_memoization(
         self, receipt: Mapping[str, object], path: Path, *, validate_cache: bool
@@ -1167,7 +1173,149 @@ class PersistentNodeGradientCache:
         self._memo_generation = generation
         self._memo_generation_path = path
         self._memo_generation_identity = identity
+        self._memo_mode = "sealed"
+        self._memo_allowed_key_digests = None
+        self._memo_ephemeral_index_snapshot = None
         self._memo_enabled = True
+
+    def authorize_ephemeral_memoization(
+        self,
+        keys: Sequence[NodeCacheKey],
+        evidence: Mapping[str, object],
+    ) -> None:
+        """Explicitly authorize a Linux fresh-unit memo from verified commit evidence.
+
+        This is never called by construction or by an ordinary unsealed cache.  The
+        caller must first complete two-phase publication and produce ordinary
+        ``commit_evidence``.  The authorization binds the process-local memo to the
+        exact requested key set and a stat identity snapshot of every commit/index
+        file; any later commit/index change disables it before a hit can be served.
+        """
+
+        with self._lock:
+            self._disable_memoization_unlocked()
+            if not self._memoize or sys.platform != "linux":
+                return
+            if not isinstance(evidence, Mapping):
+                raise TypeError("NODE_CACHE_EPHEMERAL_EVIDENCE_INVALID")
+            if evidence.get("schema_version") != "stage3-path-node-cache-evidence-v1":
+                raise ValueError("NODE_CACHE_EPHEMERAL_EVIDENCE_SCHEMA_MISMATCH")
+            if evidence.get("cache_root_ref") != self.root.as_posix():
+                raise ValueError("NODE_CACHE_EPHEMERAL_CACHE_ROOT_MISMATCH")
+            requested = sorted({
+                key.digest
+                for key in keys
+                if isinstance(key, NodeCacheKey)
+            })
+            if len(requested) != len(tuple(keys)):
+                raise TypeError("PersistentNodeGradientCache 只接受 NodeCacheKey")
+            if not requested:
+                raise ValueError("NODE_CACHE_EPHEMERAL_KEYS_REQUIRED")
+            evidence_hash = evidence.get("evidence_hash")
+            evidence_body = {
+                name: item for name, item in evidence.items() if name != "evidence_hash"
+            }
+            if (
+                not isinstance(evidence_hash, str)
+                or canonical_json_hash(evidence_body) != evidence_hash
+            ):
+                raise ValueError("NODE_CACHE_EPHEMERAL_EVIDENCE_HASH_MISMATCH")
+            commit_evidence = evidence.get("commit_evidence")
+            if not isinstance(commit_evidence, Mapping):
+                raise ValueError("NODE_CACHE_EPHEMERAL_COMMIT_EVIDENCE_MISSING")
+            commit_evidence_hash = commit_evidence.get("evidence_hash")
+            commit_body = {
+                name: item
+                for name, item in commit_evidence.items()
+                if name != "evidence_hash"
+            }
+            if (
+                not isinstance(commit_evidence_hash, str)
+                or canonical_json_hash(commit_body) != commit_evidence_hash
+            ):
+                raise ValueError("NODE_CACHE_EPHEMERAL_COMMIT_EVIDENCE_HASH_MISMATCH")
+            if (
+                commit_evidence.get("schema_version")
+                != "stage3-node-cache-evidence-v1"
+                or commit_evidence.get("codec_id") != self.codec.codec_id
+                or commit_evidence.get("all_requested_keys_committed") is not True
+                or commit_evidence.get("missing_key_digests") != []
+                or commit_evidence.get("requested_key_digests") != requested
+            ):
+                raise ValueError("NODE_CACHE_EPHEMERAL_COMMIT_EVIDENCE_INVALID")
+            authoritative = commit_evidence.get("authoritative_commits")
+            if not isinstance(authoritative, list) or not authoritative:
+                raise ValueError("NODE_CACHE_EPHEMERAL_AUTHORITATIVE_COMMITS_MISSING")
+            covered: set[str] = set()
+            records_by_digest: dict[str, list[tuple[Mapping[str, object], Mapping[str, object]]]] = {}
+            for item in authoritative:
+                if not isinstance(item, Mapping):
+                    raise ValueError("NODE_CACHE_EPHEMERAL_AUTHORITATIVE_COMMIT_INVALID")
+                commit_ref = item.get("commit_ref")
+                commit_relative = Path(str(commit_ref))
+                if (
+                    not isinstance(commit_ref, str)
+                    or commit_relative.is_absolute()
+                    or commit_relative.parts[:1] != ("commits",)
+                    or len(commit_relative.parts) != 2
+                    or commit_relative.suffix != ".json"
+                ):
+                    raise ValueError("NODE_CACHE_EPHEMERAL_COMMIT_REF_INVALID")
+                commit_path = self.root / commit_relative
+                if commit_path.is_symlink() or not commit_path.is_file():
+                    raise ValueError("NODE_CACHE_EPHEMERAL_COMMIT_MISSING")
+                commit = self._commit_header(commit_path)
+                for name in ("commit_artifact_hash", "object_ref", "object_manifest_hash"):
+                    if item.get(name) != commit.get(
+                        "artifact_hash" if name == "commit_artifact_hash" else name
+                    ):
+                        raise ValueError("NODE_CACHE_EPHEMERAL_COMMIT_IDENTITY_MISMATCH")
+                raw_digests = item.get("key_digests")
+                if not isinstance(raw_digests, list) or not raw_digests:
+                    raise ValueError("NODE_CACHE_EPHEMERAL_COMMIT_KEYS_INVALID")
+                for raw_digest in raw_digests:
+                    digest = _require_sha256(
+                        str(raw_digest), field_name="ephemeral key digest"
+                    )
+                    covered.add(digest)
+                    records_by_digest.setdefault(digest, []).append((item, commit))
+            if covered != set(requested):
+                raise ValueError("NODE_CACHE_EPHEMERAL_KEY_SET_MISMATCH")
+            for digest in requested:
+                current = self._current_index_entry(digest)
+                if current is None:
+                    raise ValueError("NODE_CACHE_EPHEMERAL_INDEX_ENTRY_MISSING")
+                matches = records_by_digest.get(digest, ())
+                if not any(
+                    current.object_ref == str(item.get("object_ref"))
+                    and current.object_manifest_hash
+                    == str(item.get("object_manifest_hash"))
+                    and any(
+                        isinstance(entry, Mapping)
+                        and str(entry.get("key_digest")) == digest
+                        and str(entry.get("value_digest")) == current.value_digest
+                        for entry in commit.get("entries", ())
+                    )
+                    for item, commit in matches
+                ):
+                    raise ValueError("NODE_CACHE_EPHEMERAL_INDEX_IDENTITY_MISMATCH")
+            snapshot = _bundle_file_identities(self.commits)
+            snapshot_payload = [
+                [name, list(identity)] for name, identity in snapshot
+            ]
+            self._memo_generation = canonical_json_hash(
+                {
+                    "evidence_hash": evidence_hash,
+                    "requested_key_digests": requested,
+                    "index_snapshot": snapshot_payload,
+                }
+            )
+            self._memo_generation_path = None
+            self._memo_generation_identity = None
+            self._memo_mode = "ephemeral"
+            self._memo_allowed_key_digests = frozenset(requested)
+            self._memo_ephemeral_index_snapshot = snapshot
+            self._memo_enabled = True
 
     def _try_enable_memoization(self) -> None:
         if (
@@ -1193,9 +1341,18 @@ class PersistentNodeGradientCache:
                 self._disable_memoization_unlocked()
 
     def _memo_generation_current(self) -> bool:
+        if not self._memo_enabled or self._memo_generation is None:
+            return False
+        if self._memo_mode == "ephemeral":
+            snapshot = self._memo_ephemeral_index_snapshot
+            if snapshot is None:
+                return False
+            try:
+                return _bundle_file_identities(self.commits) == snapshot
+            except (OSError, ValueError):
+                return False
         if (
-            not self._memo_enabled
-            or self._memo_generation is None
+            self._memo_mode != "sealed"
             or self._memo_generation_path is None
             or self._memo_generation_identity is None
         ):
@@ -1262,6 +1419,14 @@ class PersistentNodeGradientCache:
         if size_bytes is None or size_bytes <= 0 or not self._memo_enabled:
             return
         digest = current.key.digest
+        if (
+            self._memo_mode == "ephemeral"
+            and (
+                self._memo_allowed_key_digests is None
+                or digest not in self._memo_allowed_key_digests
+            )
+        ):
+            return
         previous = self._memo.pop(digest, None)
         if previous is not None:
             self._memo_bytes = max(0, self._memo_bytes - previous.size_bytes)

@@ -12,7 +12,9 @@ import pytest
 
 from param_importance_nlp.contracts import canonical_json_hash
 from param_importance_nlp.contracts.jsonio import load_canonical_json, write_canonical_json
-from param_importance_nlp.experiments.stage3 import NodeCacheKey
+from param_importance_nlp.core.quadrature import PathSpec, midpoint_rule
+from param_importance_nlp.core.tensors import TensorMap
+from param_importance_nlp.experiments.stage3 import NodeCacheKey, PathAnalysisRunner
 from param_importance_nlp.experiments.stage3_formal import (
     PersistentNodeGradientCache,
     SafeTensorTreeCodec,
@@ -317,3 +319,103 @@ def test_seal_and_evict_seal_failure_clears_memo_without_persisted_changes(
     assert not cache._memo and cache._memo_enabled is False
     assert snapshot(cache.root) == cache_before
     assert snapshot(receipt_root) == receipts_before
+
+
+
+def test_fresh_formal_unit_ephemeral_memo_reuses_thirteen_rule_accesses(
+    tmp_path: Path,
+) -> None:
+    torch = pytest.importorskip("torch")
+    codec = _CountingCodec()
+    cache = PersistentNodeGradientCache(tmp_path / "fresh-cache", codec=codec)
+    registry_hash = _hash("registry")
+    loss_hash = _hash("loss")
+    key = NodeCacheKey("fresh-formal-unit", 0.5, "float64", registry_hash, loss_hash)
+    cache.publish_many(
+        {key: TensorMap({"x": torch.tensor([1.0], dtype=torch.float64)})}
+    )
+    commit_evidence = cache.commit_evidence([key])
+    evidence: dict[str, object] = {
+        "schema_version": "stage3-path-node-cache-evidence-v1",
+        "cache_root_ref": cache.root.as_posix(),
+        "path_unit_id": "fresh-formal-unit",
+        "precision": "float64",
+        "parameter_registry_hash": registry_hash,
+        "loss_contract_hash": loss_hash,
+        "rule_requests": [
+            {
+                "rule_name": "shared-midpoint",
+                "rule_hash": _hash("shared-rule"),
+                "node_key_digests": [key.digest],
+            }
+        ],
+        "cross_rule_reused_key_digests": [key.digest],
+        "cross_rule_reused_key_count": 1,
+        "commit_evidence": commit_evidence,
+    }
+    evidence["evidence_hash"] = canonical_json_hash(evidence)
+    cache.authorize_ephemeral_memoization([key], evidence)
+    assert cache._memo_enabled is True
+    assert cache._memo_mode == "ephemeral"
+
+    path = PathSpec(
+        TensorMap({"x": torch.tensor([0.0], dtype=torch.float64)}),
+        TensorMap({"x": torch.tensor([1.0], dtype=torch.float64)}),
+        probe_id="fresh-formal",
+        loss_id="fresh-loss",
+    )
+
+    class Controller:
+        def digest(self) -> str:
+            return "fresh-state"
+
+        def restore(self) -> None:
+            return None
+
+    runner = PathAnalysisRunner(node_cache=cache)
+    before = codec.decode_count
+    for _ in range(13):
+        evaluation = runner.run_bound(
+            unit_id="fresh-formal-unit",
+            precision="float64",
+            parameter_registry_hash=registry_hash,
+            loss_contract_hash=loss_hash,
+            path_spec=path,
+            rule=midpoint_rule(),
+            gradient_callback=lambda _alpha, _state: TensorMap(
+                {"x": torch.tensor([1.0], dtype=torch.float64)}
+            ),
+            loss_callback=lambda state: torch.square(state["x"]).sum(),
+            state_controller=Controller(),
+            scope="formal",
+        )
+        assert evaluation.cache_misses == 0
+    assert codec.decode_count - before == 1
+    assert cache.memoization_bytes > 0
+
+    object_file = next((cache.root / "objects").rglob("*.bin"))
+    original_object = object_file.read_bytes()
+    object_stat = object_file.stat()
+    object_file.write_bytes(bytes([original_object[0] ^ 1]) + original_object[1:])
+    os.utime(object_file, ns=(object_stat.st_atime_ns, object_stat.st_mtime_ns))
+    with pytest.raises(ValueError, match="TENSOR|NODE_CACHE|MANIFEST|HASH"):
+        cache.get(key)
+    assert cache.memoization_bytes == 0
+    assert not cache._memo and cache._memo_enabled is False
+
+    object_file.write_bytes(original_object)
+    refreshed_commit_evidence = cache.commit_evidence([key])
+    refreshed = dict(evidence)
+    refreshed["commit_evidence"] = refreshed_commit_evidence
+    refreshed.pop("evidence_hash", None)
+    refreshed["evidence_hash"] = canonical_json_hash(refreshed)
+    cache.authorize_ephemeral_memoization([key], refreshed)
+    commit_file = next((cache.root / "commits").glob("*.json"))
+    original_commit = commit_file.read_bytes()
+    commit_stat = commit_file.stat()
+    commit_file.write_bytes(bytes([original_commit[0] ^ 1]) + original_commit[1:])
+    os.utime(commit_file, ns=(commit_stat.st_atime_ns, commit_stat.st_mtime_ns))
+    with pytest.raises(ValueError, match="JSON|NODE_CACHE|COMMIT|HASH"):
+        cache.get(key)
+    assert cache.memoization_bytes == 0
+    assert not cache._memo and cache._memo_enabled is False

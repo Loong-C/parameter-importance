@@ -12984,13 +12984,25 @@ def _run_stage3_formal_matrix_shard(
         matrix_contribution_path,
         {"reference_contribution": reference_result.reference_contribution},
     )
+    reference_cache_evidence = context.cache_evidence(reference_rules)
+    reference_keys = tuple({
+        context.node_key(float(alpha))
+        for rule in reference_rules
+        for alpha in rule.nodes.detach().cpu().to(torch.float64).tolist()
+    })
+    # This is the explicit fresh-unit boundary: reference nodes have already
+    # passed two-phase commit evidence and identity validation.  Only then may
+    # this process reuse verified templates while the candidate rules run.
+    context.node_cache.authorize_ephemeral_memoization(
+        reference_keys, reference_cache_evidence
+    )
     matrix_reference: dict[str, JSONValue] = {
         "schema_version": "stage3-task-path-integral-reference-v1",
         "refinement": reference_result.to_dict(),
         "contribution_bundle_ref": matrix_contribution_path.relative_to(root).as_posix(),
         "contribution_bundle_manifest_hash": matrix_contribution_bundle.manifest_sha256,
         "path_identity_hash": context.path.identity_hash,
-        "node_gradient_cache": context.cache_evidence(reference_rules),
+        "node_gradient_cache": reference_cache_evidence,
         "evaluation_costs": [
             {
                 "rule": rule.name,
