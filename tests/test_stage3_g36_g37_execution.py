@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from jsonschema import Draft202012Validator
 
 from ops.stage3.publish_stage3_g36_g37_execution import (
     Stage3GateExecutionPublicationError,
@@ -54,6 +56,14 @@ def test_execution_chain_appends_exact_gates_in_order_and_is_idempotent(
     first = publish_execution_chain(arguments)
     second = publish_execution_chain(arguments)
     assert first == second
+    schema = json.loads(
+        (
+            Path(__file__).parents[1]
+            / "schemas/shared/stage3-g36-g37-execution-publication-v1.json"
+        ).read_text(encoding="utf-8")
+    )
+    Draft202012Validator.check_schema(schema)
+    Draft202012Validator(schema).validate(first)
     assert first["final_execution_ref"] == (
         "evidence/stage3/g37-execution/execution-evidence/commits/"
         "formal_execution_evidence.json"

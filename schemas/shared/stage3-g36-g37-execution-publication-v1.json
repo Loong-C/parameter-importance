@@ -1,0 +1,67 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://parameter-importance.invalid/schemas/shared/stage3-g36-g37-execution-publication-v1.json",
+  "title": "Ordered Stage 3 G3-6 and G3-7 execution-evidence publication receipt",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version", "status", "scope", "formal_eligible",
+    "base_execution_ref", "base_execution_hash", "base_execution_envelope_hash",
+    "g36_publication_ref", "g36_publication_hash", "g3_6_ref", "g3_6_hash",
+    "g37_publication_ref", "g37_publication_hash", "g3_7_ref", "g3_7_hash",
+    "s308_config_hash", "s309_config_hash",
+    "intermediate_execution_ref", "intermediate_execution_hash",
+    "intermediate_execution_envelope_hash",
+    "final_execution_ref", "final_execution_hash", "final_execution_envelope_hash",
+    "gate_ids", "receipt_hash"
+  ],
+  "properties": {
+    "schema_version": {"const": "stage3-g36-g37-execution-publication-v1"},
+    "status": {"const": "PASS"},
+    "scope": {"const": "formal"},
+    "formal_eligible": {"const": true},
+    "base_execution_ref": {"$ref": "#/$defs/ref"},
+    "base_execution_hash": {"$ref": "#/$defs/hash"},
+    "base_execution_envelope_hash": {"$ref": "#/$defs/hash"},
+    "g36_publication_ref": {"$ref": "#/$defs/ref"},
+    "g36_publication_hash": {"$ref": "#/$defs/hash"},
+    "g3_6_ref": {"$ref": "#/$defs/ref"},
+    "g3_6_hash": {"$ref": "#/$defs/hash"},
+    "g37_publication_ref": {"$ref": "#/$defs/ref"},
+    "g37_publication_hash": {"$ref": "#/$defs/hash"},
+    "g3_7_ref": {"$ref": "#/$defs/ref"},
+    "g3_7_hash": {"$ref": "#/$defs/hash"},
+    "s308_config_hash": {"$ref": "#/$defs/hash"},
+    "s309_config_hash": {"$ref": "#/$defs/hash"},
+    "intermediate_execution_ref": {"$ref": "#/$defs/ref"},
+    "intermediate_execution_hash": {"$ref": "#/$defs/hash"},
+    "intermediate_execution_envelope_hash": {"$ref": "#/$defs/hash"},
+    "final_execution_ref": {"$ref": "#/$defs/ref"},
+    "final_execution_hash": {"$ref": "#/$defs/hash"},
+    "final_execution_envelope_hash": {"$ref": "#/$defs/hash"},
+    "gate_ids": {
+      "type": "array",
+      "minItems": 8,
+      "maxItems": 8,
+      "uniqueItems": true,
+      "prefixItems": [
+        {"const": "stage3.G3-0"}, {"const": "stage3.G3-1"},
+        {"const": "stage3.G3-2"}, {"const": "stage3.G3-3"},
+        {"const": "stage3.G3-4"}, {"const": "stage3.G3-5"},
+        {"const": "stage3.G3-6"}, {"const": "stage3.G3-7"}
+      ],
+      "items": false
+    },
+    "receipt_ref": {"$ref": "#/$defs/ref"},
+    "receipt_hash": {"$ref": "#/$defs/hash"}
+  },
+  "$defs": {
+    "hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "ref": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 4096,
+      "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.?/)(?!.*[\\\\?])(?!.*://).+$"
+    }
+  }
+}
