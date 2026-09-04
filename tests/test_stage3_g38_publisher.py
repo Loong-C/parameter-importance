@@ -6,7 +6,11 @@ from pathlib import Path
 
 import pytest
 
-from param_importance_nlp.contracts.jsonio import canonical_json_hash
+from param_importance_nlp.contracts.jsonio import (
+    canonical_json_bytes,
+    canonical_json_hash,
+    load_canonical_json,
+)
 from param_importance_nlp.contracts.status import GateRecord, GateStatus
 from param_importance_nlp.contracts.errors import FormalRunRejected
 from param_importance_nlp.contracts.stage23 import FormalExecutionEvidence
@@ -23,6 +27,7 @@ from param_importance_nlp.experiments.stage3_g38_publisher import (
     Stage3G38DeliveryManifest,
     Stage3G38Publisher,
     publish_stage3_delivery_manifest,
+    validate_stage3_replay_reports,
 )
 from param_importance_nlp.experiments.stage3_raw_storage import (
     persist_raw_unit_shard,
@@ -56,10 +61,48 @@ def _put_file(root: Path, name: str, data: bytes) -> dict[str, object]:
 def _manifest(root: Path) -> dict[str, object]:
     n = 0
 
-    def f(ext: str) -> dict[str, object]:
+    def f(ext: str, data: bytes | None = None) -> dict[str, object]:
         nonlocal n
         n += 1
-        return _put_file(root, f"delivery/file-{n}{ext}", f"real-{n}".encode())
+        return _put_file(
+            root,
+            f"delivery/file-{n}{ext}",
+            f"real-{n}".encode() if data is None else data,
+        )
+
+    def replay(layer: str) -> dict[str, object]:
+        evidence = f(f"-{layer}.log")
+        body: dict[str, object] = {
+            "schema_version": "stage3-g38-replay-report-v1",
+            "replay_id": f"stage3-replay-{layer}",
+            "layer": layer,
+            "scope": "formal",
+            "status": "PASS",
+            "formal_eligible": True,
+            "implementation_commit": "1" * 40,
+            "environment_hash": "2" * 64,
+            "command": ["python", "-m", "pytest", "-q", "tests/test_stage3_gate.py"],
+            "returncode": 0,
+            "started_at": "2026-08-28T00:00:00Z",
+            "completed_at": "2026-08-28T00:01:00Z",
+            "cache_mode": {
+                "local_cpu": "not_applicable",
+                "server_locked": "locked_environment",
+                "frozen_endpoint_uncached": "uncached",
+            }[layer],
+            "test_summary": {
+                "collected": 1,
+                "passed": 1,
+                "failed": 0,
+                "errors": 0,
+                "skipped": 0,
+            },
+            "input_refs": {"authority": "evidence/stage3/replay-source.json"},
+            "input_hashes": {"authority": "3" * 64},
+            "evidence_files": [evidence],
+        }
+        payload = body | {"artifact_hash": canonical_json_hash(body)}
+        return f(f"-{layer}.json", canonical_json_bytes(payload))
 
     value: dict[str, object] = {
         "schema_version": "stage3-g38-delivery-manifest-v1",
@@ -72,7 +115,10 @@ def _manifest(root: Path) -> dict[str, object]:
         "figures": [{"id": "overview", "png": f(".png"), "svg": f(".svg")}],
         "chinese_report": {"tex": f(".tex"), "pdf": f(".pdf")},
         "beamer": {"tex": f("-slides.tex"), "pdf": f("-slides.pdf"), "notes": [f("-notes.md")], "backups": [f("-backup-1.tex"), f("-backup-2.tex"), f("-backup-3.tex")]},
-        "replay_reports": {"local_cpu": f("-cpu.json"), "server_locked": f("-server.json"), "frozen_endpoint_uncached": f("-endpoint.json")},
+        "replay_reports": {
+            layer: replay(layer)
+            for layer in ("local_cpu", "server_locked", "frozen_endpoint_uncached")
+        },
         "server_large_artifact_manifest": f("-large.json"),
         "git_sync": {role: f(f"-{role}.json") for role in ("branch", "commit", "push", "remote", "server_clean_head", "sync")},
         "worklog": f(".md"),
@@ -321,6 +367,34 @@ def test_g38_requires_all_formal_inputs_and_hashes_files(tmp_path: Path) -> None
     receipt = load_committed_task_artifact(tmp_path, "outputs/g38/commits/g38_publication.json", require_formal=True)
     assert receipt.payload == result.to_dict()
     assert Stage3G38DeliveryManifest.from_mapping(dict(load_committed_task_artifact(tmp_path, inputs["delivery_manifest_ref"], require_formal=True).payload)).artifact_hash
+
+
+def test_g38_rejects_replay_with_skip_even_when_file_hash_matches(tmp_path: Path) -> None:
+    manifest = _manifest(tmp_path)
+    record = manifest["replay_reports"]["server_locked"]  # type: ignore[index]
+    path = tmp_path / str(record["path"])
+    report = dict(load_canonical_json(path))
+    report["test_summary"] = {
+        "collected": 1,
+        "passed": 0,
+        "failed": 0,
+        "errors": 0,
+        "skipped": 1,
+    }
+    report["artifact_hash"] = canonical_json_hash(
+        {key: value for key, value in report.items() if key != "artifact_hash"}
+    )
+    data = canonical_json_bytes(report)
+    path.write_bytes(data)
+    record["size"] = len(data)
+    record["sha256"] = hashlib.sha256(data).hexdigest()
+    manifest["artifact_hash"] = canonical_json_hash(
+        {key: value for key, value in manifest.items() if key != "artifact_hash"}
+    )
+    parsed = Stage3G38DeliveryManifest.from_mapping(manifest)
+
+    with pytest.raises(FormalRunRejected, match="REPLAY_TEST_SUMMARY_NOT_PASS:server_locked"):
+        validate_stage3_replay_reports(tmp_path, parsed)
 
 
 def test_g38_rejects_empty_or_spec_only_chart_bundle(tmp_path: Path) -> None:

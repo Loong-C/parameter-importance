@@ -74,6 +74,12 @@ REQUIRED_STAGE3_G38_REPLAY_LAYERS: tuple[str, ...] = (
     "server_locked",
     "frozen_endpoint_uncached",
 )
+STAGE3_G38_REPLAY_REPORT_SCHEMA = "stage3-g38-replay-report-v1"
+_REPLAY_CACHE_MODES = {
+    "local_cpu": "not_applicable",
+    "server_locked": "locked_environment",
+    "frozen_endpoint_uncached": "uncached",
+}
 
 _HASH_RE = re.compile(r"^[0-9a-f]{64}$")
 _ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,159}$")
@@ -373,7 +379,7 @@ class Stage3G38DeliveryManifest:
             if isinstance(item, Mapping) and not any(key in item for key in ("path", "ref")) and "file" in item:
                 item = item["file"]
             replay[layer] = _file_mapping(item, field=f"replay_reports.{layer}")
-            _require_suffix(replay[layer], (".json", ".md", ".txt"), field=f"replay_reports.{layer}")
+            _require_suffix(replay[layer], (".json",), field=f"replay_reports.{layer}")
 
         large = _file_mapping(pick("server_large_artifact_manifest", "large_artifact_manifest", "server_manifest"), field="server_large_artifact_manifest")
         git_raw = _mapping(pick("git_sync", "git_evidence", "sync_evidence", "git"), field="git_sync")
@@ -592,6 +598,133 @@ def _verify_file_record(
     payload = resolved.read_bytes()
     if len(payload) != size or hashlib.sha256(payload).hexdigest() != digest:
         raise FormalRunRejected(f"STAGE3_G38_FILE_HASH_OR_SIZE_MISMATCH:{ref}")
+
+
+def _utc_timestamp(value: object, *, field: str) -> datetime:
+    if not isinstance(value, str) or not value.endswith("Z"):
+        raise FormalRunRejected(f"STAGE3_G38_REPLAY_TIMESTAMP_INVALID:{field}")
+    try:
+        parsed = datetime.fromisoformat(value[:-1] + "+00:00")
+    except ValueError as error:
+        raise FormalRunRejected(f"STAGE3_G38_REPLAY_TIMESTAMP_INVALID:{field}") from error
+    if parsed.utcoffset() != timezone.utc.utcoffset(parsed):
+        raise FormalRunRejected(f"STAGE3_G38_REPLAY_TIMESTAMP_NOT_UTC:{field}")
+    return parsed
+
+
+def validate_stage3_replay_reports(
+    workspace_root: str | Path,
+    manifest: Stage3G38DeliveryManifest,
+) -> None:
+    """Verify that all three hash-bound replay files prove a real PASS run."""
+
+    root = Path(workspace_root).resolve()
+    required = {
+        "schema_version",
+        "replay_id",
+        "layer",
+        "scope",
+        "status",
+        "formal_eligible",
+        "implementation_commit",
+        "environment_hash",
+        "command",
+        "returncode",
+        "started_at",
+        "completed_at",
+        "cache_mode",
+        "test_summary",
+        "input_refs",
+        "input_hashes",
+        "evidence_files",
+        "artifact_hash",
+    }
+    for layer in REQUIRED_STAGE3_G38_REPLAY_LAYERS:
+        record = manifest.replay_reports[layer]
+        _verify_file_record(root, record, field=f"replay_reports.{layer}")
+        ref = _safe_ref(
+            record.get("path"),
+            field=f"replay_reports.{layer}.path",
+            reject_future=False,
+        )
+        try:
+            payload = _mapping(
+                load_canonical_json(root.joinpath(*PurePosixPath(ref).parts)),
+                field=f"replay_reports.{layer}",
+            )
+        except (OSError, TypeError, ValueError) as error:
+            raise FormalRunRejected(
+                f"STAGE3_G38_REPLAY_REPORT_JSON_INVALID:{layer}"
+            ) from error
+        if set(payload) != required:
+            raise FormalRunRejected(f"STAGE3_G38_REPLAY_REPORT_FIELDS_INVALID:{layer}")
+        if (
+            payload.get("schema_version") != STAGE3_G38_REPLAY_REPORT_SCHEMA
+            or payload.get("layer") != layer
+            or payload.get("scope") != "formal"
+            or payload.get("status") != "PASS"
+            or payload.get("formal_eligible") is not True
+        ):
+            raise FormalRunRejected(f"STAGE3_G38_REPLAY_REPORT_NOT_FORMAL_PASS:{layer}")
+        _safe_id(payload.get("replay_id"), field=f"replay_reports.{layer}.replay_id")
+        commit = payload.get("implementation_commit")
+        if not isinstance(commit, str) or re.fullmatch(r"[0-9a-f]{40}", commit) is None:
+            raise FormalRunRejected(f"STAGE3_G38_REPLAY_COMMIT_INVALID:{layer}")
+        _hash(payload.get("environment_hash"), field=f"replay_reports.{layer}.environment_hash")
+        command = payload.get("command")
+        if (
+            not isinstance(command, list)
+            or not command
+            or any(not isinstance(item, str) or not item for item in command)
+        ):
+            raise FormalRunRejected(f"STAGE3_G38_REPLAY_COMMAND_INVALID:{layer}")
+        returncode = payload.get("returncode")
+        if isinstance(returncode, bool) or returncode != 0:
+            raise FormalRunRejected(f"STAGE3_G38_REPLAY_RETURNCODE_NOT_ZERO:{layer}")
+        started = _utc_timestamp(payload.get("started_at"), field=f"{layer}.started_at")
+        completed = _utc_timestamp(payload.get("completed_at"), field=f"{layer}.completed_at")
+        if completed < started:
+            raise FormalRunRejected(f"STAGE3_G38_REPLAY_TIMESTAMP_ORDER_INVALID:{layer}")
+        if payload.get("cache_mode") != _REPLAY_CACHE_MODES[layer]:
+            raise FormalRunRejected(f"STAGE3_G38_REPLAY_CACHE_MODE_INVALID:{layer}")
+
+        summary = _mapping(payload.get("test_summary"), field=f"replay_reports.{layer}.test_summary")
+        if set(summary) != {"collected", "passed", "failed", "errors", "skipped"}:
+            raise FormalRunRejected(f"STAGE3_G38_REPLAY_TEST_SUMMARY_FIELDS_INVALID:{layer}")
+        counts = tuple(summary[name] for name in ("collected", "passed", "failed", "errors", "skipped"))
+        if any(isinstance(value, bool) or not isinstance(value, int) for value in counts):
+            raise FormalRunRejected(f"STAGE3_G38_REPLAY_TEST_SUMMARY_INVALID:{layer}")
+        collected, passed, failed, errors, skipped = counts
+        if collected <= 0 or passed != collected or any(value != 0 for value in (failed, errors, skipped)):
+            raise FormalRunRejected(f"STAGE3_G38_REPLAY_TEST_SUMMARY_NOT_PASS:{layer}")
+
+        input_refs = _mapping(payload.get("input_refs"), field=f"replay_reports.{layer}.input_refs")
+        input_hashes = _mapping(payload.get("input_hashes"), field=f"replay_reports.{layer}.input_hashes")
+        if not input_refs or set(input_refs) != set(input_hashes):
+            raise FormalRunRejected(f"STAGE3_G38_REPLAY_INPUT_BINDING_INVALID:{layer}")
+        for name, source_ref in input_refs.items():
+            if not isinstance(name, str):
+                raise FormalRunRejected(f"STAGE3_G38_REPLAY_INPUT_NAME_INVALID:{layer}")
+            _safe_id(name, field=f"replay_reports.{layer}.input_refs")
+            _safe_ref(source_ref, field=f"replay_reports.{layer}.input_refs.{name}")
+            _hash(input_hashes[name], field=f"replay_reports.{layer}.input_hashes.{name}")
+
+        evidence = payload.get("evidence_files")
+        if not isinstance(evidence, list) or not evidence:
+            raise FormalRunRejected(f"STAGE3_G38_REPLAY_EVIDENCE_FILES_MISSING:{layer}")
+        evidence_seen: set[str] = set()
+        for index, item in enumerate(evidence):
+            parsed_record = _file_mapping(item, field=f"replay_reports.{layer}.evidence_files[{index}]")
+            evidence_ref = str(parsed_record["path"])
+            if evidence_ref in evidence_seen:
+                raise FormalRunRejected(f"STAGE3_G38_REPLAY_EVIDENCE_FILE_DUPLICATE:{layer}")
+            evidence_seen.add(evidence_ref)
+            _verify_file_record(
+                root,
+                parsed_record,
+                field=f"replay_reports.{layer}.evidence_files[{index}]",
+            )
+        _normalise_hash_object(payload, field=f"replay_reports.{layer}")
 
 
 def _status_from_payload(payload: Mapping[str, object]) -> str | None:
@@ -1242,6 +1375,7 @@ class Stage3G38Publisher:
         )
         manifest = Stage3G38DeliveryManifest.from_mapping(dict(manifest_commit.payload))
         _verify_manifest_files(root, manifest)
+        validate_stage3_replay_reports(root, manifest)
 
         # Upstream publishers may intentionally derive a new publication
         # config hash (G3-6/G3-7), while the Stage3.10 runner retains the
@@ -1424,6 +1558,7 @@ def publish_stage3_delivery_manifest(
     root = Path(workspace_root).resolve()
     parsed = Stage3G38DeliveryManifest.from_mapping(manifest)
     _verify_manifest_files(root, parsed)
+    validate_stage3_replay_reports(root, parsed)
     published = TaskArtifactStore(root, output_dir).publish(
         task_id=STAGE3_G38_MANIFEST_TASK_ID,
         artifact_kind=STAGE3_G38_MANIFEST_ARTIFACT_KIND,
@@ -1447,6 +1582,7 @@ __all__ = [
     "STAGE3_G38_GATE_ID",
     "STAGE3_G38_PUBLICATION_CONFIG_SCHEMA",
     "STAGE3_G38_PUBLICATION_SCHEMA",
+    "STAGE3_G38_REPLAY_REPORT_SCHEMA",
     "STAGE3_G38_RECEIPT_ARTIFACT_KIND",
     "STAGE3_G38_TASK_ID",
     "Stage3G38DeliveryManifest",
@@ -1454,4 +1590,5 @@ __all__ = [
     "Stage3G38Publisher",
     "publish_stage3_delivery_manifest",
     "publish_stage3_g38",
+    "validate_stage3_replay_reports",
 ]
