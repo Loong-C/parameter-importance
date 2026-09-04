@@ -157,3 +157,28 @@ def test_renderer_rejects_completed_or_unverified_inputs(tmp_path: Path) -> None
     tampered["png"] = dict(figure["png"], sha256="f" * 64)
     with pytest.raises(ValueError, match="hash drift"):
         MODULE._figure_inputs(tmp_path, {"rendered_figures": [tampered]})
+
+
+def test_metric_rows_preserve_undefined_reason_from_real_wire_shape() -> None:
+    rows = MODULE._metric_rows(
+        {
+            "metrics": {
+                "defined": {
+                    "defined": True,
+                    "value": 0.25,
+                    "reason": None,
+                    "metadata": {},
+                },
+                "undefined": {
+                    "defined": False,
+                    "value": None,
+                    "reason": "constant input",
+                    "metadata": {},
+                },
+            }
+        }
+    )
+    assert rows == [
+        ("defined", "0.25"),
+        ("undefined", "undefined (constant input)"),
+    ]

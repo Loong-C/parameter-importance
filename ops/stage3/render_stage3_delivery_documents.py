@@ -170,7 +170,13 @@ def _metric_rows(report: Mapping[str, object]) -> list[tuple[str, str]]:
     if isinstance(raw, Mapping):
         for name, value in sorted(raw.items()):
             if isinstance(value, Mapping):
-                candidate = value.get("value", value.get("estimate", value.get("result", value)))
+                if value.get("defined") is False:
+                    reason = value.get("reason")
+                    candidate = f"undefined ({reason})" if reason is not None else "undefined"
+                else:
+                    candidate = value.get(
+                        "value", value.get("estimate", value.get("result", value))
+                    )
             else:
                 candidate = value
             rows.append((str(name), _short(candidate, 80)))
@@ -564,6 +570,7 @@ def _git_commit(repository: Path) -> str:
 
 
 def _load_inputs(root: Path, refs: Mapping[str, str], expected_config_hash: str) -> tuple[dict[str, Mapping[str, object]], dict[str, Mapping[str, object]]]:
+    from param_importance_nlp.analysis import AnalysisReport, ChartArtifact
     from param_importance_nlp.runtime.task_artifacts import load_committed_task_artifact
 
     payloads: dict[str, Mapping[str, object]] = {}
@@ -581,6 +588,74 @@ def _load_inputs(root: Path, refs: Mapping[str, str], expected_config_hash: str)
             "artifact_hash": identity.artifact_hash,
             "payload_hash": canonical_json_hash(loaded.payload),
         }
+    report = AnalysisReport.from_mapping(payloads["analysis_report"])
+    chart_payload = payloads["chart_artifacts"]
+    handoff = payloads["handoff_manifest"]
+    gates = payloads["gate_summary"]
+    _validate_semantics(report.to_dict(), chart_payload, handoff, gates)
+    if handoff.get("report_hash") != report.report_hash:
+        raise ValueError("handoff report hash does not match the live-reloaded report")
+    source_table_hash = handoff.get("source_table_hash")
+    if (
+        not isinstance(source_table_hash, str)
+        or chart_payload.get("source_table_hash") != source_table_hash
+        or source_table_hash
+        not in {source.content_hash for source in report.source_artifacts}
+    ):
+        raise ValueError("S3.10 report/chart/handoff source table identity mismatch")
+    if (
+        gates.get("stage3.G3-7_hash") != handoff.get("stage3_g37_gate_hash")
+        or gates.get("stage3.G3-7_ref") != handoff.get("stage3_g37_gate_ref")
+    ):
+        raise ValueError("S3.10 gate summary and handoff G3-7 identity mismatch")
+
+    raw_chart_artifacts = chart_payload.get("artifacts")
+    raw_figures = chart_payload.get("rendered_figures")
+    if (
+        not isinstance(raw_chart_artifacts, list)
+        or not raw_chart_artifacts
+        or not isinstance(raw_figures, list)
+        or not raw_figures
+    ):
+        raise ValueError("S3.10 rendered chart inventory is incomplete")
+    parsed_charts = [
+        ChartArtifact.from_mapping(
+            _mapping(value, field=f"chart_artifacts.artifacts[{index}]")
+        )
+        for index, value in enumerate(raw_chart_artifacts)
+    ]
+    chart_hashes: dict[tuple[str, str], str] = {}
+    for chart in parsed_charts:
+        key = (chart.spec.chart_id, chart.output_format)
+        if (
+            chart.output_format not in {"png", "svg"}
+            or chart.content_sha256 is None
+            or key in chart_hashes
+        ):
+            raise ValueError("S3.10 rendered ChartArtifact set is invalid")
+        chart_hashes[key] = chart.content_sha256
+    figure_hashes: dict[tuple[str, str], str] = {}
+    for index, value in enumerate(raw_figures):
+        figure = _mapping(value, field=f"chart_artifacts.rendered_figures[{index}]")
+        figure_id = figure.get("id")
+        if not isinstance(figure_id, str) or not figure_id:
+            raise ValueError("S3.10 rendered figure id is invalid")
+        for output_format in ("png", "svg"):
+            record = _mapping(
+                figure.get(output_format),
+                field=f"chart_artifacts.rendered_figures[{index}].{output_format}",
+            )
+            digest = record.get("sha256")
+            key = (figure_id, output_format)
+            if (
+                not isinstance(digest, str)
+                or _HASH_RE.fullmatch(digest) is None
+                or key in figure_hashes
+            ):
+                raise ValueError("S3.10 rendered figure hash inventory is invalid")
+            figure_hashes[key] = digest
+    if chart_hashes != figure_hashes:
+        raise ValueError("S3.10 ChartArtifact hashes do not match PNG/SVG file records")
     return payloads, identities
 
 
