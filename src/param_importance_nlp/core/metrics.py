@@ -167,15 +167,13 @@ def _average_ranks(values: np.ndarray) -> np.ndarray:
     """使用平均秩处理并列值；秩从 1 开始。"""
 
     order = np.argsort(values, kind="mergesort")
+    sorted_values = values[order]
+    boundaries = np.flatnonzero(sorted_values[1:] != sorted_values[:-1]) + 1
+    starts = np.concatenate(([0], boundaries))
+    ends = np.concatenate((boundaries, [values.size]))
+    average_ranks = (starts + 1 + ends) / 2.0
     ranks = np.empty(values.size, dtype=np.float64)
-    start = 0
-    while start < values.size:
-        end = start + 1
-        while end < values.size and values[order[end]] == values[order[start]]:
-            end += 1
-        average_rank = (start + 1 + end) / 2.0
-        ranks[order[start:end]] = average_rank
-        start = end
+    ranks[order] = np.repeat(average_ranks, ends - starts)
     return ranks
 
 

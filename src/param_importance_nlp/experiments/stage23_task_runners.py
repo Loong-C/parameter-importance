@@ -5494,14 +5494,13 @@ def _run_stage2_estimator(
 
 def _average_ranks(values: np.ndarray) -> np.ndarray:
     order = np.argsort(values, kind="mergesort")
+    sorted_values = values[order]
+    boundaries = np.flatnonzero(sorted_values[1:] != sorted_values[:-1]) + 1
+    starts = np.concatenate(([0], boundaries))
+    ends = np.concatenate((boundaries, [values.size]))
+    average_ranks = (starts + ends - 1) / 2.0
     ranks = np.empty(values.size, dtype=np.float64)
-    start = 0
-    while start < values.size:
-        end = start + 1
-        while end < values.size and values[order[end]] == values[order[start]]:
-            end += 1
-        ranks[order[start:end]] = (start + end - 1) / 2.0
-        start = end
+    ranks[order] = np.repeat(average_ranks, ends - starts)
     return ranks
 
 

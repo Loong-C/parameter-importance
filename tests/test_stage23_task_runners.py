@@ -8,6 +8,7 @@ import subprocess
 import sys
 from types import SimpleNamespace
 
+import numpy as np
 import torch
 
 import pytest
@@ -65,6 +66,31 @@ from param_importance_nlp.runtime.task_runtime import (
 
 ROOT = Path(__file__).resolve().parents[1]
 BASE_CONFIG = ROOT / "configs" / "local-fixtures" / "resolved-config-v1.json"
+
+
+@pytest.mark.parametrize(
+    "values",
+    [
+        np.array([], dtype=np.float64),
+        np.array([7.0]),
+        np.array([3.0, 1.0, 2.0]),
+        np.array([2.0, 1.0, 2.0, 1.0, 2.0]),
+        np.array([-4.0, -4.0, 0.0, 3.5, 3.5, 8.0]),
+        np.random.default_rng(20260904).integers(-20, 21, size=10_000).astype(np.float64),
+    ],
+)
+def test_stage23_average_ranks_vectorization_matches_legacy(values: np.ndarray) -> None:
+    order = np.argsort(values, kind="mergesort")
+    expected = np.empty(values.size, dtype=np.float64)
+    start = 0
+    while start < values.size:
+        end = start + 1
+        while end < values.size and values[order[end]] == values[order[start]]:
+            end += 1
+        expected[order[start:end]] = (start + end - 1) / 2.0
+        start = end
+
+    assert np.array_equal(stage23_task_runners._average_ranks(values), expected)
 
 
 def _base_for(task_id: str) -> dict[str, object]:

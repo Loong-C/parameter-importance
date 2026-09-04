@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 
+import numpy as np
 import pytest
 import torch
 
@@ -35,6 +36,36 @@ from param_importance_nlp.core import (
     synaptic_intelligence,
     variance,
 )
+from param_importance_nlp.core.metrics import _average_ranks
+
+
+def _legacy_average_ranks(values: np.ndarray, *, one_based: bool) -> np.ndarray:
+    order = np.argsort(values, kind="mergesort")
+    ranks = np.empty(values.size, dtype=np.float64)
+    start = 0
+    while start < values.size:
+        end = start + 1
+        while end < values.size and values[order[end]] == values[order[start]]:
+            end += 1
+        offset = 1 if one_based else -1
+        ranks[order[start:end]] = (start + end + offset) / 2.0
+        start = end
+    return ranks
+
+
+@pytest.mark.parametrize(
+    "values",
+    [
+        np.array([], dtype=np.float64),
+        np.array([7.0]),
+        np.array([3.0, 1.0, 2.0]),
+        np.array([2.0, 1.0, 2.0, 1.0, 2.0]),
+        np.array([-4.0, -4.0, 0.0, 3.5, 3.5, 8.0]),
+        np.random.default_rng(20260904).integers(-20, 21, size=10_000).astype(np.float64),
+    ],
+)
+def test_average_ranks_vectorization_matches_legacy(values: np.ndarray) -> None:
+    assert np.array_equal(_average_ranks(values), _legacy_average_ranks(values, one_based=True))
 
 
 def test_error_and_vector_metrics() -> None:
