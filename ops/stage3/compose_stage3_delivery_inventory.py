@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 from collections.abc import Mapping, Sequence
+import hashlib
 import json
 import os
 from pathlib import Path, PurePosixPath
@@ -40,8 +41,10 @@ from param_importance_nlp.runtime.task_artifacts import (  # noqa: E402
 
 INVENTORY_SCHEMA = "stage3-g38-delivery-inventory-source-v1"
 DOCUMENT_SCHEMA = "stage3-delivery-documents-v1"
+SOURCE_SNAPSHOT_SCHEMA = "stage3-g38-delivery-source-snapshot-v1"
 STAGE310_TASK_ID = "stage3.10_reports_visualizations_and_handoff"
 _HASH_RE = re.compile(r"^[0-9a-f]{64}$")
+_GIT_RE = re.compile(r"^[0-9a-f]{40}$")
 _ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,159}$")
 _FORBIDDEN_RE = re.compile(r"(?:fixture|synthetic|g3[-_.]?9|future)", re.IGNORECASE)
 
@@ -172,6 +175,128 @@ def _verify_document_manifest(
                     )
 
 
+def _verify_delivery_source_manifest(
+    source: Mapping[str, object],
+    *,
+    workspace_root: Path,
+    source_ref: str,
+    analysis_scripts: Sequence[str],
+    worklog: str,
+) -> None:
+    expected = {
+        "schema_version",
+        "snapshot_id",
+        "scope",
+        "status",
+        "formal_eligible",
+        "producer_commit",
+        "repository_branch",
+        "snapshot_root",
+        "analysis_scripts",
+        "worklog",
+        "artifact_hash",
+    }
+    if set(source) != expected:
+        raise ValueError("delivery source manifest fields are invalid")
+    if (
+        source.get("schema_version") != SOURCE_SNAPSHOT_SCHEMA
+        or source.get("scope") != "formal"
+        or source.get("status") != "PASS"
+        or source.get("formal_eligible") is not True
+        or not isinstance(source.get("producer_commit"), str)
+        or _GIT_RE.fullmatch(str(source.get("producer_commit"))) is None
+    ):
+        raise ValueError("delivery source manifest is not a formal PASS snapshot")
+    supplied = source.get("artifact_hash")
+    if (
+        not isinstance(supplied, str)
+        or _HASH_RE.fullmatch(supplied) is None
+        or canonical_json_hash(
+            {key: value for key, value in source.items() if key != "artifact_hash"}
+        )
+        != supplied
+    ):
+        raise ValueError("delivery source manifest artifact_hash is invalid")
+    snapshot_root = _safe_ref(source.get("snapshot_root"), field="source.snapshot_root")
+    if PurePosixPath(snapshot_root).parts[0] not in {"evidence", "results"}:
+        raise ValueError("delivery source snapshot must be in stable evidence/results")
+    manifest_ref = _safe_ref(
+        source_ref,
+        field="delivery_source_manifest_ref",
+        suffixes=(".json",),
+    )
+    if PurePosixPath(manifest_ref).parent.as_posix() != snapshot_root:
+        raise ValueError("delivery source manifest ref does not match snapshot_root")
+    stored_manifest = load_canonical_json(
+        workspace_root.joinpath(*PurePosixPath(manifest_ref).parts)
+    )
+    if stored_manifest != source:
+        raise ValueError("delivery source manifest mapping differs from its file")
+
+    def record_ref(
+        value: object,
+        *,
+        field: str,
+        suffixes: tuple[str, ...],
+    ) -> str:
+        record = _mapping(value, field=field)
+        if set(record) != {"source_ref", "snapshot_ref", "size", "sha256"}:
+            raise ValueError(f"{field} fields are invalid")
+        _safe_ref(record.get("source_ref"), field=f"{field}.source_ref", suffixes=suffixes)
+        snapshot_ref = _safe_ref(
+            record.get("snapshot_ref"),
+            field=f"{field}.snapshot_ref",
+            suffixes=suffixes,
+        )
+        try:
+            PurePosixPath(snapshot_ref).relative_to(PurePosixPath(snapshot_root))
+        except ValueError as error:
+            raise ValueError(f"{field}.snapshot_ref escapes snapshot_root") from error
+        size = record.get("size")
+        digest = record.get("sha256")
+        if (
+            isinstance(size, bool)
+            or not isinstance(size, int)
+            or size < 0
+            or not isinstance(digest, str)
+            or _HASH_RE.fullmatch(digest) is None
+        ):
+            raise ValueError(f"{field} byte identity is invalid")
+        current = workspace_root
+        for part in PurePosixPath(snapshot_ref).parts:
+            current = current / part
+            if current.is_symlink():
+                raise ValueError(f"{field}.snapshot_ref contains a symlink")
+        try:
+            resolved = workspace_root.joinpath(
+                *PurePosixPath(snapshot_ref).parts
+            ).resolve(strict=True)
+            resolved.relative_to(workspace_root)
+        except (OSError, ValueError) as error:
+            raise ValueError(f"{field}.snapshot_ref is not a workspace file") from error
+        payload = resolved.read_bytes()
+        if len(payload) != size or hashlib.sha256(payload).hexdigest() != digest:
+            raise ValueError(f"{field} snapshot byte identity drift")
+        return snapshot_ref
+
+    raw_scripts = source.get("analysis_scripts")
+    if not isinstance(raw_scripts, list) or not raw_scripts:
+        raise ValueError("delivery source manifest has no analysis scripts")
+    recorded_scripts = [
+        record_ref(value, field=f"source.analysis_scripts[{index}]", suffixes=(".py",))
+        for index, value in enumerate(raw_scripts)
+    ]
+    if recorded_scripts != list(analysis_scripts):
+        raise ValueError("delivery source manifest analysis script refs drift")
+    recorded_worklog = record_ref(
+        source.get("worklog"),
+        field="source.worklog",
+        suffixes=(".md",),
+    )
+    if recorded_worklog != worklog:
+        raise ValueError("delivery source manifest worklog ref drift")
+
+
 def compose_stage3_delivery_inventory(
     *,
     workspace_root: str | Path,
@@ -182,6 +307,8 @@ def compose_stage3_delivery_inventory(
     stage3_10_identities: Mapping[str, Mapping[str, object]],
     document_manifest: Mapping[str, object],
     document_manifest_ref: str,
+    delivery_source_manifest: Mapping[str, object],
+    delivery_source_manifest_ref: str,
     analysis_scripts: Sequence[str],
     replay_reports: Mapping[str, str],
     server_large_artifact_manifest: str,
@@ -239,6 +366,18 @@ def compose_stage3_delivery_inventory(
     }
     large_ref = _safe_ref(server_large_artifact_manifest, field="server_large_artifact_manifest", suffixes=(".json", ".jsonl", ".txt"))
     worklog_ref = _safe_ref(worklog, field="worklog", suffixes=(".md", ".txt", ".json"))
+    source_manifest_ref = _safe_ref(
+        delivery_source_manifest_ref,
+        field="delivery_source_manifest_ref",
+        suffixes=(".json",),
+    )
+    _verify_delivery_source_manifest(
+        delivery_source_manifest,
+        workspace_root=root,
+        source_ref=source_manifest_ref,
+        analysis_scripts=script_refs,
+        worklog=worklog_ref,
+    )
 
     charts = stage3_10_payloads["chart_artifacts"]
     handoff = stage3_10_payloads["handoff_manifest"]
@@ -259,6 +398,7 @@ def compose_stage3_delivery_inventory(
     if isinstance(raw_shards, Mapping):
         json_tables.append(_record_path(raw_shards, field="reporting.raw_shard_manifest", suffixes=(".json",)))
     json_tables.append(document_ref)
+    json_tables.append(source_manifest_ref)
     csv_tables = list(dict.fromkeys(csv_tables))
     json_tables = list(dict.fromkeys(json_tables))
 
@@ -352,6 +492,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--manifest-id", required=True)
     parser.add_argument("--document-manifest", required=True)
+    parser.add_argument("--delivery-source-manifest", required=True)
     parser.add_argument("--analysis-script", action="append", default=[], required=True)
     for role in REQUIRED_STAGE3_G38_STAGE310_KINDS:
         parser.add_argument(f"--{role.replace('_', '-')}-ref", required=True)
@@ -372,6 +513,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     payloads, identities = _load_stage310(root, refs)
     document_ref = _safe_ref(args.document_manifest, field="document_manifest", suffixes=(".json",))
     document = _mapping(load_canonical_json(root.joinpath(*PurePosixPath(document_ref).parts)), field="document_manifest")
+    source_manifest_ref = _safe_ref(
+        args.delivery_source_manifest,
+        field="delivery_source_manifest",
+        suffixes=(".json",),
+    )
+    source_manifest = _mapping(
+        load_canonical_json(root.joinpath(*PurePosixPath(source_manifest_ref).parts)),
+        field="delivery_source_manifest",
+    )
     inventory = compose_stage3_delivery_inventory(
         workspace_root=root,
         manifest_id=args.manifest_id,
@@ -381,6 +531,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         stage3_10_identities=identities,
         document_manifest=document,
         document_manifest_ref=document_ref,
+        delivery_source_manifest=source_manifest,
+        delivery_source_manifest_ref=source_manifest_ref,
         analysis_scripts=args.analysis_script,
         replay_reports=_binding_map(args.replay_report, expected=REQUIRED_STAGE3_G38_REPLAY_LAYERS, field="replay_report"),
         server_large_artifact_manifest=args.server_large_artifact_manifest,

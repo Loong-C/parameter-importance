@@ -118,9 +118,21 @@ def _case(root: Path) -> dict[str, object]:
     document_ref = "evidence/stage3/documents/stage3-formal-document-manifest.json"
     write_canonical_json(root / document_ref, document)
 
-    analysis_scripts = ["ops/stage3/build_formal_analysis.py"]
+    snapshot_root = "evidence/stage3/delivery-sources/commit-b"
+    analysis_scripts = [
+        f"{snapshot_root}/analysis/ops/stage3/build_formal_analysis.py"
+    ]
+    script_records = []
     for ref in analysis_scripts:
-        _file(root, ref)
+        record = _file(root, ref)
+        script_records.append(
+            {
+                "source_ref": "ops/stage3/build_formal_analysis.py",
+                "snapshot_ref": ref,
+                "size": record["size"],
+                "sha256": record["sha256"],
+            }
+        )
     replay = {
         role: f"evidence/stage3/replay/{role}.json"
         for role in REQUIRED_STAGE3_G38_REPLAY_LAYERS
@@ -134,15 +146,39 @@ def _case(root: Path) -> dict[str, object]:
     for ref in git_sync.values():
         _file(root, ref)
     large = "evidence/stage3/server-large-artifacts.json"
-    worklog = "Agent/worklogs/stage3-formal.md"
+    worklog = f"{snapshot_root}/worklog/worklogs/stage3-formal.md"
     _file(root, large)
-    _file(root, worklog)
+    worklog_file = _file(root, worklog)
+    source_body = {
+        "schema_version": "stage3-g38-delivery-source-snapshot-v1",
+        "snapshot_id": "stage3-formal-delivery-sources-r1",
+        "scope": "formal",
+        "status": "PASS",
+        "formal_eligible": True,
+        "producer_commit": "b" * 40,
+        "repository_branch": "codex/stage3-delivery",
+        "snapshot_root": snapshot_root,
+        "analysis_scripts": script_records,
+        "worklog": {
+            "source_ref": "worklogs/stage3-formal.md",
+            "snapshot_ref": worklog,
+            "size": worklog_file["size"],
+            "sha256": worklog_file["sha256"],
+        },
+    }
+    source_manifest = source_body | {
+        "artifact_hash": canonical_json_hash(source_body)
+    }
+    source_manifest_ref = f"{snapshot_root}/source-snapshot-manifest.json"
+    write_canonical_json(root / source_manifest_ref, source_manifest)
     return {
         "refs": refs,
         "identities": identities,
         "payloads": payloads,
         "document": document,
         "document_ref": document_ref,
+        "source_manifest": source_manifest,
+        "source_manifest_ref": source_manifest_ref,
         "analysis_scripts": analysis_scripts,
         "replay": replay,
         "git_sync": git_sync,
@@ -161,6 +197,8 @@ def _compose(root: Path, case: dict[str, object], **changes: object) -> object:
         "stage3_10_identities": case["identities"],
         "document_manifest": case["document"],
         "document_manifest_ref": case["document_ref"],
+        "delivery_source_manifest": case["source_manifest"],
+        "delivery_source_manifest_ref": case["source_manifest_ref"],
         "analysis_scripts": case["analysis_scripts"],
         "replay_reports": case["replay"],
         "server_large_artifact_manifest": case["large"],
@@ -186,10 +224,10 @@ def test_composer_binds_s310_documents_and_materializes_complete_inventory(tmp_p
     )
     assert parsed == manifest
     assert len(parsed.csv_tables) == 2
-    assert len(parsed.json_tables) == 5
+    assert len(parsed.json_tables) == 6
     assert len(parsed.figures) == 2
     assert len(parsed.beamer_backups) == 4
-    assert len(parsed.file_records()) == 32
+    assert len(parsed.file_records()) == 33
 
 
 def test_composer_rejects_document_hash_identity_and_figure_drift(tmp_path: Path) -> None:
@@ -215,6 +253,15 @@ def test_composer_rejects_document_hash_identity_and_figure_drift(tmp_path: Path
     with pytest.raises(ValueError, match="figure record drift"):
         _compose(tmp_path, case, document_manifest=bad_figure)
 
+    bad_source = deepcopy(case["source_manifest"])
+    bad_source["analysis_scripts"][0]["sha256"] = "f" * 64
+    bad_source["artifact_hash"] = canonical_json_hash(
+        {key: value for key, value in bad_source.items() if key != "artifact_hash"}
+    )
+    write_canonical_json(tmp_path / case["source_manifest_ref"], bad_source)
+    with pytest.raises(ValueError, match="snapshot byte identity drift"):
+        _compose(tmp_path, case, delivery_source_manifest=bad_source)
+
 
 def test_composer_rejects_missing_roles_and_changed_immutable_retry(tmp_path: Path) -> None:
     case = _case(tmp_path)
@@ -224,11 +271,9 @@ def test_composer_rejects_missing_roles_and_changed_immutable_retry(tmp_path: Pa
         _compose(tmp_path, case, replay_reports=replay)
 
     _compose(tmp_path, case)
-    second_script = "ops/stage3/build_formal_appendix.py"
-    _file(tmp_path, second_script)
     with pytest.raises(TaskLifecycleError, match="内容不同|different"):
         _compose(
             tmp_path,
             case,
-            analysis_scripts=[*case["analysis_scripts"], second_script],
+            manifest_id="stage3-formal-delivery-r2",
         )
