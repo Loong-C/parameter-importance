@@ -11914,7 +11914,6 @@ def _run_stage3_matrix(
                 "evidence_hash"
             ],
         },
-        "gate_record": _gate_candidate(request),
     }
     return payloads, inputs.references
 
@@ -12235,7 +12234,6 @@ def _resume_stage3_formal_matrix_from_receipt(
     return {
         "formal_path_results": formal_results,
         "completeness_report": formal_report,
-        "gate_record": _gate_candidate(request),
     }, tuple(
         dict.fromkeys(
             (*inputs.references, plan_ref, reference_aggregate_ref,
@@ -13413,7 +13411,6 @@ def _run_stage3_formal_matrix_shard(
                     "evidence_hash"
                 ],
             },
-            "gate_record": _gate_candidate(request),
         },
         tuple(
             dict.fromkeys(

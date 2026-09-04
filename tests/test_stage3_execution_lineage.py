@@ -786,6 +786,10 @@ def test_matrix_resume_after_raw_skips_candidate_evaluation(tmp_path, monkeypatc
     )
     assert candidate_calls == []
     assert raw_shard_loads == [receipt["raw_shard_ref"]]
+    assert tuple(payloads) == (
+        "formal_path_results",
+        "completeness_report",
+    )
     assert payloads["formal_path_results"]["streaming_coverage"]["committed_unit_ids"] == [
         "unit-00"
     ]
