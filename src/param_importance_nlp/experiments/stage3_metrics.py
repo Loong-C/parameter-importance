@@ -28,8 +28,6 @@ from ..core.metrics import (
     normalized_linf_error as _normalized_linf_error,
     sign_agreement as _sign_agreement,
     spearman_correlation as _spearman_correlation,
-    top_k_jaccard as _top_k_jaccard,
-    top_k_overlap as _top_k_overlap,
 )
 
 
@@ -224,14 +222,61 @@ def top_q_metrics(
     if len(set(qs)) != len(qs):
         raise ValueError("q_values 不能重复")
     ids = _validate_coordinate_ids(coordinate_ids, lhs.size)
+    ks = {q: max(1, math.ceil(q * lhs.size)) for q in qs}
+
+    # Every requested q is a prefix of the same deterministic ranking.  The
+    # previous implementation delegated overlap and Jaccard independently for
+    # every q, which rebuilt the complete O(P log P) ranking four times per q.
+    # Formal Stage 3 supplies three q values for each of thirteen rules, so a
+    # single unit needlessly sorted each multi-million-coordinate vector 156
+    # times.  Rank each side once and derive every metric from its exact prefix.
+    # This preserves the core tie policy and MetricResult payload byte-for-byte.
+    if ids is not None:
+        left_order = np.asarray(
+            sorted(range(lhs.size), key=lambda index: (-float(lhs[index]), ids[index])),
+            dtype=np.int64,
+        )
+        right_order = np.asarray(
+            sorted(range(rhs.size), key=lambda index: (-float(rhs[index]), ids[index])),
+            dtype=np.int64,
+        )
+        left_sorted = right_sorted = None
+    else:
+        left_sorted = np.sort(lhs)[::-1]
+        right_sorted = np.sort(rhs)[::-1]
+        left_order = np.argsort(-lhs, kind="mergesort")
+        right_order = np.argsort(-rhs, kind="mergesort")
+
     result: dict[float, dict[str, object]] = {}
     for q in qs:
-        k = max(1, math.ceil(q * lhs.size))
+        k = ks[q]
+        if ids is None and k < lhs.size and (
+            left_sorted[k - 1] == left_sorted[k]  # type: ignore[index]
+            or right_sorted[k - 1] == right_sorted[k]  # type: ignore[index]
+        ):
+            overlap = MetricResult.undefined(
+                "non_unique_top_k_boundary_without_coordinate_ids", k=k
+            )
+            jaccard = MetricResult.undefined(
+                "non_unique_top_k_boundary_without_coordinate_ids", k=k
+            )
+        else:
+            left_set = set(left_order[:k].tolist())
+            right_set = set(right_order[:k].tolist())
+            intersection = len(left_set & right_set)
+            union = len(left_set | right_set)
+            overlap = MetricResult.ok(intersection / k, k=k, intersection=intersection)
+            jaccard = MetricResult.ok(
+                intersection / union,
+                k=k,
+                intersection=intersection,
+                union=union,
+            )
         result[q] = {
             "q": q,
             "k": k,
-            "overlap": _top_k_overlap(lhs, rhs, k, coordinate_ids=ids),
-            "jaccard": _top_k_jaccard(lhs, rhs, k, coordinate_ids=ids),
+            "overlap": overlap,
+            "jaccard": jaccard,
         }
     return result
 

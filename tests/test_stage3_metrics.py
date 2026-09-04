@@ -5,6 +5,7 @@ import math
 import numpy as np
 import pytest
 
+from param_importance_nlp.core.metrics import top_k_jaccard, top_k_overlap
 from param_importance_nlp.experiments.stage3_metrics import (
     DEFAULT_TOP_Q,
     UnitMetricObservation,
@@ -68,6 +69,48 @@ def test_top_q_metrics_use_ceiling_and_canonical_tie_break() -> None:
     tied = top_q_metrics([2.0, 1.0, 1.0], [2.0, 1.0, 1.0], q_values=[0.5])
     assert not tied[0.5]["overlap"].defined
     assert "non_unique" in (tied[0.5]["overlap"].reason or "")
+
+
+@pytest.mark.parametrize("with_ids", [False, True])
+def test_top_q_metrics_match_independent_per_q_core_calls(with_ids: bool) -> None:
+    rng = np.random.default_rng(20260904)
+    cases = [
+        (rng.normal(size=257), rng.normal(size=257)),
+        (
+            np.asarray([3.0, 2.0, 2.0, 1.0, 0.0, -1.0]),
+            np.asarray([3.0, 2.0, 1.0, 1.0, 0.0, -1.0]),
+        ),
+    ]
+    for candidate, reference in cases:
+        ids = (
+            tuple(f"coordinate-{index:04d}" for index in range(candidate.size))
+            if with_ids
+            else None
+        )
+        q_values = (0.001, 0.01, 0.05, 0.5, 1.0)
+        observed = top_q_metrics(
+            candidate,
+            reference,
+            q_values=q_values,
+            coordinate_ids=ids,
+        )
+        for q in q_values:
+            k = max(1, math.ceil(q * candidate.size))
+            expected_overlap = top_k_overlap(
+                candidate, reference, k, coordinate_ids=ids
+            )
+            expected_jaccard = top_k_jaccard(
+                candidate, reference, k, coordinate_ids=ids
+            )
+            for name, expected in (
+                ("overlap", expected_overlap),
+                ("jaccard", expected_jaccard),
+            ):
+                actual = observed[q][name]
+                assert actual.defined is expected.defined
+                assert actual.value == expected.value
+                assert actual.reason == expected.reason
+                assert dict(actual.details) == dict(expected.details)
 
 
 def test_group_aggregation_reports_totals_means_fractions_and_tv() -> None:
