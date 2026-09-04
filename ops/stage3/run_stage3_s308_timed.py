@@ -111,6 +111,27 @@ def _existing_input(root: Path, value: Path, *, field: str) -> tuple[Path, str]:
     return path, logical
 
 
+def _executable_input(root: Path, value: Path) -> tuple[Path, str]:
+    """Allow only the final venv executable component to be a symlink."""
+
+    candidate = value if value.is_absolute() else root / value
+    absolute = candidate.absolute()
+    try:
+        relative = absolute.relative_to(root)
+    except ValueError as error:
+        raise _fail("S308_TIMED_PATH_OUTSIDE_DATA_ROOT", "python_executable") from error
+    if root.is_symlink():
+        raise _fail("S308_TIMED_DATA_ROOT_SYMLINK")
+    current = root
+    for part in relative.parts[:-1]:
+        current = current / part
+        if current.is_symlink():
+            raise _fail("S308_TIMED_PATH_SYMLINK", "python_executable")
+    if not absolute.is_file() or not os.access(absolute, os.X_OK):
+        raise _fail("S308_TIMED_EXECUTABLE_INVALID")
+    return absolute, PurePosixPath(*relative.parts).as_posix()
+
+
 def _parse_time(value: object, *, field: str) -> datetime:
     if not isinstance(value, str) or not value:
         raise _fail("S308_TIMED_TIME_INVALID", field)
@@ -380,7 +401,6 @@ def run_timed(
         ("s307_environment", arguments.s307_environment, True),
         ("s308_config", arguments.s308_config, True),
         ("s308_environment", arguments.s308_environment, True),
-        ("python_executable", arguments.python_executable, True),
         ("s308_result", arguments.s308_result, False),
         ("state", arguments.state, False),
         ("receipt", arguments.receipt, False),
@@ -391,6 +411,9 @@ def run_timed(
             else _logical_path(data_root, value, field=name)
         )
         paths[name], refs[name] = path, ref
+    paths["python_executable"], refs["python_executable"] = _executable_input(
+        data_root, arguments.python_executable
+    )
     if PurePosixPath(refs["state"]).parts[0] != "runs":
         raise _fail("S308_TIMED_STATE_REF_INVALID")
     if PurePosixPath(refs["receipt"]).parts[0] != "results":
@@ -612,6 +635,7 @@ __all__ = [
     "SCHEMA_VERSION",
     "STATE_SCHEMA_VERSION",
     "Stage3S308TimedError",
+    "_executable_input",
     "_git_commit",
     "_new_state",
     "_result_mtime",

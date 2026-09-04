@@ -9,6 +9,7 @@ import pytest
 
 from ops.stage3.run_stage3_s308_timed import (
     Stage3S308TimedError,
+    _executable_input,
     _git_commit,
     _new_state,
     _result_mtime,
@@ -72,6 +73,20 @@ def test_git_commit_accepts_sha1_and_sha256_but_rejects_other_hashes() -> None:
     assert _git_commit("e" * 64) == "e" * 64
     with pytest.raises(Stage3S308TimedError, match="GIT_COMMIT_INVALID"):
         _git_commit("f" * 39)
+
+
+def test_executable_allows_only_final_venv_symlink(tmp_path: Path) -> None:
+    environment = tmp_path / "env/bin"
+    environment.mkdir(parents=True)
+    executable = environment / "python"
+    executable.symlink_to("/bin/sh")
+    path, logical = _executable_input(tmp_path, executable)
+    assert path == executable
+    assert logical == "env/bin/python"
+    linked_parent = tmp_path / "linked-env"
+    linked_parent.symlink_to(tmp_path / "env", target_is_directory=True)
+    with pytest.raises(Stage3S308TimedError, match="PATH_SYMLINK"):
+        _executable_input(tmp_path, linked_parent / "bin/python")
 
 
 def test_result_mtime_is_timezone_aware_and_task_command_is_exact(
