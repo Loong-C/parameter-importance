@@ -177,6 +177,20 @@ def _git_snapshot(repository_root: Path, expected_commit: str | None) -> tuple[s
     return commit, branch
 
 
+def _confirm_git_snapshot(
+    repository_root: Path,
+    *,
+    expected_commit: str,
+    expected_branch: str,
+) -> tuple[str, str]:
+    """Fail if either component of a previously clean Git identity drifted."""
+
+    commit, branch = _git_snapshot(repository_root, expected_commit)
+    if branch != expected_branch:
+        raise _fail("STAGE3_PROVENANCE_GIT_BRANCH_DRIFT")
+    return commit, branch
+
+
 def _formal_artifact(
     root: Path,
     reference: str,
@@ -486,6 +500,12 @@ def publish_provenance(arguments: argparse.Namespace) -> Mapping[str, Any]:
         started_at=arguments.started_at,
         ended_at=arguments.ended_at,
     )
+    # Deep streaming validation may take long enough for the repository to
+    # change after the initial snapshot.  Recheck immediately before the first
+    # immutable write so a stale Git identity cannot leave partial authority.
+    _confirm_git_snapshot(
+        repository_root, expected_commit=git_commit, expected_branch=git_branch
+    )
     publish_canonical_immutable(source_path, provenance.to_dict())
     envelope_sources = tuple(
         dict.fromkeys(
@@ -508,9 +528,9 @@ def publish_provenance(arguments: argparse.Namespace) -> Mapping[str, Any]:
         formal_eligible=True,
         source_refs=envelope_sources,
     )
-    final_commit, final_branch = _git_snapshot(repository_root, git_commit)
-    if final_branch != git_branch:
-        raise _fail("STAGE3_PROVENANCE_GIT_BRANCH_DRIFT")
+    final_commit, final_branch = _confirm_git_snapshot(
+        repository_root, expected_commit=git_commit, expected_branch=git_branch
+    )
     receipt: dict[str, Any] = {
         "schema_version": SCHEMA_VERSION,
         "status": "PASS",
@@ -570,6 +590,7 @@ __all__ = [
     "SCHEMA_VERSION",
     "Stage3ProvenancePublicationError",
     "_build_record",
+    "_confirm_git_snapshot",
     "_device_mapping",
     "_git_snapshot",
     "main",

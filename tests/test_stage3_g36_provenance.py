@@ -12,6 +12,7 @@ import pytest
 from ops.stage3.publish_stage3_g36_provenance import (
     Stage3ProvenancePublicationError,
     _build_record,
+    _confirm_git_snapshot,
     _device_mapping,
     _git_snapshot,
 )
@@ -109,6 +110,24 @@ def test_git_snapshot_requires_clean_named_branch(tmp_path: Path) -> None:
     tracked.write_text("dirty\n", encoding="utf-8")
     with pytest.raises(Stage3ProvenancePublicationError, match="GIT_DIRTY"):
         _git_snapshot(tmp_path, commit)
+
+
+def test_confirm_git_snapshot_rejects_same_commit_on_different_branch(
+    tmp_path: Path,
+) -> None:
+    _git(tmp_path, "init", "-b", "codex/original")
+    _git(tmp_path, "config", "user.email", "test@example.invalid")
+    _git(tmp_path, "config", "user.name", "Stage3 Test")
+    tracked = tmp_path / "tracked.txt"
+    tracked.write_text("clean\n", encoding="utf-8")
+    _git(tmp_path, "add", "tracked.txt")
+    _git(tmp_path, "commit", "-m", "initial")
+    commit = _git(tmp_path, "rev-parse", "HEAD")
+    _git(tmp_path, "switch", "-c", "codex/drifted")
+    with pytest.raises(Stage3ProvenancePublicationError, match="GIT_BRANCH_DRIFT"):
+        _confirm_git_snapshot(
+            tmp_path, expected_commit=commit, expected_branch="codex/original"
+        )
 
 
 def test_build_record_rejects_inverted_times() -> None:
