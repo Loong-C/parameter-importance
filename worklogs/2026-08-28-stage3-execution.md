@@ -97,3 +97,17 @@
 - CLI/producer 审计同时修复：pilot endpoint/probe 计划可被严格 dispatcher 接受；endpoint metadata 不再被丢弃；probe selector 从 `record.endpoint_digest` 读取真实 digest；生产索引可消费带 `qualification_gate_hash` 的 probe panel；selector schema `$id` 恢复为仓库统一 `.invalid` authority。
 - 审计修复后回归：critical endpoint/fanout/index `26 passed`；orchestrator/fanout/phase `19 passed`；CLI selector/builders `2 passed`；task DAG `1 passed`；21 个 Stage 3 schema 的 Draft 2020-12 与仓库 `$id` 前缀检查均通过。
 - 独立报告链审计确认 S3.10 当前仍不足以完成中文报告、PNG/SVG、Beamer 和 G3-8 delivery authority。该缺口不影响 pilot 启动，但属于 Stage 3 最终闭环的硬未完成项，必须在 pilot 长跑期间补齐并在 G3-8 前做端到端验收。
+
+## 2026-09-04 — S3.07 正式长跑与交付桥接加固（进行中）
+
+- 当前正式控制面为 `s307-r4`，冻结范围仍是 99 个 endpoint×probe 单元，没有删减、跳过或重启已完成单元。截至本条记录，状态已持久化到 `next_step=29`，共有 29 份单位结果、34 次含历史恢复的 attempt；`step-029` 子进程仍持续消耗 CPU，唯一实验 GPU 进程位于 GPU0。受保护 PID `724839` 保持存活且未被干预。
+- S3.07 的工作区、结果、缓存和恢复状态继续分别固定在 DATA_ROOT 下的命名路径。针对 sealed node bundle、unit memo、average-rank 与 top-q 热路径的修复均以提交和回归测试落地；现有 fan-out 父进程与当前子进程保持原地运行，没有因下游代码准备而重启。
+- 独立 delivery bridge `codex/stage3-g36-production-bridge-20260904` 已补齐 S3.08 timed boundary、S3.07→S3.08 handoff audit、G3-6 provenance/publisher、S3.09 base execution、G3-7 finalization、S3.10 四类正式提交、分析表/PNG+SVG/中文报告/Beamer PDF 物化、large-artifact closure、Git sync evidence、source snapshot、G3-8 publisher 与 Stage4 handoff audit。上述能力只准备控制面；尚未把缺失的下游正式结果伪造为 PASS。
+- G3-8 replay 报告现在在 producer 和 consumer 两侧都重新打开每个 `input_ref`，检查 workspace/symlink 边界，并把声明的 SHA-256 与真实文件字节绑定。专项 replay、G3-8 publisher 和生产入口回归为 `12 passed`；提交 `230458975b91c9d81168a1391da96b48585b07b7`。
+- 一次文件传输误指向正在运行的 S3.07 工作区；核验确认范围仅为两个 tracked G3-8 文件和两个新文件。两个 tracked 文件已从该工作区自身 HEAD 精确恢复，两个新文件移动到 `$DATA_ROOT/tmp/stage3/s307-accidental-edit-recovery-20260904-r1/quarantine`，恢复后工作区 `git status` 为空；运行中的 fan-out/子进程路径未修改。正式补丁随后只应用到 delivery bridge。
+- S3.08 dry validation 在 delivery bridge 上保持 fail-closed：handoff 状态为 `IN_PROGRESS`，`completed_unit_count=29`、`required_unit_count=99`，audit hash 为 `e82efeef137ec2225f41e4a04d8a569ae562f7775ca0b4a6866627a26bbb24b9`。S3.08 result、timed state 和 timed receipt 均不存在，未提前启动 S3.08。
+
+## 2026-09-04 当前完成边界
+
+- S3.07 仍在执行第 30 个正式单元（零基 `step-029`）；因此 S3.08、G3-6、S3.09、G3-7、S3.10、G3-8 和 Stage4 handoff 都尚未发布正式 PASS。
+- 后续顺序保持为：S3.07 全部 99 单元与聚合提交完成 → S3.08 timed execution/receipt → provenance 与 G3-6 → 在 base execution 上运行 S3.09 → G3-7 → 向 execution chain 依次追加 G3-6、G3-7 → S3.10 → 三层 replay、最终表图文档、large/source/Git manifests → G3-8 → Stage4 audit。不得越过任何前置 authority，也不得用 dry-run、fixture 或未来占位文件替代正式结果。
