@@ -111,3 +111,10 @@
 
 - S3.07 仍在执行第 30 个正式单元（零基 `step-029`）；因此 S3.08、G3-6、S3.09、G3-7、S3.10、G3-8 和 Stage4 handoff 都尚未发布正式 PASS。
 - 后续顺序保持为：S3.07 全部 99 单元与聚合提交完成 → S3.08 timed execution/receipt → provenance 与 G3-6 → 在 base execution 上运行 S3.09 → G3-7 → 向 execution chain 依次追加 G3-6、G3-7 → S3.10 → 三层 replay、最终表图文档、large/source/Git manifests → G3-8 → Stage4 audit。不得越过任何前置 authority，也不得用 dry-run、fixture 或未来占位文件替代正式结果。
+
+## 2026-09-04 — 文档渲染资产闭包与第 31 单元边界
+
+- 正式文档渲染器现在要求字体文件位于 DATA_ROOT workspace 内、父链无 symlink，并在 `stage3-delivery-documents-v1` 中记录字体 `path/sha256/size`。delivery inventory composer 会重新打开并复核字体字节；独立 G3-8 consumer 会再次复核文档 manifest 的自哈希、renderer、字体、PDF/TeX/notes/backups、PNG/SVG 绑定，并要求字体进入 large-artifact 的 `document_delivery_assets` 完整目录闭包。
+- 上述生产者、composer、consumer 和负向测试以提交 `f113b17c19eca1caef49c5285c71c03e76ff6848` 落地；隔离远端回归为 `19 passed`。测试仅把 `pypdf==6.1.1` 安装到独立文档运行时，没有修改正式实验 venv 或 S3.07 运行环境。
+- Noto Sans SC 字体、OFL-1.1、ReportLab 安装报告与 PDF 验证器安装报告均保存在 `external-storage/lyx-storage/stage3-path-formal-20260829/delivery-assets-r1`。旧 `document-renderer-assets.json` 保留不覆盖；新增自哈希 `document-renderer-assets-v2.json`，artifact hash 为 `238e288892126869cc49154ed2e4cfe871a5cbe1a5fb2d897fbde609805b4324`、文件 SHA-256 为 `3b155e34177e8ca7f88c2e2f4a1d84b7ee725b725498160e1165a1de5a10685f`。
+- S3.07 已持久化 30/99 个正式单位结果，父进程 `68279` 与 `step-030` 子进程 `488564` 继续原地运行，受保护 PID `724839` 未被干预。对提交 `f113b17c...` 的 S3.08 dry validation 仍为 `IN_PROGRESS`，完成数 `30/99`，launch hash `36f0a781d086127e833ab4e6c00fb2cec0f03a0802f3bb6c458a761f25b88749`、receipt hash `d122e865bf3df7f7df6a1259d544101205a8a54263ea5cca6cdf9af76189df4e`；canonical S3.08 result、timed state、timed receipt 继续全部不存在，未提前运行。
