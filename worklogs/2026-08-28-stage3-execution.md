@@ -120,3 +120,12 @@
 - S3.07 已持久化 30/99 个正式单位结果，父进程 `68279` 与 `step-030` 子进程 `488564` 继续原地运行，受保护 PID `724839` 未被干预。对提交 `f113b17c...` 的 S3.08 dry validation 仍为 `IN_PROGRESS`，完成数 `30/99`，launch hash `36f0a781d086127e833ab4e6c00fb2cec0f03a0802f3bb6c458a761f25b88749`、receipt hash `d122e865bf3df7f7df6a1259d544101205a8a54263ea5cca6cdf9af76189df4e`；canonical S3.08 result、timed state、timed receipt 继续全部不存在，未提前运行。
 - large-artifact 共享 schema 的 `artifact_roots.minItems` 与 `file_count.minimum` 已从旧的 7 个角色同步为 8，覆盖新增 `document_delivery_assets`；提交 `5b8b502343f1975f08741fa38bd6de3565e13123`。G3-8 还会把文档 manifest 的四个 S3.10 source ref 和五元 input identity 与本次实际重载的四个正式 task commit 逐项比较，提交 `274d5ee29cde2b872bec1421633a77d36c58bd5b`。
 - 最终桥接 HEAD 上从 S3.07 handoff、S3.08 timed、G3-6/G3-7、文档/源快照/三层 replay/large/Git manifests 到 G3-8 publisher/entrypoints 的合并专项回归为 `66 passed`。期间 `step-030` 已通过 result/config/self-hash 审计并持久化，S3.07 自动推进到 31/99 和 `step-031`，未发生人工恢复、重启或 GPU 迁移。
+
+## 2026-09-04 — 实际字体 PDF 布局验收与分页修复
+
+- 使用 DATA_ROOT 内已闭包并自哈希的 Noto Sans SC 字体和生产文档渲染器，在 DATA_ROOT 的临时目录中生成 formal-shaped smoke 文档；报告为 4 页、幻灯片最初为 11 页，PDF 可由独立 `pypdf==6.1.1` 运行时解析并提取中文文本。
+- 对全部页面进行 Poppler 光栅化与逐页目视检查时发现真实布局缺陷：原第 9 页的 15 条备份指标与页脚重叠，第 16 条指标被裁切。该 smoke 仅用于布局验收，没有作为正式科学结果或 G3-8 交付发布。
+- 文档渲染器现先按实际换行行数分页，并在绘制前 fail-closed 检查最后一条 bullet 的底边不得越过页脚安全边界；指标备份页动态生成页码、标题和 `BACKUP n/N` 标签。16 条指标被安全拆分为两页（1–13、14–16），相应负向/回归测试覆盖所有指标文本和两页分页。
+- 修复提交为 `bf553a89004f647a16401ae8f11f3bd8529b606e`（`Paginate Stage3 delivery metric slides`）。文档专项回归为 `20 passed`；随后在同一提交上运行 S3.07 handoff、S3.08 timed、G3-6/G3-7、文档、三层 replay、large/source/Git manifests、G3-8 publisher/entrypoints 的完整下游集合，结果为 `66 passed in 9.67s`。
+- 使用实际 Noto 字体重新渲染后，报告仍为 4 页且字节 SHA-256 为 `33da355ae0750d6f85e0a6626d9e2c749bce19810ca130d93a6b0d9986a7f8df`；幻灯片为 12 页，字节 SHA-256 为 `16062dee6d5bfc089d396dbc7085e70aaf7b2206e1911fa703fb5c34c720c7e0`。报告和幻灯片均可提取中文；4 页报告与 12 页幻灯片均已完成视觉验收，未见重叠、裁切或页脚越界。
+- 验收期间 S3.07 保持原地运行：状态文件为 31/99、`next_step=31`、36 次 attempt，父进程 `68279` 与 `step-031` 子进程 `509779` 存活；唯一实验 GPU 进程仍位于 GPU0，受保护 PID `724839` 存活且未被干预。没有启动、重启或迁移正式实验，也没有提前写入 canonical S3.08 结果、timed state 或 timed receipt。
