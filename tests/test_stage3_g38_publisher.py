@@ -66,6 +66,11 @@ def _put_file(root: Path, name: str, data: bytes) -> dict[str, object]:
 
 def _manifest(root: Path) -> dict[str, object]:
     n = 0
+    replay_input = _put_file(
+        root,
+        "evidence/stage3/replay-source.json",
+        b'{"authority":"formal-stage3-delivery"}\n',
+    )
 
     def f(ext: str, data: bytes | None = None) -> dict[str, object]:
         nonlocal n
@@ -103,8 +108,8 @@ def _manifest(root: Path) -> dict[str, object]:
                 "errors": 0,
                 "skipped": 0,
             },
-            "input_refs": {"authority": "evidence/stage3/replay-source.json"},
-            "input_hashes": {"authority": "3" * 64},
+            "input_refs": {"authority": replay_input["path"]},
+            "input_hashes": {"authority": replay_input["sha256"]},
             "evidence_files": [evidence],
         }
         payload = body | {"artifact_hash": canonical_json_hash(body)}
@@ -583,6 +588,18 @@ def test_g38_rejects_replay_with_skip_even_when_file_hash_matches(tmp_path: Path
     parsed = Stage3G38DeliveryManifest.from_mapping(manifest)
 
     with pytest.raises(FormalRunRejected, match="REPLAY_TEST_SUMMARY_NOT_PASS:server_locked"):
+        validate_stage3_replay_reports(tmp_path, parsed)
+
+
+def test_g38_rejects_replay_input_byte_drift(tmp_path: Path) -> None:
+    manifest = _manifest(tmp_path)
+    parsed = Stage3G38DeliveryManifest.from_mapping(manifest)
+    (tmp_path / "evidence" / "stage3" / "replay-source.json").write_bytes(b"drifted\n")
+
+    with pytest.raises(
+        FormalRunRejected,
+        match="REPLAY_INPUT_FILE_HASH_MISMATCH:local_cpu:authority",
+    ):
         validate_stage3_replay_reports(tmp_path, parsed)
 
 

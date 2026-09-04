@@ -99,6 +99,22 @@ def _timestamp(value: object, *, field: str) -> tuple[str, datetime]:
     return value, parsed
 
 
+def _workspace_payload(root: Path, ref: str, *, field: str) -> bytes:
+    current = root
+    for part in PurePosixPath(ref).parts:
+        current = current / part
+        if current.is_symlink():
+            raise ValueError(f"{field} contains a symlink")
+    try:
+        resolved = root.joinpath(*PurePosixPath(ref).parts).resolve(strict=True)
+        resolved.relative_to(root)
+    except (OSError, ValueError) as error:
+        raise ValueError(f"{field} is not an existing workspace file") from error
+    if not resolved.is_file():
+        raise ValueError(f"{field} is not a regular file")
+    return resolved.read_bytes()
+
+
 def _file_record(root: Path, value: object, *, field: str, seen: set[str]) -> dict[str, JSONValue]:
     if isinstance(value, str):
         source: Mapping[str, object] = {"path": value}
@@ -108,19 +124,7 @@ def _file_record(root: Path, value: object, *, field: str, seen: set[str]) -> di
     ref = _safe_ref(source["path"], field=f"{field}.path")
     if ref in seen:
         raise ValueError(f"duplicate replay evidence file: {ref}")
-    current = root
-    for part in PurePosixPath(ref).parts:
-        current = current / part
-        if current.is_symlink():
-            raise ValueError(f"{field}.path contains a symlink")
-    try:
-        resolved = root.joinpath(*PurePosixPath(ref).parts).resolve(strict=True)
-        resolved.relative_to(root)
-    except (OSError, ValueError) as error:
-        raise ValueError(f"{field}.path is not an existing workspace file") from error
-    if not resolved.is_file():
-        raise ValueError(f"{field}.path is not a regular file")
-    payload = resolved.read_bytes()
+    payload = _workspace_payload(root, ref, field=f"{field}.path")
     record: dict[str, JSONValue] = {
         "path": ref,
         "sha256": hashlib.sha256(payload).hexdigest(),
@@ -205,8 +209,13 @@ def materialize_stage3_replay_report(
     input_hashes: dict[str, JSONValue] = {}
     for name in sorted(input_refs_raw):
         key = _safe_id(name, field="input name")
-        input_refs[key] = _safe_ref(input_refs_raw[name], field=f"input_refs.{name}")
-        input_hashes[key] = _hash(input_hashes_raw[name], field=f"input_hashes.{name}")
+        ref = _safe_ref(input_refs_raw[name], field=f"input_refs.{name}")
+        digest = _hash(input_hashes_raw[name], field=f"input_hashes.{name}")
+        payload = _workspace_payload(root, ref, field=f"input_refs.{name}")
+        if hashlib.sha256(payload).hexdigest() != digest:
+            raise ValueError(f"input_refs.{name} SHA-256 does not match the workspace file")
+        input_refs[key] = ref
+        input_hashes[key] = digest
 
     evidence_raw = source["evidence_files"]
     if not isinstance(evidence_raw, Sequence) or isinstance(evidence_raw, (str, bytes)) or not evidence_raw:

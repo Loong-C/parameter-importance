@@ -26,6 +26,9 @@ def _source(root: Path, layer: str) -> dict[str, object]:
     log = root / "evidence" / f"{layer}.log"
     log.parent.mkdir(parents=True, exist_ok=True)
     log.write_text(f"{layer}: 3 passed, 0 skipped\n", encoding="utf-8")
+    delivery = root / "results" / "stage3" / "delivery.json"
+    delivery.parent.mkdir(parents=True, exist_ok=True)
+    delivery.write_bytes(b'{"delivery":"formal"}\n')
     return {
         "schema_version": MODULE.SOURCE_SCHEMA,
         "replay_id": f"stage3-replay-{layer}",
@@ -38,7 +41,7 @@ def _source(root: Path, layer: str) -> dict[str, object]:
         "completed_at": "2026-09-04T01:01:00Z",
         "test_summary": {"collected": 3, "passed": 3, "failed": 0, "errors": 0, "skipped": 0},
         "input_refs": {"delivery": "results/stage3/delivery.json"},
-        "input_hashes": {"delivery": "3" * 64},
+        "input_hashes": {"delivery": hashlib.sha256(delivery.read_bytes()).hexdigest()},
         "evidence_files": [{"path": log.relative_to(root).as_posix(), "role": "pytest_log", "source_refs": ["results/stage3/delivery.json"]}],
     }
 
@@ -74,6 +77,15 @@ def test_materializer_rejects_failed_skipped_missing_and_changed_retry(tmp_path:
     missing = dict(source, evidence_files=["evidence/missing.log"])
     with pytest.raises(ValueError, match="existing workspace file"):
         MODULE.materialize_stage3_replay_report(workspace_root=tmp_path, source=missing, output="reports/missing.json")
+
+    (tmp_path / "results" / "stage3" / "delivery.json").write_bytes(b"changed\n")
+    with pytest.raises(ValueError, match="SHA-256 does not match"):
+        MODULE.materialize_stage3_replay_report(
+            workspace_root=tmp_path,
+            source=source,
+            output="reports/input-drift.json",
+        )
+    source = _source(tmp_path, "server_locked")
 
     output = tmp_path / "reports" / "locked.json"
     MODULE.materialize_stage3_replay_report(workspace_root=tmp_path, source=source, output=output)

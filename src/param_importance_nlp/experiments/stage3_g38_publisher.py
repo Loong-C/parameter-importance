@@ -625,6 +625,47 @@ def _verify_file_record(
         raise FormalRunRejected(f"STAGE3_G38_FILE_HASH_OR_SIZE_MISMATCH:{ref}")
 
 
+def _verify_replay_input_file(
+    workspace_root: Path,
+    *,
+    ref: str,
+    digest: str,
+    identity: str,
+) -> None:
+    """Bind one replay-declared input digest to its actual workspace bytes."""
+
+    root = workspace_root.resolve()
+    candidate = root.joinpath(*PurePosixPath(ref).parts)
+    try:
+        current = root
+        for part in PurePosixPath(ref).parts:
+            current = current / part
+            if current.is_symlink():
+                raise FormalRunRejected(
+                    f"STAGE3_G38_REPLAY_INPUT_FILE_SYMLINK:{identity}"
+                )
+        resolved = candidate.resolve(strict=True)
+        resolved.relative_to(root)
+    except FormalRunRejected:
+        raise
+    except (OSError, ValueError) as error:
+        raise FormalRunRejected(
+            f"STAGE3_G38_REPLAY_INPUT_FILE_NOT_IN_WORKSPACE:{identity}"
+        ) from error
+    if not resolved.is_file():
+        raise FormalRunRejected(
+            f"STAGE3_G38_REPLAY_INPUT_FILE_NOT_REGULAR:{identity}"
+        )
+    hasher = hashlib.sha256()
+    with resolved.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(8 * 1024 * 1024), b""):
+            hasher.update(chunk)
+    if hasher.hexdigest() != digest:
+        raise FormalRunRejected(
+            f"STAGE3_G38_REPLAY_INPUT_FILE_HASH_MISMATCH:{identity}"
+        )
+
+
 def _utc_timestamp(value: object, *, field: str) -> datetime:
     if not isinstance(value, str) or not value.endswith("Z"):
         raise FormalRunRejected(f"STAGE3_G38_REPLAY_TIMESTAMP_INVALID:{field}")
@@ -731,8 +772,17 @@ def validate_stage3_replay_reports(
             if not isinstance(name, str):
                 raise FormalRunRejected(f"STAGE3_G38_REPLAY_INPUT_NAME_INVALID:{layer}")
             _safe_id(name, field=f"replay_reports.{layer}.input_refs")
-            _safe_ref(source_ref, field=f"replay_reports.{layer}.input_refs.{name}")
-            _hash(input_hashes[name], field=f"replay_reports.{layer}.input_hashes.{name}")
+            ref = _safe_ref(source_ref, field=f"replay_reports.{layer}.input_refs.{name}")
+            digest = _hash(
+                input_hashes[name],
+                field=f"replay_reports.{layer}.input_hashes.{name}",
+            )
+            _verify_replay_input_file(
+                root,
+                ref=ref,
+                digest=digest,
+                identity=f"{layer}:{name}",
+            )
 
         evidence = payload.get("evidence_files")
         if not isinstance(evidence, list) or not evidence:
