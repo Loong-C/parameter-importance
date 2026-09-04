@@ -69,6 +69,15 @@ REQUIRED_STAGE3_G38_GIT_ROLES: tuple[str, ...] = (
     "server_clean_head",
     "sync",
 )
+STAGE3_G38_GIT_SYNC_EVIDENCE_SCHEMA = "stage3-g38-git-sync-evidence-v1"
+REQUIRED_STAGE3_G38_AGENT_DOCUMENTS: tuple[str, ...] = (
+    "Agent/git.md",
+    "Agent/local.md",
+    "Agent/remote_access.md",
+    "Agent/server.md",
+    "Agent/sync.md",
+    "Agent/worklogs.md",
+)
 REQUIRED_STAGE3_G38_REPLAY_LAYERS: tuple[str, ...] = (
     "local_cpu",
     "server_locked",
@@ -727,6 +736,127 @@ def validate_stage3_replay_reports(
         _normalise_hash_object(payload, field=f"replay_reports.{layer}")
 
 
+def _git_branch(value: object, *, field: str) -> str:
+    if (
+        not isinstance(value, str)
+        or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,199}", value) is None
+        or value.endswith("/")
+        or "//" in value
+        or ".." in value
+        or _FORBIDDEN_RE.search(value)
+        or _FUTURE_RE.search(value)
+    ):
+        raise FormalRunRejected(f"STAGE3_G38_GIT_BRANCH_INVALID:{field}")
+    return value
+
+
+def validate_stage3_git_sync_evidence(
+    workspace_root: str | Path,
+    manifest: Stage3G38DeliveryManifest,
+) -> None:
+    """Verify six command-backed Git roles and one consistent three-end snapshot."""
+
+    root = Path(workspace_root).resolve()
+    required = {
+        "schema_version",
+        "evidence_id",
+        "role",
+        "scope",
+        "status",
+        "formal_eligible",
+        "checked_at",
+        "branch",
+        "local_commit",
+        "remote_commit",
+        "server_commit",
+        "remote_name",
+        "local_delivery_worktree_clean",
+        "server_worktree_clean",
+        "agent_document_hashes",
+        "command",
+        "returncode",
+        "stdout_log",
+        "artifact_hash",
+    }
+    expected_snapshot: tuple[object, ...] | None = None
+    for role in REQUIRED_STAGE3_G38_GIT_ROLES:
+        record = manifest.git_sync[role]
+        _verify_file_record(root, record, field=f"git_sync.{role}")
+        ref = _safe_ref(
+            record.get("path"),
+            field=f"git_sync.{role}.path",
+            reject_future=False,
+        )
+        try:
+            payload = _mapping(
+                load_canonical_json(root.joinpath(*PurePosixPath(ref).parts)),
+                field=f"git_sync.{role}",
+            )
+        except (OSError, TypeError, ValueError) as error:
+            raise FormalRunRejected(f"STAGE3_G38_GIT_EVIDENCE_JSON_INVALID:{role}") from error
+        if set(payload) != required:
+            raise FormalRunRejected(f"STAGE3_G38_GIT_EVIDENCE_FIELDS_INVALID:{role}")
+        if (
+            payload.get("schema_version") != STAGE3_G38_GIT_SYNC_EVIDENCE_SCHEMA
+            or payload.get("role") != role
+            or payload.get("scope") != "formal"
+            or payload.get("status") != "PASS"
+            or payload.get("formal_eligible") is not True
+        ):
+            raise FormalRunRejected(f"STAGE3_G38_GIT_EVIDENCE_NOT_FORMAL_PASS:{role}")
+        _safe_id(payload.get("evidence_id"), field=f"git_sync.{role}.evidence_id")
+        _utc_timestamp(payload.get("checked_at"), field=f"git_sync.{role}.checked_at")
+        branch = _git_branch(payload.get("branch"), field=role)
+        commits: list[str] = []
+        for name in ("local_commit", "remote_commit", "server_commit"):
+            commit = payload.get(name)
+            if not isinstance(commit, str) or re.fullmatch(r"[0-9a-f]{40}", commit) is None:
+                raise FormalRunRejected(f"STAGE3_G38_GIT_COMMIT_INVALID:{role}:{name}")
+            commits.append(commit)
+        if len(set(commits)) != 1:
+            raise FormalRunRejected(f"STAGE3_G38_GIT_HEAD_MISMATCH:{role}")
+        remote_name = _safe_id(payload.get("remote_name"), field=f"git_sync.{role}.remote_name")
+        if (
+            payload.get("local_delivery_worktree_clean") is not True
+            or payload.get("server_worktree_clean") is not True
+        ):
+            raise FormalRunRejected(f"STAGE3_G38_GIT_WORKTREE_NOT_CLEAN:{role}")
+        document_hashes = _mapping(
+            payload.get("agent_document_hashes"),
+            field=f"git_sync.{role}.agent_document_hashes",
+        )
+        if set(document_hashes) != set(REQUIRED_STAGE3_G38_AGENT_DOCUMENTS):
+            raise FormalRunRejected(f"STAGE3_G38_AGENT_DOCUMENT_SET_INVALID:{role}")
+        normalized_documents: tuple[tuple[str, str], ...] = tuple(
+            (name, _hash(document_hashes[name], field=f"git_sync.{role}.{name}"))
+            for name in REQUIRED_STAGE3_G38_AGENT_DOCUMENTS
+        )
+        command = payload.get("command")
+        if (
+            not isinstance(command, list)
+            or not command
+            or any(not isinstance(item, str) or not item for item in command)
+        ):
+            raise FormalRunRejected(f"STAGE3_G38_GIT_COMMAND_INVALID:{role}")
+        returncode = payload.get("returncode")
+        if isinstance(returncode, bool) or returncode != 0:
+            raise FormalRunRejected(f"STAGE3_G38_GIT_RETURNCODE_NOT_ZERO:{role}")
+        log_record = _file_mapping(payload.get("stdout_log"), field=f"git_sync.{role}.stdout_log")
+        _verify_file_record(root, log_record, field=f"git_sync.{role}.stdout_log")
+        _normalise_hash_object(payload, field=f"git_sync.{role}")
+
+        snapshot: tuple[object, ...] = (
+            branch,
+            *commits,
+            remote_name,
+            normalized_documents,
+        )
+        if expected_snapshot is None:
+            expected_snapshot = snapshot
+        elif snapshot != expected_snapshot:
+            raise FormalRunRejected(f"STAGE3_G38_GIT_ROLE_SNAPSHOT_DRIFT:{role}")
+
+
 def _status_from_payload(payload: Mapping[str, object]) -> str | None:
     status = payload.get("status")
     if isinstance(status, str):
@@ -1376,6 +1506,7 @@ class Stage3G38Publisher:
         manifest = Stage3G38DeliveryManifest.from_mapping(dict(manifest_commit.payload))
         _verify_manifest_files(root, manifest)
         validate_stage3_replay_reports(root, manifest)
+        validate_stage3_git_sync_evidence(root, manifest)
 
         # Upstream publishers may intentionally derive a new publication
         # config hash (G3-6/G3-7), while the Stage3.10 runner retains the
@@ -1559,6 +1690,7 @@ def publish_stage3_delivery_manifest(
     parsed = Stage3G38DeliveryManifest.from_mapping(manifest)
     _verify_manifest_files(root, parsed)
     validate_stage3_replay_reports(root, parsed)
+    validate_stage3_git_sync_evidence(root, parsed)
     published = TaskArtifactStore(root, output_dir).publish(
         task_id=STAGE3_G38_MANIFEST_TASK_ID,
         artifact_kind=STAGE3_G38_MANIFEST_ARTIFACT_KIND,
@@ -1575,6 +1707,7 @@ __all__ = [
     "REQUIRED_STAGE3_G38_DELIVERY_ROLES",
     "REQUIRED_STAGE3_G38_GATE_IDS",
     "REQUIRED_STAGE3_G38_GIT_ROLES",
+    "REQUIRED_STAGE3_G38_AGENT_DOCUMENTS",
     "REQUIRED_STAGE3_G38_REPLAY_LAYERS",
     "STAGE3_G38_DELIVERY_MANIFEST_SCHEMA",
     "STAGE3_G38_DELIVERY_RECEIPT_ARTIFACT_KIND",
@@ -1582,6 +1715,7 @@ __all__ = [
     "STAGE3_G38_GATE_ID",
     "STAGE3_G38_PUBLICATION_CONFIG_SCHEMA",
     "STAGE3_G38_PUBLICATION_SCHEMA",
+    "STAGE3_G38_GIT_SYNC_EVIDENCE_SCHEMA",
     "STAGE3_G38_REPLAY_REPORT_SCHEMA",
     "STAGE3_G38_RECEIPT_ARTIFACT_KIND",
     "STAGE3_G38_TASK_ID",
@@ -1590,5 +1724,6 @@ __all__ = [
     "Stage3G38Publisher",
     "publish_stage3_delivery_manifest",
     "publish_stage3_g38",
+    "validate_stage3_git_sync_evidence",
     "validate_stage3_replay_reports",
 ]

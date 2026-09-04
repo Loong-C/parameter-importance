@@ -27,6 +27,7 @@ from param_importance_nlp.experiments.stage3_g38_publisher import (
     Stage3G38DeliveryManifest,
     Stage3G38Publisher,
     publish_stage3_delivery_manifest,
+    validate_stage3_git_sync_evidence,
     validate_stage3_replay_reports,
 )
 from param_importance_nlp.experiments.stage3_raw_storage import (
@@ -104,6 +105,41 @@ def _manifest(root: Path) -> dict[str, object]:
         payload = body | {"artifact_hash": canonical_json_hash(body)}
         return f(f"-{layer}.json", canonical_json_bytes(payload))
 
+    def git_evidence(role: str) -> dict[str, object]:
+        log = f(f"-{role}.log")
+        body: dict[str, object] = {
+            "schema_version": "stage3-g38-git-sync-evidence-v1",
+            "evidence_id": f"stage3-git-{role}",
+            "role": role,
+            "scope": "formal",
+            "status": "PASS",
+            "formal_eligible": True,
+            "checked_at": "2026-08-28T00:02:00Z",
+            "branch": "codex/stage3-delivery",
+            "local_commit": "4" * 40,
+            "remote_commit": "4" * 40,
+            "server_commit": "4" * 40,
+            "remote_name": "origin",
+            "local_delivery_worktree_clean": True,
+            "server_worktree_clean": True,
+            "agent_document_hashes": {
+                name: "5" * 64
+                for name in (
+                    "Agent/git.md",
+                    "Agent/local.md",
+                    "Agent/remote_access.md",
+                    "Agent/server.md",
+                    "Agent/sync.md",
+                    "Agent/worklogs.md",
+                )
+            },
+            "command": ["git", "status", "--porcelain=v1"],
+            "returncode": 0,
+            "stdout_log": log,
+        }
+        payload = body | {"artifact_hash": canonical_json_hash(body)}
+        return f(f"-{role}.json", canonical_json_bytes(payload))
+
     value: dict[str, object] = {
         "schema_version": "stage3-g38-delivery-manifest-v1",
         "manifest_id": "stage3-g38-delivery",
@@ -120,7 +156,10 @@ def _manifest(root: Path) -> dict[str, object]:
             for layer in ("local_cpu", "server_locked", "frozen_endpoint_uncached")
         },
         "server_large_artifact_manifest": f("-large.json"),
-        "git_sync": {role: f(f"-{role}.json") for role in ("branch", "commit", "push", "remote", "server_clean_head", "sync")},
+        "git_sync": {
+            role: git_evidence(role)
+            for role in ("branch", "commit", "push", "remote", "server_clean_head", "sync")
+        },
         "worklog": f(".md"),
     }
     value["artifact_hash"] = canonical_json_hash(value)
@@ -395,6 +434,28 @@ def test_g38_rejects_replay_with_skip_even_when_file_hash_matches(tmp_path: Path
 
     with pytest.raises(FormalRunRejected, match="REPLAY_TEST_SUMMARY_NOT_PASS:server_locked"):
         validate_stage3_replay_reports(tmp_path, parsed)
+
+
+def test_g38_rejects_git_head_mismatch_even_when_file_hash_matches(tmp_path: Path) -> None:
+    manifest = _manifest(tmp_path)
+    record = manifest["git_sync"]["remote"]  # type: ignore[index]
+    path = tmp_path / str(record["path"])
+    evidence = dict(load_canonical_json(path))
+    evidence["remote_commit"] = "6" * 40
+    evidence["artifact_hash"] = canonical_json_hash(
+        {key: value for key, value in evidence.items() if key != "artifact_hash"}
+    )
+    data = canonical_json_bytes(evidence)
+    path.write_bytes(data)
+    record["size"] = len(data)
+    record["sha256"] = hashlib.sha256(data).hexdigest()
+    manifest["artifact_hash"] = canonical_json_hash(
+        {key: value for key, value in manifest.items() if key != "artifact_hash"}
+    )
+    parsed = Stage3G38DeliveryManifest.from_mapping(manifest)
+
+    with pytest.raises(FormalRunRejected, match="GIT_HEAD_MISMATCH:remote"):
+        validate_stage3_git_sync_evidence(tmp_path, parsed)
 
 
 def test_g38_rejects_empty_or_spec_only_chart_bundle(tmp_path: Path) -> None:
