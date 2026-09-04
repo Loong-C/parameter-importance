@@ -158,13 +158,25 @@ def _agent_document_hashes(root: Path) -> dict[str, JSONValue]:
     return hashes
 
 
+def _agent_document_root(value: str | Path | None, *, workspace_root: Path) -> Path:
+    candidate = workspace_root if value is None else Path(value)
+    if candidate.is_symlink() or not candidate.is_dir():
+        raise ValueError("agent_document_root must be an existing non-symlink directory")
+    return candidate.resolve(strict=True)
+
+
 def materialize_stage3_git_sync_evidence(
     *,
     workspace_root: str | Path,
+    agent_document_root: str | Path | None = None,
     source: Mapping[str, object],
     output: str | Path,
 ) -> Mapping[str, JSONValue]:
     root = Path(workspace_root).resolve(strict=True)
+    document_root = _agent_document_root(
+        agent_document_root,
+        workspace_root=root,
+    )
     required = {
         "schema_version",
         "evidence_id",
@@ -223,7 +235,7 @@ def materialize_stage3_git_sync_evidence(
         "remote_name": remote_name,
         "local_delivery_worktree_clean": True,
         "server_worktree_clean": True,
-        "agent_document_hashes": _agent_document_hashes(root),
+        "agent_document_hashes": _agent_document_hashes(document_root),
         "command": list(command),
         "returncode": 0,
         "stdout_log": stdout_log,
@@ -244,6 +256,12 @@ def materialize_stage3_git_sync_evidence(
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--workspace-root", type=Path, required=True)
+    parser.add_argument(
+        "--agent-document-root",
+        type=Path,
+        required=True,
+        help="Repository root containing the authoritative ignored Agent/ documents",
+    )
     parser.add_argument("--source", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     return parser
@@ -254,6 +272,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     source = load_canonical_json(args.source)
     payload = materialize_stage3_git_sync_evidence(
         workspace_root=args.workspace_root,
+        agent_document_root=args.agent_document_root,
         source=_mapping(source, field="source"),
         output=args.output,
     )

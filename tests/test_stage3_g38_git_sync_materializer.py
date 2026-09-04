@@ -57,40 +57,54 @@ def _record(root: Path, path: Path) -> dict[str, object]:
 
 
 def test_six_materialized_roles_are_accepted_by_g38_consumer(tmp_path: Path) -> None:
-    _prepare_workspace(tmp_path)
+    delivery_root = tmp_path / "data-root"
+    document_root = tmp_path / "repository"
+    delivery_root.mkdir()
+    document_root.mkdir()
+    _prepare_workspace(document_root)
     records: dict[str, dict[str, object]] = {}
     expected_documents = {
-        ref: hashlib.sha256((tmp_path / ref).read_bytes()).hexdigest()
+        ref: hashlib.sha256((document_root / ref).read_bytes()).hexdigest()
         for ref in MODULE.AGENT_DOCUMENTS
     }
     for role in MODULE.ROLES:
-        output = tmp_path / "git-sync" / f"{role}.json"
-        payload = MODULE.materialize_stage3_git_sync_evidence(workspace_root=tmp_path, source=_source(tmp_path, role), output=output)
+        output = delivery_root / "git-sync" / f"{role}.json"
+        payload = MODULE.materialize_stage3_git_sync_evidence(
+            workspace_root=delivery_root,
+            agent_document_root=document_root,
+            source=_source(delivery_root, role),
+            output=output,
+        )
         assert payload["agent_document_hashes"] == expected_documents
         assert payload["artifact_hash"] == canonical_json_hash({key: value for key, value in payload.items() if key != "artifact_hash"})
         assert load_canonical_json(output) == payload
-        records[role] = _record(tmp_path, output)
-    validate_stage3_git_sync_evidence(tmp_path, SimpleNamespace(git_sync=records))
+        records[role] = _record(delivery_root, output)
+    assert not (delivery_root / "Agent").exists()
+    validate_stage3_git_sync_evidence(delivery_root, SimpleNamespace(git_sync=records))
 
 
 def test_materializer_rejects_head_drift_dirty_missing_policy_and_changed_retry(tmp_path: Path) -> None:
-    _prepare_workspace(tmp_path)
-    source = _source(tmp_path, "sync")
+    delivery_root = tmp_path / "data-root"
+    document_root = tmp_path / "repository"
+    delivery_root.mkdir()
+    document_root.mkdir()
+    _prepare_workspace(document_root)
+    source = _source(delivery_root, "sync")
     mismatch = dict(source, remote_commit="5" * 40)
     with pytest.raises(ValueError, match="do not match"):
-        MODULE.materialize_stage3_git_sync_evidence(workspace_root=tmp_path, source=mismatch, output="git-sync/mismatch.json")
+        MODULE.materialize_stage3_git_sync_evidence(workspace_root=delivery_root, agent_document_root=document_root, source=mismatch, output="git-sync/mismatch.json")
 
     dirty = dict(source, server_worktree_clean=False)
     with pytest.raises(ValueError, match="must be clean"):
-        MODULE.materialize_stage3_git_sync_evidence(workspace_root=tmp_path, source=dirty, output="git-sync/dirty.json")
+        MODULE.materialize_stage3_git_sync_evidence(workspace_root=delivery_root, agent_document_root=document_root, source=dirty, output="git-sync/dirty.json")
 
-    (tmp_path / MODULE.AGENT_DOCUMENTS[-1]).unlink()
+    (document_root / MODULE.AGENT_DOCUMENTS[-1]).unlink()
     with pytest.raises(ValueError, match="existing workspace file"):
-        MODULE.materialize_stage3_git_sync_evidence(workspace_root=tmp_path, source=source, output="git-sync/missing.json")
-    (tmp_path / MODULE.AGENT_DOCUMENTS[-1]).write_text("restored\n", encoding="utf-8")
+        MODULE.materialize_stage3_git_sync_evidence(workspace_root=delivery_root, agent_document_root=document_root, source=source, output="git-sync/missing.json")
+    (document_root / MODULE.AGENT_DOCUMENTS[-1]).write_text("restored\n", encoding="utf-8")
 
-    output = tmp_path / "git-sync" / "sync.json"
-    MODULE.materialize_stage3_git_sync_evidence(workspace_root=tmp_path, source=source, output=output)
-    (tmp_path / "evidence" / "git-sync.log").write_text("changed\n", encoding="utf-8")
+    output = delivery_root / "git-sync" / "sync.json"
+    MODULE.materialize_stage3_git_sync_evidence(workspace_root=delivery_root, agent_document_root=document_root, source=source, output=output)
+    (delivery_root / "evidence" / "git-sync.log").write_text("changed\n", encoding="utf-8")
     with pytest.raises(TaskLifecycleError, match="内容不同|different"):
-        MODULE.materialize_stage3_git_sync_evidence(workspace_root=tmp_path, source=source, output=output)
+        MODULE.materialize_stage3_git_sync_evidence(workspace_root=delivery_root, agent_document_root=document_root, source=source, output=output)
