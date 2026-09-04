@@ -15,9 +15,10 @@ from ops.stage3.run_stage3_s308_timed import (
     _result_mtime,
     _save_state,
     _task_command,
+    _validate_materialization_receipt,
     _validate_state,
 )
-from ops.stage3.run_stage3_formal import _load_json
+from ops.stage3.run_stage3_formal import _canonical_hash, _load_json
 
 
 HASH = "a" * 64
@@ -113,3 +114,49 @@ def test_result_mtime_is_timezone_aware_and_task_command_is_exact(
         "--environment", "/data/s308-env.json",
         "--result", "/data/s308-result.json",
     ]
+
+
+def test_materialization_receipt_binds_canonical_result_and_outputs() -> None:
+    output_dir = "results/stage3/s308/artifacts"
+    receipt = {
+        "schema_version": "stage3-task-materialization-receipt-v1",
+        "task_id": "stage3.08_error_analysis_and_stability",
+        "config_hash": "b" * 64,
+        "config_ref": "configs/stage3/s308.json",
+        "result_ref": "results/stage3/s308/result.json",
+        "artifact_output_dir": output_dir,
+        "authority_output_dir": "evidence/stage3/s308/authority",
+        "output_refs": {
+            kind: f"{output_dir}/commits/{kind}.json"
+            for kind in (
+                "path_error_table", "stability_report", "frozen_source_table"
+            )
+        },
+        "evidence_refs": {"formal_execution": "evidence/execution.json"},
+        "external_gate_ref": None,
+        "command": [
+            "{python}", "-m", "param_importance_nlp", "task", "run",
+            "--config", "{config}", "--environment", "{environment}",
+            "--result", "{result}",
+        ],
+    }
+    receipt["artifact_hash"] = _canonical_hash(receipt)
+    assert _validate_materialization_receipt(
+        receipt,
+        receipt_ref="results/stage3/s308/materialization-receipt.json",
+        config_ref="configs/stage3/s308.json",
+        result_ref="results/stage3/s308/result.json",
+        config_hash="b" * 64,
+        artifact_output_dir=output_dir,
+        environment_evidence_refs={"formal_execution": "evidence/execution.json"},
+    ) == receipt
+    with pytest.raises(Stage3S308TimedError, match="MATERIALIZATION_RECEIPT_INVALID"):
+        _validate_materialization_receipt(
+            receipt,
+            receipt_ref="results/stage3/s308/materialization-receipt.json",
+            config_ref="configs/stage3/s308.json",
+            result_ref="results/stage3/s308/task-result.json",
+            config_hash="b" * 64,
+            artifact_output_dir=output_dir,
+            environment_evidence_refs={"formal_execution": "evidence/execution.json"},
+        )

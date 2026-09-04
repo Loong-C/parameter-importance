@@ -57,7 +57,8 @@ PROVENANCE_TASK_ID = "stage3.formal_provenance_authority"
 S308_OUTPUT_KINDS = frozenset(
     {"path_error_table", "stability_report", "frozen_source_table"}
 )
-TIMED_EXECUTION_SCHEMA = "stage3-s308-timed-execution-v1"
+TIMED_EXECUTION_SCHEMA = "stage3-s308-timed-execution-v2"
+MATERIALIZATION_RECEIPT_SCHEMA = "stage3-task-materialization-receipt-v1"
 
 
 class Stage3ProvenancePublicationError(ValueError):
@@ -243,11 +244,11 @@ def _apply_timed_execution_receipt(
     )
     expected = {
         "schema_version", "status", "scope", "formal_eligible", "launch_hash",
-        "task_id", "config_ref", "config_hash", "environment_ref",
-        "environment_hash", "result_ref", "result_hash", "artifact_refs",
-        "artifact_hashes", "git_commit", "git_branch", "started_at", "ended_at",
-        "ended_at_source", "recovered", "handoff_audit_hash", "receipt_ref",
-        "receipt_hash",
+        "task_id", "materialization_receipt_ref", "materialization_receipt_hash",
+        "config_ref", "config_hash", "environment_ref", "environment_hash",
+        "result_ref", "result_hash", "artifact_refs", "artifact_hashes",
+        "git_commit", "git_branch", "started_at", "ended_at", "ended_at_source",
+        "recovered", "handoff_audit_hash", "receipt_ref", "receipt_hash",
     }
     supplied_hash = receipt.get("receipt_hash")
     ended_at_source = receipt.get("ended_at_source")
@@ -270,8 +271,8 @@ def _apply_timed_execution_receipt(
     ):
         raise _fail("STAGE3_PROVENANCE_TIMED_RECEIPT_INVALID")
     for field in (
-        "launch_hash", "config_hash", "environment_hash", "result_hash",
-        "handoff_audit_hash",
+        "launch_hash", "materialization_receipt_hash", "config_hash",
+        "environment_hash", "result_hash", "handoff_audit_hash",
     ):
         value = receipt.get(field)
         if (
@@ -302,6 +303,49 @@ def _apply_timed_execution_receipt(
             or any(character not in "0123456789abcdef" for character in value)
         ):
             raise _fail("STAGE3_PROVENANCE_TIMED_RECEIPT_HASH_INVALID", kind)
+    materialization_ref = _required_string(
+        receipt.get("materialization_receipt_ref"),
+        field="timed.materialization_receipt_ref",
+    )
+    materialization_path, normalized_materialization_ref = _logical_input(
+        Path(materialization_ref), root, field="timed.materialization_receipt_ref"
+    )
+    materialization = _mapping(
+        _load_json(materialization_path), field="timed.materialization_receipt"
+    )
+    materialization_fields = {
+        "schema_version", "task_id", "config_hash", "config_ref", "result_ref",
+        "artifact_output_dir", "authority_output_dir", "output_refs",
+        "evidence_refs", "external_gate_ref", "command", "artifact_hash",
+    }
+    expected_command = [
+        "{python}", "-m", "param_importance_nlp", "task", "run",
+        "--config", "{config}", "--environment", "{environment}",
+        "--result", "{result}",
+    ]
+    if (
+        normalized_materialization_ref != materialization_ref
+        or set(materialization) != materialization_fields
+        or materialization.get("schema_version") != MATERIALIZATION_RECEIPT_SCHEMA
+        or materialization.get("task_id") != S308_TASK_ID
+        or materialization.get("config_ref") != receipt.get("config_ref")
+        or materialization.get("config_hash") != receipt.get("config_hash")
+        or materialization.get("result_ref") != receipt.get("result_ref")
+        or materialization.get("output_refs") != dict(artifacts)
+        or materialization.get("external_gate_ref") is not None
+        or materialization.get("command") != expected_command
+        or materialization.get("artifact_hash")
+        != receipt.get("materialization_receipt_hash")
+        or materialization.get("artifact_hash")
+        != _canonical_hash(
+            {
+                key: item
+                for key, item in materialization.items()
+                if key != "artifact_hash"
+            }
+        )
+    ):
+        raise _fail("STAGE3_PROVENANCE_MATERIALIZATION_RECEIPT_INVALID")
     started_at = _required_string(receipt.get("started_at"), field="timed.started_at")
     ended_at = _required_string(receipt.get("ended_at"), field="timed.ended_at")
     if _parse_time(ended_at, field="timed.ended_at") < _parse_time(

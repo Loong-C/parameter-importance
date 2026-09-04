@@ -49,8 +49,9 @@ from param_importance_nlp.runtime import (
 )
 
 
-SCHEMA_VERSION = "stage3-s308-timed-execution-v1"
+SCHEMA_VERSION = "stage3-s308-timed-execution-v2"
 STATE_SCHEMA_VERSION = "stage3-s308-timed-state-v1"
+MATERIALIZATION_RECEIPT_SCHEMA = "stage3-task-materialization-receipt-v1"
 TASK_ID = "stage3.08_error_analysis_and_stability"
 OUTPUT_KINDS = frozenset(
     {"path_error_table", "stability_report", "frozen_source_table"}
@@ -150,6 +151,67 @@ def _result_mtime(path: Path) -> str:
         .isoformat()
         .replace("+00:00", "Z")
     )
+
+
+def _validate_materialization_receipt(
+    value: Mapping[str, Any],
+    *,
+    receipt_ref: str,
+    config_ref: str,
+    result_ref: str,
+    config_hash: str,
+    artifact_output_dir: str,
+    environment_evidence_refs: Mapping[str, str],
+) -> Mapping[str, Any]:
+    """Require the canonical task materialization identity before timing S3.08."""
+
+    expected_fields = {
+        "schema_version", "task_id", "config_hash", "config_ref", "result_ref",
+        "artifact_output_dir", "authority_output_dir", "output_refs",
+        "evidence_refs", "external_gate_ref", "command", "artifact_hash",
+    }
+    supplied_hash = value.get("artifact_hash")
+    expected_outputs = {
+        kind: f"{artifact_output_dir}/commits/{kind}.json"
+        for kind in OUTPUT_KINDS
+    }
+    evidence_refs = value.get("evidence_refs")
+    expected_command = [
+        "{python}", "-m", "param_importance_nlp", "task", "run",
+        "--config", "{config}", "--environment", "{environment}",
+        "--result", "{result}",
+    ]
+    if (
+        set(value) != expected_fields
+        or value.get("schema_version") != MATERIALIZATION_RECEIPT_SCHEMA
+        or value.get("task_id") != TASK_ID
+        or value.get("config_hash") != config_hash
+        or value.get("config_ref") != config_ref
+        or value.get("result_ref") != result_ref
+        or value.get("artifact_output_dir") != artifact_output_dir
+        or value.get("output_refs") != expected_outputs
+        or value.get("external_gate_ref") is not None
+        or value.get("command") != expected_command
+        or not isinstance(value.get("authority_output_dir"), str)
+        or not value["authority_output_dir"]
+        or not isinstance(evidence_refs, Mapping)
+        or not evidence_refs
+        or any(
+            not isinstance(key, str)
+            or not isinstance(reference, str)
+            or not reference
+            or environment_evidence_refs.get(key) != reference
+            for key, reference in (
+                evidence_refs.items() if isinstance(evidence_refs, Mapping) else ()
+            )
+        )
+        or supplied_hash
+        != _canonical_hash(
+            {key: item for key, item in value.items() if key != "artifact_hash"}
+        )
+    ):
+        raise _fail("S308_TIMED_MATERIALIZATION_RECEIPT_INVALID", receipt_ref)
+    return value
 
 
 def _launch_identity(arguments: argparse.Namespace, *, refs: Mapping[str, str]) -> str:
@@ -367,8 +429,17 @@ def _task_environment(data_root: Path, repository_root: Path) -> dict[str, str]:
 def _load_receipt(path: Path, *, launch_hash: str) -> Mapping[str, Any]:
     receipt = _load_json(path)
     supplied = receipt.get("receipt_hash")
+    expected_fields = {
+        "schema_version", "status", "scope", "formal_eligible", "launch_hash",
+        "task_id", "materialization_receipt_ref", "materialization_receipt_hash",
+        "config_ref", "config_hash", "environment_ref", "environment_hash",
+        "result_ref", "result_hash", "artifact_refs", "artifact_hashes",
+        "git_commit", "git_branch", "started_at", "ended_at", "ended_at_source",
+        "recovered", "handoff_audit_hash", "receipt_ref", "receipt_hash",
+    }
     if (
-        receipt.get("schema_version") != SCHEMA_VERSION
+        set(receipt) != expected_fields
+        or receipt.get("schema_version") != SCHEMA_VERSION
         or receipt.get("status") != "PASS"
         or receipt.get("formal_eligible") is not True
         or receipt.get("launch_hash") != launch_hash
@@ -399,6 +470,7 @@ def run_timed(
         ("s307_manifest", arguments.s307_manifest, True),
         ("s307_workspace_root", arguments.s307_workspace_root, True),
         ("s307_environment", arguments.s307_environment, True),
+        ("s308_materialization_receipt", arguments.s308_materialization_receipt, True),
         ("s308_config", arguments.s308_config, True),
         ("s308_environment", arguments.s308_environment, True),
         ("s308_result", arguments.s308_result, False),
@@ -418,6 +490,8 @@ def run_timed(
         raise _fail("S308_TIMED_STATE_REF_INVALID")
     if PurePosixPath(refs["receipt"]).parts[0] != "results":
         raise _fail("S308_TIMED_RECEIPT_REF_INVALID")
+    if PurePosixPath(refs["s308_materialization_receipt"]).parts[0] != "results":
+        raise _fail("S308_TIMED_MATERIALIZATION_RECEIPT_REF_INVALID")
     if paths["state"] == paths["receipt"] or paths["s308_result"] in {
         paths["state"], paths["receipt"]
     }:
@@ -429,6 +503,21 @@ def run_timed(
     )
     if config.task_id != TASK_ID or config.run_intent != "formal":
         raise _fail("S308_TIMED_CONFIG_INVALID")
+    artifacts = config.section("artifacts")
+    if not isinstance(artifacts, Mapping):
+        raise _fail("S308_TIMED_ARTIFACT_CONFIG_INVALID")
+    artifact_output_dir = artifacts.get("output_dir")
+    if not isinstance(artifact_output_dir, str) or not artifact_output_dir:
+        raise _fail("S308_TIMED_ARTIFACT_OUTPUT_DIR_INVALID")
+    materialization_receipt = _validate_materialization_receipt(
+        _load_json(paths["s308_materialization_receipt"]),
+        receipt_ref=refs["s308_materialization_receipt"],
+        config_ref=refs["s308_config"],
+        result_ref=refs["s308_result"],
+        config_hash=config.config_hash,
+        artifact_output_dir=artifact_output_dir,
+        environment_evidence_refs=environment.evidence_refs,
+    )
     expected_commit = _git_commit(arguments.expected_git_commit)
     git_commit, git_branch = _git_snapshot(repository_root, expected_commit)
     launch_hash = _launch_identity(arguments, refs=refs)
@@ -447,6 +536,8 @@ def run_timed(
             "git_branch": git_branch,
             "config_hash": config.config_hash,
             "environment_hash": environment.environment_hash,
+            "materialization_receipt_ref": refs["s308_materialization_receipt"],
+            "materialization_receipt_hash": materialization_receipt["artifact_hash"],
             "handoff_status": audit.get("status"),
             "handoff_audit_hash": audit.get("audit_hash"),
             "completed_unit_count": audit.get("completed_unit_count"),
@@ -560,6 +651,8 @@ def run_timed(
             "formal_eligible": True,
             "launch_hash": launch_hash,
             "task_id": TASK_ID,
+            "materialization_receipt_ref": refs["s308_materialization_receipt"],
+            "materialization_receipt_hash": materialization_receipt["artifact_hash"],
             "config_ref": refs["s308_config"],
             "config_hash": config.config_hash,
             "environment_ref": refs["s308_environment"],
@@ -593,6 +686,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--s307-manifest", type=Path, required=True)
     parser.add_argument("--s307-workspace-root", type=Path, required=True)
     parser.add_argument("--s307-environment", type=Path, required=True)
+    parser.add_argument("--s308-materialization-receipt", type=Path, required=True)
     parser.add_argument("--s308-config", type=Path, required=True)
     parser.add_argument("--s308-environment", type=Path, required=True)
     parser.add_argument("--s308-result", type=Path, required=True)
@@ -641,6 +735,7 @@ __all__ = [
     "_result_mtime",
     "_save_state",
     "_task_command",
+    "_validate_materialization_receipt",
     "_validate_state",
     "main",
     "run_timed",

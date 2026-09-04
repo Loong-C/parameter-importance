@@ -158,23 +158,50 @@ def test_timed_receipt_binds_all_provenance_execution_inputs(tmp_path: Path) -> 
         path = tmp_path / ref
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text("{}\n", encoding="utf-8")
+    artifact_refs = {
+        "path_error_table": "evidence/error.json",
+        "stability_report": "evidence/stability.json",
+        "frozen_source_table": "evidence/table.json",
+    }
+    materialization_ref = "results/s308-materialization-receipt.json"
+    materialization = {
+        "schema_version": "stage3-task-materialization-receipt-v1",
+        "task_id": "stage3.08_error_analysis_and_stability",
+        "config_ref": refs["config_ref"],
+        "config_hash": "2" * 64,
+        "result_ref": refs["result_ref"],
+        "artifact_output_dir": "evidence",
+        "authority_output_dir": "authority/s308",
+        "output_refs": artifact_refs,
+        "evidence_refs": {"formal_execution": "evidence/execution.json"},
+        "external_gate_ref": None,
+        "command": [
+            "{python}", "-m", "param_importance_nlp", "task", "run",
+            "--config", "{config}", "--environment", "{environment}",
+            "--result", "{result}",
+        ],
+    }
+    materialization["artifact_hash"] = _canonical_hash(materialization)
+    materialization_path = tmp_path / materialization_ref
+    materialization_path.write_text(
+        json.dumps(materialization, sort_keys=True, separators=(",", ":")) + "\n",
+        encoding="utf-8",
+    )
     receipt_ref = "results/s308-timed-receipt.json"
     receipt = {
-        "schema_version": "stage3-s308-timed-execution-v1",
+        "schema_version": "stage3-s308-timed-execution-v2",
         "status": "PASS",
         "scope": "formal",
         "formal_eligible": True,
         "launch_hash": "1" * 64,
         "task_id": "stage3.08_error_analysis_and_stability",
+        "materialization_receipt_ref": materialization_ref,
+        "materialization_receipt_hash": materialization["artifact_hash"],
         **refs,
         "config_hash": "2" * 64,
         "environment_hash": "3" * 64,
         "result_hash": "4" * 64,
-        "artifact_refs": {
-            "path_error_table": "evidence/error.json",
-            "stability_report": "evidence/stability.json",
-            "frozen_source_table": "evidence/table.json",
-        },
+        "artifact_refs": artifact_refs,
         "artifact_hashes": {
             "path_error_table": "5" * 64,
             "stability_report": "6" * 64,
@@ -232,7 +259,7 @@ def test_timed_receipt_rejects_tampering(tmp_path: Path) -> None:
     receipt_path = tmp_path / "results/timed.json"
     receipt_path.parent.mkdir(parents=True)
     receipt_path.write_text(
-        '{"schema_version":"stage3-s308-timed-execution-v1",'
+        '{"schema_version":"stage3-s308-timed-execution-v2",'
         '"receipt_hash":"' + "0" * 64 + '"}\n',
         encoding="utf-8",
     )
