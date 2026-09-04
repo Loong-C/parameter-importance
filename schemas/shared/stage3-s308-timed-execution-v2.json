@@ -1,0 +1,93 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://parameter-importance.invalid/schemas/shared/stage3-s308-timed-execution-v2.json",
+  "title": "Stage 3.08 materialization-bound timed execution receipt",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version", "status", "scope", "formal_eligible", "launch_hash",
+    "task_id", "materialization_receipt_ref", "materialization_receipt_hash",
+    "config_ref", "config_hash", "environment_ref", "environment_hash",
+    "result_ref", "result_hash", "artifact_refs", "artifact_hashes",
+    "git_commit", "git_branch", "started_at", "ended_at", "ended_at_source",
+    "recovered", "handoff_audit_hash", "receipt_ref", "receipt_hash"
+  ],
+  "properties": {
+    "schema_version": {"const": "stage3-s308-timed-execution-v2"},
+    "status": {"const": "PASS"},
+    "scope": {"const": "formal"},
+    "formal_eligible": {"const": true},
+    "launch_hash": {"$ref": "#/$defs/hash"},
+    "task_id": {"const": "stage3.08_error_analysis_and_stability"},
+    "materialization_receipt_ref": {"$ref": "#/$defs/ref"},
+    "materialization_receipt_hash": {"$ref": "#/$defs/hash"},
+    "config_ref": {"$ref": "#/$defs/ref"},
+    "config_hash": {"$ref": "#/$defs/hash"},
+    "environment_ref": {"$ref": "#/$defs/ref"},
+    "environment_hash": {"$ref": "#/$defs/hash"},
+    "result_ref": {"$ref": "#/$defs/ref"},
+    "result_hash": {"$ref": "#/$defs/hash"},
+    "artifact_refs": {"$ref": "#/$defs/outputRefs"},
+    "artifact_hashes": {"$ref": "#/$defs/outputHashes"},
+    "git_commit": {
+      "type": "string",
+      "pattern": "^(?:[0-9a-f]{40}|[0-9a-f]{64})$"
+    },
+    "git_branch": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 1024,
+      "pattern": "^(?!HEAD$).+$"
+    },
+    "started_at": {"type": "string", "format": "date-time"},
+    "ended_at": {"type": "string", "format": "date-time"},
+    "ended_at_source": {
+      "enum": ["wrapper_post_wait", "result_mtime_recovery"]
+    },
+    "recovered": {"type": "boolean"},
+    "handoff_audit_hash": {"$ref": "#/$defs/hash"},
+    "receipt_ref": {"$ref": "#/$defs/ref"},
+    "receipt_hash": {"$ref": "#/$defs/hash"}
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "ended_at_source": {"const": "result_mtime_recovery"}
+        },
+        "required": ["ended_at_source"]
+      },
+      "then": {"properties": {"recovered": {"const": true}}},
+      "else": {"properties": {"recovered": {"const": false}}}
+    }
+  ],
+  "$defs": {
+    "hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "ref": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 4096,
+      "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.?/)(?!.*[\\\\?])(?!.*://).+$"
+    },
+    "outputRefs": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path_error_table", "stability_report", "frozen_source_table"],
+      "properties": {
+        "path_error_table": {"$ref": "#/$defs/ref"},
+        "stability_report": {"$ref": "#/$defs/ref"},
+        "frozen_source_table": {"$ref": "#/$defs/ref"}
+      }
+    },
+    "outputHashes": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path_error_table", "stability_report", "frozen_source_table"],
+      "properties": {
+        "path_error_table": {"$ref": "#/$defs/hash"},
+        "stability_report": {"$ref": "#/$defs/hash"},
+        "frozen_source_table": {"$ref": "#/$defs/hash"}
+      }
+    }
+  }
+}

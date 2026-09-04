@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import json
 from pathlib import Path
 
 import pytest
+from jsonschema import Draft202012Validator, ValidationError
 
 from ops.stage3.run_stage3_s308_timed import (
     Stage3S308TimedError,
@@ -22,6 +24,60 @@ from ops.stage3.run_stage3_formal import _canonical_hash, _load_json
 
 
 HASH = "a" * 64
+
+
+def _timed_receipt() -> dict[str, object]:
+    return {
+        "schema_version": "stage3-s308-timed-execution-v2",
+        "status": "PASS",
+        "scope": "formal",
+        "formal_eligible": True,
+        "launch_hash": "1" * 64,
+        "task_id": "stage3.08_error_analysis_and_stability",
+        "materialization_receipt_ref": "results/stage3/s308/materialization.json",
+        "materialization_receipt_hash": "2" * 64,
+        "config_ref": "configs/stage3/s308.json",
+        "config_hash": "3" * 64,
+        "environment_ref": "configs/stage3/s308-environment.json",
+        "environment_hash": "4" * 64,
+        "result_ref": "results/stage3/s308/result.json",
+        "result_hash": "5" * 64,
+        "artifact_refs": {
+            "path_error_table": "results/stage3/s308/path-error.json",
+            "stability_report": "results/stage3/s308/stability.json",
+            "frozen_source_table": "results/stage3/s308/source-table.json",
+        },
+        "artifact_hashes": {
+            "path_error_table": "6" * 64,
+            "stability_report": "7" * 64,
+            "frozen_source_table": "8" * 64,
+        },
+        "git_commit": "9" * 40,
+        "git_branch": "codex/stage3",
+        "started_at": "2026-09-04T10:00:00Z",
+        "ended_at": "2026-09-04T10:01:00Z",
+        "ended_at_source": "wrapper_post_wait",
+        "recovered": False,
+        "handoff_audit_hash": "a" * 64,
+        "receipt_ref": "results/stage3/s308/timed-execution.json",
+        "receipt_hash": "b" * 64,
+    }
+
+
+def test_timed_receipt_v2_has_strict_machine_schema() -> None:
+    schema = json.loads(
+        (
+            Path(__file__).parents[1]
+            / "schemas/shared/stage3-s308-timed-execution-v2.json"
+        ).read_text(encoding="utf-8")
+    )
+    Draft202012Validator.check_schema(schema)
+    validator = Draft202012Validator(schema)
+    validator.validate(_timed_receipt())
+    inconsistent = _timed_receipt()
+    inconsistent["ended_at_source"] = "result_mtime_recovery"
+    with pytest.raises(ValidationError):
+        validator.validate(inconsistent)
 
 
 def _state() -> dict[str, object]:
