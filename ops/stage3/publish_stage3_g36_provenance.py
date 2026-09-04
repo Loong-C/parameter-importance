@@ -23,7 +23,7 @@ if __package__ in {None, ""}:
         if str(_candidate) not in sys.path:
             sys.path.insert(0, str(_candidate))
 
-from ops.stage3.run_stage3_formal import _load_json
+from ops.stage3.run_stage3_formal import _canonical_hash, _load_json
 from param_importance_nlp.analysis.report import FrozenSourceTable
 from param_importance_nlp.contracts import (
     FormalExecutionEvidence,
@@ -57,6 +57,7 @@ PROVENANCE_TASK_ID = "stage3.formal_provenance_authority"
 S308_OUTPUT_KINDS = frozenset(
     {"path_error_table", "stability_report", "frozen_source_table"}
 )
+TIMED_EXECUTION_SCHEMA = "stage3-s308-timed-execution-v1"
 
 
 class Stage3ProvenancePublicationError(ValueError):
@@ -221,6 +222,122 @@ def _parse_time(value: str, *, field: str) -> datetime:
     return parsed
 
 
+def _apply_timed_execution_receipt(
+    arguments: argparse.Namespace,
+    root: Path,
+) -> tuple[Mapping[str, Any] | None, str | None]:
+    """Bind optional CLI inputs to one immutable S3.08 timing receipt."""
+
+    receipt_argument = getattr(arguments, "timed_execution_receipt", None)
+    if receipt_argument is None:
+        required = ("config", "environment", "task_result", "started_at", "ended_at")
+        missing = [name for name in required if getattr(arguments, name, None) is None]
+        if missing:
+            raise _fail("STAGE3_PROVENANCE_EXECUTION_INPUTS_REQUIRED", ",".join(missing))
+        return None, None
+    receipt_path, receipt_ref = _logical_input(
+        receipt_argument, root, field="timed_execution_receipt"
+    )
+    receipt = _mapping(
+        _load_json(receipt_path), field="timed_execution_receipt"
+    )
+    expected = {
+        "schema_version", "status", "scope", "formal_eligible", "launch_hash",
+        "task_id", "config_ref", "config_hash", "environment_ref",
+        "environment_hash", "result_ref", "result_hash", "artifact_refs",
+        "artifact_hashes", "git_commit", "git_branch", "started_at", "ended_at",
+        "ended_at_source", "recovered", "handoff_audit_hash", "receipt_ref",
+        "receipt_hash",
+    }
+    supplied_hash = receipt.get("receipt_hash")
+    ended_at_source = receipt.get("ended_at_source")
+    recovered = receipt.get("recovered")
+    if (
+        set(receipt) != expected
+        or receipt.get("schema_version") != TIMED_EXECUTION_SCHEMA
+        or receipt.get("status") != "PASS"
+        or receipt.get("scope") != "formal"
+        or receipt.get("formal_eligible") is not True
+        or receipt.get("task_id") != S308_TASK_ID
+        or receipt.get("receipt_ref") != receipt_ref
+        or ended_at_source not in {"wrapper_post_wait", "result_mtime_recovery"}
+        or type(recovered) is not bool
+        or (ended_at_source == "result_mtime_recovery") != recovered
+        or supplied_hash
+        != _canonical_hash(
+            {key: item for key, item in receipt.items() if key != "receipt_hash"}
+        )
+    ):
+        raise _fail("STAGE3_PROVENANCE_TIMED_RECEIPT_INVALID")
+    for field in (
+        "launch_hash", "config_hash", "environment_hash", "result_hash",
+        "handoff_audit_hash",
+    ):
+        value = receipt.get(field)
+        if (
+            not isinstance(value, str)
+            or len(value) != 64
+            or any(character not in "0123456789abcdef" for character in value)
+        ):
+            raise _fail("STAGE3_PROVENANCE_TIMED_RECEIPT_HASH_INVALID", field)
+    git_commit = receipt.get("git_commit")
+    if (
+        not isinstance(git_commit, str)
+        or len(git_commit) not in {40, 64}
+        or any(character not in "0123456789abcdef" for character in git_commit)
+        or not isinstance(receipt.get("git_branch"), str)
+        or not receipt["git_branch"]
+    ):
+        raise _fail("STAGE3_PROVENANCE_TIMED_RECEIPT_GIT_INVALID")
+    artifacts = _mapping(receipt.get("artifact_refs"), field="timed.artifact_refs")
+    hashes = _mapping(receipt.get("artifact_hashes"), field="timed.artifact_hashes")
+    if set(artifacts) != S308_OUTPUT_KINDS or set(hashes) != S308_OUTPUT_KINDS:
+        raise _fail("STAGE3_PROVENANCE_TIMED_RECEIPT_OUTPUT_SET_INVALID")
+    for kind in S308_OUTPUT_KINDS:
+        _required_string(artifacts.get(kind), field=f"timed.artifact_refs.{kind}")
+        value = hashes.get(kind)
+        if (
+            not isinstance(value, str)
+            or len(value) != 64
+            or any(character not in "0123456789abcdef" for character in value)
+        ):
+            raise _fail("STAGE3_PROVENANCE_TIMED_RECEIPT_HASH_INVALID", kind)
+    started_at = _required_string(receipt.get("started_at"), field="timed.started_at")
+    ended_at = _required_string(receipt.get("ended_at"), field="timed.ended_at")
+    if _parse_time(ended_at, field="timed.ended_at") < _parse_time(
+        started_at, field="timed.started_at"
+    ):
+        raise _fail("STAGE3_PROVENANCE_TIMED_RECEIPT_TIME_ORDER_INVALID")
+
+    for attribute, field in (
+        ("config", "config_ref"),
+        ("environment", "environment_ref"),
+        ("task_result", "result_ref"),
+    ):
+        bound_path, _ = _logical_input(
+            Path(_required_string(receipt.get(field), field=f"timed.{field}")),
+            root,
+            field=f"timed.{field}",
+        )
+        supplied = getattr(arguments, attribute, None)
+        if supplied is not None:
+            supplied_path, _ = _logical_input(supplied, root, field=attribute)
+            if supplied_path != bound_path:
+                raise _fail("STAGE3_PROVENANCE_TIMED_RECEIPT_INPUT_MISMATCH", attribute)
+        setattr(arguments, attribute, bound_path)
+    for attribute in ("started_at", "ended_at"):
+        supplied = getattr(arguments, attribute, None)
+        bound = receipt[attribute]
+        if supplied is not None and supplied != bound:
+            raise _fail("STAGE3_PROVENANCE_TIMED_RECEIPT_INPUT_MISMATCH", attribute)
+        setattr(arguments, attribute, bound)
+    supplied_commit = getattr(arguments, "expected_git_commit", None)
+    if supplied_commit is not None and supplied_commit != git_commit:
+        raise _fail("STAGE3_PROVENANCE_TIMED_RECEIPT_INPUT_MISMATCH", "git_commit")
+    arguments.expected_git_commit = git_commit
+    return receipt, receipt_ref
+
+
 def _device_mapping(config: ResolvedConfigV2) -> tuple[str, ...]:
     runtime = _mapping(config.base_config.section("runtime"), field="base_config.runtime")
     distributed = _mapping(
@@ -339,6 +456,9 @@ def publish_provenance(arguments: argparse.Namespace) -> Mapping[str, Any]:
         raise _fail("STAGE3_PROVENANCE_REPOSITORY_OUTSIDE_DATA_ROOT") from error
     if not repository_root.is_dir() or root.is_symlink():
         raise _fail("STAGE3_PROVENANCE_REPOSITORY_OR_DATA_ROOT_INVALID")
+    timed_receipt, timed_receipt_ref = _apply_timed_execution_receipt(
+        arguments, root
+    )
     config_path, config_ref = _logical_input(arguments.config, root, field="config")
     environment_path, environment_ref = _logical_input(
         arguments.environment, root, field="environment"
@@ -375,9 +495,33 @@ def publish_provenance(arguments: argparse.Namespace) -> Mapping[str, Any]:
         or result.get("formal_eligible") is not True
     ):
         raise _fail("STAGE3_PROVENANCE_S308_RESULT_INVALID")
+    if timed_receipt is not None and (
+        timed_receipt.get("config_hash") != config.config_hash
+        or timed_receipt.get("environment_hash") != environment.environment_hash
+        or timed_receipt.get("result_hash") != result.get("result_hash")
+        or timed_receipt.get("git_branch") != git_branch
+    ):
+        raise _fail("STAGE3_PROVENANCE_TIMED_RECEIPT_IDENTITY_MISMATCH")
     output_refs = _mapping(result.get("artifact_refs"), field="task_result.artifact_refs")
     if set(output_refs) != S308_OUTPUT_KINDS:
         raise _fail("STAGE3_PROVENANCE_S308_OUTPUT_SET_INVALID")
+    if timed_receipt is not None:
+        timed_refs = _mapping(
+            timed_receipt.get("artifact_refs"), field="timed.artifact_refs"
+        )
+        timed_hashes = _mapping(
+            timed_receipt.get("artifact_hashes"), field="timed.artifact_hashes"
+        )
+        if dict(output_refs) != dict(timed_refs):
+            raise _fail("STAGE3_PROVENANCE_TIMED_RECEIPT_OUTPUT_REF_MISMATCH")
+        for kind, reference in output_refs.items():
+            loaded = _formal_artifact(
+                root, str(reference), field=f"timed.{kind}", kinds={kind}
+            )
+            if loaded.identity.artifact_hash != timed_hashes.get(kind):
+                raise _fail(
+                    "STAGE3_PROVENANCE_TIMED_RECEIPT_OUTPUT_HASH_MISMATCH", kind
+                )
     table_ref = _required_string(
         output_refs.get("frozen_source_table"), field="frozen_source_table_ref"
     )
@@ -511,6 +655,7 @@ def publish_provenance(arguments: argparse.Namespace) -> Mapping[str, Any]:
         dict.fromkeys(
             (
                 source_ref,
+                *((timed_receipt_ref,) if timed_receipt_ref is not None else ()),
                 config_ref,
                 environment_ref,
                 result_ref,
@@ -552,6 +697,9 @@ def publish_provenance(arguments: argparse.Namespace) -> Mapping[str, Any]:
         "streaming_coverage_ref": streaming_ref,
         "streaming_coverage_hash": streaming_hash,
     }
+    if timed_receipt is not None and timed_receipt_ref is not None:
+        receipt["timed_execution_receipt_ref"] = timed_receipt_ref
+        receipt["timed_execution_receipt_hash"] = timed_receipt["receipt_hash"]
     if receipt_ref is not None:
         receipt["receipt_ref"] = receipt_ref
     receipt["receipt_hash"] = canonical_json_hash(receipt)
@@ -564,11 +712,12 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--data-root", type=Path, required=True)
     parser.add_argument("--repository-root", type=Path, required=True)
-    parser.add_argument("--config", type=Path, required=True)
-    parser.add_argument("--environment", type=Path, required=True)
-    parser.add_argument("--task-result", type=Path, required=True)
-    parser.add_argument("--started-at", required=True)
-    parser.add_argument("--ended-at", required=True)
+    parser.add_argument("--config", type=Path)
+    parser.add_argument("--environment", type=Path)
+    parser.add_argument("--task-result", type=Path)
+    parser.add_argument("--started-at")
+    parser.add_argument("--ended-at")
+    parser.add_argument("--timed-execution-receipt", type=Path)
     parser.add_argument("--source-output", type=Path, required=True)
     parser.add_argument("--authority-output-dir", required=True)
     parser.add_argument("--receipt", type=Path)
@@ -593,6 +742,7 @@ __all__ = [
     "_confirm_git_snapshot",
     "_device_mapping",
     "_git_snapshot",
+    "_apply_timed_execution_receipt",
     "main",
     "publish_provenance",
 ]

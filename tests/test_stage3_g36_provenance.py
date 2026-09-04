@@ -4,7 +4,9 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from pathlib import Path
+import json
 import subprocess
+from argparse import Namespace
 from types import SimpleNamespace
 
 import pytest
@@ -12,11 +14,13 @@ import pytest
 from ops.stage3.publish_stage3_g36_provenance import (
     Stage3ProvenancePublicationError,
     _build_record,
+    _apply_timed_execution_receipt,
     _confirm_git_snapshot,
     _device_mapping,
     _git_snapshot,
 )
 from param_importance_nlp.contracts import ProvenanceRecord
+from ops.stage3.run_stage3_formal import _canonical_hash
 
 
 HASH = "a" * 64
@@ -142,3 +146,96 @@ def test_build_record_rejects_inverted_times() -> None:
             started_at=datetime(2026, 9, 4, 10, 1, tzinfo=timezone.utc).isoformat(),
             ended_at=datetime(2026, 9, 4, 10, 0, tzinfo=timezone.utc).isoformat(),
         )
+
+
+def test_timed_receipt_binds_all_provenance_execution_inputs(tmp_path: Path) -> None:
+    refs = {
+        "config_ref": "configs/s308.json",
+        "environment_ref": "configs/s308-environment.json",
+        "result_ref": "results/s308-result.json",
+    }
+    for ref in refs.values():
+        path = tmp_path / ref
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("{}\n", encoding="utf-8")
+    receipt_ref = "results/s308-timed-receipt.json"
+    receipt = {
+        "schema_version": "stage3-s308-timed-execution-v1",
+        "status": "PASS",
+        "scope": "formal",
+        "formal_eligible": True,
+        "launch_hash": "1" * 64,
+        "task_id": "stage3.08_error_analysis_and_stability",
+        **refs,
+        "config_hash": "2" * 64,
+        "environment_hash": "3" * 64,
+        "result_hash": "4" * 64,
+        "artifact_refs": {
+            "path_error_table": "evidence/error.json",
+            "stability_report": "evidence/stability.json",
+            "frozen_source_table": "evidence/table.json",
+        },
+        "artifact_hashes": {
+            "path_error_table": "5" * 64,
+            "stability_report": "6" * 64,
+            "frozen_source_table": "7" * 64,
+        },
+        "git_commit": "8" * 40,
+        "git_branch": "codex/stage3",
+        "started_at": "2026-09-04T10:00:00Z",
+        "ended_at": "2026-09-04T10:01:00Z",
+        "ended_at_source": "wrapper_post_wait",
+        "recovered": False,
+        "handoff_audit_hash": "9" * 64,
+        "receipt_ref": receipt_ref,
+    }
+    receipt["receipt_hash"] = _canonical_hash(receipt)
+    receipt_path = tmp_path / receipt_ref
+    receipt_path.write_text(
+        json.dumps(receipt, sort_keys=True, separators=(",", ":")) + "\n",
+        encoding="utf-8",
+    )
+    arguments = Namespace(
+        timed_execution_receipt=receipt_path,
+        config=None,
+        environment=None,
+        task_result=None,
+        started_at=None,
+        ended_at=None,
+        expected_git_commit=None,
+    )
+    loaded, logical = _apply_timed_execution_receipt(arguments, tmp_path)
+    assert loaded == receipt
+    assert logical == receipt_ref
+    assert arguments.config == tmp_path / refs["config_ref"]
+    assert arguments.environment == tmp_path / refs["environment_ref"]
+    assert arguments.task_result == tmp_path / refs["result_ref"]
+    assert arguments.started_at == receipt["started_at"]
+    assert arguments.ended_at == receipt["ended_at"]
+    assert arguments.expected_git_commit == receipt["git_commit"]
+
+    receipt["ended_at_source"] = "result_mtime_recovery"
+    receipt["receipt_hash"] = _canonical_hash(
+        {key: value for key, value in receipt.items() if key != "receipt_hash"}
+    )
+    receipt_path.write_text(
+        json.dumps(receipt, sort_keys=True, separators=(",", ":")) + "\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(Stage3ProvenancePublicationError, match="TIMED_RECEIPT_INVALID"):
+        _apply_timed_execution_receipt(
+            Namespace(timed_execution_receipt=receipt_path), tmp_path
+        )
+
+
+def test_timed_receipt_rejects_tampering(tmp_path: Path) -> None:
+    receipt_path = tmp_path / "results/timed.json"
+    receipt_path.parent.mkdir(parents=True)
+    receipt_path.write_text(
+        '{"schema_version":"stage3-s308-timed-execution-v1",'
+        '"receipt_hash":"' + "0" * 64 + '"}\n',
+        encoding="utf-8",
+    )
+    arguments = Namespace(timed_execution_receipt=receipt_path)
+    with pytest.raises(Stage3ProvenancePublicationError, match="TIMED_RECEIPT_INVALID"):
+        _apply_timed_execution_receipt(arguments, tmp_path)
