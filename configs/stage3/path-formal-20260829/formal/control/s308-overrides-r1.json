@@ -1,0 +1,1 @@
+{"artifacts":{"required_kinds":["path_error_table","stability_report","frozen_source_table"]},"execution":{"dry_run":false,"fail_on_blocked":true,"max_attempts":1,"runner_kind":"statistics","timeout_seconds":14400}}
