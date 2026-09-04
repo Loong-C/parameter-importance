@@ -4,6 +4,7 @@ import base64
 import hashlib
 import importlib.util
 from pathlib import Path
+import shutil
 
 import pytest
 
@@ -111,6 +112,9 @@ def test_hash_bound_cjk_report_and_slides_are_reproducible(tmp_path: Path) -> No
     )
     if font is None:
         pytest.skip("no usable TrueType font")
+    workspace_font = tmp_path / "assets" / f"formal-cjk{font.suffix}"
+    workspace_font.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(font, workspace_font)
 
     manifests = []
     for name in ("output/pdf/first", "output/pdf/second"):
@@ -125,7 +129,7 @@ def test_hash_bound_cjk_report_and_slides_are_reproducible(tmp_path: Path) -> No
                 source_refs=source_refs,
                 input_identities=identities,
                 producer_commit="a" * 40,
-                font_file=font,
+                font_file=workspace_font,
             )
         )
 
@@ -135,6 +139,12 @@ def test_hash_bound_cjk_report_and_slides_are_reproducible(tmp_path: Path) -> No
     assert first["beamer"]["pdf"]["sha256"] == second["beamer"]["pdf"]["sha256"]
     assert len(first["beamer"]["backups"]) == 4
     assert manifests[0]["completion_boundary"] == "PENDING_G3_8_DELIVERY_ACCEPTANCE"
+    assert manifests[0]["font"] == {
+        "name": "Stage3CJK",
+        "path": workspace_font.relative_to(tmp_path).as_posix(),
+        "sha256": hashlib.sha256(workspace_font.read_bytes()).hexdigest(),
+        "size": workspace_font.stat().st_size,
+    }
 
     report_path = tmp_path / first["chinese_report"]["pdf"]["path"]
     slides_path = tmp_path / first["beamer"]["pdf"]["path"]
@@ -157,6 +167,11 @@ def test_renderer_rejects_completed_or_unverified_inputs(tmp_path: Path) -> None
     tampered["png"] = dict(figure["png"], sha256="f" * 64)
     with pytest.raises(ValueError, match="hash drift"):
         MODULE._figure_inputs(tmp_path, {"rendered_figures": [tampered]})
+
+    outside = tmp_path.parent / "outside-font.ttf"
+    outside.write_bytes(b"not-a-font")
+    with pytest.raises(ValueError, match="inside workspace_root"):
+        MODULE._register_font(tmp_path, outside)
 
 
 def test_metric_rows_preserve_undefined_reason_from_real_wire_shape() -> None:

@@ -31,6 +31,7 @@ from param_importance_nlp.experiments.stage3_g38_publisher import (
     publish_stage3_delivery_manifest,
     validate_stage3_g38_handoff_authority,
     validate_stage3_git_sync_evidence,
+    validate_stage3_document_manifest,
     validate_stage3_large_artifact_manifest,
     validate_stage3_replay_reports,
 )
@@ -70,6 +71,11 @@ def _manifest(root: Path) -> dict[str, object]:
         root,
         "evidence/stage3/replay-source.json",
         b'{"authority":"formal-stage3-delivery"}\n',
+    )
+    document_font = _put_file(
+        root,
+        "large/document_delivery_assets/NotoSansSC-wght.ttf",
+        b"formal-document-font",
     )
 
     def f(ext: str, data: bytes | None = None) -> dict[str, object]:
@@ -160,14 +166,19 @@ def _manifest(root: Path) -> dict[str, object]:
             "s307_formal_output",
             "stage3_formal_results",
             "stage3_formal_evidence",
+            "document_delivery_assets",
         )
         total_size = 0
         for role in roles:
             root_ref = f"large/{role}"
-            file_record = _put_file(
-                root,
-                f"{root_ref}/payload.bin",
-                f"large:{role}".encode(),
+            file_record = (
+                document_font
+                if role == "document_delivery_assets"
+                else _put_file(
+                    root,
+                    f"{root_ref}/payload.bin",
+                    f"large:{role}".encode(),
+                )
             )
             group_body: dict[str, object] = {
                 "role": role,
@@ -218,6 +229,43 @@ def _manifest(root: Path) -> dict[str, object]:
         },
         "worklog": f(".md"),
     }
+    document_body: dict[str, object] = {
+        "schema_version": "stage3-delivery-documents-v1",
+        "status": "PASS",
+        "scope": "formal",
+        "formal_eligible": True,
+        "producer_commit": "4" * 40,
+        "renderer": {
+            "name": "reportlab",
+            "version": "4.4.9",
+            "invariant_pdf": True,
+        },
+        "font": {"name": "Stage3CJK", **document_font},
+        "inputs": {
+            role: {
+                "task_id": "stage3.10_reports_visualizations_and_handoff",
+                "artifact_kind": role,
+                "config_hash": "7" * 64,
+                "artifact_hash": hashlib.sha256(f"artifact:{role}".encode()).hexdigest(),
+                "payload_hash": hashlib.sha256(f"payload:{role}".encode()).hexdigest(),
+            }
+            for role in ("analysis_report", "chart_artifacts", "handoff_manifest", "gate_summary")
+        },
+        "source_refs": {
+            role: f"inputs/stage310/{role}.json"
+            for role in ("analysis_report", "chart_artifacts", "handoff_manifest", "gate_summary")
+        },
+        "figure_inputs": value["figures"],
+        "files": {
+            "chinese_report": value["chinese_report"],
+            "beamer": value["beamer"],
+        },
+        "completion_boundary": "PENDING_G3_8_DELIVERY_ACCEPTANCE",
+    }
+    document = document_body | {"artifact_hash": canonical_json_hash(document_body)}
+    value["source_tables"]["json"].append(  # type: ignore[index]
+        f("-documents.json", canonical_json_bytes(document))
+    )
     value["artifact_hash"] = canonical_json_hash(value)
     return value
 
@@ -635,6 +683,17 @@ def test_g38_rejects_unlisted_file_in_large_artifact_root(tmp_path: Path) -> Non
 
     with pytest.raises(FormalRunRejected, match="LARGE_DIRECTORY_CLOSURE_MISMATCH"):
         validate_stage3_large_artifact_manifest(tmp_path, parsed)
+
+
+def test_g38_rejects_document_font_byte_drift(tmp_path: Path) -> None:
+    manifest = _manifest(tmp_path)
+    parsed = Stage3G38DeliveryManifest.from_mapping(manifest)
+    (tmp_path / "large/document_delivery_assets/NotoSansSC-wght.ttf").write_bytes(
+        b"drifted-font"
+    )
+
+    with pytest.raises(FormalRunRejected, match="DOCUMENT_FONT_FILE_MISMATCH"):
+        validate_stage3_document_manifest(tmp_path, parsed)
 
 
 def test_g38_rejects_empty_or_spec_only_chart_bundle(tmp_path: Path) -> None:

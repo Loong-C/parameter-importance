@@ -80,6 +80,7 @@ REQUIRED_STAGE3_G38_AGENT_DOCUMENTS: tuple[str, ...] = (
     "Agent/worklogs.md",
 )
 STAGE3_G38_LARGE_ARTIFACT_MANIFEST_SCHEMA = "stage3-g38-large-artifact-manifest-v1"
+STAGE3_DELIVERY_DOCUMENT_SCHEMA = "stage3-delivery-documents-v1"
 REQUIRED_STAGE3_G38_LARGE_ARTIFACT_ROLES: tuple[str, ...] = (
     "stage3_formal_endpoints",
     "stage3_formal_probes",
@@ -88,6 +89,7 @@ REQUIRED_STAGE3_G38_LARGE_ARTIFACT_ROLES: tuple[str, ...] = (
     "s307_formal_output",
     "stage3_formal_results",
     "stage3_formal_evidence",
+    "document_delivery_assets",
 )
 REQUIRED_STAGE3_G38_REPLAY_LAYERS: tuple[str, ...] = (
     "local_cpu",
@@ -1110,6 +1112,257 @@ def validate_stage3_large_artifact_manifest(
     ):
         raise FormalRunRejected("STAGE3_G38_LARGE_MANIFEST_TOTAL_MISMATCH")
     _normalise_hash_object(payload, field="server_large_artifact_manifest")
+
+
+def validate_stage3_document_manifest(
+    workspace_root: str | Path,
+    manifest: Stage3G38DeliveryManifest,
+) -> None:
+    """Reopen the rendered-document manifest and bind its font and outputs."""
+
+    root = Path(workspace_root).resolve()
+    matches: list[Mapping[str, object]] = []
+    for index, record in enumerate(manifest.json_tables):
+        _verify_file_record(root, record, field=f"document_manifest_candidates[{index}]")
+        ref = _safe_ref(
+            record.get("path"),
+            field=f"document_manifest_candidates[{index}].path",
+            reject_future=False,
+        )
+        try:
+            candidate = load_canonical_json(root.joinpath(*PurePosixPath(ref).parts))
+        except (OSError, TypeError, ValueError):
+            continue
+        if isinstance(candidate, Mapping) and candidate.get("schema_version") == STAGE3_DELIVERY_DOCUMENT_SCHEMA:
+            matches.append(candidate)
+    if len(matches) != 1:
+        raise FormalRunRejected("STAGE3_G38_DOCUMENT_MANIFEST_COUNT_INVALID")
+    document = matches[0]
+    required = {
+        "schema_version",
+        "status",
+        "scope",
+        "formal_eligible",
+        "producer_commit",
+        "renderer",
+        "font",
+        "inputs",
+        "source_refs",
+        "figure_inputs",
+        "files",
+        "completion_boundary",
+        "artifact_hash",
+    }
+    if set(document) != required:
+        raise FormalRunRejected("STAGE3_G38_DOCUMENT_MANIFEST_FIELDS_INVALID")
+    if (
+        document.get("status") != "PASS"
+        or document.get("scope") != "formal"
+        or document.get("formal_eligible") is not True
+        or document.get("completion_boundary") != "PENDING_G3_8_DELIVERY_ACCEPTANCE"
+        or not isinstance(document.get("producer_commit"), str)
+        or re.fullmatch(r"[0-9a-f]{40}", str(document.get("producer_commit"))) is None
+    ):
+        raise FormalRunRejected("STAGE3_G38_DOCUMENT_MANIFEST_NOT_FORMAL_PASS")
+    _normalise_hash_object(document, field="document_manifest")
+
+    try:
+        renderer = _mapping(document.get("renderer"), field="document_manifest.renderer")
+    except TypeError as error:
+        raise FormalRunRejected("STAGE3_G38_DOCUMENT_RENDERER_INVALID") from error
+    if (
+        set(renderer) != {"name", "version", "invariant_pdf"}
+        or renderer.get("name") != "reportlab"
+        or not isinstance(renderer.get("version"), str)
+        or not renderer.get("version")
+        or renderer.get("invariant_pdf") is not True
+    ):
+        raise FormalRunRejected("STAGE3_G38_DOCUMENT_RENDERER_INVALID")
+
+    def strict_record(
+        value: object,
+        *,
+        field: str,
+        suffixes: tuple[str, ...],
+    ) -> dict[str, object]:
+        try:
+            raw = _mapping(value, field=field)
+            if set(raw) != {"path", "sha256", "size"}:
+                raise ValueError("fields")
+            parsed = _file_mapping(raw, field=field)
+            _require_suffix(parsed, suffixes, field=field)
+            _verify_file_record(root, parsed, field=field)
+        except FormalRunRejected:
+            raise
+        except (TypeError, ValueError) as error:
+            raise FormalRunRejected(f"STAGE3_G38_DOCUMENT_FILE_RECORD_INVALID:{field}") from error
+        return {
+            "path": str(parsed["path"]),
+            "sha256": str(parsed["sha256"]),
+            "size": int(parsed["size"]),
+        }
+
+    try:
+        font = _mapping(document.get("font"), field="document_manifest.font")
+    except TypeError as error:
+        raise FormalRunRejected("STAGE3_G38_DOCUMENT_FONT_RECORD_INVALID") from error
+    if (
+        set(font) != {"name", "path", "sha256", "size"}
+        or not isinstance(font.get("name"), str)
+        or not font.get("name")
+    ):
+        raise FormalRunRejected("STAGE3_G38_DOCUMENT_FONT_RECORD_INVALID")
+    try:
+        font_record = strict_record(
+            {key: font[key] for key in ("path", "sha256", "size")},
+            field="document_manifest.font",
+            suffixes=(".ttf", ".otf", ".ttc"),
+        )
+    except FormalRunRejected as error:
+        raise FormalRunRejected("STAGE3_G38_DOCUMENT_FONT_FILE_MISMATCH") from error
+
+    try:
+        inputs = _mapping(document.get("inputs"), field="document_manifest.inputs")
+        source_refs = _mapping(document.get("source_refs"), field="document_manifest.source_refs")
+    except TypeError as error:
+        raise FormalRunRejected("STAGE3_G38_DOCUMENT_SOURCE_BINDING_INVALID") from error
+    expected_roles = set(REQUIRED_STAGE3_G38_STAGE310_KINDS)
+    if set(inputs) != expected_roles or set(source_refs) != expected_roles:
+        raise FormalRunRejected("STAGE3_G38_DOCUMENT_SOURCE_BINDING_INVALID")
+    for role in REQUIRED_STAGE3_G38_STAGE310_KINDS:
+        try:
+            identity = _mapping(inputs[role], field=f"document_manifest.inputs.{role}")
+        except TypeError as error:
+            raise FormalRunRejected("STAGE3_G38_DOCUMENT_SOURCE_BINDING_INVALID") from error
+        if (
+            set(identity) != {"task_id", "artifact_kind", "config_hash", "artifact_hash", "payload_hash"}
+            or identity.get("task_id") != STAGE3_G38_STAGE310_TASK_ID
+            or identity.get("artifact_kind") != role
+        ):
+            raise FormalRunRejected("STAGE3_G38_DOCUMENT_SOURCE_BINDING_INVALID")
+        for key in ("config_hash", "artifact_hash", "payload_hash"):
+            try:
+                _hash(identity.get(key), field=f"document_manifest.inputs.{role}.{key}")
+            except ValueError as error:
+                raise FormalRunRejected("STAGE3_G38_DOCUMENT_SOURCE_BINDING_INVALID") from error
+        try:
+            _safe_ref(source_refs[role], field=f"document_manifest.source_refs.{role}")
+        except (TypeError, ValueError) as error:
+            raise FormalRunRejected("STAGE3_G38_DOCUMENT_SOURCE_BINDING_INVALID") from error
+
+    try:
+        files = _mapping(document.get("files"), field="document_manifest.files")
+        report = _mapping(files.get("chinese_report"), field="document_manifest.files.chinese_report")
+        beamer = _mapping(files.get("beamer"), field="document_manifest.files.beamer")
+    except TypeError as error:
+        raise FormalRunRejected("STAGE3_G38_DOCUMENT_OUTPUT_FIELDS_INVALID") from error
+    if (
+        set(files) != {"chinese_report", "beamer"}
+        or set(report) != {"tex", "pdf"}
+        or set(beamer) != {"tex", "pdf", "notes", "backups"}
+        or not isinstance(beamer.get("notes"), list)
+        or not isinstance(beamer.get("backups"), list)
+    ):
+        raise FormalRunRejected("STAGE3_G38_DOCUMENT_OUTPUT_FIELDS_INVALID")
+    output_pairs: list[tuple[object, Mapping[str, object], str, tuple[str, ...]]] = [
+        (report["tex"], manifest.chinese_report_tex, "chinese_report.tex", (".tex",)),
+        (report["pdf"], manifest.chinese_report_pdf, "chinese_report.pdf", (".pdf",)),
+        (beamer["tex"], manifest.beamer_tex, "beamer.tex", (".tex",)),
+        (beamer["pdf"], manifest.beamer_pdf, "beamer.pdf", (".pdf",)),
+    ]
+    notes = beamer["notes"]
+    backups = beamer["backups"]
+    if len(notes) != len(manifest.beamer_notes) or len(backups) != len(manifest.beamer_backups):
+        raise FormalRunRejected("STAGE3_G38_DOCUMENT_OUTPUT_COUNT_MISMATCH")
+    output_pairs.extend(
+        (value, manifest.beamer_notes[index], f"beamer.notes[{index}]", (".md", ".txt"))
+        for index, value in enumerate(notes)
+    )
+    output_pairs.extend(
+        (value, manifest.beamer_backups[index], f"beamer.backups[{index}]", (".tex",))
+        for index, value in enumerate(backups)
+    )
+    for recorded, expected, field, suffixes in output_pairs:
+        actual = strict_record(recorded, field=f"document_manifest.files.{field}", suffixes=suffixes)
+        expected_record = {
+            "path": str(expected["path"]),
+            "sha256": str(expected["sha256"]),
+            "size": int(expected["size"]),
+        }
+        if actual != expected_record:
+            raise FormalRunRejected(f"STAGE3_G38_DOCUMENT_OUTPUT_RECORD_MISMATCH:{field}")
+
+    raw_figures = document.get("figure_inputs")
+    if not isinstance(raw_figures, list) or not raw_figures:
+        raise FormalRunRejected("STAGE3_G38_DOCUMENT_FIGURES_INVALID")
+    expected_figures = {str(item["id"]): item for item in manifest.figures}
+    document_figures: dict[str, Mapping[str, object]] = {}
+    for index, value in enumerate(raw_figures):
+        try:
+            figure = _mapping(value, field=f"document_manifest.figure_inputs[{index}]")
+        except TypeError as error:
+            raise FormalRunRejected("STAGE3_G38_DOCUMENT_FIGURES_INVALID") from error
+        figure_id = figure.get("id")
+        if (
+            set(figure) != {"id", "png", "svg"}
+            or not isinstance(figure_id, str)
+            or figure_id not in expected_figures
+            or figure_id in document_figures
+        ):
+            raise FormalRunRejected("STAGE3_G38_DOCUMENT_FIGURES_INVALID")
+        document_figures[figure_id] = figure
+        for output_format, suffix in (("png", ".png"), ("svg", ".svg")):
+            recorded = strict_record(
+                figure[output_format],
+                field=f"document_manifest.figure_inputs.{figure_id}.{output_format}",
+                suffixes=(suffix,),
+            )
+            expected = expected_figures[figure_id][output_format]
+            expected_record = {
+                "path": str(expected["path"]),
+                "sha256": str(expected["sha256"]),
+                "size": int(expected["size"]),
+            }
+            if recorded != expected_record:
+                raise FormalRunRejected(
+                    f"STAGE3_G38_DOCUMENT_FIGURE_RECORD_MISMATCH:{figure_id}:{output_format}"
+                )
+    if set(document_figures) != set(expected_figures):
+        raise FormalRunRejected("STAGE3_G38_DOCUMENT_FIGURES_INVALID")
+
+    large_record = manifest.server_large_artifact_manifest
+    _verify_file_record(root, large_record, field="document_manifest.large_artifact_manifest")
+    large_ref = _safe_ref(
+        large_record.get("path"),
+        field="document_manifest.large_artifact_manifest.path",
+        reject_future=False,
+    )
+    try:
+        large = _mapping(
+            load_canonical_json(root.joinpath(*PurePosixPath(large_ref).parts)),
+            field="document_manifest.large_artifact_manifest",
+        )
+    except (OSError, TypeError, ValueError) as error:
+        raise FormalRunRejected("STAGE3_G38_DOCUMENT_LARGE_MANIFEST_INVALID") from error
+    groups = large.get("artifact_roots")
+    if not isinstance(groups, list):
+        raise FormalRunRejected("STAGE3_G38_DOCUMENT_ASSET_ROLE_MISSING")
+    asset_groups = [
+        group
+        for group in groups
+        if isinstance(group, Mapping) and group.get("role") == "document_delivery_assets"
+    ]
+    if len(asset_groups) != 1 or not isinstance(asset_groups[0].get("files"), list):
+        raise FormalRunRejected("STAGE3_G38_DOCUMENT_ASSET_ROLE_MISSING")
+    asset_paths: set[str] = set()
+    for index, value in enumerate(asset_groups[0]["files"]):
+        try:
+            record = _file_mapping(value, field=f"document_delivery_assets.files[{index}]")
+        except (TypeError, ValueError) as error:
+            raise FormalRunRejected("STAGE3_G38_DOCUMENT_ASSET_ROLE_INVALID") from error
+        asset_paths.add(str(record["path"]))
+    if font_record["path"] not in asset_paths:
+        raise FormalRunRejected("STAGE3_G38_DOCUMENT_FONT_NOT_IN_LARGE_ARTIFACT_CLOSURE")
 
 
 def _status_from_payload(payload: Mapping[str, object]) -> str | None:
@@ -2166,6 +2419,7 @@ class Stage3G38Publisher:
         validate_stage3_replay_reports(root, manifest)
         validate_stage3_git_sync_evidence(root, manifest)
         validate_stage3_large_artifact_manifest(root, manifest)
+        validate_stage3_document_manifest(root, manifest)
 
         # Upstream publishers may intentionally derive a new publication
         # config hash (G3-6/G3-7), while the Stage3.10 runner retains the
@@ -2351,6 +2605,7 @@ def publish_stage3_delivery_manifest(
     validate_stage3_replay_reports(root, parsed)
     validate_stage3_git_sync_evidence(root, parsed)
     validate_stage3_large_artifact_manifest(root, parsed)
+    validate_stage3_document_manifest(root, parsed)
     published = TaskArtifactStore(root, output_dir).publish(
         task_id=STAGE3_G38_MANIFEST_TASK_ID,
         artifact_kind=STAGE3_G38_MANIFEST_ARTIFACT_KIND,
@@ -2378,6 +2633,7 @@ __all__ = [
     "STAGE3_G38_PUBLICATION_SCHEMA",
     "STAGE3_G38_GIT_SYNC_EVIDENCE_SCHEMA",
     "STAGE3_G38_LARGE_ARTIFACT_MANIFEST_SCHEMA",
+    "STAGE3_DELIVERY_DOCUMENT_SCHEMA",
     "STAGE3_G38_REPLAY_REPORT_SCHEMA",
     "STAGE3_G38_RECEIPT_ARTIFACT_KIND",
     "STAGE3_G38_TASK_ID",
@@ -2389,5 +2645,6 @@ __all__ = [
     "validate_stage3_g38_handoff_authority",
     "validate_stage3_git_sync_evidence",
     "validate_stage3_large_artifact_manifest",
+    "validate_stage3_document_manifest",
     "validate_stage3_replay_reports",
 ]

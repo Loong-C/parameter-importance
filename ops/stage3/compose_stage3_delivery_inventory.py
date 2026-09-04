@@ -86,6 +86,44 @@ def _record_path(value: object, *, field: str, suffixes: tuple[str, ...] | None 
     return _safe_ref(path, field=f"{field}.path", suffixes=suffixes)
 
 
+def _verify_file_record(
+    workspace_root: Path,
+    value: object,
+    *,
+    field: str,
+    suffixes: tuple[str, ...] | None = None,
+) -> dict[str, object]:
+    record = _mapping(value, field=field)
+    if set(record) != {"path", "sha256", "size"}:
+        raise ValueError(f"{field} must contain exactly path/sha256/size")
+    ref = _safe_ref(record.get("path"), field=f"{field}.path", suffixes=suffixes)
+    digest = record.get("sha256")
+    size = record.get("size")
+    if not isinstance(digest, str) or _HASH_RE.fullmatch(digest) is None:
+        raise ValueError(f"{field}.sha256 is invalid")
+    if isinstance(size, bool) or not isinstance(size, int) or size <= 0:
+        raise ValueError(f"{field}.size is invalid")
+    path = workspace_root.joinpath(*PurePosixPath(ref).parts)
+    current = workspace_root
+    for part in PurePosixPath(ref).parts:
+        current = current / part
+        if current.is_symlink():
+            raise ValueError(f"{field} contains a symlink")
+    try:
+        resolved = path.resolve(strict=True)
+        resolved.relative_to(workspace_root)
+    except (OSError, ValueError) as error:
+        raise ValueError(f"{field} is not a workspace file") from error
+    if not resolved.is_file():
+        raise ValueError(f"{field} is not a regular file")
+    payload = resolved.read_bytes()
+    if len(payload) != size:
+        raise ValueError(f"{field} size drift")
+    if hashlib.sha256(payload).hexdigest() != digest:
+        raise ValueError(f"{field} hash drift")
+    return {"path": ref, "sha256": digest, "size": size}
+
+
 def _binding_map(values: Sequence[str], *, expected: Sequence[str], field: str) -> dict[str, str]:
     result: dict[str, str] = {}
     for index, value in enumerate(values):
@@ -103,6 +141,7 @@ def _binding_map(values: Sequence[str], *, expected: Sequence[str], field: str) 
 def _verify_document_manifest(
     document: Mapping[str, object],
     *,
+    workspace_root: Path,
     stage3_10_refs: Mapping[str, str],
     stage3_10_identities: Mapping[str, Mapping[str, object]],
     rendered_figures: object,
@@ -120,6 +159,26 @@ def _verify_document_manifest(
         raise ValueError("document manifest artifact_hash is invalid")
     if canonical_json_hash({key: value for key, value in document.items() if key != "artifact_hash"}) != supplied:
         raise ValueError("document manifest artifact_hash does not match its content")
+    renderer = _mapping(document.get("renderer"), field="document.renderer")
+    if (
+        set(renderer) != {"name", "version", "invariant_pdf"}
+        or renderer.get("name") != "reportlab"
+        or not isinstance(renderer.get("version"), str)
+        or not renderer.get("version")
+        or renderer.get("invariant_pdf") is not True
+    ):
+        raise ValueError("document manifest renderer identity is invalid")
+    font = _mapping(document.get("font"), field="document.font")
+    if set(font) != {"name", "path", "sha256", "size"}:
+        raise ValueError("document manifest font record is invalid")
+    if not isinstance(font.get("name"), str) or not font.get("name"):
+        raise ValueError("document manifest font name is invalid")
+    _verify_file_record(
+        workspace_root,
+        {key: font[key] for key in ("path", "sha256", "size")},
+        field="document.font",
+        suffixes=(".ttf", ".otf", ".ttc"),
+    )
     refs = _mapping(document.get("source_refs"), field="document.source_refs")
     identities = _mapping(document.get("inputs"), field="document.inputs")
     if set(refs) != set(REQUIRED_STAGE3_G38_STAGE310_KINDS) or set(identities) != set(REQUIRED_STAGE3_G38_STAGE310_KINDS):
@@ -341,6 +400,7 @@ def compose_stage3_delivery_inventory(
     rendered_figures = stage3_10_payloads["chart_artifacts"].get("rendered_figures")
     _verify_document_manifest(
         document_manifest,
+        workspace_root=root,
         stage3_10_refs=normalized_refs,
         stage3_10_identities=stage3_10_identities,
         rendered_figures=rendered_figures,

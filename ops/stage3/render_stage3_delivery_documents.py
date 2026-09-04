@@ -235,13 +235,30 @@ def _figure_inputs(root: Path, charts: Mapping[str, object]) -> list[dict[str, o
     return figures
 
 
-def _register_font(font_file: Path | None) -> tuple[str, dict[str, JSONValue]]:
+def _register_font(root: Path, font_file: Path | None) -> tuple[str, dict[str, JSONValue]]:
     from reportlab.pdfbase import pdfmetrics
     from reportlab.pdfbase.ttfonts import TTFont
 
     if font_file is None:
-        return "Helvetica", {"name": "Helvetica", "sha256": "0" * 64, "size": 0}
-    resolved = font_file.resolve(strict=True)
+        raise ValueError("font_file is required for the formal document renderer")
+    candidate = font_file if font_file.is_absolute() else root / font_file
+    candidate = Path(os.path.abspath(candidate))
+    try:
+        ref = candidate.relative_to(root).as_posix()
+    except ValueError as error:
+        raise ValueError("font_file must stay inside workspace_root") from error
+    current = root
+    for part in PurePosixPath(ref).parts:
+        current = current / part
+        if current.is_symlink():
+            raise ValueError("font_file contains a symlink")
+    resolved = candidate.resolve(strict=True)
+    try:
+        resolved.relative_to(root)
+    except ValueError as error:
+        raise ValueError("font_file must stay inside workspace_root") from error
+    if resolved.suffix.casefold() not in {".ttf", ".otf", ".ttc"}:
+        raise ValueError("font_file must be a TTF, OTF, or TTC file")
     payload = resolved.read_bytes()
     if not payload:
         raise ValueError("font file is empty")
@@ -249,6 +266,7 @@ def _register_font(font_file: Path | None) -> tuple[str, dict[str, JSONValue]]:
     pdfmetrics.registerFont(TTFont(font_name, str(resolved), subfontIndex=0))
     return font_name, {
         "name": font_name,
+        "path": ref,
         "sha256": hashlib.sha256(payload).hexdigest(),
         "size": len(payload),
     }
@@ -527,7 +545,10 @@ def render_stage3_delivery_documents(
     figures = _figure_inputs(root, chart_artifacts)
     metrics = _metric_rows(analysis_report)
     out.mkdir(parents=True, exist_ok=True)
-    font_name, font_record = _register_font(None if font_file is None else Path(font_file))
+    font_name, font_record = _register_font(
+        root,
+        None if font_file is None else Path(font_file),
+    )
     report_tex, beamer_tex, notes, backups = _write_tex_sources(out, metrics=metrics, handoff=handoff_manifest, gates=gate_summary, figures=figures, source_refs=source_refs)
     report_pdf = out / "stage3-formal-report-zh.pdf"
     beamer_pdf = out / "stage3-formal-beamer.pdf"

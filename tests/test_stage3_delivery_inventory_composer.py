@@ -100,6 +100,7 @@ def _case(root: Path) -> dict[str, object]:
             for index in range(1, 5)
         ],
     }
+    font = _file(root, "large/document_delivery_assets/formal-cjk.ttf")
     document_body = {
         "schema_version": DOCUMENT_SCHEMA,
         "status": "PASS",
@@ -107,7 +108,7 @@ def _case(root: Path) -> dict[str, object]:
         "formal_eligible": True,
         "producer_commit": "b" * 40,
         "renderer": {"name": "reportlab", "version": "4.0", "invariant_pdf": True},
-        "font": {"name": "formal-cjk", "sha256": "c" * 64},
+        "font": {"name": "formal-cjk", **font},
         "inputs": identities,
         "source_refs": refs,
         "figure_inputs": figures,
@@ -252,6 +253,14 @@ def test_composer_rejects_document_hash_identity_and_figure_drift(tmp_path: Path
     )
     with pytest.raises(ValueError, match="figure record drift"):
         _compose(tmp_path, case, document_manifest=bad_figure)
+
+    bad_font = deepcopy(case["document"])
+    bad_font["font"]["sha256"] = "f" * 64
+    bad_font["artifact_hash"] = canonical_json_hash(
+        {key: value for key, value in bad_font.items() if key != "artifact_hash"}
+    )
+    with pytest.raises(ValueError, match="font hash drift"):
+        _compose(tmp_path, case, document_manifest=bad_font)
 
     bad_source = deepcopy(case["source_manifest"])
     bad_source["analysis_scripts"][0]["sha256"] = "f" * 64
