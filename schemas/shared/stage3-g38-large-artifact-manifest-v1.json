@@ -19,10 +19,10 @@
     "source_refs": {"$ref": "#/$defs/refs"},
     "source_hashes": {"$ref": "#/$defs/hashes"},
     "artifact_roots": {
-      "type": "array", "minItems": 7,
+      "type": "array", "minItems": 8,
       "items": {"$ref": "#/$defs/artifact_root"}
     },
-    "file_count": {"type": "integer", "minimum": 7},
+    "file_count": {"type": "integer", "minimum": 8},
     "total_size": {"type": "integer", "minimum": 1},
     "artifact_hash": {"$ref": "#/$defs/hash"}
   },

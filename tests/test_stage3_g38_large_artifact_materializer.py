@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from jsonschema import Draft202012Validator
 
 from ops.stage3.materialize_stage3_large_artifact_manifest import (
     materialize_stage3_large_artifact_manifest,
@@ -54,6 +56,20 @@ def test_large_artifact_materializer_is_complete_deterministic_and_validated(
     assert repeated == manifest
     assert manifest["file_count"] == len(REQUIRED_STAGE3_G38_LARGE_ARTIFACT_ROLES)
     assert load_canonical_json(tmp_path / str(kwargs["output"])) == manifest
+
+    schema_path = (
+        Path(__file__).resolve().parents[1]
+        / "schemas/shared/stage3-g38-large-artifact-manifest-v1.json"
+    )
+    schema = json.loads(schema_path.read_text(encoding="utf-8"))
+    assert schema["properties"]["artifact_roots"]["minItems"] == len(
+        REQUIRED_STAGE3_G38_LARGE_ARTIFACT_ROLES
+    )
+    assert schema["properties"]["file_count"]["minimum"] == len(
+        REQUIRED_STAGE3_G38_LARGE_ARTIFACT_ROLES
+    )
+    Draft202012Validator.check_schema(schema)
+    Draft202012Validator(schema).validate(manifest)
 
     record = _record(tmp_path / str(kwargs["output"]), tmp_path)
     delivery = SimpleNamespace(server_large_artifact_manifest=record)
