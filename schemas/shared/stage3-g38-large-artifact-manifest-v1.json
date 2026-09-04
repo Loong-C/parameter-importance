@@ -1,0 +1,68 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://parameter-importance.invalid/schemas/shared/stage3-g38-large-artifact-manifest-v1.json",
+  "title": "Stage 3 complete server-side large artifact inventory consumed by G3-8",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version", "manifest_id", "scope", "status", "formal_eligible",
+    "generated_at", "source_refs", "source_hashes", "artifact_roots",
+    "file_count", "total_size", "artifact_hash"
+  ],
+  "properties": {
+    "schema_version": {"const": "stage3-g38-large-artifact-manifest-v1"},
+    "manifest_id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,159}$"},
+    "scope": {"const": "formal"},
+    "status": {"const": "PASS"},
+    "formal_eligible": {"const": true},
+    "generated_at": {"type": "string", "format": "date-time", "pattern": "Z$"},
+    "source_refs": {"$ref": "#/$defs/refs"},
+    "source_hashes": {"$ref": "#/$defs/hashes"},
+    "artifact_roots": {
+      "type": "array", "minItems": 7,
+      "items": {"$ref": "#/$defs/artifact_root"}
+    },
+    "file_count": {"type": "integer", "minimum": 7},
+    "total_size": {"type": "integer", "minimum": 1},
+    "artifact_hash": {"$ref": "#/$defs/hash"}
+  },
+  "$defs": {
+    "hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "ref": {
+      "type": "string", "minLength": 1,
+      "pattern": "^(?!.*[?])(?!.*://)(?!.*\\\\)(?!.*fixture)(?!.*synthetic).+$"
+    },
+    "refs": {
+      "type": "object", "minProperties": 1,
+      "additionalProperties": {"$ref": "#/$defs/ref"}
+    },
+    "hashes": {
+      "type": "object", "minProperties": 1,
+      "additionalProperties": {"$ref": "#/$defs/hash"}
+    },
+    "file": {
+      "type": "object", "additionalProperties": false,
+      "required": ["path", "sha256", "size"],
+      "properties": {
+        "path": {"$ref": "#/$defs/ref"},
+        "sha256": {"$ref": "#/$defs/hash"},
+        "size": {"type": "integer", "minimum": 0}
+      }
+    },
+    "artifact_root": {
+      "type": "object", "additionalProperties": false,
+      "required": ["role", "root_ref", "files", "file_count", "total_size", "collection_hash"],
+      "properties": {
+        "role": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,159}$"},
+        "root_ref": {"$ref": "#/$defs/ref"},
+        "files": {
+          "type": "array", "minItems": 1,
+          "items": {"$ref": "#/$defs/file"}
+        },
+        "file_count": {"type": "integer", "minimum": 1},
+        "total_size": {"type": "integer", "minimum": 0},
+        "collection_hash": {"$ref": "#/$defs/hash"}
+      }
+    }
+  }
+}

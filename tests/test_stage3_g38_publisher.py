@@ -28,6 +28,7 @@ from param_importance_nlp.experiments.stage3_g38_publisher import (
     Stage3G38Publisher,
     publish_stage3_delivery_manifest,
     validate_stage3_git_sync_evidence,
+    validate_stage3_large_artifact_manifest,
     validate_stage3_replay_reports,
 )
 from param_importance_nlp.experiments.stage3_raw_storage import (
@@ -140,6 +141,52 @@ def _manifest(root: Path) -> dict[str, object]:
         payload = body | {"artifact_hash": canonical_json_hash(body)}
         return f(f"-{role}.json", canonical_json_bytes(payload))
 
+    def large_manifest() -> dict[str, object]:
+        groups: list[dict[str, object]] = []
+        roles = (
+            "stage3_formal_endpoints",
+            "stage3_formal_probes",
+            "stage3_formal_configs",
+            "s307_formal_cache",
+            "s307_formal_output",
+            "stage3_formal_results",
+            "stage3_formal_evidence",
+        )
+        total_size = 0
+        for role in roles:
+            root_ref = f"large/{role}"
+            file_record = _put_file(
+                root,
+                f"{root_ref}/payload.bin",
+                f"large:{role}".encode(),
+            )
+            group_body: dict[str, object] = {
+                "role": role,
+                "root_ref": root_ref,
+                "files": [file_record],
+                "file_count": 1,
+                "total_size": file_record["size"],
+            }
+            groups.append(
+                group_body | {"collection_hash": canonical_json_hash(group_body)}
+            )
+            total_size += int(file_record["size"])
+        body: dict[str, object] = {
+            "schema_version": "stage3-g38-large-artifact-manifest-v1",
+            "manifest_id": "stage3-formal-large-artifacts",
+            "scope": "formal",
+            "status": "PASS",
+            "formal_eligible": True,
+            "generated_at": "2026-08-28T00:03:00Z",
+            "source_refs": {"formal_execution": "evidence/stage3/execution.json"},
+            "source_hashes": {"formal_execution": "6" * 64},
+            "artifact_roots": groups,
+            "file_count": len(groups),
+            "total_size": total_size,
+        }
+        payload = body | {"artifact_hash": canonical_json_hash(body)}
+        return f("-large.json", canonical_json_bytes(payload))
+
     value: dict[str, object] = {
         "schema_version": "stage3-g38-delivery-manifest-v1",
         "manifest_id": "stage3-g38-delivery",
@@ -155,7 +202,7 @@ def _manifest(root: Path) -> dict[str, object]:
             layer: replay(layer)
             for layer in ("local_cpu", "server_locked", "frozen_endpoint_uncached")
         },
-        "server_large_artifact_manifest": f("-large.json"),
+        "server_large_artifact_manifest": large_manifest(),
         "git_sync": {
             role: git_evidence(role)
             for role in ("branch", "commit", "push", "remote", "server_clean_head", "sync")
@@ -456,6 +503,18 @@ def test_g38_rejects_git_head_mismatch_even_when_file_hash_matches(tmp_path: Pat
 
     with pytest.raises(FormalRunRejected, match="GIT_HEAD_MISMATCH:remote"):
         validate_stage3_git_sync_evidence(tmp_path, parsed)
+
+
+def test_g38_rejects_unlisted_file_in_large_artifact_root(tmp_path: Path) -> None:
+    manifest = _manifest(tmp_path)
+    record = manifest["server_large_artifact_manifest"]
+    large = load_canonical_json(tmp_path / str(record["path"]))  # type: ignore[index]
+    first_root = large["artifact_roots"][0]["root_ref"]  # type: ignore[index]
+    _put_file(tmp_path, f"{first_root}/unlisted.bin", b"unlisted")
+    parsed = Stage3G38DeliveryManifest.from_mapping(manifest)
+
+    with pytest.raises(FormalRunRejected, match="LARGE_DIRECTORY_CLOSURE_MISMATCH"):
+        validate_stage3_large_artifact_manifest(tmp_path, parsed)
 
 
 def test_g38_rejects_empty_or_spec_only_chart_bundle(tmp_path: Path) -> None:

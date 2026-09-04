@@ -25,6 +25,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import hashlib
+import os
 import re
 from pathlib import Path, PurePosixPath
 from typing import Any
@@ -77,6 +78,16 @@ REQUIRED_STAGE3_G38_AGENT_DOCUMENTS: tuple[str, ...] = (
     "Agent/server.md",
     "Agent/sync.md",
     "Agent/worklogs.md",
+)
+STAGE3_G38_LARGE_ARTIFACT_MANIFEST_SCHEMA = "stage3-g38-large-artifact-manifest-v1"
+REQUIRED_STAGE3_G38_LARGE_ARTIFACT_ROLES: tuple[str, ...] = (
+    "stage3_formal_endpoints",
+    "stage3_formal_probes",
+    "stage3_formal_configs",
+    "s307_formal_cache",
+    "s307_formal_output",
+    "stage3_formal_results",
+    "stage3_formal_evidence",
 )
 REQUIRED_STAGE3_G38_REPLAY_LAYERS: tuple[str, ...] = (
     "local_cpu",
@@ -604,8 +615,13 @@ def _verify_file_record(
         raise FormalRunRejected(f"STAGE3_G38_FILE_NOT_IN_WORKSPACE:{ref}") from error
     if not resolved.is_file():
         raise FormalRunRejected(f"STAGE3_G38_FILE_NOT_REGULAR:{ref}")
-    payload = resolved.read_bytes()
-    if len(payload) != size or hashlib.sha256(payload).hexdigest() != digest:
+    if resolved.stat().st_size != size:
+        raise FormalRunRejected(f"STAGE3_G38_FILE_HASH_OR_SIZE_MISMATCH:{ref}")
+    hasher = hashlib.sha256()
+    with resolved.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(8 * 1024 * 1024), b""):
+            hasher.update(chunk)
+    if hasher.hexdigest() != digest:
         raise FormalRunRejected(f"STAGE3_G38_FILE_HASH_OR_SIZE_MISMATCH:{ref}")
 
 
@@ -855,6 +871,195 @@ def validate_stage3_git_sync_evidence(
             expected_snapshot = snapshot
         elif snapshot != expected_snapshot:
             raise FormalRunRejected(f"STAGE3_G38_GIT_ROLE_SNAPSHOT_DRIFT:{role}")
+
+
+def _directory_file_refs(root: Path, root_ref: str) -> set[str]:
+    path = root.joinpath(*PurePosixPath(root_ref).parts)
+    try:
+        current = root
+        for part in PurePosixPath(root_ref).parts:
+            current = current / part
+            if current.is_symlink():
+                raise FormalRunRejected(f"STAGE3_G38_LARGE_ROOT_SYMLINK:{root_ref}")
+        resolved = path.resolve(strict=True)
+        resolved.relative_to(root)
+    except FormalRunRejected:
+        raise
+    except (OSError, ValueError) as error:
+        raise FormalRunRejected(f"STAGE3_G38_LARGE_ROOT_INVALID:{root_ref}") from error
+    if not resolved.is_dir():
+        raise FormalRunRejected(f"STAGE3_G38_LARGE_ROOT_NOT_DIRECTORY:{root_ref}")
+
+    files: set[str] = set()
+
+    def walk_error(error: OSError) -> None:
+        raise FormalRunRejected(f"STAGE3_G38_LARGE_ROOT_WALK_FAILED:{root_ref}") from error
+
+    for directory, dirnames, filenames in os.walk(resolved, topdown=True, onerror=walk_error, followlinks=False):
+        directory_path = Path(directory)
+        for name in dirnames:
+            if (directory_path / name).is_symlink():
+                raise FormalRunRejected(f"STAGE3_G38_LARGE_TREE_SYMLINK:{root_ref}")
+        for name in filenames:
+            candidate = directory_path / name
+            if candidate.is_symlink() or not candidate.is_file():
+                raise FormalRunRejected(f"STAGE3_G38_LARGE_TREE_NONREGULAR:{root_ref}")
+            files.add(candidate.relative_to(root).as_posix())
+    return files
+
+
+def validate_stage3_large_artifact_manifest(
+    workspace_root: str | Path,
+    manifest: Stage3G38DeliveryManifest,
+) -> None:
+    """Verify the complete, per-file hash inventory of every Stage 3 large root."""
+
+    root = Path(workspace_root).resolve()
+    record = manifest.server_large_artifact_manifest
+    _verify_file_record(root, record, field="server_large_artifact_manifest")
+    ref = _safe_ref(
+        record.get("path"),
+        field="server_large_artifact_manifest.path",
+        reject_future=False,
+    )
+    try:
+        payload = _mapping(
+            load_canonical_json(root.joinpath(*PurePosixPath(ref).parts)),
+            field="server_large_artifact_manifest",
+        )
+    except (OSError, TypeError, ValueError) as error:
+        raise FormalRunRejected("STAGE3_G38_LARGE_MANIFEST_JSON_INVALID") from error
+    required = {
+        "schema_version",
+        "manifest_id",
+        "scope",
+        "status",
+        "formal_eligible",
+        "generated_at",
+        "source_refs",
+        "source_hashes",
+        "artifact_roots",
+        "file_count",
+        "total_size",
+        "artifact_hash",
+    }
+    if set(payload) != required:
+        raise FormalRunRejected("STAGE3_G38_LARGE_MANIFEST_FIELDS_INVALID")
+    if (
+        payload.get("schema_version") != STAGE3_G38_LARGE_ARTIFACT_MANIFEST_SCHEMA
+        or payload.get("scope") != "formal"
+        or payload.get("status") != "PASS"
+        or payload.get("formal_eligible") is not True
+    ):
+        raise FormalRunRejected("STAGE3_G38_LARGE_MANIFEST_NOT_FORMAL_PASS")
+    _safe_id(payload.get("manifest_id"), field="server_large_artifact_manifest.manifest_id")
+    _utc_timestamp(payload.get("generated_at"), field="server_large_artifact_manifest.generated_at")
+    source_refs = _mapping(payload.get("source_refs"), field="server_large_artifact_manifest.source_refs")
+    source_hashes = _mapping(payload.get("source_hashes"), field="server_large_artifact_manifest.source_hashes")
+    if not source_refs or set(source_refs) != set(source_hashes):
+        raise FormalRunRejected("STAGE3_G38_LARGE_MANIFEST_SOURCE_BINDING_INVALID")
+    for name, source_ref in source_refs.items():
+        if not isinstance(name, str):
+            raise FormalRunRejected("STAGE3_G38_LARGE_MANIFEST_SOURCE_NAME_INVALID")
+        _safe_id(name, field="server_large_artifact_manifest.source_refs")
+        _safe_ref(source_ref, field=f"server_large_artifact_manifest.source_refs.{name}")
+        _hash(source_hashes[name], field=f"server_large_artifact_manifest.source_hashes.{name}")
+
+    groups = payload.get("artifact_roots")
+    if not isinstance(groups, list) or not groups:
+        raise FormalRunRejected("STAGE3_G38_LARGE_MANIFEST_ROOTS_MISSING")
+    seen_roles: set[str] = set()
+    seen_roots: list[PurePosixPath] = []
+    seen_files: set[str] = set()
+    total_count = 0
+    total_size = 0
+    for index, raw_group in enumerate(groups):
+        group = _mapping(raw_group, field=f"artifact_roots[{index}]")
+        if set(group) != {"role", "root_ref", "files", "file_count", "total_size", "collection_hash"}:
+            raise FormalRunRejected(f"STAGE3_G38_LARGE_GROUP_FIELDS_INVALID:{index}")
+        role = _safe_id(group.get("role"), field=f"artifact_roots[{index}].role")
+        if role in seen_roles:
+            raise FormalRunRejected(f"STAGE3_G38_LARGE_ROLE_DUPLICATE:{role}")
+        seen_roles.add(role)
+        root_ref = _safe_ref(
+            group.get("root_ref"),
+            field=f"artifact_roots[{index}].root_ref",
+            reject_future=False,
+        )
+        root_path = PurePosixPath(root_ref)
+        if any(root_path == prior or root_path in prior.parents or prior in root_path.parents for prior in seen_roots):
+            raise FormalRunRejected(f"STAGE3_G38_LARGE_ROOT_OVERLAP:{root_ref}")
+        seen_roots.append(root_path)
+        files = group.get("files")
+        if not isinstance(files, list) or not files:
+            raise FormalRunRejected(f"STAGE3_G38_LARGE_GROUP_FILES_MISSING:{role}")
+        declared: set[str] = set()
+        normalized_files: list[dict[str, JSONValue]] = []
+        previous_ref: str | None = None
+        group_size = 0
+        for file_index, raw_file in enumerate(files):
+            item = _mapping(raw_file, field=f"artifact_roots[{index}].files[{file_index}]")
+            if set(item) != {"path", "sha256", "size"}:
+                raise FormalRunRejected(f"STAGE3_G38_LARGE_FILE_FIELDS_INVALID:{role}:{file_index}")
+            parsed = _file_mapping(item, field=f"artifact_roots[{index}].files[{file_index}]")
+            file_ref = str(parsed["path"])
+            try:
+                PurePosixPath(file_ref).relative_to(root_path)
+            except ValueError as error:
+                raise FormalRunRejected(f"STAGE3_G38_LARGE_FILE_OUTSIDE_ROOT:{file_ref}") from error
+            if previous_ref is not None and file_ref <= previous_ref:
+                raise FormalRunRejected(f"STAGE3_G38_LARGE_FILES_NOT_SORTED:{role}")
+            previous_ref = file_ref
+            if file_ref in seen_files:
+                raise FormalRunRejected(f"STAGE3_G38_LARGE_FILE_DUPLICATE:{file_ref}")
+            seen_files.add(file_ref)
+            declared.add(file_ref)
+            _verify_file_record(root, parsed, field=f"artifact_roots[{index}].files[{file_index}]")
+            group_size += int(parsed["size"])
+            normalized_files.append({
+                "path": file_ref,
+                "sha256": str(parsed["sha256"]),
+                "size": int(parsed["size"]),
+            })
+        actual = _directory_file_refs(root, root_ref)
+        if actual != declared:
+            raise FormalRunRejected(f"STAGE3_G38_LARGE_DIRECTORY_CLOSURE_MISMATCH:{role}")
+        group_count = group.get("file_count")
+        declared_group_size = group.get("total_size")
+        if (
+            isinstance(group_count, bool)
+            or not isinstance(group_count, int)
+            or isinstance(declared_group_size, bool)
+            or not isinstance(declared_group_size, int)
+            or group_count != len(normalized_files)
+            or declared_group_size != group_size
+        ):
+            raise FormalRunRejected(f"STAGE3_G38_LARGE_GROUP_TOTAL_MISMATCH:{role}")
+        collection_body: dict[str, JSONValue] = {
+            "role": role,
+            "root_ref": root_ref,
+            "files": normalized_files,
+            "file_count": len(normalized_files),
+            "total_size": group_size,
+        }
+        if group.get("collection_hash") != canonical_json_hash(collection_body):
+            raise FormalRunRejected(f"STAGE3_G38_LARGE_GROUP_HASH_MISMATCH:{role}")
+        total_count += len(normalized_files)
+        total_size += group_size
+    if not set(REQUIRED_STAGE3_G38_LARGE_ARTIFACT_ROLES).issubset(seen_roles):
+        raise FormalRunRejected("STAGE3_G38_LARGE_REQUIRED_ROLES_MISSING")
+    manifest_count = payload.get("file_count")
+    declared_total_size = payload.get("total_size")
+    if (
+        isinstance(manifest_count, bool)
+        or not isinstance(manifest_count, int)
+        or isinstance(declared_total_size, bool)
+        or not isinstance(declared_total_size, int)
+        or manifest_count != total_count
+        or declared_total_size != total_size
+    ):
+        raise FormalRunRejected("STAGE3_G38_LARGE_MANIFEST_TOTAL_MISMATCH")
+    _normalise_hash_object(payload, field="server_large_artifact_manifest")
 
 
 def _status_from_payload(payload: Mapping[str, object]) -> str | None:
@@ -1507,6 +1712,7 @@ class Stage3G38Publisher:
         _verify_manifest_files(root, manifest)
         validate_stage3_replay_reports(root, manifest)
         validate_stage3_git_sync_evidence(root, manifest)
+        validate_stage3_large_artifact_manifest(root, manifest)
 
         # Upstream publishers may intentionally derive a new publication
         # config hash (G3-6/G3-7), while the Stage3.10 runner retains the
@@ -1691,6 +1897,7 @@ def publish_stage3_delivery_manifest(
     _verify_manifest_files(root, parsed)
     validate_stage3_replay_reports(root, parsed)
     validate_stage3_git_sync_evidence(root, parsed)
+    validate_stage3_large_artifact_manifest(root, parsed)
     published = TaskArtifactStore(root, output_dir).publish(
         task_id=STAGE3_G38_MANIFEST_TASK_ID,
         artifact_kind=STAGE3_G38_MANIFEST_ARTIFACT_KIND,
@@ -1708,6 +1915,7 @@ __all__ = [
     "REQUIRED_STAGE3_G38_GATE_IDS",
     "REQUIRED_STAGE3_G38_GIT_ROLES",
     "REQUIRED_STAGE3_G38_AGENT_DOCUMENTS",
+    "REQUIRED_STAGE3_G38_LARGE_ARTIFACT_ROLES",
     "REQUIRED_STAGE3_G38_REPLAY_LAYERS",
     "STAGE3_G38_DELIVERY_MANIFEST_SCHEMA",
     "STAGE3_G38_DELIVERY_RECEIPT_ARTIFACT_KIND",
@@ -1716,6 +1924,7 @@ __all__ = [
     "STAGE3_G38_PUBLICATION_CONFIG_SCHEMA",
     "STAGE3_G38_PUBLICATION_SCHEMA",
     "STAGE3_G38_GIT_SYNC_EVIDENCE_SCHEMA",
+    "STAGE3_G38_LARGE_ARTIFACT_MANIFEST_SCHEMA",
     "STAGE3_G38_REPLAY_REPORT_SCHEMA",
     "STAGE3_G38_RECEIPT_ARTIFACT_KIND",
     "STAGE3_G38_TASK_ID",
@@ -1725,5 +1934,6 @@ __all__ = [
     "publish_stage3_delivery_manifest",
     "publish_stage3_g38",
     "validate_stage3_git_sync_evidence",
+    "validate_stage3_large_artifact_manifest",
     "validate_stage3_replay_reports",
 ]
