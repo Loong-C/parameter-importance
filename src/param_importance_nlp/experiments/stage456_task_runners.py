@@ -106,6 +106,9 @@ from .training_routes import (
     TrainingRouteResult,
     TrainingRouteRunner,
 )
+from .stage3_g38_publisher import (
+    validate_stage3_g38_handoff_authority,
+)
 
 
 _HASH_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -315,6 +318,45 @@ def _blocked_missing(
     return TaskBlockedError(
         TaskBlocker(code, requirement, message, True, evidence_refs)
     )
+
+
+def _validate_stage3_handoff_binding(
+    request: TaskExecutionRequest,
+    root: Path,
+) -> tuple[Mapping[str, JSONValue] | None, tuple[str, ...]]:
+    """Validate and expose Stage 3's canonical G3-8 handoff to Stage 4."""
+
+    if request.task.stage != 4 or request.config.run_intent != "formal":
+        return None, ()
+    gate_ref = request.environment.evidence_refs.get("gate_stage3_g3_8")
+    publication_ref = request.environment.evidence_refs.get(
+        "stage3_g38_publication"
+    )
+    if gate_ref is None or publication_ref is None:
+        refs = tuple(
+            value
+            for value in (gate_ref, publication_ref)
+            if isinstance(value, str)
+        )
+        raise _blocked_missing(
+            BlockerCode.GATE_NOT_READY,
+            "stage3.G3-8",
+            "formal Stage 4 缺少 canonical G3-8 Gate 与 publication receipt",
+            evidence_refs=refs,
+        )
+    audit = validate_stage3_g38_handoff_authority(
+        root,
+        gate_ref=gate_ref,
+        publication_ref=publication_ref,
+    )
+    lineage = audit.get("lineage_refs")
+    if (
+        not isinstance(lineage, list)
+        or not lineage
+        or any(not isinstance(value, str) for value in lineage)
+    ):
+        raise ValueError("STAGE456_STAGE3_HANDOFF_LINEAGE_INVALID")
+    return audit, tuple(lineage)
 
 
 def _load_route(
@@ -1779,6 +1821,9 @@ def _run_route(
     route, route_ref, route_source_hash = _load_route(request, root)
     estimator_audit = _validate_estimator_binding(request, route, root)
     quadrature_audit = _validate_quadrature_binding(request, root)
+    stage3_handoff_audit, stage3_handoff_refs = (
+        _validate_stage3_handoff_binding(request, root)
+    )
     artifacts = request.config.section("artifacts")
     assert isinstance(artifacts, dict)
     output_root = _resolve(root, artifacts["output_dir"], field_name="output_dir")
@@ -2107,6 +2152,11 @@ def _run_route(
         "pruning_results": pruning_results,
         "estimator_decision_audit": dict(estimator_audit),
         "quadrature_decision_audit": dict(quadrature_audit),
+        "stage3_handoff_audit": (
+            None
+            if stage3_handoff_audit is None
+            else dict(stage3_handoff_audit)
+        ),
         "event_stream_refs": event_refs,
         "resource_profiles": [
             {
@@ -2147,6 +2197,7 @@ def _run_route(
         refs.append(str(quadrature_ref))
     if request.environment.estimator_decision_ref is not None:
         refs.append(request.environment.estimator_decision_ref)
+    refs.extend(stage3_handoff_refs)
     source_refs = tuple(dict.fromkeys(refs))
     return _ExecutedRoute(route, result, common, source_refs)
 
@@ -3720,6 +3771,15 @@ class Stage456TaskRunner(TaskRunner):
             finally:
                 executor.close()
         payloads, source_refs = _derived_payloads(request, self.workspace_root)
+        handoff_audit, handoff_refs = _validate_stage3_handoff_binding(
+            request, self.workspace_root
+        )
+        if handoff_audit is not None:
+            payloads = {
+                kind: {**dict(payload), "stage3_handoff_audit": dict(handoff_audit)}
+                for kind, payload in payloads.items()
+            }
+            source_refs = tuple(dict.fromkeys((*source_refs, *handoff_refs)))
         return _publish(
             request,
             store,

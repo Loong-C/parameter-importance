@@ -137,6 +137,11 @@ def test_stage4_to_stage9_catalog_refs_point_to_detailed_task_anchors() -> None:
         "stage9.report", "stage9.bundle", "stage9.replay",
     }
     assert expected_leaf_ids <= set(DEFAULT_TASK_CATALOG.task_ids)
+    assert all(
+        "stage3.G3-8" in task.formal_eligibility.required_gate_ids
+        for task in DEFAULT_TASK_CATALOG.tasks
+        if task.stage == 4
+    )
 
 
 def test_every_task_freezes_runner_config_artifacts_recovery_and_formal_policy() -> None:

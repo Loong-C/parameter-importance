@@ -1371,6 +1371,409 @@ class Stage3G38Publication:
         )
 
 
+def validate_stage3_g38_handoff_authority(
+    workspace_root: str | Path,
+    *,
+    gate_ref: str,
+    publication_ref: str,
+) -> dict[str, JSONValue]:
+    """Reload and bind the canonical G3-8 gate/receipt for Stage 4 entry.
+
+    This is intentionally a lightweight *consumer* check.  G3-8 already
+    streamed the full large-artifact inventory when it published the gate;
+    Stage 4 reopens every immutable control-plane authority and verifies all
+    hashes/config identities without rehashing terabytes before each task.
+    A self-consistent GateRecord from another producer is therefore
+    insufficient: both canonical G3-8 commits and their complete cross-links
+    must still be live.
+    """
+
+    root = Path(workspace_root).resolve()
+    canonical_gate_ref = _safe_ref(
+        gate_ref, field="stage4_g3_8_gate_ref", reject_future=False
+    )
+    canonical_publication_ref = _safe_ref(
+        publication_ref,
+        field="stage4_g3_8_publication_ref",
+        reject_future=False,
+    )
+    if canonical_gate_ref == canonical_publication_ref:
+        raise FormalRunRejected("STAGE3_G38_HANDOFF_GATE_RECEIPT_REF_COLLISION")
+
+    gate_artifact = _load_formal_commit(
+        root,
+        canonical_gate_ref,
+        field="stage4_g3_8_gate",
+        config_hash=None,
+        expected_kind=STAGE3_G38_GATE_ARTIFACT_KIND,
+        expected_task_id=STAGE3_G38_TASK_ID,
+    )
+    publication_artifact = _load_formal_commit(
+        root,
+        canonical_publication_ref,
+        field="stage4_g3_8_publication",
+        config_hash=None,
+        expected_kind=STAGE3_G38_RECEIPT_ARTIFACT_KIND,
+        expected_task_id=STAGE3_G38_TASK_ID,
+    )
+    try:
+        gate = GateRecord.from_mapping(dict(gate_artifact.payload))
+        publication = Stage3G38Publication.from_mapping(
+            dict(publication_artifact.payload)
+        )
+    except (TypeError, ValueError) as error:
+        raise FormalRunRejected("STAGE3_G38_HANDOFF_PAYLOAD_INVALID") from error
+    if (
+        gate.gate_id != STAGE3_G38_GATE_ID
+        or gate.stage != 3
+        or gate.status is not GateStatus.PASS
+        or gate.effective_status() is not GateStatus.PASS
+        or publication.status != "PASS"
+        or publication.formal_eligible is not True
+        or publication.task_id != STAGE3_G38_TASK_ID
+    ):
+        raise FormalRunRejected("STAGE3_G38_HANDOFF_NOT_LIVE_PASS")
+    if (
+        gate_artifact.identity.config_hash
+        != publication_artifact.identity.config_hash
+        or publication.config_hash != publication.publication_config_hash
+        or publication.publication_config_hash
+        != gate_artifact.identity.config_hash
+    ):
+        raise FormalRunRejected("STAGE3_G38_HANDOFF_PUBLICATION_CONFIG_MISMATCH")
+    if (
+        publication.g3_8_ref != canonical_gate_ref
+        or publication.g3_8_hash != gate.artifact_hash
+        or publication.g3_8_gate.to_dict() != gate.to_dict()
+    ):
+        raise FormalRunRejected("STAGE3_G38_HANDOFF_GATE_BINDING_MISMATCH")
+
+    gate_ref_map = {
+        gate_id: publication.gate_refs[gate_id]
+        for gate_id in REQUIRED_STAGE3_G38_GATE_IDS
+    }
+    gate_hash_map = {
+        gate_id: publication.gate_hashes[gate_id]
+        for gate_id in REQUIRED_STAGE3_G38_GATE_IDS
+    }
+    loaded_gates: dict[str, LoadedTaskArtifact] = {}
+    gate_records: dict[str, GateRecord] = {}
+    for gate_id in REQUIRED_STAGE3_G38_GATE_IDS:
+        loaded = _load_formal_commit(
+            root,
+            gate_ref_map[gate_id],
+            field=f"stage4_{gate_id.replace('.', '_')}",
+            config_hash=None,
+            expected_kind=STAGE3_G38_GATE_ARTIFACT_KIND,
+        )
+        try:
+            record = GateRecord.from_mapping(dict(loaded.payload))
+        except (TypeError, ValueError) as error:
+            raise FormalRunRejected(
+                f"STAGE3_G38_HANDOFF_PREREQUISITE_GATE_INVALID:{gate_id}"
+            ) from error
+        if (
+            record.gate_id != gate_id
+            or record.stage != 3
+            or record.status is not GateStatus.PASS
+            or record.effective_status() is not GateStatus.PASS
+            or record.artifact_hash != gate_hash_map[gate_id]
+        ):
+            raise FormalRunRejected(
+                f"STAGE3_G38_HANDOFF_PREREQUISITE_GATE_DRIFT:{gate_id}"
+            )
+        loaded_gates[gate_id] = loaded
+        gate_records[gate_id] = record
+
+    if set(publication.stage3_10_refs) != set(REQUIRED_STAGE3_G38_STAGE310_KINDS):
+        raise FormalRunRejected("STAGE3_G38_HANDOFF_STAGE310_COVERAGE_INVALID")
+    stage_ref_map = {
+        role: publication.stage3_10_refs[role]
+        for role in REQUIRED_STAGE3_G38_STAGE310_KINDS
+    }
+    stage_loaded = {
+        role: _load_formal_commit(
+            root,
+            stage_ref_map[role],
+            field=f"stage4_stage3_10_{role}",
+            config_hash=None,
+            expected_kind=role,
+            expected_task_id=STAGE3_G38_STAGE310_TASK_ID,
+        )
+        for role in REQUIRED_STAGE3_G38_STAGE310_KINDS
+    }
+    if len({item.identity.config_hash for item in stage_loaded.values()}) != 1:
+        raise FormalRunRejected("STAGE3_G38_HANDOFF_STAGE310_CONFIG_MISMATCH")
+    for role, loaded in stage_loaded.items():
+        if loaded.identity.artifact_hash != publication.stage3_10_hashes[role]:
+            raise FormalRunRejected(
+                f"STAGE3_G38_HANDOFF_STAGE310_HASH_DRIFT:{role}"
+            )
+        status = _status_from_payload(loaded.payload)
+        if (
+            status in {"BLOCKED", "FAIL", "FAILED", "NOT_RUN"}
+            or loaded.payload.get("formal_eligible") is False
+        ):
+            raise FormalRunRejected(
+                f"STAGE3_G38_HANDOFF_STAGE310_NOT_PASS:{role}"
+            )
+
+    from .stage3_g37_publisher import (
+        STAGE3_G37_FINALIZATION_ARTIFACT_KIND,
+        STAGE3_G37_PUBLICATION_ARTIFACT_KIND,
+        STAGE3_G37_RECOMMENDATION_ARTIFACT_KIND,
+        STAGE3_G37_TASK_ID,
+        Stage3G37Publication,
+    )
+
+    execution_artifact = _load_formal_commit(
+        root,
+        publication.execution_evidence_ref,
+        field="stage4_execution_evidence",
+        config_hash=None,
+        expected_kind="formal_execution_evidence",
+    )
+    execution = FormalExecutionEvidence.from_mapping(execution_artifact.payload)
+    execution.require_for_stage(3)
+    execution_gates = {
+        item.gate_id: item for item in execution.prerequisite_gates
+    }
+    if (
+        execution.artifact_hash != publication.execution_evidence_hash
+        or set(execution_gates) != set(REQUIRED_STAGE3_G38_GATE_IDS)
+        or any(
+            execution_gates[gate_id].artifact_hash
+            != gate_records[gate_id].artifact_hash
+            for gate_id in REQUIRED_STAGE3_G38_GATE_IDS
+        )
+    ):
+        raise FormalRunRejected("STAGE3_G38_HANDOFF_EXECUTION_EVIDENCE_DRIFT")
+
+    g37_artifact = _load_formal_commit(
+        root,
+        publication.g3_7_publication_ref,
+        field="stage4_g3_7_publication",
+        config_hash=None,
+        expected_kind=STAGE3_G37_PUBLICATION_ARTIFACT_KIND,
+        expected_task_id=STAGE3_G37_TASK_ID,
+    )
+    g37 = Stage3G37Publication.from_mapping(dict(g37_artifact.payload))
+    if (
+        g37.status != "PASS"
+        or g37.formal_eligible is not True
+        or g37.artifact_hash != publication.g3_7_publication_hash
+        or g37.g3_7_ref != gate_ref_map["stage3.G3-7"]
+        or g37.g3_7_hash != gate_hash_map["stage3.G3-7"]
+        or g37.recommendation_ref != publication.recommendation_ref
+        or g37.finalization_ref != publication.finalization_ref
+    ):
+        raise FormalRunRejected("STAGE3_G38_HANDOFF_G37_AUTHORITY_DRIFT")
+
+    recommendation = _load_formal_commit(
+        root,
+        publication.recommendation_ref,
+        field="stage4_recommendation",
+        config_hash=g37.publication_config_hash,
+        expected_kind=STAGE3_G37_RECOMMENDATION_ARTIFACT_KIND,
+        expected_task_id=STAGE3_G37_TASK_ID,
+    )
+    finalization = _load_formal_commit(
+        root,
+        publication.finalization_ref,
+        field="stage4_finalization",
+        config_hash=g37.publication_config_hash,
+        expected_kind=STAGE3_G37_FINALIZATION_ARTIFACT_KIND,
+        expected_task_id=STAGE3_G37_TASK_ID,
+    )
+    _require_qualified_recommendation(recommendation.payload)
+    _require_finalization_pass(finalization.payload)
+    recommendation_hash = str(recommendation.payload.get("artifact_hash"))
+    finalization_hash = str(finalization.payload.get("artifact_hash"))
+    if (
+        recommendation_hash != publication.recommendation_hash
+        or recommendation_hash != g37.recommendation_hash
+        or finalization_hash != publication.finalization_hash
+        or finalization_hash != g37.finalization_hash
+    ):
+        raise FormalRunRejected("STAGE3_G38_HANDOFF_G37_OUTPUT_HASH_DRIFT")
+
+    manifest_artifact = _load_formal_commit(
+        root,
+        publication.delivery_manifest_ref,
+        field="stage4_delivery_manifest",
+        config_hash=None,
+        expected_kind=STAGE3_G38_MANIFEST_ARTIFACT_KIND,
+        expected_task_id=STAGE3_G38_MANIFEST_TASK_ID,
+    )
+    manifest = Stage3G38DeliveryManifest.from_mapping(
+        dict(manifest_artifact.payload)
+    )
+    if manifest_artifact.identity.artifact_hash != publication.delivery_manifest_hash:
+        raise FormalRunRejected("STAGE3_G38_HANDOFF_DELIVERY_MANIFEST_HASH_DRIFT")
+
+    expected_input_config_hashes = {
+        **{
+            gate_id: loaded_gates[gate_id].identity.config_hash
+            for gate_id in REQUIRED_STAGE3_G38_GATE_IDS
+        },
+        **{
+            f"stage3_10.{role}": stage_loaded[role].identity.config_hash
+            for role in REQUIRED_STAGE3_G38_STAGE310_KINDS
+        },
+        "execution_evidence": execution_artifact.identity.config_hash,
+        "g3_7_publication": g37_artifact.identity.config_hash,
+        "recommendation": recommendation.identity.config_hash,
+        "finalization": finalization.identity.config_hash,
+        "delivery_manifest": manifest_artifact.identity.config_hash,
+    }
+    if dict(publication.input_config_hashes) != expected_input_config_hashes:
+        raise FormalRunRejected("STAGE3_G38_HANDOFF_INPUT_CONFIG_IDENTITY_DRIFT")
+    input_hash_values = set(expected_input_config_hashes.values())
+    expected_input_config_hash = (
+        next(iter(input_hash_values))
+        if len(input_hash_values) == 1
+        else canonical_json_hash(
+            {
+                "schema_version": "stage3-g38-input-config-set-v1",
+                "config_hashes": expected_input_config_hashes,
+            }
+        )
+    )
+    if publication.input_config_hash != expected_input_config_hash:
+        raise FormalRunRejected("STAGE3_G38_HANDOFF_INPUT_CONFIG_HASH_DRIFT")
+
+    publication_config = {
+        "schema_version": STAGE3_G38_PUBLICATION_CONFIG_SCHEMA,
+        "input_config_hash": expected_input_config_hash,
+        "input_config_hashes": expected_input_config_hashes,
+        "gate_refs": gate_ref_map,
+        "gate_hashes": gate_hash_map,
+        "stage3_10_refs": stage_ref_map,
+        "stage3_10_hashes": {
+            role: stage_loaded[role].identity.artifact_hash
+            for role in REQUIRED_STAGE3_G38_STAGE310_KINDS
+        },
+        "execution_evidence_ref": publication.execution_evidence_ref,
+        "execution_evidence_hash": execution.artifact_hash,
+        "g3_7_publication_ref": publication.g3_7_publication_ref,
+        "g3_7_publication_hash": g37.artifact_hash,
+        "recommendation_ref": publication.recommendation_ref,
+        "recommendation_hash": recommendation_hash,
+        "finalization_ref": publication.finalization_ref,
+        "finalization_hash": finalization_hash,
+        "delivery_manifest_ref": publication.delivery_manifest_ref,
+    }
+    computed_publication_config_hash = canonical_json_hash(publication_config)
+    if computed_publication_config_hash != publication.publication_config_hash:
+        raise FormalRunRejected("STAGE3_G38_HANDOFF_PUBLICATION_CONFIG_HASH_DRIFT")
+
+    expected_sources = tuple(
+        dict.fromkeys(
+            (
+                *gate_ref_map.values(),
+                *stage_ref_map.values(),
+                publication.execution_evidence_ref,
+                publication.g3_7_publication_ref,
+                publication.recommendation_ref,
+                publication.finalization_ref,
+                publication.delivery_manifest_ref,
+            )
+        )
+    )
+    if (
+        set(publication.source_artifact_refs) != set(expected_sources)
+        or len(publication.source_artifact_refs) != len(expected_sources)
+        or set(gate.evidence_refs) != set(expected_sources)
+        or len(gate.evidence_refs) != len(expected_sources)
+        or gate_artifact.source_refs != gate.evidence_refs
+        or publication_artifact.source_refs
+        != (*publication.source_artifact_refs, canonical_gate_ref)
+    ):
+        raise FormalRunRejected("STAGE3_G38_HANDOFF_SOURCE_LINEAGE_DRIFT")
+
+    handoff = stage_loaded["handoff_manifest"].payload
+    if (
+        handoff.get("scope") != "formal"
+        or handoff.get("formal_eligible") is not True
+        or handoff.get("formal_stage_complete") is not False
+        or handoff.get("completion_boundary")
+        != "PENDING_G3_8_DELIVERY_ACCEPTANCE"
+        or handoff.get("stage3_g37_publication_ref")
+        != publication.g3_7_publication_ref
+        or handoff.get("stage3_g37_publication_hash") != g37.artifact_hash
+        or handoff.get("stage3_g37_gate_ref")
+        != gate_ref_map["stage3.G3-7"]
+        or handoff.get("stage3_g37_gate_hash")
+        != gate_hash_map["stage3.G3-7"]
+        or handoff.get("stage3_g37_recommendation_ref")
+        != publication.recommendation_ref
+        or handoff.get("stage3_g37_recommendation_hash")
+        != recommendation_hash
+        or handoff.get("stage3_g37_finalization_ref")
+        != publication.finalization_ref
+        or handoff.get("stage3_g37_finalization_hash") != finalization_hash
+        or handoff.get("stage3_finalization") != dict(finalization.payload)
+        or handoff.get("execution_evidence_ref")
+        != publication.execution_evidence_ref
+        or handoff.get("execution_evidence_hash") != execution.artifact_hash
+    ):
+        raise FormalRunRejected("STAGE3_G38_HANDOFF_MANIFEST_AUTHORITY_DRIFT")
+
+    expected_measured = {
+        "g3_0_through_g3_7_live_pass": True,
+        "stage3_10_formal_commit_count": 4,
+        "delivery_file_count": len(manifest.file_records()),
+        "delivery_manifest_hash": manifest_artifact.identity.artifact_hash,
+        "publication_config_hash": computed_publication_config_hash,
+    }
+    expected_threshold = {
+        "all_prerequisite_gates_pass": True,
+        "stage3_10_formal_commits": 4,
+        "delivery_manifest_complete": True,
+        "small_file_hash_and_size_match": True,
+        "qualified_recommendation": True,
+        "formal_finalization": True,
+    }
+    if gate.measured != expected_measured or gate.threshold != expected_threshold:
+        raise FormalRunRejected("STAGE3_G38_HANDOFF_GATE_SEMANTICS_DRIFT")
+
+    lineage_refs = (
+        canonical_publication_ref,
+        canonical_gate_ref,
+        stage_ref_map["handoff_manifest"],
+        publication.recommendation_ref,
+        publication.finalization_ref,
+        publication.delivery_manifest_ref,
+    )
+    audit: dict[str, JSONValue] = {
+        "schema_version": "stage3-g38-handoff-audit-v1",
+        "scope": "formal",
+        "status": "PASS",
+        "formal_eligible": True,
+        "publication_ref": canonical_publication_ref,
+        "publication_hash": publication.artifact_hash,
+        "publication_commit_hash": publication_artifact.identity.artifact_hash,
+        "publication_config_hash": computed_publication_config_hash,
+        "g3_8_ref": canonical_gate_ref,
+        "g3_8_hash": gate.artifact_hash,
+        "g3_8_commit_hash": gate_artifact.identity.artifact_hash,
+        "handoff_manifest_ref": stage_ref_map["handoff_manifest"],
+        "handoff_manifest_hash": stage_loaded[
+            "handoff_manifest"
+        ].identity.artifact_hash,
+        "recommendation_ref": publication.recommendation_ref,
+        "recommendation_hash": recommendation_hash,
+        "finalization_ref": publication.finalization_ref,
+        "finalization_hash": finalization_hash,
+        "delivery_manifest_ref": publication.delivery_manifest_ref,
+        "delivery_manifest_hash": manifest_artifact.identity.artifact_hash,
+        "source_artifact_refs": list(expected_sources),
+        "lineage_refs": list(lineage_refs),
+    }
+    audit["audit_hash"] = canonical_json_hash(audit)
+    return audit
+
+
 class Stage3G38Publisher:
     """Reload formal inputs, verify delivery, then publish G3-8 and receipt."""
 
@@ -1933,6 +2336,7 @@ __all__ = [
     "Stage3G38Publisher",
     "publish_stage3_delivery_manifest",
     "publish_stage3_g38",
+    "validate_stage3_g38_handoff_authority",
     "validate_stage3_git_sync_evidence",
     "validate_stage3_large_artifact_manifest",
     "validate_stage3_replay_reports",

@@ -8,6 +8,18 @@ Stage 4 验证同一 base initialization 下的 pretrain、direct supervised、f
 - 合格的 Stage 2 `EstimatorDecision`；启用路径审计时还需 Stage 3 recommendation；
 - route spec 中的 base initialization、phase 输入和 checkpoint lineage 全部 hash-bound；
 - 本机 fixture 可用 tiny provider 验证执行链，但 `formal_eligible=false`。
+- 所有 formal Stage 4 task 都必须在 runtime environment 中同时绑定
+  `evidence_refs.gate_stage3_g3_8` 与
+  `evidence_refs.stage3_g38_publication`。前者必须是 canonical
+  `stage3.10_g3_8_delivery_acceptance:gate_record` commit，后者必须是同一
+  publisher/config 的 `g38_publication` receipt。只声明
+  `passed_gate_ids=[stage3.G3-8]`、只给一个同名 GateRecord，或使用其他 producer
+  包装的自洽 GateRecord 均不能进入 Stage 4。
+- Stage 4 会重新打开 receipt 所绑定的 G3-0--G3-7、S3.10 handoff、G3-7
+  recommendation/finalization、execution evidence 与 delivery manifest 控制面
+  commits，核对 producer/kind/config/hash/source lineage，并把生成的
+  `stage3-g38-handoff-audit-v1` 及关键 refs 写入 Stage 4 输出 lineage。大文件本体
+  已由 G3-8 流式验收，Stage 4 不在每个 task 前重复扫描 TB 级数据。
 
 ## 声明式入口与运行边界
 

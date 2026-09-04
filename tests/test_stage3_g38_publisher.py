@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import hashlib
 import importlib.util
+import json
 from pathlib import Path
 
 import pytest
+from jsonschema import Draft202012Validator
 
 from param_importance_nlp.contracts.jsonio import (
     canonical_json_bytes,
@@ -27,6 +29,7 @@ from param_importance_nlp.experiments.stage3_g38_publisher import (
     Stage3G38DeliveryManifest,
     Stage3G38Publisher,
     publish_stage3_delivery_manifest,
+    validate_stage3_g38_handoff_authority,
     validate_stage3_git_sync_evidence,
     validate_stage3_large_artifact_manifest,
     validate_stage3_replay_reports,
@@ -35,6 +38,7 @@ from param_importance_nlp.experiments.stage3_raw_storage import (
     persist_raw_unit_shard,
     publish_raw_aggregate,
 )
+from param_importance_nlp.runtime.task_runtime import TaskRuntime, TaskRuntimeEnvironment
 from param_importance_nlp.runtime.task_artifacts import TaskArtifactStore, load_committed_task_artifact
 import torch
 
@@ -453,6 +457,105 @@ def test_g38_requires_all_formal_inputs_and_hashes_files(tmp_path: Path) -> None
     receipt = load_committed_task_artifact(tmp_path, "outputs/g38/commits/g38_publication.json", require_formal=True)
     assert receipt.payload == result.to_dict()
     assert Stage3G38DeliveryManifest.from_mapping(dict(load_committed_task_artifact(tmp_path, inputs["delivery_manifest_ref"], require_formal=True).payload)).artifact_hash
+
+
+def test_stage4_handoff_requires_canonical_g38_gate_and_receipt(
+    tmp_path: Path,
+) -> None:
+    inputs = _inputs(tmp_path)
+    publication = Stage3G38Publisher().publish(
+        workspace_root=tmp_path,
+        output_dir="outputs/g38",
+        config_hash=CONFIG,
+        checked_at="2026-08-28T01:00:00Z",
+        **inputs,
+    )
+    gate_ref = "outputs/g38/commits/gate_record.json"
+    publication_ref = "outputs/g38/commits/g38_publication.json"
+
+    audit = validate_stage3_g38_handoff_authority(
+        tmp_path,
+        gate_ref=gate_ref,
+        publication_ref=publication_ref,
+    )
+    assert audit["status"] == "PASS"
+    assert audit["formal_eligible"] is True
+    assert audit["g3_8_hash"] == publication.g3_8_hash
+    assert audit["handoff_manifest_ref"] == inputs["stage3_10_refs"][
+        "handoff_manifest"
+    ]
+    assert audit["recommendation_ref"] == publication.recommendation_ref
+    assert audit["audit_hash"] == canonical_json_hash(
+        {key: value for key, value in audit.items() if key != "audit_hash"}
+    )
+    handoff_schema_path = (
+        Path(__file__).resolve().parents[1]
+        / "schemas/stage4/stage3-handoff-audit-v1.json"
+    )
+    handoff_schema = json.loads(handoff_schema_path.read_text(encoding="utf-8"))
+    Draft202012Validator.check_schema(handoff_schema)
+    Draft202012Validator(handoff_schema).validate(audit)
+
+    runtime = TaskRuntime(workspace_root=tmp_path)
+    valid_environment = TaskRuntimeEnvironment(
+        passed_gate_ids=frozenset({"stage3.G3-8"}),
+        evidence_refs={
+            "gate_stage3_g3_8": gate_ref,
+            "stage3_g38_publication": publication_ref,
+        },
+    )
+    assert runtime._verified_gate_ref(
+        valid_environment, "stage3.G3-8"
+    ) == (True, (gate_ref, publication_ref))
+    gate_only = TaskRuntimeEnvironment(
+        passed_gate_ids=frozenset({"stage3.G3-8"}),
+        evidence_refs={"gate_stage3_g3_8": gate_ref},
+    )
+    assert runtime._verified_gate_ref(gate_only, "stage3.G3-8") == (
+        False,
+        (gate_ref,),
+    )
+
+    forged_gate = TaskArtifactStore(tmp_path, "outputs/forged-gate").publish(
+        task_id="stage3.forged_g3_8",
+        artifact_kind="gate_record",
+        config_hash=publication.publication_config_hash,
+        run_intent="formal",
+        formal_eligible=True,
+        payload=publication.g3_8_gate.to_dict(),
+        source_refs=publication.source_artifact_refs,
+    )
+    with pytest.raises(FormalRunRejected, match="TASK_ID_INVALID"):
+        validate_stage3_g38_handoff_authority(
+            tmp_path,
+            gate_ref=forged_gate.commit_ref,
+            publication_ref=publication_ref,
+        )
+
+    tampered = publication.to_dict()
+    tampered["delivery_manifest_hash"] = "f" * 64
+    tampered["artifact_hash"] = canonical_json_hash(
+        {key: value for key, value in tampered.items() if key != "artifact_hash"}
+    )
+    tampered_receipt = TaskArtifactStore(
+        tmp_path, "outputs/tampered-receipt"
+    ).publish(
+        task_id="stage3.10_g3_8_delivery_acceptance",
+        artifact_kind="g38_publication",
+        config_hash=publication.publication_config_hash,
+        run_intent="formal",
+        formal_eligible=True,
+        payload=tampered,
+        source_refs=(*publication.source_artifact_refs, gate_ref),
+    )
+    with pytest.raises(
+        FormalRunRejected, match="DELIVERY_MANIFEST_HASH_DRIFT"
+    ):
+        validate_stage3_g38_handoff_authority(
+            tmp_path,
+            gate_ref=gate_ref,
+            publication_ref=tampered_receipt.commit_ref,
+        )
 
 
 def test_g38_rejects_replay_with_skip_even_when_file_hash_matches(tmp_path: Path) -> None:

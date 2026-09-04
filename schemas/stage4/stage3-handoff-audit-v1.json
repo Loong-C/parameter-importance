@@ -1,0 +1,48 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://parameter-importance.invalid/schemas/stage4/stage3-handoff-audit-v1.json",
+  "title": "Stage 3 G3-8 authority consumed by formal Stage 4",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version", "scope", "status", "formal_eligible",
+    "publication_ref", "publication_hash", "publication_commit_hash",
+    "publication_config_hash", "g3_8_ref", "g3_8_hash", "g3_8_commit_hash",
+    "handoff_manifest_ref", "handoff_manifest_hash", "recommendation_ref",
+    "recommendation_hash", "finalization_ref", "finalization_hash",
+    "delivery_manifest_ref", "delivery_manifest_hash", "source_artifact_refs",
+    "lineage_refs", "audit_hash"
+  ],
+  "properties": {
+    "schema_version": {"const": "stage3-g38-handoff-audit-v1"},
+    "scope": {"const": "formal"},
+    "status": {"const": "PASS"},
+    "formal_eligible": {"const": true},
+    "publication_ref": {"$ref": "#/$defs/ref"},
+    "publication_hash": {"$ref": "#/$defs/hash"},
+    "publication_commit_hash": {"$ref": "#/$defs/hash"},
+    "publication_config_hash": {"$ref": "#/$defs/hash"},
+    "g3_8_ref": {"$ref": "#/$defs/ref"},
+    "g3_8_hash": {"$ref": "#/$defs/hash"},
+    "g3_8_commit_hash": {"$ref": "#/$defs/hash"},
+    "handoff_manifest_ref": {"$ref": "#/$defs/ref"},
+    "handoff_manifest_hash": {"$ref": "#/$defs/hash"},
+    "recommendation_ref": {"$ref": "#/$defs/ref"},
+    "recommendation_hash": {"$ref": "#/$defs/hash"},
+    "finalization_ref": {"$ref": "#/$defs/ref"},
+    "finalization_hash": {"$ref": "#/$defs/hash"},
+    "delivery_manifest_ref": {"$ref": "#/$defs/ref"},
+    "delivery_manifest_hash": {"$ref": "#/$defs/hash"},
+    "source_artifact_refs": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"$ref": "#/$defs/ref"}},
+    "lineage_refs": {"type": "array", "minItems": 6, "maxItems": 6, "uniqueItems": true, "items": {"$ref": "#/$defs/ref"}},
+    "audit_hash": {"$ref": "#/$defs/hash"}
+  },
+  "$defs": {
+    "hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "ref": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.(?:/|$))(?!.*\\\\).+$"
+    }
+  }
+}

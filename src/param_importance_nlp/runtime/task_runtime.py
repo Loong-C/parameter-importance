@@ -857,11 +857,46 @@ class TaskRuntime:
             return False, (reference,)
         return freeze.stage == stage and freeze.formal_eligible, (reference,)
 
+    def _verified_stage3_g38_handoff(
+        self,
+        environment: TaskRuntimeEnvironment,
+    ) -> tuple[bool, tuple[str, ...]]:
+        """Require the canonical G3-8 gate *and* its acceptance receipt."""
+
+        gate_ref = environment.evidence_refs.get("gate_stage3_g3_8")
+        publication_ref = environment.evidence_refs.get("stage3_g38_publication")
+        refs = tuple(
+            value
+            for value in (gate_ref, publication_ref)
+            if isinstance(value, str)
+        )
+        if gate_ref is None or publication_ref is None:
+            return False, refs
+        try:
+            from ..experiments.stage3_g38_publisher import (
+                validate_stage3_g38_handoff_authority,
+            )
+
+            audit = validate_stage3_g38_handoff_authority(
+                self._workspace_root,
+                gate_ref=gate_ref,
+                publication_ref=publication_ref,
+            )
+        except Exception:
+            return False, refs
+        return (
+            audit.get("status") == "PASS"
+            and audit.get("formal_eligible") is True,
+            refs,
+        )
+
     def _verified_gate_ref(
         self,
         environment: TaskRuntimeEnvironment,
         gate_id: str,
     ) -> tuple[bool, tuple[str, ...]]:
+        if gate_id == "stage3.G3-8":
+            return self._verified_stage3_g38_handoff(environment)
         reference = environment.evidence_refs.get(self._gate_evidence_key(gate_id))
         if reference is None:
             return False, ()

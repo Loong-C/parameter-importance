@@ -187,6 +187,7 @@ from .stage3_g38_publisher import (
     Stage3G38Publication,
     Stage3G38Publisher,
     publish_stage3_delivery_manifest,
+    validate_stage3_g38_handoff_authority,
 )
 from .training_endpoints import EndpointBundle, TrainingEndpointObserver
 from .stage3_trajectory import (
@@ -457,6 +458,7 @@ __all__ = [
     "Stage3G38Publication",
     "Stage3G38Publisher",
     "publish_stage3_delivery_manifest",
+    "validate_stage3_g38_handoff_authority",
     "finalize_stage3",
     "load_stage3_finalization",
     "reload_stage3_finalization",
