@@ -3275,6 +3275,42 @@ def _load_formal_document_ref(
     return payload
 
 
+def _promoted_stage3_matrix_plan(
+    request: TaskExecutionRequest,
+    root: Path,
+    *,
+    source_ref: str,
+    source_payload: Mapping[str, object],
+) -> tuple[Mapping[str, object], str]:
+    """Load the formal commit that promotes the exact S3.07 source plan."""
+
+    authority_ref = request.environment.evidence_refs.get(
+        "formal_stage3_matrix_plan"
+    )
+    if not isinstance(authority_ref, str) or not authority_ref:
+        raise ValueError("STAGE3_FORMAL_MATRIX_PLAN_AUTHORITY_REQUIRED")
+    try:
+        authority = load_committed_task_artifact(
+            root,
+            authority_ref,
+            require_formal=True,
+        )
+    except (FileNotFoundError, OSError, TypeError, ValueError) as error:
+        raise ValueError("STAGE3_FORMAL_MATRIX_PLAN_AUTHORITY_INVALID") from error
+    if (
+        authority.identity.artifact_kind
+        not in {"formal_plan", "stage3_formal_plan"}
+        or authority.identity.config_hash != request.config.config_hash
+        or (
+            source_ref != authority_ref
+            and source_ref not in authority.source_refs
+        )
+        or dict(authority.payload) != dict(source_payload)
+    ):
+        raise ValueError("STAGE3_FORMAL_MATRIX_PLAN_PROMOTION_MISMATCH")
+    return authority.payload, authority_ref
+
+
 def _formal_input_document(
     request: TaskExecutionRequest,
     root: Path,
@@ -13618,14 +13654,20 @@ def _run_stage3_formal_statistics(
         )
         if len(observations) != len(raw_rows):
             raise ValueError("formal observation 行含非 object")
-        plan_ref = formal_results.get("formal_plan_ref")
-        if not isinstance(plan_ref, str):
+        source_plan_ref = formal_results.get("formal_plan_ref")
+        if not isinstance(source_plan_ref, str):
             raise ValueError("formal plan ref 缺失")
         plan = _load_formal_document_ref(
             root,
-            plan_ref,
+            source_plan_ref,
             field="formal_plan_ref",
             schema_version="stage3-formal-pilot-plan-v1",
+        )
+        plan, plan_ref = _promoted_stage3_matrix_plan(
+            request,
+            root,
+            source_ref=source_plan_ref,
+            source_payload=plan,
         )
         if not isinstance(plan, Mapping):
             raise ValueError("formal plan 不是 object")

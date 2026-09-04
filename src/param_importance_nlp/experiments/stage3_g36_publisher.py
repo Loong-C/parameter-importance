@@ -201,6 +201,38 @@ def _load_formal_commit(
     return loaded
 
 
+def _resolve_streaming_plan_ref(
+    root: Path,
+    *,
+    plan_artifact: LoadedTaskArtifact,
+    formal_plan_ref: str,
+    streaming_formal_plan_ref: str | None,
+) -> str:
+    """Bind a historical matrix-plan ref to its promoted formal authority.
+
+    Streaming S3.07 receipts created before plan promotion retain the original
+    canonical document ref. A later formal commit may wrap that exact payload,
+    but only when its immutable source refs name the original document. This
+    bridge preserves the receipts without treating the raw document as a
+    formal commit.
+    """
+
+    if streaming_formal_plan_ref is None:
+        return formal_plan_ref
+    source_ref = _ref(
+        streaming_formal_plan_ref,
+        field="streaming_formal_plan_ref",
+    )
+    if source_ref == formal_plan_ref:
+        return source_ref
+    if source_ref not in plan_artifact.source_refs:
+        raise FormalRunRejected("STAGE3_G36_STREAMING_PLAN_SOURCE_UNBOUND")
+    source = _load_workspace_json(root, source_ref, field="streaming_formal_plan")
+    if dict(source) != dict(plan_artifact.payload):
+        raise FormalRunRejected("STAGE3_G36_STREAMING_PLAN_PAYLOAD_MISMATCH")
+    return source_ref
+
+
 def _mapping(value: object, *, field: str) -> Mapping[str, object]:
     if not isinstance(value, Mapping):
         raise TypeError(f"{field} 必须是 object")
@@ -824,6 +856,7 @@ def _evaluation_sources(
     execution: FormalExecutionEvidence,
     table: FrozenSourceTable,
     streaming_coverage_ref: str | None = None,
+    streaming_formal_plan_ref: str | None = None,
 ) -> tuple[str, ...]:
     refs: list[str] = [
         frozen_ref,
@@ -834,6 +867,11 @@ def _evaluation_sources(
     ]
     if streaming_coverage_ref is not None:
         refs.append(streaming_coverage_ref)
+    if (
+        streaming_formal_plan_ref is not None
+        and streaming_formal_plan_ref != plan_ref
+    ):
+        refs.append(streaming_formal_plan_ref)
     for gate in execution.prerequisite_gates:
         refs.extend(gate.evidence_refs)
     refs.extend(_source_refs_from_rows(table))
@@ -1115,6 +1153,7 @@ class Stage3G36Publisher:
         stage3_scope_gate_ref: str,
         streaming_coverage_ref: str | None = None,
         streaming_coverage_hash: str | None = None,
+        streaming_formal_plan_ref: str | None = None,
         publication_id: str | None = None,
         task_id: str = STAGE3_G36_TASK_ID,
     ) -> Stage3G36Publication:
@@ -1143,17 +1182,18 @@ class Stage3G36Publisher:
         scope_gate_artifact = _load_formal_commit(
             root, stage3_scope_gate_ref, field="scope_gate", kinds=frozenset({"gate_record"})
         )
-        input_artifacts = (
-            table_artifact,
-            provenance_artifact,
-            plan_artifact,
-            execution_artifact,
-            scope_decision_artifact,
-            scope_gate_artifact,
-        )
+        # S3.08, its promoted plan and the completed provenance describe this
+        # publication attempt and therefore share the requested config hash.
+        # Execution and G3-0 are immutable upstream authorities produced by
+        # different canonical tasks; their exact refs and semantic hashes are
+        # validated below instead of falsely requiring one producer config.
         drifted_configs = tuple(
             item.identity.commit_ref
-            for item in input_artifacts
+            for item in (
+                table_artifact,
+                plan_artifact,
+                provenance_artifact,
+            )
             if item.identity.config_hash != config_hash
         )
         if drifted_configs:
@@ -1168,7 +1208,8 @@ class Stage3G36Publisher:
             execution.require_for_stage(3)
             provenance = ProvenanceRecord.from_mapping(dict(provenance_artifact.payload))
             if (
-                provenance.status is not ProvenanceStatus.COMPLETED
+                provenance.config_hash != config_hash
+                or provenance.status is not ProvenanceStatus.COMPLETED
                 or provenance.scope != "formal"
                 or provenance.formal_eligible is not True
                 or provenance.worktree_clean is not True
@@ -1190,6 +1231,12 @@ class Stage3G36Publisher:
         matrix_plan = plan.get("plan_kind") == "matrix"
         streaming_coverage: Mapping[str, object] | None = None
         resolved_streaming_hash: str | None = None
+        resolved_streaming_plan_ref = _resolve_streaming_plan_ref(
+            root,
+            plan_artifact=plan_artifact,
+            formal_plan_ref=formal_plan_ref,
+            streaming_formal_plan_ref=streaming_formal_plan_ref,
+        )
         if matrix_plan:
             if streaming_coverage_ref is None:
                 raise FormalRunRejected("STAGE3_G36_STREAMING_COVERAGE_REQUIRED")
@@ -1199,7 +1246,7 @@ class Stage3G36Publisher:
                 expected_units=units,
                 expected_rules=rules,
                 expected_execution_hash=execution.artifact_hash,
-                expected_plan_ref=formal_plan_ref,
+                expected_plan_ref=resolved_streaming_plan_ref,
                 expected_plan_hash=str(plan["artifact_hash"]),
                 expected_index_ref=plan.get("production_unit_index_ref"),
                 expected_index_hash=plan.get("production_unit_index_hash"),
@@ -1214,7 +1261,7 @@ class Stage3G36Publisher:
                 expected_units=units,
                 expected_rules=rules,
                 expected_execution_hash=execution.artifact_hash,
-                expected_plan_ref=formal_plan_ref,
+                expected_plan_ref=resolved_streaming_plan_ref,
                 expected_plan_hash=str(plan["artifact_hash"]),
                 expected_index_ref=plan.get("production_unit_index_ref"),
                 expected_index_hash=plan.get("production_unit_index_hash"),
@@ -1230,6 +1277,7 @@ class Stage3G36Publisher:
             decision_ref=stage3_scope_decision_ref,
             scope_gate_ref=stage3_scope_gate_ref,
             streaming_coverage_ref=streaming_coverage_ref,
+            streaming_formal_plan_ref=resolved_streaming_plan_ref,
             execution=execution,
             table=table,
         )

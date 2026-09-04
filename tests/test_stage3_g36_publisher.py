@@ -2,11 +2,14 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
+import param_importance_nlp.experiments.stage23_task_runners as stage23_task_runners
 import param_importance_nlp.experiments.stage3_g36_publisher as g36_publisher
 from param_importance_nlp.analysis.report import FrozenSourceTable
+from param_importance_nlp.cli import build_parser
 from param_importance_nlp.contracts import (
     FormalExecutionEvidence,
     GateRecord,
@@ -208,6 +211,7 @@ def _publish_inputs(
     *,
     self_bind_provenance: bool = False,
     matrix_plan: bool = False,
+    upstream_config_hash: str = CONFIG_HASH,
 ) -> dict[str, str]:
     def store(name: str) -> TaskArtifactStore:
         return TaskArtifactStore(root, f"artifacts/{name}")
@@ -217,7 +221,7 @@ def _publish_inputs(
     decision_commit = store("scope").publish(
         task_id="stage3.01_prerequisites_and_scope",
         artifact_kind="scope_authority",
-        config_hash=CONFIG_HASH,
+        config_hash=upstream_config_hash,
         run_intent="formal",
         payload=decision,
         formal_eligible=True,
@@ -227,7 +231,7 @@ def _publish_inputs(
     scope_gate_commit = store("scope").publish(
         task_id="stage3.01_prerequisites_and_scope",
         artifact_kind="gate_record",
-        config_hash=CONFIG_HASH,
+        config_hash=upstream_config_hash,
         run_intent="formal",
         payload=scope_gate.to_dict(),
         formal_eligible=True,
@@ -256,7 +260,7 @@ def _publish_inputs(
     execution_commit = store("execution").publish(
         task_id="stage3.08_g3_6_publisher",
         artifact_kind="formal_execution_evidence",
-        config_hash=CONFIG_HASH,
+        config_hash=upstream_config_hash,
         run_intent="formal",
         payload=execution.to_dict(),
         formal_eligible=True,
@@ -386,6 +390,144 @@ def test_stage3_g36_publisher_rejects_cross_config_input_mix(tmp_path: Path) -> 
             config_hash="d" * 64,
             **refs,
         )
+
+
+def test_stage3_g36_publisher_preserves_distinct_upstream_config_identities(
+    tmp_path: Path,
+) -> None:
+    refs = _publish_inputs(tmp_path, upstream_config_hash="d" * 64)
+    result = Stage3G36Publisher().publish(
+        workspace_root=tmp_path,
+        output_dir="artifacts/publisher",
+        config_hash=CONFIG_HASH,
+        **refs,
+    )
+    assert result.status == "PASS"
+    assert result.formal_eligible is True
+
+
+def test_streaming_plan_ref_requires_exact_promoted_source_binding(
+    tmp_path: Path,
+) -> None:
+    refs = _publish_inputs(tmp_path)
+    plan = load_committed_task_artifact(
+        tmp_path,
+        refs["formal_plan_ref"],
+        require_formal=True,
+    )
+    source_ref = "plans/stage3/formal-matrix-source.json"
+    write_canonical_json(tmp_path / source_ref, plan.payload)
+    promoted = TaskArtifactStore(tmp_path, "artifacts/promoted-plan").publish(
+        task_id="stage3.formal_plan_authority",
+        artifact_kind="stage3_formal_plan",
+        config_hash=CONFIG_HASH,
+        run_intent="formal",
+        payload=plan.payload,
+        formal_eligible=True,
+        source_refs=(source_ref,),
+    )
+    promoted_plan = load_committed_task_artifact(
+        tmp_path,
+        promoted.commit_ref,
+        require_formal=True,
+    )
+    assert g36_publisher._resolve_streaming_plan_ref(
+        tmp_path,
+        plan_artifact=promoted_plan,
+        formal_plan_ref=promoted.commit_ref,
+        streaming_formal_plan_ref=source_ref,
+    ) == source_ref
+    with pytest.raises(FormalRunRejected, match="STREAMING_PLAN_SOURCE_UNBOUND"):
+        g36_publisher._resolve_streaming_plan_ref(
+            tmp_path,
+            plan_artifact=plan,
+            formal_plan_ref=plan.identity.commit_ref,
+            streaming_formal_plan_ref=source_ref,
+        )
+
+
+def test_stage308_uses_exact_hash_bound_plan_promotion(tmp_path: Path) -> None:
+    refs = _publish_inputs(tmp_path)
+    plan = load_committed_task_artifact(
+        tmp_path,
+        refs["formal_plan_ref"],
+        require_formal=True,
+    )
+    source_ref = "plans/stage3/formal-matrix-source.json"
+    write_canonical_json(tmp_path / source_ref, plan.payload)
+    authority = TaskArtifactStore(tmp_path, "artifacts/plan-authority").publish(
+        task_id="stage3.formal_plan_authority",
+        artifact_kind="stage3_formal_plan",
+        config_hash=CONFIG_HASH,
+        run_intent="formal",
+        payload=plan.payload,
+        formal_eligible=True,
+        source_refs=(source_ref,),
+    )
+    request = SimpleNamespace(
+        environment=SimpleNamespace(
+            evidence_refs={"formal_stage3_matrix_plan": authority.commit_ref}
+        ),
+        config=SimpleNamespace(config_hash=CONFIG_HASH),
+    )
+    promoted, promoted_ref = stage23_task_runners._promoted_stage3_matrix_plan(
+        request,
+        tmp_path,
+        source_ref=source_ref,
+        source_payload=plan.payload,
+    )
+    assert promoted == plan.payload
+    assert promoted_ref == authority.commit_ref
+    direct_request = SimpleNamespace(
+        environment=SimpleNamespace(
+            evidence_refs={"formal_stage3_matrix_plan": plan.identity.commit_ref}
+        ),
+        config=SimpleNamespace(config_hash=CONFIG_HASH),
+    )
+    direct, direct_ref = stage23_task_runners._promoted_stage3_matrix_plan(
+        direct_request,
+        tmp_path,
+        source_ref=plan.identity.commit_ref,
+        source_payload=plan.payload,
+    )
+    assert direct == plan.payload
+    assert direct_ref == plan.identity.commit_ref
+
+
+def test_stage3_g36_cli_carries_streaming_coverage_and_plan_refs() -> None:
+    arguments = build_parser().parse_args(
+        [
+            "artifact",
+            "stage3-g36-publish",
+            "--workspace-root",
+            ".",
+            "--output-dir",
+            "artifacts/g36",
+            "--config-hash",
+            CONFIG_HASH,
+            "--frozen-source-table-ref",
+            TABLE_REF,
+            "--provenance-ref",
+            PROVENANCE_REF,
+            "--formal-plan-ref",
+            PLAN_REF,
+            "--execution-evidence-ref",
+            EXECUTION_REF,
+            "--stage3-scope-decision-ref",
+            DECISION_REF,
+            "--stage3-scope-gate-ref",
+            SCOPE_GATE_REF,
+            "--streaming-coverage-ref",
+            "coverage/aggregate.json",
+            "--streaming-coverage-hash",
+            "e" * 64,
+            "--streaming-formal-plan-ref",
+            "plans/stage3/formal-matrix-source.json",
+        ]
+    )
+    assert arguments.streaming_coverage_ref == "coverage/aggregate.json"
+    assert arguments.streaming_coverage_hash == "e" * 64
+    assert arguments.streaming_formal_plan_ref.endswith("formal-matrix-source.json")
 
 
 def test_stage3_g36_publisher_rejects_provenance_self_binding(tmp_path: Path) -> None:

@@ -274,18 +274,21 @@ def _scope_from_evaluation(
     *,
     decision_ref: str | None,
     gate_ref: str | None,
-    expected_config_hash: str,
 ) -> tuple[str, str]:
     """Live-reload the G3-0 authority referenced by the committed evaluator."""
 
-    decision_ref = decision_ref or evaluation.stage3_scope_decision_ref
-    gate_ref = gate_ref or evaluation.stage3_scope_gate_ref
+    evaluated_decision_ref = evaluation.stage3_scope_decision_ref
+    evaluated_gate_ref = evaluation.stage3_scope_gate_ref
+    if decision_ref is not None and decision_ref != evaluated_decision_ref:
+        raise FormalRunRejected("STAGE3_G37_SCOPE_DECISION_REF_MISMATCH")
+    if gate_ref is not None and gate_ref != evaluated_gate_ref:
+        raise FormalRunRejected("STAGE3_G37_SCOPE_GATE_REF_MISMATCH")
+    decision_ref = decision_ref or evaluated_decision_ref
+    gate_ref = gate_ref or evaluated_gate_ref
     if not isinstance(decision_ref, str) or not isinstance(gate_ref, str):
         raise FormalRunRejected("STAGE3_G37_SCOPE_AUTHORITY_REFS_REQUIRED")
     decision_artifact = _load_formal(root, decision_ref, field="scope_decision", kinds=frozenset({"scope_authority", "stage3_scope_authority"}))
     gate_artifact = _load_formal(root, gate_ref, field="scope_gate", kinds=_GATE_KINDS)
-    if decision_artifact.identity.config_hash != expected_config_hash or gate_artifact.identity.config_hash != expected_config_hash:
-        raise FormalRunRejected("STAGE3_G37_SCOPE_CONFIG_HASH_MISMATCH")
     decision = _mapping(decision_artifact.payload, field="scope_decision")
     gate = GateRecord.from_mapping(dict(gate_artifact.payload))
     validate_stage3_scope_decision(decision)
@@ -698,13 +701,36 @@ class Stage3G37Publisher:
             "evaluation": _load_formal(root, evaluation_ref, field="g3_6_evaluation", kinds=_EVALUATION_KINDS),
             "g3_6": _load_formal(root, g3_6_ref, field="g3_6", kinds=_GATE_KINDS),
         }
+        # Scope authorities are immutable producers in their own right. Load
+        # the exact refs committed by G3-6 so their real config identities are
+        # included in the publication binding instead of being relabelled as
+        # the S3.08/G3-6 producer config.
+        scope_ref_from_eval = loaded["evaluation"].payload.get(
+            "stage3_scope_decision_ref"
+        )
+        scope_gate_ref_from_eval = loaded["evaluation"].payload.get(
+            "stage3_scope_gate_ref"
+        )
+        if isinstance(scope_ref_from_eval, str):
+            loaded["scope_decision"] = _load_formal(
+                root,
+                scope_ref_from_eval,
+                field="scope_decision",
+                kinds=frozenset({"scope_authority", "stage3_scope_authority"}),
+            )
+        if isinstance(scope_gate_ref_from_eval, str):
+            loaded["scope_gate"] = _load_formal(
+                root,
+                scope_gate_ref_from_eval,
+                field="scope_gate",
+                kinds=_GATE_KINDS,
+            )
         input_config_hashes = {
             name: item.identity.config_hash for name, item in loaded.items()
         }
         g36_authority_names = (
             "frozen_source_table",
             "formal_plan",
-            "execution",
             "provenance",
             "evaluation",
             "g3_6",
@@ -714,7 +740,6 @@ class Stage3G37Publisher:
         }
         if len(g36_config_values) != 1:
             raise FormalRunRejected("STAGE3_G37_G3_6_AUTHORITY_CONFIG_HASH_MISMATCH")
-        g36_config_hash = next(iter(g36_config_values))
         if (
             input_config_hashes["cost_accuracy_table"]
             != input_config_hashes["quadrature_decision"]
@@ -741,24 +766,6 @@ class Stage3G37Publisher:
             }
             for name, item in loaded.items()
         }
-        # Scope authority is part of the evaluator's immutable identity.  It
-        # is not a positional API argument that may be silently swapped.
-        scope_ref_from_eval = loaded["evaluation"].payload.get("stage3_scope_decision_ref")
-        scope_gate_ref_from_eval = loaded["evaluation"].payload.get("stage3_scope_gate_ref")
-        if isinstance(scope_ref_from_eval, str):
-            input_config_hashes["scope_decision"] = g36_config_hash
-            input_binding["scope_decision"] = {
-                "commit_ref": scope_ref_from_eval,
-                "artifact_hash": loaded["evaluation"].payload.get("stage3_scope_decision_hash"),
-                "config_hash": g36_config_hash,
-            }
-        if isinstance(scope_gate_ref_from_eval, str):
-            input_config_hashes["scope_gate"] = g36_config_hash
-            input_binding["scope_gate"] = {
-                "commit_ref": scope_gate_ref_from_eval,
-                "artifact_hash": loaded["evaluation"].payload.get("stage3_scope_gate_hash"),
-                "config_hash": g36_config_hash,
-            }
         publication_config_hash = canonical_json_hash({
             "schema_version": "stage3-g37-publication-config-v1",
             "input_config_hash": input_config_hash,
@@ -838,7 +845,6 @@ class Stage3G37Publisher:
                 gate_block_reasons.append("G3_6_MEASURED_BINDING_MISMATCH")
             scope_decision_ref, scope_gate_ref = _scope_from_evaluation(
                 root, evaluation, execution, decision_ref=stage3_scope_decision_ref, gate_ref=stage3_scope_gate_ref,
-                expected_config_hash=g36_config_hash,
             )
             reasons = list(gate_block_reasons)
             reasons.extend(_candidate_consistency(candidate, evaluation, execution=execution, plan_hash=plan_hash, units=units, rules=rules, thresholds=thresholds))

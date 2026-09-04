@@ -50,9 +50,16 @@ def _g36_test_module():
     return module
 
 
-def _inputs(tmp_path: Path) -> tuple[dict[str, str], object, object]:
+def _inputs(
+    tmp_path: Path,
+    *,
+    upstream_config_hash: str = CONFIG_HASH,
+) -> tuple[dict[str, str], object, object]:
     helper = _g36_test_module()
-    refs = helper._publish_inputs(tmp_path)
+    refs = helper._publish_inputs(
+        tmp_path,
+        upstream_config_hash=upstream_config_hash,
+    )
     g36 = Stage3G36Publisher().publish(
         workspace_root=tmp_path,
         output_dir="artifacts/g36",
@@ -224,6 +231,24 @@ def test_g37_commits_real_blocked_gate_for_missing_fallback_and_roundtrips(tmp_p
     assert Stage3G37Publication.from_mapping(result.to_dict()).artifact_hash == result.artifact_hash
     # The Gate commit exists even though qualification correctly stopped.
     assert Path(tmp_path, result.g3_7_ref).exists()
+
+
+def test_g37_binds_real_upstream_config_identities_without_relabelling(
+    tmp_path: Path,
+) -> None:
+    refs, _g36, _source = _inputs(
+        tmp_path,
+        upstream_config_hash="e" * 64,
+    )
+    result = Stage3G37Publisher().publish(
+        workspace_root=tmp_path,
+        output_dir="artifacts/g37",
+        **refs,
+    )
+    assert result.input_config_hashes["execution"] == "e" * 64
+    assert result.input_config_hashes["scope_decision"] == "e" * 64
+    assert result.input_config_hashes["scope_gate"] == "e" * 64
+    assert result.input_config_hashes["frozen_source_table"] == CONFIG_HASH
 
 
 def test_g37_qualifies_and_publishes_recommendation_finalization_and_receipt(tmp_path: Path) -> None:

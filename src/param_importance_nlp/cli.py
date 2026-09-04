@@ -2460,6 +2460,9 @@ def _artifact_stage3_g36_publish(arguments: argparse.Namespace) -> int:
         execution_evidence_ref=arguments.execution_evidence_ref,
         stage3_scope_decision_ref=arguments.stage3_scope_decision_ref,
         stage3_scope_gate_ref=arguments.stage3_scope_gate_ref,
+        streaming_coverage_ref=arguments.streaming_coverage_ref,
+        streaming_coverage_hash=arguments.streaming_coverage_hash,
+        streaming_formal_plan_ref=arguments.streaming_formal_plan_ref,
         publication_id=arguments.publication_id,
     )
     if arguments.receipt is not None:
@@ -3150,6 +3153,9 @@ def build_parser(*, prog: str | None = None) -> argparse.ArgumentParser:
     stage3_g36_publish.add_argument("--execution-evidence-ref", required=True)
     stage3_g36_publish.add_argument("--stage3-scope-decision-ref", required=True)
     stage3_g36_publish.add_argument("--stage3-scope-gate-ref", required=True)
+    stage3_g36_publish.add_argument("--streaming-coverage-ref")
+    stage3_g36_publish.add_argument("--streaming-coverage-hash")
+    stage3_g36_publish.add_argument("--streaming-formal-plan-ref")
     stage3_g36_publish.add_argument("--receipt", type=Path)
     stage3_g36_publish.set_defaults(handler=_artifact_stage3_g36_publish)
 
