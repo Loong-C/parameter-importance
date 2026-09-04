@@ -62,6 +62,10 @@ def test_hash_bound_cjk_report_and_slides_are_reproducible(tmp_path: Path) -> No
             "mean_normalized_l1_error": {"value": 0.0125},
             "nodes_error_pearson": {"value": -0.88},
             "raw_path_loss_mean": {"value": 2.75},
+            **{
+                f"formal_metric_{index:02d}": {"value": index / 1000.0}
+                for index in range(4, 17)
+            },
         },
     }
     charts = {
@@ -149,7 +153,27 @@ def test_hash_bound_cjk_report_and_slides_are_reproducible(tmp_path: Path) -> No
     report_path = tmp_path / first["chinese_report"]["pdf"]["path"]
     slides_path = tmp_path / first["beamer"]["pdf"]["path"]
     assert len(PdfReader(str(report_path)).pages) >= 4
-    assert len(PdfReader(str(slides_path)).pages) >= 10
+    slide_pages = PdfReader(str(slides_path)).pages
+    assert len(slide_pages) >= 12
+    backup_metric_pages = [
+        page.extract_text() or ""
+        for page in slide_pages
+        if any(
+            tag in (page.extract_text() or "")
+            for tag in ("BACKUP 2/5", "BACKUP 3/5")
+        )
+    ]
+    assert len(backup_metric_pages) == 2
+    backup_metric_text = "\n".join(backup_metric_pages)
+    assert all(
+        name in backup_metric_text
+        for name in (
+            "mean_normalized_l1_error",
+            "nodes_error_pearson",
+            "raw_path_loss_mean",
+            *(f"formal_metric_{index:02d}" for index in range(4, 17)),
+        )
+    )
     assert report_path.read_bytes().startswith(b"%PDF-")
     assert slides_path.read_bytes().startswith(b"%PDF-")
 

@@ -374,14 +374,49 @@ def _write_report_pdf(
     doc.build(story, onFirstPage=footer, onLaterPages=footer, canvasmaker=InvariantCanvas)
 
 
-def _draw_wrapped(canvas: Any, text: str, *, x: float, y: float, width_chars: int, leading: float, font_name: str, font_size: float) -> float:
+def _wrapped_lines(text: str, *, width_chars: int) -> list[str]:
     import textwrap
 
+    return textwrap.wrap(
+        text,
+        width=width_chars,
+        break_long_words=True,
+        replace_whitespace=False,
+    ) or [""]
+
+
+def _draw_wrapped(canvas: Any, text: str, *, x: float, y: float, width_chars: int, leading: float, font_name: str, font_size: float) -> float:
     canvas.setFont(font_name, font_size)
-    for line in textwrap.wrap(text, width=width_chars, break_long_words=True, replace_whitespace=False) or [""]:
+    for line in _wrapped_lines(text, width_chars=width_chars):
         canvas.drawString(x, y, line)
         y -= leading
     return y
+
+
+def _paginate_slide_bullets(
+    bullets: Sequence[str],
+    *,
+    width_chars: int,
+    available_height: float,
+    leading: float,
+    spacing: float,
+) -> list[list[str]]:
+    pages: list[list[str]] = []
+    current: list[str] = []
+    used = 0.0
+    for bullet in bullets:
+        required = len(_wrapped_lines(bullet, width_chars=width_chars)) * leading + spacing
+        if required > available_height:
+            raise ValueError("one slide bullet exceeds the safe content height")
+        if current and used + required > available_height:
+            pages.append(current)
+            current = []
+            used = 0.0
+        current.append(bullet)
+        used += required
+    if current or not pages:
+        pages.append(current)
+    return pages
 
 
 def _write_slides_pdf(
@@ -411,8 +446,12 @@ def _write_slides_pdf(
         pdf.setFillColor(colors.HexColor("#0b6e75")); pdf.setFont(font_name, 8); pdf.drawRightString(width - 0.45 * inch, height - 0.48 * inch, tag)
         text_width = 70 if image is None else 44
         y = height - 1.20 * inch
+        bottom_safe = 0.58 * inch
         pdf.setFillColor(colors.HexColor("#263238"))
         for bullet in bullets:
+            required = len(_wrapped_lines(bullet, width_chars=text_width)) * 0.29 * inch + 0.14 * inch
+            if y - required < bottom_safe:
+                raise ValueError(f"slide content exceeds safe footer boundary: {title}")
             pdf.setFont(font_name, 16); pdf.drawString(0.58 * inch, y, "•")
             y = _draw_wrapped(pdf, bullet, x=0.88 * inch, y=y, width_chars=text_width, leading=0.29 * inch, font_name=font_name, font_size=13)
             y -= 0.14 * inch
@@ -427,15 +466,30 @@ def _write_slides_pdf(
 
     frame("Stage 3 正式实验汇报", ["99 个正式路径积分单元与独立 Gate 链", "报告由 S3.10 哈希绑定提交和已验证图表生成", "完成边界：等待独立 G3-8 交付验收"])
     frame("结论与方法选择", [f"默认规则：{handoff['default_rule']}", f"回退规则：{handoff['fallback_rule']}", f"通过规则：{_short(handoff.get('passing_rules', []), 160)}", "成本语义：measured callback cost and unique nodes"])
-    frame("正式指标", [f"{name}: {value}" for name, value in metrics[:8]])
+    metric_bullets = [f"{name}: {value}" for name, value in metrics]
+    metric_pages = _paginate_slide_bullets(
+        metric_bullets,
+        width_chars=70,
+        available_height=(7.5 - 1.20 - 0.58) * inch,
+        leading=0.29 * inch,
+        spacing=0.14 * inch,
+    )
+    frame("正式指标", metric_pages[0])
     for figure in figures:
         frame(str(figure["id"]), ["正式 S3.10 图表", f"PNG: {str(figure['png']['sha256'])[:16]}...", f"SVG: {str(figure['svg']['sha256'])[:16]}..."], Path(figure["png_path"]))
     frame("Gate 与完成边界", [f"{key}: {gates[key]}" for key in ("stage3.G3-6", "stage3.G3-7", "stage3.G3-8", "formal_exit_gate")])
     frame("下一步", ["物化小文件交付清单与服务器大资产清单", "完成本地 CPU、锁定服务器与冻结端点无缓存三层语义回放", "验证分支、提交、推送、远端、服务器 clean HEAD 与多端同步", "由独立 G3-8 消费者验收并发布 Stage4 handoff"])
-    frame("备份：核心谱系", [f"{role}: {_short(ref, 130)}" for role, ref in sorted(source_refs.items())], tag="BACKUP 1/4")
-    frame("备份：指标定义", [f"{name}: {value}" for name, value in metrics], tag="BACKUP 2/4")
-    frame("备份：图表字节绑定", [f"{figure['id']}: PNG {figure['png']['sha256'][:20]}... / SVG {figure['svg']['sha256'][:20]}..." for figure in figures], tag="BACKUP 3/4")
-    frame("备份：验收边界", ["G3-8 不生成科学结果，只消费已完成交付", "所有文件须重新计算大小与 SHA-256", "大资产保持在服务器 DATA_ROOT，Git 仅保存代码与小文件", "Stage4 仅在 G3-8 PASS 后接收 handoff"], tag="BACKUP 4/4")
+    backup_total = 3 + len(metric_pages)
+    frame("备份：核心谱系", [f"{role}: {_short(ref, 130)}" for role, ref in sorted(source_refs.items())], tag=f"BACKUP 1/{backup_total}")
+    for index, bullets in enumerate(metric_pages, start=1):
+        suffix = f" ({index}/{len(metric_pages)})" if len(metric_pages) > 1 else ""
+        frame(
+            f"备份：指标定义{suffix}",
+            bullets,
+            tag=f"BACKUP {index + 1}/{backup_total}",
+        )
+    frame("备份：图表字节绑定", [f"{figure['id']}: PNG {figure['png']['sha256'][:20]}... / SVG {figure['svg']['sha256'][:20]}..." for figure in figures], tag=f"BACKUP {backup_total - 1}/{backup_total}")
+    frame("备份：验收边界", ["G3-8 不生成科学结果，只消费已完成交付", "所有文件须重新计算大小与 SHA-256", "大资产保持在服务器 DATA_ROOT，Git 仅保存代码与小文件", "Stage4 仅在 G3-8 PASS 后接收 handoff"], tag=f"BACKUP {backup_total}/{backup_total}")
     pdf.save()
 
 
