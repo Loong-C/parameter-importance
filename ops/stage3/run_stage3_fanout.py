@@ -81,12 +81,17 @@ class FanoutRunner:
         data_root: Path,
         environment: Path,
         python_executable: str | None = None,
+        config_catalog: Any | None = None,
     ) -> None:
         self.manifest = dict(manifest)
         self.workspace_root = workspace_root.resolve()
         self.data_root = data_root.resolve()
         self.environment = environment.resolve()
         self.python_executable = python_executable or sys.executable
+        # Operational launches use the current frozen catalog.  Read-only
+        # cross-version audits may inject the exact historical catalog that
+        # created an immutable manifest/config set.
+        self.config_catalog = config_catalog
         self._validate_manifest()
         self.task_id = str(self.manifest["task_id"])
         self.scope = str(self.manifest["scope"])
@@ -258,7 +263,12 @@ class FanoutRunner:
             try:
                 from param_importance_nlp.contracts import ResolvedConfigV2
 
-                resolved_config = ResolvedConfigV2.from_mapping(config)
+                if self.config_catalog is None:
+                    resolved_config = ResolvedConfigV2.from_mapping(config)
+                else:
+                    resolved_config = ResolvedConfigV2.from_mapping(
+                        config, catalog=self.config_catalog
+                    )
             except Exception as error:
                 raise _fail("FANOUT_CONFIG_CONTRACT_INVALID", step_id) from error
             if (
@@ -282,7 +292,13 @@ class FanoutRunner:
                 field=f"{step_id}.retry_config_ref",
             )
             try:
-                retry_config = ResolvedConfigV2.from_mapping(_load_json(retry_path))
+                retry_payload = _load_json(retry_path)
+                if self.config_catalog is None:
+                    retry_config = ResolvedConfigV2.from_mapping(retry_payload)
+                else:
+                    retry_config = ResolvedConfigV2.from_mapping(
+                        retry_payload, catalog=self.config_catalog
+                    )
             except Exception as error:
                 raise _fail("FANOUT_RETRY_CONFIG_CONTRACT_INVALID", step_id) from error
             retry_recovery = retry_config.section("recovery")
