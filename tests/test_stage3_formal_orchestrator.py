@@ -12,6 +12,7 @@ from types import SimpleNamespace
 import pytest
 
 from ops.stage3 import run_stage3_formal as orchestrator
+from param_importance_nlp.contracts import DEFAULT_TASK_CATALOG
 
 
 def _hash(value: object) -> str:
@@ -69,6 +70,14 @@ def test_phase_dag_runs_real_stage301_before_pilot_and_keeps_formal_post_gate() 
     assert "stage3.10_reports_visualizations_and_handoff" not in (
         orchestrator.EXTERNAL_GATE_BY_TASK
     )
+
+
+def test_formal_task_output_contracts_match_runtime_catalog() -> None:
+    """A numbered task must not be required to self-publish a later Gate."""
+
+    for task_id in orchestrator.FORMAL_TASK_ORDER:
+        declared = DEFAULT_TASK_CATALOG.get(task_id).artifact_kinds
+        assert declared == orchestrator.EXPECTED_OUTPUTS[task_id]
 
 
 def test_gpu_health_rejects_permanently_excluded_uuid(tmp_path: Path) -> None:

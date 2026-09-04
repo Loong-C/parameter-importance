@@ -940,7 +940,11 @@ _TASKS_RAW: Final = (
     _task("stage3.04_quadrature_engine_and_unit_tests", "求积引擎与解析测试", "plan/stage3/04_quadrature_engine_and_unit_tests.md", RunnerKind.VALIDATION, ("quadrature_rules", "analytic_validation_report", "gate_record"), RecoveryMode.RESTART_IDEMPOTENT, SafeBoundary.IMMUTABLE_PUBLISH, gates=("stage3.G3-1",), estimator_decision=True),
     _task("stage3.05_reference_integral_and_precision", "参考积分与精度预算", "plan/stage3/05_reference_integral_and_precision.md", RunnerKind.REFERENCE, ("path_integral_reference", "precision_budget", "gate_record"), RecoveryMode.RESUME_SHARDS, SafeBoundary.SHARD_COMMIT, gates=("stage3.G3-2", "stage3.G3-3"), capabilities=("server", "cuda"), estimator_decision=True),
     _task("stage3.06_pilot_and_threshold_freeze", "Pilot、阈值与预算冻结", "plan/stage3/06_pilot_and_threshold_freeze.md", RunnerKind.PILOT, ("quadrature_pilot_report", "threshold_freeze", "gate_record"), RecoveryMode.RESUME_SHARDS, SafeBoundary.SHARD_COMMIT, gates=("stage3.G3-4",), capabilities=("server", "cuda"), estimator_decision=True),
-    _task("stage3.07_formal_experiment_matrix", "路径积分正式实验矩阵", "plan/stage3/07_formal_experiment_matrix.md", RunnerKind.PATH_INTEGRATION, ("formal_path_results", "completeness_report", "gate_record"), RecoveryMode.RESUME_SHARDS, SafeBoundary.SHARD_COMMIT, gates=("stage3.G3-5",), capabilities=("server", "cuda"), estimator_decision=True),
+    # S3.07 cannot self-publish G3-6: the independent publisher needs the
+    # frozen S3.08 observation table and completed provenance first.  Keep
+    # this declaration aligned with the formal/fan-out orchestrators so S3.08
+    # can load the complete, real two-commit predecessor without a fake Gate.
+    _task("stage3.07_formal_experiment_matrix", "路径积分正式实验矩阵", "plan/stage3/07_formal_experiment_matrix.md", RunnerKind.PATH_INTEGRATION, ("formal_path_results", "completeness_report"), RecoveryMode.RESUME_SHARDS, SafeBoundary.SHARD_COMMIT, gates=("stage3.G3-5",), capabilities=("server", "cuda"), estimator_decision=True),
     # Stage3.08 only freezes the complete observation table.  G3-6 is
     # published by the independent ``stage3.08_g3_6_publisher`` after these
     # three commits and their completed provenance already exist.  Keeping the
