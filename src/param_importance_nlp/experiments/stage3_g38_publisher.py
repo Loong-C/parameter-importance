@@ -1117,6 +1117,9 @@ def validate_stage3_large_artifact_manifest(
 def validate_stage3_document_manifest(
     workspace_root: str | Path,
     manifest: Stage3G38DeliveryManifest,
+    *,
+    stage3_10_refs: Mapping[str, str] | None = None,
+    stage3_10_identities: Mapping[str, Mapping[str, object]] | None = None,
 ) -> None:
     """Reopen the rendered-document manifest and bind its font and outputs."""
 
@@ -1229,6 +1232,10 @@ def validate_stage3_document_manifest(
     expected_roles = set(REQUIRED_STAGE3_G38_STAGE310_KINDS)
     if set(inputs) != expected_roles or set(source_refs) != expected_roles:
         raise FormalRunRejected("STAGE3_G38_DOCUMENT_SOURCE_BINDING_INVALID")
+    if stage3_10_refs is not None and set(stage3_10_refs) != expected_roles:
+        raise FormalRunRejected("STAGE3_G38_DOCUMENT_EXPECTED_SOURCE_REFS_INVALID")
+    if stage3_10_identities is not None and set(stage3_10_identities) != expected_roles:
+        raise FormalRunRejected("STAGE3_G38_DOCUMENT_EXPECTED_IDENTITIES_INVALID")
     for role in REQUIRED_STAGE3_G38_STAGE310_KINDS:
         try:
             identity = _mapping(inputs[role], field=f"document_manifest.inputs.{role}")
@@ -1246,9 +1253,56 @@ def validate_stage3_document_manifest(
             except ValueError as error:
                 raise FormalRunRejected("STAGE3_G38_DOCUMENT_SOURCE_BINDING_INVALID") from error
         try:
-            _safe_ref(source_refs[role], field=f"document_manifest.source_refs.{role}")
+            source_ref = _safe_ref(
+                source_refs[role], field=f"document_manifest.source_refs.{role}"
+            )
         except (TypeError, ValueError) as error:
             raise FormalRunRejected("STAGE3_G38_DOCUMENT_SOURCE_BINDING_INVALID") from error
+        if stage3_10_refs is not None:
+            try:
+                expected_ref = _safe_ref(
+                    stage3_10_refs[role],
+                    field=f"document_manifest.expected_source_refs.{role}",
+                )
+            except (TypeError, ValueError) as error:
+                raise FormalRunRejected(
+                    "STAGE3_G38_DOCUMENT_EXPECTED_SOURCE_REFS_INVALID"
+                ) from error
+            if source_ref != expected_ref:
+                raise FormalRunRejected(
+                    f"STAGE3_G38_DOCUMENT_SOURCE_REF_MISMATCH:{role}"
+                )
+        if stage3_10_identities is not None:
+            try:
+                expected_identity = _mapping(
+                    stage3_10_identities[role],
+                    field=f"document_manifest.expected_identities.{role}",
+                )
+            except TypeError as error:
+                raise FormalRunRejected(
+                    "STAGE3_G38_DOCUMENT_EXPECTED_IDENTITIES_INVALID"
+                ) from error
+            if set(expected_identity) != {
+                "task_id",
+                "artifact_kind",
+                "config_hash",
+                "artifact_hash",
+                "payload_hash",
+            }:
+                raise FormalRunRejected(
+                    "STAGE3_G38_DOCUMENT_EXPECTED_IDENTITIES_INVALID"
+                )
+            for key in (
+                "task_id",
+                "artifact_kind",
+                "config_hash",
+                "artifact_hash",
+                "payload_hash",
+            ):
+                if identity.get(key) != expected_identity.get(key):
+                    raise FormalRunRejected(
+                        f"STAGE3_G38_DOCUMENT_INPUT_IDENTITY_MISMATCH:{role}:{key}"
+                    )
 
     try:
         files = _mapping(document.get("files"), field="document_manifest.files")
@@ -2419,7 +2473,21 @@ class Stage3G38Publisher:
         validate_stage3_replay_reports(root, manifest)
         validate_stage3_git_sync_evidence(root, manifest)
         validate_stage3_large_artifact_manifest(root, manifest)
-        validate_stage3_document_manifest(root, manifest)
+        validate_stage3_document_manifest(
+            root,
+            manifest,
+            stage3_10_refs=stage_ref_map,
+            stage3_10_identities={
+                role: {
+                    "task_id": loaded.identity.task_id,
+                    "artifact_kind": loaded.identity.artifact_kind,
+                    "config_hash": loaded.identity.config_hash,
+                    "artifact_hash": loaded.identity.artifact_hash,
+                    "payload_hash": canonical_json_hash(loaded.payload),
+                }
+                for role, loaded in stage_loaded.items()
+            },
+        )
 
         # Upstream publishers may intentionally derive a new publication
         # config hash (G3-6/G3-7), while the Stage3.10 runner retains the
@@ -2600,12 +2668,37 @@ def publish_stage3_delivery_manifest(
     if not set(normalized_refs.values()).issubset(set(refs)):
         raise FormalRunRejected("STAGE3_G38_MANIFEST_MISSING_STAGE310_SOURCES")
     root = Path(workspace_root).resolve()
+    stage_loaded = {
+        role: _load_formal_commit(
+            root,
+            normalized_refs[role],
+            field=f"stage3_10_{role}",
+            config_hash=config_hash,
+            expected_kind=role,
+            expected_task_id=STAGE3_G38_STAGE310_TASK_ID,
+        )
+        for role in REQUIRED_STAGE3_G38_STAGE310_KINDS
+    }
     parsed = Stage3G38DeliveryManifest.from_mapping(manifest)
     _verify_manifest_files(root, parsed)
     validate_stage3_replay_reports(root, parsed)
     validate_stage3_git_sync_evidence(root, parsed)
     validate_stage3_large_artifact_manifest(root, parsed)
-    validate_stage3_document_manifest(root, parsed)
+    validate_stage3_document_manifest(
+        root,
+        parsed,
+        stage3_10_refs=normalized_refs,
+        stage3_10_identities={
+            role: {
+                "task_id": loaded.identity.task_id,
+                "artifact_kind": loaded.identity.artifact_kind,
+                "config_hash": loaded.identity.config_hash,
+                "artifact_hash": loaded.identity.artifact_hash,
+                "payload_hash": canonical_json_hash(loaded.payload),
+            }
+            for role, loaded in stage_loaded.items()
+        },
+    )
     published = TaskArtifactStore(root, output_dir).publish(
         task_id=STAGE3_G38_MANIFEST_TASK_ID,
         artifact_kind=STAGE3_G38_MANIFEST_ARTIFACT_KIND,

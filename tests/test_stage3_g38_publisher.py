@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import importlib.util
 import json
+from collections.abc import Mapping
 from pathlib import Path
 
 import pytest
@@ -65,7 +66,10 @@ def _put_file(root: Path, name: str, data: bytes) -> dict[str, object]:
     return {"path": name, "sha256": hashlib.sha256(data).hexdigest(), "size": len(data)}
 
 
-def _manifest(root: Path) -> dict[str, object]:
+def _manifest(
+    root: Path,
+    stage3_10_refs: Mapping[str, str] | None = None,
+) -> dict[str, object]:
     n = 0
     replay_input = _put_file(
         root,
@@ -229,6 +233,33 @@ def _manifest(root: Path) -> dict[str, object]:
         },
         "worklog": f(".md"),
     }
+    if stage3_10_refs is None:
+        document_source_refs = {
+            role: f"inputs/stage310/{role}.json"
+            for role in ("analysis_report", "chart_artifacts", "handoff_manifest", "gate_summary")
+        }
+        document_identities = {
+            role: {
+                "task_id": "stage3.10_reports_visualizations_and_handoff",
+                "artifact_kind": role,
+                "config_hash": "7" * 64,
+                "artifact_hash": hashlib.sha256(f"artifact:{role}".encode()).hexdigest(),
+                "payload_hash": hashlib.sha256(f"payload:{role}".encode()).hexdigest(),
+            }
+            for role in document_source_refs
+        }
+    else:
+        document_source_refs = dict(stage3_10_refs)
+        document_identities = {}
+        for role, ref in document_source_refs.items():
+            loaded = load_committed_task_artifact(root, ref, require_formal=True)
+            document_identities[role] = {
+                "task_id": loaded.identity.task_id,
+                "artifact_kind": loaded.identity.artifact_kind,
+                "config_hash": loaded.identity.config_hash,
+                "artifact_hash": loaded.identity.artifact_hash,
+                "payload_hash": canonical_json_hash(loaded.payload),
+            }
     document_body: dict[str, object] = {
         "schema_version": "stage3-delivery-documents-v1",
         "status": "PASS",
@@ -241,20 +272,8 @@ def _manifest(root: Path) -> dict[str, object]:
             "invariant_pdf": True,
         },
         "font": {"name": "Stage3CJK", **document_font},
-        "inputs": {
-            role: {
-                "task_id": "stage3.10_reports_visualizations_and_handoff",
-                "artifact_kind": role,
-                "config_hash": "7" * 64,
-                "artifact_hash": hashlib.sha256(f"artifact:{role}".encode()).hexdigest(),
-                "payload_hash": hashlib.sha256(f"payload:{role}".encode()).hexdigest(),
-            }
-            for role in ("analysis_report", "chart_artifacts", "handoff_manifest", "gate_summary")
-        },
-        "source_refs": {
-            role: f"inputs/stage310/{role}.json"
-            for role in ("analysis_report", "chart_artifacts", "handoff_manifest", "gate_summary")
-        },
+        "inputs": document_identities,
+        "source_refs": document_source_refs,
         "figure_inputs": value["figures"],
         "files": {
             "chinese_report": value["chinese_report"],
@@ -472,7 +491,7 @@ def _inputs(root: Path) -> dict[str, object]:
         )
         stage310[kind] = published.commit_ref
 
-    manifest = _manifest(root)
+    manifest = _manifest(root, stage3_10_refs=stage310)
     manifest_commit = publish_stage3_delivery_manifest(
         workspace_root=root,
         output_dir="inputs/manifest",
@@ -694,6 +713,23 @@ def test_g38_rejects_document_font_byte_drift(tmp_path: Path) -> None:
 
     with pytest.raises(FormalRunRejected, match="DOCUMENT_FONT_FILE_MISMATCH"):
         validate_stage3_document_manifest(tmp_path, parsed)
+
+
+def test_g38_rejects_document_source_ref_drift(tmp_path: Path) -> None:
+    manifest = _manifest(tmp_path)
+    parsed = Stage3G38DeliveryManifest.from_mapping(manifest)
+    expected = {
+        role: f"inputs/stage310/{role}.json"
+        for role in ("analysis_report", "chart_artifacts", "handoff_manifest", "gate_summary")
+    }
+    expected["analysis_report"] = "inputs/stage310/other-analysis-report.json"
+
+    with pytest.raises(FormalRunRejected, match="DOCUMENT_SOURCE_REF_MISMATCH:analysis_report"):
+        validate_stage3_document_manifest(
+            tmp_path,
+            parsed,
+            stage3_10_refs=expected,
+        )
 
 
 def test_g38_rejects_empty_or_spec_only_chart_bundle(tmp_path: Path) -> None:
