@@ -1,0 +1,1 @@
+{"artifacts":{"required_kinds":["cost_accuracy_table","quadrature_decision"]},"execution":{"dry_run":false,"fail_on_blocked":true,"max_attempts":1,"runner_kind":"analysis","timeout_seconds":7200}}
